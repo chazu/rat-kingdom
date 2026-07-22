@@ -90,9 +90,9 @@ impl Space {
                     inner.waiters.push(waiter);
                     continue;
                 }
-                match waiter.tx.send(tuple.clone()) {
-                    Ok(()) => consumed = true,
-                    Err(_) => {} // receiver gone (timeout); drop the waiter
+                // On Err the receiver is gone (timed out); drop the waiter.
+                if waiter.tx.send(tuple.clone()).is_ok() {
+                    consumed = true;
                 }
             } else {
                 // Non-destructive: deliver and drop the waiter (rd is one-shot).
