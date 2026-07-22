@@ -45,12 +45,15 @@ impl Default for HarnessConfig {
 }
 
 impl Config {
-    /// Load config layered from defaults, an optional TOML file, and `RK_*` env
-    /// vars (nested keys split on `_`, e.g. `RK_LOG_FILTER`).
+    /// Load config layered from defaults, an optional TOML file, and
+    /// `RK_CONFIG_*` env vars (nested keys split on `_`, e.g.
+    /// `RK_CONFIG_LOG_FILTER`). The prefix is deliberately NOT plain `RK_`:
+    /// runtime identity vars (RK_AGENT, RK_LOG, RK_HOME...) must never leak
+    /// into config parsing.
     pub fn load(config_file: &Path) -> crate::Result<Self> {
         Figment::from(Serialized::defaults(Config::default()))
             .merge(Toml::file(config_file))
-            .merge(Env::prefixed("RK_").split("_"))
+            .merge(Env::prefixed("RK_CONFIG_").split("_"))
             .extract()
             .map_err(|e| crate::Error::Config(e.to_string()))
     }

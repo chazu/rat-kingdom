@@ -3,6 +3,7 @@
 //! completion and state are events, not pane contents.
 
 pub mod claude;
+pub mod codex;
 pub mod fake;
 
 use serde::{Deserialize, Serialize};
@@ -152,9 +153,10 @@ pub trait Harness: Send + Sync {
 pub fn make_harness(kind: &str) -> rk_core::Result<Box<dyn Harness>> {
     match kind {
         "claude" => Ok(Box::new(claude::ClaudeHarness)),
+        "codex" => Ok(Box::new(codex::CodexHarness)),
         "fake" => Ok(Box::new(fake::FakeHarness)),
         other => Err(rk_core::Error::other(format!(
-            "unknown harness kind: {other} (available: claude, fake)"
+            "unknown harness kind: {other} (available: claude, codex, fake)"
         ))),
     }
 }
@@ -178,11 +180,23 @@ pub(crate) mod runner {
     }
 
     pub fn launch(mut wiring: Wiring) -> rk_core::Result<HarnessSession> {
+        // Only pipe stdin for steerable adapters: a piped-but-idle stdin makes
+        // some CLIs (codex exec) block waiting for EOF before starting.
+        let stdin_mode = if wiring.steer_line.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        };
         wiring
             .command
-            .stdin(Stdio::piped())
+            .stdin(stdin_mode)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            // Each harness child gets its OWN process group: some harnesses
+            // (codex) signal their process group on cleanup, which must never
+            // reach the daemon; and our signals should hit the child's whole
+            // tree, not the daemon's.
+            .process_group(0)
             .kill_on_drop(true);
         let mut child = wiring.command.spawn()?;
         let pid = child.id();
@@ -261,9 +275,11 @@ pub(crate) mod runner {
 
     fn send_signal(pid: Option<u32>, sig: i32) {
         if let Some(pid) = pid {
-            // SAFETY: plain kill(2) on a pid we own.
+            // Negative pid = the child's whole process group (it leads its
+            // own group via process_group(0) above).
+            // SAFETY: plain kill(2) on a process group we created.
             unsafe {
-                libc_kill(pid as i32, sig);
+                libc_kill(-(pid as i32), sig);
             }
         }
     }

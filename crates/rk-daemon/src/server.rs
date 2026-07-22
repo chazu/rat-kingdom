@@ -80,6 +80,18 @@ impl Daemon {
                     sock.display()
                 )));
             }
+            // Connect failure alone does not prove staleness — THIS process
+            // may be sandboxed away from the socket. Only reclaim it if the
+            // recorded owner pid is actually dead.
+            if let Some(pid) = read_pid(&self.layout) {
+                if process_alive(pid) {
+                    return Err(rk_core::Error::other(format!(
+                        "daemon pid {pid} appears alive but its socket is unreachable \
+                         from this process (sandbox?) — refusing to clobber {}",
+                        sock.display()
+                    )));
+                }
+            }
             debug!(path = %sock.display(), "removing stale socket");
             std::fs::remove_file(&sock)?;
         }
@@ -87,6 +99,8 @@ impl Daemon {
         let listener = UnixListener::bind(&sock)?;
         std::fs::write(self.layout.pid_file(), std::process::id().to_string())?;
         info!(socket = %sock.display(), pid = std::process::id(), castle = %self.castle, "daemon listening");
+        // Only now that the bind is won may shared state be touched.
+        self.supervisor.on_daemon_started();
 
         let daemon = Arc::new(self);
         let mut shutdown_rx = daemon.shutdown_tx.subscribe();
@@ -136,8 +150,17 @@ impl Daemon {
             }
         }
 
-        std::fs::remove_file(daemon.layout.socket_path()).ok();
-        std::fs::remove_file(daemon.layout.pid_file()).ok();
+        // Remove the socket/pid files only if they are still OURS — a newer
+        // daemon may have already bound a fresh socket at the same path, and
+        // unlinking it would strand that daemon unreachable.
+        let ours = std::fs::read_to_string(daemon.layout.pid_file())
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            == Some(std::process::id());
+        if ours {
+            std::fs::remove_file(daemon.layout.socket_path()).ok();
+            std::fs::remove_file(daemon.layout.pid_file()).ok();
+        }
         Ok(())
     }
 
@@ -431,6 +454,28 @@ where
     let mut out = serde_json::to_vec(value)?;
     out.push(b'\n');
     write.write_all(&out).await
+}
+
+fn read_pid(layout: &Layout) -> Option<u32> {
+    std::fs::read_to_string(layout.pid_file())
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn process_alive(pid: u32) -> bool {
+    // kill(pid, 0): 0 or EPERM = alive; ESRCH = gone.
+    unsafe { kill_probe(pid as i32, 0) == 0 || last_errno_is_eperm() }
+}
+
+extern "C" {
+    #[link_name = "kill"]
+    fn kill_probe(pid: i32, sig: i32) -> i32;
+}
+
+fn last_errno_is_eperm() -> bool {
+    std::io::Error::last_os_error().raw_os_error() == Some(1)
 }
 
 async fn shutdown_signal() {

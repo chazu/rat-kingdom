@@ -28,9 +28,21 @@ impl Client {
     }
 
     /// Connect, auto-starting a detached daemon process if needed.
+    ///
+    /// Never auto-spawns from inside an agent session (`RK_AGENT` set): the
+    /// agent may be running under a harness sandbox where socket connects
+    /// fail — spawning a daemon there would clobber the real daemon's socket
+    /// and registry from inside the sandbox.
     pub async fn connect_or_spawn(layout: &Layout) -> rk_core::Result<Self> {
         if let Ok(client) = Self::connect(layout).await {
             return Ok(client);
+        }
+        if std::env::var("RK_AGENT").is_ok() {
+            return Err(rk_core::Error::other(
+                "cannot reach the rk daemon from this agent session — if your harness \
+                 sandbox blocks unix sockets, the orchestrator must launch you with \
+                 socket access (rk never starts daemons from inside agent sessions)",
+            ));
         }
         spawn_detached_daemon(layout)?;
         // Poll for the socket to come up.

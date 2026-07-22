@@ -139,6 +139,14 @@ async fn main() -> Result<()> {
             DaemonCommand::Stop => {
                 let mut client = Client::connect(&layout).await?;
                 client.call("stop", json!({})).await?;
+                // Wait for the old daemon to fully release the socket so an
+                // immediate restart cannot race its shutdown cleanup.
+                for _ in 0..50 {
+                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                    if Client::connect(&layout).await.is_err() {
+                        break;
+                    }
+                }
                 if cli.json {
                     println!("{}", json!({ "stopped": true }));
                 } else {

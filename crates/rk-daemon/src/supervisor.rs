@@ -63,11 +63,7 @@ impl Supervisor {
         default_harness: String,
         space: Space,
     ) -> rk_core::Result<Self> {
-        let mut registry = Registry::load(&layout.home().join("agents.json"))?;
-        let orphaned = registry.orphan_live_agents()?;
-        if !orphaned.is_empty() {
-            warn!(?orphaned, "orphaned live agents from previous daemon run");
-        }
+        let registry = Registry::load(&layout.home().join("agents.json"))?;
         Ok(Self {
             layout,
             castle,
@@ -76,6 +72,18 @@ impl Supervisor {
             controls: Mutex::new(HashMap::new()),
             space,
         })
+    }
+
+    /// Called once the daemon has WON the socket bind — never earlier. A
+    /// Daemon that loses the bind race must not touch shared registry state.
+    pub fn on_daemon_started(&self) {
+        match self.lock_registry().orphan_live_agents() {
+            Ok(orphaned) if !orphaned.is_empty() => {
+                warn!(?orphaned, "orphaned live agents from previous daemon run");
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "failed to orphan stale agents"),
+        }
     }
 
     pub fn spawn(self: &Arc<Self>, params: SpawnParams) -> rk_core::Result<AgentRecord> {

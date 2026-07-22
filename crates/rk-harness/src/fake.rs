@@ -33,8 +33,14 @@ impl Harness for FakeHarness {
     }
 
     fn launch(&self, spec: &LaunchSpec) -> rk_core::Result<HarnessSession> {
-        let script =
-            std::env::var("RK_FAKE_HARNESS_CMD").unwrap_or_else(|_| DEFAULT_SCRIPT.to_string());
+        // Per-launch script via spec.env beats the process env var (which is
+        // racy when parallel tests share the process).
+        let script = spec
+            .env
+            .get("RK_FAKE_HARNESS_CMD")
+            .cloned()
+            .or_else(|| std::env::var("RK_FAKE_HARNESS_CMD").ok())
+            .unwrap_or_else(|| DEFAULT_SCRIPT.to_string());
         let mut cmd = Command::new("bash");
         cmd.args(["-c", &script]);
         cmd.current_dir(&spec.cwd);
@@ -105,14 +111,17 @@ mod tests {
     #[tokio::test]
     async fn interrupt_terminates_a_hung_fake() {
         let dir = tempfile::tempdir().unwrap();
-        // A fake that never finishes.
-        std::env::set_var("RK_FAKE_HARNESS_CMD", "sleep 300");
-        let session = FakeHarness.launch(&LaunchSpec {
-            cwd: dir.path().to_path_buf(),
-            ..Default::default()
-        });
-        std::env::remove_var("RK_FAKE_HARNESS_CMD");
-        let mut session = session.unwrap();
+        // A fake that never finishes; script via spec.env (no process-global
+        // state, so parallel tests cannot race).
+        let mut env = std::collections::HashMap::new();
+        env.insert("RK_FAKE_HARNESS_CMD".to_string(), "sleep 300".to_string());
+        let mut session = FakeHarness
+            .launch(&LaunchSpec {
+                cwd: dir.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
 
         session.control.kill().await.unwrap();
         let mut saw_exit = false;
