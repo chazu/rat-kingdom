@@ -301,9 +301,48 @@ impl WorkflowEngine {
                         i.context.active_agent = None;
                     });
                 }
-                Step::Gate(gate) => {
-                    tokio::time::sleep(parse_duration(&gate.duration)?).await;
-                }
+                Step::Gate(gate) => match gate.gate_type.as_str() {
+                    "timer" => {
+                        let duration = gate.duration.as_deref().ok_or_else(|| {
+                            rk_core::Error::other("timer gate missing duration")
+                        })?;
+                        tokio::time::sleep(parse_duration(duration)?).await;
+                    }
+                    "approval" => {
+                        // Block until a human decision for THIS instance arrives
+                        // (via `rk approve`/`rk reject`, which write a
+                        // `workflow_approval` event) or the timeout elapses.
+                        let timeout = parse_duration(gate.timeout.as_deref().unwrap_or("24h"))?;
+                        let mut pattern =
+                            Pattern::category(Category::Event).identity("workflow_approval");
+                        // Scope the wait to this instance. serde_json renders the
+                        // pair contiguously regardless of key order, so this
+                        // substring is a reliable per-instance predicate.
+                        pattern.payload_search = Some(format!("\"instance\":\"{id}\""));
+                        let decision = match self
+                            .space
+                            .rd(&pattern, timeout)
+                            .await
+                            .map_err(|e| {
+                                rk_core::Error::other(format!("approval gate failed: {e}"))
+                            })? {
+                            Some(tuple) => tuple.payload,
+                            // Fail closed: no human response means no merge.
+                            None => json!({
+                                "approved": false,
+                                "reason": format!("no approval within {}", gate.timeout.as_deref().unwrap_or("24h")),
+                            }),
+                        };
+                        self.update(id, |i| {
+                            i.context.previous_result = Some(decision);
+                        });
+                    }
+                    other => {
+                        return Err(rk_core::Error::other(format!(
+                            "unknown gate type: {other}"
+                        )));
+                    }
+                },
                 Step::Read(read) => {
                     let category = Category::from_str(&read.category)?;
                     let scope = read.scope.clone().unwrap_or_else(|| repo_name_of(repo));
@@ -377,6 +416,38 @@ impl WorkflowEngine {
 
     pub fn status(&self, id: &str) -> Option<Instance> {
         self.lock().get(id).cloned()
+    }
+
+    /// Record a human approval decision for a parked instance. Writes a
+    /// `workflow_approval` event that an approval gate blocked on this instance
+    /// is waiting to read. Idempotent from the caller's view: the first
+    /// decision to reach the blocked gate wins.
+    pub fn approve(
+        &self,
+        instance_id: &str,
+        approved: bool,
+        by: &str,
+        reason: Option<String>,
+    ) -> rk_core::Result<()> {
+        let instance = self.status(instance_id).ok_or_else(|| {
+            rk_core::Error::other(format!("no such workflow instance: {instance_id}"))
+        })?;
+        let payload = json!({
+            "instance": instance_id,
+            "step": instance.current_step,
+            "approved": approved,
+            "by": by,
+            "reason": reason,
+        });
+        self.space.out(rk_core::tuple::Tuple::new(
+            Category::Event,
+            repo_name_of(&instance.repo),
+            "workflow_approval",
+            by.to_string(),
+            payload,
+        ))?;
+        info!(instance = %instance_id, approved, by = %by, "workflow approval recorded");
+        Ok(())
     }
 
     fn context(&self, id: &str) -> WorkflowContext {

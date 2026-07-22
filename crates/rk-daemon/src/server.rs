@@ -414,6 +414,26 @@ impl Daemon {
                     ),
                 })
             }
+            "workflow.approve" => {
+                let params: WorkflowApproveParams = match parse_params(&req.params) {
+                    Ok(p) => p,
+                    Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
+                };
+                reply(
+                    match self.engine().approve(
+                        &params.instance,
+                        params.approved,
+                        &params.by,
+                        params.reason,
+                    ) {
+                        Ok(()) => Response::ok(
+                            id,
+                            json!({"instance": params.instance, "approved": params.approved}),
+                        ),
+                        Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
+                    },
+                )
+            }
             "workflow.definitions" => {
                 let params: WorkflowDefsParams = match parse_params(&req.params) {
                     Ok(p) => p,
@@ -742,6 +762,15 @@ struct WorkflowRunParams {
 #[derive(Deserialize)]
 struct WorkflowDefsParams {
     repo: String,
+}
+
+#[derive(Deserialize)]
+struct WorkflowApproveParams {
+    instance: String,
+    approved: bool,
+    by: String,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]

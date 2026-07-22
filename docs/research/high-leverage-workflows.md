@@ -409,28 +409,46 @@ valve that makes broad autonomy palatable.
 approval. The schema already names the intended mechanism: *"human gates arrive
 with approval tuples"* (schema.cue:101).
 
-**Primitive to add:** an **approval gate** —
-`{type: "gate", gateType: "approval", timeout: "24h"}` that blocks until an
-`approval` tuple for this instance appears in the space (e.g. via
-`rk approve <instance>` / `rk reject <instance>`), capturing the decision into
-`ctx.previousResult` so a following `evaluate`/branch can act on it.
+**Primitive added:** an **approval gate** —
+`{type: "gate", gateType: "approval", timeout: "24h"}` that blocks until a
+`workflow_approval` event for this instance appears in the space (via
+`rk approve <instance>` / `rk reject <instance>`), capturing the decision
+(`{approved: bool, by, reason}`) into `ctx.previousResult` so a following
+`evaluate` can act on it. **Fails closed:** if no human responds within
+`timeout`, the captured decision is `{approved: false}`, so the run does not
+merge on silence.
 
-**Sketch:**
+**Scoping.** `rk approve`/`rk reject` name the workflow instance id (from
+`rk workflow list`). The daemon writes the approval event under the instance's
+repo scope with the instance id in the payload; the gate matches on that id, so
+a decision only satisfies the instance it names. The current step index is
+recorded on the event for auditing.
+
+**Shape (implemented in `examples/workflows/gated-merge.cue`):**
 
 ```cue
 steps: [
 	{type: "spawn", role: "rat", task: {title: _input.taskId, description: _input.description}},
 	{type: "wait", timeout: "30m"},
-	{type: "evaluate", expect: {is_error: false}},
-	{type: "dismiss", noMerge: true},                          // hold branch for review
-	{type: "gate", gateType: "approval", timeout: "24h"},      // NEW: block on approval tuple
-	{type: "evaluate", expect: {approved: true}},              // proceed only if approved
-	{type: "dismiss"},                                          // merge on approval
+	{type: "evaluate", expect: {is_error: false}},            // implementation must succeed
+	{type: "gate", gateType: "approval", timeout: "24h"},     // block on the human decision
+	{type: "evaluate", expect: {approved: true}},             // proceed only if approved
+	{type: "dismiss"},                                         // merge on approval
 ]
 ```
 
-Until the primitive lands, a timer gate is a poor stand-in (it merges on a
-schedule, not on consent) and should not be used for genuinely risky merges.
+The rat is deliberately *not* dismissed before the gate — its branch and
+worktree stay live for the reviewer to inspect while parked. On approval the
+final `dismiss` merges; on rejection (or timeout) the `{approved: true}`
+evaluate fails, the run ends unmerged, and the branch is left in place for
+manual `rk dismiss --no-merge` or a follow-up. (The engine is a linear step
+machine with no conditional branch, so "merge here / hold there" is expressed
+as *proceed-to-merge on approval, fail-and-hold otherwise* rather than two
+divergent tails.)
+
+A timer gate remains available (`gateType: "timer", duration: ...`) but merges
+on a schedule, not on consent, and should not stand in for a real approval on
+genuinely risky merges.
 
 ### 7. `backlog-drain`
 

@@ -22,9 +22,12 @@ fn all_shipped_examples_load() {
         "expected shipped examples in {}",
         dir.display()
     );
+    // Cover every required param across the shipped set so a new example that
+    // adds one is caught here rather than by a user.
     let inputs = HashMap::from([
         ("taskId".to_string(), json!("example-task")),
         ("description".to_string(), json!("example description")),
+        ("question".to_string(), json!("example question")),
     ]);
     for def in defs {
         let workflow = rk_workflow::load(&def, &inputs)

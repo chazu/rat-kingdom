@@ -156,3 +156,211 @@ async fn cue_workflow_runs_end_to_end_with_agent_resolution() {
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
+
+// spawn → wait → evaluate → approval gate → evaluate(approved) → dismiss.
+const GATED_WORKFLOW: &str = r#"
+workflow: {
+    name: "gated"
+    params: {taskId: {type: "string", required: true}}
+    agents: {default: {harness: "fake", model: "sonnet"}}
+    steps: [
+        {type: "spawn", role: "rat", task: {title: _input.taskId, description: "do " + _input.taskId}},
+        {type: "wait", timeout: "30s"},
+        {type: "evaluate", expect: {is_error: false}},
+        {type: "gate", gateType: "approval", timeout: "30s"},
+        {type: "evaluate", expect: {approved: true}},
+        {type: "dismiss"},
+    ]
+}
+"#;
+
+/// The approval gate blocks the run until `rk approve` (here: the
+/// `workflow.approve` RPC) supplies a decision for this instance; on approval
+/// the branch merges. This is the safety-valve happy path.
+#[tokio::test]
+async fn approval_gate_blocks_until_approved_then_merges() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    git(repo_dir.path(), &["init", "-b", "main"]);
+    git(repo_dir.path(), &["config", "user.email", "r@x"]);
+    git(repo_dir.path(), &["config", "user.name", "R"]);
+    std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
+    git(repo_dir.path(), &["add", "."]);
+    git(repo_dir.path(), &["commit", "-m", "init"]);
+
+    let wf_dir = repo_dir.path().join(".rk").join("workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(wf_dir.join("gated.cue"), GATED_WORKFLOW).unwrap();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_MODEL_MARKER", "unset");
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let started = client
+        .call(
+            "workflow.run",
+            json!({
+                "name": "gated",
+                "repo": repo_dir.path().to_string_lossy(),
+                "params": {"taskId": "gated-1"},
+            }),
+        )
+        .await
+        .unwrap();
+    let id = started["instance"]["id"].as_str().unwrap().to_string();
+
+    // Wait until the run parks at the approval gate (step index 3).
+    let mut parked = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = client
+            .call("workflow.status", json!({"name": id}))
+            .await
+            .unwrap();
+        let inst = &status["instance"];
+        assert_ne!(
+            inst["status"], "failed",
+            "run failed before the gate: {}",
+            inst["error"]
+        );
+        if inst["status"] == "running" && inst["current_step"] == 3 {
+            parked = true;
+            break;
+        }
+    }
+    assert!(parked, "workflow never parked at the approval gate");
+
+    // A human approves; the gate wakes and the run merges.
+    client
+        .call(
+            "workflow.approve",
+            json!({"instance": id, "approved": true, "by": "operator"}),
+        )
+        .await
+        .unwrap();
+
+    let mut completed = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = client
+            .call("workflow.status", json!({"name": id}))
+            .await
+            .unwrap();
+        match status["instance"]["status"].as_str().unwrap_or("") {
+            "completed" => {
+                completed = true;
+                break;
+            }
+            "failed" => panic!("workflow failed: {}", status["instance"]["error"]),
+            _ => {}
+        }
+    }
+    assert!(completed, "approved workflow did not complete");
+
+    let files = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir.path())
+        .args(["ls-tree", "--name-only", "main"])
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&files.stdout).to_string();
+    assert!(listing.contains("work-"), "merged work in main: {listing}");
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+/// Rejection fails the run at the `{approved: true}` evaluate; the branch is
+/// left unmerged (fail-closed veto).
+#[tokio::test]
+async fn approval_gate_rejection_leaves_branch_unmerged() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    git(repo_dir.path(), &["init", "-b", "main"]);
+    git(repo_dir.path(), &["config", "user.email", "r@x"]);
+    git(repo_dir.path(), &["config", "user.name", "R"]);
+    std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
+    git(repo_dir.path(), &["add", "."]);
+    git(repo_dir.path(), &["commit", "-m", "init"]);
+
+    let wf_dir = repo_dir.path().join(".rk").join("workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(wf_dir.join("gated.cue"), GATED_WORKFLOW).unwrap();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_MODEL_MARKER", "unset");
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let started = client
+        .call(
+            "workflow.run",
+            json!({
+                "name": "gated",
+                "repo": repo_dir.path().to_string_lossy(),
+                "params": {"taskId": "gated-2"},
+            }),
+        )
+        .await
+        .unwrap();
+    let id = started["instance"]["id"].as_str().unwrap().to_string();
+
+    let mut parked = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = client
+            .call("workflow.status", json!({"name": id}))
+            .await
+            .unwrap();
+        if status["instance"]["current_step"] == 3 && status["instance"]["status"] == "running" {
+            parked = true;
+            break;
+        }
+    }
+    assert!(parked, "workflow never parked at the approval gate");
+
+    client
+        .call(
+            "workflow.approve",
+            json!({"instance": id, "approved": false, "by": "operator", "reason": "not yet"}),
+        )
+        .await
+        .unwrap();
+
+    let mut failed = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = client
+            .call("workflow.status", json!({"name": id}))
+            .await
+            .unwrap();
+        match status["instance"]["status"].as_str().unwrap_or("") {
+            "failed" => {
+                failed = true;
+                break;
+            }
+            "completed" => panic!("rejected workflow should not complete"),
+            _ => {}
+        }
+    }
+    assert!(failed, "rejected workflow did not fail");
+
+    // The rat's work never reached main.
+    let files = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir.path())
+        .args(["ls-tree", "--name-only", "main"])
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&files.stdout).to_string();
+    assert!(
+        !listing.contains("work-"),
+        "rejected work must not merge: {listing}"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
