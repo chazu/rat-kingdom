@@ -121,13 +121,17 @@ impl Supervisor {
             None => repo.current_branch()?,
         };
 
-        let name = {
-            let registry = self.lock_registry();
-            rk_core::names::next_name(registry.names_in_use())
-        };
+        // Reserve the name atomically: it stays claimed against concurrent
+        // spawns until `insert` records the rat (or a failure path below frees
+        // it). Picking without reserving let two near-simultaneous spawns grab
+        // the same name and collide on the worktree path.
+        let name = self.lock_registry().reserve_name();
         let branch = agent_branch(&name, &params.task);
         let worktree = self.layout.worktrees_dir().join(&repo_name).join(&name);
-        repo.create_worktree(&worktree, &branch, &target_branch)?;
+        if let Err(e) = repo.create_worktree(&worktree, &branch, &target_branch) {
+            self.lock_registry().release_name(&name);
+            return Err(e);
+        }
 
         let harness_kind = params
             .harness
@@ -138,6 +142,7 @@ impl Supervisor {
             Err(e) => {
                 let _ = repo.remove_worktree(&worktree);
                 let _ = repo.delete_branch(&branch);
+                self.lock_registry().release_name(&name);
                 return Err(e);
             }
         };
@@ -192,6 +197,7 @@ impl Supervisor {
             Err(e) => {
                 let _ = repo.remove_worktree(&worktree);
                 let _ = repo.delete_branch(&branch);
+                self.lock_registry().release_name(&name);
                 return Err(e);
             }
         };
@@ -256,6 +262,7 @@ impl Supervisor {
         if !rk_mux::HerdrMux::available() {
             let _ = repo.remove_worktree(&worktree);
             let _ = repo.delete_branch(&branch);
+            self.lock_registry().release_name(&name);
             return Err(rk_core::Error::other(
                 "--attach needs a running herdr server (https://herdr.dev); \
                  spawn headless or start herdr first",
@@ -276,6 +283,7 @@ impl Supervisor {
             Err(e) => {
                 let _ = repo.remove_worktree(&worktree);
                 let _ = repo.delete_branch(&branch);
+                self.lock_registry().release_name(&name);
                 return Err(e);
             }
         };
