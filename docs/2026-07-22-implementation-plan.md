@@ -37,9 +37,25 @@
   REMAINING from P6: live multi-machine validation over a real remote,
   Take-op export wiring (consume replication), per-actor history compaction,
   Ed25519 castle identity (currently hostname).
-- **P5, P7 NOT STARTED; P3 herdr mux remaining.** P5 workflows (cuengine —
-  NOTE: needs Go toolchain in build, or `cue` CLI fallback), P7 steward/top/
-  polish.
+- **P5 CORE DONE (via `cue` CLI, decided over cuengine)** — rk-workflow:
+  top-level `workflow:` field validated against embedded schema.cue; `_input`
+  via CUE at load time, `{{ctx.*}}` at runtime; aspects with imp semantics;
+  evaluate = `cue eval -c` unification. Per-node models + layered agent
+  profiles (step > workflow agents.<name> > global [agents.<name>] > workflow
+  default > global default > [harness] default; unknown profile = error).
+  Daemon executor: spawn/wait/evaluate/dismiss/timer-gate, instance
+  persistence, `rk workflow run/list/status/defs`. E2E test green.
+  REMAINING from P5: human gates (approval tuples), sub-workflow step,
+  reactive triggers, restart recovery of running instances.
+- **P3 herdr mux DONE** — rk-mux (shell-out to herdr CLI): `rk spawn
+  --attach` runs the harness TUI in a herdr pane (prompt delivered on
+  herdr's idle report, completion via the rat's own `rk done` tuple, steer
+  through the pane, dismissal closes it); `rk attach <name>` execs into
+  `herdr agent attach`. Degrades cleanly when herdr is absent.
+  REMAINING: live interactive validation, herdr agent-status as secondary
+  liveness signal, notifications on blocked state.
+- **P7 NOT STARTED** — steward workflow, rk top, suggestion/endorsement
+  promotion, rk doctor, packaging.
 
 Known polish items: codex Completed.result sometimes empty (last agent_message
 not always present); `rk scan` positional args can't skip scope; consider
