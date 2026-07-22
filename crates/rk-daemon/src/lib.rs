@@ -4,9 +4,11 @@
 pub mod agents;
 pub mod client;
 pub mod proto;
+pub mod repos;
 pub mod server;
 pub mod supervisor;
 pub mod sync;
+pub mod tickets;
 pub mod workflow_exec;
 
 pub use client::{Client, WatchStream};

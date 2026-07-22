@@ -1,7 +1,9 @@
 //! `rk` — the rat-kingdom CLI.
 
 mod agent_cmds;
+mod repo_cmds;
 mod space_cmds;
+mod ticket_cmds;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -77,10 +79,74 @@ enum Command {
     },
     /// List castles seen in the shared tuplespace.
     Peers,
+    /// Register and inspect repositories the system knows about.
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
+    /// Create, inspect, and update tickets (durable work items).
+    Ticket {
+        #[command(subcommand)]
+        command: TicketCommand,
+    },
     /// Run and inspect CUE-defined workflows.
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepoCommand {
+    /// Register a repository (path is canonicalized; name defaults to its directory).
+    Add {
+        /// Path to the repository.
+        path: String,
+        /// Name to register it under (defaults to the directory name).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List registered repositories.
+    List,
+    /// Show one repository and its open tickets.
+    Show {
+        /// Registered repo name.
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TicketCommand {
+    /// File a new ticket.
+    New(ticket_cmds::NewArgs),
+    /// List tickets (filter by --repo, --status, --parent).
+    List(ticket_cmds::ListArgs),
+    /// Show one ticket and its sub-tickets.
+    Show {
+        /// Ticket id (e.g. TKT-12).
+        id: String,
+    },
+    /// Update a ticket's status or fields.
+    Update(ticket_cmds::UpdateArgs),
+    /// List open tickets whose dependencies are all satisfied (actionable now).
+    Ready {
+        /// Only tickets in this repo scope.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Declare that one ticket depends on (is blocked by) another.
+    Dep {
+        /// The blocked ticket.
+        id: String,
+        /// The ticket it depends on.
+        dep: String,
+    },
+    /// Remove a dependency edge.
+    Undep {
+        /// The blocked ticket.
+        id: String,
+        /// The dependency to remove.
+        dep: String,
     },
 }
 
@@ -311,6 +377,26 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Repo { command } => match command {
+            RepoCommand::Add { path, name } => {
+                repo_cmds::add(&layout, path, name, cli.json).await?
+            }
+            RepoCommand::List => repo_cmds::list(&layout, cli.json).await?,
+            RepoCommand::Show { name } => repo_cmds::show(&layout, name, cli.json).await?,
+        },
+        Command::Ticket { command } => match command {
+            TicketCommand::New(args) => ticket_cmds::new(&layout, args, cli.json).await?,
+            TicketCommand::List(args) => ticket_cmds::list(&layout, args, cli.json).await?,
+            TicketCommand::Show { id } => ticket_cmds::show(&layout, id, cli.json).await?,
+            TicketCommand::Update(args) => ticket_cmds::update(&layout, args, cli.json).await?,
+            TicketCommand::Ready { repo } => ticket_cmds::ready(&layout, repo, cli.json).await?,
+            TicketCommand::Dep { id, dep } => {
+                ticket_cmds::dep(&layout, id, dep, false, cli.json).await?
+            }
+            TicketCommand::Undep { id, dep } => {
+                ticket_cmds::dep(&layout, id, dep, true, cli.json).await?
+            }
+        },
     }
 
     Ok(())

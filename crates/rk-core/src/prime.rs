@@ -32,6 +32,21 @@ from the environment):
 - `rk done [\"summary\"]` — signal completion. MANDATORY final step.
 ";
 
+const FRAGMENT_TICKETS: &str = "\
+## Tickets: durable work items
+
+Follow-up work you discover but must NOT do yourself is recorded as a ticket,
+not started:
+
+- `rk ticket new \"<title>\" [--body \"...\"] [--repo <name>]` — file a work item.
+- `rk ticket new \"<title>\" --parent <TKT-id>` — decompose a ticket into sub-tickets.
+- `rk ticket list [--repo <name>] [--status open]` — read the backlog.
+- `rk ticket show <TKT-id>` — read one ticket and its sub-tickets.
+
+Filing or decomposing a ticket is how you hand work to the orchestrator. Never
+start a ticket yourself unless it is your assigned task.
+";
+
 const FRAGMENT_GIT_SAFETY: &str = "\
 ## Git safety
 
@@ -85,6 +100,8 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
             );
             out.push_str(FRAGMENT_SPACE);
             out.push('\n');
+            out.push_str(FRAGMENT_TICKETS);
+            out.push('\n');
             out.push_str(FRAGMENT_GIT_SAFETY);
             out.push('\n');
             out.push_str(FRAGMENT_COMPLETION);
@@ -93,6 +110,8 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
             out.push_str(FRAGMENT_SINGLE_TASK);
             out.push('\n');
             out.push_str(FRAGMENT_SPACE);
+            out.push('\n');
+            out.push_str(FRAGMENT_TICKETS);
             out.push('\n');
             out.push_str(FRAGMENT_GIT_SAFETY);
             out.push('\n');
@@ -122,6 +141,7 @@ mod tests {
         for needle in [
             "only your task",
             "Coordination: the tuplespace",
+            "Tickets: durable work items",
             "Git safety",
             "Completion protocol",
             "You are Whisker",
