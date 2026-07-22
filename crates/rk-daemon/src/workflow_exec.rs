@@ -10,7 +10,7 @@ use rk_core::tuple::{Category, Pattern};
 use rk_space::Space;
 use rk_workflow::{
     resolve::{resolve, resolve_fields},
-    AgentProfile, ForEachStep, Step, TicketQuery, WaitAllStep, Workflow,
+    AgentProfile, DismissAllStep, ForEachStep, Step, TicketQuery, WaitAllStep, Workflow,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -450,6 +450,14 @@ impl WorkflowEngine {
                     let summary = self.join(&ctx.fanout, wait_all).await?;
                     self.update(id, |i| i.context.previous_result = Some(summary.clone()));
                 }
+                Step::DismissAll(dismiss_all) => {
+                    let summary = self.dismiss_fanout(&ctx.fanout, dismiss_all).await?;
+                    self.update(id, |i| {
+                        i.context.previous_result = Some(summary.clone());
+                        // The fan-out set is spent once its branches are merged.
+                        i.context.fanout = Vec::new();
+                    });
+                }
             }
             Ok(Flow::Next)
         })
@@ -571,6 +579,72 @@ impl WorkflowEngine {
             "ok": ok,
             "errors": count - ok,
             "all_ok": ok == count,
+            "results": results,
+        }))
+    }
+
+    /// Dismiss every agent in the fan-out set in parallel — the fan-out
+    /// counterpart to a single `dismiss` over `active_agent`. Each agent is
+    /// merged (unless `no_merge`) and cleaned up concurrently, then the caller
+    /// clears the fan-out set. Aggregates into `{count, merged, errors,
+    /// all_merged, results}`. A hard dismiss failure (e.g. a git error — a
+    /// merge *conflict* is a clean `merged: false`, not an error) fails the
+    /// step, symmetric to how `wait_all` fails on a timeout.
+    async fn dismiss_fanout(
+        &self,
+        fanout: &[FannedAgent],
+        dismiss_all: &DismissAllStep,
+    ) -> rk_core::Result<Value> {
+        if fanout.is_empty() {
+            return Err(rk_core::Error::other(
+                "dismiss_all step with no fan-out agents (missing or empty for_each)",
+            ));
+        }
+        // Dismiss all branches concurrently: each dismissal kills its child and
+        // merges its branch independently, so serializing them would waste the
+        // whole point of a fan-out.
+        let mut set = tokio::task::JoinSet::new();
+        for fa in fanout {
+            let supervisor = Arc::clone(&self.supervisor);
+            let agent = fa.agent.clone();
+            let no_merge = dismiss_all.no_merge;
+            set.spawn(async move {
+                let outcome = supervisor.dismiss(&agent, no_merge).await;
+                (agent, outcome)
+            });
+        }
+        let count = fanout.len();
+        let mut results = Vec::with_capacity(count);
+        let mut merged = 0usize;
+        let mut failures = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            let (agent, outcome) = joined
+                .map_err(|e| rk_core::Error::other(format!("dismiss_all task join error: {e}")))?;
+            match outcome {
+                Ok(value) => {
+                    if value.get("merged").and_then(Value::as_bool) == Some(true) {
+                        merged += 1;
+                    }
+                    results.push(value);
+                }
+                Err(e) => {
+                    failures.push(format!("{agent}: {e}"));
+                    results.push(json!({"agent": agent, "error": e.to_string()}));
+                }
+            }
+        }
+        if !failures.is_empty() {
+            return Err(rk_core::Error::other(format!(
+                "dismiss_all failed for {} of {count} agents: {}",
+                failures.len(),
+                failures.join("; ")
+            )));
+        }
+        Ok(json!({
+            "count": count,
+            "merged": merged,
+            "errors": count - merged,
+            "all_merged": merged == count,
             "results": results,
         }))
     }
