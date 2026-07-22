@@ -31,22 +31,45 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    pub fn new(layout: Layout, castle: String, default_harness: String) -> rk_core::Result<Self> {
+    pub fn new(
+        layout: Layout,
+        castle: String,
+        default_harness: String,
+        budget: rk_ledger::Budget,
+    ) -> rk_core::Result<Self> {
         layout.ensure()?;
         let space = Space::open(&layout.db_path())?;
-        Self::with_space(layout, castle, default_harness, space)
+        Self::with_space(layout, castle, default_harness, budget, space)
     }
 
     #[doc(hidden)]
     pub fn new_in_memory(layout: Layout, castle: String) -> rk_core::Result<Self> {
         let space = Space::open_in_memory()?;
-        Self::with_space(layout, castle, "fake".into(), space)
+        Self::with_space(
+            layout,
+            castle,
+            "fake".into(),
+            rk_ledger::Budget::default(),
+            space,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn with_space_for_tests(
+        layout: Layout,
+        castle: String,
+        default_harness: String,
+        budget: rk_ledger::Budget,
+        space: Space,
+    ) -> rk_core::Result<Self> {
+        Self::with_space(layout, castle, default_harness, budget, space)
     }
 
     fn with_space(
         layout: Layout,
         castle: String,
         default_harness: String,
+        budget: rk_ledger::Budget,
         space: Space,
     ) -> rk_core::Result<Self> {
         layout.ensure()?;
@@ -54,6 +77,7 @@ impl Daemon {
             layout.clone(),
             castle.clone(),
             default_harness,
+            budget,
             space.clone(),
         )?);
         let (shutdown_tx, _) = watch::channel(false);

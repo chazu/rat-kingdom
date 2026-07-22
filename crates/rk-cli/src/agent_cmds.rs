@@ -222,3 +222,64 @@ pub async fn respawn(layout: &Layout, args: NameArg, as_json: bool) -> Result<()
     }
     Ok(())
 }
+
+pub async fn cost(layout: &Layout, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client.call("agent.list", json!({})).await?;
+    let agents = result["agents"].as_array().cloned().unwrap_or_default();
+    let mut total_tokens_all = 0u64;
+    let mut total_cost = 0.0f64;
+    let mut rows = Vec::new();
+    for a in &agents {
+        let tokens = total_tokens(&a["usage"]);
+        let cost = a["cost_usd"].as_f64().unwrap_or(0.0);
+        total_tokens_all += tokens;
+        total_cost += cost;
+        rows.push(json!({
+            "agent": a["name"],
+            "harness": a["harness"],
+            "model": a["model"],
+            "task": a["task"],
+            "state": a["state"],
+            "tokens": tokens,
+            "usage": a["usage"],
+            "cost_usd": cost,
+        }));
+    }
+    if as_json {
+        println!(
+            "{}",
+            json!({"agents": rows, "total_tokens": total_tokens_all, "total_cost_usd": total_cost})
+        );
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("(no agents)");
+        return Ok(());
+    }
+    println!(
+        "{:<12} {:<8} {:<14} {:<10} {:>12} {:>10}",
+        "AGENT", "HARNESS", "TASK", "STATE", "TOKENS", "COST"
+    );
+    for r in &rows {
+        println!(
+            "{:<12} {:<8} {:<14} {:<10} {:>12} {:>10}",
+            r["agent"].as_str().unwrap_or("?"),
+            r["harness"].as_str().unwrap_or("?"),
+            r["task"].as_str().unwrap_or("-"),
+            r["state"].as_str().unwrap_or("?"),
+            r["tokens"].as_u64().unwrap_or(0),
+            format!("${:.4}", r["cost_usd"].as_f64().unwrap_or(0.0)),
+        );
+    }
+    println!(
+        "{:<12} {:<8} {:<14} {:<10} {:>12} {:>10}",
+        "TOTAL",
+        "",
+        "",
+        "",
+        total_tokens_all,
+        format!("${total_cost:.4}")
+    );
+    Ok(())
+}

@@ -33,6 +33,10 @@ pub struct AgentRecord {
     pub name: String,
     pub role: String,
     pub harness: String,
+    /// Model requested at spawn (None = harness default; pricing then relies
+    /// on harness-reported cost only).
+    #[serde(default)]
+    pub model: Option<String>,
     pub repo_root: PathBuf,
     pub repo_name: String,
     pub task: Option<String>,
@@ -149,6 +153,7 @@ mod tests {
             name: name.into(),
             role: "rat".into(),
             harness: "fake".into(),
+            model: None,
             repo_root: "/tmp/repo".into(),
             repo_name: "repo".into(),
             task: Some(".rk-1".into()),

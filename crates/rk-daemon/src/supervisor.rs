@@ -9,6 +9,8 @@ use rk_core::prime::{render, PrimeContext};
 use rk_core::tuple::{Category, Tuple};
 use rk_git::{agent_branch, Repo};
 use rk_harness::{make_harness, HarnessEvent, LaunchSpec, SessionControl, TokenUsage};
+use rk_ledger::pricing::PricingTable;
+use rk_ledger::{Budget, BudgetAction};
 use rk_space::Space;
 use serde::Deserialize;
 use serde_json::json;
@@ -54,6 +56,10 @@ pub struct Supervisor {
     /// Live control handles (not persisted; gone after restart).
     controls: Mutex<HashMap<String, SessionControl>>,
     space: Space,
+    pricing: PricingTable,
+    budget: Budget,
+    /// Agents already warned about budget (avoid repeat warnings).
+    budget_warned: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Supervisor {
@@ -61,9 +67,19 @@ impl Supervisor {
         layout: Layout,
         castle: String,
         default_harness: String,
+        budget: Budget,
         space: Space,
     ) -> rk_core::Result<Self> {
         let registry = Registry::load(&layout.home().join("agents.json"))?;
+        let mut pricing = PricingTable::vendored();
+        // User/runtime overrides, LiteLLM-shaped.
+        let overrides = layout.home().join("pricing.json");
+        if let Ok(json) = std::fs::read_to_string(&overrides) {
+            match pricing.merge_pricing_json(&json) {
+                Ok(n) => tracing::info!(entries = n, "merged pricing overrides"),
+                Err(e) => warn!(error = %e, "invalid pricing.json ignored"),
+            }
+        }
         Ok(Self {
             layout,
             castle,
@@ -71,6 +87,9 @@ impl Supervisor {
             registry: Mutex::new(registry),
             controls: Mutex::new(HashMap::new()),
             space,
+            pricing,
+            budget,
+            budget_warned: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -162,6 +181,7 @@ impl Supervisor {
             name: name.clone(),
             role: params.role.clone(),
             harness: harness_kind,
+            model: params.model.clone(),
             repo_root: repo.root().to_path_buf(),
             repo_name: repo_name.clone(),
             task: Some(params.task.clone()),
@@ -286,9 +306,19 @@ impl Supervisor {
                 });
             }
             HarnessEvent::Usage { usage } => {
-                let _ = self.lock_registry().update(name, |r| {
+                let updated = self.lock_registry().update(name, |r| {
                     r.usage.add(&usage);
+                    // Incremental cost for harnesses that don't self-report
+                    // USD; an authoritative Completed cost overwrites later.
+                    if let Some(model) = &r.model {
+                        if let Some(price) = self.pricing.lookup(model) {
+                            r.cost_usd += price.cost(&usage);
+                        }
+                    }
                 });
+                if let Ok(Some(record)) = updated {
+                    self.enforce_budget(&record);
+                }
             }
             HarnessEvent::Completed {
                 result,
@@ -334,6 +364,71 @@ impl Supervisor {
             HarnessEvent::AssistantText { .. }
             | HarnessEvent::ToolUse { .. }
             | HarnessEvent::Retry { .. } => {}
+        }
+    }
+
+    /// Graduated budget policy: warn once at the threshold (obstacle tuple +
+    /// steer when possible), hard-stop at the cap.
+    fn enforce_budget(self: &Arc<Self>, record: &AgentRecord) {
+        match self.budget.check(record.cost_usd, record.usage.total()) {
+            BudgetAction::Ok => {}
+            BudgetAction::Warn => {
+                if !self.mark_budget_warned(&record.name) {
+                    return; // already warned
+                }
+                warn!(agent = %record.name, cost = record.cost_usd, "budget warning threshold crossed");
+                self.emit_obstacle_for_budget(record, "warning");
+                let control = self.lock_controls().get(&record.name).cloned();
+                let name = record.name.clone();
+                if let Some(control) = control {
+                    tokio::spawn(async move {
+                        let _ = control
+                            .steer(&format!(
+                                "BUDGET WARNING for {name}: you are approaching your \
+                                 token/cost cap. Wrap up: commit what you have and run \
+                                 `rk done` now."
+                            ))
+                            .await;
+                    });
+                }
+            }
+            BudgetAction::Stop => {
+                warn!(agent = %record.name, cost = record.cost_usd, tokens = record.usage.total(), "budget cap hit — stopping agent");
+                self.emit_obstacle_for_budget(record, "exceeded");
+                let control = self.lock_controls().remove(&record.name);
+                if let Some(control) = control {
+                    tokio::spawn(async move {
+                        let _ = control.kill().await;
+                    });
+                }
+            }
+        }
+    }
+
+    /// Returns true if this call newly marked the agent (first warning).
+    fn mark_budget_warned(&self, name: &str) -> bool {
+        match self.budget_warned.lock() {
+            Ok(mut set) => set.insert(name.to_string()),
+            Err(p) => p.into_inner().insert(name.to_string()),
+        }
+    }
+
+    fn emit_obstacle_for_budget(&self, record: &AgentRecord, kind: &str) {
+        let tuple = Tuple::new(
+            Category::Obstacle,
+            record.repo_name.clone(),
+            record.name.clone(),
+            self.castle.clone(),
+            json!({
+                "type": format!("budget_{kind}"),
+                "agent": record.name,
+                "task": record.task,
+                "cost_usd": record.cost_usd,
+                "tokens": record.usage.total(),
+            }),
+        );
+        if let Err(e) = self.space.out(tuple) {
+            warn!(error = %e, "failed to emit budget obstacle");
         }
     }
 

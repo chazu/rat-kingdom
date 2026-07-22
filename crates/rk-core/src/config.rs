@@ -12,6 +12,27 @@ pub struct Config {
     pub castle_name: Option<String>,
     pub log: LogConfig,
     pub harness: HarnessConfig,
+    pub budget: BudgetConfig,
+}
+
+/// Per-agent budget caps. Zero = unlimited.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct BudgetConfig {
+    pub max_usd: f64,
+    pub max_tokens: u64,
+    /// Fraction of a cap at which the warning fires.
+    pub warn_at: f64,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_usd: 0.0,
+            max_tokens: 0,
+            warn_at: 0.8,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

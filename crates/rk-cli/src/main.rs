@@ -66,6 +66,8 @@ enum Command {
     Dismiss(agent_cmds::DismissArgs),
     /// Relaunch a failed/orphaned agent in its preserved worktree.
     Respawn(agent_cmds::NameArg),
+    /// Per-agent and fleet token/cost rollup.
+    Cost,
 }
 
 #[derive(Subcommand)]
@@ -107,9 +109,19 @@ async fn main() -> Result<()> {
         }
         Command::Daemon { command } => match command {
             DaemonCommand::Run => {
-                Daemon::new(layout, config.castle_name(), config.harness.default.clone())?
-                    .run()
-                    .await?;
+                let budget = rk_ledger::Budget {
+                    max_usd: config.budget.max_usd,
+                    max_tokens: config.budget.max_tokens,
+                    warn_at: config.budget.warn_at,
+                };
+                Daemon::new(
+                    layout,
+                    config.castle_name(),
+                    config.harness.default.clone(),
+                    budget,
+                )?
+                .run()
+                .await?;
             }
             DaemonCommand::Status => match Client::connect(&layout).await {
                 Ok(mut client) => {
@@ -170,6 +182,7 @@ async fn main() -> Result<()> {
         Command::Interrupt(args) => agent_cmds::interrupt(&layout, args, cli.json).await?,
         Command::Dismiss(args) => agent_cmds::dismiss(&layout, args, cli.json).await?,
         Command::Respawn(args) => agent_cmds::respawn(&layout, args, cli.json).await?,
+        Command::Cost => agent_cmds::cost(&layout, cli.json).await?,
     }
 
     Ok(())
