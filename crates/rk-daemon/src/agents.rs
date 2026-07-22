@@ -1,7 +1,7 @@
 //! Agent registry: the supervision tree as first-class data.
 //!
 //! Every record carries its `parent` (the spawner) — completion routing walks
-//! this structure, never payload fields (imp's foreman-routing lesson).
+//! this structure, never payload fields (the predecessor's foreman-routing lesson).
 
 use chrono::{DateTime, Utc};
 use rk_harness::TokenUsage;

@@ -1,7 +1,7 @@
 //! Priming: role instructions composed from shared fragments.
 //!
 //! One source of truth per concern — command syntax, completion protocol, git
-//! safety — composed per role. No per-role copies to drift (imp's
+//! safety — composed per role. No per-role copies to drift (the predecessor's
 //! priming-consistency lesson), and the rendered result is delivered via the
 //! harness's system-prompt channel, never typed into a terminal.
 

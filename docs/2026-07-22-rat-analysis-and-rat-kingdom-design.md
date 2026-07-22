@@ -1,27 +1,27 @@
-# imp Analysis & rat-kingdom Design Research
+# Predecessor Analysis & rat-kingdom Design Research
 
-Date: 2026-07-22. Sources: full code walk of ~/.imp (Go, ~44.7k LOC), its `.ai/research` +
+Date: 2026-07-22. Sources: full code walk of the predecessor harness (Go, ~44.7k LOC), its `.ai/research` +
 `docs/` corpus, local ground truth on installed CLIs (claude 2.1.217, codex 0.144.6,
 herdr 0.7.4), and web research on harness automation surfaces, git-notes coordination,
 and the mid-2026 Rust ecosystem. Citations inline.
 
 ---
 
-## 1. What imp is and how it actually works
+## 1. What the predecessor is and how it actually works
 
-imp is a multi-agent orchestration harness: a single daemon + CLI that spawns AI coding
+The predecessor is a multi-agent orchestration harness: a single daemon + CLI that spawns AI coding
 agents into tmux sessions, isolates each in a git worktree, and coordinates them
 stigmergically through a Linda-style tuplespace ("BBS").
 
 **Mechanism summary (verified in code):**
 
-- **Roles**: king, imp, reviewer, merge-handler, foreman, steward. King/steward are
+- **Roles**: king, worker, reviewer, merge-handler, foreman, steward. King/steward are
   global singletons (no worktree); everything else gets branch `agent/{name}/{taskID}`
-  and worktree `~/.imp-castle/worktrees/<repo>/<agent>` (`internal/agent/agent.go:169`).
+  and a per-agent worktree under the castle root (`internal/agent/agent.go:169`).
 - **Spawn**: create worktree → install anti-main-commit hook → `tmux new-session -e`
-  with `IMP_*` env + OTLP env → *type* the harness command into the shell
+  with the predecessor's env vars + OTLP env → *type* the harness command into the shell
   (`tmux send-keys`) → poll pane text for Claude's `❯` prompt → type
-  `run "imp prime" for instructions` → type "Begin working now".
+  the prime command → type "Begin working now".
 - **Harness invocation**: a single config string, default
   `auggie -w {{workspace}} --allow-indexing` (`internal/config/config.go:16`). No
   process abstraction, no argv, no readiness abstraction — the readiness probe is
@@ -42,20 +42,20 @@ stigmergically through a Linda-style tuplespace ("BBS").
   earliest-`claimed_at`-wins with a revocation message to the loser.
 - **Telemetry**: the daemon embeds an OTLP receiver (4317/4318) → DuckDB/Parquet. Spawn
   sets `OTEL_EXPORTER_OTLP_ENDPOINT` etc. so an OTel-aware harness reports tokens/cost.
-  imp itself computes no cost and enforces no budgets.
+  The predecessor itself computes no cost and enforces no budgets.
 
 **Scope by package (non-test LOC)**: cli 7.4k, bbs 7.4k, workflow 3.1k, daemon 3.0k,
 telemetry/otel 2.0k, onboard 1.6k, agent 1.4k, hub 1.0k, remainder ~3k.
 
 ## 2. Where comms fall over (the loose ends)
 
-From code inspection and imp's own post-mortem research docs:
+From code inspection and the predecessor's own post-mortem research docs:
 
 1. **Keystroke injection is the only channel into a live agent.** No ack; `delivered=true`
    means "we typed it," not "the agent saw it." Blind to TUI state (permission dialogs,
    sub-prompts, mid-render). Single biggest fragility.
 2. **Timing hacks as synchronization**: 500ms text→Enter sleep, 5s post-ready settle,
-   60s `IMP_STARTUP_DELAY` fallback, 10s poll floor on every message.
+   60s startup-delay fallback, 10s poll floor on every message.
 3. **Claude-specific readiness probe vs. configurable harness** — priming mis-times on
    any non-Claude CLI (falls back to the 60s sleep and can inject before the agent
    listens).
@@ -72,7 +72,7 @@ From code inspection and imp's own post-mortem research docs:
    lineage is a hand-copied payload field the sugar command doesn't even emit
    (`.ai/research/2026-04-06-foreman-worker-notification-routing`). Race: king dismisses
    a worker before its foreman integrates the branch.
-6. **Prompt-discipline failures**: imps claim second tasks because the priming template
+6. **Prompt-discipline failures**: workers claim second tasks because the priming template
    both forbids it and teaches the claim loop; 8 drifted templates with inconsistent
    command syntax, invalid tracker statuses, and a regex-based "communication section
    replacer" that can mangle a reviewer's structured output.
@@ -86,7 +86,7 @@ From code inspection and imp's own post-mortem research docs:
 keystrokes) where a protocol should be, (b) a hand-rolled concurrency primitive over a
 database, or (c) discipline encoded in prose instead of structure.
 
-## 3. What imp got right (keep these)
+## 3. What the predecessor got right (keep these)
 
 - **The tuplespace model itself**: fixed `(category, scope, identity)` prefix, small
   category vocabulary with an epistemic hierarchy (fact > convention > artifact > claim >
@@ -94,7 +94,7 @@ database, or (c) discipline encoded in prose instead of structure.
   isolation boundary, always-loaded `system` scope, "prime the space, not the agent."
 - **Reactive daemon triggers over polling agents**: deterministic dispatch table fires
   workflows on tuple writes — zero tokens, zero latency, can't be broken by an agent
-  deviating from protocol. imp's own docs call this the reliability win.
+  deviating from protocol. The predecessor's own docs call this the reliability win.
 - **Schema-enforcing sugar commands** (`task-done`, `obstacle`, `escalate`) that
   auto-fill identity from env — "the strongest defense against BBS noise."
 - **Steward pattern**: offload routine triage (fetch branch, test, auto-dismiss or
@@ -170,7 +170,7 @@ Normalized capability matrix:
 | Amp | stream-json | stream-json | stdin msg | signal | `threads continue` | per-msg | no |
 
 Completion detection becomes structural (a `result`/`turn.completed` event or process
-exit), replacing imp's pane-scraping and `session_activity` heuristics entirely.
+exit), replacing the predecessor's pane-scraping and `session_activity` heuristics entirely.
 Human attach remains available by running these processes under herdr (§7).
 
 ## 5. Cost tracking and token budgets
@@ -190,7 +190,7 @@ Human attach remains available by running these processes under herdr (§7).
 `llm-pricing` and `ccost` crates exist as references. Formula:
 `(input − cached) × in_price + cached × cache_read_price + output × out_price`.
 
-**Budget enforcement design** (imp designed this but never wired it — two config bugs
+**Budget enforcement design** (the predecessor designed this but never wired it — two config bugs
 left it inert; see `.ai/plans/otlp-token-metrics-feedback-loop.md`):
 - Ledger table keyed by (agent, task, session): tokens by class, computed USD, updated
   from live Usage events — not from a 5-min poll.
@@ -199,11 +199,11 @@ left it inert; see `.ai/plans/otlp-token-metrics-feedback-loop.md`):
 - Burn-rate is a better stuck/spinning signal than terminal activity; combine with
   harness state (herdr's idle/working/blocked) instead of tmux `session_activity`.
 - Write the ledger summary back into the tuplespace as `fact` tuples so coordinators
-  see per-agent burn in-context (imp's good idea, kept).
+  see per-agent burn in-context (the predecessor's good idea, kept).
 
 ## 6. Git notes for asynchronous multi-castle coordination
 
-This replaces imp's bbs-sync orphan branch + custom NDJSON merge driver + after-the-fact
+This replaces the predecessor's bbs-sync orphan branch + custom NDJSON merge driver + after-the-fact
 claim resolution. The prior art (git-appraise, git-bug, Gerrit NoteDb, Radicle COBs)
 converges on one pattern:
 
@@ -220,13 +220,13 @@ converges on one pattern:
    mirror+prune — `fetch --prune` with a mirroring notes refspec deletes local notes)
    and materialize a local view: union all actors' records, resolve conflicts at the
    application layer (LWW by timestamp, or claim-arbitration deterministically by
-   (timestamp, actor-id) — same rule imp used, but now computed identically by every
+   (timestamp, actor-id) — same rule the predecessor used, but now computed identically by every
    reader with no revocation messages needed for the common case).
 4. Anchoring: notes naturally annotate commits — perfect for "review of commit C,"
    "task X completed at commit C," CI verdicts. Free-standing tuples (tasks, claims,
    obstacles) can annotate a well-known anchor object per scope, or use git-bug-style
    per-entity operation chains under `refs/rk/` instead of notes proper.
-5. Ephemeral tuples (heartbeats, signals) stay **out of git** entirely (imp's NDJSON
+5. Ephemeral tuples (heartbeats, signals) stay **out of git** entirely (the predecessor's NDJSON
    design learned this — write amplification); they live only in the local daemon.
 6. Compaction: periodic squash of old note history per actor ref; prune dead actors.
 
@@ -241,7 +241,7 @@ Semantics consequence: the tuplespace becomes **local-first with eventual conver
 Local operations (in/rd/out/scan, blocking waiters) run against the local store at full
 speed; the git layer is a replication transport. Destructive `in` across castles is
 modeled as a claim record + deterministic arbitration (a true distributed atomic take is
-impossible over async git sync anyway — imp's earliest-wins policy was correct, just
+impossible over async git sync anyway — the predecessor's earliest-wins policy was correct, just
 delivered over the wrong channel).
 
 ## 7. herdr vs tmux — verdict: use herdr
@@ -250,7 +250,7 @@ herdr (herdr.dev, ~19.4k★, Rust, v0.7.x, AGPL-3.0 + commercial) is a terminal 
 manager built *specifically* for AI coding agents. Verified locally (0.7.4 installed,
 server running, protocol 16):
 
-| Need (imp's tmux pain) | tmux | herdr |
+| Need (the predecessor's tmux pain) | tmux | herdr |
 |---|---|---|
 | Inject input | `send-keys` + sleeps | `pane.send_text/send_keys`, atomic `pane run`, `agent prompt --wait` |
 | Read output | `capture-pane` scraping | `pane.read` (visible/recent/unwrapped), read-only stream attach |
@@ -261,7 +261,7 @@ server running, protocol 16):
 | Session file discovery | none | integrations report `agent-session-id`/`agent-session-path` → direct handle to the harness JSONL for cost backfill |
 | Remote | ssh+tmux | `--remote <ssh-target>`, named sessions |
 
-The `pane report-agent` / session-path mechanism directly solves imp's two hardest
+The `pane report-agent` / session-path mechanism directly solves the predecessor's two hardest
 problems (activity detection and notification timing), and the socket API replaces every
 `send-keys` sleep with a request/response + event subscription.
 
@@ -288,13 +288,13 @@ implementation; or degrade to headless-only (no attach surface) via portable-pty
 | CLI | clap 4 (derive) | uncontested |
 | TUI (dashboard) | ratatui | + `tui-term` if embedding panes; largely obviated by herdr |
 | Git | git2 + system-git for notes-merge/push; gix later | gix lacks notes & push (verified in crate-status) |
-| Storage | rusqlite (bundled) | one store; WAL; `DELETE..RETURNING` for atomic `in()`. Skip DuckDB/Parquet tier (imp's own audit: never used). redb only if SQL proves unnecessary |
+| Storage | rusqlite (bundled) | one store; WAL; `DELETE..RETURNING` for atomic `in()`. Skip DuckDB/Parquet tier (the predecessor's own audit: never used). redb only if SQL proves unnecessary |
 | Serialization | serde + serde_json, NDJSON everywhere | same record shape for socket framing and git-notes lines |
 | PTY (fallback path) | portable-pty | wezterm's, battle-tested, pre-1.0 — pin |
 | IPC | tokio UnixListener (or `interprocess` if Windows matters) | NDJSON-over-UDS, same shape as herdr's protocol |
 | Config | figment + toml | layered file/env/CLI |
 | Telemetry | tracing + tracing-opentelemetry; optional OTLP receiver via opentelemetry-rust/tonic | isolate behind a facade — OTel-rust metrics still churn |
-| Workflow definitions | **CUE via cuengine** (decided 2026-07-22) | keep imp's CUE form factor; see §9a. cuengine = FFI over the Go evaluator (v0.40.x, active, AGPL-3.0, Go toolchain in build). Fallback for unification-style checks: temp-package trick or `cue` CLI shell-out |
+| Workflow definitions | **CUE via cuengine** (decided 2026-07-22) | keep the predecessor's CUE form factor; see §9a. cuengine = FFI over the Go evaluator (v0.40.x, active, AGPL-3.0, Go toolchain in build). Fallback for unification-style checks: temp-package trick or `cue` CLI shell-out |
 | Schema/validation (internal) | serde types + schemars/jsonschema | for tuple payloads and IPC, not workflows |
 | Pricing | vendored LiteLLM model-prices JSON + runtime refresh | `llm-pricing`/`ccost` as references |
 | Daemon | tmux-style lazy spawn (client starts detached server on connect-fail) + shipped launchd/systemd units | don't double-fork daemonize |
@@ -325,18 +325,18 @@ rat-kingdom (workspace)
 └── rk-cli         clap front end + sugar commands (typed, env-autofilled)
 ```
 
-### 9a. Workflow engine: imp's CUE form factor, kept (decided 2026-07-22)
+### 9a. Workflow engine: the predecessor's CUE form factor, kept (decided 2026-07-22)
 
-rat-kingdom mimics imp's workflow layout — CUE definitions, the aspect system, and
-reactive triggers — using **cuengine** for evaluation. imp's workflows need not port
+rat-kingdom mimics the predecessor's workflow layout — CUE definitions, the aspect system, and
+reactive triggers — using **cuengine** for evaluation. The predecessor's workflows need not port
 over verbatim; it's the form factor we're keeping.
 
-The layout being mimicked (from `~/.imp/internal/workflow/schema.cue`, `types.go`,
+The layout being mimicked (from the predecessor repo's `internal/workflow/schema.cue`, `types.go`,
 `loader.go:590`):
 
 - **One workflow per `.cue` file**, validated by unification against a `#Workflow`
   schema in the same CUE package. Discovery: global dir (`~/.rat-kingdom/workflows/`)
-  overridden by per-repo dir. Always re-read from disk (imp's no-cache choice — keep).
+  overridden by per-repo dir. Always re-read from disk (the predecessor's no-cache choice — keep).
 - **`_input` / `_ctx` context model**: `_input.*` = declared params (`#Param`:
   type/required/default); `_ctx.*` = implicit execution context threaded through steps
   (`taskId`, `activeAgent`, `activeBranch`, `activeRepo`, `previousOutput`) so steps
@@ -348,16 +348,16 @@ The layout being mimicked (from `~/.imp/internal/workflow/schema.cue`, `types.go
 - **Aspects — load-time AOP weaving** (`#Aspect`): `match` {step type, name glob,
   spawn role — AND semantics} + `before`/`after` step lists. Applied as a pure
   transformation of the step list at load time, in declaration order, first aspect
-  innermost (imp's `expandAspects`). This stays a plain Rust function over the parsed
+  innermost (the predecessor's `expandAspects`). This stays a plain Rust function over the parsed
   step list — CUE defines aspects; Rust weaves them. Injected steps are ordinary steps
   afterward (visible in `workflow status`, timed, recoverable).
 - **Triggers in CUE** (`#Trigger`): exact `{category, identity}` tuple match +
   agent/scope excludes → workflow name + params templated from payload fields.
-  Same reactive dispatch table as imp, fed by rk-space's out() hook.
+  Same reactive dispatch table as the predecessor, fed by rk-space's out() hook.
 
 **Evaluation pipeline**: cuengine evaluates the workflow *package* (schema + user
 files) → JSON export → serde into typed step configs. Schema violations surface as
-CUE unification errors at load, exactly like imp.
+CUE unification errors at load, exactly like the predecessor.
 
 **Known constraint**: cuengine exposes package/module evaluation only — no
 string-eval or `unify` primitive. Two places need unification at *runtime*:
@@ -368,7 +368,7 @@ string-eval or `unify` primitive. Two places need unification at *runtime*:
    evaluate it with cuengine; error or non-concrete result = step failure.
 2. **Param interpolation** (`_input`/`_ctx` references inside step configs): resolve
    the same way — inject a generated `context.cue` carrying `_input`/`_ctx` values
-   into the evaluation package, so CUE itself performs interpolation (imp resolves
+   into the evaluation package, so CUE itself performs interpolation (the predecessor resolves
    `_ctx` in Go with string templates; letting CUE do it is cleaner and gets
    defaults/constraints for free).
 
@@ -379,7 +379,7 @@ Apache-2.0) which does expose compile/unify primitives but is younger.
 License note: cuengine is AGPL-3.0-or-later and statically links; fine for a
 personal/internal tool, revisit if rat-kingdom is ever distributed.
 
-Design commitments distilled from imp's lessons:
+Design commitments distilled from the predecessor's lessons:
 1. **Protocol, not keystrokes** — all agent I/O via harness event streams; terminal is
    for humans.
 2. **One critical section for out+index+wake; one predicate for match** — eliminate the
@@ -400,7 +400,7 @@ Design commitments distilled from imp's lessons:
 
 - Notes-on-anchor-objects vs. git-bug-style per-entity refs for free-standing tuples
   (leaning: per-entity refs under `refs/rk/`; notes proper for commit-anchored facts).
-- ~~How much of imp's workflow engine to carry~~ **Decided**: keep imp's CUE form
+- ~~How much of the predecessor's workflow engine to carry~~ **Decided**: keep the predecessor's CUE form
   factor (schema, aspects, triggers) via cuengine — see §9a. Remaining sub-question:
   temp-package unification vs. `cue` CLI shell-out for the evaluate step (prototype
   both, pick by ergonomics/latency).

@@ -5,7 +5,7 @@
 //! substring `LIKE` over that text — byte-for-byte the same haystack that
 //! [`rk_core::tuple::Pattern::matches`] uses in memory. Do not "optimize" this
 //! into FTS tokenization: divergent predicates between the storage query and
-//! the waiter wake path are how imp lost wakeups.
+//! the waiter wake path are how the predecessor lost wakeups.
 
 use chrono::{DateTime, Utc};
 use rk_core::id::RecordId;

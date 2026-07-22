@@ -169,7 +169,7 @@ pub struct Pattern {
     pub instance: Option<String>,
     /// Substring/FTS search over the serialized payload.
     ///
-    /// INVARIANT (the imp lesson): every code path that decides whether a tuple
+    /// INVARIANT (the predecessor's lesson): every code path that decides whether a tuple
     /// matches a waiting reader MUST use [`Pattern::matches`], which includes
     /// this field. There is no "cheap" prefix-only match anywhere.
     #[serde(skip_serializing_if = "Option::is_none")]

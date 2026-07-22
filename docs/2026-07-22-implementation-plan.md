@@ -39,7 +39,7 @@
   Ed25519 castle identity (currently hostname).
 - **P5 CORE DONE (via `cue` CLI, decided over cuengine)** — rk-workflow:
   top-level `workflow:` field validated against embedded schema.cue; `_input`
-  via CUE at load time, `{{ctx.*}}` at runtime; aspects with imp semantics;
+  via CUE at load time, `{{ctx.*}}` at runtime; aspects with the predecessor's semantics;
   evaluate = `cue eval -c` unification. Per-node models + layered agent
   profiles (step > workflow agents.<name> > global [agents.<name>] > workflow
   default > global default > [harness] default; unknown profile = error).
@@ -61,13 +61,13 @@ Known polish items: codex Completed.result sometimes empty (last agent_message
 not always present); `rk scan` positional args can't skip scope; consider
 `--allowedTools` support for tighter-than-bypass Claude spawns.
 
-Companion to `2026-07-22-imp-analysis-and-rat-kingdom-design.md`. Phases are
+Companion to `2026-07-22-rat-analysis-and-rat-kingdom-design.md`. Phases are
 tracer-bullet vertical slices: each ends with something runnable and useful on its
 own, and each de-risks the next. Crate names refer to the workspace layout in §9 of
 the design doc.
 
 Ordering rationale: the tuplespace is the substrate everything writes to, so it goes
-first and gets the concurrency treatment imp never had. One harness end-to-end beats
+first and gets the concurrency treatment the predecessor never had. One harness end-to-end beats
 three harnesses half-wired, so Claude Code alone carries Phase 2. Cost tracking lands
 before workflows because the ledger only needs harness events, while workflows need
 everything. Multiplayer sync is deliberately late — it's the most novel work and
@@ -116,7 +116,7 @@ machine; CI green.
    critical section**; `in` via `DELETE ... RETURNING`; furniture rejects `in`.
 3. Waiter registry: blocked `in`/`rd` register a predicate; **the wake path
    evaluates the exact same predicate the reader blocks on** (including payload
-   search). Re-check after registration. This kills imp's lost-wakeup class.
+   search). Re-check after registration. This kills the predecessor's lost-wakeup class.
 4. Property tests (proptest/loom-style): N writers × M blocked readers, assert no
    lost wakeups, no double-consume of `in`, under randomized interleavings.
 5. Wire protocol: NDJSON ops on the daemon socket; `rk-cli` subcommands; `--json`
@@ -164,7 +164,7 @@ malformed payloads.
    worktree, branch, task, **parent**), spawn tree as first-class data.
    Completion events route to the spawner by structure.
 6. Session resume: persist session_id; `rk respawn <agent>` uses `--resume` with
-   a continuation message (actually delivered, unlike imp).
+   a continuation message (actually delivered, unlike the predecessor).
 7. Directed-agent capability gating: a spawned-for-task agent's sugar toolset
    excludes claim; single-task discipline is structural.
 
@@ -235,7 +235,7 @@ hand back control.
 5. Offline backfill parsers: `~/.claude/projects/**/*.jsonl` and
    `$CODEX_HOME/sessions/**.jsonl` (`rk cost import`) for sessions run outside
    rat-kingdom.
-6. Attribute-key schema tests (imp's telemetry died of key drift — pin and test).
+6. Attribute-key schema tests (the predecessor's telemetry died of key drift — pin and test).
 
 **Exit criteria**: a deliberately runaway prompt gets warned, steered, then killed
 at the configured cap; `rk cost` matches the harness's own self-reported totals
@@ -246,7 +246,7 @@ within rounding.
 ## Phase 5 — Workflows & reactive triggers (rk-workflow)
 
 **Top-line features**
-- CUE-defined workflows in imp's form factor: `#Workflow` schema, `_input`/`_ctx`,
+- CUE-defined workflows in the predecessor's form factor: `#Workflow` schema, `_input`/`_ctx`,
   spawn/wait/evaluate/dismiss/gate/sub-workflow steps, **aspects** (before/after
   weaving by type/name/role).
 - Reactive triggers: tuple write → workflow dispatch, zero tokens, zero latency.
@@ -259,7 +259,7 @@ within rounding.
    re-read from disk. Load-time errors are CUE unification errors, verbatim.
 2. Aspect weaver: pure Rust `expand_aspects` (match {type, name-glob, spawn-role},
    AND semantics; declaration order, first innermost) + unit tests mirroring
-   imp's semantics.
+   the predecessor's semantics.
 3. Interpolation: generate `context.cue` carrying `_input`/`_ctx` into the eval
    package so CUE resolves references, defaults, and constraints itself.
 4. Step handlers over Phase-2/3 machinery: spawn, wait (subscribes to the Phase-1
@@ -294,7 +294,7 @@ mid-workflow resumes correctly.
 - `rk peers` — who's active, what they've claimed, last-seen.
 
 **Steps**
-1. Castle identity: Ed25519 keypair + proquint name (imp's scheme), stored under
+1. Castle identity: Ed25519 keypair + proquint name (the predecessor's scheme), stored under
    the config dir; actor-id = castle + instance.
 2. Record format: append-only NDJSON lines (ULID + hybrid timestamp + actor +
    tuple op), one line per record — `cat_sort_uniq`-safe by construction.
@@ -310,7 +310,7 @@ mid-workflow resumes correctly.
    ordering computed identically by every reader; losing side's daemon steers its
    agent to wind down.
 6. Compaction: periodic per-actor history squash; dead-actor pruning; `rk sync
-   status` with divergence warnings (imp's silent-stall lesson: sync failure is an
+   status` with divergence warnings (the predecessor's silent-stall lesson: sync failure is an
    `obstacle` tuple, not a debug log).
 7. Two-castle integration test (two temp clones + bare remote): concurrent claims,
    partition/rejoin, convergence assertions; property test on merge idempotence.
@@ -330,7 +330,7 @@ partition, and a human on machine B sees machine A's obstacles in `rk watch`.
 - `rk top` — ratatui fleet dashboard: agents, states, burn rates, budgets,
   workflow instances (thin — herdr carries per-agent detail).
 - Knowledge maturation: `suggestion`/`endorsement` categories in the system scope
-  with quorum promotion (imp's cross-repo insight pattern, generalized).
+  with quorum promotion (the predecessor's cross-repo insight pattern, generalized).
 - Operational polish: `rk doctor`, shell completions, launchd/systemd units,
   crash-loop backoff on respawn, docs site.
 
@@ -343,7 +343,7 @@ partition, and a human on machine B sees machine A's obstacles in `rk watch`.
    distinct-scope endorsements; quorum auto-promotion in a dedicated (non-GC)
    maintenance job.
 4. Template lint in CI (fragment composition rules, no cross-mode leakage —
-   imp's priming-drift lesson).
+   the predecessor's priming-drift lesson).
 5. `rk doctor` (harness versions, herdr protocol, git remote refspecs, pricing
    staleness), packaging, install docs.
 

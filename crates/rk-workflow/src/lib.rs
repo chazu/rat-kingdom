@@ -260,7 +260,7 @@ fn tempfile_dir() -> rk_core::Result<PathBuf> {
     Ok(dir)
 }
 
-/// imp's aspect semantics, verbatim: per aspect in declaration order, splice
+/// The predecessor's aspect semantics, verbatim: per aspect in declaration order, splice
 /// `before`/`after` around every matching step; first aspect is innermost.
 pub fn expand_aspects(mut steps: Vec<Step>, aspects: &[Aspect]) -> Vec<Step> {
     for aspect in aspects {

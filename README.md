@@ -5,11 +5,6 @@ A multi-agent orchestration harness for AI coding agents, in Rust. Rats
 shared tuplespace, and are driven over their harnesses' structured protocols —
 no terminal scraping, no keystroke injection, no sleeps.
 
-Successor to [imp](https://github.com/chazu/imp)'s ideas with its failure
-modes fixed structurally; design rationale in
-`docs/2026-07-22-imp-analysis-and-rat-kingdom-design.md`, build status in
-`docs/2026-07-22-implementation-plan.md`.
-
 ## Requirements
 
 | What | Why | Required? |

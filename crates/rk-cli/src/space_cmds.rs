@@ -3,7 +3,7 @@
 //! Sugar commands are the schema-enforcement layer: they construct payloads
 //! themselves from `RK_*` env (set at spawn), so agents cannot write malformed
 //! coordination tuples, and a missing env var is an explicit error instead of
-//! a silently absent field (imp's foreman-routing lesson).
+//! a silently absent field (the predecessor's foreman-routing lesson).
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
