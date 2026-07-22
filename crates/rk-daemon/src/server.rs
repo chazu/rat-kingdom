@@ -32,7 +32,7 @@ pub struct Daemon {
     default_harness: String,
     engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
     repos: std::sync::Mutex<crate::repos::RepoRegistry>,
-    tickets: crate::tickets::Tickets,
+    tickets: Arc<crate::tickets::Tickets>,
     started: Instant,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -110,18 +110,21 @@ impl Daemon {
         space: Space,
     ) -> rk_core::Result<Self> {
         layout.ensure()?;
+        // One Tickets instance, shared by the RPC handlers and the supervisor,
+        // so ticket-lifecycle writes serialize on a single lock.
+        let tickets = Arc::new(crate::tickets::Tickets::new(space.clone(), castle.clone()));
         let supervisor = Arc::new(crate::supervisor::Supervisor::new(
             layout.clone(),
             castle.clone(),
             default_harness.clone(),
             budget,
             space.clone(),
+            tickets.clone(),
         )?);
         let (shutdown_tx, _) = watch::channel(false);
         let repos = std::sync::Mutex::new(crate::repos::RepoRegistry::load(
             &layout.home().join("repos.json"),
         )?);
-        let tickets = crate::tickets::Tickets::new(space.clone(), castle.clone());
         Ok(Self {
             layout,
             space,

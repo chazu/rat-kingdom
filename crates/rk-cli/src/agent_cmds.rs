@@ -123,6 +123,19 @@ pub async fn spawn(layout: &Layout, args: SpawnArgs, as_json: bool) -> Result<()
     };
 
     let repo = crate::repo_cmds::resolve_path(&mut client, &repo_arg).await?;
+
+    // Mark the ticket in_progress BEFORE launching the rat. A fast rat can
+    // finish (and auto-set `done`) before this returns, so it must not run
+    // after the spawn or it would clobber that `done`.
+    if let Some(ticket_id) = &args.ticket {
+        let _ = client
+            .call(
+                "ticket.update",
+                json!({ "id": ticket_id, "status": "in_progress" }),
+            )
+            .await;
+    }
+
     let result = client
         .call(
             "agent.spawn",
@@ -142,13 +155,14 @@ pub async fn spawn(layout: &Layout, args: SpawnArgs, as_json: bool) -> Result<()
         .await?;
     let agent = &result["agent"];
 
-    // A ticket-dispatched rat takes ownership of its ticket.
+    // Record the assignee only — never the status — so this can't overwrite a
+    // `done` the rat may already have set on completion.
     if let Some(ticket_id) = &args.ticket {
         let name = agent["name"].as_str().unwrap_or("");
         let _ = client
             .call(
                 "ticket.update",
-                json!({ "id": ticket_id, "status": "in_progress", "assignee": name }),
+                json!({ "id": ticket_id, "assignee": name }),
             )
             .await;
     }

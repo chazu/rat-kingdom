@@ -142,6 +142,12 @@ ticket, resolves the repo from the ticket's scope, and flips the ticket to
 rk spawn --ticket TKT-3            # no hand-written --task/--prompt/--repo needed
 ```
 
+The ticket's lifecycle then closes itself: when the rat finishes (its `rk done`,
+or the harness's own completion for a rat that forgets), the ticket moves to
+`done` — which **automatically unblocks any dependents** — and merging it on
+`rk dismiss` moves it to `closed`. A rat that errors leaves its ticket
+`in_progress` for inspection.
+
 ## Configuration (`~/.rat-kingdom/config.toml`)
 
 ```toml

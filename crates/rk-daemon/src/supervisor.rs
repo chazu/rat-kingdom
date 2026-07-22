@@ -60,6 +60,8 @@ pub struct Supervisor {
     /// Live control handles (not persisted; gone after restart).
     controls: Mutex<HashMap<String, SessionControl>>,
     space: Space,
+    /// Shared with the server so ticket-lifecycle writes serialize on one lock.
+    tickets: Arc<crate::tickets::Tickets>,
     pricing: PricingTable,
     budget: Budget,
     /// Agents already warned about budget (avoid repeat warnings).
@@ -73,6 +75,7 @@ impl Supervisor {
         default_harness: String,
         budget: Budget,
         space: Space,
+        tickets: Arc<crate::tickets::Tickets>,
     ) -> rk_core::Result<Self> {
         let registry = Registry::load(&layout.home().join("agents.json"))?;
         let mut pricing = PricingTable::vendored();
@@ -91,6 +94,7 @@ impl Supervisor {
             registry: Mutex::new(registry),
             controls: Mutex::new(HashMap::new()),
             space,
+            tickets,
             pricing,
             budget,
             budget_warned: Mutex::new(std::collections::HashSet::new()),
@@ -612,6 +616,22 @@ impl Supervisor {
                 warn!(error = %e, "failed to notify parent");
             }
         }
+        // A rat dispatched from a ticket closes that ticket's loop: a clean
+        // finish marks it done (which unblocks any dependents), an error leaves
+        // it in_progress for inspection. Fire-and-forget so completion routing
+        // is never held up by the ticket's serialization lock.
+        if !is_error {
+            if let Some(task) = record.task.clone() {
+                if task.starts_with(crate::tickets::ID_PREFIX) {
+                    let tickets = self.tickets.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = tickets.set_status(&task, "done").await {
+                            warn!(ticket = %task, error = %e, "failed to mark ticket done");
+                        }
+                    });
+                }
+            }
+        }
     }
 
     pub async fn steer(&self, name: &str, message: &str) -> rk_core::Result<()> {
@@ -687,6 +707,16 @@ impl Supervisor {
             r.state = AgentState::Dismissed;
             r.pid = None;
         })?;
+        // A merged ticket-rat closes its ticket for good.
+        if merged {
+            if let Some(task) = &record.task {
+                if task.starts_with(crate::tickets::ID_PREFIX) {
+                    if let Err(e) = self.tickets.set_status(task, "closed").await {
+                        warn!(ticket = %task, error = %e, "failed to close ticket on dismiss");
+                    }
+                }
+            }
+        }
         self.emit_event(
             &record.repo_name,
             "agent_dismissed",

@@ -29,7 +29,7 @@ pub const STATUSES: &[&str] = &[
     "closed",
 ];
 
-const ID_PREFIX: &str = "TKT-";
+pub(crate) const ID_PREFIX: &str = "TKT-";
 
 fn system_scope() -> String {
     rk_core::tuple::SYSTEM_SCOPE.to_string()
@@ -63,7 +63,7 @@ pub struct NewTicket {
 
 /// A partial update to a ticket. Every field is optional; only present fields
 /// are written.
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct TicketChanges {
     #[serde(default)]
     pub status: Option<String>,
@@ -205,6 +205,19 @@ impl Tickets {
                 obj.insert("parent".into(), json!(v));
             }
         })
+        .await
+    }
+
+    /// Set just the status (used by the supervisor to close a ticket's loop
+    /// when its rat completes or is merged). No-op error if the ticket is gone.
+    pub async fn set_status(&self, id: &str, status: &str) -> rk_core::Result<Tuple> {
+        self.update(
+            id,
+            TicketChanges {
+                status: Some(status.to_string()),
+                ..Default::default()
+            },
+        )
         .await
     }
 
