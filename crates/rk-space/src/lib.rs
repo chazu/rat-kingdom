@@ -113,6 +113,21 @@ impl Space {
         self.lock().store.query(pattern, false, None)
     }
 
+    /// Idempotent write for replication: inserts (and wakes waiters /
+    /// publishes) only if this tuple id is not already present. Returns
+    /// whether the tuple was new. Remotely-authored tuples arrive here so
+    /// repeated sync cycles cannot duplicate them.
+    pub fn out_if_new(&self, tuple: Tuple) -> rk_core::Result<bool> {
+        {
+            let inner = self.lock();
+            if inner.store.exists(tuple.id)? {
+                return Ok(false);
+            }
+        }
+        self.out(tuple)?;
+        Ok(true)
+    }
+
     /// Blocking destructive read: atomically consume the oldest matching
     /// tuple, or wait up to `timeout` for one to arrive. Returns `None` on
     /// timeout. Furniture is never consumable.

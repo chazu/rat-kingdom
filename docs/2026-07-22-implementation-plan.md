@@ -19,9 +19,15 @@
   REMAINING: axe adapter (axe not installed locally — parser+launch shape per
   jrswab/axe docs, validate when installed), rk-mux herdr client (attach
   surface), capability-driven fallbacks in supervisor (steer→resume for codex).
-- **P4–P7 NOT STARTED.** Next: P4 ledger (usage events already flow into
-  registry; needs pricing table + budgets + burn-rate anomalies), then P5
-  workflows (cuengine), P6 git-notes sync, P7 steward/top/polish.
+- **P4 CORE DONE** — rk-ledger (vendored LiteLLM-subset pricing + overlay,
+  Budget with graduated Ok/Warn/Stop), supervisor computes incremental USD
+  from usage deltas when the harness doesn't self-report, enforce_budget on
+  every update (warn-once + steer → kill at cap, obstacle tuples), `rk cost`
+  rollup. Integration-tested with a runaway fake rat. REMAINING from P4:
+  `rk pricing refresh` (live LiteLLM fetch), offline session-JSONL backfill,
+  burn-rate/stuck anomaly detection.
+- **P5–P7 NOT STARTED.** P5 workflows (cuengine — NOTE: needs Go toolchain in
+  build, or `cue` CLI fallback), P6 git-notes sync, P7 steward/top/polish.
 
 Known polish items: codex Completed.result sometimes empty (last agent_message
 not always present); `rk scan` positional args can't skip scope; consider

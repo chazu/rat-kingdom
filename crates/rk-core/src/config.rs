@@ -13,6 +13,27 @@ pub struct Config {
     pub log: LogConfig,
     pub harness: HarnessConfig,
     pub budget: BudgetConfig,
+    pub sync: SyncConfig,
+}
+
+/// Multiplayer sync via git notes in the RK_HOME state repo.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SyncConfig {
+    pub enabled: bool,
+    /// Git remote URL for the shared sync repo.
+    pub remote_url: Option<String>,
+    pub interval_secs: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            remote_url: None,
+            interval_secs: 30,
+        }
+    }
 }
 
 /// Per-agent budget caps. Zero = unlimited.

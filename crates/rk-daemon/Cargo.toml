@@ -13,6 +13,7 @@ rk-space.workspace = true
 rk-git.workspace = true
 rk-harness.workspace = true
 rk-ledger.workspace = true
+rk-sync.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

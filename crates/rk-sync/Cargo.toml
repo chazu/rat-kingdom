@@ -1,0 +1,21 @@
+[package]
+name = "rk-sync"
+description = "rat-kingdom multiplayer: per-actor git-notes refs, union merge, claim arbitration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rk-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

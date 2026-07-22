@@ -6,6 +6,7 @@ members = [
     "crates/rk-git",
     "crates/rk-harness",
     "crates/rk-ledger",
+    "crates/rk-sync",
     "crates/rk-daemon",
     "crates/rk-cli",
 ]
@@ -23,6 +24,7 @@ rk-space = { path = "crates/rk-space" }
 rk-git = { path = "crates/rk-git" }
 rk-harness = { path = "crates/rk-harness" }
 rk-ledger = { path = "crates/rk-ledger" }
+rk-sync = { path = "crates/rk-sync" }
 rk-daemon = { path = "crates/rk-daemon" }
 
 anyhow = "1"

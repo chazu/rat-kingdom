@@ -68,6 +68,19 @@ enum Command {
     Respawn(agent_cmds::NameArg),
     /// Per-agent and fleet token/cost rollup.
     Cost,
+    /// Multiplayer sync via git notes.
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommand,
+    },
+    /// List castles seen in the shared tuplespace.
+    Peers,
+}
+
+#[derive(Subcommand)]
+enum SyncCommand {
+    /// Run one sync cycle immediately.
+    Now,
 }
 
 #[derive(Subcommand)]
@@ -119,6 +132,7 @@ async fn main() -> Result<()> {
                     config.castle_name(),
                     config.harness.default.clone(),
                     budget,
+                    config.sync.clone(),
                 )?
                 .run()
                 .await?;
@@ -183,6 +197,31 @@ async fn main() -> Result<()> {
         Command::Dismiss(args) => agent_cmds::dismiss(&layout, args, cli.json).await?,
         Command::Respawn(args) => agent_cmds::respawn(&layout, args, cli.json).await?,
         Command::Cost => agent_cmds::cost(&layout, cli.json).await?,
+        Command::Sync { command } => match command {
+            SyncCommand::Now => {
+                let mut client = Client::connect_or_spawn(&layout).await?;
+                let stats = client.call("sync.now", json!({})).await?;
+                if cli.json {
+                    println!("{stats}");
+                } else {
+                    println!(
+                        "synced: {} exported · {} imported · {} castles · pushed: {}",
+                        stats["exported"], stats["imported"], stats["actors_seen"], stats["pushed"]
+                    );
+                }
+            }
+        },
+        Command::Peers => {
+            let mut client = Client::connect_or_spawn(&layout).await?;
+            let result = client.call("sync.peers", json!({})).await?;
+            if cli.json {
+                println!("{}", result["peers"]);
+            } else {
+                for p in result["peers"].as_array().cloned().unwrap_or_default() {
+                    println!("{}", p.as_str().unwrap_or("?"));
+                }
+            }
+        }
     }
 
     Ok(())

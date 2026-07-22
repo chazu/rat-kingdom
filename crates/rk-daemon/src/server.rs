@@ -26,6 +26,8 @@ pub struct Daemon {
     space: Space,
     castle: String,
     supervisor: Arc<crate::supervisor::Supervisor>,
+    syncer: Option<Arc<crate::sync::Syncer>>,
+    sync_interval: Duration,
     started: Instant,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -36,10 +38,21 @@ impl Daemon {
         castle: String,
         default_harness: String,
         budget: rk_ledger::Budget,
+        sync: rk_core::config::SyncConfig,
     ) -> rk_core::Result<Self> {
         layout.ensure()?;
         let space = Space::open(&layout.db_path())?;
-        Self::with_space(layout, castle, default_harness, budget, space)
+        let mut daemon = Self::with_space(layout, castle, default_harness, budget, space)?;
+        if sync.enabled {
+            let syncer = crate::sync::Syncer::new(
+                &daemon.layout,
+                &daemon.castle,
+                sync.remote_url.as_deref(),
+            )?;
+            daemon.syncer = Some(Arc::new(syncer));
+            daemon.sync_interval = Duration::from_secs(sync.interval_secs.max(5));
+        }
+        Ok(daemon)
     }
 
     #[doc(hidden)]
@@ -86,6 +99,8 @@ impl Daemon {
             space,
             castle,
             supervisor,
+            syncer: None,
+            sync_interval: Duration::from_secs(30),
             started: Instant::now(),
             shutdown_tx,
         })
@@ -143,6 +158,34 @@ impl Daemon {
                             Err(e) => warn!(error = %e, "gc failed"),
                         },
                         _ = gc_shutdown.changed() => break,
+                    }
+                }
+            });
+        }
+
+        // Multiplayer sync loop (git shell-outs are blocking → spawn_blocking).
+        if let Some(syncer) = daemon.syncer.clone() {
+            let space = daemon.space.clone();
+            let interval = daemon.sync_interval;
+            let mut sync_shutdown = daemon.shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            let syncer = Arc::clone(&syncer);
+                            let space = space.clone();
+                            let result = tokio::task::spawn_blocking(move || {
+                                syncer.run_cycle(&space)
+                            })
+                            .await;
+                            match result {
+                                Ok(Ok(stats)) => debug!(?stats, "sync cycle"),
+                                Ok(Err(e)) => warn!(error = %e, "sync cycle failed"),
+                                Err(e) => warn!(error = %e, "sync task panicked"),
+                            }
+                        }
+                        _ = sync_shutdown.changed() => break,
                     }
                 }
             });
@@ -295,6 +338,37 @@ impl Daemon {
                         Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
                     },
                 )
+            }
+            "sync.now" => {
+                let Some(syncer) = self.syncer.clone() else {
+                    return Outcome::Reply(Response::err(
+                        id,
+                        codes::INTERNAL,
+                        "sync is not enabled ([sync] enabled = true in config.toml)",
+                    ));
+                };
+                let space = self.space.clone();
+                let result = tokio::task::spawn_blocking(move || syncer.run_cycle(&space)).await;
+                reply(match result {
+                    Ok(Ok(stats)) => Response::ok(id, json!(stats)),
+                    Ok(Err(e)) => Response::err(id, codes::INTERNAL, e.to_string()),
+                    Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
+                })
+            }
+            "sync.peers" => {
+                let Some(syncer) = self.syncer.clone() else {
+                    return Outcome::Reply(Response::err(
+                        id,
+                        codes::INTERNAL,
+                        "sync is not enabled ([sync] enabled = true in config.toml)",
+                    ));
+                };
+                let result = tokio::task::spawn_blocking(move || syncer.peers()).await;
+                reply(match result {
+                    Ok(Ok(peers)) => Response::ok(id, json!({"peers": peers})),
+                    Ok(Err(e)) => Response::err(id, codes::INTERNAL, e.to_string()),
+                    Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
+                })
             }
             other => reply(Response::err(
                 id,

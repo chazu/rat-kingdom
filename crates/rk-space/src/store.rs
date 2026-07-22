@@ -75,6 +75,18 @@ impl Store {
         Ok(())
     }
 
+    pub fn exists(&self, id: RecordId) -> rk_core::Result<bool> {
+        let n: u64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tuples WHERE id = ?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)?;
+        Ok(n > 0)
+    }
+
     pub fn delete(&self, id: RecordId) -> rk_core::Result<bool> {
         let n = self
             .conn
