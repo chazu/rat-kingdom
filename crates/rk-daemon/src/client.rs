@@ -45,6 +45,15 @@ impl Client {
         ))
     }
 
+    /// Upgrade this connection to a watch stream: sends `space.watch`, then
+    /// notifications arrive via [`WatchStream::next`].
+    pub async fn watch(mut self, params: Value) -> rk_core::Result<WatchStream> {
+        self.call("space.watch", params).await?;
+        Ok(WatchStream {
+            stream: self.stream,
+        })
+    }
+
     pub async fn call(&mut self, method: &str, params: Value) -> rk_core::Result<Value> {
         self.next_id += 1;
         let req = Request {
@@ -69,6 +78,24 @@ impl Client {
             )));
         }
         Ok(resp.result.unwrap_or(Value::Null))
+    }
+}
+
+/// A connection upgraded to a live tuple feed by [`Client::watch`].
+pub struct WatchStream {
+    stream: BufReader<UnixStream>,
+}
+
+impl WatchStream {
+    /// The next pushed notification (`{"method": "tuple"|"lagged", "params": ...}`),
+    /// or `None` when the daemon closes the stream.
+    pub async fn next(&mut self) -> rk_core::Result<Option<Value>> {
+        let mut buf = String::new();
+        let n = self.stream.read_line(&mut buf).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_str(&buf)?))
     }
 }
 
