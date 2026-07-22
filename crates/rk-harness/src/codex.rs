@@ -161,12 +161,10 @@ pub(crate) fn parse_event_line(line: &str) -> Vec<HarnessEvent> {
         Some("thread.started") => events.push(HarnessEvent::Started {
             session_id: v["thread_id"].as_str().map(String::from),
         }),
-        Some("turn.completed") => {
-            if v["usage"].is_object() {
-                events.push(HarnessEvent::Usage {
-                    usage: usage_from(&v["usage"]),
-                });
-            }
+        Some("turn.completed") if v["usage"].is_object() => {
+            events.push(HarnessEvent::Usage {
+                usage: usage_from(&v["usage"]),
+            });
         }
         Some("item.completed") => {
             let item = &v["item"];
