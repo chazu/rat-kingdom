@@ -101,6 +101,22 @@ enum Command {
         #[command(subcommand)]
         command: WorkflowCommand,
     },
+    /// Approve a workflow instance parked at an approval gate (lets it merge).
+    Approve(WorkflowDecisionArgs),
+    /// Reject a workflow instance parked at an approval gate (holds it unmerged).
+    Reject(WorkflowDecisionArgs),
+}
+
+#[derive(clap::Args)]
+struct WorkflowDecisionArgs {
+    /// Workflow instance id (from `rk workflow list`).
+    instance: String,
+    /// Who is making the decision (defaults to $RK_AGENT, $USER, or "operator").
+    #[arg(long)]
+    by: Option<String>,
+    /// Optional note recorded with the decision.
+    #[arg(long)]
+    reason: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -194,6 +210,41 @@ enum DaemonCommand {
     Status,
     /// Stop the running daemon.
     Stop,
+}
+
+/// Emit a human approval decision for a workflow instance parked at an
+/// approval gate. The daemon writes the `workflow_approval` event the blocked
+/// gate is waiting on.
+async fn decide(
+    layout: &Layout,
+    args: WorkflowDecisionArgs,
+    approved: bool,
+    as_json: bool,
+) -> Result<()> {
+    let by = args
+        .by
+        .or_else(|| std::env::var("RK_AGENT").ok())
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "operator".to_string());
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call(
+            "workflow.approve",
+            json!({
+                "instance": args.instance,
+                "approved": approved,
+                "by": by,
+                "reason": args.reason,
+            }),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        let verb = if approved { "approved" } else { "rejected" };
+        println!("{verb} {}", args.instance);
+    }
+    Ok(())
 }
 
 fn init_tracing(config: &Config) {
@@ -373,6 +424,8 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Approve(args) => decide(&layout, args, true, cli.json).await?,
+        Command::Reject(args) => decide(&layout, args, false, cli.json).await?,
         Command::Peers => {
             let mut client = Client::connect_or_spawn(&layout).await?;
             let result = client.call("sync.peers", json!({})).await?;

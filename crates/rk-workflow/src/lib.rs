@@ -114,7 +114,13 @@ pub struct DismissStep {
 pub struct GateStep {
     #[serde(rename = "gateType")]
     pub gate_type: String,
-    pub duration: String,
+    /// Timer gates: how long to sleep. Absent for approval gates.
+    #[serde(default)]
+    pub duration: Option<String>,
+    /// Approval gates: how long to wait for a human decision before failing
+    /// closed (not-approved). Absent for timer gates.
+    #[serde(default)]
+    pub timeout: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -348,10 +354,36 @@ workflow: {
         // Aspect wove a timer gate after the rat spawn (and only there):
         // spawn(rat), gate, wait, evaluate, spawn(reviewer), wait, dismiss.
         assert_eq!(wf.steps.len(), 7);
-        assert!(matches!(&wf.steps[1], Step::Gate(g) if g.duration == "1s"));
+        assert!(matches!(&wf.steps[1], Step::Gate(g) if g.duration.as_deref() == Some("1s")));
         assert!(matches!(&wf.steps[4], Step::Spawn(s) if s.role == "reviewer"));
         // Workflow agent profiles parsed.
         assert_eq!(wf.agents["default"].model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn approval_gate_loads_with_default_timeout() {
+        let source = r#"
+workflow: {
+    name: "gated"
+    steps: [
+        {type: "spawn", task: {title: "t"}},
+        {type: "gate", gateType: "approval"},
+        {type: "gate", gateType: "approval", timeout: "1h"},
+        {type: "gate", gateType: "timer", duration: "5s"},
+    ]
+}
+"#;
+        let wf = load_str(source, &HashMap::new()).unwrap();
+        // Approval gate with no explicit timeout picks up the schema default.
+        assert!(
+            matches!(&wf.steps[1], Step::Gate(g) if g.gate_type == "approval" && g.timeout.as_deref() == Some("24h") && g.duration.is_none())
+        );
+        assert!(
+            matches!(&wf.steps[2], Step::Gate(g) if g.gate_type == "approval" && g.timeout.as_deref() == Some("1h"))
+        );
+        assert!(
+            matches!(&wf.steps[3], Step::Gate(g) if g.gate_type == "timer" && g.duration.as_deref() == Some("5s"))
+        );
     }
 
     #[test]
@@ -396,7 +428,8 @@ workflow: {
         let gate = |d: &str| {
             Step::Gate(GateStep {
                 gate_type: "timer".into(),
-                duration: d.into(),
+                duration: Some(d.into()),
+                timeout: None,
             })
         };
         let aspects = vec![
@@ -423,7 +456,7 @@ workflow: {
         let durations: Vec<&str> = woven
             .iter()
             .map(|s| match s {
-                Step::Gate(g) => g.duration.as_str(),
+                Step::Gate(g) => g.duration.as_deref().unwrap_or("?"),
                 Step::Spawn(_) => "SPAWN",
                 _ => "?",
             })

@@ -98,9 +98,23 @@ workflow: #Workflow
 	noMerge?: bool
 }
 
-// Timer gate only in v1 (human gates arrive with approval tuples).
+// A gate parks the workflow between steps. Two kinds:
+//   timer    — sleep for `duration`, then continue (schedule, not consent).
+//   approval — block until a human decision arrives for THIS instance (via
+//              `rk approve <instance>` / `rk reject <instance>`) or `timeout`
+//              elapses. The decision ({approved: bool, by, reason}) lands in
+//              ctx.previousResult so a following `evaluate` can gate the merge.
+//              On timeout with no response the decision is {approved: false}.
 #GateStep: {
 	type:     "gate"
-	gateType: "timer"
-	duration: string
+	gateType: "timer" | "approval"
+	// timer only: how long to sleep.
+	if gateType == "timer" {
+		duration: string
+	}
+	// approval only: how long to wait for a human before defaulting to
+	// not-approved. The safety valve fails closed.
+	if gateType == "approval" {
+		timeout: string | *"24h"
+	}
 }
