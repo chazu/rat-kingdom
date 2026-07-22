@@ -341,32 +341,60 @@ babysitting each round. It converts review from advisory (today's
 - There is no loop, so "re-review after rework, up to N times" can't be
   expressed.
 
-**Primitives to add:**
+**Primitives added (shipped — see `examples/workflows/reviewer-drives-rework.cue`
+and `crates/rk-daemon/src/workflow_exec.rs`):**
 
-- **(a) verdict-visible evaluate/read** — either let the reviewer emit its
-  verdict in the `harness_result` payload (so `evaluate` sees it), or add a
-  `read` step that pulls a named tuple into `ctx` (e.g. `ctx.verdict`).
-- **(b) conditional branch** — a `when` / `switch` step (or `next:` targets on
-  `evaluate`) that routes on a `ctx` value instead of aborting.
-- **(c) bounded loop** — a `repeat: {max: N}` block (or labelled step + `goto
-  label maxIterations: N`) so REWORK re-enters the rework→review sub-sequence.
+- **(a) `read` step** — lifts the *newest* matching tuple from the space into a
+  ctx variable: `{type: "read", category: "artifact", identity: "review",
+  field: "recommendation", into: "verdict"}`. The reviewer records its verdict
+  exactly as `code-review.cue` already does (`rk out artifact <repo> review …`),
+  so nothing about the reviewer changes — the workflow can now *see* it. Newest
+  wins so each re-review round reads that round's verdict. Values land in
+  `ctx.vars` and interpolate as `{{ctx.var.<name>}}`.
+- **(b) `when` step** — routes on a ctx variable: `{type: "when", var:
+  "verdict", cases: {APPROVE: […], STOP: […], REWORK: […]}, default: […]}`. The
+  matching case's nested steps run in place; `default` catches unrecognised
+  values. It consults `ctx`, it never aborts.
+- **(c) `repeat` step** — a bounded loop `{type: "repeat", max: N, steps: […]}`
+  with a **mandatory hard cap** (schema enforces `1 <= max <= 100`). The body
+  runs at most `max` times; a nested `break` exits early. Two control steps
+  complete the set: `break` (exit the nearest `repeat`) and `stop` (fail the
+  instance — the STOP route).
 
-**Sketch once those exist (illustrative syntax, not current schema):**
+The executor stays a single linear pass; nested steps recurse through a small
+`run_step`/`run_steps` pair that threads a `Flow::{Next,Break}` signal, and the
+`repeat` cap keeps total step executions bounded, preserving the "steps run
+once (bounded)" safety property.
 
-```
+**Shipped shape:**
+
+```cue
 spawn rat → wait → evaluate is_error:false → dismiss noMerge
-repeat max=3:
-    spawn reviewer (emits verdict in result) → wait → read verdict → ctx.verdict
-    when ctx.verdict:
-        "APPROVE": dismiss (merge) ; break
-        "STOP":    dismiss noMerge  ; fail
-        "REWORK":  spawn rework-rat on {{ctx.activeBranch}} → wait → evaluate is_error:false → dismiss noMerge ; continue
+repeat max=maxRounds:
+    spawn reviewer → wait → evaluate is_error:false
+    read artifact review .recommendation → ctx.var.verdict
+    when verdict:
+        "APPROVE": [ dismiss noMerge, break ]                 // accept → run completes
+        "STOP":    [ dismiss noMerge, stop ]                  // abort → run fails
+        "REWORK":  [ dismiss noMerge, spawn rework, wait,
+                     evaluate is_error:false, dismiss noMerge ] // loop back
+        default:   [ dismiss noMerge, stop ]                  // unknown verdict → abort
 ```
 
-The primitives are small and composable — (a) is a payload/read plumbing change,
-(b) is a step that consults `ctx`, (c) is a bounded re-entry over a slice of the
-step list. Together they unlock *every* looping self-improvement workflow, so
-this is the highest-value engine investment.
+**Merge semantics note.** An agent's dismiss merges its branch into its *base*
+(`target_branch = base`), so a reviewer chained off the work branch cannot land
+work on `main` — the same reason `fix-then-verify` leaves its result on a branch.
+So APPROVE does not `git merge` to main inside the run; it `break`s so the
+instance **completes**, and the orchestrator merges the reviewed (chain-tip)
+branch on dismissal. STOP `stop`s so the instance **fails** and the branch is
+discarded. The verdict routes *completion vs failure*, which is what the
+orchestrator's merge-on-dismissal keys off — routing without a merge-to-main
+primitive. A dedicated "merge branch X into main" step (or a dismiss that names
+a non-active agent) would let APPROVE land work directly; that is a natural
+follow-up, filed as a ticket.
+
+The same three primitives retrofit a looping variant onto `fix-then-verify`
+(verifier fails → route to a rework rat → re-verify), as predicted.
 
 ### 6. `gated-merge`
 

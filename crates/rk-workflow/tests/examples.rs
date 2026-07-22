@@ -34,6 +34,49 @@ fn all_shipped_examples_load() {
 }
 
 #[test]
+fn reviewer_drives_rework_loads_and_routes() {
+    use rk_workflow::Step;
+    let inputs = HashMap::from([
+        ("taskId".to_string(), json!("fix-login")),
+        ("maxRounds".to_string(), json!(4)),
+    ]);
+    let workflow =
+        rk_workflow::load(&examples_dir().join("reviewer-drives-rework.cue"), &inputs).unwrap();
+
+    // Top level: spawn, wait, evaluate, dismiss, repeat.
+    let Step::Repeat(repeat) = workflow.steps.last().unwrap() else {
+        panic!("last step should be a repeat loop");
+    };
+    // The `max` came from _input.maxRounds — a real, bounded cap.
+    assert_eq!(repeat.max, 4);
+
+    // The loop body ends in a `when` routing on the read verdict.
+    let read = repeat
+        .steps
+        .iter()
+        .find_map(|s| match s {
+            Step::Read(r) => Some(r),
+            _ => None,
+        })
+        .expect("a read step lifting the verdict");
+    assert_eq!(read.into, "verdict");
+    assert_eq!(read.field.as_deref(), Some("recommendation"));
+
+    let Step::When(when) = repeat.steps.last().unwrap() else {
+        panic!("loop body should end in a when");
+    };
+    assert_eq!(when.var, "verdict");
+    // APPROVE merges then breaks; STOP aborts; REWORK loops back.
+    assert!(matches!(when.cases["APPROVE"].last().unwrap(), Step::Break));
+    assert!(when.cases["STOP"]
+        .iter()
+        .any(|s| matches!(s, Step::Stop(_))));
+    assert!(when.cases["REWORK"]
+        .iter()
+        .any(|s| matches!(s, Step::Spawn(sp) if sp.role == "rat")));
+}
+
+#[test]
 fn code_review_resolves_reviewer_profile() {
     let inputs = HashMap::from([("taskId".to_string(), json!("t1"))]);
     let workflow = rk_workflow::load(&examples_dir().join("code-review.cue"), &inputs).unwrap();

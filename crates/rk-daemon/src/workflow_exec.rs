@@ -11,10 +11,16 @@ use rk_workflow::{resolve::resolve, AgentProfile, Step, Workflow};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{info, warn};
+
+/// A boxed future for hand-rolled async recursion (nested `when` / `repeat`).
+type StepFuture<'a> = Pin<Box<dyn Future<Output = rk_core::Result<Flow>> + Send + 'a>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
@@ -45,6 +51,18 @@ pub struct WorkflowContext {
     pub active_agent: Option<String>,
     pub active_branch: Option<String>,
     pub previous_result: Option<Value>,
+    /// Values lifted from the space by `read` steps, keyed by `read.into`.
+    /// Consumed by `when` steps and by `{{ctx.var.<name>}}` interpolation.
+    #[serde(default)]
+    pub vars: HashMap<String, Value>,
+}
+
+/// Control-flow signal threaded out of a step (or nested step sequence).
+enum Flow {
+    /// Continue with the next step in sequence.
+    Next,
+    /// Exit the nearest enclosing `repeat` (or end the workflow at top level).
+    Break,
 }
 
 pub struct WorkflowEngine {
@@ -168,18 +186,52 @@ impl WorkflowEngine {
         Ok(instance)
     }
 
+    /// Run the top-level step list once. `current_step` tracks top-level
+    /// progress only; steps nested inside `when`/`repeat` execute in place
+    /// without advancing it (they are bounded by the `repeat` cap).
     async fn execute(&self, id: &str, workflow: Workflow, repo: &str) -> rk_core::Result<()> {
         for (index, step) in workflow.steps.iter().enumerate() {
             self.update(id, |i| i.current_step = index);
+            if let Flow::Break = self.run_step(id, step, repo, &workflow.agents).await? {
+                // A top-level break ends the workflow (nothing to loop out of).
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run a sequence of steps, short-circuiting on the first `Break`.
+    fn run_steps<'a>(
+        &'a self,
+        id: &'a str,
+        steps: &'a [Step],
+        repo: &'a str,
+        agents: &'a HashMap<String, AgentProfile>,
+    ) -> StepFuture<'a> {
+        Box::pin(async move {
+            for step in steps {
+                if let Flow::Break = self.run_step(id, step, repo, agents).await? {
+                    return Ok(Flow::Break);
+                }
+            }
+            Ok(Flow::Next)
+        })
+    }
+
+    /// Execute a single step (recursing for `when`/`repeat`).
+    fn run_step<'a>(
+        &'a self,
+        id: &'a str,
+        step: &'a Step,
+        repo: &'a str,
+        agents: &'a HashMap<String, AgentProfile>,
+    ) -> StepFuture<'a> {
+        Box::pin(async move {
             let ctx = self.context(id);
             match step {
                 Step::Spawn(spawn) => {
-                    let resolved = resolve(
-                        spawn,
-                        &workflow.agents,
-                        &self.global_agents,
-                        &self.default_harness,
-                    )?;
+                    let resolved =
+                        resolve(spawn, agents, &self.global_agents, &self.default_harness)?;
                     let title = interpolate(&spawn.task.title, &ctx);
                     let prompt = spawn
                         .task
@@ -252,9 +304,69 @@ impl WorkflowEngine {
                 Step::Gate(gate) => {
                     tokio::time::sleep(parse_duration(&gate.duration)?).await;
                 }
+                Step::Read(read) => {
+                    let category = Category::from_str(&read.category)?;
+                    let scope = read.scope.clone().unwrap_or_else(|| repo_name_of(repo));
+                    let mut pattern = Pattern::category(category)
+                        .scope(scope)
+                        .identity(read.identity.clone());
+                    pattern.payload_search = read.search.clone();
+                    // Newest match wins (scan is oldest-first, so pop the tail);
+                    // fall back to a blocking read if none is present yet.
+                    let tuple = match self
+                        .space
+                        .scan(&pattern)
+                        .map_err(|e| rk_core::Error::other(format!("read scan failed: {e}")))?
+                        .pop()
+                    {
+                        Some(t) => Some(t),
+                        None => self
+                            .space
+                            .rd(&pattern, parse_duration(&read.timeout)?)
+                            .await
+                            .map_err(|e| rk_core::Error::other(format!("read failed: {e}")))?,
+                    };
+                    let tuple = tuple.ok_or_else(|| {
+                        rk_core::Error::other(format!(
+                            "read timed out after {} for {} tuple '{}'",
+                            read.timeout, read.category, read.identity
+                        ))
+                    })?;
+                    let value = match &read.field {
+                        Some(field) => tuple.payload.get(field).cloned().unwrap_or(Value::Null),
+                        None => tuple.payload.clone(),
+                    };
+                    self.update(id, |i| {
+                        i.context.vars.insert(read.into.clone(), value.clone());
+                    });
+                }
+                Step::When(when) => {
+                    let key = ctx
+                        .vars
+                        .get(&when.var)
+                        .map(value_as_key)
+                        .unwrap_or_default();
+                    let branch = when.cases.get(&key).unwrap_or(&when.default);
+                    return self.run_steps(id, branch, repo, agents).await;
+                }
+                Step::Repeat(repeat) => {
+                    for _ in 0..repeat.max {
+                        if let Flow::Break = self.run_steps(id, &repeat.steps, repo, agents).await?
+                        {
+                            break;
+                        }
+                    }
+                }
+                Step::Break => return Ok(Flow::Break),
+                Step::Stop(stop) => {
+                    return Err(rk_core::Error::other(format!(
+                        "workflow stopped: {}",
+                        stop.reason.as_deref().unwrap_or("stop step reached")
+                    )));
+                }
             }
-        }
-        Ok(())
+            Ok(Flow::Next)
+        })
     }
 
     pub fn list(&self) -> Vec<Instance> {
@@ -322,15 +434,32 @@ fn interpolate(text: &str, ctx: &WorkflowContext) -> String {
                 .unwrap_or_else(|| v.to_string())
         })
         .unwrap_or_default();
-    text.replace(
-        "{{ctx.activeAgent}}",
-        ctx.active_agent.as_deref().unwrap_or(""),
-    )
-    .replace(
-        "{{ctx.activeBranch}}",
-        ctx.active_branch.as_deref().unwrap_or(""),
-    )
-    .replace("{{ctx.previousResult}}", &previous)
+    let mut out = text
+        .replace(
+            "{{ctx.activeAgent}}",
+            ctx.active_agent.as_deref().unwrap_or(""),
+        )
+        .replace(
+            "{{ctx.activeBranch}}",
+            ctx.active_branch.as_deref().unwrap_or(""),
+        )
+        .replace("{{ctx.previousResult}}", &previous);
+    // `read`-lifted variables: {{ctx.var.<name>}}.
+    for (name, value) in &ctx.vars {
+        out = out.replace(&format!("{{{{ctx.var.{name}}}}}"), &value_as_key(value));
+    }
+    out
+}
+
+/// Render a ctx variable as a plain string for `when`-case matching and
+/// interpolation: strings pass through, null becomes empty, anything else is
+/// its compact JSON form.
+fn value_as_key(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
 }
 
 fn repo_name_of(repo: &str) -> String {
@@ -365,11 +494,32 @@ mod tests {
             active_agent: Some("Whisker".into()),
             active_branch: Some("rat/whisker/t1".into()),
             previous_result: Some(json!({"result": "looks good", "is_error": false})),
+            vars: HashMap::new(),
         };
         let text = "Review {{ctx.activeBranch}} by {{ctx.activeAgent}}: {{ctx.previousResult}}";
         assert_eq!(
             interpolate(text, &ctx),
             "Review rat/whisker/t1 by Whisker: looks good"
         );
+    }
+
+    #[test]
+    fn interpolate_replaces_read_vars() {
+        let ctx = WorkflowContext {
+            vars: HashMap::from([
+                ("verdict".to_string(), json!("REWORK")),
+                ("rounds".to_string(), json!(3)),
+            ]),
+            ..Default::default()
+        };
+        let text = "verdict={{ctx.var.verdict}} rounds={{ctx.var.rounds}}";
+        assert_eq!(interpolate(text, &ctx), "verdict=REWORK rounds=3");
+    }
+
+    #[test]
+    fn value_as_key_renders_variants() {
+        assert_eq!(value_as_key(&json!("APPROVE")), "APPROVE");
+        assert_eq!(value_as_key(&Value::Null), "");
+        assert_eq!(value_as_key(&json!(42)), "42");
     }
 }

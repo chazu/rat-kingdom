@@ -59,6 +59,16 @@ pub enum Step {
     Evaluate(EvaluateStep),
     Dismiss(DismissStep),
     Gate(GateStep),
+    /// Lift the newest matching tuple's payload (or one field) into a ctx var.
+    Read(ReadStep),
+    /// Route on a ctx var: run the matching case's nested steps, else `default`.
+    When(WhenStep),
+    /// Bounded loop: run `steps` up to `max` times; `break` exits early.
+    Repeat(RepeatStep),
+    /// Exit the nearest enclosing `repeat`.
+    Break,
+    /// Abort the whole instance (failed) with an optional reason.
+    Stop(StopStep),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -115,6 +125,56 @@ pub struct GateStep {
     #[serde(rename = "gateType")]
     pub gate_type: String,
     pub duration: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReadStep {
+    /// Tuple category to match (rendered as its snake_case name in CUE).
+    pub category: String,
+    /// Tuple identity to match.
+    pub identity: String,
+    /// Scope to match; defaults to the workflow's repo name at runtime.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Optional substring the serialized payload must contain.
+    #[serde(default)]
+    pub search: Option<String>,
+    /// JSON payload field to lift; whole payload if unset.
+    #[serde(default)]
+    pub field: Option<String>,
+    /// ctx variable name to store the value under.
+    pub into: String,
+    #[serde(default = "default_read_timeout")]
+    pub timeout: String,
+}
+
+fn default_read_timeout() -> String {
+    "5m".into()
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WhenStep {
+    /// ctx variable to switch on (as set by a prior `read`).
+    pub var: String,
+    /// Value -> nested steps. String values match by equality.
+    #[serde(default)]
+    pub cases: HashMap<String, Vec<Step>>,
+    /// Steps run when the value matches no case.
+    #[serde(default)]
+    pub default: Vec<Step>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepeatStep {
+    /// Hard iteration cap; the body runs at most this many times.
+    pub max: u32,
+    pub steps: Vec<Step>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StopStep {
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -287,6 +347,11 @@ fn step_matches(step: &Step, matcher: &AspectMatch) -> bool {
             Step::Evaluate(_) => "evaluate",
             Step::Dismiss(_) => "dismiss",
             Step::Gate(_) => "gate",
+            Step::Read(_) => "read",
+            Step::When(_) => "when",
+            Step::Repeat(_) => "repeat",
+            Step::Break => "break",
+            Step::Stop(_) => "stop",
         };
         if actual != step_type {
             return false;
@@ -365,6 +430,79 @@ workflow: {
     fn missing_required_param_is_rejected() {
         let err = load_str(SAMPLE, &HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("taskId"), "{err}");
+    }
+
+    const CONTROL_FLOW: &str = r#"
+workflow: {
+    name: "route"
+    agents: {default: {harness: "fake"}}
+    steps: [
+        {type: "spawn", role: "rat", task: {title: "t"}},
+        {type: "wait"},
+        {type: "read", category: "artifact", identity: "review", field: "recommendation", into: "verdict"},
+        {
+            type: "repeat"
+            max:  3
+            steps: [
+                {type: "spawn", role: "reviewer", task: {title: "r"}},
+                {type: "wait"},
+                {type: "read", category: "artifact", identity: "review", field: "recommendation", into: "verdict"},
+                {
+                    type: "when"
+                    var:  "verdict"
+                    cases: {
+                        "APPROVE": [{type: "dismiss"}, {type: "break"}]
+                        "STOP": [{type: "dismiss", noMerge: true}, {type: "stop", reason: "reviewer STOP"}]
+                    }
+                    default: [{type: "dismiss", noMerge: true}]
+                },
+            ]
+        },
+    ]
+}
+"#;
+
+    #[test]
+    fn loads_read_when_repeat_break_stop() {
+        let wf = load_str(CONTROL_FLOW, &HashMap::new()).unwrap();
+        assert_eq!(wf.steps.len(), 4);
+        let Step::Read(read) = &wf.steps[2] else {
+            panic!("step 2 should be read");
+        };
+        assert_eq!(read.category, "artifact");
+        assert_eq!(read.field.as_deref(), Some("recommendation"));
+        assert_eq!(read.into, "verdict");
+        // read timeout defaulted.
+        assert_eq!(read.timeout, "5m");
+
+        let Step::Repeat(repeat) = &wf.steps[3] else {
+            panic!("step 3 should be repeat");
+        };
+        assert_eq!(repeat.max, 3);
+        assert_eq!(repeat.steps.len(), 4);
+        let Step::When(when) = &repeat.steps[3] else {
+            panic!("nested step 3 should be when");
+        };
+        assert_eq!(when.var, "verdict");
+        // APPROVE case ends in a break; STOP case ends in a stop.
+        assert!(matches!(when.cases["APPROVE"].last().unwrap(), Step::Break));
+        assert!(matches!(
+            when.cases["STOP"].last().unwrap(),
+            Step::Stop(s) if s.reason.as_deref() == Some("reviewer STOP")
+        ));
+        assert!(matches!(when.default.first().unwrap(), Step::Dismiss(_)));
+    }
+
+    #[test]
+    fn repeat_max_over_cap_is_rejected() {
+        let bad = r#"
+workflow: {
+    name: "loopy"
+    steps: [{type: "repeat", max: 101, steps: [{type: "gate", gateType: "timer", duration: "1s"}]}]
+}
+"#;
+        let err = load_str(bad, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("cue export failed"), "{err}");
     }
 
     #[test]
