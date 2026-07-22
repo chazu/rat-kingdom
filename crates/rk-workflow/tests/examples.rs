@@ -22,9 +22,13 @@ fn all_shipped_examples_load() {
         "expected shipped examples in {}",
         dir.display()
     );
+    // Cover every required-without-default param across the shipped set so the
+    // loader reaches the schema check for each example rather than bailing on a
+    // missing input.
     let inputs = HashMap::from([
         ("taskId".to_string(), json!("example-task")),
         ("description".to_string(), json!("example description")),
+        ("question".to_string(), json!("How does the tuplespace work?")),
     ]);
     for def in defs {
         let workflow = rk_workflow::load(&def, &inputs)

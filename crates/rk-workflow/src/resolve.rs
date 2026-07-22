@@ -27,6 +27,30 @@ pub fn resolve(
     global_agents: &HashMap<String, AgentProfile>,
     global_default_harness: &str,
 ) -> rk_core::Result<ResolvedAgent> {
+    resolve_fields(
+        step.agent.as_deref(),
+        step.harness.as_deref(),
+        step.model.as_deref(),
+        step.permission_mode.as_deref(),
+        workflow_agents,
+        global_agents,
+        global_default_harness,
+    )
+}
+
+/// Resolution over the raw agent-selection fields, shared by [`resolve`] (for
+/// spawn steps) and the fan-out step, which carries the same fields but is not
+/// a [`SpawnStep`]. See the module docs for the layering rules.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_fields(
+    agent: Option<&str>,
+    step_harness: Option<&str>,
+    step_model: Option<&str>,
+    step_permission_mode: Option<&str>,
+    workflow_agents: &HashMap<String, AgentProfile>,
+    global_agents: &HashMap<String, AgentProfile>,
+    global_default_harness: &str,
+) -> rk_core::Result<ResolvedAgent> {
     // Layered profiles, least specific first.
     let mut layers: Vec<&AgentProfile> = Vec::new();
     if let Some(p) = global_agents.get("default") {
@@ -35,9 +59,9 @@ pub fn resolve(
     if let Some(p) = workflow_agents.get("default") {
         layers.push(p);
     }
-    if let Some(name) = &step.agent {
-        let global_named = global_agents.get(name);
-        let workflow_named = workflow_agents.get(name);
+    if let Some(name) = &agent {
+        let global_named = global_agents.get(*name);
+        let workflow_named = workflow_agents.get(*name);
         if global_named.is_none() && workflow_named.is_none() {
             return Err(rk_core::Error::other(format!(
                 "unknown agent profile '{name}' (not in workflow agents nor global [agents])"
@@ -66,14 +90,14 @@ pub fn resolve(
         }
     }
     // Inline step overrides beat everything.
-    if step.harness.is_some() {
-        harness = step.harness.clone();
+    if step_harness.is_some() {
+        harness = step_harness.map(String::from);
     }
-    if step.model.is_some() {
-        model = step.model.clone();
+    if step_model.is_some() {
+        model = step_model.map(String::from);
     }
-    if step.permission_mode.is_some() {
-        permission_mode = step.permission_mode.clone();
+    if step_permission_mode.is_some() {
+        permission_mode = step_permission_mode.map(String::from);
     }
 
     Ok(ResolvedAgent {

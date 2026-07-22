@@ -414,32 +414,66 @@ backlog" as one command instead of hand-launching a run per ticket. Combined
 with `backlog-groom` (which keeps the queue decomposed) it turns a well-groomed
 backlog directly into parallel fleet work.
 
-**Why not today:** the step list is static and single-active-agent. There is no
-way to (a) enumerate tickets at runtime and spawn one rat each, or (b) wait for
-several agents to finish (join). `wait` only tracks the most-recent spawn.
+**Why it wasn't expressible before:** the step list was static and
+single-active-agent. There was no way to (a) enumerate tickets at runtime and
+spawn one rat each, or (b) wait for several agents to finish (join). `wait` only
+tracked the most-recent spawn.
 
-**Primitives to add:**
+**Status: implemented.** Two step types were added — `for_each` (dynamic
+fan-out) and `wait_all` (parallel join) — plus the `backlog-drain` example
+workflow. See `crates/rk-workflow/src/{lib,schema.cue}.rs`,
+`crates/rk-daemon/src/workflow_exec.rs`, and
+`crates/rk-daemon/tests/backlog_drain.rs`.
 
-- **dynamic fan-out** — a `spawn` variant driven by a tuplespace/ticket query,
-  e.g. `forEach: {query: "ticket status=ready", limit: N}` spawning one agent
-  per match with the ticket bound into the task template.
-- **parallel join** — a `waitAll` step that blocks until every agent spawned in
-  the current fan-out has emitted its `harness_result`, aggregating results into
-  `ctx` for a final `evaluate`.
+**Design decision — the single-active-agent invariant is preserved, not
+generalised.** Rather than widening `ctx.active_agent` into a list (which would
+have forced every sequential step — `wait`, `dismiss`, `interpolate` — to reason
+about a set), the fan-out gets its **own** context slot: `ctx.fanout:
+Vec<FannedAgent>`, populated by `for_each` and consumed by `wait_all`. Sequential
+workflows keep using `active_agent` unchanged; parallel workflows use the fan-out
+set. The two paths never interleave, so the deepest risk in this ticket — a
+half-migrated executor — never materialises. This is the cheaper of the two
+answers to the open question below, and the extra field is strictly additive.
 
-**Sketch (illustrative):**
+**How it works:**
 
+- **`for_each`** resolves a ticket query (`status` defaults to `ready` —
+  dependency-aware readiness — scoped to the workflow's own repo, capped by
+  `limit`), then spawns one agent per ticket with the same agent-resolution as a
+  `spawn` step. The task title defaults to `{{item.id}}` so the supervisor drives
+  each ticket's status lifecycle (→ `done`/`closed`) exactly as for any
+  ticket-dispatched rat; `{{item.title}}` / `{{item.body}}` bind the body. Each
+  rat gets its own branch off the base — fan-out never chains onto
+  `ctx.active_branch`. It deliberately does **not** pre-claim tickets
+  (`in_progress`): writing status here would race the supervisor's
+  fire-and-forget `done` write on fast completions (see open questions).
+- **`wait_all`** blocks until every agent in the fan-out set has emitted its
+  `harness_result` (one shared deadline; the step fails if any is still running
+  when it elapses), then aggregates into `ctx.previousResult`:
+  `{count, ok, errors, all_ok, results}`. A following `evaluate` asserts against
+  that summary — e.g. `expect: {all_ok: true}`.
+
+**Schema (as shipped):**
+
+```cue
+steps: [
+    {
+        type: "for_each"
+        query: {status: "ready", limit: _input.limit}   // limit default 5
+        role: "rat"
+        task: {
+            title:       "{{item.id}}"                    // default; drives ticket lifecycle
+            description: "Work {{item.id}}: {{item.title}}\n\n{{item.body}}"
+        }
+    },
+    {type: "wait_all", timeout: "45m"},
+    {type: "evaluate", expect: {all_ok: true}},
+]
 ```
-forEach ticket in (rk ticket list --status ready --limit 5):
-    spawn rat  { title: ticket.id, description: ticket.body }   // parallel
-waitAll timeout=45m
-evaluate { all: {is_error: false} }
-# each rat's own dismiss/merge is governed by solo-task semantics per branch
-```
 
-Fan-out is the largest engine change of the three (it touches the executor's
-one-active-agent assumption and the `wait` matcher), so it is the lowest-priority
-Tier-2 item despite being the flashiest operator lever.
+Branches are left parked per-rat for merge under solo-task semantics — this
+workflow runs the fleet in parallel; it does not auto-merge. A symmetric
+`dismiss_all` merge/cleanup primitive is a natural follow-up (see build order).
 
 ---
 
@@ -453,6 +487,10 @@ Tier-2 item despite being the flashiest operator lever.
 3. Add the **approval gate** and ship `gated-merge` — small, self-contained, and
    the schema already anticipates it.
 4. Add **fan-out + join** and ship `backlog-drain` — biggest change, do last.
+   **(Done.)** `for_each` + `wait_all` landed with the fan-out set held in its
+   own `ctx.fanout` slot (§7). A follow-up `dismiss_all` (parallel merge/cleanup
+   of a fan-out's branches) would make the primitive symmetric and let a drain
+   auto-merge instead of parking branches.
 
 ## Open questions
 
@@ -466,11 +504,15 @@ Tier-2 item despite being the flashiest operator lever.
   flexible but invite unbounded loops. A hard iteration cap should be mandatory
   either way, to preserve the "steps run once" safety property the executor
   currently guarantees for free.
-- **Fan-out and the single-active-agent model.** Parallel spawn breaks the
-  `ctx.active_agent` / `ctx.active_branch` invariant the whole executor is built
-  on (workflow_exec.rs:201–231). Does fan-out get a separate agent-set context,
-  or does the model generalise `active_agent` to a list? This is the deepest
-  design decision of the four.
+- **Fan-out and the single-active-agent model.** *Resolved (see §7):* fan-out
+  got a **separate** agent-set context (`ctx.fanout`) rather than generalising
+  `active_agent` to a list, so the sequential path is untouched. Two loose ends
+  remain: (1) **claiming** — the fan-out does not mark drained tickets
+  `in_progress`, because that write races the supervisor's fire-and-forget
+  `done` transition; guarding concurrent drains needs an atomic
+  open→in_progress claim the ticket store does not yet expose. (2) **merge** —
+  fanned branches are parked, not merged; a `dismiss_all` primitive would close
+  that gap.
 - **Approval-tuple plumbing.** What CLI/UX emits the approval tuple
   (`rk approve <instance>`?), how is it scoped to an instance+step, and what is
   the timeout/expiry policy when no human responds?
