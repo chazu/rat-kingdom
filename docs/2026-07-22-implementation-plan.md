@@ -1,5 +1,32 @@
 # rat-kingdom Implementation Plan
 
+## Status (updated 2026-07-22)
+
+- **P0 DONE** — workspace (rk-core/space/git/harness/daemon/cli), CI, config
+  (`RK_CONFIG_*` env — plain `RK_*` is reserved for runtime identity), lazy-spawn
+  daemon, `rk ping`.
+- **P1 DONE** — tuplespace with single-critical-section out/take/rd, one match
+  predicate everywhere (payload search = substring LIKE, deliberately not FTS),
+  stress-tested; sugar commands (done/obstacle/need/claim); `rk watch` streaming.
+- **P2 DONE** — Claude Code adapter (bidirectional stream-json), rk-git
+  (worktree-per-rat, temp-worktree merge w/ compare-and-swap update-ref),
+  supervisor (structural parent routing, crash detection, respawn+resume,
+  orphan-on-restart), CLI agent commands. **Live-validated with real Claude.**
+- **P3 IN PROGRESS** — Codex adapter DONE + live-validated (post-processor for
+  cumulative→delta usage and Completed-synthesis; sandbox mapping). Battle
+  fixes landed: per-child process groups, agent-context never auto-spawns
+  daemons, pid-verified stale-socket reclaim, stop waits for release.
+  REMAINING: axe adapter (axe not installed locally — parser+launch shape per
+  jrswab/axe docs, validate when installed), rk-mux herdr client (attach
+  surface), capability-driven fallbacks in supervisor (steer→resume for codex).
+- **P4–P7 NOT STARTED.** Next: P4 ledger (usage events already flow into
+  registry; needs pricing table + budgets + burn-rate anomalies), then P5
+  workflows (cuengine), P6 git-notes sync, P7 steward/top/polish.
+
+Known polish items: codex Completed.result sometimes empty (last agent_message
+not always present); `rk scan` positional args can't skip scope; consider
+`--allowedTools` support for tighter-than-bypass Claude spawns.
+
 Companion to `2026-07-22-imp-analysis-and-rat-kingdom-design.md`. Phases are
 tracer-bullet vertical slices: each ends with something runnable and useful on its
 own, and each de-risks the next. Crate names refer to the workspace layout in §9 of

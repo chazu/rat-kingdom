@@ -2,6 +2,7 @@
 //! protocols. No terminal scraping, no keystroke injection, no sleeps —
 //! completion and state are events, not pane contents.
 
+pub mod axe;
 pub mod claude;
 pub mod codex;
 pub mod fake;
@@ -109,6 +110,23 @@ enum KillSignal {
 }
 
 impl SessionControl {
+    /// A control handle for adapters with no stdin protocol: signals only.
+    pub(crate) fn signal_only(pid: Option<u32>) -> Self {
+        let (kill_tx, mut kill_rx) = mpsc::channel::<KillSignal>(4);
+        tokio::spawn(async move {
+            while let Some(sig) = kill_rx.recv().await {
+                match sig {
+                    KillSignal::Interrupt => send_group_signal(pid, SIGINT),
+                    KillSignal::Kill => send_group_signal(pid, SIGTERM),
+                }
+            }
+        });
+        Self {
+            steer_tx: None,
+            kill_tx,
+        }
+    }
+
     /// Send mid-session guidance. Errors if this harness cannot steer.
     pub async fn steer(&self, message: &str) -> rk_core::Result<()> {
         let Some(tx) = &self.steer_tx else {
@@ -142,6 +160,25 @@ impl SessionControl {
     }
 }
 
+pub(crate) const SIGINT: i32 = 2;
+pub(crate) const SIGTERM: i32 = 15;
+
+/// Signal a child's process group (children lead their own group via
+/// `process_group(0)`).
+pub(crate) fn send_group_signal(pid: Option<u32>, sig: i32) {
+    if let Some(pid) = pid {
+        // SAFETY: plain kill(2) on a process group we created.
+        unsafe {
+            libc_kill(-(pid as i32), sig);
+        }
+    }
+}
+
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+
 /// A coding-agent CLI adapter.
 pub trait Harness: Send + Sync {
     fn kind(&self) -> &'static str;
@@ -154,9 +191,10 @@ pub fn make_harness(kind: &str) -> rk_core::Result<Box<dyn Harness>> {
     match kind {
         "claude" => Ok(Box::new(claude::ClaudeHarness)),
         "codex" => Ok(Box::new(codex::CodexHarness)),
+        "axe" => Ok(Box::new(axe::AxeHarness)),
         "fake" => Ok(Box::new(fake::FakeHarness)),
         other => Err(rk_core::Error::other(format!(
-            "unknown harness kind: {other} (available: claude, codex, fake)"
+            "unknown harness kind: {other} (available: claude, codex, axe, fake)"
         ))),
     }
 }
@@ -245,8 +283,8 @@ pub(crate) mod runner {
                     }
                     sig = kill_rx.recv() => {
                         match sig {
-                            Some(KillSignal::Interrupt) => send_signal(pid, libc_sigint()),
-                            Some(KillSignal::Kill) => send_signal(pid, libc_sigterm()),
+                            Some(KillSignal::Interrupt) => crate::send_group_signal(pid, crate::SIGINT),
+                            Some(KillSignal::Kill) => crate::send_group_signal(pid, crate::SIGTERM),
                             None => {}
                         }
                     }
@@ -271,29 +309,5 @@ pub(crate) mod runner {
             },
             pid,
         })
-    }
-
-    fn send_signal(pid: Option<u32>, sig: i32) {
-        if let Some(pid) = pid {
-            // Negative pid = the child's whole process group (it leads its
-            // own group via process_group(0) above).
-            // SAFETY: plain kill(2) on a process group we created.
-            unsafe {
-                libc_kill(-(pid as i32), sig);
-            }
-        }
-    }
-
-    extern "C" {
-        #[link_name = "kill"]
-        fn libc_kill(pid: i32, sig: i32) -> i32;
-    }
-
-    fn libc_sigint() -> i32 {
-        2
-    }
-
-    fn libc_sigterm() -> i32 {
-        15
     }
 }
