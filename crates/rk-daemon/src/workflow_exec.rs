@@ -348,11 +348,29 @@ impl WorkflowEngine {
                                 rk_core::Error::other(format!("approval gate failed: {e}"))
                             })? {
                             Some(tuple) => tuple.payload,
-                            // Fail closed: no human response means no merge.
-                            None => json!({
-                                "approved": false,
-                                "reason": format!("no approval within {}", gate.timeout.as_deref().unwrap_or("24h")),
-                            }),
+                            None => {
+                                // Fail closed: no human response means no merge.
+                                // Record the synthetic decision as a
+                                // workflow_approval event too, so a following
+                                // `read`/`when` routes the timeout down the same
+                                // clean reject path as an explicit rejection —
+                                // rather than the read blocking on a tuple that
+                                // never arrives.
+                                let payload = json!({
+                                    "instance": id,
+                                    "approved": false,
+                                    "by": "system",
+                                    "reason": format!("no approval within {}", gate.timeout.as_deref().unwrap_or("24h")),
+                                });
+                                let _ = self.space.out(rk_core::tuple::Tuple::new(
+                                    Category::Event,
+                                    repo_name_of(repo),
+                                    "workflow_approval",
+                                    "system".to_string(),
+                                    payload.clone(),
+                                ));
+                                payload
+                            }
                         };
                         self.update(id, |i| {
                             i.context.previous_result = Some(decision);
