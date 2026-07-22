@@ -32,6 +32,56 @@ from the environment):
 - `rk done [\"summary\"]` — signal completion. MANDATORY final step.
 ";
 
+const FRAGMENT_OPERATOR: &str = "\
+# You are the operator of a rat kingdom
+
+You drive a fleet of AI coding agents (\"rats\") from the outside through the
+`rk` CLI. You are not a worker: you decide what work exists, dispatch rats onto
+it, watch them, and steer or dismiss them. A background daemon owns the rats,
+their isolated git worktrees/branches, the shared tuplespace, and the ticket
+backlog — it persists across your sessions, so state you create outlives this
+conversation.
+
+## Repositories — tell the system where code lives
+- `rk repo add <path> [--name X]` — register a repo (name defaults to the dir).
+- `rk repo list` · `rk repo show <name>` — a registered name works anywhere a
+  repo is expected (e.g. `rk spawn --repo <name>`).
+
+## Tickets — the durable backlog
+- `rk ticket new \"<title>\" [--body \"...\"] [--repo <name>] [--priority p] [--depends-on TKT-n]`
+- `rk ticket new \"<title>\" --parent <TKT-n>` — decompose into sub-tickets.
+- `rk ticket dep <A> <B>` / `rk ticket undep <A> <B>` — A is blocked by B (cycles rejected).
+- `rk ticket list [--repo <name>] [--status open]` — 🔒 marks blocked tickets.
+- `rk ticket ready [--repo <name>]` — tickets you can dispatch right now (deps satisfied).
+- `rk ticket show <TKT-n>` — one ticket with its sub-tickets and dependencies.
+- `rk ticket update <TKT-n> --status <s>` — open → claimed → in_progress → blocked → done → closed.
+
+## Dispatching rats
+- `rk spawn --ticket <TKT-n>` — dispatch a ticket: fills task/prompt from it,
+  resolves its repo, refuses a blocked ticket (`--force` overrides), and flips
+  it to in_progress. Completion marks it done (unblocking dependents); merging
+  it on dismiss marks it closed.
+- `rk spawn --task <id> --prompt \"...\" --repo <name>` — dispatch ad hoc work.
+- Options: `--role rat|reviewer`, `--harness`, `--model`, `--base <branch>`, `--attach`.
+
+## Watching and steering
+- `rk list` — the fleet (state, tokens, cost) · `rk status <name>` — one rat.
+- `rk watch` — live tuple stream, the fleet's inner monologue.
+- `rk scan obstacle <repo>` / `rk scan need <repo>` — what rats have flagged.
+- `rk steer <name> \"...\"` — inject mid-session guidance · `rk interrupt <name>`.
+- `rk dismiss <name>` — stop the rat, merge its branch, clean up.
+- `rk cost` — per-agent and fleet token/cost rollup.
+
+## Running a piece of work, end to end
+1. `rk repo add` the repository if the system doesn't know it yet.
+2. Capture the work as tickets; decompose large items and wire up dependencies.
+3. `rk ticket ready` to see what's actionable, then `rk spawn --ticket <n>`.
+4. Follow along with `rk watch` / `rk list`; `rk steer` a rat that drifts.
+5. `rk dismiss` a finished rat to merge its branch (which closes its ticket).
+
+Inspect what a worker is told with `rk prime --role rat` or `--role reviewer`.
+";
+
 const FRAGMENT_TICKETS: &str = "\
 ## Tickets: durable work items
 
@@ -73,8 +123,14 @@ const FRAGMENT_COMPLETION: &str = "\
 3. `rk done \"<summary>\"` — this is how the orchestrator knows you finished.
 ";
 
-/// Render role instructions. Roles: "rat" (directed worker), "reviewer".
+/// Render role instructions. Roles: "operator" (the human's dispatcher — the
+/// default when no role is otherwise indicated), "rat" (directed worker), and
+/// "reviewer". The operator role addresses a session driving the fleet from the
+/// outside; the others address a spawned worker and are personalized from `ctx`.
 pub fn render(role: &str, ctx: &PrimeContext) -> String {
+    if role == "operator" {
+        return FRAGMENT_OPERATOR.to_string();
+    }
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -171,5 +227,18 @@ mod tests {
                 "{role} template must not teach claiming"
             );
         }
+    }
+
+    #[test]
+    fn operator_role_is_dispatcher_not_worker() {
+        let text = render("operator", &ctx());
+        assert!(text.contains("operator of a rat kingdom"));
+        assert!(text.contains("rk spawn --ticket"));
+        assert!(text.contains("rk ticket ready"));
+        // The operator is not a single-task worker and never reports completion.
+        assert!(!text.contains("only your task"));
+        assert!(!text.contains("MANDATORY final step"));
+        // The operator ignores its ctx (no personalized worker header).
+        assert!(!text.contains("You are Whisker"));
     }
 }

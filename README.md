@@ -67,6 +67,22 @@ rk out artifact $RK_REPO name --payload '{"...": "..."}'   # work products
 The daemon independently records `harness_result` events from the harness
 protocol, so even a rat that forgets `rk done` is tracked.
 
+## Priming a session
+
+`rk prime` prints the instructions for driving the system — point any LLM
+session (or your own `CLAUDE.md`) at it to learn the commands:
+
+```bash
+rk prime                 # operator: how to run the fleet (the default)
+rk prime --role rat      # what a worker rat is told
+rk prime --role reviewer # what a reviewer is told
+```
+
+With no `--role`, it renders the `operator` role — a session driving the fleet
+from the outside (repos, tickets, spawn, watch, steer, dismiss). Spawned rats
+carry `RK_ROLE`, so `rk prime` inside a rat automatically renders that rat's
+own role instead.
+
 ## The tuplespace
 
 Coordination substrate and audit log in one. Tuples are

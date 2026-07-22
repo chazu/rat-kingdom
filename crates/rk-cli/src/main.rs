@@ -79,6 +79,13 @@ enum Command {
     },
     /// List castles seen in the shared tuplespace.
     Peers,
+    /// Print role instructions for the system. Defaults to the `operator` role
+    /// unless RK_ROLE (set on spawned rats) indicates otherwise.
+    Prime {
+        /// Role to render: operator | rat | reviewer. Overrides RK_ROLE.
+        #[arg(long)]
+        role: Option<String>,
+    },
     /// Register and inspect repositories the system knows about.
     Repo {
         #[command(subcommand)]
@@ -375,6 +382,30 @@ async fn main() -> Result<()> {
                 for p in result["peers"].as_array().cloned().unwrap_or_default() {
                     println!("{}", p.as_str().unwrap_or("?"));
                 }
+            }
+        }
+        Command::Prime { role } => {
+            // Explicit --role wins; otherwise a spawned rat's RK_ROLE; otherwise
+            // the operator (a session driving the fleet from outside).
+            let role = role
+                .or_else(|| std::env::var("RK_ROLE").ok())
+                .unwrap_or_else(|| "operator".to_string());
+            const ROLES: [&str; 3] = ["operator", "rat", "reviewer"];
+            if !ROLES.contains(&role.as_str()) {
+                anyhow::bail!("unknown role '{role}' (expected: {})", ROLES.join(", "));
+            }
+            let ctx = rk_core::prime::PrimeContext {
+                agent: std::env::var("RK_AGENT").unwrap_or_default(),
+                repo: std::env::var("RK_REPO").unwrap_or_default(),
+                task: std::env::var("RK_TASK").ok(),
+                branch: std::env::var("RK_BRANCH").ok(),
+                parent: std::env::var("RK_PARENT").ok(),
+            };
+            let text = rk_core::prime::render(&role, &ctx);
+            if cli.json {
+                println!("{}", json!({ "role": role, "prime": text }));
+            } else {
+                print!("{text}");
             }
         }
         Command::Repo { command } => match command {

@@ -154,7 +154,14 @@ impl Supervisor {
             .clone()
             .unwrap_or_else(|| format!("Work on task {}. Begin now.", params.task));
 
-        let mut env = self.agent_env(&name, &repo_name, &params.task, Some(&branch), &worktree);
+        let mut env = self.agent_env(
+            &name,
+            &params.role,
+            &repo_name,
+            &params.task,
+            Some(&branch),
+            &worktree,
+        );
         if let Some(parent) = &params.parent {
             env.insert("RK_PARENT".into(), parent.clone());
         }
@@ -391,6 +398,7 @@ impl Supervisor {
 
         let env = self.agent_env(
             &record.name,
+            &record.role,
             &record.repo_name,
             &task,
             record.branch.as_deref(),
@@ -738,6 +746,7 @@ impl Supervisor {
     fn agent_env(
         &self,
         name: &str,
+        role: &str,
         repo_name: &str,
         task: &str,
         branch: Option<&str>,
@@ -746,6 +755,8 @@ impl Supervisor {
         let mut env = HashMap::new();
         env.insert("RK_HOME".into(), self.layout.home().display().to_string());
         env.insert("RK_AGENT".into(), name.to_string());
+        // So `rk prime` inside the rat renders this rat's own role automatically.
+        env.insert("RK_ROLE".into(), role.to_string());
         env.insert("RK_REPO".into(), repo_name.to_string());
         env.insert("RK_TASK".into(), task.to_string());
         if let Some(branch) = branch {
