@@ -7,6 +7,8 @@ members = [
     "crates/rk-harness",
     "crates/rk-ledger",
     "crates/rk-sync",
+    "crates/rk-workflow",
+    "crates/rk-mux",
     "crates/rk-daemon",
     "crates/rk-cli",
 ]
@@ -25,6 +27,8 @@ rk-git = { path = "crates/rk-git" }
 rk-harness = { path = "crates/rk-harness" }
 rk-ledger = { path = "crates/rk-ledger" }
 rk-sync = { path = "crates/rk-sync" }
+rk-workflow = { path = "crates/rk-workflow" }
+rk-mux = { path = "crates/rk-mux" }
 rk-daemon = { path = "crates/rk-daemon" }
 
 anyhow = "1"

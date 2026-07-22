@@ -28,29 +28,51 @@ pub struct Daemon {
     supervisor: Arc<crate::supervisor::Supervisor>,
     syncer: Option<Arc<crate::sync::Syncer>>,
     sync_interval: Duration,
+    global_agents: std::collections::HashMap<String, rk_workflow::AgentProfile>,
+    default_harness: String,
+    engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
     started: Instant,
     shutdown_tx: watch::Sender<bool>,
 }
 
 impl Daemon {
-    pub fn new(
-        layout: Layout,
-        castle: String,
-        default_harness: String,
-        budget: rk_ledger::Budget,
-        sync: rk_core::config::SyncConfig,
-    ) -> rk_core::Result<Self> {
+    pub fn new(layout: Layout, config: &rk_core::config::Config) -> rk_core::Result<Self> {
         layout.ensure()?;
         let space = Space::open(&layout.db_path())?;
-        let mut daemon = Self::with_space(layout, castle, default_harness, budget, space)?;
-        if sync.enabled {
+        let budget = rk_ledger::Budget {
+            max_usd: config.budget.max_usd,
+            max_tokens: config.budget.max_tokens,
+            warn_at: config.budget.warn_at,
+        };
+        let mut daemon = Self::with_space(
+            layout,
+            config.castle_name(),
+            config.harness.default.clone(),
+            budget,
+            space,
+        )?;
+        daemon.global_agents = config
+            .agents
+            .iter()
+            .map(|(name, p)| {
+                (
+                    name.clone(),
+                    rk_workflow::AgentProfile {
+                        harness: p.harness.clone(),
+                        model: p.model.clone(),
+                        permission_mode: p.permission_mode.clone(),
+                    },
+                )
+            })
+            .collect();
+        if config.sync.enabled {
             let syncer = crate::sync::Syncer::new(
                 &daemon.layout,
                 &daemon.castle,
-                sync.remote_url.as_deref(),
+                config.sync.remote_url.as_deref(),
             )?;
             daemon.syncer = Some(Arc::new(syncer));
-            daemon.sync_interval = Duration::from_secs(sync.interval_secs.max(5));
+            daemon.sync_interval = Duration::from_secs(config.sync.interval_secs.max(5));
         }
         Ok(daemon)
     }
@@ -89,7 +111,7 @@ impl Daemon {
         let supervisor = Arc::new(crate::supervisor::Supervisor::new(
             layout.clone(),
             castle.clone(),
-            default_harness,
+            default_harness.clone(),
             budget,
             space.clone(),
         )?);
@@ -101,6 +123,9 @@ impl Daemon {
             supervisor,
             syncer: None,
             sync_interval: Duration::from_secs(30),
+            global_agents: Default::default(),
+            default_harness,
+            engine: std::sync::OnceLock::new(),
             started: Instant::now(),
             shutdown_tx,
         })
@@ -231,6 +256,18 @@ impl Daemon {
         Ok(())
     }
 
+    fn engine(&self) -> Arc<crate::workflow_exec::WorkflowEngine> {
+        Arc::clone(self.engine.get_or_init(|| {
+            Arc::new(crate::workflow_exec::WorkflowEngine::new(
+                self.layout.clone(),
+                Arc::clone(&self.supervisor),
+                self.space.clone(),
+                self.global_agents.clone(),
+                self.default_harness.clone(),
+            ))
+        }))
+    }
+
     async fn serve_conn(&self, stream: UnixStream) -> std::io::Result<()> {
         let (read, mut write) = stream.into_split();
         let mut lines = BufReader::new(read).lines();
@@ -338,6 +375,43 @@ impl Daemon {
                         Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
                     },
                 )
+            }
+            "workflow.run" => {
+                let params: WorkflowRunParams = match parse_params(&req.params) {
+                    Ok(p) => p,
+                    Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
+                };
+                reply(
+                    match self.engine().run(&params.name, &params.repo, params.params) {
+                        Ok(instance) => Response::ok(id, json!({"instance": instance})),
+                        Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
+                    },
+                )
+            }
+            "workflow.list" => reply(Response::ok(id, json!({"instances": self.engine().list()}))),
+            "workflow.status" => {
+                let params: NameParams = match parse_params(&req.params) {
+                    Ok(p) => p,
+                    Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
+                };
+                reply(match self.engine().status(&params.name) {
+                    Some(instance) => Response::ok(id, json!({"instance": instance})),
+                    None => Response::err(
+                        id,
+                        codes::INTERNAL,
+                        format!("no such instance: {}", params.name),
+                    ),
+                })
+            }
+            "workflow.definitions" => {
+                let params: WorkflowDefsParams = match parse_params(&req.params) {
+                    Ok(p) => p,
+                    Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
+                };
+                reply(Response::ok(
+                    id,
+                    json!({"definitions": self.engine().definitions(&params.repo)}),
+                ))
             }
             "sync.now" => {
                 let Some(syncer) = self.syncer.clone() else {
@@ -512,6 +586,19 @@ struct OutParams {
 struct PatternParams {
     #[serde(flatten)]
     pattern: Pattern,
+}
+
+#[derive(Deserialize)]
+struct WorkflowRunParams {
+    name: String,
+    repo: String,
+    #[serde(default)]
+    params: std::collections::HashMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct WorkflowDefsParams {
+    repo: String,
 }
 
 #[derive(Deserialize)]

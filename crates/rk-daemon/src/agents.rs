@@ -47,6 +47,9 @@ pub struct AgentRecord {
     /// Spawning agent's name (None = spawned by a human).
     pub parent: Option<String>,
     pub session_id: Option<String>,
+    /// herdr target when running attached in a pane (attach-mode spawn).
+    #[serde(default)]
+    pub attach_target: Option<String>,
     pub pid: Option<u32>,
     pub state: AgentState,
     pub result: Option<String>,
@@ -162,6 +165,7 @@ mod tests {
             target_branch: "main".into(),
             parent: None,
             session_id: None,
+            attach_target: None,
             pid: Some(1234),
             state,
             result: None,

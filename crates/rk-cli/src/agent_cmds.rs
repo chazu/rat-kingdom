@@ -35,6 +35,9 @@ pub struct SpawnArgs {
     /// Harness permission mode (e.g. acceptEdits, bypassPermissions).
     #[arg(long)]
     pub permission_mode: Option<String>,
+    /// Run interactively in a herdr pane (human-attachable).
+    #[arg(long)]
+    pub attach: bool,
 }
 
 #[derive(Args)]
@@ -76,6 +79,7 @@ pub async fn spawn(layout: &Layout, args: SpawnArgs, as_json: bool) -> Result<()
                 "base": args.base,
                 "model": args.model,
                 "permission_mode": args.permission_mode,
+                "attach": args.attach,
             }),
         )
         .await?;
@@ -221,6 +225,24 @@ pub async fn respawn(layout: &Layout, args: NameArg, as_json: bool) -> Result<()
         println!("respawned {}", args.name);
     }
     Ok(())
+}
+
+/// Exec into the herdr attach for a running attach-mode rat.
+pub async fn attach(layout: &Layout, args: NameArg) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call("agent.status", json!({"name": args.name}))
+        .await?;
+    let Some(target) = result["agent"]["attach_target"].as_str() else {
+        anyhow::bail!(
+            "{} is not an attach-mode rat (spawn with --attach to get a herdr pane)",
+            args.name
+        );
+    };
+    use std::os::unix::process::CommandExt;
+    let argv = rk_mux::HerdrMux::attach_argv(target);
+    let err = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
+    Err(anyhow::anyhow!("failed to exec herdr attach: {err}"))
 }
 
 pub async fn cost(layout: &Layout, as_json: bool) -> Result<()> {

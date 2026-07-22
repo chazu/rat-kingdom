@@ -14,6 +14,17 @@ pub struct Config {
     pub harness: HarnessConfig,
     pub budget: BudgetConfig,
     pub sync: SyncConfig,
+    /// Named agent profiles: [agents.<name>] harness/model/permission_mode.
+    /// The "default" profile applies to all spawns that name no profile.
+    pub agents: std::collections::HashMap<String, AgentProfileConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AgentProfileConfig {
+    pub harness: Option<String>,
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
 }
 
 /// Multiplayer sync via git notes in the RK_HOME state repo.

@@ -66,6 +66,8 @@ enum Command {
     Dismiss(agent_cmds::DismissArgs),
     /// Relaunch a failed/orphaned agent in its preserved worktree.
     Respawn(agent_cmds::NameArg),
+    /// Attach interactively to an attach-mode rat's herdr pane.
+    Attach(agent_cmds::NameArg),
     /// Per-agent and fleet token/cost rollup.
     Cost,
     /// Multiplayer sync via git notes.
@@ -75,6 +77,34 @@ enum Command {
     },
     /// List castles seen in the shared tuplespace.
     Peers,
+    /// Run and inspect CUE-defined workflows.
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkflowCommand {
+    /// Run a workflow by name (or .cue path).
+    Run {
+        name: String,
+        /// Repository the workflow operates on.
+        #[arg(long, default_value = ".")]
+        repo: String,
+        /// Workflow parameters as key=value (repeatable).
+        #[arg(long = "param")]
+        params: Vec<String>,
+    },
+    /// List workflow instances.
+    List,
+    /// Show one instance.
+    Status { id: String },
+    /// List available workflow definitions.
+    Defs {
+        #[arg(long, default_value = ".")]
+        repo: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -122,20 +152,7 @@ async fn main() -> Result<()> {
         }
         Command::Daemon { command } => match command {
             DaemonCommand::Run => {
-                let budget = rk_ledger::Budget {
-                    max_usd: config.budget.max_usd,
-                    max_tokens: config.budget.max_tokens,
-                    warn_at: config.budget.warn_at,
-                };
-                Daemon::new(
-                    layout,
-                    config.castle_name(),
-                    config.harness.default.clone(),
-                    budget,
-                    config.sync.clone(),
-                )?
-                .run()
-                .await?;
+                Daemon::new(layout, &config)?.run().await?;
             }
             DaemonCommand::Status => match Client::connect(&layout).await {
                 Ok(mut client) => {
@@ -196,6 +213,7 @@ async fn main() -> Result<()> {
         Command::Interrupt(args) => agent_cmds::interrupt(&layout, args, cli.json).await?,
         Command::Dismiss(args) => agent_cmds::dismiss(&layout, args, cli.json).await?,
         Command::Respawn(args) => agent_cmds::respawn(&layout, args, cli.json).await?,
+        Command::Attach(args) => agent_cmds::attach(&layout, args).await?,
         Command::Cost => agent_cmds::cost(&layout, cli.json).await?,
         Command::Sync { command } => match command {
             SyncCommand::Now => {
@@ -211,6 +229,77 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Command::Workflow { command } => {
+            let mut client = Client::connect_or_spawn(&layout).await?;
+            match command {
+                WorkflowCommand::Run { name, repo, params } => {
+                    let repo = std::fs::canonicalize(&repo)?;
+                    let mut map = serde_json::Map::new();
+                    for pair in params {
+                        let (k, v) = pair.split_once('=').ok_or_else(|| {
+                            anyhow::anyhow!("--param must be key=value, got: {pair}")
+                        })?;
+                        map.insert(k.to_string(), json!(v));
+                    }
+                    let result = client
+                        .call(
+                            "workflow.run",
+                            json!({"name": name, "repo": repo.to_string_lossy(), "params": map}),
+                        )
+                        .await?;
+                    if cli.json {
+                        println!("{}", result["instance"]);
+                    } else {
+                        println!(
+                            "started {} ({} steps)",
+                            result["instance"]["id"].as_str().unwrap_or("?"),
+                            result["instance"]["total_steps"]
+                        );
+                    }
+                }
+                WorkflowCommand::List => {
+                    let result = client.call("workflow.list", json!({})).await?;
+                    if cli.json {
+                        println!("{}", result["instances"]);
+                    } else {
+                        for i in result["instances"].as_array().cloned().unwrap_or_default() {
+                            println!(
+                                "{:14} {:12} {:10} step {}/{}",
+                                i["id"].as_str().unwrap_or("?"),
+                                i["workflow"].as_str().unwrap_or("?"),
+                                i["status"].as_str().unwrap_or("?"),
+                                i["current_step"],
+                                i["total_steps"],
+                            );
+                        }
+                    }
+                }
+                WorkflowCommand::Status { id } => {
+                    let result = client.call("workflow.status", json!({"name": id})).await?;
+                    println!("{}", result["instance"]);
+                }
+                WorkflowCommand::Defs { repo } => {
+                    let repo = std::fs::canonicalize(&repo)?;
+                    let result = client
+                        .call(
+                            "workflow.definitions",
+                            json!({"repo": repo.to_string_lossy()}),
+                        )
+                        .await?;
+                    if cli.json {
+                        println!("{}", result["definitions"]);
+                    } else {
+                        for d in result["definitions"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                        {
+                            println!("{}", d.as_str().unwrap_or("?"));
+                        }
+                    }
+                }
+            }
+        }
         Command::Peers => {
             let mut client = Client::connect_or_spawn(&layout).await?;
             let result = client.call("sync.peers", json!({})).await?;

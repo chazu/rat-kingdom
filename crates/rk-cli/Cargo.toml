@@ -14,7 +14,8 @@ path = "src/main.rs"
 [dependencies]
 rk-core.workspace = true
 rk-daemon.workspace = true
-rk-ledger.workspace = true
+rk-mux.workspace = true
+
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true

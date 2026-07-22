@@ -26,8 +26,20 @@
   rollup. Integration-tested with a runaway fake rat. REMAINING from P4:
   `rk pricing refresh` (live LiteLLM fetch), offline session-JSONL backfill,
   burn-rate/stuck anomaly detection.
-- **P5–P7 NOT STARTED.** P5 workflows (cuengine — NOTE: needs Go toolchain in
-  build, or `cue` CLI fallback), P6 git-notes sync, P7 steward/top/polish.
+- **P6 CORE DONE** (spiked early per the de-risk note) — rk-sync: per-actor
+  `refs/notes/rk/<castle>` (fast-forward-only pushes), ULID-keyed NDJSON
+  records, read-time union merge, deterministic earliest-wins claim
+  arbitration, castle-presence announcements. Daemon Syncer through a
+  dedicated `~/.rat-kingdom/sync` state repo: cursor-tracked export of durable
+  local tuples, fetch-first/push, import via `out_if_new` (wakes local
+  waiters), failures as system-scope obstacles. `rk sync now`, `rk peers`,
+  [sync] config + interval loop. Two-castle convergence tests pass.
+  REMAINING from P6: live multi-machine validation over a real remote,
+  Take-op export wiring (consume replication), per-actor history compaction,
+  Ed25519 castle identity (currently hostname).
+- **P5, P7 NOT STARTED; P3 herdr mux remaining.** P5 workflows (cuengine —
+  NOTE: needs Go toolchain in build, or `cue` CLI fallback), P7 steward/top/
+  polish.
 
 Known polish items: codex Completed.result sometimes empty (last agent_message
 not always present); `rk scan` positional args can't skip scope; consider

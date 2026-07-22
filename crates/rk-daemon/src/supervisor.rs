@@ -42,6 +42,10 @@ pub struct SpawnParams {
     pub model: Option<String>,
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// Run in a herdr pane (interactive, human-attachable) instead of
+    /// headless. Completion comes from the rat's own `rk done` tuple.
+    #[serde(default)]
+    pub attach: bool,
 }
 
 fn default_role() -> String {
@@ -168,6 +172,10 @@ impl Supervisor {
             resume_session: None,
         };
 
+        if params.attach {
+            return self.spawn_attached(params, repo, repo_name, name, branch, worktree, spec);
+        }
+
         let session = match harness.launch(&spec) {
             Ok(s) => s,
             Err(e) => {
@@ -190,6 +198,7 @@ impl Supervisor {
             target_branch,
             parent: params.parent.clone(),
             session_id: None,
+            attach_target: None,
             pid: session.pid,
             state: AgentState::Running,
             result: None,
@@ -215,6 +224,142 @@ impl Supervisor {
                 supervisor.handle_event(&name, event);
             }
         });
+
+        Ok(record)
+    }
+
+    /// Attach-mode spawn: the harness runs interactively in a herdr pane.
+    /// The daemon still owns the worktree/branch/registry; completion arrives
+    /// via the rat's own `rk done` tuple, and humans can attach any time.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_attached(
+        self: &Arc<Self>,
+        params: SpawnParams,
+        repo: Repo,
+        repo_name: String,
+        name: String,
+        branch: String,
+        worktree: std::path::PathBuf,
+        spec: LaunchSpec,
+    ) -> rk_core::Result<AgentRecord> {
+        if !rk_mux::HerdrMux::available() {
+            let _ = repo.remove_worktree(&worktree);
+            let _ = repo.delete_branch(&branch);
+            return Err(rk_core::Error::other(
+                "--attach needs a running herdr server (https://herdr.dev); \
+                 spawn headless or start herdr first",
+            ));
+        }
+        let harness_kind = params
+            .harness
+            .clone()
+            .unwrap_or_else(|| self.default_harness.clone());
+        let argv = rk_mux::interactive_argv(
+            &harness_kind,
+            spec.system_prompt.as_deref(),
+            spec.model.as_deref(),
+            spec.permission_mode.as_deref(),
+        )?;
+        let target = match rk_mux::HerdrMux::start_agent(&name, &worktree, &spec.env, &argv) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = repo.remove_worktree(&worktree);
+                let _ = repo.delete_branch(&branch);
+                return Err(e);
+            }
+        };
+
+        let record = AgentRecord {
+            name: name.clone(),
+            role: params.role.clone(),
+            harness: harness_kind,
+            model: params.model.clone(),
+            repo_root: repo.root().to_path_buf(),
+            repo_name: repo_name.clone(),
+            task: Some(params.task.clone()),
+            branch: Some(branch),
+            worktree: Some(worktree),
+            target_branch: match &params.base {
+                Some(b) => b.clone(),
+                None => repo.current_branch()?,
+            },
+            parent: params.parent.clone(),
+            session_id: None,
+            attach_target: Some(target.clone()),
+            pid: None,
+            state: AgentState::Running,
+            result: None,
+            usage: TokenUsage::default(),
+            cost_usd: 0.0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        self.lock_registry().insert(record.clone())?;
+        self.emit_event(
+            &repo_name,
+            "agent_spawned",
+            json!({"agent": name, "task": params.task, "role": params.role, "attached": true}),
+        );
+
+        // Deliver the initial prompt once herdr reports the TUI idle (its
+        // integration hook, not a sleep); fall back to sending anyway.
+        {
+            let target = target.clone();
+            let prompt = spec.prompt.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = std::process::Command::new("herdr")
+                    .args([
+                        "agent",
+                        "wait",
+                        &target,
+                        "--status",
+                        "idle",
+                        "--timeout",
+                        "30000",
+                    ])
+                    .output();
+                if let Err(e) = rk_mux::HerdrMux::send(&target, &prompt) {
+                    warn!(error = %e, "failed to deliver prompt to herdr pane");
+                }
+            });
+        }
+
+        // Completion watcher: the rat's `rk done` tuple is the signal.
+        {
+            let supervisor = Arc::clone(self);
+            let agent = name.clone();
+            let space = self.space.clone();
+            tokio::spawn(async move {
+                let mut pattern =
+                    rk_core::tuple::Pattern::category(Category::Event).identity("task_done");
+                pattern.payload_search = Some(format!("\"agent\":\"{agent}\""));
+                match space
+                    .rd(&pattern, std::time::Duration::from_secs(24 * 3600))
+                    .await
+                {
+                    Ok(Some(tuple)) => {
+                        let updated = supervisor.lock_registry().update(&agent, |r| {
+                            r.state = AgentState::Completed;
+                            r.result = tuple.payload["summary"]
+                                .as_str()
+                                .map(String::from)
+                                .or(Some("done".into()));
+                        });
+                        if let Ok(Some(record)) = updated {
+                            supervisor.route_completion(&record, false);
+                            rk_mux::HerdrMux::notify(
+                                &format!("{agent} finished"),
+                                record.result.as_deref().unwrap_or(""),
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        warn!(agent = %agent, "attach-mode completion watch timed out");
+                    }
+                    Err(e) => warn!(error = %e, "completion watch failed"),
+                }
+            });
+        }
 
         Ok(record)
     }
@@ -470,12 +615,22 @@ impl Supervisor {
     }
 
     pub async fn steer(&self, name: &str, message: &str) -> rk_core::Result<()> {
-        let control = self
-            .lock_controls()
+        let control = self.lock_controls().get(name).cloned();
+        if let Some(control) = control {
+            return control.steer(message).await;
+        }
+        // Attach-mode rats steer through their herdr pane.
+        let target = self
+            .lock_registry()
             .get(name)
-            .cloned()
-            .ok_or_else(|| rk_core::Error::other(format!("{name} has no live session")))?;
-        control.steer(message).await
+            .and_then(|r| r.attach_target.clone());
+        if let Some(target) = target {
+            let message = message.to_string();
+            return tokio::task::spawn_blocking(move || rk_mux::HerdrMux::send(&target, &message))
+                .await
+                .map_err(|e| rk_core::Error::other(e.to_string()))?;
+        }
+        Err(rk_core::Error::other(format!("{name} has no live session")))
     }
 
     pub async fn interrupt(&self, name: &str) -> rk_core::Result<()> {
@@ -501,6 +656,9 @@ impl Supervisor {
             let _ = control.kill().await;
             // Give the child a moment to exit cleanly before touching git.
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        if let Some(target) = record.attach_target.clone() {
+            let _ = tokio::task::spawn_blocking(move || rk_mux::HerdrMux::close(&target)).await;
         }
 
         let repo = Repo::discover(&record.repo_root)?;

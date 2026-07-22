@@ -7,6 +7,7 @@ pub mod proto;
 pub mod server;
 pub mod supervisor;
 pub mod sync;
+pub mod workflow_exec;
 
 pub use client::{Client, WatchStream};
 pub use server::Daemon;
