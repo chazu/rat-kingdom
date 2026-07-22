@@ -144,16 +144,44 @@ pub fn load(file: &Path, inputs: &HashMap<String, Value>) -> rk_core::Result<Wor
 }
 
 /// Load from source text (see [`load`]).
+///
+/// Two-pass: params are exported first (they never reference `_input`) so
+/// declared defaults can be merged into the inputs before the full export —
+/// otherwise `_input.<param-with-default>` would be an unresolved reference.
 pub fn load_str(source: &str, inputs: &HashMap<String, Value>) -> rk_core::Result<Workflow> {
     let dir = tempfile_dir()?;
     std::fs::write(dir.join("schema.cue"), SCHEMA)?;
     std::fs::write(dir.join("workflow.cue"), ensure_package(source))?;
     std::fs::write(dir.join("input.cue"), render_inputs(inputs)?)?;
 
+    // Pass 1: declared params → required-check + defaults.
+    let params_json = cue_export(&dir, "workflow.params")?;
+    let params: HashMap<String, Param> = serde_json::from_str(&params_json)
+        .map_err(|e| rk_core::Error::other(format!("workflow params malformed: {e}")))?;
+    let mut effective = inputs.clone();
+    for (name, param) in &params {
+        if effective.contains_key(name) {
+            continue;
+        }
+        match &param.default {
+            Some(default) => {
+                effective.insert(name.clone(), default.clone());
+            }
+            None if param.required => {
+                std::fs::remove_dir_all(&dir).ok();
+                return Err(rk_core::Error::other(format!(
+                    "missing required workflow param: {name} (pass --param {name}=...)"
+                )));
+            }
+            None => {}
+        }
+    }
+    std::fs::write(dir.join("input.cue"), render_inputs(&effective)?)?;
+
+    // Pass 2: the full workflow with all inputs resolvable.
     let json = cue_export(&dir, "workflow")?;
     let mut workflow: Workflow = serde_json::from_str(&json)
         .map_err(|e| rk_core::Error::other(format!("workflow JSON did not match schema: {e}")))?;
-    validate_params(&workflow, inputs)?;
     workflow.steps = expand_aspects(workflow.steps, &workflow.aspects);
     std::fs::remove_dir_all(&dir).ok();
     Ok(workflow)
@@ -205,17 +233,6 @@ fn render_inputs(inputs: &HashMap<String, Value>) -> rk_core::Result<String> {
     }
     out.push_str("}\n");
     Ok(out)
-}
-
-fn validate_params(workflow: &Workflow, inputs: &HashMap<String, Value>) -> rk_core::Result<()> {
-    for (name, param) in &workflow.params {
-        if param.required && param.default.is_none() && !inputs.contains_key(name) {
-            return Err(rk_core::Error::other(format!(
-                "missing required workflow param: {name} (pass --param {name}=...)"
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn cue_export(dir: &Path, expr: &str) -> rk_core::Result<String> {
