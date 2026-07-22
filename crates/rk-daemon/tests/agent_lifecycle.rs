@@ -143,3 +143,61 @@ async fn spawn_complete_route_dismiss_merge() {
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
+
+/// A rat dispatched with a ticket id as its task closes the ticket's loop:
+/// completion → `done`, merge-on-dismiss → `closed`.
+#[tokio::test]
+async fn ticket_dispatched_rat_closes_its_ticket() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    // File a ticket, then dispatch a rat whose task IS that ticket id.
+    let ticket = client
+        .call("ticket.new", json!({"title": "do the thing", "scope": "svc"}))
+        .await
+        .unwrap();
+    let id = ticket["ticket"]["identity"].as_str().unwrap().to_string();
+
+    let spawned = client
+        .call(
+            "agent.spawn",
+            json!({
+                "repo": repo_dir.path().to_string_lossy(),
+                "task": id,
+                "harness": "fake",
+            }),
+        )
+        .await
+        .unwrap();
+    let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+
+    // On completion the ticket becomes `done`.
+    let mut done = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let t = client.call("ticket.get", json!({"id": id})).await.unwrap();
+        if t["ticket"]["payload"]["status"] == "done" {
+            done = true;
+            break;
+        }
+    }
+    assert!(done, "ticket was not marked done on completion");
+
+    // Dismiss with merge closes it for good.
+    let dismissed = client
+        .call("agent.dismiss", json!({"name": name}))
+        .await
+        .unwrap();
+    assert_eq!(dismissed["merged"], true);
+    let t = client.call("ticket.get", json!({"id": id})).await.unwrap();
+    assert_eq!(t["ticket"]["payload"]["status"], "closed");
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}

@@ -1,7 +1,9 @@
 //! `rk` — the rat-kingdom CLI.
 
 mod agent_cmds;
+mod repo_cmds;
 mod space_cmds;
+mod ticket_cmds;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -77,10 +79,97 @@ enum Command {
     },
     /// List castles seen in the shared tuplespace.
     Peers,
+    /// Print role instructions for the system. Defaults to the `operator` role
+    /// unless RK_ROLE (set on spawned rats) indicates otherwise.
+    Prime {
+        /// Role to render: operator | rat | reviewer. Overrides RK_ROLE.
+        #[arg(long)]
+        role: Option<String>,
+    },
+    /// Register and inspect repositories the system knows about.
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
+    /// Create, inspect, and update tickets (durable work items).
+    Ticket {
+        #[command(subcommand)]
+        command: TicketCommand,
+    },
     /// Run and inspect CUE-defined workflows.
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
+    },
+    /// Approve a workflow instance parked at an approval gate (lets it merge).
+    Approve(WorkflowDecisionArgs),
+    /// Reject a workflow instance parked at an approval gate (holds it unmerged).
+    Reject(WorkflowDecisionArgs),
+}
+
+#[derive(clap::Args)]
+struct WorkflowDecisionArgs {
+    /// Workflow instance id (from `rk workflow list`).
+    instance: String,
+    /// Who is making the decision (defaults to $RK_AGENT, $USER, or "operator").
+    #[arg(long)]
+    by: Option<String>,
+    /// Optional note recorded with the decision.
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum RepoCommand {
+    /// Register a repository (path is canonicalized; name defaults to its directory).
+    Add {
+        /// Path to the repository.
+        path: String,
+        /// Name to register it under (defaults to the directory name).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List registered repositories.
+    List,
+    /// Show one repository and its open tickets.
+    Show {
+        /// Registered repo name.
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TicketCommand {
+    /// File a new ticket.
+    New(ticket_cmds::NewArgs),
+    /// List tickets (filter by --repo, --status, --parent).
+    List(ticket_cmds::ListArgs),
+    /// Show one ticket and its sub-tickets.
+    Show {
+        /// Ticket id (e.g. TKT-12).
+        id: String,
+    },
+    /// Update a ticket's status or fields.
+    Update(ticket_cmds::UpdateArgs),
+    /// List open tickets whose dependencies are all satisfied (actionable now).
+    Ready {
+        /// Only tickets in this repo scope.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Declare that one ticket depends on (is blocked by) another.
+    Dep {
+        /// The blocked ticket.
+        id: String,
+        /// The ticket it depends on.
+        dep: String,
+    },
+    /// Remove a dependency edge.
+    Undep {
+        /// The blocked ticket.
+        id: String,
+        /// The dependency to remove.
+        dep: String,
     },
 }
 
@@ -121,6 +210,41 @@ enum DaemonCommand {
     Status,
     /// Stop the running daemon.
     Stop,
+}
+
+/// Emit a human approval decision for a workflow instance parked at an
+/// approval gate. The daemon writes the `workflow_approval` event the blocked
+/// gate is waiting on.
+async fn decide(
+    layout: &Layout,
+    args: WorkflowDecisionArgs,
+    approved: bool,
+    as_json: bool,
+) -> Result<()> {
+    let by = args
+        .by
+        .or_else(|| std::env::var("RK_AGENT").ok())
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "operator".to_string());
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call(
+            "workflow.approve",
+            json!({
+                "instance": args.instance,
+                "approved": approved,
+                "by": by,
+                "reason": args.reason,
+            }),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        let verb = if approved { "approved" } else { "rejected" };
+        println!("{verb} {}", args.instance);
+    }
+    Ok(())
 }
 
 fn init_tracing(config: &Config) {
@@ -300,6 +424,8 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Approve(args) => decide(&layout, args, true, cli.json).await?,
+        Command::Reject(args) => decide(&layout, args, false, cli.json).await?,
         Command::Peers => {
             let mut client = Client::connect_or_spawn(&layout).await?;
             let result = client.call("sync.peers", json!({})).await?;
@@ -311,6 +437,50 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Prime { role } => {
+            // Explicit --role wins; otherwise a spawned rat's RK_ROLE; otherwise
+            // the operator (a session driving the fleet from outside).
+            let role = role
+                .or_else(|| std::env::var("RK_ROLE").ok())
+                .unwrap_or_else(|| "operator".to_string());
+            const ROLES: [&str; 3] = ["operator", "rat", "reviewer"];
+            if !ROLES.contains(&role.as_str()) {
+                anyhow::bail!("unknown role '{role}' (expected: {})", ROLES.join(", "));
+            }
+            let ctx = rk_core::prime::PrimeContext {
+                agent: std::env::var("RK_AGENT").unwrap_or_default(),
+                repo: std::env::var("RK_REPO").unwrap_or_default(),
+                task: std::env::var("RK_TASK").ok(),
+                branch: std::env::var("RK_BRANCH").ok(),
+                parent: std::env::var("RK_PARENT").ok(),
+            };
+            let text = rk_core::prime::render(&role, &ctx);
+            if cli.json {
+                println!("{}", json!({ "role": role, "prime": text }));
+            } else {
+                print!("{text}");
+            }
+        }
+        Command::Repo { command } => match command {
+            RepoCommand::Add { path, name } => {
+                repo_cmds::add(&layout, path, name, cli.json).await?
+            }
+            RepoCommand::List => repo_cmds::list(&layout, cli.json).await?,
+            RepoCommand::Show { name } => repo_cmds::show(&layout, name, cli.json).await?,
+        },
+        Command::Ticket { command } => match command {
+            TicketCommand::New(args) => ticket_cmds::new(&layout, args, cli.json).await?,
+            TicketCommand::List(args) => ticket_cmds::list(&layout, args, cli.json).await?,
+            TicketCommand::Show { id } => ticket_cmds::show(&layout, id, cli.json).await?,
+            TicketCommand::Update(args) => ticket_cmds::update(&layout, args, cli.json).await?,
+            TicketCommand::Ready { repo } => ticket_cmds::ready(&layout, repo, cli.json).await?,
+            TicketCommand::Dep { id, dep } => {
+                ticket_cmds::dep(&layout, id, dep, false, cli.json).await?
+            }
+            TicketCommand::Undep { id, dep } => {
+                ticket_cmds::dep(&layout, id, dep, true, cli.json).await?
+            }
+        },
     }
 
     Ok(())

@@ -1,7 +1,7 @@
 //! The rat-kingdom tuplespace: Linda primitives (`out`, `in`/`take`, `rd`,
 //! `scan`) with blocking reads and no lost wakeups.
 //!
-//! # Concurrency design (the imp lesson, fixed structurally)
+//! # Concurrency design (the predecessor's lesson, fixed structurally)
 //!
 //! One mutex guards both the store and the waiter list. `out` inserts the
 //! tuple, offers it to waiters, and (if consumed) deletes it — all under one
@@ -257,7 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn payload_search_waiter_wakes_via_same_predicate() {
-        // The imp regression case: a waiter whose pattern includes payload
+        // The predecessor's regression case: a waiter whose pattern includes payload
         // search must be woken by a matching write.
         let space = Space::open_in_memory().unwrap();
         let mut pattern = Pattern::default().identity("task_done");

@@ -60,6 +60,8 @@ pub struct Supervisor {
     /// Live control handles (not persisted; gone after restart).
     controls: Mutex<HashMap<String, SessionControl>>,
     space: Space,
+    /// Shared with the server so ticket-lifecycle writes serialize on one lock.
+    tickets: Arc<crate::tickets::Tickets>,
     pricing: PricingTable,
     budget: Budget,
     /// Agents already warned about budget (avoid repeat warnings).
@@ -73,6 +75,7 @@ impl Supervisor {
         default_harness: String,
         budget: Budget,
         space: Space,
+        tickets: Arc<crate::tickets::Tickets>,
     ) -> rk_core::Result<Self> {
         let registry = Registry::load(&layout.home().join("agents.json"))?;
         let mut pricing = PricingTable::vendored();
@@ -91,6 +94,7 @@ impl Supervisor {
             registry: Mutex::new(registry),
             controls: Mutex::new(HashMap::new()),
             space,
+            tickets,
             pricing,
             budget,
             budget_warned: Mutex::new(std::collections::HashSet::new()),
@@ -117,13 +121,17 @@ impl Supervisor {
             None => repo.current_branch()?,
         };
 
-        let name = {
-            let registry = self.lock_registry();
-            rk_core::names::next_name(registry.names_in_use())
-        };
+        // Reserve the name atomically: it stays claimed against concurrent
+        // spawns until `insert` records the rat (or a failure path below frees
+        // it). Picking without reserving let two near-simultaneous spawns grab
+        // the same name and collide on the worktree path.
+        let name = self.lock_registry().reserve_name();
         let branch = agent_branch(&name, &params.task);
         let worktree = self.layout.worktrees_dir().join(&repo_name).join(&name);
-        repo.create_worktree(&worktree, &branch, &target_branch)?;
+        if let Err(e) = repo.create_worktree(&worktree, &branch, &target_branch) {
+            self.lock_registry().release_name(&name);
+            return Err(e);
+        }
 
         let harness_kind = params
             .harness
@@ -134,6 +142,7 @@ impl Supervisor {
             Err(e) => {
                 let _ = repo.remove_worktree(&worktree);
                 let _ = repo.delete_branch(&branch);
+                self.lock_registry().release_name(&name);
                 return Err(e);
             }
         };
@@ -150,7 +159,14 @@ impl Supervisor {
             .clone()
             .unwrap_or_else(|| format!("Work on task {}. Begin now.", params.task));
 
-        let mut env = self.agent_env(&name, &repo_name, &params.task, Some(&branch), &worktree);
+        let mut env = self.agent_env(
+            &name,
+            &params.role,
+            &repo_name,
+            &params.task,
+            Some(&branch),
+            &worktree,
+        );
         if let Some(parent) = &params.parent {
             env.insert("RK_PARENT".into(), parent.clone());
         }
@@ -181,6 +197,7 @@ impl Supervisor {
             Err(e) => {
                 let _ = repo.remove_worktree(&worktree);
                 let _ = repo.delete_branch(&branch);
+                self.lock_registry().release_name(&name);
                 return Err(e);
             }
         };
@@ -245,6 +262,7 @@ impl Supervisor {
         if !rk_mux::HerdrMux::available() {
             let _ = repo.remove_worktree(&worktree);
             let _ = repo.delete_branch(&branch);
+            self.lock_registry().release_name(&name);
             return Err(rk_core::Error::other(
                 "--attach needs a running herdr server (https://herdr.dev); \
                  spawn headless or start herdr first",
@@ -265,6 +283,7 @@ impl Supervisor {
             Err(e) => {
                 let _ = repo.remove_worktree(&worktree);
                 let _ = repo.delete_branch(&branch);
+                self.lock_registry().release_name(&name);
                 return Err(e);
             }
         };
@@ -387,6 +406,7 @@ impl Supervisor {
 
         let env = self.agent_env(
             &record.name,
+            &record.role,
             &record.repo_name,
             &task,
             record.branch.as_deref(),
@@ -612,6 +632,22 @@ impl Supervisor {
                 warn!(error = %e, "failed to notify parent");
             }
         }
+        // A rat dispatched from a ticket closes that ticket's loop: a clean
+        // finish marks it done (which unblocks any dependents), an error leaves
+        // it in_progress for inspection. Fire-and-forget so completion routing
+        // is never held up by the ticket's serialization lock.
+        if !is_error {
+            if let Some(task) = record.task.clone() {
+                if task.starts_with(crate::tickets::ID_PREFIX) {
+                    let tickets = self.tickets.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = tickets.set_status(&task, "done").await {
+                            warn!(ticket = %task, error = %e, "failed to mark ticket done");
+                        }
+                    });
+                }
+            }
+        }
     }
 
     pub async fn steer(&self, name: &str, message: &str) -> rk_core::Result<()> {
@@ -687,6 +723,16 @@ impl Supervisor {
             r.state = AgentState::Dismissed;
             r.pid = None;
         })?;
+        // A merged ticket-rat closes its ticket for good.
+        if merged {
+            if let Some(task) = &record.task {
+                if task.starts_with(crate::tickets::ID_PREFIX) {
+                    if let Err(e) = self.tickets.set_status(task, "closed").await {
+                        warn!(ticket = %task, error = %e, "failed to close ticket on dismiss");
+                    }
+                }
+            }
+        }
         self.emit_event(
             &record.repo_name,
             "agent_dismissed",
@@ -708,6 +754,7 @@ impl Supervisor {
     fn agent_env(
         &self,
         name: &str,
+        role: &str,
         repo_name: &str,
         task: &str,
         branch: Option<&str>,
@@ -716,6 +763,8 @@ impl Supervisor {
         let mut env = HashMap::new();
         env.insert("RK_HOME".into(), self.layout.home().display().to_string());
         env.insert("RK_AGENT".into(), name.to_string());
+        // So `rk prime` inside the rat renders this rat's own role automatically.
+        env.insert("RK_ROLE".into(), role.to_string());
         env.insert("RK_REPO".into(), repo_name.to_string());
         env.insert("RK_TASK".into(), task.to_string());
         if let Some(branch) = branch {

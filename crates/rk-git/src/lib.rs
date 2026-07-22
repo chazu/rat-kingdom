@@ -152,14 +152,7 @@ impl Repo {
                             ),
                         });
                     }
-                    // Move the branch ref; any checked-out working tree of
-                    // target will see it on next status/pull.
-                    self.git(&[
-                        "update-ref",
-                        &format!("refs/heads/{target}"),
-                        merged_commit.trim(),
-                        target_before.trim(),
-                    ])?;
+                    self.advance_target(target, merged_commit.trim(), target_before.trim())?;
                     Ok(MergeOutcome {
                         merged: true,
                         detail: format!("merged {branch} into {target}"),
@@ -174,6 +167,31 @@ impl Repo {
         // Always clean up the temp worktree.
         let _ = self.git(&["worktree", "remove", "--force", &tmp.to_string_lossy()]);
         result
+    }
+
+    /// Advance `target` from `expected` to `merged` (a fast-forward — `merged`
+    /// descends from `expected`).
+    ///
+    /// If the operator has `target` checked out in the main worktree, moving
+    /// the ref alone leaves their index+working tree stale: the merged files
+    /// live in the new HEAD but not on disk, so `git status` reports them as
+    /// deleted. So when the root is on `target`, fast-forward it in place
+    /// (`merge --ff-only`), which advances the ref *and* refreshes the working
+    /// tree while preserving any uncommitted local edits. When it isn't (no
+    /// live checkout, or the operator has conflicting uncommitted work that a
+    /// fast-forward would refuse to touch), fall back to a bare ref move.
+    fn advance_target(&self, target: &str, merged: &str, expected: &str) -> rk_core::Result<()> {
+        let root_on_target = self.current_branch().ok().as_deref() == Some(target);
+        if root_on_target && self.git(&["merge", "--ff-only", merged]).is_ok() {
+            return Ok(());
+        }
+        self.git(&[
+            "update-ref",
+            &format!("refs/heads/{target}"),
+            merged,
+            expected,
+        ])?;
+        Ok(())
     }
 
     fn git(&self, args: &[&str]) -> rk_core::Result<String> {
@@ -278,10 +296,43 @@ mod tests {
         // main now contains the work.
         let log = git_in(dir.path(), &["log", "--oneline", "main"]).unwrap();
         assert!(log.contains("add feature"));
-        // The user's checkout of main was never touched mid-merge; their
-        // working tree updates on next checkout/pull, but the ref moved:
         let files = git_in(dir.path(), &["ls-tree", "--name-only", "main"]).unwrap();
         assert!(files.contains("feature.txt"));
+        // main is checked out at the root, so the merge must fast-forward the
+        // operator's working tree too — the file is on disk and status is
+        // clean (not a phantom "deleted" from a bare ref move).
+        assert!(dir.path().join("feature.txt").exists());
+        assert!(
+            git_in(dir.path(), &["status", "--porcelain"])
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "operator's working tree should be clean after auto-merge"
+        );
+    }
+
+    #[test]
+    fn merge_preserves_uncommitted_operator_work() {
+        let (dir, repo) = scratch_repo();
+        let wt = dir.path().join("wt-pip");
+        let branch = agent_branch("Pip", "task-3");
+        repo.create_worktree(&wt, &branch, "main").unwrap();
+
+        // Rat adds a new file on its branch.
+        std::fs::write(wt.join("rat.txt"), "cheese\n").unwrap();
+        run(&wt, &["add", "."]);
+        run(&wt, &["commit", "-m", "rat work"]);
+
+        // Operator has an uncommitted edit to an unrelated file at the root.
+        std::fs::write(dir.path().join("scratch.txt"), "wip\n").unwrap();
+
+        let outcome = repo.merge_branch(&branch, "main").unwrap();
+        assert!(outcome.merged, "{}", outcome.detail);
+
+        // The rat's file arrived AND the operator's uncommitted work survived.
+        assert!(dir.path().join("rat.txt").exists());
+        let scratch = std::fs::read_to_string(dir.path().join("scratch.txt")).unwrap();
+        assert_eq!(scratch, "wip\n");
     }
 
     #[test]

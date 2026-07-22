@@ -5,11 +5,6 @@ A multi-agent orchestration harness for AI coding agents, in Rust. Rats
 shared tuplespace, and are driven over their harnesses' structured protocols —
 no terminal scraping, no keystroke injection, no sleeps.
 
-Successor to [imp](https://github.com/chazu/imp)'s ideas with its failure
-modes fixed structurally; design rationale in
-`docs/2026-07-22-imp-analysis-and-rat-kingdom-design.md`, build status in
-`docs/2026-07-22-implementation-plan.md`.
-
 ## Requirements
 
 | What | Why | Required? |
@@ -67,6 +62,22 @@ rk out artifact $RK_REPO name --payload '{"...": "..."}'   # work products
 The daemon independently records `harness_result` events from the harness
 protocol, so even a rat that forgets `rk done` is tracked.
 
+## Priming a session
+
+`rk prime` prints the instructions for driving the system — point any LLM
+session (or your own `CLAUDE.md`) at it to learn the commands:
+
+```bash
+rk prime                 # operator: how to run the fleet (the default)
+rk prime --role rat      # what a worker rat is told
+rk prime --role reviewer # what a reviewer is told
+```
+
+With no `--role`, it renders the `operator` role — a session driving the fleet
+from the outside (repos, tickets, spawn, watch, steer, dismiss). Spawned rats
+carry `RK_ROLE`, so `rk prime` inside a rat automatically renders that rat's
+own role instead.
+
 ## The tuplespace
 
 Coordination substrate and audit log in one. Tuples are
@@ -83,6 +94,70 @@ rk in available myrepo --timeout 30s                     # destructive take
 
 Lifecycle classes: `furniture` (daemon-owned, unconsumable), `session`
 (default), `ephemeral` (`--ttl 5m`, GC'd).
+
+## Repos
+
+So the system knows where your repositories live, register them by name. The
+registry is machine-local (paths differ per castle) and is what lets you refer
+to a repo by name instead of a path elsewhere.
+
+```bash
+rk repo add ~/dev/rat-kingdom          # name defaults to the directory ("rat-kingdom")
+rk repo add ~/dev/other --name svc     # or name it explicitly
+rk repo list                           # NAME → PATH
+rk repo show rat-kingdom               # details + its open tickets
+```
+
+A registered name works anywhere a repo is expected, e.g. `rk spawn --repo rat-kingdom`.
+
+## Tickets
+
+Durable work items — a backlog you and the rats can create, read, and
+decompose. A ticket is a `task` tuple (`TKT-<n>`) that persists until closed,
+and — because it carries a repo *name*, not a path — it replicates across
+castles as a shared backlog through git-notes sync.
+
+```bash
+rk ticket new "Fix the login redirect loop" --repo svc --priority high
+rk ticket new "Add SSO" --body "SAML + OIDC" --parent TKT-1   # decompose into sub-tickets
+rk ticket list --repo svc --status open
+rk ticket show TKT-1                                          # details + sub-tickets
+rk ticket update TKT-3 --status in_progress --assignee Whisker
+```
+
+Statuses: `open → claimed → in_progress → blocked → done → closed`. Rats are
+primed to *file* or *decompose* tickets for follow-up work rather than starting
+it themselves — the orchestrator routes them.
+
+**Dependencies.** A ticket can be blocked by others (distinct from parent/child
+decomposition — this is a DAG of "must finish first" edges). Cycles are
+rejected.
+
+```bash
+rk ticket new "Build API" --depends-on TKT-1            # blocked-by at creation
+rk ticket dep TKT-3 TKT-2                               # TKT-3 is blocked by TKT-2
+rk ticket undep TKT-3 TKT-2                             # drop the edge
+rk ticket ready --repo svc                              # open tickets with all deps satisfied
+```
+
+`rk ticket list` marks blocked tickets with 🔒; `rk ticket show` annotates each
+dependency as satisfied (✓) or `blocking`. `rk spawn --ticket TKT-2` refuses a
+blocked ticket unless you pass `--force`, so `rk ticket ready` is the list of
+what you can actually dispatch right now.
+
+Dispatch a ticket straight to a rat — it fills the task and prompt from the
+ticket, resolves the repo from the ticket's scope, and flips the ticket to
+`in_progress`:
+
+```bash
+rk spawn --ticket TKT-3            # no hand-written --task/--prompt/--repo needed
+```
+
+The ticket's lifecycle then closes itself: when the rat finishes (its `rk done`,
+or the harness's own completion for a rat that forgets), the ticket moves to
+`done` — which **automatically unblocks any dependents** — and merging it on
+`rk dismiss` moves it to `closed`. A rat that errors leaves its ticket
+`in_progress` for inspection.
 
 ## Configuration (`~/.rat-kingdom/config.toml`)
 

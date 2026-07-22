@@ -59,6 +59,22 @@ pub enum Step {
     Evaluate(EvaluateStep),
     Dismiss(DismissStep),
     Gate(GateStep),
+    /// Lift the newest matching tuple's payload (or one field) into a ctx var.
+    Read(ReadStep),
+    /// Route on a ctx var: run the matching case's nested steps, else `default`.
+    When(WhenStep),
+    /// Bounded loop: run `steps` up to `max` times; `break` exits early.
+    Repeat(RepeatStep),
+    /// Exit the nearest enclosing `repeat`.
+    Break,
+    /// Abort the whole instance (failed) with an optional reason.
+    Stop(StopStep),
+    /// Dynamic fan-out: spawn one agent per matching ticket, in parallel.
+    ForEach(ForEachStep),
+    /// Parallel join: block until every fanned-out agent has completed.
+    WaitAll(WaitAllStep),
+    /// Parallel dismiss: merge/cleanup every fanned-out agent, clear the set.
+    DismissAll(DismissAllStep),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -99,6 +115,61 @@ fn default_wait_timeout() -> String {
     "10m".into()
 }
 
+/// Fan out one agent per matching ticket, all spawned in parallel. Populates
+/// the workflow's fan-out set, which a following [`WaitAllStep`] then joins on.
+/// Every agent-selection field (`agent`/`harness`/`model`/`permission_mode`)
+/// mirrors [`SpawnStep`] and resolves the same way. The `task` template binds
+/// per-ticket placeholders `{{item.id}}`, `{{item.title}}`, `{{item.body}}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForEachStep {
+    pub query: TicketQuery,
+    #[serde(default = "default_role")]
+    pub role: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    pub task: TaskDef,
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+/// Which tickets a fan-out enumerates. `status: "ready"` (the default) means
+/// open tickets whose dependencies are all satisfied; any other value filters
+/// by that literal ticket status. Scope is always the workflow's own repo.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TicketQuery {
+    #[serde(default = "default_query_status")]
+    pub status: String,
+    #[serde(default = "default_query_limit")]
+    pub limit: usize,
+}
+
+fn default_query_status() -> String {
+    "ready".into()
+}
+
+fn default_query_limit() -> usize {
+    5
+}
+
+/// Join step: block until every agent spawned by the preceding fan-out has
+/// emitted its `harness_result`, aggregating them into `ctx.previousResult`
+/// (`{count, ok, errors, all_ok, results}`) for a following `evaluate`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaitAllStep {
+    #[serde(default = "default_wait_all_timeout")]
+    pub timeout: String,
+}
+
+fn default_wait_all_timeout() -> String {
+    "45m".into()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvaluateStep {
     pub expect: Value,
@@ -110,11 +181,78 @@ pub struct DismissStep {
     pub no_merge: bool,
 }
 
+/// Dismiss every agent in the fan-out set in parallel — the fan-out counterpart
+/// to [`DismissStep`] over the single `active_agent`. Merges each parked branch
+/// (unless `no_merge`), then clears the fan-out set. Aggregates the per-agent
+/// outcomes into `ctx.previousResult` (`{count, merged, errors, all_merged,
+/// results}`) for a following `evaluate`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DismissAllStep {
+    #[serde(default, rename = "noMerge")]
+    pub no_merge: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GateStep {
     #[serde(rename = "gateType")]
     pub gate_type: String,
-    pub duration: String,
+    /// Timer gates: how long to sleep. Absent for approval gates.
+    #[serde(default)]
+    pub duration: Option<String>,
+    /// Approval gates: how long to wait for a human decision before failing
+    /// closed (not-approved). Absent for timer gates.
+    #[serde(default)]
+    pub timeout: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReadStep {
+    /// Tuple category to match (rendered as its snake_case name in CUE).
+    pub category: String,
+    /// Tuple identity to match.
+    pub identity: String,
+    /// Scope to match; defaults to the workflow's repo name at runtime.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Optional substring the serialized payload must contain.
+    #[serde(default)]
+    pub search: Option<String>,
+    /// JSON payload field to lift; whole payload if unset.
+    #[serde(default)]
+    pub field: Option<String>,
+    /// ctx variable name to store the value under.
+    pub into: String,
+    #[serde(default = "default_read_timeout")]
+    pub timeout: String,
+}
+
+fn default_read_timeout() -> String {
+    "5m".into()
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WhenStep {
+    /// ctx variable to switch on (as set by a prior `read`).
+    pub var: String,
+    /// Value -> nested steps. String values match by equality.
+    #[serde(default)]
+    pub cases: HashMap<String, Vec<Step>>,
+    /// Steps run when the value matches no case.
+    #[serde(default)]
+    pub default: Vec<Step>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepeatStep {
+    /// Hard iteration cap; the body runs at most this many times.
+    pub max: u32,
+    pub steps: Vec<Step>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StopStep {
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -260,7 +398,7 @@ fn tempfile_dir() -> rk_core::Result<PathBuf> {
     Ok(dir)
 }
 
-/// imp's aspect semantics, verbatim: per aspect in declaration order, splice
+/// The predecessor's aspect semantics, verbatim: per aspect in declaration order, splice
 /// `before`/`after` around every matching step; first aspect is innermost.
 pub fn expand_aspects(mut steps: Vec<Step>, aspects: &[Aspect]) -> Vec<Step> {
     for aspect in aspects {
@@ -287,6 +425,14 @@ fn step_matches(step: &Step, matcher: &AspectMatch) -> bool {
             Step::Evaluate(_) => "evaluate",
             Step::Dismiss(_) => "dismiss",
             Step::Gate(_) => "gate",
+            Step::Read(_) => "read",
+            Step::When(_) => "when",
+            Step::Repeat(_) => "repeat",
+            Step::Break => "break",
+            Step::Stop(_) => "stop",
+            Step::ForEach(_) => "for_each",
+            Step::WaitAll(_) => "wait_all",
+            Step::DismissAll(_) => "dismiss_all",
         };
         if actual != step_type {
             return false;
@@ -295,6 +441,7 @@ fn step_matches(step: &Step, matcher: &AspectMatch) -> bool {
     if let Some(role) = &matcher.role {
         match step {
             Step::Spawn(spawn) if &spawn.role == role => {}
+            Step::ForEach(fe) if &fe.role == role => {}
             _ => return false,
         }
     }
@@ -348,10 +495,36 @@ workflow: {
         // Aspect wove a timer gate after the rat spawn (and only there):
         // spawn(rat), gate, wait, evaluate, spawn(reviewer), wait, dismiss.
         assert_eq!(wf.steps.len(), 7);
-        assert!(matches!(&wf.steps[1], Step::Gate(g) if g.duration == "1s"));
+        assert!(matches!(&wf.steps[1], Step::Gate(g) if g.duration.as_deref() == Some("1s")));
         assert!(matches!(&wf.steps[4], Step::Spawn(s) if s.role == "reviewer"));
         // Workflow agent profiles parsed.
         assert_eq!(wf.agents["default"].model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn approval_gate_loads_with_default_timeout() {
+        let source = r#"
+workflow: {
+    name: "gated"
+    steps: [
+        {type: "spawn", task: {title: "t"}},
+        {type: "gate", gateType: "approval"},
+        {type: "gate", gateType: "approval", timeout: "1h"},
+        {type: "gate", gateType: "timer", duration: "5s"},
+    ]
+}
+"#;
+        let wf = load_str(source, &HashMap::new()).unwrap();
+        // Approval gate with no explicit timeout picks up the schema default.
+        assert!(
+            matches!(&wf.steps[1], Step::Gate(g) if g.gate_type == "approval" && g.timeout.as_deref() == Some("24h") && g.duration.is_none())
+        );
+        assert!(
+            matches!(&wf.steps[2], Step::Gate(g) if g.gate_type == "approval" && g.timeout.as_deref() == Some("1h"))
+        );
+        assert!(
+            matches!(&wf.steps[3], Step::Gate(g) if g.gate_type == "timer" && g.duration.as_deref() == Some("5s"))
+        );
     }
 
     #[test]
@@ -365,6 +538,100 @@ workflow: {
     fn missing_required_param_is_rejected() {
         let err = load_str(SAMPLE, &HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("taskId"), "{err}");
+    }
+
+    const CONTROL_FLOW: &str = r#"
+workflow: {
+    name: "route"
+    agents: {default: {harness: "fake"}}
+    steps: [
+        {type: "spawn", role: "rat", task: {title: "t"}},
+        {type: "wait"},
+        {type: "read", category: "artifact", identity: "review", field: "recommendation", into: "verdict"},
+        {
+            type: "repeat"
+            max:  3
+            steps: [
+                {type: "spawn", role: "reviewer", task: {title: "r"}},
+                {type: "wait"},
+                {type: "read", category: "artifact", identity: "review", field: "recommendation", into: "verdict"},
+                {
+                    type: "when"
+                    var:  "verdict"
+                    cases: {
+                        "APPROVE": [{type: "dismiss"}, {type: "break"}]
+                        "STOP": [{type: "dismiss", noMerge: true}, {type: "stop", reason: "reviewer STOP"}]
+                    }
+                    default: [{type: "dismiss", noMerge: true}]
+                },
+            ]
+        },
+    ]
+}
+"#;
+
+    #[test]
+    fn loads_read_when_repeat_break_stop() {
+        let wf = load_str(CONTROL_FLOW, &HashMap::new()).unwrap();
+        assert_eq!(wf.steps.len(), 4);
+        let Step::Read(read) = &wf.steps[2] else {
+            panic!("step 2 should be read");
+        };
+        assert_eq!(read.category, "artifact");
+        assert_eq!(read.field.as_deref(), Some("recommendation"));
+        assert_eq!(read.into, "verdict");
+        // read timeout defaulted.
+        assert_eq!(read.timeout, "5m");
+
+        let Step::Repeat(repeat) = &wf.steps[3] else {
+            panic!("step 3 should be repeat");
+        };
+        assert_eq!(repeat.max, 3);
+        assert_eq!(repeat.steps.len(), 4);
+        let Step::When(when) = &repeat.steps[3] else {
+            panic!("nested step 3 should be when");
+        };
+        assert_eq!(when.var, "verdict");
+        // APPROVE case ends in a break; STOP case ends in a stop.
+        assert!(matches!(when.cases["APPROVE"].last().unwrap(), Step::Break));
+        assert!(matches!(
+            when.cases["STOP"].last().unwrap(),
+            Step::Stop(s) if s.reason.as_deref() == Some("reviewer STOP")
+        ));
+        assert!(matches!(when.default.first().unwrap(), Step::Dismiss(_)));
+    }
+
+    #[test]
+    fn loads_dismiss_all() {
+        let source = r#"
+workflow: {
+    name: "drain-merge"
+    steps: [
+        {type: "for_each", query: {status: "ready", limit: 3}, task: {title: "{{item.id}}"}},
+        {type: "wait_all"},
+        {type: "dismiss_all"},
+        {type: "dismiss_all", noMerge: true},
+    ]
+}
+"#;
+        let wf = load_str(source, &HashMap::new()).unwrap();
+        assert_eq!(wf.steps.len(), 4);
+        // Default dismiss_all merges (no_merge defaults false).
+        assert!(matches!(&wf.steps[2], Step::DismissAll(d) if !d.no_merge));
+        // noMerge parked variant.
+        assert!(matches!(&wf.steps[3], Step::DismissAll(d) if d.no_merge));
+    }
+
+    #[test]
+    fn repeat_max_over_cap_is_rejected() {
+        let bad = r#"
+workflow: {
+    name: "loopy"
+    steps: [{type: "repeat", max: 101, steps: [{type: "gate", gateType: "timer", duration: "1s"}]}]
+}
+"#;
+        let err = load_str(bad, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("cue export failed"), "{err}");
     }
 
     #[test]
@@ -396,7 +663,8 @@ workflow: {
         let gate = |d: &str| {
             Step::Gate(GateStep {
                 gate_type: "timer".into(),
-                duration: d.into(),
+                duration: Some(d.into()),
+                timeout: None,
             })
         };
         let aspects = vec![
@@ -423,7 +691,7 @@ workflow: {
         let durations: Vec<&str> = woven
             .iter()
             .map(|s| match s {
-                Step::Gate(g) => g.duration.as_str(),
+                Step::Gate(g) => g.duration.as_deref().unwrap_or("?"),
                 Step::Spawn(_) => "SPAWN",
                 _ => "?",
             })

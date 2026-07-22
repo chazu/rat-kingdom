@@ -1,0 +1,567 @@
+# High-leverage workflows for the rat-kingdom library
+
+## Question
+
+What high-leverage workflows should rat-kingdom add to its workflow library?
+First study the existing workflow system — the CUE schema at
+`crates/rk-workflow/src/schema.cue` (step types spawn / wait / evaluate /
+dismiss / gate, agent profiles, aspects, and `ctx` / `_input` templating) and
+the shipped examples in `examples/workflows/` (solo-task, code-review,
+research). Then propose a set of new CUE-defined workflows that give the
+operator strong leverage over the rat fleet, prioritising **self-improvement
+loops**: workflows where the fleet improves its own code, workflows, prompts,
+or backlog. For each proposal give a name, one-line purpose, why it is
+high-leverage, and the concrete step sequence expressed with the existing
+primitives — noting any primitive that would have to be added.
+
+## Direct answer
+
+Add seven workflows, in two tiers:
+
+**Tier 1 — expressible today with zero engine changes** (ship these first):
+
+1. **`workflow-review`** — a rat audits the workflow library and proposes
+   refined CUE + tickets.
+2. **`backlog-groom`** — a rat decomposes, dedupes, and tags the ticket backlog.
+3. **`fix-then-verify`** — a fixer rat implements, an independent verifier rat
+   writes a regression test and confirms red→green before merge.
+4. **`prompt-refine`** — a rat mines obstacle/need tuples and failed runs to
+   propose edits to role prompts and convention tuples.
+
+**Tier 2 — high-value, but each needs one new primitive** (build the primitive,
+then ship):
+
+5. **`reviewer-drives-rework`** — a reviewer's APPROVE / REWORK / STOP verdict
+   *routes* the next action (merge, loop back to a rework rat, or abort).
+   Needs: **conditional branch** + **bounded loop** + a way for `evaluate` to
+   read the verdict.
+6. **`gated-merge`** — a rat implements, then work parks behind a **human
+   approval gate** before auto-merge. Needs: **approval gate** (already
+   anticipated in the schema).
+7. **`backlog-drain`** — fan out one solo-task rat per ready ticket, in
+   parallel, then join. Needs: **dynamic fan-out over a tuplespace query** +
+   **parallel join**.
+
+The four Tier-1 workflows are the highest-ROI thing to do *right now* because
+each closes a self-improvement loop (the fleet grooms its own backlog, refines
+its own prompts, audits its own workflows, and self-verifies its own fixes)
+using only `spawn / wait / evaluate / dismiss` — no engine work. Tier 2 is where
+the biggest operator leverage lives (routing, approval, fan-out), but each is
+gated on one specific, well-scoped primitive.
+
+## Evidence and reasoning
+
+### What the schema and runner actually support today
+
+Read of `crates/rk-workflow/src/schema.cue` and the executor at
+`crates/rk-daemon/src/workflow_exec.rs` (`execute`, lines 171–258) establishes
+the real semantics — not just the declared shape:
+
+- **`spawn`** launches an agent and sets `ctx.active_agent` and
+  `ctx.active_branch` (workflow_exec.rs:201–204). A later spawn bases its
+  worktree on `spawn.branch` **or** `ctx.active_branch` (line 196), so
+  successive spawns *chain onto the previous rat's branch*. This is exactly how
+  `code-review.cue` puts the reviewer on the implementer's branch.
+- **`wait`** blocks until a `harness_result` Event tuple for the active agent
+  appears, then stores that tuple's payload into `ctx.previousResult`
+  (workflow_exec.rs:206–231). It matches by `"agent":"<name>"` in the payload.
+- **`evaluate`** CUE-unifies `expect` against `ctx.previousResult` and requires
+  the result to be *concrete and valid*; **on failure it returns `Err`, which
+  fails the entire instance** (workflow_exec.rs:232–241, `unify_concrete`). It
+  is a hard gate, **not** a router — there is no "else" branch.
+- **`dismiss`** merges (or, with `noMerge`, keeps) the active agent's branch and
+  clears `active_agent`, but **leaves `active_branch` set** (workflow_exec.rs:
+  242–251). That residual branch is what lets the next spawn chain on.
+- **`gate`** only supports `gateType: "timer"` and simply sleeps
+  (workflow_exec.rs:252–254). The schema comment is explicit: *"Timer gate only
+  in v1 (human gates arrive with approval tuples)"* (schema.cue:101).
+- **`aspects`** splice `before` / `after` steps around matching steps at load
+  time (schema.cue:49–61) — a static, compile-time weave, not runtime control
+  flow.
+- **Templating**: `{{ctx.activeAgent}}`, `{{ctx.activeBranch}}`,
+  `{{ctx.previousResult}}` interpolate into step strings; `_input.<name>`
+  resolves parameters at load (schema.cue:5–9).
+
+Three consequences drive the tiering below:
+
+1. **There is no control flow.** Steps are a fixed linear list executed once
+   (`for (index, step) in workflow.steps` — workflow_exec.rs:172). No loops, no
+   conditionals, no jumps. `evaluate` can only *stop*, never *branch*.
+2. **`evaluate` can only see `previousResult`.** It cannot read arbitrary
+   tuples. Critically, `code-review.cue`'s reviewer records its verdict as an
+   **artifact tuple** (`rk out artifact … review`), which `evaluate` cannot
+   observe. So today a workflow *cannot branch on a review verdict* — it can
+   only park the branch for a human.
+3. **One active agent at a time.** `spawn` overwrites `active_agent`; `wait`
+   waits for whichever is current. There is no fan-out to N rats and no join.
+
+Everything expressible with a *fixed, linear chain of spawn/wait/evaluate/
+dismiss over chained branches* is Tier 1. Everything needing routing, looping,
+approval, or fan-out is Tier 2 and names its missing primitive.
+
+### Why self-improvement loops are the highest-leverage target
+
+The operator's leverage is a multiplier on fleet throughput and quality. A
+workflow that produces one feature is linear leverage. A workflow that improves
+the *backlog*, the *prompts*, the *workflows*, or the *verification bar*
+compounds: every future rat run benefits. That is why the four Tier-1 picks are
+all meta-workflows over the kingdom's own artifacts (workflows, tickets,
+prompts, fixes) rather than over product features.
+
+---
+
+## Tier 1 — ship today (no engine changes)
+
+### 1. `workflow-review`
+
+**Purpose:** a rat audits the workflow library and proposes refined CUE plus
+follow-up tickets.
+
+**Why high-leverage:** the workflows *are* the operator's control surface. A rat
+that reviews and sharpens them improves every future run routed through them —
+the definition of compounding leverage. It is also the fleet reasoning about its
+own coordination substrate.
+
+**Steps (all supported today):**
+
+```cue
+workflow: {
+	name:        "workflow-review"
+	description: "a rat audits the workflow library and proposes refined CUE + tickets"
+	params: {
+		focus: {type: "string", required: false, default: "all shipped workflows"}
+	}
+	agents: {default: {harness: "claude"}}
+	steps: [
+		{
+			type: "spawn"
+			role: "rat"
+			task: {
+				title: "review-workflows"
+				description: """
+					Read crates/rk-workflow/src/schema.cue and every file under
+					examples/workflows/. Focus: \(_input.focus).
+
+					For each workflow: assess correctness against the schema, missing
+					guardrails (evaluate/dismiss), and leverage. Where you can improve a
+					definition, write the revised .cue to docs/proposals/ (do NOT edit the
+					shipped files). File a ticket per substantive change:
+					  rk ticket new "<title>" --body "<rationale>"
+					Record a summary artifact:
+					  rk out artifact $RK_REPO workflow-review --payload '{"reviewed": N, "tickets": M}'
+					Commit your proposals, then report done.
+					"""
+			}
+		},
+		{type: "wait", timeout: "30m"},
+		{type: "evaluate", expect: {is_error: false}},
+		{type: "dismiss"},          // merge the proposals doc
+	]
+}
+```
+
+An optional second stage (spawn a cheap reviewer on the same branch to run
+`cue vet` / `rk workflow validate` on the proposed CUE, exactly as
+`code-review.cue` chains a reviewer) fits with no new primitives.
+
+### 2. `backlog-groom`
+
+**Purpose:** a rat decomposes oversized tickets, dedupes, tags, and closes stale
+items — improving the queue that feeds every other workflow.
+
+**Why high-leverage:** the backlog is the fleet's work-distribution medium. Task
+instructions already tell every rat to *file* tickets and *decompose* via
+`rk ticket new --parent`, but nothing grooms the result. A grooming loop keeps
+the queue decomposed into grabbable, dependency-ordered units, which raises the
+hit rate of *every* dispatch.
+
+**Steps (all supported today):**
+
+```cue
+workflow: {
+	name:        "backlog-groom"
+	description: "one rat decomposes, dedupes, and tags the ticket backlog"
+	params: {repo: {type: "string", required: false, default: ""}}
+	agents: {default: {harness: "claude"}}
+	steps: [
+		{
+			type: "spawn"
+			role: "rat"
+			task: {
+				title: "groom-backlog"
+				description: """
+					Read the open backlog:  rk ticket list --status open
+					For each oversized ticket, decompose it:
+					  rk ticket new "<sub>" --parent <TKT-id>
+					Merge duplicates (note the survivor in each), and flag stale items.
+					Do NOT start any ticket. Record what you changed:
+					  rk out artifact $RK_REPO backlog-groom --payload '{"decomposed": N, "deduped": M}'
+					Report done.
+					"""
+			}
+		},
+		{type: "wait", timeout: "20m"},
+		{type: "evaluate", expect: {is_error: false}},
+		{type: "dismiss", noMerge: true},   // no code change; ticket store mutated directly
+	]
+}
+```
+
+Grooming mutates the ticket store through the `rk ticket` CLI, not the
+worktree, so `dismiss noMerge` is correct — there is nothing to merge.
+
+### 3. `fix-then-verify`
+
+**Purpose:** a fixer rat implements a change; an independent verifier rat writes
+a regression test and confirms it goes red-before, green-after, then merges.
+
+**Why high-leverage:** it institutionalises the "prove the fix" discipline
+without a human in the loop, and does so with a *fresh* agent so the verification
+is independent of the fixer's assumptions. This is the single-pass, non-looping
+core of a fix/verify cycle — and it is fully expressible today because the
+verifier chains onto the fixer's branch.
+
+**Steps (all supported today):**
+
+```cue
+workflow: {
+	name:        "fix-then-verify"
+	description: "fixer implements; independent verifier writes a regression test and confirms red→green"
+	params: {
+		taskId: {type: "string", required: true}
+		description: {type: "string", required: false, default: ""}
+	}
+	agents: {
+		default:  {harness: "claude"}
+		verifier: {harness: "claude"}
+	}
+	steps: [
+		{
+			type: "spawn"
+			role: "rat"
+			task: {title: _input.taskId, description: _input.description}
+		},
+		{type: "wait", timeout: "30m"},
+		{type: "evaluate", expect: {is_error: false}},
+		{type: "dismiss", noMerge: true},          // keep branch for the verifier
+		{
+			type:  "spawn"
+			role:  "verifier"
+			agent: "verifier"
+			task: {
+				title: "verify-" + _input.taskId
+				description: """
+					You are on branch {{ctx.activeBranch}}. The task was: \(_input.description)
+					Independently verify the fix:
+					  1. Write or identify a regression test that FAILS on main.
+					  2. Confirm it PASSES on this branch.
+					  3. Run the full suite.
+					Commit the test. If verification fails, exit non-zero (is_error).
+					Report done.
+					"""
+			}
+		},
+		{type: "wait", timeout: "20m"},
+		{type: "evaluate", expect: {is_error: false}},   // hard gate: bad verify fails the run
+		{type: "dismiss"},                                // merge fix + regression test
+	]
+}
+```
+
+Note the leverage of the existing `evaluate` semantics: because a failed
+`evaluate` fails the whole instance, an unverifiable fix *does not merge*. The
+looping variant ("verifier fails → send it back to a rework rat") is **Tier 2**
+(`reviewer-drives-rework`), because the loop-back needs branching + iteration.
+
+### 4. `prompt-refine`
+
+**Purpose:** a rat mines `obstacle` / `need` tuples and failed workflow instances
+to propose edits to role prompts and `convention` tuples.
+
+**Why high-leverage:** prompts and conventions are the fleet's shared priors.
+Recurring obstacles are a direct signal that a prompt or convention is missing or
+wrong; folding those lessons back in reduces the *same* failure across all future
+rats. This is stigmergic self-improvement: the tuplespace already records the
+pain, so a rat can read it and close the loop.
+
+**Steps (all supported today):**
+
+```cue
+workflow: {
+	name:        "prompt-refine"
+	description: "mine obstacle/need tuples and failed runs; propose prompt + convention edits"
+	agents: {default: {harness: "claude"}}
+	steps: [
+		{
+			type: "spawn"
+			role: "rat"
+			task: {
+				title: "refine-prompts"
+				description: """
+					Scan recurring pain:
+					  rk scan obstacle ; rk scan need ; rk scan fact system
+					Cross-reference with recent workflow_failed events.
+					Where a recurring failure traces to a weak role prompt or a missing
+					convention, propose a concrete edit (write a diff/patch under
+					docs/proposals/prompts/) and, for durable rules, propose a convention:
+					  rk out artifact $RK_REPO convention-proposal --payload '{"rule": "...", "why": "..."}'
+					File a ticket for each proposed change. Do NOT edit live prompts.
+					Commit proposals, report done.
+					"""
+			}
+		},
+		{type: "wait", timeout: "25m"},
+		{type: "evaluate", expect: {is_error: false}},
+		{type: "dismiss"},
+	]
+}
+```
+
+---
+
+## Tier 2 — high leverage, each gated on one new primitive
+
+### 5. `reviewer-drives-rework`
+
+**Purpose:** a reviewer's APPROVE / REWORK / STOP verdict routes the next action
+— merge on APPROVE, loop back to a rework rat on REWORK (up to N rounds), abort
+on STOP.
+
+**Why high-leverage:** this is the canonical operator lever — a
+review→rework→re-review cycle that runs to a clean verdict without a human
+babysitting each round. It converts review from advisory (today's
+`code-review.cue` merely parks the branch) into *driving*.
+
+**Why it is not expressible today (three gaps):**
+
+- `evaluate` can only see `previousResult`, but the reviewer records its verdict
+  as an **artifact tuple** (`code-review.cue:52–54`). The workflow can't read it.
+- `evaluate` is a hard gate, not a router — it can't send APPROVE one way and
+  REWORK another.
+- There is no loop, so "re-review after rework, up to N times" can't be
+  expressed.
+
+**Primitives added (shipped — see `examples/workflows/reviewer-drives-rework.cue`
+and `crates/rk-daemon/src/workflow_exec.rs`):**
+
+- **(a) `read` step** — lifts the *newest* matching tuple from the space into a
+  ctx variable: `{type: "read", category: "artifact", identity: "review",
+  field: "recommendation", into: "verdict"}`. The reviewer records its verdict
+  exactly as `code-review.cue` already does (`rk out artifact <repo> review …`),
+  so nothing about the reviewer changes — the workflow can now *see* it. Newest
+  wins so each re-review round reads that round's verdict. Values land in
+  `ctx.vars` and interpolate as `{{ctx.var.<name>}}`.
+- **(b) `when` step** — routes on a ctx variable: `{type: "when", var:
+  "verdict", cases: {APPROVE: […], STOP: […], REWORK: […]}, default: […]}`. The
+  matching case's nested steps run in place; `default` catches unrecognised
+  values. It consults `ctx`, it never aborts.
+- **(c) `repeat` step** — a bounded loop `{type: "repeat", max: N, steps: […]}`
+  with a **mandatory hard cap** (schema enforces `1 <= max <= 100`). The body
+  runs at most `max` times; a nested `break` exits early. Two control steps
+  complete the set: `break` (exit the nearest `repeat`) and `stop` (fail the
+  instance — the STOP route).
+
+The executor stays a single linear pass; nested steps recurse through a small
+`run_step`/`run_steps` pair that threads a `Flow::{Next,Break}` signal, and the
+`repeat` cap keeps total step executions bounded, preserving the "steps run
+once (bounded)" safety property.
+
+**Shipped shape:**
+
+```cue
+spawn rat → wait → evaluate is_error:false → dismiss noMerge
+repeat max=maxRounds:
+    spawn reviewer → wait → evaluate is_error:false
+    read artifact review .recommendation → ctx.var.verdict
+    when verdict:
+        "APPROVE": [ dismiss noMerge, break ]                 // accept → run completes
+        "STOP":    [ dismiss noMerge, stop ]                  // abort → run fails
+        "REWORK":  [ dismiss noMerge, spawn rework, wait,
+                     evaluate is_error:false, dismiss noMerge ] // loop back
+        default:   [ dismiss noMerge, stop ]                  // unknown verdict → abort
+```
+
+**Merge semantics note.** An agent's dismiss merges its branch into its *base*
+(`target_branch = base`), so a reviewer chained off the work branch cannot land
+work on `main` — the same reason `fix-then-verify` leaves its result on a branch.
+So APPROVE does not `git merge` to main inside the run; it `break`s so the
+instance **completes**, and the orchestrator merges the reviewed (chain-tip)
+branch on dismissal. STOP `stop`s so the instance **fails** and the branch is
+discarded. The verdict routes *completion vs failure*, which is what the
+orchestrator's merge-on-dismissal keys off — routing without a merge-to-main
+primitive. A dedicated "merge branch X into main" step (or a dismiss that names
+a non-active agent) would let APPROVE land work directly; that is a natural
+follow-up, filed as a ticket.
+
+The same three primitives retrofit a looping variant onto `fix-then-verify`
+(verifier fails → route to a rework rat → re-verify), as predicted.
+
+### 6. `gated-merge`
+
+**Purpose:** a rat implements a change, then the branch parks behind a **human
+approval gate**; on approval it auto-merges, otherwise it is dismissed unmerged.
+
+**Why high-leverage:** it lets the operator run the fleet unattended on risky
+changes while keeping a human veto exactly at the merge boundary — the safety
+valve that makes broad autonomy palatable.
+
+**Why not today:** `gate` is timer-only; `evaluate` can't observe an external
+approval. The schema already names the intended mechanism: *"human gates arrive
+with approval tuples"* (schema.cue:101).
+
+**Primitive added:** an **approval gate** —
+`{type: "gate", gateType: "approval", timeout: "24h"}` that blocks until a
+`workflow_approval` event for this instance appears in the space (via
+`rk approve <instance>` / `rk reject <instance>`), capturing the decision
+(`{approved: bool, by, reason}`) into `ctx.previousResult` so a following
+`evaluate` can act on it. **Fails closed:** if no human responds within
+`timeout`, the captured decision is `{approved: false}`, so the run does not
+merge on silence.
+
+**Scoping.** `rk approve`/`rk reject` name the workflow instance id (from
+`rk workflow list`). The daemon writes the approval event under the instance's
+repo scope with the instance id in the payload; the gate matches on that id, so
+a decision only satisfies the instance it names. The current step index is
+recorded on the event for auditing.
+
+**Shape (implemented in `examples/workflows/gated-merge.cue`):**
+
+```cue
+steps: [
+	{type: "spawn", role: "rat", task: {title: _input.taskId, description: _input.description}},
+	{type: "wait", timeout: "30m"},
+	{type: "evaluate", expect: {is_error: false}},            // implementation must succeed
+	{type: "gate", gateType: "approval", timeout: "24h"},     // block on the human decision
+	{type: "evaluate", expect: {approved: true}},             // proceed only if approved
+	{type: "dismiss"},                                         // merge on approval
+]
+```
+
+The rat is deliberately *not* dismissed before the gate — its branch and
+worktree stay live for the reviewer to inspect while parked. On approval the
+final `dismiss` merges; on rejection (or timeout) the `{approved: true}`
+evaluate fails, the run ends unmerged, and the branch is left in place for
+manual `rk dismiss --no-merge` or a follow-up. (The engine is a linear step
+machine with no conditional branch, so "merge here / hold there" is expressed
+as *proceed-to-merge on approval, fail-and-hold otherwise* rather than two
+divergent tails.)
+
+A timer gate remains available (`gateType: "timer", duration: ...`) but merges
+on a schedule, not on consent, and should not stand in for a real approval on
+genuinely risky merges.
+
+### 7. `backlog-drain`
+
+**Purpose:** fan out one solo-task rat per ready ticket, run them in parallel,
+then join and report.
+
+**Why high-leverage:** this is the operator's throughput dial — "work the ready
+backlog" as one command instead of hand-launching a run per ticket. Combined
+with `backlog-groom` (which keeps the queue decomposed) it turns a well-groomed
+backlog directly into parallel fleet work.
+
+**Why it wasn't expressible before:** the step list was static and
+single-active-agent. There was no way to (a) enumerate tickets at runtime and
+spawn one rat each, or (b) wait for several agents to finish (join). `wait` only
+tracked the most-recent spawn.
+
+**Status: implemented.** Two step types were added — `for_each` (dynamic
+fan-out) and `wait_all` (parallel join) — plus the `backlog-drain` example
+workflow. See `crates/rk-workflow/src/{lib,schema.cue}.rs`,
+`crates/rk-daemon/src/workflow_exec.rs`, and
+`crates/rk-daemon/tests/backlog_drain.rs`.
+
+**Design decision — the single-active-agent invariant is preserved, not
+generalised.** Rather than widening `ctx.active_agent` into a list (which would
+have forced every sequential step — `wait`, `dismiss`, `interpolate` — to reason
+about a set), the fan-out gets its **own** context slot: `ctx.fanout:
+Vec<FannedAgent>`, populated by `for_each` and consumed by `wait_all`. Sequential
+workflows keep using `active_agent` unchanged; parallel workflows use the fan-out
+set. The two paths never interleave, so the deepest risk in this ticket — a
+half-migrated executor — never materialises. This is the cheaper of the two
+answers to the open question below, and the extra field is strictly additive.
+
+**How it works:**
+
+- **`for_each`** resolves a ticket query (`status` defaults to `ready` —
+  dependency-aware readiness — scoped to the workflow's own repo, capped by
+  `limit`), then spawns one agent per ticket with the same agent-resolution as a
+  `spawn` step. The task title defaults to `{{item.id}}` so the supervisor drives
+  each ticket's status lifecycle (→ `done`/`closed`) exactly as for any
+  ticket-dispatched rat; `{{item.title}}` / `{{item.body}}` bind the body. Each
+  rat gets its own branch off the base — fan-out never chains onto
+  `ctx.active_branch`. It deliberately does **not** pre-claim tickets
+  (`in_progress`): writing status here would race the supervisor's
+  fire-and-forget `done` write on fast completions (see open questions).
+- **`wait_all`** blocks until every agent in the fan-out set has emitted its
+  `harness_result` (one shared deadline; the step fails if any is still running
+  when it elapses), then aggregates into `ctx.previousResult`:
+  `{count, ok, errors, all_ok, results}`. A following `evaluate` asserts against
+  that summary — e.g. `expect: {all_ok: true}`.
+
+**Schema (as shipped):**
+
+```cue
+steps: [
+    {
+        type: "for_each"
+        query: {status: "ready", limit: _input.limit}   // limit default 5
+        role: "rat"
+        task: {
+            title:       "{{item.id}}"                    // default; drives ticket lifecycle
+            description: "Work {{item.id}}: {{item.title}}\n\n{{item.body}}"
+        }
+    },
+    {type: "wait_all", timeout: "45m"},
+    {type: "evaluate", expect: {all_ok: true}},
+]
+```
+
+Branches are left parked per-rat for merge under solo-task semantics — this
+workflow runs the fleet in parallel; it does not auto-merge. A symmetric
+`dismiss_all` merge/cleanup primitive is a natural follow-up (see build order).
+
+---
+
+## Recommended build order
+
+1. Ship Tier 1 (`workflow-review`, `backlog-groom`, `fix-then-verify`,
+   `prompt-refine`) as-is — pure CUE, no engine risk, immediate self-improvement.
+2. Add the **verdict-read + conditional branch + bounded loop** primitives and
+   ship `reviewer-drives-rework`. Highest leverage-per-primitive; the same three
+   additions retrofit a looping variant onto `fix-then-verify`.
+3. Add the **approval gate** and ship `gated-merge` — small, self-contained, and
+   the schema already anticipates it.
+4. Add **fan-out + join** and ship `backlog-drain` — biggest change, do last.
+   **(Done.)** `for_each` + `wait_all` landed with the fan-out set held in its
+   own `ctx.fanout` slot (§7). A follow-up `dismiss_all` (parallel merge/cleanup
+   of a fan-out's branches) would make the primitive symmetric and let a drain
+   auto-merge instead of parking branches.
+
+## Open questions
+
+- **Verdict channel for routing.** Should a reviewer's verdict travel in the
+  `harness_result` payload (so `evaluate` sees it directly) or via a new `read`
+  step that lifts a named artifact tuple into `ctx`? The artifact route is more
+  general (any tuple becomes branchable) but adds a step type; the payload route
+  is cheaper but couples verdicts to harness output shape.
+- **Loop representation.** `repeat {max}` block vs. labelled steps with a bounded
+  `goto`. A block is easier to validate statically in CUE; labels are more
+  flexible but invite unbounded loops. A hard iteration cap should be mandatory
+  either way, to preserve the "steps run once" safety property the executor
+  currently guarantees for free.
+- **Fan-out and the single-active-agent model.** *Resolved (see §7):* fan-out
+  got a **separate** agent-set context (`ctx.fanout`) rather than generalising
+  `active_agent` to a list, so the sequential path is untouched. Two loose ends
+  remain: (1) **claiming** — the fan-out does not mark drained tickets
+  `in_progress`, because that write races the supervisor's fire-and-forget
+  `done` transition; guarding concurrent drains needs an atomic
+  open→in_progress claim the ticket store does not yet expose. (2) **merge** —
+  fanned branches are parked, not merged; a `dismiss_all` primitive would close
+  that gap.
+- **Approval-tuple plumbing.** What CLI/UX emits the approval tuple
+  (`rk approve <instance>`?), how is it scoped to an instance+step, and what is
+  the timeout/expiry policy when no human responds?
+- **Grooming authority.** Should `backlog-groom` be allowed to *close* stale
+  tickets autonomously, or only propose closure? Autonomy is higher-leverage but
+  risks silent loss of real work items.

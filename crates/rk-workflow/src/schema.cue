@@ -3,9 +3,14 @@
 // package with this schema, so violations are CUE unification errors.
 //
 // Runtime context placeholders usable inside step strings:
-//   {{ctx.activeAgent}}   name of the most recently spawned agent
-//   {{ctx.activeBranch}}  its branch
+//   {{ctx.activeAgent}}    name of the most recently spawned agent
+//   {{ctx.activeBranch}}   its branch
 //   {{ctx.previousResult}} result text of the last completed wait step
+//   {{ctx.var.<name>}}     a variable lifted by a `read` step
+// Inside a for_each task template, per-ticket placeholders also resolve:
+//   {{item.id}}    the ticket id (e.g. TKT-7)
+//   {{item.title}} the ticket title
+//   {{item.body}}  the ticket body
 // Parameters are referenced as _input.<name> and resolve at load time.
 package workflow
 
@@ -54,13 +59,22 @@ workflow: #Workflow
 
 // All non-empty fields must match (AND).
 #AspectMatch: {
-	// Step type: "spawn" | "wait" | "evaluate" | "dismiss" | "gate".
+	// Step type: "spawn" | "wait" | "evaluate" | "dismiss" | "gate" | "read" |
+	// "when" | "repeat" | "break" | "stop" | "for_each" | "wait_all" |
+	// "dismiss_all". Aspects only weave top-level steps, not steps nested
+	// inside `when`/`repeat`.
 	type?: string
 	// Spawn steps only: match by role.
 	role?: string
 }
 
-#Step: #SpawnStep | #WaitStep | #EvaluateStep | #DismissStep | #GateStep
+#Step: #SpawnStep | #WaitStep | #EvaluateStep | #DismissStep | #GateStep |
+	#ReadStep | #WhenStep | #RepeatStep | #BreakStep | #StopStep |
+	#ForEachStep | #WaitAllStep | #DismissAllStep
+
+// Tuple categories a `read` step may match.
+#Category: "fact" | "convention" | "task" | "available" | "claim" | "obstacle" |
+	"need" | "artifact" | "event" | "message" | "suggestion" | "endorsement"
 
 #SpawnStep: {
 	type: "spawn"
@@ -98,9 +112,130 @@ workflow: #Workflow
 	noMerge?: bool
 }
 
-// Timer gate only in v1 (human gates arrive with approval tuples).
+// A gate parks the workflow between steps. Two kinds:
+//   timer    — sleep for `duration`, then continue (schedule, not consent).
+//   approval — block until a human decision arrives for THIS instance (via
+//              `rk approve <instance>` / `rk reject <instance>`) or `timeout`
+//              elapses. The decision ({approved: bool, by, reason}) lands in
+//              ctx.previousResult so a following `evaluate` can gate the merge.
+//              On timeout with no response the decision is {approved: false}.
 #GateStep: {
 	type:     "gate"
-	gateType: "timer"
-	duration: string
+	gateType: "timer" | "approval"
+	// timer only: how long to sleep.
+	if gateType == "timer" {
+		duration: string
+	}
+	// approval only: how long to wait for a human before defaulting to
+	// not-approved. The safety valve fails closed.
+	if gateType == "approval" {
+		timeout: string | *"24h"
+	}
+}
+
+// Lift the newest matching tuple from the space into a ctx variable, so a
+// later `when` step can route on it. This is how a reviewer's verdict —
+// recorded as an artifact tuple (`rk out artifact <repo> review ...`) —
+// becomes observable to the workflow. Blocks up to `timeout` if no tuple
+// matches yet; the newest match wins so re-review rounds see the latest verdict.
+#ReadStep: {
+	type: "read"
+	// Tuple category to match.
+	category: #Category
+	// Tuple identity to match (e.g. "review").
+	identity: string
+	// Scope to match; defaults to this workflow's repo name at runtime.
+	scope?: string
+	// Optional substring the serialized payload must contain.
+	search?: string
+	// JSON payload field to lift (e.g. "recommendation"); whole payload if unset.
+	field?: string
+	// ctx variable name to store the value under (referenced by `when.var`).
+	into:    string
+	timeout: string | *"5m"
+}
+
+// Route on a ctx variable set by a prior `read`. Runs the sub-steps of the
+// matching case, or `default` if the value matches no case. Nested steps are
+// executed in place; they share the one-active-agent context.
+#WhenStep: {
+	type: "when"
+	// Name of the ctx variable to switch on (as set by `read`.into).
+	var: string
+	// value -> steps. String values match by equality.
+	cases: [string]: [...#Step]
+	default?: [...#Step]
+}
+
+// Bounded loop: run `steps` in order up to `max` times. A `break` step inside
+// exits early; falling off the end of the body starts the next iteration. The
+// hard `max` cap (<=100) preserves the executor's "steps run once" safety
+// property — the body can execute at most `max` times, never unbounded.
+#RepeatStep: {
+	type:  "repeat"
+	max:   int & >0 & <=100
+	steps: [...#Step] & [_, ...]
+}
+
+// Exit the nearest enclosing `repeat` immediately; the instance keeps running
+// after the loop. A `break` with no enclosing `repeat` ends the workflow.
+#BreakStep: {
+	type: "break"
+}
+
+// Abort the whole workflow instance (it finishes as failed) with an optional
+// reason — the routing target for a reviewer STOP verdict.
+#StopStep: {
+	type:    "stop"
+	reason?: string
+}
+
+// Dynamic fan-out: spawn one agent per matching ticket, all in parallel, into
+// the fan-out set that a following wait_all joins on. Agent-selection fields
+// resolve exactly like a spawn step. The task template binds per-ticket
+// placeholders {{item.id}}, {{item.title}}, {{item.body}}; the title defaults
+// to the ticket id so the supervisor drives that ticket's status lifecycle.
+#ForEachStep: {
+	type:  "for_each"
+	query: #TicketQuery
+	role:  string | *"rat"
+	// Named agent profile from `agents` (or global config).
+	agent?: string
+	// Inline overrides (beat any profile).
+	harness?:         string
+	model?:           string
+	permission_mode?: string
+	task: {
+		title:        string | *"{{item.id}}"
+		description?: string
+	}
+	// Base/merge-target branch override (each rat still gets its own branch).
+	branch?: string
+}
+
+// Which tickets a fan-out enumerates. "ready" (the default) means open tickets
+// with all dependencies satisfied; any other value filters by that literal
+// status. Scope is always the workflow's own repo.
+#TicketQuery: {
+	status: string | *"ready"
+	limit:  int & >0 | *5
+}
+
+// Parallel join: block until every agent spawned by the preceding fan-out has
+// emitted its harness_result, aggregating them into ctx.previousResult
+// ({count, ok, errors, all_ok, results}) for a following evaluate.
+#WaitAllStep: {
+	type:    "wait_all"
+	timeout: string | *"45m"
+}
+
+// Parallel dismiss: for every agent in the fan-out set, dismiss it (merge its
+// branch unless noMerge) concurrently, then clear the fan-out set. This is the
+// fan-out counterpart to a single `dismiss` over active_agent — where dismiss
+// merges the one active branch, dismiss_all merges every branch a preceding
+// for_each parked. The aggregate ({count, merged, errors, all_merged, results})
+// lands in ctx.previousResult for a following evaluate.
+#DismissAllStep: {
+	type: "dismiss_all"
+	noMerge?: bool
 }

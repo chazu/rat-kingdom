@@ -8,10 +8,14 @@ use serde_json::{json, Value};
 
 #[derive(Args)]
 pub struct SpawnArgs {
-    /// Task identifier (e.g. ".rk-42" or a short slug).
+    /// Task identifier (e.g. ".rk-42" or a short slug). Optional if --ticket is given.
     #[arg(long)]
-    pub task: String,
-    /// Repository path (defaults to the current directory).
+    pub task: Option<String>,
+    /// Dispatch an existing ticket: fills task + prompt from it, resolves the
+    /// repo from its scope, and flips it to in_progress.
+    #[arg(long)]
+    pub ticket: Option<String>,
+    /// Repository: a path, or a registered repo name (defaults to the current directory).
     #[arg(long, default_value = ".")]
     pub repo: String,
     /// Task description / initial prompt.
@@ -38,6 +42,9 @@ pub struct SpawnArgs {
     /// Run interactively in a herdr pane (human-attachable).
     #[arg(long)]
     pub attach: bool,
+    /// Dispatch a ticket even if its dependencies are unmet.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args)]
@@ -64,15 +71,78 @@ pub struct DismissArgs {
 }
 
 pub async fn spawn(layout: &Layout, args: SpawnArgs, as_json: bool) -> Result<()> {
-    let repo = std::fs::canonicalize(&args.repo)?;
     let mut client = Client::connect_or_spawn(layout).await?;
+
+    // Resolve task / prompt / repo, optionally from a ticket.
+    let (task, prompt, repo_arg) = if let Some(ticket_id) = &args.ticket {
+        let result = client
+            .call("ticket.get", json!({ "id": ticket_id }))
+            .await?;
+        if result["ticket"].is_null() {
+            anyhow::bail!("no such ticket: {ticket_id}");
+        }
+        // Refuse to dispatch a ticket whose dependencies are unmet.
+        let blockers: Vec<String> = result["blockers"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !blockers.is_empty() && !args.force {
+            anyhow::bail!(
+                "{ticket_id} is blocked by {} (finish them first, or pass --force)",
+                blockers.join(", ")
+            );
+        }
+        let ticket = &result["ticket"];
+        let payload = &ticket["payload"];
+        let title = payload["title"].as_str().unwrap_or("");
+        let body = payload["body"].as_str().unwrap_or("");
+        let prompt = args.prompt.clone().unwrap_or_else(|| {
+            if body.is_empty() {
+                title.to_string()
+            } else {
+                format!("{title}\n\n{body}")
+            }
+        });
+        // Explicit --repo wins; otherwise take the ticket's scope.
+        let repo_arg = if args.repo == "." {
+            ticket["scope"].as_str().unwrap_or(".").to_string()
+        } else {
+            args.repo.clone()
+        };
+        (ticket_id.clone(), Some(prompt), repo_arg)
+    } else {
+        let task = args
+            .task
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("provide --task <id> or --ticket <id>"))?;
+        (task, args.prompt.clone(), args.repo.clone())
+    };
+
+    let repo = crate::repo_cmds::resolve_path(&mut client, &repo_arg).await?;
+
+    // Mark the ticket in_progress BEFORE launching the rat. A fast rat can
+    // finish (and auto-set `done`) before this returns, so it must not run
+    // after the spawn or it would clobber that `done`.
+    if let Some(ticket_id) = &args.ticket {
+        let _ = client
+            .call(
+                "ticket.update",
+                json!({ "id": ticket_id, "status": "in_progress" }),
+            )
+            .await;
+    }
+
     let result = client
         .call(
             "agent.spawn",
             json!({
-                "repo": repo.to_string_lossy(),
-                "task": args.task,
-                "prompt": args.prompt,
+                "repo": repo,
+                "task": task,
+                "prompt": prompt,
                 "role": args.role,
                 "harness": args.harness,
                 "parent": args.parent,
@@ -84,6 +154,19 @@ pub async fn spawn(layout: &Layout, args: SpawnArgs, as_json: bool) -> Result<()
         )
         .await?;
     let agent = &result["agent"];
+
+    // Record the assignee only — never the status — so this can't overwrite a
+    // `done` the rat may already have set on completion.
+    if let Some(ticket_id) = &args.ticket {
+        let name = agent["name"].as_str().unwrap_or("");
+        let _ = client
+            .call(
+                "ticket.update",
+                json!({ "id": ticket_id, "assignee": name }),
+            )
+            .await;
+    }
+
     if as_json {
         println!("{agent}");
     } else {

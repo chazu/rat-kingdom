@@ -31,6 +31,8 @@ pub struct Daemon {
     global_agents: std::collections::HashMap<String, rk_workflow::AgentProfile>,
     default_harness: String,
     engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
+    repos: std::sync::Mutex<crate::repos::RepoRegistry>,
+    tickets: Arc<crate::tickets::Tickets>,
     started: Instant,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -108,14 +110,21 @@ impl Daemon {
         space: Space,
     ) -> rk_core::Result<Self> {
         layout.ensure()?;
+        // One Tickets instance, shared by the RPC handlers and the supervisor,
+        // so ticket-lifecycle writes serialize on a single lock.
+        let tickets = Arc::new(crate::tickets::Tickets::new(space.clone(), castle.clone()));
         let supervisor = Arc::new(crate::supervisor::Supervisor::new(
             layout.clone(),
             castle.clone(),
             default_harness.clone(),
             budget,
             space.clone(),
+            tickets.clone(),
         )?);
         let (shutdown_tx, _) = watch::channel(false);
+        let repos = std::sync::Mutex::new(crate::repos::RepoRegistry::load(
+            &layout.home().join("repos.json"),
+        )?);
         Ok(Self {
             layout,
             space,
@@ -126,6 +135,8 @@ impl Daemon {
             global_agents: Default::default(),
             default_harness,
             engine: std::sync::OnceLock::new(),
+            repos,
+            tickets,
             started: Instant::now(),
             shutdown_tx,
         })
@@ -262,6 +273,7 @@ impl Daemon {
                 self.layout.clone(),
                 Arc::clone(&self.supervisor),
                 self.space.clone(),
+                Arc::clone(&self.tickets),
                 self.global_agents.clone(),
                 self.default_harness.clone(),
             ))
@@ -403,6 +415,26 @@ impl Daemon {
                     ),
                 })
             }
+            "workflow.approve" => {
+                let params: WorkflowApproveParams = match parse_params(&req.params) {
+                    Ok(p) => p,
+                    Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
+                };
+                reply(
+                    match self.engine().approve(
+                        &params.instance,
+                        params.approved,
+                        &params.by,
+                        params.reason,
+                    ) {
+                        Ok(()) => Response::ok(
+                            id,
+                            json!({"instance": params.instance, "approved": params.approved}),
+                        ),
+                        Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
+                    },
+                )
+            }
             "workflow.definitions" => {
                 let params: WorkflowDefsParams = match parse_params(&req.params) {
                     Ok(p) => p,
@@ -444,11 +476,143 @@ impl Daemon {
                     Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
                 })
             }
+            "repo.add" => reply(self.handle_repo_add(req)),
+            "repo.list" => reply(match self.repos.lock() {
+                Ok(reg) => Response::ok(id, json!({"repos": reg.list()})),
+                Err(_) => Response::err(id, codes::INTERNAL, "repo registry lock poisoned"),
+            }),
+            "repo.get" => reply(self.handle_repo_get(req)),
+            "ticket.new" => reply(self.handle_ticket_new(req).await),
+            "ticket.list" => reply(self.handle_ticket_list(req)),
+            "ticket.get" => reply(self.handle_ticket_get(req)),
+            "ticket.update" => reply(self.handle_ticket_update(req).await),
+            "ticket.dep" => reply(self.handle_ticket_dep(req).await),
+            "ticket.ready" => reply(self.handle_ticket_ready(req)),
             other => reply(Response::err(
                 id,
                 codes::UNKNOWN_METHOD,
                 format!("unknown method: {other}"),
             )),
+        }
+    }
+
+    fn handle_repo_add(&self, req: Request) -> Response {
+        let params: RepoAddParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let path = std::path::PathBuf::from(&params.path);
+        if !path.exists() {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                format!("path does not exist: {}", params.path),
+            );
+        }
+        let record = crate::repos::RepoRecord {
+            name: params.name,
+            path,
+            created_at: chrono::Utc::now(),
+        };
+        let mut reg = match self.repos.lock() {
+            Ok(r) => r,
+            Err(_) => return Response::err(req.id, codes::INTERNAL, "repo registry lock poisoned"),
+        };
+        match reg.add(record.clone()) {
+            Ok(()) => Response::ok(req.id, json!({"repo": record})),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    fn handle_repo_get(&self, req: Request) -> Response {
+        let params: NameParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let reg = match self.repos.lock() {
+            Ok(r) => r,
+            Err(_) => return Response::err(req.id, codes::INTERNAL, "repo registry lock poisoned"),
+        };
+        match reg.get(&params.name) {
+            Some(record) => Response::ok(req.id, json!({"repo": record})),
+            None => Response::ok(req.id, json!({"repo": null})),
+        }
+    }
+
+    async fn handle_ticket_new(&self, req: Request) -> Response {
+        let params: crate::tickets::NewTicket = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        match self.tickets.create(params).await {
+            Ok(tuple) => Response::ok(req.id, json!({"ticket": tuple})),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    fn handle_ticket_list(&self, req: Request) -> Response {
+        let params: TicketListParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        match self.tickets.list(params.scope, params.status, params.parent) {
+            Ok(tickets) => {
+                let blocked = self.tickets.blocked_ids(&tickets).unwrap_or_default();
+                Response::ok(req.id, json!({"tickets": tickets, "blocked": blocked}))
+            }
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    fn handle_ticket_get(&self, req: Request) -> Response {
+        let params: TicketGetParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        match self.tickets.get(&params.id) {
+            Ok(ticket) => {
+                let blockers = self.tickets.blockers(&params.id).ok().flatten();
+                Response::ok(req.id, json!({"ticket": ticket, "blockers": blockers}))
+            }
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    async fn handle_ticket_update(&self, req: Request) -> Response {
+        let params: TicketUpdateParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        match self.tickets.update(&params.id, params.changes).await {
+            Ok(ticket) => Response::ok(req.id, json!({"ticket": ticket})),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    async fn handle_ticket_dep(&self, req: Request) -> Response {
+        let params: TicketDepParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let result = if params.remove {
+            self.tickets.remove_dep(&params.id, &params.dep).await
+        } else {
+            self.tickets.add_dep(&params.id, &params.dep).await
+        };
+        match result {
+            Ok(ticket) => Response::ok(req.id, json!({"ticket": ticket})),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    fn handle_ticket_ready(&self, req: Request) -> Response {
+        let params: TicketReadyParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        match self.tickets.ready(params.scope) {
+            Ok(tickets) => Response::ok(req.id, json!({"tickets": tickets})),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
     }
 
@@ -602,6 +766,15 @@ struct WorkflowDefsParams {
 }
 
 #[derive(Deserialize)]
+struct WorkflowApproveParams {
+    instance: String,
+    approved: bool,
+    by: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct NameParams {
     name: String,
 }
@@ -625,6 +798,48 @@ struct BlockingParams {
     pattern: PatternParams,
     #[serde(default)]
     timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RepoAddParams {
+    name: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct TicketListParams {
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    parent: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TicketGetParams {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct TicketDepParams {
+    id: String,
+    dep: String,
+    #[serde(default)]
+    remove: bool,
+}
+
+#[derive(Deserialize)]
+struct TicketReadyParams {
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TicketUpdateParams {
+    id: String,
+    #[serde(flatten)]
+    changes: crate::tickets::TicketChanges,
 }
 
 fn parse_params<T: serde::de::DeserializeOwned>(params: &Value) -> Result<T, String> {

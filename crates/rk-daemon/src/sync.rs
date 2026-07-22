@@ -136,7 +136,7 @@ impl Syncer {
                 }
                 Err(e) => {
                     // Sync failure is coordination-visible, not a debug log
-                    // (imp's silent-stall lesson) — but local export already
+                    // (the predecessor's silent-stall lesson) — but local export already
                     // happened, so nothing is lost.
                     warn!(error = %e, "remote sync failed");
                     space.out(Tuple::new(

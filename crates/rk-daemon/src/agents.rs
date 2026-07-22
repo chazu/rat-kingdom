@@ -1,12 +1,12 @@
 //! Agent registry: the supervision tree as first-class data.
 //!
 //! Every record carries its `parent` (the spawner) — completion routing walks
-//! this structure, never payload fields (imp's foreman-routing lesson).
+//! this structure, never payload fields (the predecessor's foreman-routing lesson).
 
 use chrono::{DateTime, Utc};
 use rk_harness::TokenUsage;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +64,14 @@ pub struct AgentRecord {
 pub struct Registry {
     path: PathBuf,
     agents: HashMap<String, AgentRecord>,
+    /// Names handed out by [`Registry::reserve_name`] but not yet [`insert`]ed.
+    /// Closes the spawn window where a name is chosen but its worktree/record
+    /// don't exist yet, so concurrent spawns can't collide on it. In-memory
+    /// only — a daemon restart starts with a clean slate (any half-spawned
+    /// rats are already gone).
+    ///
+    /// [`insert`]: Registry::insert
+    reserved: HashSet<String>,
 }
 
 impl Registry {
@@ -77,7 +85,32 @@ impl Registry {
         Ok(Self {
             path: path.to_path_buf(),
             agents,
+            reserved: HashSet::new(),
         })
+    }
+
+    /// Atomically pick a free rat name and reserve it against concurrent
+    /// spawns. Callers hold the registry lock across this call and the
+    /// eventual [`insert`](Registry::insert) (which frees the reservation);
+    /// if the spawn fails before then, call [`release_name`] to free it.
+    ///
+    /// [`release_name`]: Registry::release_name
+    pub fn reserve_name(&mut self) -> String {
+        let taken: Vec<&str> = self
+            .agents
+            .keys()
+            .chain(self.reserved.iter())
+            .map(String::as_str)
+            .collect();
+        let name = rk_core::names::next_name(taken);
+        self.reserved.insert(name.clone());
+        name
+    }
+
+    /// Release a name reserved by [`reserve_name`](Registry::reserve_name)
+    /// when a spawn fails before the record is inserted.
+    pub fn release_name(&mut self, name: &str) {
+        self.reserved.remove(name);
     }
 
     /// Mark all live agents orphaned (called once at daemon startup).
@@ -96,16 +129,13 @@ impl Registry {
     }
 
     pub fn insert(&mut self, record: AgentRecord) -> rk_core::Result<()> {
+        self.reserved.remove(&record.name);
         self.agents.insert(record.name.clone(), record);
         self.persist()
     }
 
     pub fn get(&self, name: &str) -> Option<&AgentRecord> {
         self.agents.get(name)
-    }
-
-    pub fn names_in_use(&self) -> Vec<&str> {
-        self.agents.keys().map(String::as_str).collect()
     }
 
     pub fn list(&self) -> Vec<&AgentRecord> {
@@ -187,6 +217,32 @@ mod tests {
         }
         let reg = Registry::load(&path).unwrap();
         assert_eq!(reg.get("Whisker").unwrap().cost_usd, 1.25);
+    }
+
+    #[test]
+    fn reserve_name_is_unique_until_inserted_or_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.json");
+        let mut reg = Registry::load(&path).unwrap();
+
+        // Two reservations without an intervening insert must differ — this is
+        // the concurrent-spawn window that used to hand out duplicates.
+        let first = reg.reserve_name();
+        let second = reg.reserve_name();
+        assert_ne!(first, second);
+
+        // Inserting the first frees its reservation but the name is now in the
+        // registry, so it still won't be reused.
+        reg.insert(record(&first, AgentState::Running)).unwrap();
+        let third = reg.reserve_name();
+        assert_ne!(third, first);
+        assert_ne!(third, second);
+
+        // Releasing a reservation (spawn failed) returns the name to the pool.
+        reg.release_name(&second);
+        reg.release_name(&third);
+        let reused = reg.reserve_name();
+        assert_eq!(reused, second, "released name should be picked first again");
     }
 
     #[test]
