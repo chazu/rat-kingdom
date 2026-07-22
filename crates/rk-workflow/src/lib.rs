@@ -69,6 +69,10 @@ pub enum Step {
     Break,
     /// Abort the whole instance (failed) with an optional reason.
     Stop(StopStep),
+    /// Dynamic fan-out: spawn one agent per matching ticket, in parallel.
+    ForEach(ForEachStep),
+    /// Parallel join: block until every fanned-out agent has completed.
+    WaitAll(WaitAllStep),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -107,6 +111,61 @@ pub struct WaitStep {
 
 fn default_wait_timeout() -> String {
     "10m".into()
+}
+
+/// Fan out one agent per matching ticket, all spawned in parallel. Populates
+/// the workflow's fan-out set, which a following [`WaitAllStep`] then joins on.
+/// Every agent-selection field (`agent`/`harness`/`model`/`permission_mode`)
+/// mirrors [`SpawnStep`] and resolves the same way. The `task` template binds
+/// per-ticket placeholders `{{item.id}}`, `{{item.title}}`, `{{item.body}}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForEachStep {
+    pub query: TicketQuery,
+    #[serde(default = "default_role")]
+    pub role: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    pub task: TaskDef,
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+/// Which tickets a fan-out enumerates. `status: "ready"` (the default) means
+/// open tickets whose dependencies are all satisfied; any other value filters
+/// by that literal ticket status. Scope is always the workflow's own repo.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TicketQuery {
+    #[serde(default = "default_query_status")]
+    pub status: String,
+    #[serde(default = "default_query_limit")]
+    pub limit: usize,
+}
+
+fn default_query_status() -> String {
+    "ready".into()
+}
+
+fn default_query_limit() -> usize {
+    5
+}
+
+/// Join step: block until every agent spawned by the preceding fan-out has
+/// emitted its `harness_result`, aggregating them into `ctx.previousResult`
+/// (`{count, ok, errors, all_ok, results}`) for a following `evaluate`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaitAllStep {
+    #[serde(default = "default_wait_all_timeout")]
+    pub timeout: String,
+}
+
+fn default_wait_all_timeout() -> String {
+    "45m".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -358,6 +417,8 @@ fn step_matches(step: &Step, matcher: &AspectMatch) -> bool {
             Step::Repeat(_) => "repeat",
             Step::Break => "break",
             Step::Stop(_) => "stop",
+            Step::ForEach(_) => "for_each",
+            Step::WaitAll(_) => "wait_all",
         };
         if actual != step_type {
             return false;
@@ -366,6 +427,7 @@ fn step_matches(step: &Step, matcher: &AspectMatch) -> bool {
     if let Some(role) = &matcher.role {
         match step {
             Step::Spawn(spawn) if &spawn.role == role => {}
+            Step::ForEach(fe) if &fe.role == role => {}
             _ => return false,
         }
     }

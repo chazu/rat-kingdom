@@ -7,6 +7,10 @@
 //   {{ctx.activeBranch}}   its branch
 //   {{ctx.previousResult}} result text of the last completed wait step
 //   {{ctx.var.<name>}}     a variable lifted by a `read` step
+// Inside a for_each task template, per-ticket placeholders also resolve:
+//   {{item.id}}    the ticket id (e.g. TKT-7)
+//   {{item.title}} the ticket title
+//   {{item.body}}  the ticket body
 // Parameters are referenced as _input.<name> and resolve at load time.
 package workflow
 
@@ -64,7 +68,8 @@ workflow: #Workflow
 }
 
 #Step: #SpawnStep | #WaitStep | #EvaluateStep | #DismissStep | #GateStep |
-	#ReadStep | #WhenStep | #RepeatStep | #BreakStep | #StopStep
+	#ReadStep | #WhenStep | #RepeatStep | #BreakStep | #StopStep |
+	#ForEachStep | #WaitAllStep
 
 // Tuple categories a `read` step may match.
 #Category: "fact" | "convention" | "task" | "available" | "claim" | "obstacle" |
@@ -182,4 +187,43 @@ workflow: #Workflow
 #StopStep: {
 	type:    "stop"
 	reason?: string
+}
+
+// Dynamic fan-out: spawn one agent per matching ticket, all in parallel, into
+// the fan-out set that a following wait_all joins on. Agent-selection fields
+// resolve exactly like a spawn step. The task template binds per-ticket
+// placeholders {{item.id}}, {{item.title}}, {{item.body}}; the title defaults
+// to the ticket id so the supervisor drives that ticket's status lifecycle.
+#ForEachStep: {
+	type:  "for_each"
+	query: #TicketQuery
+	role:  string | *"rat"
+	// Named agent profile from `agents` (or global config).
+	agent?: string
+	// Inline overrides (beat any profile).
+	harness?:         string
+	model?:           string
+	permission_mode?: string
+	task: {
+		title:        string | *"{{item.id}}"
+		description?: string
+	}
+	// Base/merge-target branch override (each rat still gets its own branch).
+	branch?: string
+}
+
+// Which tickets a fan-out enumerates. "ready" (the default) means open tickets
+// with all dependencies satisfied; any other value filters by that literal
+// status. Scope is always the workflow's own repo.
+#TicketQuery: {
+	status: string | *"ready"
+	limit:  int & >0 | *5
+}
+
+// Parallel join: block until every agent spawned by the preceding fan-out has
+// emitted its harness_result, aggregating them into ctx.previousResult
+// ({count, ok, errors, all_ok, results}) for a following evaluate.
+#WaitAllStep: {
+	type:    "wait_all"
+	timeout: string | *"45m"
 }

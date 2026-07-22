@@ -273,6 +273,7 @@ impl Daemon {
                 self.layout.clone(),
                 Arc::clone(&self.supervisor),
                 self.space.clone(),
+                Arc::clone(&self.tickets),
                 self.global_agents.clone(),
                 self.default_harness.clone(),
             ))
