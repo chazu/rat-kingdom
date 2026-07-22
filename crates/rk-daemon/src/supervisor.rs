@@ -119,13 +119,7 @@ impl Supervisor {
             .clone()
             .unwrap_or_else(|| format!("Work on task {}. Begin now.", params.task));
 
-        let mut env: HashMap<String, String> = HashMap::new();
-        env.insert("RK_HOME".into(), self.layout.home().display().to_string());
-        env.insert("RK_AGENT".into(), name.clone());
-        env.insert("RK_REPO".into(), repo_name.clone());
-        env.insert("RK_TASK".into(), params.task.clone());
-        env.insert("RK_BRANCH".into(), branch.clone());
-        env.insert("RK_WORKTREE".into(), worktree.display().to_string());
+        let mut env = self.agent_env(&name, &repo_name, &params.task, Some(&branch), &worktree);
         if let Some(parent) = &params.parent {
             env.insert("RK_PARENT".into(), parent.clone());
         }
@@ -135,7 +129,14 @@ impl Supervisor {
             system_prompt: Some(render(&params.role, &prime_ctx)),
             cwd: worktree.clone(),
             env,
-            permission_mode: params.permission_mode.clone(),
+            // Rats work in isolated worktrees; autonomous operation is the
+            // default. Override per-spawn for tighter modes.
+            permission_mode: Some(
+                params
+                    .permission_mode
+                    .clone()
+                    .unwrap_or_else(|| "bypassPermissions".into()),
+            ),
             model: params.model.clone(),
             resume_session: None,
         };
@@ -211,15 +212,13 @@ impl Supervisor {
             None
         };
 
-        let mut env: HashMap<String, String> = HashMap::new();
-        env.insert("RK_HOME".into(), self.layout.home().display().to_string());
-        env.insert("RK_AGENT".into(), record.name.clone());
-        env.insert("RK_REPO".into(), record.repo_name.clone());
-        env.insert("RK_TASK".into(), task.clone());
-        if let Some(branch) = &record.branch {
-            env.insert("RK_BRANCH".into(), branch.clone());
-        }
-        env.insert("RK_WORKTREE".into(), worktree.display().to_string());
+        let env = self.agent_env(
+            &record.name,
+            &record.repo_name,
+            &task,
+            record.branch.as_deref(),
+            &worktree,
+        );
 
         let prime_ctx = PrimeContext {
             agent: record.name.clone(),
@@ -237,7 +236,7 @@ impl Supervisor {
             system_prompt: Some(render(&record.role, &prime_ctx)),
             cwd: worktree,
             env,
-            permission_mode: None,
+            permission_mode: Some("bypassPermissions".into()),
             model: None,
             resume_session: resume,
         };
@@ -441,6 +440,34 @@ impl Supervisor {
 
     pub fn status(&self, name: &str) -> Option<AgentRecord> {
         self.lock_registry().get(name).cloned()
+    }
+
+    /// Standard spawn environment. Prepends the running `rk` binary's
+    /// directory to PATH so the sugar commands work inside agent sessions.
+    fn agent_env(
+        &self,
+        name: &str,
+        repo_name: &str,
+        task: &str,
+        branch: Option<&str>,
+        worktree: &std::path::Path,
+    ) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        env.insert("RK_HOME".into(), self.layout.home().display().to_string());
+        env.insert("RK_AGENT".into(), name.to_string());
+        env.insert("RK_REPO".into(), repo_name.to_string());
+        env.insert("RK_TASK".into(), task.to_string());
+        if let Some(branch) = branch {
+            env.insert("RK_BRANCH".into(), branch.to_string());
+        }
+        env.insert("RK_WORKTREE".into(), worktree.display().to_string());
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let path = std::env::var("PATH").unwrap_or_default();
+                env.insert("PATH".into(), format!("{}:{path}", dir.display()));
+            }
+        }
+        env
     }
 
     fn emit_event(&self, scope: &str, identity: &str, payload: serde_json::Value) {
