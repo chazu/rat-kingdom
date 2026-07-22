@@ -459,10 +459,14 @@ impl WorkflowEngine {
     /// parallel, returning the fan-out set. The task title defaults to the
     /// ticket id, so the supervisor owns each ticket's status lifecycle exactly
     /// as it does for any ticket-dispatched rat (→ `done` on a clean finish,
-    /// → `closed` on merge). The fan-out deliberately does not pre-claim the
-    /// tickets: writing `in_progress` here would race the supervisor's
-    /// fire-and-forget `done` write on fast completions. Guarding against
-    /// concurrent drains needs an atomic open→in_progress claim (see TKT-6).
+    /// → `closed` on merge).
+    ///
+    /// Each ticket is atomically claimed (`open` → `in_progress`) via
+    /// `tickets.claim` *before* its agent spawns, so two concurrent drains
+    /// never grab the same ticket — the loser simply skips it (TKT-6). Claiming
+    /// before the spawn (rather than after) keeps this write strictly ahead of
+    /// the supervisor's fire-and-forget `done`, so it no longer races
+    /// completion the way an unordered post-spawn `in_progress` write would.
     async fn fan_out(
         &self,
         id: &str,
@@ -477,6 +481,13 @@ impl WorkflowEngine {
         let ctx = self.context(id);
         let mut fanned = Vec::with_capacity(items.len());
         for item in items {
+            // Atomically claim the ticket before spawning. If a concurrent drain
+            // already claimed it, we lose the race and skip it, so one ticket is
+            // never dispatched to two rats.
+            if !self.tickets.claim(&item.id).await? {
+                info!(instance = %id, ticket = %item.id, "ticket already claimed; skipping");
+                continue;
+            }
             let resolved = resolve_fields(
                 fe.agent.as_deref(),
                 fe.harness.as_deref(),
