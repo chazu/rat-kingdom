@@ -208,6 +208,32 @@ impl Tickets {
         .await
     }
 
+    /// Atomically claim an open ticket for a backlog-drain: compare-and-set
+    /// `open` → `in_progress`. Returns `true` if this call won the claim (the
+    /// ticket existed, was `open`, and is now `in_progress`), `false` if it was
+    /// already claimed (any non-`open` status) or no longer exists. Serialized
+    /// through the same lock as every other mutation and executed as a single
+    /// take-and-replace, so of two concurrent drains racing for one ticket
+    /// exactly one wins and the loser leaves the ticket untouched.
+    pub async fn claim(&self, id: &str) -> rk_core::Result<bool> {
+        let _guard = self.lock.lock().await;
+        let Some(existing) = self.take_ticket(id).await? else {
+            return Ok(false);
+        };
+        let open = existing.payload.get("status").and_then(Value::as_str) == Some("open");
+        let mut payload = existing.payload.clone();
+        if open {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("status".into(), json!("in_progress"));
+                obj.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
+            }
+        }
+        // Always write the ticket back — with the new status on a win, unchanged
+        // on a loss — so a losing claim never destroys the ticket it took.
+        self.space.out(with_payload(existing, payload))?;
+        Ok(open)
+    }
+
     /// Set just the status (used by the supervisor to close a ticket's loop
     /// when its rat completes or is merged). No-op error if the ticket is gone.
     pub async fn set_status(&self, id: &str, status: &str) -> rk_core::Result<Tuple> {
@@ -314,6 +340,19 @@ impl Tickets {
             .collect())
     }
 
+    /// Existence-checked destructive take of a ticket tuple by id. Returns
+    /// `None` if no such ticket exists, so callers short-circuit rather than
+    /// block a `take` that would wait out its whole timeout. Assumes
+    /// `self.lock` is already held by the caller.
+    async fn take_ticket(&self, id: &str) -> rk_core::Result<Option<Tuple>> {
+        if self.get(id)?.is_none() {
+            return Ok(None);
+        }
+        let mut pattern = Pattern::category(Category::Task);
+        pattern.identity = Some(id.to_string());
+        self.space.take(&pattern, Duration::from_secs(2)).await
+    }
+
     /// Take the ticket, apply `f` to its payload object, stamp `updated_at`, and
     /// write it back. Assumes `self.lock` is already held by the caller.
     async fn edit(
@@ -321,16 +360,8 @@ impl Tickets {
         id: &str,
         f: impl FnOnce(&mut serde_json::Map<String, Value>),
     ) -> rk_core::Result<Tuple> {
-        // Existence check first so a missing ticket is an immediate error rather
-        // than a blocking `take` that waits out its whole timeout.
-        if self.get(id)?.is_none() {
-            return Err(rk_core::Error::other(format!("no such ticket: {id}")));
-        }
-        let mut pattern = Pattern::category(Category::Task);
-        pattern.identity = Some(id.to_string());
         let existing = self
-            .space
-            .take(&pattern, Duration::from_secs(2))
+            .take_ticket(id)
             .await?
             .ok_or_else(|| rk_core::Error::other(format!("no such ticket: {id}")))?;
 
@@ -341,19 +372,25 @@ impl Tickets {
         f(obj);
         obj.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
 
-        let updated = Tuple {
-            id: RecordId::new(),
-            category: existing.category,
-            scope: existing.scope,
-            identity: existing.identity,
-            instance: existing.instance,
-            lifecycle: existing.lifecycle,
-            payload,
-            created_at: existing.created_at,
-            expires_at: existing.expires_at,
-        };
+        let updated = with_payload(existing, payload);
         self.space.out(updated.clone())?;
         Ok(updated)
+    }
+}
+
+/// Rebuild a ticket tuple with a fresh record id and the given (possibly
+/// mutated) payload, preserving every other field of the tuple it replaces.
+fn with_payload(existing: Tuple, payload: Value) -> Tuple {
+    Tuple {
+        id: RecordId::new(),
+        category: existing.category,
+        scope: existing.scope,
+        identity: existing.identity,
+        instance: existing.instance,
+        lifecycle: existing.lifecycle,
+        payload,
+        created_at: existing.created_at,
+        expires_at: existing.expires_at,
     }
 }
 
@@ -529,6 +566,68 @@ mod tests {
         assert!(t.add_dep(&a.identity, &c.identity).await.is_err());
         // Self-dependency is rejected too.
         assert!(t.add_dep(&a.identity, &a.identity).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn claim_is_won_exactly_once() {
+        let t = tickets();
+        let a = t.create(new("x", "r", None)).await.unwrap();
+        assert!(t.claim(&a.identity).await.unwrap(), "first claim wins");
+        assert!(
+            !t.claim(&a.identity).await.unwrap(),
+            "second claim loses — already in_progress"
+        );
+        // The won claim advanced the ticket, and losing left it untouched.
+        let tk = t.get(&a.identity).unwrap().unwrap();
+        assert_eq!(tk.payload["status"], "in_progress");
+        // Still exactly one tuple — a losing claim must not destroy the ticket.
+        assert_eq!(t.list(None, None, None).unwrap().len(), 1);
+        // Claiming a ticket that never existed is a clean loss, not an error.
+        assert!(!t.claim("TKT-999").await.unwrap());
+    }
+
+    // Two drains race to claim a shared backlog; the atomic claim must hand each
+    // ticket to exactly one of them (never both), so no ticket is double-grabbed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_drains_never_double_grab() {
+        let t = std::sync::Arc::new(tickets());
+        let ids: Vec<String> = {
+            let mut ids = Vec::new();
+            for i in 0..25 {
+                let tk = t.create(new(&format!("t{i}"), "r", None)).await.unwrap();
+                ids.push(tk.identity);
+            }
+            ids
+        };
+
+        async fn drain(t: std::sync::Arc<Tickets>, ids: Vec<String>) -> Vec<String> {
+            let mut won = Vec::new();
+            for id in ids {
+                if t.claim(&id).await.unwrap() {
+                    won.push(id);
+                }
+            }
+            won
+        }
+        let (a, b) = tokio::join!(
+            drain(t.clone(), ids.clone()),
+            drain(t.clone(), ids.clone())
+        );
+
+        // No ticket won by both drains.
+        for id in &a {
+            assert!(!b.contains(id), "{id} double-grabbed by both drains");
+        }
+        // Every ticket claimed exactly once across the two drains combined.
+        let mut all: Vec<String> = a.iter().chain(&b).cloned().collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), ids.len(), "each ticket claimed exactly once");
+        // And every ticket is now in_progress.
+        for id in &ids {
+            let tk = t.get(id).unwrap().unwrap();
+            assert_eq!(tk.payload["status"], "in_progress");
+        }
     }
 
     #[tokio::test]
