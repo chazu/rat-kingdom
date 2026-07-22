@@ -60,8 +60,9 @@ workflow: #Workflow
 // All non-empty fields must match (AND).
 #AspectMatch: {
 	// Step type: "spawn" | "wait" | "evaluate" | "dismiss" | "gate" | "read" |
-	// "when" | "repeat" | "break" | "stop". Aspects only weave top-level steps,
-	// not steps nested inside `when`/`repeat`.
+	// "when" | "repeat" | "break" | "stop" | "for_each" | "wait_all" |
+	// "dismiss_all". Aspects only weave top-level steps, not steps nested
+	// inside `when`/`repeat`.
 	type?: string
 	// Spawn steps only: match by role.
 	role?: string
@@ -69,7 +70,7 @@ workflow: #Workflow
 
 #Step: #SpawnStep | #WaitStep | #EvaluateStep | #DismissStep | #GateStep |
 	#ReadStep | #WhenStep | #RepeatStep | #BreakStep | #StopStep |
-	#ForEachStep | #WaitAllStep
+	#ForEachStep | #WaitAllStep | #DismissAllStep
 
 // Tuple categories a `read` step may match.
 #Category: "fact" | "convention" | "task" | "available" | "claim" | "obstacle" |
@@ -226,4 +227,15 @@ workflow: #Workflow
 #WaitAllStep: {
 	type:    "wait_all"
 	timeout: string | *"45m"
+}
+
+// Parallel dismiss: for every agent in the fan-out set, dismiss it (merge its
+// branch unless noMerge) concurrently, then clear the fan-out set. This is the
+// fan-out counterpart to a single `dismiss` over active_agent — where dismiss
+// merges the one active branch, dismiss_all merges every branch a preceding
+// for_each parked. The aggregate ({count, merged, errors, all_merged, results})
+// lands in ctx.previousResult for a following evaluate.
+#DismissAllStep: {
+	type: "dismiss_all"
+	noMerge?: bool
 }

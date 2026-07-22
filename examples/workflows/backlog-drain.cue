@@ -12,8 +12,10 @@
 // clean finish, → closed on merge), exactly as for any ticket-dispatched rat.
 // `wait_all` blocks until every rat has finished, aggregating their results
 // into ctx.previousResult ({count, ok, errors, all_ok, results}); the evaluate
-// then asserts none errored. Branches are left parked per-rat for merge under
-// solo-task semantics — this workflow runs the fleet, it does not auto-merge.
+// then asserts none errored. Finally `dismiss_all` merges every rat's branch in
+// one parallel sweep and clears the fan-out set — the symmetric close to the
+// fan-out (for_each spawns them, wait_all joins them, dismiss_all merges them).
+// Drop the trailing dismiss_all to leave branches parked for manual merge.
 //
 // Copy to ~/.rat-kingdom/workflows/ (global) or <repo>/.rk/workflows/.
 workflow: {
@@ -52,5 +54,7 @@ workflow: {
 		{type: "wait_all", timeout: _input.timeout},
 		// Every drained rat must have finished cleanly.
 		{type: "evaluate", expect: {all_ok: true}},
+		// Merge every rat's branch in parallel and clear the fan-out set.
+		{type: "dismiss_all"},
 	]
 }

@@ -73,6 +73,8 @@ pub enum Step {
     ForEach(ForEachStep),
     /// Parallel join: block until every fanned-out agent has completed.
     WaitAll(WaitAllStep),
+    /// Parallel dismiss: merge/cleanup every fanned-out agent, clear the set.
+    DismissAll(DismissAllStep),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -175,6 +177,17 @@ pub struct EvaluateStep {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DismissStep {
+    #[serde(default, rename = "noMerge")]
+    pub no_merge: bool,
+}
+
+/// Dismiss every agent in the fan-out set in parallel — the fan-out counterpart
+/// to [`DismissStep`] over the single `active_agent`. Merges each parked branch
+/// (unless `no_merge`), then clears the fan-out set. Aggregates the per-agent
+/// outcomes into `ctx.previousResult` (`{count, merged, errors, all_merged,
+/// results}`) for a following `evaluate`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DismissAllStep {
     #[serde(default, rename = "noMerge")]
     pub no_merge: bool,
 }
@@ -419,6 +432,7 @@ fn step_matches(step: &Step, matcher: &AspectMatch) -> bool {
             Step::Stop(_) => "stop",
             Step::ForEach(_) => "for_each",
             Step::WaitAll(_) => "wait_all",
+            Step::DismissAll(_) => "dismiss_all",
         };
         if actual != step_type {
             return false;
@@ -585,6 +599,27 @@ workflow: {
             Step::Stop(s) if s.reason.as_deref() == Some("reviewer STOP")
         ));
         assert!(matches!(when.default.first().unwrap(), Step::Dismiss(_)));
+    }
+
+    #[test]
+    fn loads_dismiss_all() {
+        let source = r#"
+workflow: {
+    name: "drain-merge"
+    steps: [
+        {type: "for_each", query: {status: "ready", limit: 3}, task: {title: "{{item.id}}"}},
+        {type: "wait_all"},
+        {type: "dismiss_all"},
+        {type: "dismiss_all", noMerge: true},
+    ]
+}
+"#;
+        let wf = load_str(source, &HashMap::new()).unwrap();
+        assert_eq!(wf.steps.len(), 4);
+        // Default dismiss_all merges (no_merge defaults false).
+        assert!(matches!(&wf.steps[2], Step::DismissAll(d) if !d.no_merge));
+        // noMerge parked variant.
+        assert!(matches!(&wf.steps[3], Step::DismissAll(d) if d.no_merge));
     }
 
     #[test]
