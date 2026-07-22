@@ -1,5 +1,6 @@
 //! `rk` — the rat-kingdom CLI.
 
+mod agent_cmds;
 mod space_cmds;
 
 use anyhow::Result;
@@ -51,6 +52,20 @@ enum Command {
     Need(space_cmds::TextArgs),
     /// Advisory claim on a task (sugar; env-autofilled).
     Claim(space_cmds::ClaimArgs),
+    /// Spawn a rat to work on a task in an isolated worktree.
+    Spawn(agent_cmds::SpawnArgs),
+    /// List all agents.
+    List,
+    /// Show one agent's status.
+    Status(agent_cmds::NameArg),
+    /// Send mid-session guidance to a running agent.
+    Steer(agent_cmds::SteerArgs),
+    /// Gracefully interrupt a running agent.
+    Interrupt(agent_cmds::NameArg),
+    /// Dismiss an agent: stop it, merge its branch, clean up.
+    Dismiss(agent_cmds::DismissArgs),
+    /// Relaunch a failed/orphaned agent in its preserved worktree.
+    Respawn(agent_cmds::NameArg),
 }
 
 #[derive(Subcommand)]
@@ -92,7 +107,9 @@ async fn main() -> Result<()> {
         }
         Command::Daemon { command } => match command {
             DaemonCommand::Run => {
-                Daemon::new(layout, config.castle_name())?.run().await?;
+                Daemon::new(layout, config.castle_name(), config.harness.default.clone())?
+                    .run()
+                    .await?;
             }
             DaemonCommand::Status => match Client::connect(&layout).await {
                 Ok(mut client) => {
@@ -138,6 +155,13 @@ async fn main() -> Result<()> {
         Command::Obstacle(args) => space_cmds::report(&layout, args, "obstacle", cli.json).await?,
         Command::Need(args) => space_cmds::report(&layout, args, "need", cli.json).await?,
         Command::Claim(args) => space_cmds::claim(&layout, args, cli.json).await?,
+        Command::Spawn(args) => agent_cmds::spawn(&layout, args, cli.json).await?,
+        Command::List => agent_cmds::list(&layout, cli.json).await?,
+        Command::Status(args) => agent_cmds::status(&layout, args, cli.json).await?,
+        Command::Steer(args) => agent_cmds::steer(&layout, args, cli.json).await?,
+        Command::Interrupt(args) => agent_cmds::interrupt(&layout, args, cli.json).await?,
+        Command::Dismiss(args) => agent_cmds::dismiss(&layout, args, cli.json).await?,
+        Command::Respawn(args) => agent_cmds::respawn(&layout, args, cli.json).await?,
     }
 
     Ok(())

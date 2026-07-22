@@ -25,32 +25,43 @@ pub struct Daemon {
     layout: Layout,
     space: Space,
     castle: String,
+    supervisor: Arc<crate::supervisor::Supervisor>,
     started: Instant,
     shutdown_tx: watch::Sender<bool>,
 }
 
 impl Daemon {
-    pub fn new(layout: Layout, castle: String) -> rk_core::Result<Self> {
+    pub fn new(layout: Layout, castle: String, default_harness: String) -> rk_core::Result<Self> {
         layout.ensure()?;
         let space = Space::open(&layout.db_path())?;
-        let (shutdown_tx, _) = watch::channel(false);
-        Ok(Self {
-            layout,
-            space,
-            castle,
-            started: Instant::now(),
-            shutdown_tx,
-        })
+        Self::with_space(layout, castle, default_harness, space)
     }
 
     #[doc(hidden)]
     pub fn new_in_memory(layout: Layout, castle: String) -> rk_core::Result<Self> {
         let space = Space::open_in_memory()?;
+        Self::with_space(layout, castle, "fake".into(), space)
+    }
+
+    fn with_space(
+        layout: Layout,
+        castle: String,
+        default_harness: String,
+        space: Space,
+    ) -> rk_core::Result<Self> {
+        layout.ensure()?;
+        let supervisor = Arc::new(crate::supervisor::Supervisor::new(
+            layout.clone(),
+            castle.clone(),
+            default_harness,
+            space.clone(),
+        )?);
         let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
             layout,
             space,
             castle,
+            supervisor,
             started: Instant::now(),
             shutdown_tx,
         })
@@ -205,11 +216,80 @@ impl Daemon {
                 },
                 Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
             },
+            "agent.spawn" => reply(self.handle_spawn(req)),
+            "agent.respawn" => reply(self.handle_named(req, |sup, name| {
+                sup.respawn(&name).map(|r| json!({"agent": r}))
+            })),
+            "agent.list" => reply(Response::ok(id, json!({"agents": self.supervisor.list()}))),
+            "agent.status" => reply(self.handle_named(req, |sup, name| {
+                sup.status(&name)
+                    .map(|r| json!({"agent": r}))
+                    .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))
+            })),
+            "agent.steer" => reply(self.handle_steer(req).await),
+            "agent.interrupt" => {
+                let params: NameParams = match parse_params(&req.params) {
+                    Ok(p) => p,
+                    Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
+                };
+                reply(match self.supervisor.interrupt(&params.name).await {
+                    Ok(()) => Response::ok(id, json!({"interrupted": true})),
+                    Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
+                })
+            }
+            "agent.dismiss" => {
+                let params: DismissParams = match parse_params(&req.params) {
+                    Ok(p) => p,
+                    Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
+                };
+                reply(
+                    match self.supervisor.dismiss(&params.name, params.no_merge).await {
+                        Ok(v) => Response::ok(id, v),
+                        Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
+                    },
+                )
+            }
             other => reply(Response::err(
                 id,
                 codes::UNKNOWN_METHOD,
                 format!("unknown method: {other}"),
             )),
+        }
+    }
+
+    fn handle_spawn(&self, req: Request) -> Response {
+        let params: crate::supervisor::SpawnParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        match self.supervisor.spawn(params) {
+            Ok(record) => Response::ok(req.id, json!({"agent": record})),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    fn handle_named<F>(&self, req: Request, f: F) -> Response
+    where
+        F: FnOnce(&Arc<crate::supervisor::Supervisor>, String) -> rk_core::Result<Value>,
+    {
+        let params: NameParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        match f(&self.supervisor, params.name) {
+            Ok(v) => Response::ok(req.id, v),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    async fn handle_steer(&self, req: Request) -> Response {
+        let params: SteerParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        match self.supervisor.steer(&params.name, &params.message).await {
+            Ok(()) => Response::ok(req.id, json!({"steered": true})),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
     }
 
@@ -311,6 +391,24 @@ struct OutParams {
 struct PatternParams {
     #[serde(flatten)]
     pattern: Pattern,
+}
+
+#[derive(Deserialize)]
+struct NameParams {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct SteerParams {
+    name: String,
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct DismissParams {
+    name: String,
+    #[serde(default)]
+    no_merge: bool,
 }
 
 #[derive(Deserialize)]

@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/rk-core", "crates/rk-space", "crates/rk-daemon", "crates/rk-cli"]
+members = [
+    "crates/rk-core",
+    "crates/rk-space",
+    "crates/rk-git",
+    "crates/rk-harness",
+    "crates/rk-daemon",
+    "crates/rk-cli",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +19,8 @@ rust-version = "1.85"
 [workspace.dependencies]
 rk-core = { path = "crates/rk-core" }
 rk-space = { path = "crates/rk-space" }
+rk-git = { path = "crates/rk-git" }
+rk-harness = { path = "crates/rk-harness" }
 rk-daemon = { path = "crates/rk-daemon" }
 
 anyhow = "1"

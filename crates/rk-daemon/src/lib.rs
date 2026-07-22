@@ -1,9 +1,11 @@
 //! rat-kingdom daemon: NDJSON-over-UDS server hosting the tuplespace, plus the
 //! client used by `rk`.
 
+pub mod agents;
 pub mod client;
 pub mod proto;
 pub mod server;
+pub mod supervisor;
 
 pub use client::{Client, WatchStream};
 pub use server::Daemon;
