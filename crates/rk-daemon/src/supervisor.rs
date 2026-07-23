@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use rk_core::config::SupervisorConfig;
 use rk_core::paths::Layout;
 use rk_core::prime::{render, PrimeContext};
-use rk_core::tuple::{Category, Tuple};
+use rk_core::tuple::{Category, Pattern, Tuple, SYSTEM_SCOPE};
 use rk_git::{agent_branch, Repo};
 use rk_harness::{make_harness, HarnessEvent, LaunchSpec, SessionControl, TokenUsage};
 use rk_ledger::pricing::PricingTable;
@@ -244,6 +244,7 @@ impl Supervisor {
             task: Some(params.task.clone()),
             branch: Some(branch.clone()),
             parent: params.parent.clone(),
+            conventions: self.scan_conventions(&repo_name),
         };
         let prompt = params
             .prompt
@@ -512,6 +513,7 @@ impl Supervisor {
             task: record.task.clone(),
             branch: record.branch.clone(),
             parent: record.parent.clone(),
+            conventions: self.scan_conventions(&record.repo_name),
         };
         let spec = LaunchSpec {
             prompt: format!(
@@ -680,6 +682,30 @@ impl Supervisor {
             Ok(mut set) => set.insert(name.to_string()),
             Err(p) => p.into_inner().insert(name.to_string()),
         }
+    }
+
+    /// Active fleet conventions binding on a rat spawned into `repo`: the text
+    /// of every `Convention` tuple in the `system` scope (fleet-wide norms) and
+    /// the repo's own scope (repo-local norms). Composed into the rat's prompt
+    /// as a "Standing conventions" section (stigmergy P6) so a quorum-promoted
+    /// norm actually changes what the rat does. Scan/parse failures degrade to
+    /// no conventions — priming must never fail on a convention read.
+    fn scan_conventions(&self, repo: &str) -> Vec<String> {
+        let mut texts = Vec::new();
+        for scope in [SYSTEM_SCOPE, repo] {
+            let pattern = Pattern::category(Category::Convention).scope(scope);
+            match self.space.scan(&pattern) {
+                Ok(tuples) => {
+                    for t in tuples {
+                        if let Some(text) = t.payload.get("text").and_then(|v| v.as_str()) {
+                            texts.push(text.to_string());
+                        }
+                    }
+                }
+                Err(e) => warn!(error = %e, scope, "failed to scan conventions for priming"),
+            }
+        }
+        texts
     }
 
     fn emit_obstacle_for_budget(&self, record: &AgentRecord, kind: &str) {

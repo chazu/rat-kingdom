@@ -477,6 +477,9 @@ async fn main() -> Result<()> {
                 task: std::env::var("RK_TASK").ok(),
                 branch: std::env::var("RK_BRANCH").ok(),
                 parent: std::env::var("RK_PARENT").ok(),
+                // `rk prime` inspects the template shape; live conventions are
+                // scanned and injected by the supervisor at spawn time.
+                conventions: Vec::new(),
             };
             let text = rk_core::prime::render(&role, &ctx);
             if cli.json {
