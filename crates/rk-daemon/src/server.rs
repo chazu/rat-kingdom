@@ -304,7 +304,13 @@ impl Daemon {
                 tick.tick().await;
                 loop {
                     tokio::select! {
-                        _ = tick.tick() => supervisor.sweep(&cfg),
+                        _ = tick.tick() => {
+                            supervisor.sweep(&cfg);
+                            // Self-healing respawn rides the same tick (TKT-53):
+                            // relaunch crashed/orphaned rats with crash-loop
+                            // backoff. No-op unless [supervisor].respawn_enabled.
+                            supervisor.respawn_sweep(&cfg);
+                        }
                         _ = sweep_shutdown.changed() => break,
                     }
                 }

@@ -191,6 +191,21 @@ pub struct SupervisorConfig {
     /// After the first (soft) flag steers the rat, how long to wait before
     /// escalating to a kill if it is STILL flagged. Prefer steer-then-wait.
     pub kill_grace_secs: u64,
+    /// Self-healing respawn: when true, the same sweep auto-`respawn`s agents
+    /// that crashed out of their run (Orphaned by a daemon restart, or Failed)
+    /// instead of leaving them for a manual `rk respawn`. Off by default — it
+    /// relaunches agents (and spends), so it is opt-in like burn detection.
+    /// An agent whose branch already merged is never auto-respawned.
+    pub respawn_enabled: bool,
+    /// Crash-loop bound: how many times the sweep will auto-respawn one agent
+    /// before giving up and escalating a `need` for a human. Zero disables
+    /// auto-respawn even when `respawn_enabled` is true.
+    pub respawn_max_attempts: u32,
+    /// Base backoff (seconds) between auto-respawns of the same agent. Grows
+    /// exponentially per attempt (`base * 2^(attempt-1)`) so a genuinely-broken
+    /// task backs off instead of respawn-looping hot. The first attempt fires
+    /// immediately; the backoff gates every retry after it.
+    pub respawn_backoff_secs: u64,
 }
 
 impl Default for SupervisorConfig {
@@ -201,6 +216,9 @@ impl Default for SupervisorConfig {
             stuck_after_secs: 900,
             burn_usd_per_min: 0.0,
             kill_grace_secs: 600,
+            respawn_enabled: false,
+            respawn_max_attempts: 3,
+            respawn_backoff_secs: 60,
         }
     }
 }
