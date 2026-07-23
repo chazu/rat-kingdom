@@ -391,6 +391,7 @@ impl Supervisor {
             session_id: None,
             attach_target: None,
             pid: session.pid,
+            merge_commit: None,
             state: AgentState::Running,
             result: None,
             usage: TokenUsage::default(),
@@ -481,6 +482,7 @@ impl Supervisor {
             session_id: None,
             attach_target: Some(target.clone()),
             pid: None,
+            merge_commit: None,
             state: AgentState::Running,
             result: None,
             usage: TokenUsage::default(),
@@ -1504,6 +1506,7 @@ impl Supervisor {
 
         let repo = Repo::discover(&record.repo_root)?;
         let mut merged = false;
+        let mut merge_commit: Option<String> = None;
         let mut pr_opened = false;
         let mut pr_url: Option<String> = None;
         let mut detail = String::from("no merge requested");
@@ -1534,6 +1537,7 @@ impl Supervisor {
                             repo.merge_branch(branch, &record.target_branch)?
                         };
                         merged = outcome.merged;
+                        merge_commit = outcome.commit;
                         detail = outcome.detail;
                         if merged {
                             repo.delete_branch(branch)?;
@@ -1558,6 +1562,11 @@ impl Supervisor {
         self.lock_registry().update(name, |r| {
             r.state = AgentState::Dismissed;
             r.pid = None;
+            // Record the landed merge commit as the `rk revert` anchor; a
+            // no-merge or PR-mode dismiss leaves any prior record untouched.
+            if merge_commit.is_some() {
+                r.merge_commit = merge_commit.clone();
+            }
         })?;
         // A merged ticket-rat closes its ticket for good.
         if merged {
@@ -1575,6 +1584,7 @@ impl Supervisor {
             json!({
                 "agent": name,
                 "merged": merged,
+                "merge_commit": &merge_commit,
                 "pr_opened": pr_opened,
                 "pr_url": &pr_url,
                 "detail": &detail,
@@ -1600,9 +1610,98 @@ impl Supervisor {
         Ok(json!({
             "agent": name,
             "merged": merged,
+            "merge_commit": merge_commit,
             "pr_opened": pr_opened,
             "pr_url": pr_url,
             "detail": detail,
+        }))
+    }
+
+    /// Revert a dismissed agent's landed merge — the undo for an unattended
+    /// auto-merge that turned out bad (steward/drain landed it, then main
+    /// broke). Revert-merges the merge commit recorded on the agent's record
+    /// at dismiss time (CAS-safe, through the same per-target merge queue as
+    /// land/dismiss), reopens the agent's ticket (`open`, or `blocked` with
+    /// `block` to hold it out of the auto-dispatch backlog), and emits a
+    /// `fact` tuple recording what was undone. A revert conflict or a target
+    /// moved mid-revert is a clean `reverted: false`, mirroring merge; an
+    /// agent that never merged (no-merge, PR-mode, or already reverted) is an
+    /// error.
+    pub async fn revert(&self, name: &str, block: bool) -> rk_core::Result<serde_json::Value> {
+        let record = self
+            .lock_registry()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
+        let Some(commit) = record.merge_commit.clone() else {
+            return Err(rk_core::Error::other(format!(
+                "{name} has no recorded merge commit to revert \
+                 (never merged, PR-mode, or already reverted)"
+            )));
+        };
+
+        let repo = Repo::discover(&record.repo_root)?;
+        // Same per-target merge queue as land/dismiss: the revert takes its
+        // turn so it never races a concurrent auto-merge into this target.
+        let outcome = {
+            let _merge_guard = self
+                .merge_queue
+                .acquire(repo.root(), &record.target_branch)
+                .await;
+            repo.revert_merge(&commit, &record.target_branch)?
+        };
+        let reverted = outcome.merged;
+
+        let mut ticket_status: Option<&str> = None;
+        if reverted {
+            // Clear the anchor so a second `rk revert` errors instead of
+            // reverting the revert.
+            self.lock_registry().update(name, |r| {
+                r.merge_commit = None;
+            })?;
+            // Reopen the ticket the bad merge closed, so the work is durably
+            // back on the backlog rather than falsely done.
+            if let Some(task) = &record.task {
+                if task.starts_with(crate::tickets::ID_PREFIX) {
+                    let status = if block { "blocked" } else { "open" };
+                    match self.tickets.set_status(task, status).await {
+                        Ok(_) => ticket_status = Some(status),
+                        Err(e) => {
+                            warn!(ticket = %task, error = %e, "failed to reopen ticket on revert");
+                        }
+                    }
+                }
+            }
+            let fact = Tuple::new(
+                Category::Fact,
+                record.repo_name.clone(),
+                format!("merge-reverted-{name}"),
+                self.castle.clone(),
+                json!({
+                    "agent": name,
+                    "branch": &record.branch,
+                    "target": &record.target_branch,
+                    "task": &record.task,
+                    "merge_commit": &commit,
+                    "revert_commit": &outcome.commit,
+                    "ticket_status": ticket_status,
+                    "detail": &outcome.detail,
+                }),
+            );
+            if let Err(e) = self.space.out(fact) {
+                warn!(error = %e, "failed to emit merge-reverted fact tuple");
+            }
+        }
+        info!(agent = name, reverted, merge_commit = %commit, "revert");
+        Ok(json!({
+            "agent": name,
+            "reverted": reverted,
+            "merge_commit": commit,
+            "revert_commit": outcome.commit,
+            "target": record.target_branch,
+            "task": record.task,
+            "ticket_status": ticket_status,
+            "detail": outcome.detail,
         }))
     }
 
@@ -1898,6 +1997,7 @@ mod respawn_tests {
             session_id: None,
             attach_target: None,
             pid: None,
+            merge_commit: None,
             state: AgentState::Failed,
             result: None,
             usage: TokenUsage::default(),

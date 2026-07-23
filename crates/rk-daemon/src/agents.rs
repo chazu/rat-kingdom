@@ -56,6 +56,11 @@ pub struct AgentRecord {
     #[serde(default)]
     pub attach_target: Option<String>,
     pub pid: Option<u32>,
+    /// Merge commit a Direct-mode dismiss landed on the target — the anchor
+    /// `rk revert` revert-merges. Cleared once reverted, so a second revert
+    /// errors instead of reverting the revert.
+    #[serde(default)]
+    pub merge_commit: Option<String>,
     pub state: AgentState,
     pub result: Option<String>,
     pub usage: TokenUsage,
@@ -203,6 +208,7 @@ mod tests {
             session_id: None,
             attach_target: None,
             pid: Some(1234),
+            merge_commit: None,
             state,
             result: None,
             usage: TokenUsage::default(),

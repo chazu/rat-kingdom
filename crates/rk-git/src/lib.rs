@@ -26,6 +26,9 @@ pub struct Repo {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeOutcome {
     pub merged: bool,
+    /// The commit the target ref was advanced to (the merge commit, or the
+    /// revert commit for [`Repo::revert_merge`]). `None` when nothing landed.
+    pub commit: Option<String>,
     pub detail: String,
 }
 
@@ -184,6 +187,65 @@ impl Repo {
     /// `target`: run the merge in a temporary detached worktree, then
     /// fast-forward the target ref if it was not moved concurrently.
     pub fn merge_branch(&self, branch: &str, target: &str) -> rk_core::Result<MergeOutcome> {
+        self.advance_via_worktree(
+            target,
+            "merge",
+            &format!("branch {branch} left unmerged"),
+            |tmp| {
+                git_in(
+                    tmp,
+                    &[
+                        "merge",
+                        "--no-ff",
+                        "-m",
+                        &format!("merge {branch} into {target} [rk]"),
+                        branch,
+                    ],
+                )
+                .map(|_| ())
+            },
+            format!("merged {branch} into {target}"),
+        )
+    }
+
+    /// Revert a previously-landed merge commit on `target` — the undo for
+    /// [`merge_branch`](Repo::merge_branch). Creates a new commit that
+    /// reverses the merge's tree changes (`git revert -m 1`, keeping the
+    /// first parent — the target side), leaving history intact. Runs in a
+    /// temporary detached worktree with the same compare-and-swap advance as
+    /// the merge itself, so no live checkout is disturbed; a revert conflict
+    /// or a concurrently-moved target is a clean `merged: false`, never an
+    /// error.
+    pub fn revert_merge(&self, commit: &str, target: &str) -> rk_core::Result<MergeOutcome> {
+        if commit.trim().is_empty() {
+            return Err(rk_core::Error::other(
+                "revert_merge requires a merge commit",
+            ));
+        }
+        self.advance_via_worktree(
+            target,
+            "revert",
+            "nothing reverted",
+            |tmp| git_in(tmp, &["revert", "--no-edit", "-m", "1", commit]).map(|_| ()),
+            format!("reverted merge {commit} on {target}"),
+        )
+    }
+
+    /// The shared engine behind [`merge_branch`](Repo::merge_branch) and
+    /// [`revert_merge`](Repo::revert_merge): run `op` (a commit-producing git
+    /// operation) in a temporary detached worktree of `target`, then advance
+    /// the target ref to the new commit iff it was not moved concurrently.
+    /// An `op` failure (conflict) and a moved target are clean
+    /// `merged: false` outcomes; `aftermath` describes what the moved-target
+    /// case leaves behind.
+    fn advance_via_worktree(
+        &self,
+        target: &str,
+        op_name: &str,
+        aftermath: &str,
+        op: impl FnOnce(&Path) -> rk_core::Result<()>,
+        success_detail: String,
+    ) -> rk_core::Result<MergeOutcome> {
         let seq = MERGE_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = self
             .root
@@ -199,37 +261,28 @@ impl Repo {
         ])?;
         let result = (|| -> rk_core::Result<MergeOutcome> {
             let target_before = self.git(&["rev-parse", &format!("refs/heads/{target}")])?;
-            let merge = git_in(
-                &tmp,
-                &[
-                    "merge",
-                    "--no-ff",
-                    "-m",
-                    &format!("merge {branch} into {target} [rk]"),
-                    branch,
-                ],
-            );
-            match merge {
-                Ok(_) => {
-                    let merged_commit = git_in(&tmp, &["rev-parse", "HEAD"])?;
+            match op(&tmp) {
+                Ok(()) => {
+                    let new_commit = git_in(&tmp, &["rev-parse", "HEAD"])?;
                     let target_now = self.git(&["rev-parse", &format!("refs/heads/{target}")])?;
                     if target_now.trim() != target_before.trim() {
                         return Ok(MergeOutcome {
                             merged: false,
-                            detail: format!(
-                                "{target} moved during merge; branch {branch} left unmerged"
-                            ),
+                            commit: None,
+                            detail: format!("{target} moved during {op_name}; {aftermath}"),
                         });
                     }
-                    self.advance_target(target, merged_commit.trim(), target_before.trim())?;
+                    self.advance_target(target, new_commit.trim(), target_before.trim())?;
                     Ok(MergeOutcome {
                         merged: true,
-                        detail: format!("merged {branch} into {target}"),
+                        commit: Some(new_commit.trim().to_string()),
+                        detail: success_detail,
                     })
                 }
                 Err(e) => Ok(MergeOutcome {
                     merged: false,
-                    detail: format!("merge conflict or failure: {e}"),
+                    commit: None,
+                    detail: format!("{op_name} conflict or failure: {e}"),
                 }),
             }
         })();
@@ -632,6 +685,80 @@ mod tests {
                 .is_empty(),
             "operator's working tree should be clean after auto-merge"
         );
+    }
+
+    #[test]
+    fn revert_merge_undoes_a_landed_merge() {
+        let (dir, repo) = scratch_repo();
+        let wt = dir.path().join("wt-scabbers");
+        let branch = agent_branch("Scabbers", "task-5");
+        repo.create_worktree(&wt, &branch, "main").unwrap();
+
+        std::fs::write(wt.join("bad.txt"), "regression\n").unwrap();
+        run(&wt, &["add", "."]);
+        run(&wt, &["commit", "-m", "bad work"]);
+
+        let outcome = repo.merge_branch(&branch, "main").unwrap();
+        assert!(outcome.merged, "{}", outcome.detail);
+        let merge_commit = outcome.commit.expect("merge outcome carries the merge commit");
+        repo.remove_worktree(&wt).unwrap();
+        repo.delete_branch(&branch).unwrap();
+        assert!(dir.path().join("bad.txt").exists());
+
+        let revert = repo.revert_merge(&merge_commit, "main").unwrap();
+        assert!(revert.merged, "{}", revert.detail);
+        assert!(revert.commit.is_some());
+
+        // The bad file is gone from main's tree AND the operator's checkout,
+        // while history keeps both the merge and the revert.
+        let files = git_in(dir.path(), &["ls-tree", "--name-only", "main"]).unwrap();
+        assert!(!files.contains("bad.txt"));
+        assert!(!dir.path().join("bad.txt").exists());
+        let log = git_in(dir.path(), &["log", "--oneline", "main"]).unwrap();
+        assert!(log.contains("Revert"));
+        assert!(
+            git_in(dir.path(), &["status", "--porcelain"])
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "operator's working tree should be clean after revert"
+        );
+    }
+
+    #[test]
+    fn revert_merge_rejects_empty_commit() {
+        let (_dir, repo) = scratch_repo();
+        assert!(repo.revert_merge("", "main").is_err());
+    }
+
+    #[test]
+    fn revert_merge_conflict_reports_not_merged() {
+        let (dir, repo) = scratch_repo();
+        let wt = dir.path().join("wt-templeton");
+        let branch = agent_branch("Templeton", "task-6");
+        repo.create_worktree(&wt, &branch, "main").unwrap();
+
+        std::fs::write(wt.join("shared.txt"), "rat version\n").unwrap();
+        run(&wt, &["add", "."]);
+        run(&wt, &["commit", "-m", "rat work"]);
+        let outcome = repo.merge_branch(&branch, "main").unwrap();
+        assert!(outcome.merged, "{}", outcome.detail);
+        let merge_commit = outcome.commit.unwrap();
+        repo.remove_worktree(&wt).unwrap();
+        repo.delete_branch(&branch).unwrap();
+
+        // Main has since built on the merged file: the revert now conflicts.
+        std::fs::write(dir.path().join("shared.txt"), "operator edit on top\n").unwrap();
+        run(dir.path(), &["add", "."]);
+        run(dir.path(), &["commit", "-m", "build on rat work"]);
+
+        let revert = repo.revert_merge(&merge_commit, "main").unwrap();
+        assert!(!revert.merged);
+        assert!(revert.commit.is_none());
+        assert!(revert.detail.contains("revert conflict or failure"));
+        // The conflicted revert must leave main untouched.
+        let files = git_in(dir.path(), &["ls-tree", "--name-only", "main"]).unwrap();
+        assert!(files.contains("shared.txt"));
     }
 
     #[test]

@@ -75,6 +75,9 @@ enum Command {
     Interrupt(agent_cmds::NameArg),
     /// Dismiss an agent: stop it, merge its branch, clean up.
     Dismiss(agent_cmds::DismissArgs),
+    /// Undo a bad auto-merge: revert a dismissed agent's landed merge commit
+    /// and reopen its ticket.
+    Revert(agent_cmds::RevertArgs),
     /// Relaunch a failed/orphaned agent in its preserved worktree.
     Respawn(agent_cmds::NameArg),
     /// Attach interactively to an attach-mode rat's herdr pane.
@@ -368,6 +371,7 @@ async fn main() -> Result<()> {
         Command::Steer(args) => agent_cmds::steer(&layout, args, cli.json).await?,
         Command::Interrupt(args) => agent_cmds::interrupt(&layout, args, cli.json).await?,
         Command::Dismiss(args) => agent_cmds::dismiss(&layout, args, cli.json).await?,
+        Command::Revert(args) => agent_cmds::revert(&layout, args, cli.json).await?,
         Command::Respawn(args) => agent_cmds::respawn(&layout, args, cli.json).await?,
         Command::Attach(args) => agent_cmds::attach(&layout, args).await?,
         Command::Cost { fleet } => {

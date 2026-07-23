@@ -142,8 +142,11 @@ Grouped by leverage dimension. ★ = selected for the deep-dive top 10.
 20. **Diff-scope guardrail** — flag/block merges touching sensitive paths or
     exceeding a size budget. *Leverage: catches the runaway refactor before it
     lands.*
-21. **Rollback / revert-merge** — `rk revert <agent>` undoes a bad dismissal.
-    *Leverage: cheap recovery lowers the cost of trusting auto-merge.*
+21. **Rollback / revert-merge** — `rk revert <agent>` undoes a bad dismissal
+    (LANDED, TKT-54). *Leverage: cheap recovery lowers the cost of trusting
+    auto-merge.* The dismiss-time merge commit is recorded on the agent record;
+    revert-merges it CAS-safe through the merge queue, reopens the ticket
+    (`open`/`--block`), and emits a `fact` tuple.
 22. **Workflow instance restart recovery** — resume running instances across daemon
     restart (LANDED, TKT-52). *Leverage: long unattended runs survive a restart
     instead of dying silently.* Persisted instances are rehydrated on startup and
