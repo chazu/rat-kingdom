@@ -768,6 +768,27 @@ impl Supervisor {
         }
     }
 
+    /// Read-only preflight: would a spawn into `repo` be refused by the
+    /// fleet/repo budget cap right now? Lets an autoscaler (the continuous-drain
+    /// controller) skip claiming a ticket it could not dispatch, rather than
+    /// claim-then-orphan it in `in_progress`. Side-effect free — unlike
+    /// [`check_dispatch_budget`](Self::check_dispatch_budget), it emits no
+    /// obstacle, so polling it every drain cycle does not spam `rk inbox`. The
+    /// authoritative guard still runs inside `spawn`; this only avoids the claim.
+    ///
+    /// Preflight has no workflow instance in hand, so it checks only the
+    /// fleet/repo scopes (`check_dispatch`); the per-instance cap (TKT-32) is
+    /// still enforced by the authoritative guard in `spawn`.
+    pub fn would_exceed_budget(&self, repo: &str) -> bool {
+        let (fleet_spent, repo_spent, _instance_spent) = self.cost_rollup(repo, None);
+        matches!(
+            self.fleet_budget
+                .check_dispatch(fleet_spent, repo_spent)
+                .action,
+            BudgetAction::Stop
+        )
+    }
+
     /// Returns true the first time a given scope is warned, so a warn obstacle
     /// is not re-posted on every subsequent dispatch in the band. The instance
     /// scope is keyed by instance id so each workflow run warns independently.

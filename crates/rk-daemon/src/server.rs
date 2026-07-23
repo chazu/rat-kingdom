@@ -34,6 +34,7 @@ pub struct Daemon {
     reactor_config: rk_core::config::ReactorConfig,
     scheduler_config: rk_core::config::SchedulerConfig,
     sweep_config: rk_core::config::SupervisorConfig,
+    drain_config: rk_core::config::DrainConfig,
     evaporation_decay: f64,
     global_agents: std::collections::HashMap<String, rk_workflow::AgentProfile>,
     tier_routing: rk_workflow::TierRouting,
@@ -99,6 +100,7 @@ impl Daemon {
         daemon.reactor_config = config.reactor.clone();
         daemon.scheduler_config = config.scheduler.clone();
         daemon.sweep_config = config.supervisor.clone();
+        daemon.drain_config = config.drain.clone();
         daemon.evaporation_decay = config.evaporation.decay;
         daemon.require_named_checks = config.policy.require_named_checks;
         if config.sync.enabled {
@@ -168,6 +170,11 @@ impl Daemon {
         self.require_named_checks = v;
     }
 
+    #[doc(hidden)]
+    pub fn set_drain_config(&mut self, cfg: rk_core::config::DrainConfig) {
+        self.drain_config = cfg;
+    }
+
     fn with_space(
         layout: Layout,
         castle: String,
@@ -203,6 +210,7 @@ impl Daemon {
             reactor_config: rk_core::config::ReactorConfig::default(),
             scheduler_config: rk_core::config::SchedulerConfig::default(),
             sweep_config: rk_core::config::SupervisorConfig::default(),
+            drain_config: rk_core::config::DrainConfig::default(),
             evaporation_decay: rk_core::config::EvaporationConfig::default().decay,
             global_agents: Default::default(),
             tier_routing: Default::default(),
@@ -421,6 +429,48 @@ impl Daemon {
                         Ok(Ok(n)) => debug!(fired = n, "scheduler cycle fired workflows"),
                         Ok(Err(e)) => warn!(error = %e, "scheduler cycle failed"),
                         Err(e) => warn!(error = %e, "scheduler task panicked"),
+                    }
+                }
+            });
+        }
+
+        // Continuous-drain loop: a WIP-limited fleet autoscaler. While fewer than
+        // `max_wip` rats are live and the ready backlog is non-empty, claim the
+        // highest-priority ready ticket and spawn a rat — the always-on refill
+        // counterpart to a one-shot backlog-drain workflow. Off unless explicitly
+        // enabled *and* given a positive cap (handing the dispatch loop to the
+        // daemon is opt-in). Wakes on the tuple feed (a completion frees a slot)
+        // with the interval as a fallback, mirroring the reactor.
+        if daemon.drain_config.enabled && daemon.drain_config.max_wip > 0 {
+            let drain = Arc::new(crate::drain::Drain::new(
+                Arc::clone(&daemon.supervisor),
+                daemon.tickets.clone(),
+                daemon.layout.clone(),
+                daemon.drain_config.clone(),
+            ));
+            let mut feed = daemon.space.subscribe();
+            let mut drain_shutdown = daemon.shutdown_tx.subscribe();
+            let interval = Duration::from_secs(daemon.drain_config.interval_secs.max(1));
+            // Unlike the reactor/scheduler, a drain cycle shells out to nothing
+            // (it claims tickets and spawns) so it runs directly in this async
+            // task — the same context the RPC spawn path already uses.
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        recv = feed.recv() => match recv {
+                            // Coalesce a burst so one refill covers the batch.
+                            Ok(_) => while feed.try_recv().is_ok() {},
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                        _ = drain_shutdown.changed() => break,
+                    }
+                    match drain.run_cycle().await {
+                        Ok(0) => {}
+                        Ok(n) => debug!(spawned = n, "drain cycle refilled fleet"),
+                        Err(e) => warn!(error = %e, "drain cycle failed"),
                     }
                 }
             });

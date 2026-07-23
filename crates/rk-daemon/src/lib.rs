@@ -5,6 +5,7 @@ pub mod agent_log;
 pub mod agents;
 pub mod client;
 pub mod cron;
+pub mod drain;
 pub mod inbox;
 pub mod proto;
 pub mod reactor;

@@ -17,6 +17,7 @@ pub struct Config {
     pub reactor: ReactorConfig,
     pub scheduler: SchedulerConfig,
     pub supervisor: SupervisorConfig,
+    pub drain: DrainConfig,
     pub evaporation: EvaporationConfig,
     pub policy: PolicyConfig,
     /// Named agent profiles: [agents.<name>] harness/model/permission_mode.
@@ -200,6 +201,59 @@ impl Default for SupervisorConfig {
             stuck_after_secs: 900,
             burn_usd_per_min: 0.0,
             kill_grace_secs: 600,
+        }
+    }
+}
+
+/// The continuous-drain controller: a WIP-limited fleet autoscaler. Maintains a
+/// target live-agent concurrency (`max_wip`) by continuously claiming the
+/// highest-priority ready ticket and spawning a rat whenever the fleet has a
+/// free slot — the always-on refill counterpart to a one-shot backlog-drain
+/// workflow, turning "keep the fleet busy" from one operator spawn per ticket
+/// into a single config dial. Combined with the steward closing each merged
+/// item it is a closed loop: the operator grooms/prioritises, the fleet
+/// executes. Off by default: the per-spawn fleet/repo budget cap (the wallet
+/// kill-switch) and the liveness sweep (which reaps stuck rats, freeing slots)
+/// are its safety net, but enabling it still hands the dispatch loop to the
+/// daemon, so it is opt-in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DrainConfig {
+    /// Master switch. Off by default — turning it on makes the fleet
+    /// self-dispatch from the ready backlog with no operator in the loop.
+    pub enabled: bool,
+    /// Target concurrency W: the controller keeps up to this many rats live,
+    /// spawning the highest-priority ready ticket whenever a slot frees. Zero
+    /// (the default) also disables the loop, so `enabled` alone is inert until a
+    /// cap is set.
+    pub max_wip: usize,
+    /// Fallback refill cadence (seconds). A freed slot — a completion or
+    /// dismissal — also wakes a refill through the tuple feed; this bounds the
+    /// worst-case latency if that wake is dropped, and paces retries while the
+    /// backlog is empty or the budget cap is holding dispatch.
+    pub interval_secs: u64,
+    /// Restrict dispatch to a single repo scope (by name). Unset drains every
+    /// registered repo's ready backlog; system-scope tickets, which resolve to
+    /// no registered repo, are never dispatched. The cross-repo WIP-partition
+    /// variant is a follow-up.
+    pub repo: Option<String>,
+    /// Priority aging: seconds of waiting that buy one level of effective
+    /// priority boost, so a low-priority ticket cannot starve behind a steady
+    /// stream of higher-priority work. Zero disables aging (strict priority,
+    /// oldest ticket first).
+    pub aging_secs: u64,
+}
+
+impl Default for DrainConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_wip: 0,
+            interval_secs: 30,
+            repo: None,
+            // An hour of waiting buys one priority level — a low ticket outranks
+            // a fresh normal one after ~2h, a fresh high after ~3h.
+            aging_secs: 3600,
         }
     }
 }
