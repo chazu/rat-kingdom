@@ -1,0 +1,24 @@
+[tools]
+rust = "1.85"
+
+[tasks.build]
+description = "Build an optimized release build of rk"
+run = "cargo build --release -p rk-cli"
+
+[tasks.install]
+description = "Build and install an optimized release build of rk"
+run = "./scripts/install.sh"
+
+[tasks.deploy]
+description = "Build, install, and restart the daemon onto the freshly built rk binary"
+run = """
+./scripts/install.sh
+RK="${RK_INSTALL_DIR:-$HOME/.local/bin}/rk"
+"$RK" daemon stop || true
+"$RK" ping >/dev/null
+"$RK" daemon status
+"""
+
+[tasks.clean]
+description = "Remove build artifacts"
+run = "cargo clean"
