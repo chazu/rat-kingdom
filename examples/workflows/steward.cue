@@ -132,6 +132,11 @@ workflow: {
 				"APPROVE": [
 					{type: "dismiss", noMerge: true},
 					{type: "land", branch: "{{ctx.activeBranch}}", target: _input.target},
+					// GATE THE LAND RESULT. A conflict or moved target lands as a
+					// clean {merged: false} (not an error), so without this the
+					// instance would complete as if merged. Fail closed on
+					// merged:false — the held, unmerged branch surfaces in rk inbox.
+					{type: "evaluate", expect: {merged: true}},
 				]
 				// REWORK: hand the fixable work back durably as a ticket rather
 				// than looping a rework rat here — the steward stays fast and
