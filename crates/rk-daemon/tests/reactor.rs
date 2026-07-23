@@ -107,6 +107,7 @@ fn build_reactor_with_space(
         Default::default(),
         Default::default(),
         "fake".into(),
+        false,
     ));
     Arc::new(Reactor::new(space, engine, tickets, layout.clone(), config))
 }

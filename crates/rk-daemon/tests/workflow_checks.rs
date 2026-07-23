@@ -1,0 +1,311 @@
+//! TKT-30 end to end: a workflow `run` step resolves a repo-registered NAMED
+//! check (`<repo>/.rk/checks.cue`) instead of a raw command, and the
+//! `require_named_checks` policy refuses a raw inline command fail-closed so a
+//! compromised/untrusted workflow definition cannot execute arbitrary shell.
+
+use rk_core::paths::Layout;
+use rk_daemon::{Client, Daemon};
+use serde_json::json;
+use std::path::Path;
+use std::process::Command;
+use std::time::Duration;
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+async fn connect(layout: &Layout) -> Client {
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Ok(c) = Client::connect(layout).await {
+            return c;
+        }
+    }
+    panic!("daemon did not come up");
+}
+
+const WORKING_FAKE: &str = r#"
+read -r _prompt
+echo "work for $RK_TASK by $RK_AGENT" > "work-$RK_AGENT.txt"
+git add . >/dev/null 2>&1
+git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
+echo '{"type":"system","subtype":"init","session_id":"wf-fake"}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"did the work","session_id":"wf-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+"#;
+
+/// The named check `worktree-has-work` asserts the rat's committed work file
+/// exists in the worktree and carries its own inline `expectExit: 0` gate.
+const CHECKS: &str = r#"
+checks: [
+    {name: "worktree-has-work", command: "test -f work-{{ctx.activeAgent}}.txt", expectExit: 0, timeout: "30s"},
+]
+"#;
+
+// spawn → wait → run (by NAME, not raw command) → dismiss. The check's own
+// expectExit gate fails closed on a red result; here it is green so it merges.
+const CHECK_WORKFLOW: &str = r#"
+workflow: {
+    name: "named-check"
+    params: {taskId: {type: "string", required: true}}
+    agents: {default: {harness: "fake", model: "sonnet"}}
+    steps: [
+        {type: "spawn", role: "rat", task: {title: _input.taskId, description: "do " + _input.taskId}},
+        {type: "wait", timeout: "30s"},
+        {type: "run", check: "worktree-has-work"},
+        {type: "dismiss"},
+    ]
+}
+"#;
+
+// spawn → wait → run (RAW command) → dismiss. Refused fail-closed under policy.
+const RAW_WORKFLOW: &str = r#"
+workflow: {
+    name: "raw-run"
+    params: {taskId: {type: "string", required: true}}
+    agents: {default: {harness: "fake", model: "sonnet"}}
+    steps: [
+        {type: "spawn", role: "rat", task: {title: _input.taskId, description: "do " + _input.taskId}},
+        {type: "wait", timeout: "30s"},
+        {type: "run", command: "echo pwned", expectExit: 0, timeout: "30s"},
+        {type: "dismiss"},
+    ]
+}
+"#;
+
+fn init_repo(repo: &Path) {
+    git(repo, &["init", "-b", "main"]);
+    git(repo, &["config", "user.email", "r@x"]);
+    git(repo, &["config", "user.name", "R"]);
+    std::fs::write(repo.join("README.md"), "# x\n").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-m", "init"]);
+}
+
+fn write_def(repo: &Path, name: &str, src: &str) {
+    let wf_dir = repo.join(".rk").join("workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(wf_dir.join(format!("{name}.cue")), src).unwrap();
+}
+
+fn write_checks(repo: &Path, src: &str) {
+    let rk_dir = repo.join(".rk");
+    std::fs::create_dir_all(&rk_dir).unwrap();
+    std::fs::write(rk_dir.join("checks.cue"), src).unwrap();
+}
+
+async fn await_status(client: &mut Client, id: &str, want: &str) -> serde_json::Value {
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = client
+            .call("workflow.status", json!({"name": id}))
+            .await
+            .unwrap();
+        match status["instance"]["status"].as_str().unwrap_or("") {
+            s if s == want => return status,
+            "failed" if want != "failed" => {
+                panic!(
+                    "workflow failed unexpectedly: {}",
+                    status["instance"]["error"]
+                )
+            }
+            "completed" if want != "completed" => panic!("workflow completed unexpectedly"),
+            _ => {}
+        }
+    }
+    panic!("workflow never reached status {want}");
+}
+
+fn main_listing(repo: &Path) -> String {
+    let files = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-tree", "--name-only", "main"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&files.stdout).to_string()
+}
+
+/// A `run` step referencing a repo-registered named check resolves its command
+/// from `<repo>/.rk/checks.cue`, runs it in the worktree, and — even with the
+/// require_named_checks policy ON — the check runs and its green inline gate
+/// lets the branch merge. This is the sanctioned path.
+#[tokio::test]
+async fn named_check_resolves_and_merges_under_policy() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    write_def(repo_dir.path(), "named-check", CHECK_WORKFLOW);
+    write_checks(repo_dir.path(), CHECKS);
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    let layout = Layout::at(home.path());
+    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    // Policy ON: raw commands are refused, but named checks still run.
+    daemon.set_require_named_checks(true);
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let started = client
+        .call(
+            "workflow.run",
+            json!({
+                "name": "named-check",
+                "repo": repo_dir.path().to_string_lossy(),
+                "params": {"taskId": "named-1"},
+            }),
+        )
+        .await
+        .unwrap();
+    let id = started["instance"]["id"].as_str().unwrap().to_string();
+
+    await_status(&mut client, &id, "completed").await;
+    let listing = main_listing(repo_dir.path());
+    assert!(
+        listing.contains("work-"),
+        "named-check green work must merge: {listing}"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+/// With require_named_checks ON, a `run` step carrying a RAW `command` is
+/// refused fail-closed: the instance fails, the dismiss never runs, and the
+/// rat's work never reaches main. A compromised workflow def cannot run
+/// arbitrary shell.
+#[tokio::test]
+async fn raw_command_refused_under_policy_fails_closed() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    write_def(repo_dir.path(), "raw-run", RAW_WORKFLOW);
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    let layout = Layout::at(home.path());
+    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    daemon.set_require_named_checks(true);
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let started = client
+        .call(
+            "workflow.run",
+            json!({
+                "name": "raw-run",
+                "repo": repo_dir.path().to_string_lossy(),
+                "params": {"taskId": "raw-1"},
+            }),
+        )
+        .await
+        .unwrap();
+    let id = started["instance"]["id"].as_str().unwrap().to_string();
+
+    let status = await_status(&mut client, &id, "failed").await;
+    let err = status["instance"]["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("require_named_checks") || err.contains("refused by policy"),
+        "expected a policy refusal, got: {err}"
+    );
+
+    let listing = main_listing(repo_dir.path());
+    assert!(
+        !listing.contains("work-"),
+        "policy-refused work must not merge: {listing}"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+/// With the policy OFF (default), the same raw-command workflow runs normally —
+/// the policy is opt-in and backward compatible.
+#[tokio::test]
+async fn raw_command_runs_when_policy_off() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    write_def(repo_dir.path(), "raw-run", RAW_WORKFLOW);
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    // Policy OFF by default.
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let started = client
+        .call(
+            "workflow.run",
+            json!({
+                "name": "raw-run",
+                "repo": repo_dir.path().to_string_lossy(),
+                "params": {"taskId": "raw-2"},
+            }),
+        )
+        .await
+        .unwrap();
+    let id = started["instance"]["id"].as_str().unwrap().to_string();
+
+    await_status(&mut client, &id, "completed").await;
+    let listing = main_listing(repo_dir.path());
+    assert!(
+        listing.contains("work-"),
+        "raw work must merge when policy off: {listing}"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+/// A `run` step referencing a check name that is not in the registry fails
+/// closed — a typo or a stale reference never silently runs nothing.
+#[tokio::test]
+async fn unknown_check_fails_closed() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    // Workflow references "worktree-has-work" but the registry is empty.
+    write_def(repo_dir.path(), "named-check", CHECK_WORKFLOW);
+    write_checks(repo_dir.path(), "checks: []\n");
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let started = client
+        .call(
+            "workflow.run",
+            json!({
+                "name": "named-check",
+                "repo": repo_dir.path().to_string_lossy(),
+                "params": {"taskId": "named-2"},
+            }),
+        )
+        .await
+        .unwrap();
+    let id = started["instance"]["id"].as_str().unwrap().to_string();
+
+    let status = await_status(&mut client, &id, "failed").await;
+    let err = status["instance"]["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("no check named 'worktree-has-work'"),
+        "expected an unknown-check error, got: {err}"
+    );
+
+    let listing = main_listing(repo_dir.path());
+    assert!(
+        !listing.contains("work-"),
+        "unknown-check work must not merge: {listing}"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}

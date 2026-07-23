@@ -404,8 +404,11 @@ as this gate.
   on red (evaluate already fails-closed).
 
 **Dependencies / risks.**
-- **Arbitrary command execution.** Restrict to a per-repo allowlist / named check
-  commands (ties into #19 policy) so a compromised workflow def can't run anything.
+- **Arbitrary command execution.** ✅ ADDRESSED (TKT-30). A run step may reference a
+  repo-registered named `check` (`<repo>/.rk/checks.cue`) instead of a raw `command`,
+  and `[policy] require_named_checks = true` refuses raw commands fail-closed — so a
+  compromised workflow def can invoke only the repo owner's registered checks, never
+  arbitrary shell.
 - Long suites: bound by timeout; consider running under axe's budget for a hard cap.
 - Enables #2 and strengthens #23.
 

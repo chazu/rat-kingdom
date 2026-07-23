@@ -280,21 +280,32 @@ workflow: #Workflow
 // a verdict the runner cannot forge. A non-zero exit fails closed: either via
 // the following evaluate, or inline when `expectExit` is set.
 //
-// SECURITY: `command` is executed verbatim via `sh -c` in the worktree. It is
-// only as trusted as the workflow definition that carries it — a per-repo
-// allowlist / named-check restriction is deferred to the policy engine (#19).
+// SECURITY: a raw `command` is executed verbatim via `sh -c` in the worktree and
+// is only as trusted as the workflow definition that carries it. With the
+// `[policy] require_named_checks` flag on, a raw `command` is REFUSED fail-closed
+// and the step must instead reference a `check` — a repo-owned named entry in
+// `<repo>/.rk/checks.cue` (TKT-30). A named check runs regardless of the policy,
+// so a compromised workflow def can invoke only the repo's registered checks,
+// never arbitrary shell. Exactly one of `command` / `check` is set.
 #RunStep: {
 	type: "run"
-	// Command line, run via `sh -c` in the worktree.
-	command: string
-	// Working directory relative to the worktree root; the root if unset.
+	// Raw command line, run via `sh -c` in the worktree. Gated by the
+	// require_named_checks policy. Mutually exclusive with `check`.
+	command?: string
+	// Name of a repo-registered check (`<repo>/.rk/checks.cue`) to run instead of
+	// a raw command. Runs regardless of policy. Mutually exclusive with `command`.
+	check?: string
+	// Working directory relative to the worktree root; the root if unset. For a
+	// named check, overrides the check's own cwd when set.
 	cwd?: string
 	// If set, the step fails the instance inline when the actual exit code
 	// differs (fail-closed). If unset, the exit is only captured for a
-	// following evaluate/when to route on.
+	// following evaluate/when to route on. For a named check, overrides the
+	// check's own expectExit when set.
 	expectExit?: int
 	// Hard wall-clock bound; a suite still running when it elapses is killed
-	// and the step fails closed.
+	// and the step fails closed. A named check's own timeout applies unless the
+	// step overrides it.
 	timeout: string | *"10m"
 }
 

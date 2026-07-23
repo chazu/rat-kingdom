@@ -210,6 +210,13 @@ kill_grace_secs = 600            # obstacle+steer first, kill only if still flag
 enabled = false
 remote_url = "git@github.com:you/rk-sync-state.git"
 interval_secs = 30
+
+[policy]                         # workflow-execution policy
+require_named_checks = false     # true => a workflow `run` step may ONLY invoke
+                                 # a repo-registered named check (see below); a
+                                 # raw inline `command` is refused fail-closed, so
+                                 # a compromised/untrusted workflow def cannot run
+                                 # arbitrary shell in a rat's worktree.
 ```
 
 Env: `RK_HOME` (state dir), `RK_LOG` (tracing filter), `RK_CONFIG_*`
@@ -279,6 +286,16 @@ workflow: {
   the cap, its next spawn — single or fan-out — is refused and the instance
   fails, surfacing a `budget_instance_exceeded` obstacle in `rk inbox`. Layered
   below `fleet_max_usd`/`repo_max_usd`; per-run spend shows in `rk cost --fleet`.
+- **Named checks (run-step allowlist)**: a `run` step runs a command in the rat's
+  worktree to gate the merge on a verdict the runner cannot forge — but a raw
+  `command` is only as trusted as the workflow def that carries it. Register the
+  checks a repo trusts in `<repo>/.rk/checks.cue` (see `examples/checks.cue`) and
+  reference one by name: `{type: "run", check: "test"}`. Set `[policy]
+  require_named_checks = true` to refuse raw `command` run steps fail-closed, so a
+  compromised or untrusted workflow definition can invoke only the repo owner's
+  registered checks — never arbitrary shell. A named check supplies its own
+  command/cwd/`expectExit`/timeout; the step may override cwd/`expectExit`/timeout.
+  See `examples/workflows/named-check-merge.cue`.
 
 ## Reactor (triggers)
 

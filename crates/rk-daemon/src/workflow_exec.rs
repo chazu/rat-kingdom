@@ -27,6 +27,20 @@ use tracing::{info, warn};
 /// A boxed future for hand-rolled async recursion (nested `when` / `repeat`).
 type StepFuture<'a> = Pin<Box<dyn Future<Output = rk_core::Result<Flow>> + Send + 'a>>;
 
+/// Mirrors rk-workflow's `RunStep` timeout default; a referencing `run` step
+/// left at this value defers to a named check's own timeout (TKT-30).
+const DEFAULT_RUN_TIMEOUT: &str = "10m";
+
+/// The effective parameters of a `run` step after named-check resolution and
+/// policy enforcement — a raw command or a repo-registered check collapse to the
+/// same shape here.
+struct ResolvedRun {
+    command: String,
+    cwd: Option<String>,
+    expect_exit: Option<i64>,
+    timeout: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
     pub id: String,
@@ -104,10 +118,14 @@ pub struct WorkflowEngine {
     /// Global cost-tier routing; a workflow's own `tiers:` table shadows it.
     tier_routing: TierRouting,
     default_harness: String,
+    /// When set, a `run` step may only invoke a repo-registered named check; a
+    /// raw inline command is refused fail-closed (TKT-30, `[policy]`).
+    require_named_checks: bool,
     instances: Mutex<HashMap<String, Instance>>,
 }
 
 impl WorkflowEngine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         layout: Layout,
         supervisor: Arc<Supervisor>,
@@ -116,6 +134,7 @@ impl WorkflowEngine {
         global_agents: HashMap<String, AgentProfile>,
         tier_routing: TierRouting,
         default_harness: String,
+        require_named_checks: bool,
     ) -> Self {
         Self {
             layout,
@@ -125,6 +144,7 @@ impl WorkflowEngine {
             global_agents,
             tier_routing,
             default_harness,
+            require_named_checks,
             instances: Mutex::new(HashMap::new()),
         }
     }
@@ -487,7 +507,7 @@ impl WorkflowEngine {
                     });
                 }
                 Step::Run(run) => {
-                    let result = self.run_command(&ctx, run).await?;
+                    let result = self.run_command(&ctx, run, repo).await?;
                     self.update(id, |i| i.context.previous_result = Some(result.clone()));
                 }
                 Step::Land(land) => {
@@ -723,7 +743,12 @@ impl WorkflowEngine {
     /// Fail-closed: a spawn failure, a timeout (the child is killed on drop),
     /// or an `expect_exit` mismatch all return an `Err` that fails the instance
     /// rather than letting a red — or hung — suite slip through.
-    async fn run_command(&self, ctx: &WorkflowContext, run: &RunStep) -> rk_core::Result<Value> {
+    async fn run_command(
+        &self,
+        ctx: &WorkflowContext,
+        run: &RunStep,
+        repo: &str,
+    ) -> rk_core::Result<Value> {
         let agent = ctx
             .active_agent
             .clone()
@@ -734,14 +759,18 @@ impl WorkflowEngine {
         let worktree = record.worktree.ok_or_else(|| {
             rk_core::Error::other(format!("run step: agent {agent} has no worktree"))
         })?;
+        // Resolve the effective command, cwd, expect_exit, and timeout from
+        // either a repo-registered named check or a raw inline command — the
+        // latter gated fail-closed by the require_named_checks policy (TKT-30).
+        let resolved = self.resolve_run(run, repo)?;
         // Resolve cwd relative to the worktree root; interpolate ctx
         // placeholders in both fields for parity with the other steps.
         let mut dir = worktree.clone();
-        if let Some(sub) = &run.cwd {
+        if let Some(sub) = &resolved.cwd {
             dir = dir.join(interpolate(sub, ctx));
         }
-        let command = interpolate(&run.command, ctx);
-        let timeout = parse_duration(&run.timeout)?;
+        let command = interpolate(&resolved.command, ctx);
+        let timeout = parse_duration(&resolved.timeout)?;
 
         let child = tokio::process::Command::new("sh")
             .arg("-c")
@@ -765,7 +794,7 @@ impl WorkflowEngine {
                 // Fail closed: a suite that outruns its timeout is a red gate.
                 return Err(rk_core::Error::other(format!(
                     "run step: `{command}` timed out after {}",
-                    run.timeout
+                    resolved.timeout
                 )));
             }
         };
@@ -776,10 +805,11 @@ impl WorkflowEngine {
         info!(agent = %agent, exit, command = %command, "run step completed");
         let result = json!({"exit": exit, "stdout": stdout, "stderr": stderr});
 
-        // Inline fail-closed gate: when the workflow declares the expected exit,
-        // enforce it here so `run` can gate on its own without a trailing
-        // evaluate. When unset, the exit is left for a following evaluate/when.
-        if let Some(expected) = run.expect_exit {
+        // Inline fail-closed gate: when the step (or named check) declares the
+        // expected exit, enforce it here so `run` can gate on its own without a
+        // trailing evaluate. When unset, the exit is left for a following
+        // evaluate/when.
+        if let Some(expected) = resolved.expect_exit {
             if exit != expected {
                 return Err(rk_core::Error::other(format!(
                     "run step: `{command}` exited {exit}, expected {expected}"
@@ -787,6 +817,84 @@ impl WorkflowEngine {
             }
         }
         Ok(result)
+    }
+
+    /// Resolve a `run` step to its effective command, cwd, exit gate, and
+    /// timeout — enforcing the named-check policy (TKT-30).
+    ///
+    /// A step names EITHER a raw `command` OR a repo-registered `check`, never
+    /// both and never neither. A `check` is looked up in `<repo>/.rk/checks.cue`
+    /// (the repo owner's allowlist); its command/cwd/expectExit/timeout supply
+    /// the defaults, with the step's own `cwd`/`expectExit`/`timeout` (when set)
+    /// taking precedence. A raw `command` is refused fail-closed when the
+    /// `require_named_checks` policy is on, so a compromised workflow definition
+    /// cannot run arbitrary shell — only the checks the repo registered.
+    fn resolve_run(&self, run: &RunStep, repo: &str) -> rk_core::Result<ResolvedRun> {
+        match (&run.command, &run.check) {
+            (Some(_), Some(_)) => Err(rk_core::Error::other(
+                "run step: set exactly one of `command` or `check`, not both",
+            )),
+            (None, None) => Err(rk_core::Error::other(
+                "run step: set one of `command` (raw) or `check` (named)",
+            )),
+            (Some(command), None) => {
+                if self.require_named_checks {
+                    return Err(rk_core::Error::other(
+                        "run step: raw `command` refused by policy (require_named_checks); \
+                         reference a named `check` registered in <repo>/.rk/checks.cue",
+                    ));
+                }
+                Ok(ResolvedRun {
+                    command: command.clone(),
+                    cwd: run.cwd.clone(),
+                    expect_exit: run.expect_exit,
+                    timeout: run.timeout.clone(),
+                })
+            }
+            (None, Some(name)) => {
+                let check = self.find_check(repo, name)?;
+                // Step-level overrides win over the check's own defaults; the
+                // step's timeout only overrides when it is non-default (a check
+                // gets to set its own bound without every referencing step
+                // having to restate it).
+                let timeout = if run.timeout == DEFAULT_RUN_TIMEOUT {
+                    check
+                        .timeout
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_RUN_TIMEOUT.to_string())
+                } else {
+                    run.timeout.clone()
+                };
+                Ok(ResolvedRun {
+                    command: check.command,
+                    cwd: run.cwd.clone().or(check.cwd),
+                    expect_exit: run.expect_exit.or(check.expect_exit),
+                    timeout,
+                })
+            }
+        }
+    }
+
+    /// Look up a named check in the repo's registry (`<repo>/.rk/checks.cue`).
+    /// Fails closed: a missing registry, an unparseable one, or an unknown name
+    /// all error rather than silently running nothing.
+    fn find_check(&self, repo: &str, name: &str) -> rk_core::Result<rk_workflow::Check> {
+        let file = std::path::PathBuf::from(repo)
+            .join(".rk")
+            .join("checks.cue");
+        if !file.exists() {
+            return Err(rk_core::Error::other(format!(
+                "run step: check '{name}' referenced but no registry at {}",
+                file.display()
+            )));
+        }
+        let checks = rk_workflow::load_checks(&file)?;
+        checks.into_iter().find(|c| c.name == name).ok_or_else(|| {
+            rk_core::Error::other(format!(
+                "run step: no check named '{name}' in {}",
+                file.display()
+            ))
+        })
     }
 
     /// Resolve a fan-out ticket query to a bounded list of items in the

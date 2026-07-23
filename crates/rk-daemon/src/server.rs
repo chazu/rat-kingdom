@@ -38,6 +38,9 @@ pub struct Daemon {
     global_agents: std::collections::HashMap<String, rk_workflow::AgentProfile>,
     tier_routing: rk_workflow::TierRouting,
     default_harness: String,
+    /// When set, workflow `run` steps may only invoke repo-registered named
+    /// checks; raw inline commands are refused (TKT-30, `[policy]`).
+    require_named_checks: bool,
     engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
     repos: std::sync::Mutex<crate::repos::RepoRegistry>,
     tickets: Arc<crate::tickets::Tickets>,
@@ -97,6 +100,7 @@ impl Daemon {
         daemon.scheduler_config = config.scheduler.clone();
         daemon.sweep_config = config.supervisor.clone();
         daemon.evaporation_decay = config.evaporation.decay;
+        daemon.require_named_checks = config.policy.require_named_checks;
         if config.sync.enabled {
             let syncer = crate::sync::Syncer::new(
                 &daemon.layout,
@@ -159,6 +163,11 @@ impl Daemon {
         self.sweep_config = cfg;
     }
 
+    #[doc(hidden)]
+    pub fn set_require_named_checks(&mut self, v: bool) {
+        self.require_named_checks = v;
+    }
+
     fn with_space(
         layout: Layout,
         castle: String,
@@ -198,6 +207,7 @@ impl Daemon {
             global_agents: Default::default(),
             tier_routing: Default::default(),
             default_harness,
+            require_named_checks: false,
             engine: std::sync::OnceLock::new(),
             repos,
             tickets,
@@ -466,6 +476,7 @@ impl Daemon {
                 self.global_agents.clone(),
                 self.tier_routing.clone(),
                 self.default_harness.clone(),
+                self.require_named_checks,
             ))
         }))
     }

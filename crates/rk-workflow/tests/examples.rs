@@ -62,6 +62,23 @@ fn shipped_example_triggers_load() {
 }
 
 #[test]
+fn shipped_example_checks_load() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("examples")
+        .join("checks.cue");
+    let checks = rk_workflow::load_checks(&file)
+        .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
+    assert!(!checks.is_empty(), "example checks should not be empty");
+    // The named-check-merge example's default check must exist in the registry.
+    assert!(
+        checks.iter().any(|c| c.name == "test"),
+        "example checks must register the 'test' check the workflow defaults to"
+    );
+}
+
+#[test]
 fn reviewer_drives_rework_loads_and_routes() {
     use rk_workflow::Step;
     let inputs = HashMap::from([
@@ -136,7 +153,7 @@ fn steward_loads_and_routes() {
         .collect();
     assert!(
         runs.iter()
-            .any(|r| r.command.contains("git diff --name-only")),
+            .any(|r| r.command.as_deref().unwrap_or_default().contains("git diff --name-only")),
         "a protected-path policy gate must run before merge"
     );
     let gate_evaluates = workflow
@@ -182,14 +199,14 @@ fn steward_loads_and_routes() {
     assert!(
         when.cases["REWORK"]
             .iter()
-            .any(|s| matches!(s, Step::Run(r) if r.command.contains("rk ticket new"))),
+            .any(|s| matches!(s, Step::Run(r) if r.command.as_deref().unwrap_or_default().contains("rk ticket new"))),
         "REWORK must file a follow-up ticket"
     );
     // STOP escalates to the operator via a need tuple and holds the branch.
     assert!(
         when.cases["STOP"]
             .iter()
-            .any(|s| matches!(s, Step::Run(r) if r.command.contains("rk out need"))),
+            .any(|s| matches!(s, Step::Run(r) if r.command.as_deref().unwrap_or_default().contains("rk out need"))),
         "STOP must escalate via a need tuple"
     );
     // Unknown verdict: escalate and fail loudly.
