@@ -69,3 +69,31 @@ triggers: [
 		maxFires: 20
 	},
 ]
+
+// ── Reference: the convention-quorum loop (TKT-22) ──────────────────────────
+//
+// The flagship norm-formation loop — Suggestion → Endorsement → Convention →
+// injected into the next rat's prompt — is deliberately NOT wired as a #Trigger
+// here. All three of its hops are built-ins, so there is nothing to add to this
+// file to enable it:
+//
+//   1. propose + endorse   `rk suggest '<norm>'`, then peers `rk endorse <id>`
+//   2. promote at quorum    a built-in reactor reaction (`promote_conventions`),
+//                           gated by `[reactor] quorum` in config.toml — no
+//                           trigger, no workflow, no model, no operator.
+//   3. inject at spawn      the supervisor composes active conventions into a
+//                           spawned rat's system prompt (a "Standing conventions"
+//                           section), so a promoted norm is binding, not advisory.
+//
+// GOTCHA — do not try to react to a promotion with a #Trigger. A promoted
+// Convention is authored by the reserved instance "reactor", and the reactor
+// skips its own output before matching any trigger (the re-entrancy break that
+// stops the fleet from reacting to itself). So a trigger like
+//   {name: "on-convention", match: {category: "convention"}, run: "..."}
+// would type-check but SILENTLY NEVER FIRE. React to the rat-authored
+// `suggestion`/`endorsement` tuples upstream if you need a hook — never to the
+// reactor-authored `convention` downstream.
+//
+// See docs/reactor.md ("The composed convention-quorum loop"), the runnable
+// demo `scripts/convention-quorum-demo.sh`, and the CI self-test
+// `crates/rk-daemon/tests/convention_quorum.rs`.

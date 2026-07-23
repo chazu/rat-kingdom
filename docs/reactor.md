@@ -221,6 +221,38 @@ only when the `Endorsement`/`Suggestion` population changed since the previous
 cycle, so its input is still the whole store but it no longer re-scans on a wake
 that carried no relevant tuple.
 
+### The composed convention-quorum loop
+
+Quorum promotion is only the middle hop of a three-hop loop that turns a stray
+proposal into behaviour every future rat follows — with **no human and no model
+in the path**:
+
+1. **Propose + endorse** (rats). A rat runs `rk suggest '<norm>'` during its
+   work; peers who agree run `rk endorse <sug-id>`. Both tuples are system-scope
+   and Ephemeral — a proposal that never gathers support simply decays.
+2. **Promote at quorum** (reactor). The built-in `promote_conventions` above
+   mints a Furniture `Convention` once `[reactor] quorum` distinct endorsers back
+   one suggestion.
+3. **Inject at spawn** (supervisor, TKT-18). At spawn the supervisor scans active
+   conventions for the rat's repo scope + `system` and composes their text into
+   the rendered prompt as a binding **"Standing conventions"** section — so a
+   promoted norm changes what the next rat *does*, not just what it *could read*.
+
+The seam between hops 2 and 3 is a real contract: the convention must carry the
+suggestion's **non-blank** `text`, because the injection step drops a blank-text
+convention (a norm whose source text decayed to empty would reach quorum yet
+never bind). `crates/rk-daemon/tests/convention_quorum.rs` pins that contract
+end to end over the wire; `scripts/convention-quorum-demo.sh` runs all three
+hops against a throwaway daemon with the real `rk` CLI.
+
+> **No trigger closes this loop — and you must not try to add one.** All three
+> hops are built-ins; a promoted `Convention` is authored by the reserved
+> `reactor` instance, which the dispatcher skips *before* matching triggers (the
+> re-entrancy break). A `#Trigger` on `category: convention` would type-check and
+> then silently never fire. If you need a hook, react to the rat-authored
+> `suggestion`/`endorsement` tuples upstream, never to the `convention`
+> downstream. See `examples/triggers.cue`.
+
 ## Built-in reaction: obstacle coalescence
 
 The second built-in closes the flat **obstacle** pile into the durable backlog.
@@ -301,4 +333,8 @@ notify_escalations = true # desktop-push a steward escalation via herdr; false =
   and obstacle coalescence — quorum, per-scope/topic separation, idempotent
   re-filing; steward escalation notify — fires once, steward-only, disable
   switch) plus unit tests in the reactor and workflow modules.
+- Composed convention-quorum loop: self-test
+  `crates/rk-daemon/tests/convention_quorum.rs` (suggestion → quorum →
+  injectable convention, over the wire), runnable demo
+  `scripts/convention-quorum-demo.sh`.
 - Example: `examples/triggers.cue`.
