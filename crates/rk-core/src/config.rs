@@ -324,6 +324,20 @@ impl Default for EvaporationConfig {
     }
 }
 
+/// How an agent's branch reaches its base once the work is done: `Direct` is a
+/// plain git merge into the base (the historical behaviour); `Pr` opens a
+/// pull/merge request via git and leaves the branch for review rather than
+/// merging it. Per-repo on [`crate::config`]-consuming `RepoRecord`; the
+/// fleet-wide fallback for repos registered without an explicit mode is
+/// [`PolicyConfig::default_merge_mode`].
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeMode {
+    #[default]
+    Direct,
+    Pr,
+}
+
 /// Workflow-execution policy. The seed of the #19 policy engine: today it gates
 /// the one primitive that can run arbitrary shell — the workflow `run` step.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
@@ -336,6 +350,10 @@ pub struct PolicyConfig {
     /// agent's worktree — it can invoke only the checks the repo owner declared.
     /// Defaults to false (raw commands allowed) for backward compatibility.
     pub require_named_checks: bool,
+    /// Fleet-wide default merge mode for a repo registered without an explicit
+    /// `rk repo add --merge-mode`. A repo's own `RepoRecord.merge_mode` overrides
+    /// this. Defaults to `Direct` (plain git merge) for backward compatibility.
+    pub default_merge_mode: MergeMode,
 }
 
 /// Budget caps. `max_usd`/`max_tokens` are per-agent (graduated warn→steer→kill
