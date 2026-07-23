@@ -105,6 +105,37 @@ impl Repo {
         Ok(!self.git(&["status", "--porcelain"])?.trim().is_empty())
     }
 
+    /// True iff `commit` is an ancestor of (or equal to) `of` — i.e. `of`
+    /// already contains `commit`. Both are any revision `git` can resolve
+    /// (branch name, tag, sha). Returns false when either revision is
+    /// unresolvable, so the caller cannot mistake "couldn't tell" for merged.
+    pub fn is_ancestor(&self, commit: &str, of: &str) -> bool {
+        // `merge-base --is-ancestor A B` exits 0 when A is an ancestor of B,
+        // 1 when it is not, and non-0/1 on a bad revision — `git()` maps every
+        // non-zero exit to Err, collapsing "not an ancestor" and "bad rev" into
+        // the same false. That is the safe direction: unknown ⇒ not merged.
+        self.git(&["merge-base", "--is-ancestor", commit, of]).is_ok()
+    }
+
+    /// Whether an awaiting-review branch has been dealt with on the forge:
+    /// either merged into `target` (its tip is an ancestor of `target`) or
+    /// gone (the local branch ref no longer exists).
+    ///
+    /// In PR mode the daemon KEEPS the branch after opening the PR (TKT-65), so
+    /// a branch that has since vanished was deleted by a human — the forge's
+    /// conventional post-merge cleanup — and the work either landed or was
+    /// abandoned deliberately; either way nothing awaits review. A branch that
+    /// still exists is cleared only once `target` actually contains it, which
+    /// happens locally when the operator pulls the merge (or a Direct-mode
+    /// fast-forward advances the target). No network, no forge API: a pure
+    /// read over local refs, matching the use-git-directly PR-mode decision.
+    pub fn branch_merged_or_gone(&self, branch: &str, target: &str) -> bool {
+        if !self.branch_exists(branch) {
+            return true;
+        }
+        self.is_ancestor(branch, target)
+    }
+
     /// Create a worktree at `path` on new `branch` forked from `base`.
     pub fn create_worktree(&self, path: &Path, branch: &str, base: &str) -> rk_core::Result<()> {
         if PROTECTED_BRANCHES.contains(&branch) {
@@ -708,5 +739,49 @@ mod tests {
             from_wt.root().canonicalize().unwrap(),
             repo.root().canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn branch_merged_or_gone_tracks_the_pr_lifecycle() {
+        let (dir, repo) = scratch_repo();
+        let branch = commit_on_branch(dir.path(), &repo, "pip", "task-1");
+
+        // Fresh PR branch ahead of main: not merged, still present.
+        assert!(repo.branch_exists(&branch));
+        assert!(!repo.is_ancestor(&branch, "main"));
+        assert!(
+            !repo.branch_merged_or_gone(&branch, "main"),
+            "an open, unmerged PR branch must not auto-clear"
+        );
+
+        // Human merges the PR: the branch tip becomes an ancestor of main.
+        let outcome = repo.merge_branch(&branch, "main").unwrap();
+        assert!(outcome.merged, "{}", outcome.detail);
+        assert!(repo.is_ancestor(&branch, "main"));
+        assert!(
+            repo.branch_merged_or_gone(&branch, "main"),
+            "a branch merged into target auto-clears"
+        );
+    }
+
+    #[test]
+    fn branch_merged_or_gone_when_branch_deleted() {
+        let (dir, repo) = scratch_repo();
+        let branch = commit_on_branch(dir.path(), &repo, "nibbles", "task-2");
+        // Human deletes the branch on the forge (PR mode keeps it otherwise),
+        // reflected locally as a gone ref — treated as cleared even without an
+        // ancestry check, since there is no ref left to compare.
+        repo.remove_worktree(&dir.path().join("wt-nibbles")).unwrap();
+        repo.delete_branch(&branch).unwrap();
+        assert!(!repo.branch_exists(&branch));
+        assert!(repo.branch_merged_or_gone(&branch, "main"));
+    }
+
+    #[test]
+    fn is_ancestor_false_on_unknown_revision() {
+        let (_dir, repo) = scratch_repo();
+        // A bad revision must read as "not an ancestor", never merged.
+        assert!(!repo.is_ancestor("rat/does-not-exist/tkt", "main"));
+        assert!(!repo.is_ancestor("main", "no-such-target"));
     }
 }

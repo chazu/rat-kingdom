@@ -8,6 +8,7 @@ use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
 use rk_space::Space;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -837,9 +838,65 @@ impl Daemon {
             Ok(t) => t,
             Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
         };
-        let items =
-            crate::inbox::build(&agents, &instances, &obstacles, &needs, &pull_requests);
+        // An awaiting-review row auto-clears once its branch is merged into the
+        // target (or gone) — the PR-mode land opened a PR but nothing emits a
+        // close event when the human merges on the forge. Detect it locally:
+        // resolve each open PR's repo and ask git whether the branch has landed.
+        // Local-only (no fetch, no forge API), so the row clears when the merge
+        // reaches the local target — the operator's pull or a Direct-mode
+        // fast-forward. Follow-up TKT for fetch-driven detection without a pull.
+        let cleared_prs = self.cleared_pull_requests(&pull_requests);
+        let items = crate::inbox::build(
+            &agents,
+            &instances,
+            &obstacles,
+            &needs,
+            &pull_requests,
+            &cleared_prs,
+        );
         Response::ok(id, crate::inbox::to_json(&items))
+    }
+
+    /// (scope, branch) pairs among the open-PR events whose branch has since
+    /// been merged into its target or deleted locally — the rows to drop from
+    /// the awaiting-review queue. Resolves each event's scope to a registered
+    /// repo path and asks git; an unregistered scope or unopenable repo means
+    /// "cannot tell", so the row stays (fails toward surfacing, never hiding).
+    fn cleared_pull_requests(&self, pull_requests: &[Tuple]) -> HashSet<(String, String)> {
+        let mut cleared = HashSet::new();
+        // Resolve scopes to paths once, under the registry lock, then release it
+        // before shelling out to git.
+        let mut paths: std::collections::HashMap<String, std::path::PathBuf> =
+            std::collections::HashMap::new();
+        if let Ok(reg) = self.repos.lock() {
+            for t in pull_requests {
+                if !paths.contains_key(&t.scope) {
+                    if let Some(rec) = reg.get(&t.scope) {
+                        paths.insert(t.scope.clone(), rec.path.clone());
+                    }
+                }
+            }
+        }
+        for t in pull_requests {
+            let Some(branch) = t.payload.get("branch").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let target = t
+                .payload
+                .get("target")
+                .and_then(|v| v.as_str())
+                .unwrap_or("main");
+            let Some(path) = paths.get(&t.scope) else {
+                continue;
+            };
+            let Ok(repo) = rk_git::Repo::discover(path) else {
+                continue;
+            };
+            if repo.branch_merged_or_gone(branch, target) {
+                cleared.insert((t.scope.clone(), branch.to_string()));
+            }
+        }
+        cleared
     }
 
     fn handle_repo_add(&self, req: Request) -> Response {

@@ -190,5 +190,26 @@ async fn pr_mode_dismiss_opens_pr_and_keeps_branch() {
         "awaiting-review action points at the forge merge: {review}"
     );
 
+    // TKT-69: the row auto-clears once the PR is merged. The daemon never sees
+    // the forge merge directly, so it detects it locally — once the merge
+    // reaches the local target branch (the operator's pull, here simulated by
+    // merging the branch into main), the awaiting-review row disappears without
+    // waiting for the `pull_request_opened` event to be pruned.
+    git(repo_path, &["checkout", "main"]);
+    git(repo_path, &["merge", "--ff-only", &branch]);
+    assert_ne!(
+        git(repo_path, &["rev-parse", "main"]).trim(),
+        base_head,
+        "sanity: main should now contain the merged branch"
+    );
+    let inbox = client.call("inbox.list", json!({})).await.unwrap();
+    let items = inbox["items"].as_array().expect("inbox has items array");
+    assert!(
+        !items
+            .iter()
+            .any(|it| it["kind"] == "awaiting-review" && it["subject"] == branch),
+        "merged PR must auto-clear from the awaiting-review queue: {inbox}"
+    );
+
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
