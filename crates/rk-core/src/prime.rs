@@ -73,6 +73,7 @@ conversation.
 
 ## Watching and steering
 - `rk list` — the fleet (state, tokens, cost) · `rk status <name>` — one rat.
+- `rk log <name>` — a rat's transcript (prose, tool calls, retries); `--follow` to stream.
 - `rk watch` — live tuple stream, the fleet's inner monologue.
 - `rk scan obstacle <repo>` / `rk scan need <repo>` — what rats have flagged.
 - `rk steer <name> \"...\"` — inject mid-session guidance · `rk interrupt <name>`.

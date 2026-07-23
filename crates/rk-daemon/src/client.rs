@@ -66,6 +66,18 @@ impl Client {
         })
     }
 
+    /// Send one request, keep its reply, then upgrade the same connection to a
+    /// notification stream (used by `agent.log --follow`: the reply carries the
+    /// backlog, the stream carries new entries).
+    pub async fn call_then_stream(
+        mut self,
+        method: &str,
+        params: Value,
+    ) -> rk_core::Result<(Value, WatchStream)> {
+        let reply = self.call(method, params).await?;
+        Ok((reply, WatchStream { stream: self.stream }))
+    }
+
     pub async fn call(&mut self, method: &str, params: Value) -> rk_core::Result<Value> {
         self.next_id += 1;
         let req = Request {

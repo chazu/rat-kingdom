@@ -37,6 +37,7 @@ rk spawn --task fix-readme --prompt "Fix the typos in README.md, commit, then ru
 
 rk list                      # fleet at a glance (state, tokens, cost)
 rk status Whisker            # one rat in detail
+rk log Whisker               # its transcript (prose, tool calls, retries); -f to follow
 rk watch                     # live tuple stream — the system's inner monologue
 rk steer Whisker "also check CONTRIBUTING.md"   # mid-session guidance
 rk dismiss Whisker           # stop + merge its branch + clean up
@@ -326,7 +327,10 @@ rk steer Whisker "try the other approach"   # works from outside too
 
 The daemon still owns the worktree/branch/registry; completion is the rat's
 own `rk done`, and dismissal closes the pane and merges as usual. Without
-herdr, everything runs headless.
+herdr, everything runs headless — but you are not blind to a headless rat:
+`rk log <name>` replays its transcript (assistant prose, tool calls, retries)
+and `rk log <name> --follow` streams it live, persisted as a bounded per-agent
+ring under `~/.rat-kingdom/agent-logs/` (local only; never synced).
 
 ## Multiplayer (git-notes sync)
 

@@ -67,6 +67,8 @@ enum Command {
     Inbox,
     /// Show one agent's status.
     Status(agent_cmds::NameArg),
+    /// Print an agent's transcript (assistant text, tool calls, retries); --follow to stream.
+    Log(agent_cmds::LogArgs),
     /// Send mid-session guidance to a running agent.
     Steer(agent_cmds::SteerArgs),
     /// Gracefully interrupt a running agent.
@@ -343,6 +345,7 @@ async fn main() -> Result<()> {
         Command::List => agent_cmds::list(&layout, cli.json).await?,
         Command::Inbox => agent_cmds::inbox(&layout, cli.json).await?,
         Command::Status(args) => agent_cmds::status(&layout, args, cli.json).await?,
+        Command::Log(args) => agent_cmds::log(&layout, args, cli.json).await?,
         Command::Steer(args) => agent_cmds::steer(&layout, args, cli.json).await?,
         Command::Interrupt(args) => agent_cmds::interrupt(&layout, args, cli.json).await?,
         Command::Dismiss(args) => agent_cmds::dismiss(&layout, args, cli.json).await?,
