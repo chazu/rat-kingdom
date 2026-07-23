@@ -154,6 +154,23 @@ fn shipped_example_schedules_load() {
 }
 
 #[test]
+fn shipped_example_checks_load() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("examples")
+        .join("checks.cue");
+    let checks = rk_workflow::load_checks(&file)
+        .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
+    assert!(!checks.is_empty(), "example checks should not be empty");
+    // The named-check-merge example's default check must exist in the registry.
+    assert!(
+        checks.iter().any(|c| c.name == "test"),
+        "example checks must register the 'test' check the workflow defaults to"
+    );
+}
+
+#[test]
 fn reviewer_drives_rework_loads_and_routes() {
     use rk_workflow::Step;
     let inputs = HashMap::from([

@@ -18,6 +18,7 @@ pub struct Config {
     pub scheduler: SchedulerConfig,
     pub supervisor: SupervisorConfig,
     pub evaporation: EvaporationConfig,
+    pub policy: PolicyConfig,
     /// Named agent profiles: [agents.<name>] harness/model/permission_mode.
     /// The "default" profile applies to all spawns that name no profile.
     pub agents: std::collections::HashMap<String, AgentProfileConfig>,
@@ -220,6 +221,20 @@ impl Default for EvaporationConfig {
         // ~30 GC cycles (60s each) to fade from full → ~30 min.
         Self { decay: 1.0 / 30.0 }
     }
+}
+
+/// Workflow-execution policy. The seed of the #19 policy engine: today it gates
+/// the one primitive that can run arbitrary shell — the workflow `run` step.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PolicyConfig {
+    /// When true, a workflow `run` step may ONLY reference a repo-registered
+    /// named check (`check: "<name>"` resolved from `<repo>/.rk/checks.cue`); a
+    /// raw inline `command` is refused fail-closed. This stops a compromised or
+    /// untrusted workflow definition from executing arbitrary shell in an
+    /// agent's worktree — it can invoke only the checks the repo owner declared.
+    /// Defaults to false (raw commands allowed) for backward compatibility.
+    pub require_named_checks: bool,
 }
 
 /// Budget caps. `max_usd`/`max_tokens` are per-agent (graduated warn→steer→kill

@@ -95,6 +95,7 @@ fn build_scheduler(layout: &Layout, config: SchedulerConfig, space: rk_space::Sp
         Default::default(),
         Default::default(),
         "fake".into(),
+        false,
     ));
     Arc::new(Scheduler::new(engine, layout.clone(), config))
 }

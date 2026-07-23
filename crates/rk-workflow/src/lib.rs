@@ -13,6 +13,7 @@ use std::process::Command;
 const SCHEMA: &str = include_str!("schema.cue");
 const TRIGGER_SCHEMA: &str = include_str!("triggers-schema.cue");
 const SCHEDULE_SCHEMA: &str = include_str!("schedules-schema.cue");
+const CHECK_SCHEMA: &str = include_str!("checks-schema.cue");
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Workflow {
@@ -337,24 +338,90 @@ pub struct StopStep {
 /// `when`) can gate the merge; a red check fails the instance fail-closed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunStep {
-    /// Command line, executed via `sh -c` in the worktree.
-    pub command: String,
-    /// Working directory relative to the worktree root; the root if unset.
+    /// Raw command line, executed verbatim via `sh -c` in the worktree. Only as
+    /// trusted as the workflow definition that carries it, so it is gated behind
+    /// the `[policy] require_named_checks` flag: when that flag is set, a `run`
+    /// step MUST reference a named `check` instead and a raw `command` is refused
+    /// fail-closed. Mutually exclusive with `check`.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Name of a repo-registered check (`<repo>/.rk/checks.cue`) to run instead
+    /// of a raw `command`. A named check is the repo owner's own allowlist entry,
+    /// so it runs regardless of the `require_named_checks` policy — the whole
+    /// point is that a compromised workflow def can invoke only these, never
+    /// arbitrary shell. Mutually exclusive with `command`.
+    #[serde(default)]
+    pub check: Option<String>,
+    /// Working directory relative to the worktree root; the root if unset. For a
+    /// named check, this overrides the check's own `cwd` when set.
     #[serde(default)]
     pub cwd: Option<String>,
     /// If set, the step itself fails the instance when the actual exit code
     /// differs — a fail-closed inline gate. If unset, the exit is only
-    /// captured for a following `evaluate`/`when` to route on.
+    /// captured for a following `evaluate`/`when` to route on. For a named check,
+    /// this overrides the check's own `expectExit` when set.
     #[serde(default, rename = "expectExit")]
     pub expect_exit: Option<i64>,
     /// Hard wall-clock bound; a suite still running when it elapses is killed
-    /// and the step fails closed.
+    /// and the step fails closed. For a named check, the check's own timeout
+    /// applies unless the step sets one explicitly (a non-default value).
     #[serde(default = "default_run_timeout")]
     pub timeout: String,
 }
 
 fn default_run_timeout() -> String {
     "10m".into()
+}
+
+/// A repo-registered named check: the per-repo allowlist entry a workflow `run`
+/// step invokes by name instead of carrying a raw shell command. The registry
+/// lives in `<repo>/.rk/checks.cue` and is owned by the repo, NOT by the (possibly
+/// untrusted) workflow definition — so with the `require_named_checks` policy on,
+/// a compromised workflow def can only ever run the checks listed here, never
+/// arbitrary shell (TKT-30). The command is still executed via `sh -c`, but the
+/// text is fixed by the repo owner.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Check {
+    /// Stable name a `run` step references via `check: "<name>"`.
+    pub name: String,
+    /// Command line, executed via `sh -c` in the worktree.
+    pub command: String,
+    /// Working directory relative to the worktree root; the root if unset.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Inline fail-closed exit gate, as on a raw `run` step.
+    #[serde(default, rename = "expectExit")]
+    pub expect_exit: Option<i64>,
+    /// Hard wall-clock bound; unset falls back to the run step's own timeout.
+    #[serde(default)]
+    pub timeout: Option<String>,
+}
+
+/// Load and validate every `#Check` in one repo's `checks.cue` registry.
+pub fn load_checks(file: &Path) -> rk_core::Result<Vec<Check>> {
+    let source = std::fs::read_to_string(file)
+        .map_err(|e| rk_core::Error::other(format!("read {}: {e}", file.display())))?;
+    load_checks_str(&source)
+}
+
+/// Load named checks from source text (see [`load_checks`]).
+pub fn load_checks_str(source: &str) -> rk_core::Result<Vec<Check>> {
+    let dir = tempfile_dir()?;
+    std::fs::write(dir.join("schema.cue"), CHECK_SCHEMA)?;
+    std::fs::write(dir.join("checks.cue"), ensure_checks_package(source))?;
+    let json = cue_export(&dir, "checks")?;
+    let checks: Vec<Check> = serde_json::from_str(&json)
+        .map_err(|e| rk_core::Error::other(format!("checks JSON did not match schema: {e}")))?;
+    std::fs::remove_dir_all(&dir).ok();
+    Ok(checks)
+}
+
+fn ensure_checks_package(source: &str) -> String {
+    if source.trim_start().starts_with("package ") || source.contains("\npackage ") {
+        source.to_string()
+    } else {
+        format!("package checks\n\n{source}")
+    }
 }
 
 /// Merge a NAMED branch into a NAMED target — the explicit `{branch, target}`
@@ -955,7 +1022,8 @@ workflow: {
         assert!(matches!(
             &wf.steps[2],
             Step::Run(r)
-                if r.command == "cargo test"
+                if r.command.as_deref() == Some("cargo test")
+                    && r.check.is_none()
                     && r.cwd.is_none()
                     && r.expect_exit.is_none()
                     && r.timeout == "5m"
@@ -1168,6 +1236,40 @@ schedules: [
     fn schedule_empty_cron_is_a_cue_error() {
         let bad = r#"schedules: [{name: "x", cron: "", run: "w"}]"#;
         let err = load_schedules_str(bad).unwrap_err();
+        assert!(err.to_string().contains("cue export failed"), "{err}");
+    }
+
+    #[test]
+    fn loads_named_checks() {
+        let source = r#"
+checks: [
+    {name: "test", command: "cargo test"},
+    {name: "clippy", command: "cargo clippy", cwd: "crates/x", expectExit: 0, timeout: "5m"},
+]
+"#;
+        let checks = load_checks_str(source).unwrap();
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].name, "test");
+        assert_eq!(checks[0].command, "cargo test");
+        assert!(checks[0].cwd.is_none());
+        assert!(checks[0].expect_exit.is_none());
+        assert!(checks[0].timeout.is_none());
+        assert_eq!(checks[1].cwd.as_deref(), Some("crates/x"));
+        assert_eq!(checks[1].expect_exit, Some(0));
+        assert_eq!(checks[1].timeout.as_deref(), Some("5m"));
+    }
+
+    #[test]
+    fn check_bad_name_is_a_cue_error() {
+        let bad = r#"checks: [{name: "Bad Name", command: "x"}]"#;
+        let err = load_checks_str(bad).unwrap_err();
+        assert!(err.to_string().contains("cue export failed"), "{err}");
+    }
+
+    #[test]
+    fn check_missing_command_is_a_cue_error() {
+        let bad = r#"checks: [{name: "x"}]"#;
+        let err = load_checks_str(bad).unwrap_err();
         assert!(err.to_string().contains("cue export failed"), "{err}");
     }
 }
