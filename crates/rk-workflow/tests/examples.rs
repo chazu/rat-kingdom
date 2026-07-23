@@ -27,7 +27,10 @@ fn all_shipped_examples_load() {
     let inputs = HashMap::from([
         ("taskId".to_string(), json!("example-task")),
         ("description".to_string(), json!("example description")),
-        ("question".to_string(), json!("How does the tuplespace work?")),
+        (
+            "question".to_string(),
+            json!("How does the tuplespace work?"),
+        ),
     ]);
     for def in defs {
         let workflow = rk_workflow::load(&def, &inputs)
@@ -66,9 +69,11 @@ fn nightly_self_improve_chains_groom_drain_refine() {
     use rk_workflow::Step;
     // All params default, so it loads with no inputs — exactly how the scheduler
     // fires it (static params only, everything else defaulted).
-    let workflow =
-        rk_workflow::load(&examples_dir().join("nightly-self-improve.cue"), &HashMap::new())
-            .unwrap();
+    let workflow = rk_workflow::load(
+        &examples_dir().join("nightly-self-improve.cue"),
+        &HashMap::new(),
+    )
+    .unwrap();
 
     // Phase 1 GROOM: a single spawn whose merge is a noMerge dismiss (it mutates
     // the ticket store), with NO abort gate — a groom hiccup must not stop the night.
@@ -83,7 +88,10 @@ fn nightly_self_improve_chains_groom_drain_refine() {
 
     // Phase 2 DRAIN: a fan-out over ready tickets, joined and batch-merge gated
     // on every rat finishing cleanly before dismiss_all.
-    let Some(Step::ForEach(fe)) = workflow.steps.iter().find(|s| matches!(s, Step::ForEach(_)))
+    let Some(Step::ForEach(fe)) = workflow
+        .steps
+        .iter()
+        .find(|s| matches!(s, Step::ForEach(_)))
     else {
         panic!("phase 2 must fan out over ready tickets");
     };
@@ -94,7 +102,10 @@ fn nightly_self_improve_chains_groom_drain_refine() {
         .any(|s| matches!(s, Step::Evaluate(e) if e.expect.get("all_ok").is_some()));
     assert!(drain_gate, "the drain batch merge must be gated on all_ok");
     assert!(
-        workflow.steps.iter().any(|s| matches!(s, Step::DismissAll(_))),
+        workflow
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::DismissAll(_))),
         "the drain phase must dismiss_all the fan-out"
     );
 
@@ -129,6 +140,27 @@ fn nightly_self_improve_chains_groom_drain_refine() {
 }
 
 #[test]
+fn fanout_and_nightly_examples_carry_a_budget_cap() {
+    // Every unattended fan-out / overnight example must scope spend to ONE run
+    // via a per-instance budget cap (#WorkflowBudget), not lean on the
+    // fleet-wide caps. A silent drop of this field would let a single runaway
+    // pass eat the whole fleet cap — regression-guard it here (TKT-45).
+    for name in ["backlog-drain", "cost-tiered-drain", "nightly-self-improve"] {
+        let workflow =
+            rk_workflow::load(&examples_dir().join(format!("{name}.cue")), &HashMap::new())
+                .unwrap_or_else(|e| panic!("{name} failed to load: {e}"));
+        let budget = workflow
+            .budget
+            .unwrap_or_else(|| panic!("{name} must set a per-instance budget cap"));
+        assert!(
+            budget.max_usd > 0.0,
+            "{name} budget.max_usd must be a positive dollar ceiling, got {}",
+            budget.max_usd
+        );
+    }
+}
+
+#[test]
 fn shipped_example_schedules_load() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -137,7 +169,10 @@ fn shipped_example_schedules_load() {
         .join("schedules.cue");
     let schedules = rk_workflow::load_schedules(&file)
         .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
-    assert!(!schedules.is_empty(), "example schedules should not be empty");
+    assert!(
+        !schedules.is_empty(),
+        "example schedules should not be empty"
+    );
     // Every example schedule names a workflow that ships in examples/workflows.
     let workflows: Vec<String> = rk_workflow::definitions(&examples_dir())
         .iter()
@@ -244,8 +279,10 @@ fn steward_loads_and_routes() {
         })
         .collect();
     assert!(
-        runs.iter()
-            .any(|r| r.command.as_deref().is_some_and(|c| c.contains("git diff --name-only"))),
+        runs.iter().any(|r| r
+            .command
+            .as_deref()
+            .is_some_and(|c| c.contains("git diff --name-only"))),
         "a protected-path policy gate must run before merge"
     );
     let gate_evaluates = workflow

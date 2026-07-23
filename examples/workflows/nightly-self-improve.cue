@@ -21,10 +21,15 @@
 // separately instead (examples/schedules.cue shows both).
 //
 //   rk workflow run nightly-self-improve --param repo=rat-kingdom
+//   rk workflow run nightly-self-improve --param budgetUsd=40
 //
 // Scheduled nightly via examples/schedules.cue. Overnight cost is bounded by the
-// fleet/repo budget caps (rk_ledger::FleetBudget) — the same pre-dispatch guard
-// every spawn passes, which refuses new dispatch once a cap is hit.
+// per-instance `budget` cap below (#WorkflowBudget) — a wallet kill-switch
+// scoped to THIS night. Once this run's summed agent cost reaches it, the same
+// pre-dispatch guard every spawn passes refuses further dispatch. This layers
+// below the global fleet/repo caps (rk_ledger::FleetBudget), which are
+// fleet-wide, not scoped to one run — so without a per-instance cap a single
+// runaway night could consume the whole fleet's cap.
 //
 // Copy to ~/.rat-kingdom/workflows/ (global) or <repo>/.rk/workflows/.
 workflow: {
@@ -41,9 +46,20 @@ workflow: {
 		// proposals land on the base, not chained onto the groom branch — see the
 		// note on that spawn below.
 		base: {type: "string", required: false, default: "main"}
+		// Per-instance wallet cap in whole USD for the WHOLE night (groom + drain
+		// + refine). Once this run's summed agent cost reaches it, further
+		// dispatch is refused — below the global fleet/repo caps. This is what
+		// bounds THIS night specifically; the fleet/repo caps are fleet-wide, so
+		// without it a single runaway night could eat the whole fleet cap.
+		// (max_usd is a number; params are int/string/bool only, so this is an
+		// int-dollar param.)
+		budgetUsd: {type: "int", required: false, default: 30}
 	}
 
 	agents: {default: {harness: "claude"}}
+
+	// Wallet kill-switch scoped to this one overnight instance.
+	budget: {max_usd: _input.budgetUsd}
 
 	steps: [
 		// ── Phase 1: GROOM ──────────────────────────────────────────────────
