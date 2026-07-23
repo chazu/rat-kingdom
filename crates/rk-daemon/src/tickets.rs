@@ -59,6 +59,11 @@ pub struct NewTicket {
     /// Who filed it (an agent name, or the castle for human-filed tickets).
     #[serde(default)]
     pub created_by: Option<String>,
+    /// Dedupe key for reactor-coalesced tickets: a stable topic identifier that
+    /// makes a still-open ticket its own "already filed" guard. `None` for
+    /// ordinary tickets; written into the payload only when present.
+    #[serde(default)]
+    pub coalesce_key: Option<String>,
 }
 
 /// A partial update to a ticket. Every field is optional; only present fields
@@ -122,7 +127,7 @@ impl Tickets {
         }
         let id = self.next_id()?;
         let now = chrono::Utc::now().to_rfc3339();
-        let payload = json!({
+        let mut payload = json!({
             "title": t.title,
             "body": t.body.unwrap_or_default(),
             "status": "open",
@@ -135,6 +140,9 @@ impl Tickets {
             "created_at": now,
             "updated_at": now,
         });
+        if let Some(key) = t.coalesce_key {
+            payload["coalesce_key"] = json!(key);
+        }
         let tuple = Tuple::new(Category::Task, t.scope, id, self.castle.clone(), payload)
             .with_lifecycle(Lifecycle::Session);
         self.space.out(tuple.clone())?;
@@ -460,6 +468,7 @@ mod tests {
             labels: vec![],
             depends_on: vec![],
             created_by: None,
+            coalesce_key: None,
         }
     }
 

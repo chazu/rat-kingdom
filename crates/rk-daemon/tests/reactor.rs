@@ -102,12 +102,12 @@ fn build_reactor_with_space(
         layout.clone(),
         supervisor,
         space.clone(),
-        tickets,
+        tickets.clone(),
         Default::default(),
         Default::default(),
         "fake".into(),
     ));
-    Arc::new(Reactor::new(space, engine, layout.clone(), config))
+    Arc::new(Reactor::new(space, engine, tickets, layout.clone(), config))
 }
 
 fn write_trigger(layout: &Layout) {
@@ -560,6 +560,179 @@ async fn quorum_promotes_even_after_suggestion_decays() {
     let convs = conventions(&space);
     assert_eq!(convs.len(), 1);
     assert_eq!(convs[0].payload["text"], serde_json::Value::Null);
+}
+
+// --- Obstacle coalescence -------------------------------------------------
+
+/// One raw obstacle trail as the CLI writes it: identity=instance=agent, so a
+/// rat holds a single obstacle at a time; `text` is the wall it hit.
+fn obstacle(scope: &str, agent: &str, text: &str) -> Tuple {
+    let mut t = Tuple::new(
+        Category::Obstacle,
+        scope,
+        agent,
+        agent,
+        json!({"agent": agent, "text": text}),
+    )
+    .with_lifecycle(rk_core::tuple::Lifecycle::Ephemeral);
+    t.strength = Some(1.0);
+    t
+}
+
+fn coalesced_tickets(space: &rk_space::Space) -> Vec<Tuple> {
+    space
+        .scan(&rk_core::tuple::Pattern::category(Category::Task))
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.payload.get("coalesce_key").is_some())
+        .collect()
+}
+
+/// The reactor files the coalesced ticket via a spawned async create; poll the
+/// space until it lands (or give up after a generous budget).
+async fn wait_for_coalesced(space: &rk_space::Space, want: usize) -> Vec<Tuple> {
+    for _ in 0..100 {
+        let t = coalesced_tickets(space);
+        if t.len() >= want {
+            return t;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    coalesced_tickets(space)
+}
+
+/// Ten rats hitting one wall must produce ONE ticket, not ten obstacles with no
+/// signal. Sub-quorum stays a gradient; quorum closes the loop to the backlog;
+/// re-running never double-files (open ticket + guard marker are the guards).
+#[tokio::test]
+async fn obstacles_coalesce_into_one_ticket_at_quorum() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let config = ReactorConfig {
+        coalesce_quorum: 3,
+        ..Default::default()
+    };
+    let reactor = build_reactor_with_space(&layout, config, space.clone());
+
+    // Two distinct rats hit the same wall; one of them restates it (a second
+    // tuple on the same instance). Distinct reporters = 2, below quorum.
+    space
+        .out(obstacle("myrepo", "Whisker", "cargo build fails on rk-space"))
+        .unwrap();
+    space
+        .out(obstacle("myrepo", "Whisker", "cargo build FAILS on rk-space!!"))
+        .unwrap();
+    space
+        .out(obstacle("myrepo", "Nibbles", "Cargo build fails on rk-space."))
+        .unwrap();
+    reactor.run_cycle().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        coalesced_tickets(&space).is_empty(),
+        "two distinct reporters is sub-quorum — no ticket, restating does not inflate"
+    );
+    // Coalescence never injects synthetic obstacles into the raw pile.
+    let reactor_obstacles = space
+        .scan(&rk_core::tuple::Pattern::category(Category::Obstacle))
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.instance == REACTOR_INSTANCE)
+        .count();
+    assert_eq!(reactor_obstacles, 0, "the obstacle pile stays rat-authored");
+
+    // A third distinct rat trips quorum → exactly one ticket is filed.
+    space
+        .out(obstacle("myrepo", "Sooty", "cargo build fails on rk-space"))
+        .unwrap();
+    reactor.run_cycle().unwrap();
+    let tickets = wait_for_coalesced(&space, 1).await;
+    assert_eq!(tickets.len(), 1, "quorum files exactly one ticket");
+    let t = &tickets[0];
+    assert_eq!(t.scope, "myrepo");
+    assert_eq!(t.payload["status"], "open");
+    assert_eq!(t.instance, "test-castle");
+    assert_eq!(t.payload["created_by"], json!(REACTOR_INSTANCE));
+    assert_eq!(t.payload["labels"], json!(["obstacle-coalesce"]));
+    assert!(
+        t.payload["coalesce_key"]
+            .as_str()
+            .is_some_and(|k| k.starts_with("myrepo::")),
+        "ticket carries the scope-qualified dedupe key"
+    );
+
+    // Idempotent: further cycles (even with the wall still hot) never re-file —
+    // the open ticket and the guard marker suppress it.
+    reactor.run_cycle().unwrap();
+    reactor.run_cycle().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        coalesced_tickets(&space).len(),
+        1,
+        "an open coalesced ticket files once until closed"
+    );
+}
+
+/// A different wall in a different repo is a different topic → its own ticket;
+/// coalescence is per (scope, normalised topic), never a global merge.
+#[tokio::test]
+async fn distinct_topics_and_scopes_file_separate_tickets() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let config = ReactorConfig {
+        coalesce_quorum: 2,
+        ..Default::default()
+    };
+    let reactor = build_reactor_with_space(&layout, config, space.clone());
+
+    // Wall A in repo one.
+    space.out(obstacle("one", "Whisker", "flaky network test")).unwrap();
+    space.out(obstacle("one", "Nibbles", "flaky network test")).unwrap();
+    // Same words, different repo → different topic key.
+    space.out(obstacle("two", "Whisker", "flaky network test")).unwrap();
+    space.out(obstacle("two", "Gouda", "flaky network test")).unwrap();
+    // A wholly different wall in repo one, at quorum too.
+    space.out(obstacle("one", "Brie", "missing config key")).unwrap();
+    space.out(obstacle("one", "Sooty", "missing config key")).unwrap();
+
+    reactor.run_cycle().unwrap();
+    let tickets = wait_for_coalesced(&space, 3).await;
+    let mut keys: Vec<String> = tickets
+        .iter()
+        .map(|t| t.payload["coalesce_key"].as_str().unwrap().to_string())
+        .collect();
+    keys.sort();
+    assert_eq!(keys.len(), 3, "three distinct (scope, topic) buckets → three tickets");
+    assert!(keys.iter().any(|k| k.starts_with("one::") && k.contains("flaky")));
+    assert!(keys.iter().any(|k| k.starts_with("two::") && k.contains("flaky")));
+    assert!(keys.iter().any(|k| k.starts_with("one::") && k.contains("missing")));
+}
+
+/// Coalescence is off when the quorum is zero: the pile stays flat.
+#[tokio::test]
+async fn zero_quorum_disables_coalescence() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let config = ReactorConfig {
+        coalesce_quorum: 0,
+        ..Default::default()
+    };
+    let reactor = build_reactor_with_space(&layout, config, space.clone());
+
+    for agent in ["a", "b", "c", "d"] {
+        space.out(obstacle("myrepo", agent, "the same wall")).unwrap();
+    }
+    reactor.run_cycle().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(coalesced_tickets(&space).is_empty(), "zero quorum files nothing");
 }
 
 async fn connect(layout: &Layout) -> Client {

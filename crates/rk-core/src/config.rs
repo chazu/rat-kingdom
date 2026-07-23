@@ -100,6 +100,11 @@ pub struct ReactorConfig {
     /// feed), so a proposal that misses quorum before its endorsements decay
     /// simply never promotes. Zero disables quorum promotion entirely.
     pub quorum: u32,
+    /// Distinct-reporter count at which repeated obstacles/needs on one
+    /// normalised topic are coalesced into a single durable ticket. Counted per
+    /// topic at scan time, so a hot wall that many rats hit files exactly one
+    /// backlog item. Zero disables obstacle coalescence entirely.
+    pub coalesce_quorum: u32,
 }
 
 impl Default for ReactorConfig {
@@ -112,6 +117,7 @@ impl Default for ReactorConfig {
             marker_ttl_secs: 7 * 24 * 3600,
             exclude_instances: Vec::new(),
             quorum: 3,
+            coalesce_quorum: 3,
         }
     }
 }
