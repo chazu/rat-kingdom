@@ -245,7 +245,7 @@ fn steward_loads_and_routes() {
         .collect();
     assert!(
         runs.iter()
-            .any(|r| r.command.contains("git diff --name-only")),
+            .any(|r| r.command.as_deref().is_some_and(|c| c.contains("git diff --name-only"))),
         "a protected-path policy gate must run before merge"
     );
     let gate_evaluates = workflow
@@ -291,14 +291,14 @@ fn steward_loads_and_routes() {
     assert!(
         when.cases["REWORK"]
             .iter()
-            .any(|s| matches!(s, Step::Run(r) if r.command.contains("rk ticket new"))),
+            .any(|s| matches!(s, Step::Run(r) if r.command.as_deref().is_some_and(|c| c.contains("rk ticket new")))),
         "REWORK must file a follow-up ticket"
     );
     // STOP escalates to the operator via a need tuple and holds the branch.
     assert!(
         when.cases["STOP"]
             .iter()
-            .any(|s| matches!(s, Step::Run(r) if r.command.contains("rk out need"))),
+            .any(|s| matches!(s, Step::Run(r) if r.command.as_deref().is_some_and(|c| c.contains("rk out need")))),
         "STOP must escalate via a need tuple"
     );
     // Unknown verdict: escalate and fail loudly.

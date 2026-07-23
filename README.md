@@ -212,6 +212,19 @@ stuck_after_secs = 900           # silence past this => STUCK (0 = off)
 burn_usd_per_min = 0.0           # sustained USD/min => RUNNING AWAY (0 = off)
 kill_grace_secs = 600            # obstacle+steer first, kill only if still flagged
 
+[drain]                          # continuous-drain: WIP-limited fleet autoscaler
+enabled = false                  # off by default — turning it on hands the
+                                 # dispatch loop to the daemon (opt-in)
+max_wip = 0                      # target concurrency W: keep up to this many rats
+                                 # live, spawning the highest-priority ready ticket
+                                 # whenever a slot frees (0 also disables the loop)
+interval_secs = 30               # fallback refill cadence; a freed slot also wakes
+                                 # a refill via the tuple feed
+# repo = "myrepo"                # restrict to one repo scope (unset = every
+                                 # registered repo; system-scope tickets never run)
+aging_secs = 3600               # seconds of waiting that buy one priority level,
+                                 # so low-priority tickets can't starve (0 = strict)
+
 [sync]                           # multiplayer (git-notes replication)
 enabled = false
 remote_url = "git@github.com:you/rk-sync-state.git"
