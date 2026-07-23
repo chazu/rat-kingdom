@@ -10,7 +10,7 @@ use rk_core::tuple::{Category, Pattern};
 use rk_space::Space;
 use rk_workflow::{
     resolve::{resolve, resolve_fields},
-    AgentProfile, DismissAllStep, ForEachStep, Step, TicketQuery, WaitAllStep, Workflow,
+    AgentProfile, DismissAllStep, ForEachStep, RunStep, Step, TicketQuery, WaitAllStep, Workflow,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -466,6 +466,10 @@ impl WorkflowEngine {
                         i.context.fanout = Vec::new();
                     });
                 }
+                Step::Run(run) => {
+                    let result = self.run_command(&ctx, run).await?;
+                    self.update(id, |i| i.context.previous_result = Some(result.clone()));
+                }
             }
             Ok(Flow::Next)
         })
@@ -655,6 +659,87 @@ impl WorkflowEngine {
             "all_merged": merged == count,
             "results": results,
         }))
+    }
+
+    /// Execute a `run` step's command in the active agent's worktree — the
+    /// deterministic quality gate. Where `evaluate` unifies only against the
+    /// harness's self-reported output (it takes the rat's word), this runs the
+    /// repo's real checks and captures `{exit, stdout, stderr}` into a value
+    /// for `ctx.previous_result`, so a following `evaluate {expect: {exit: 0}}`
+    /// (or a `when`) gates the merge on a verdict the runner cannot forge.
+    ///
+    /// Fail-closed: a spawn failure, a timeout (the child is killed on drop),
+    /// or an `expect_exit` mismatch all return an `Err` that fails the instance
+    /// rather than letting a red — or hung — suite slip through.
+    async fn run_command(
+        &self,
+        ctx: &WorkflowContext,
+        run: &RunStep,
+    ) -> rk_core::Result<Value> {
+        let agent = ctx
+            .active_agent
+            .clone()
+            .ok_or_else(|| rk_core::Error::other("run step with no active agent"))?;
+        let record = self.supervisor.status(&agent).ok_or_else(|| {
+            rk_core::Error::other(format!("run step: no record for agent {agent}"))
+        })?;
+        let worktree = record.worktree.ok_or_else(|| {
+            rk_core::Error::other(format!("run step: agent {agent} has no worktree"))
+        })?;
+        // Resolve cwd relative to the worktree root; interpolate ctx
+        // placeholders in both fields for parity with the other steps.
+        let mut dir = worktree.clone();
+        if let Some(sub) = &run.cwd {
+            dir = dir.join(interpolate(sub, ctx));
+        }
+        let command = interpolate(&run.command, ctx);
+        let timeout = parse_duration(&run.timeout)?;
+
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // Kill the suite if the timeout below drops the wait future, so a
+            // hung check leaves no orphan behind.
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| {
+                rk_core::Error::other(format!("run step: failed to spawn `{command}`: {e}"))
+            })?;
+
+        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(res) => {
+                res.map_err(|e| rk_core::Error::other(format!("run step: `{command}` failed: {e}")))?
+            }
+            Err(_) => {
+                // Fail closed: a suite that outruns its timeout is a red gate.
+                return Err(rk_core::Error::other(format!(
+                    "run step: `{command}` timed out after {}",
+                    run.timeout
+                )));
+            }
+        };
+
+        let exit = output.status.code().unwrap_or(-1) as i64;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        info!(agent = %agent, exit, command = %command, "run step completed");
+        let result = json!({"exit": exit, "stdout": stdout, "stderr": stderr});
+
+        // Inline fail-closed gate: when the workflow declares the expected exit,
+        // enforce it here so `run` can gate on its own without a trailing
+        // evaluate. When unset, the exit is left for a following evaluate/when.
+        if let Some(expected) = run.expect_exit {
+            if exit != expected {
+                return Err(rk_core::Error::other(format!(
+                    "run step: `{command}` exited {exit}, expected {expected}"
+                )));
+            }
+        }
+        Ok(result)
     }
 
     /// Resolve a fan-out ticket query to a bounded list of items in the

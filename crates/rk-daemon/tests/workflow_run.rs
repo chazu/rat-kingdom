@@ -364,3 +364,185 @@ async fn approval_gate_rejection_leaves_branch_unmerged() {
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
+
+// spawn → wait → run (the repo's real check, green) → evaluate {exit:0} → dismiss.
+// The run command interpolates the active agent and asserts the rat's committed
+// work file exists in the worktree — proving the command runs in that worktree's
+// cwd and that {exit,stdout,stderr} lands in ctx.previousResult for the evaluate.
+const RUN_GREEN_WORKFLOW: &str = r#"
+workflow: {
+    name: "run-green"
+    params: {taskId: {type: "string", required: true}}
+    agents: {default: {harness: "fake", model: "sonnet"}}
+    steps: [
+        {type: "spawn", role: "rat", task: {title: _input.taskId, description: "do " + _input.taskId}},
+        {type: "wait", timeout: "30s"},
+        {type: "run", command: "test -f work-{{ctx.activeAgent}}.txt", timeout: "30s"},
+        {type: "evaluate", expect: {exit: 0}},
+        {type: "dismiss"},
+    ]
+}
+"#;
+
+/// A green `run` gate (command exits 0 in the worktree) unifies with the
+/// following `evaluate {expect: {exit: 0}}` and the branch merges. This is the
+/// deterministic quality gate's happy path — the suite is green, so it lands.
+#[tokio::test]
+async fn run_step_green_check_gates_and_merges() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    git(repo_dir.path(), &["init", "-b", "main"]);
+    git(repo_dir.path(), &["config", "user.email", "r@x"]);
+    git(repo_dir.path(), &["config", "user.name", "R"]);
+    std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
+    git(repo_dir.path(), &["add", "."]);
+    git(repo_dir.path(), &["commit", "-m", "init"]);
+
+    let wf_dir = repo_dir.path().join(".rk").join("workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(wf_dir.join("run-green.cue"), RUN_GREEN_WORKFLOW).unwrap();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_MODEL_MARKER", "unset");
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let started = client
+        .call(
+            "workflow.run",
+            json!({
+                "name": "run-green",
+                "repo": repo_dir.path().to_string_lossy(),
+                "params": {"taskId": "run-green-1"},
+            }),
+        )
+        .await
+        .unwrap();
+    let id = started["instance"]["id"].as_str().unwrap().to_string();
+
+    let mut completed = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = client
+            .call("workflow.status", json!({"name": id}))
+            .await
+            .unwrap();
+        match status["instance"]["status"].as_str().unwrap_or("") {
+            "completed" => {
+                completed = true;
+                break;
+            }
+            "failed" => panic!("green run gate failed: {}", status["instance"]["error"]),
+            _ => {}
+        }
+    }
+    assert!(completed, "green-gated workflow did not complete");
+
+    let files = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir.path())
+        .args(["ls-tree", "--name-only", "main"])
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&files.stdout).to_string();
+    assert!(listing.contains("work-"), "green work must merge: {listing}");
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+// spawn → wait → run (red, inline expectExit gate) → dismiss (never reached).
+// The command exits non-zero; the inline `expectExit: 0` fails the instance
+// closed before the dismiss, so the branch is never merged.
+const RUN_RED_WORKFLOW: &str = r#"
+workflow: {
+    name: "run-red"
+    params: {taskId: {type: "string", required: true}}
+    agents: {default: {harness: "fake", model: "sonnet"}}
+    steps: [
+        {type: "spawn", role: "rat", task: {title: _input.taskId, description: "do " + _input.taskId}},
+        {type: "wait", timeout: "30s"},
+        {type: "run", command: "echo boom >&2; exit 1", expectExit: 0, timeout: "30s"},
+        {type: "dismiss"},
+    ]
+}
+"#;
+
+/// A red `run` gate (command exits non-zero) fails the instance closed via its
+/// inline `expectExit`, so the dismiss never runs and the rat's work never
+/// reaches main. This is the teeth: "the rat says it passed" cannot override
+/// "the suite is red, so it does not land."
+#[tokio::test]
+async fn run_step_red_check_fails_closed_and_holds_branch() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    git(repo_dir.path(), &["init", "-b", "main"]);
+    git(repo_dir.path(), &["config", "user.email", "r@x"]);
+    git(repo_dir.path(), &["config", "user.name", "R"]);
+    std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
+    git(repo_dir.path(), &["add", "."]);
+    git(repo_dir.path(), &["commit", "-m", "init"]);
+
+    let wf_dir = repo_dir.path().join(".rk").join("workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(wf_dir.join("run-red.cue"), RUN_RED_WORKFLOW).unwrap();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_MODEL_MARKER", "unset");
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let started = client
+        .call(
+            "workflow.run",
+            json!({
+                "name": "run-red",
+                "repo": repo_dir.path().to_string_lossy(),
+                "params": {"taskId": "run-red-1"},
+            }),
+        )
+        .await
+        .unwrap();
+    let id = started["instance"]["id"].as_str().unwrap().to_string();
+
+    let mut failed = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = client
+            .call("workflow.status", json!({"name": id}))
+            .await
+            .unwrap();
+        match status["instance"]["status"].as_str().unwrap_or("") {
+            "failed" => {
+                let err = status["instance"]["error"].as_str().unwrap_or("");
+                assert!(
+                    err.contains("exited 1") && err.contains("expected 0"),
+                    "expected a fail-closed run-gate error, got: {err}"
+                );
+                failed = true;
+                break;
+            }
+            "completed" => panic!("red run gate must not complete"),
+            _ => {}
+        }
+    }
+    assert!(failed, "red-gated workflow did not fail closed");
+
+    // The rat's work never reached main — the gate held the branch.
+    let files = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir.path())
+        .args(["ls-tree", "--name-only", "main"])
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&files.stdout).to_string();
+    assert!(
+        !listing.contains("work-"),
+        "red work must not merge: {listing}"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
