@@ -3,6 +3,7 @@
 
 pub mod agents;
 pub mod client;
+pub mod inbox;
 pub mod proto;
 pub mod repos;
 pub mod server;
@@ -169,6 +170,47 @@ mod tests {
         assert_eq!(note["method"], "tuple");
         assert_eq!(note["params"]["scope"], "watched");
         assert_eq!(note["params"]["identity"], "y");
+    }
+
+    #[tokio::test]
+    async fn inbox_aggregates_and_ranks_over_the_wire() {
+        let (_dir, layout, _handle) = start_daemon().await;
+        let mut client = connect(&layout).await;
+
+        // A budget-exceeded obstacle and a plain need, written straight to the
+        // space, are the two attention items with no agents/workflows around.
+        client
+            .call(
+                "space.out",
+                json!({
+                    "category": "obstacle",
+                    "scope": "myrepo",
+                    "identity": "Nibbles",
+                    "payload": {"type": "budget_exceeded", "cost_usd": 3.5, "tokens": 800000},
+                }),
+            )
+            .await
+            .unwrap();
+        client
+            .call(
+                "space.out",
+                json!({
+                    "category": "need",
+                    "scope": "myrepo",
+                    "identity": "Scamper",
+                    "payload": {"text": "need a reviewer"},
+                }),
+            )
+            .await
+            .unwrap();
+
+        let inbox = client.call("inbox.list", json!({})).await.unwrap();
+        let items = inbox["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        // Budget obstacle outranks the need and carries its resolving command.
+        assert_eq!(items[0]["kind"], "obstacle");
+        assert_eq!(items[0]["action"], "rk status Nibbles");
+        assert_eq!(items[1]["kind"], "need");
     }
 
     #[tokio::test]

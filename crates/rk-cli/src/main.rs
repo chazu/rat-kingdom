@@ -58,6 +58,9 @@ enum Command {
     Spawn(agent_cmds::SpawnArgs),
     /// List all agents.
     List,
+    /// One ranked triage list of everything awaiting a human, each row carrying
+    /// the exact `rk` command that resolves it.
+    Inbox,
     /// Show one agent's status.
     Status(agent_cmds::NameArg),
     /// Send mid-session guidance to a running agent.
@@ -332,6 +335,7 @@ async fn main() -> Result<()> {
         Command::Claim(args) => space_cmds::claim(&layout, args, cli.json).await?,
         Command::Spawn(args) => agent_cmds::spawn(&layout, args, cli.json).await?,
         Command::List => agent_cmds::list(&layout, cli.json).await?,
+        Command::Inbox => agent_cmds::inbox(&layout, cli.json).await?,
         Command::Status(args) => agent_cmds::status(&layout, args, cli.json).await?,
         Command::Steer(args) => agent_cmds::steer(&layout, args, cli.json).await?,
         Command::Interrupt(args) => agent_cmds::interrupt(&layout, args, cli.json).await?,

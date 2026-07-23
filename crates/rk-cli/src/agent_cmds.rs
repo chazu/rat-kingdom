@@ -212,6 +212,34 @@ pub async fn list(layout: &Layout, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Render the unified operator attention queue — one ranked triage list of
+/// everything awaiting a human, each row carrying its resolving command.
+pub async fn inbox(layout: &Layout, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client.call("inbox.list", json!({})).await?;
+    if as_json {
+        println!("{}", result["items"]);
+        return Ok(());
+    }
+    let items = result["items"].as_array().cloned().unwrap_or_default();
+    if items.is_empty() {
+        println!("inbox clear — nothing awaiting a human");
+        return Ok(());
+    }
+    println!("{:<16} {:<14} {:<10} DETAIL", "KIND", "SUBJECT", "SCOPE");
+    for it in &items {
+        println!(
+            "{:<16} {:<14} {:<10} {}",
+            it["kind"].as_str().unwrap_or("?"),
+            it["subject"].as_str().unwrap_or("?"),
+            it["scope"].as_str().unwrap_or("-"),
+            it["detail"].as_str().unwrap_or(""),
+        );
+        println!("  → {}", it["action"].as_str().unwrap_or("?"));
+    }
+    Ok(())
+}
+
 fn total_tokens(usage: &Value) -> u64 {
     ["input", "output", "cache_read", "cache_creation"]
         .iter()

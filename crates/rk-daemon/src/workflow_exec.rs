@@ -37,6 +37,12 @@ pub struct Instance {
     pub context: WorkflowContext,
     #[serde(default)]
     pub error: Option<String>,
+    /// Set while the instance is blocked awaiting a human decision at an
+    /// approval gate; cleared once the decision (or timeout) arrives. This is
+    /// the precise "parked at a gate" signal `rk inbox` reports — a `Running`
+    /// status alone can't distinguish a parked gate from active execution.
+    #[serde(default)]
+    pub awaiting: Option<String>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -171,6 +177,7 @@ impl WorkflowEngine {
             total_steps: workflow.steps.len(),
             context: WorkflowContext::default(),
             error: None,
+            awaiting: None,
             started_at: chrono::Utc::now(),
             completed_at: None,
         };
@@ -340,13 +347,14 @@ impl WorkflowEngine {
                         // pair contiguously regardless of key order, so this
                         // substring is a reliable per-instance predicate.
                         pattern.payload_search = Some(format!("\"instance\":\"{id}\""));
-                        let decision = match self
-                            .space
-                            .rd(&pattern, timeout)
-                            .await
-                            .map_err(|e| {
-                                rk_core::Error::other(format!("approval gate failed: {e}"))
-                            })? {
+                        // Flag the instance as parked so `rk inbox` can surface
+                        // it with the `rk approve`/`rk reject` resolving command.
+                        self.update(id, |i| i.awaiting = Some("approval".to_string()));
+                        let read = self.space.rd(&pattern, timeout).await;
+                        self.update(id, |i| i.awaiting = None);
+                        let decision = match read.map_err(|e| {
+                            rk_core::Error::other(format!("approval gate failed: {e}"))
+                        })? {
                             Some(tuple) => tuple.payload,
                             None => {
                                 // Fail closed: no human response means no merge.

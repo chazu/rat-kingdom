@@ -360,6 +360,7 @@ impl Daemon {
                 sup.respawn(&name).map(|r| json!({"agent": r}))
             })),
             "agent.list" => reply(Response::ok(id, json!({"agents": self.supervisor.list()}))),
+            "inbox.list" => reply(self.handle_inbox(id)),
             "agent.status" => reply(self.handle_named(req, |sup, name| {
                 sup.status(&name)
                     .map(|r| json!({"agent": r}))
@@ -494,6 +495,24 @@ impl Daemon {
                 format!("unknown method: {other}"),
             )),
         }
+    }
+
+    /// Union everything awaiting a human — failed/orphaned agents, failed or
+    /// gate-parked workflow instances, obstacle and need tuples — into one
+    /// ranked triage list. Pure read-side aggregation; no new storage.
+    fn handle_inbox(&self, id: String) -> Response {
+        let agents = self.supervisor.list();
+        let instances = self.engine().list();
+        let obstacles = match self.space.scan(&Pattern::category(Category::Obstacle)) {
+            Ok(t) => t,
+            Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
+        };
+        let needs = match self.space.scan(&Pattern::category(Category::Need)) {
+            Ok(t) => t,
+            Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
+        };
+        let items = crate::inbox::build(&agents, &instances, &obstacles, &needs);
+        Response::ok(id, crate::inbox::to_json(&items))
     }
 
     fn handle_repo_add(&self, req: Request) -> Response {
