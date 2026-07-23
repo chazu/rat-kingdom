@@ -27,6 +27,11 @@ workflow: {
 		repo: {type: "string", required: false, default: ""}
 		limit: {type: "int", required: false, default: 5}
 		timeout: {type: "string", required: false, default: "45m"}
+		// Per-instance wallet cap in whole USD. Once this run's spawned agents'
+		// summed cost reaches it, further dispatch is refused (below the global
+		// fleet/repo caps). (max_usd is a number; params are int/string/bool
+		// only, so this is an int-dollar param.)
+		budgetUsd: {type: "int", required: false, default: 10}
 	}
 
 	// Two cost tiers plus the fallthrough default. Cheap runs the bounded axe
@@ -36,6 +41,11 @@ workflow: {
 		cheap:   {harness: "axe"}
 		premium: {harness: "claude", model: "opus"}
 	}
+
+	// Wallet kill-switch scoped to this one drain instance. Layers below the
+	// per-ticket cost tiers above: tiers pick a cheaper harness per ticket, this
+	// caps the summed spend of the whole fan-out.
+	budget: {max_usd: _input.budgetUsd}
 
 	// Ordered routing rules; first match wins.
 	tiers: {

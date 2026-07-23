@@ -28,9 +28,17 @@ workflow: {
 		limit: {type: "int", required: false, default: 5}
 		// Join timeout — every rat must finish within this window.
 		timeout: {type: "string", required: false, default: "45m"}
+		// Per-instance wallet cap in whole USD. Once this run's spawned agents'
+		// summed cost reaches it, further dispatch is refused (below the global
+		// fleet/repo caps). (max_usd is a number; params are int/string/bool
+		// only, so this is an int-dollar param.)
+		budgetUsd: {type: "int", required: false, default: 10}
 	}
 
 	agents: {default: {harness: "claude"}}
+
+	// Wallet kill-switch scoped to this one drain instance.
+	budget: {max_usd: _input.budgetUsd}
 
 	steps: [
 		{
