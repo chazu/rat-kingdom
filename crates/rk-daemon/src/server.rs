@@ -712,6 +712,18 @@ impl Daemon {
                     },
                 )
             }
+            "agent.revert" => {
+                let params: RevertParams = match parse_params(&req.params) {
+                    Ok(p) => p,
+                    Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
+                };
+                reply(
+                    match self.supervisor.revert(&params.name, params.block).await {
+                        Ok(v) => Response::ok(id, v),
+                        Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
+                    },
+                )
+            }
             "workflow.run" => {
                 let params: WorkflowRunParams = match parse_params(&req.params) {
                     Ok(p) => p,
@@ -1264,6 +1276,14 @@ struct DismissParams {
     name: String,
     #[serde(default)]
     no_merge: bool,
+}
+
+#[derive(Deserialize)]
+struct RevertParams {
+    name: String,
+    /// Reopen the agent's ticket as `blocked` instead of `open`.
+    #[serde(default)]
+    block: bool,
 }
 
 #[derive(Deserialize)]

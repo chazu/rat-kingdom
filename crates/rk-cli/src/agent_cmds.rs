@@ -82,6 +82,16 @@ pub struct DismissArgs {
     pub no_merge: bool,
 }
 
+#[derive(Args)]
+pub struct RevertArgs {
+    /// Dismissed agent whose landed merge to undo.
+    pub name: String,
+    /// Reopen the agent's ticket as `blocked` instead of `open`, holding it
+    /// out of the auto-dispatch backlog until a human looks at it.
+    #[arg(long)]
+    pub block: bool,
+}
+
 pub async fn spawn(layout: &Layout, args: SpawnArgs, as_json: bool) -> Result<()> {
     let mut client = Client::connect_or_spawn(layout).await?;
 
@@ -383,6 +393,40 @@ pub async fn dismiss(layout: &Layout, args: DismissArgs, as_json: bool) -> Resul
     } else {
         println!(
             "dismissed {} — {}",
+            args.name,
+            result["detail"].as_str().unwrap_or("?")
+        );
+    }
+    Ok(())
+}
+
+/// Undo a bad auto-merge: revert-merge the commit a dismissal landed and put
+/// the agent's ticket back on the backlog.
+pub async fn revert(layout: &Layout, args: RevertArgs, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call(
+            "agent.revert",
+            json!({"name": args.name, "block": args.block}),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else if result["reverted"].as_bool().unwrap_or(false) {
+        println!(
+            "reverted {} — {}",
+            args.name,
+            result["detail"].as_str().unwrap_or("?")
+        );
+        if let Some(status) = result["ticket_status"].as_str() {
+            println!(
+                "ticket {} reopened as {status}",
+                result["task"].as_str().unwrap_or("?")
+            );
+        }
+    } else {
+        println!(
+            "revert failed for {} — {}",
             args.name,
             result["detail"].as_str().unwrap_or("?")
         );

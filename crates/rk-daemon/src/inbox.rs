@@ -268,6 +268,7 @@ mod tests {
             session_id: None,
             attach_target: None,
             pid: None,
+            merge_commit: None,
             state,
             result: None,
             usage: TokenUsage::default(),

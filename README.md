@@ -41,6 +41,7 @@ rk log Whisker               # its transcript (prose, tool calls, retries); -f t
 rk watch                     # live tuple stream — the system's inner monologue
 rk steer Whisker "also check CONTRIBUTING.md"   # mid-session guidance
 rk dismiss Whisker           # stop + merge its branch + clean up
+rk revert Whisker            # undo a bad auto-merge: revert the landed commit, reopen the ticket
 rk cost                      # per-agent token/cost rollup
 rk cost --fleet              # fleet/repo spend vs configured budget caps
 ```
@@ -174,6 +175,12 @@ or the harness's own completion for a rat that forgets), the ticket moves to
 `done` — which **automatically unblocks any dependents** — and merging it on
 `rk dismiss` moves it to `closed`. A rat that errors leaves its ticket
 `in_progress` for inspection.
+
+If an unattended auto-merge turns out bad, `rk revert <agent>` is the undo:
+it revert-merges the commit that dismissal landed (recorded on the agent's
+record), reopens the ticket to `open` (`--block` for `blocked`, holding it
+out of the auto-dispatch backlog), and leaves a `fact` tuple recording what
+was undone. History stays intact — the revert is a new commit, not a rewrite.
 
 ## Configuration (`~/.rat-kingdom/config.toml`)
 
