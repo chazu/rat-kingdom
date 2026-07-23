@@ -481,3 +481,48 @@ pub async fn cost(layout: &Layout, as_json: bool) -> Result<()> {
     );
     Ok(())
 }
+
+/// `rk cost --fleet`: the hierarchical fleet/repo budget rollup — current spend
+/// vs the configured caps — so an operator can see how close the wallet
+/// kill-switch is to refusing new dispatch.
+pub async fn cost_fleet(layout: &Layout, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let rollup = client.call("budget.rollup", json!({})).await?;
+    if as_json {
+        println!("{rollup}");
+        return Ok(());
+    }
+    let fmt_cap = |cap: f64| {
+        if cap > 0.0 {
+            format!("${cap:.4}")
+        } else {
+            "unlimited".to_string()
+        }
+    };
+    println!(
+        "{:<20} {:>12} {:>12} {:>12} {:>10}",
+        "SCOPE", "SPENT", "CAP", "REMAINING", "STATUS"
+    );
+    let row = |label: &str, s: &serde_json::Value| {
+        let cap = s["cap_usd"].as_f64().unwrap_or(0.0);
+        let remaining = if cap > 0.0 {
+            format!("${:.4}", s["remaining_usd"].as_f64().unwrap_or(0.0))
+        } else {
+            "-".to_string()
+        };
+        println!(
+            "{:<20} {:>12} {:>12} {:>12} {:>10}",
+            label,
+            format!("${:.4}", s["spent_usd"].as_f64().unwrap_or(0.0)),
+            fmt_cap(cap),
+            remaining,
+            s["status"].as_str().unwrap_or("?"),
+        );
+    };
+    row("fleet", &rollup["fleet"]);
+    for r in rollup["repos"].as_array().cloned().unwrap_or_default() {
+        let repo = r["repo"].as_str().unwrap_or("?").to_string();
+        row(&format!("repo:{repo}"), &r);
+    }
+    Ok(())
+}

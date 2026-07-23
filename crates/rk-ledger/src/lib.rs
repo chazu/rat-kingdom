@@ -76,6 +76,108 @@ impl Budget {
     }
 }
 
+/// Fleet/repo caps layered ABOVE the per-agent [`Budget`]. Where `Budget`
+/// governs one agent's own spend (warn→steer→kill mid-run), these govern the
+/// SUM of every agent's cost — fleet-wide and per-repo — and are enforced as a
+/// *dispatch preflight*: once the running total reaches the cap, new spawns are
+/// refused rather than a live agent killed. This is the wallet kill-switch that
+/// lets a continuous autoscaler or nightly run go unattended without draining
+/// the account. Zero on either cap = unlimited.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FleetBudget {
+    pub fleet_max_usd: f64,
+    pub repo_max_usd: f64,
+    /// Fraction of a cap at which dispatch is still allowed but flagged (0.8).
+    pub warn_at: f64,
+}
+
+/// Which cap bound a dispatch decision, for reporting and obstacle tuples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetScope {
+    Fleet,
+    Repo,
+}
+
+impl BudgetScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetScope::Fleet => "fleet",
+            BudgetScope::Repo => "repo",
+        }
+    }
+}
+
+/// Outcome of a pre-dispatch fleet/repo budget check. `action == Stop` means
+/// refuse the spawn; `Warn` means allow it but surface an obstacle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DispatchCheck {
+    pub action: BudgetAction,
+    /// The binding cap when `action != Ok`.
+    pub scope: Option<BudgetScope>,
+    pub spent_usd: f64,
+    pub cap_usd: f64,
+}
+
+impl DispatchCheck {
+    fn ok() -> Self {
+        Self {
+            action: BudgetAction::Ok,
+            scope: None,
+            spent_usd: 0.0,
+            cap_usd: 0.0,
+        }
+    }
+
+    /// True when dispatch must be refused.
+    pub fn denied(&self) -> bool {
+        self.action == BudgetAction::Stop
+    }
+}
+
+fn severity(a: BudgetAction) -> u8 {
+    match a {
+        BudgetAction::Ok => 0,
+        BudgetAction::Warn => 1,
+        BudgetAction::Stop => 2,
+    }
+}
+
+impl FleetBudget {
+    /// Decide whether another spawn is allowed given the current fleet-wide and
+    /// per-repo cost rollups. The tightest binding constraint wins; the fleet
+    /// cap is reported first on a severity tie since it is the broader
+    /// guardrail. Zero caps are skipped (unlimited).
+    pub fn check_dispatch(&self, fleet_spent_usd: f64, repo_spent_usd: f64) -> DispatchCheck {
+        let warn_frac = if self.warn_at > 0.0 { self.warn_at } else { 0.8 };
+        let mut worst = DispatchCheck::ok();
+        for (scope, spent, cap) in [
+            (BudgetScope::Fleet, fleet_spent_usd, self.fleet_max_usd),
+            (BudgetScope::Repo, repo_spent_usd, self.repo_max_usd),
+        ] {
+            if cap <= 0.0 {
+                continue;
+            }
+            let action = if spent >= cap {
+                BudgetAction::Stop
+            } else if spent >= cap * warn_frac {
+                BudgetAction::Warn
+            } else {
+                BudgetAction::Ok
+            };
+            if severity(action) > severity(worst.action) {
+                worst = DispatchCheck {
+                    action,
+                    scope: Some(scope),
+                    spent_usd: spent,
+                    cap_usd: cap,
+                };
+            }
+        }
+        worst
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +232,56 @@ mod tests {
         assert_eq!(budget.check(0.0, 799), BudgetAction::Ok);
         assert_eq!(budget.check(0.0, 800), BudgetAction::Warn);
         assert_eq!(budget.check(0.0, 1000), BudgetAction::Stop);
+    }
+
+    #[test]
+    fn fleet_cap_graduates_and_denies_dispatch() {
+        let fb = FleetBudget {
+            fleet_max_usd: 10.0,
+            repo_max_usd: 0.0,
+            warn_at: 0.8,
+        };
+        assert_eq!(fb.check_dispatch(5.0, 0.0).action, BudgetAction::Ok);
+        let warn = fb.check_dispatch(8.0, 0.0);
+        assert_eq!(warn.action, BudgetAction::Warn);
+        assert_eq!(warn.scope, Some(BudgetScope::Fleet));
+        let deny = fb.check_dispatch(10.0, 0.0);
+        assert!(deny.denied());
+        assert_eq!(deny.scope, Some(BudgetScope::Fleet));
+        assert_eq!(deny.cap_usd, 10.0);
+    }
+
+    #[test]
+    fn repo_cap_binds_before_fleet() {
+        let fb = FleetBudget {
+            fleet_max_usd: 100.0,
+            repo_max_usd: 5.0,
+            warn_at: 0.8,
+        };
+        // Fleet well under cap, but this repo is over its own cap.
+        let deny = fb.check_dispatch(20.0, 5.0);
+        assert!(deny.denied());
+        assert_eq!(deny.scope, Some(BudgetScope::Repo));
+    }
+
+    #[test]
+    fn fleet_wins_severity_tie() {
+        let fb = FleetBudget {
+            fleet_max_usd: 10.0,
+            repo_max_usd: 10.0,
+            warn_at: 0.8,
+        };
+        // Both caps hit — fleet is reported as the binding scope.
+        let deny = fb.check_dispatch(10.0, 10.0);
+        assert!(deny.denied());
+        assert_eq!(deny.scope, Some(BudgetScope::Fleet));
+    }
+
+    #[test]
+    fn zero_fleet_caps_are_unlimited() {
+        assert_eq!(
+            FleetBudget::default().check_dispatch(1e9, 1e9).action,
+            BudgetAction::Ok
+        );
     }
 }

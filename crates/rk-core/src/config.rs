@@ -173,14 +173,22 @@ impl Default for EvaporationConfig {
     }
 }
 
-/// Per-agent budget caps. Zero = unlimited.
+/// Budget caps. `max_usd`/`max_tokens` are per-agent (graduated warn→steer→kill
+/// mid-run). `fleet_max_usd`/`repo_max_usd` are hierarchical caps layered above:
+/// the SUM of all agents' cost fleet-wide and per-repo, enforced as a dispatch
+/// preflight (once hit, new spawns are refused). Zero = unlimited.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct BudgetConfig {
     pub max_usd: f64,
     pub max_tokens: u64,
-    /// Fraction of a cap at which the warning fires.
+    /// Fraction of a cap at which the warning fires (per-agent and fleet/repo).
     pub warn_at: f64,
+    /// Fleet-wide USD cap across every agent in every repo — the wallet
+    /// kill-switch for continuous/nightly runs. Zero = unlimited.
+    pub fleet_max_usd: f64,
+    /// Per-repo USD cap across every agent in one repo. Zero = unlimited.
+    pub repo_max_usd: f64,
 }
 
 impl Default for BudgetConfig {
@@ -189,6 +197,8 @@ impl Default for BudgetConfig {
             max_usd: 0.0,
             max_tokens: 0,
             warn_at: 0.8,
+            fleet_max_usd: 0.0,
+            repo_max_usd: 0.0,
         }
     }
 }

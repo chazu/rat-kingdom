@@ -41,7 +41,8 @@ rk log Whisker               # its transcript (prose, tool calls, retries); -f t
 rk watch                     # live tuple stream — the system's inner monologue
 rk steer Whisker "also check CONTRIBUTING.md"   # mid-session guidance
 rk dismiss Whisker           # stop + merge its branch + clean up
-rk cost                      # per-agent and fleet token/cost rollup
+rk cost                      # per-agent token/cost rollup
+rk cost --fleet              # fleet/repo spend vs configured budget caps
 ```
 
 Spawn options: `--harness claude|codex|axe|fake`, `--model`, `--role
@@ -183,10 +184,15 @@ tier = "cheap"                   # First matching rule wins; a fan-out spawn
 priority = "high"                # A workflow's own `tiers:` field shadows these.
 tier = "default"                 # A rule with no label/priority is the fallback.
 
-[budget]                         # per-agent caps; 0 = unlimited
-max_usd = 5.0
+[budget]                         # 0 = unlimited on any cap
+max_usd = 5.0                    # per-agent: warn→steer→kill mid-run
 max_tokens = 0
 warn_at = 0.8                    # warn (obstacle tuple + steer) at 80%, kill at cap
+fleet_max_usd = 0.0              # fleet-wide wallet kill-switch: once the SUM of
+                                 # all agents' cost hits this, new spawns are
+                                 # REFUSED (dispatch stops) — safe for autoscaler/
+                                 # nightly runs. See `rk cost --fleet`.
+repo_max_usd = 0.0               # same guard, scoped per-repo
 
 [supervisor]                     # liveness/burn sweep (budget only sees Usage
                                  # events; this catches rats hung emitting nothing)

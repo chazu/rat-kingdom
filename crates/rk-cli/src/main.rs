@@ -80,7 +80,12 @@ enum Command {
     /// Attach interactively to an attach-mode rat's herdr pane.
     Attach(agent_cmds::NameArg),
     /// Per-agent and fleet token/cost rollup.
-    Cost,
+    Cost {
+        /// Show the hierarchical fleet/repo budget rollup vs configured caps
+        /// instead of the per-agent breakdown.
+        #[arg(long)]
+        fleet: bool,
+    },
     /// Multiplayer sync via git notes.
     Sync {
         #[command(subcommand)]
@@ -351,7 +356,13 @@ async fn main() -> Result<()> {
         Command::Dismiss(args) => agent_cmds::dismiss(&layout, args, cli.json).await?,
         Command::Respawn(args) => agent_cmds::respawn(&layout, args, cli.json).await?,
         Command::Attach(args) => agent_cmds::attach(&layout, args).await?,
-        Command::Cost => agent_cmds::cost(&layout, cli.json).await?,
+        Command::Cost { fleet } => {
+            if fleet {
+                agent_cmds::cost_fleet(&layout, cli.json).await?
+            } else {
+                agent_cmds::cost(&layout, cli.json).await?
+            }
+        }
         Command::Sync { command } => match command {
             SyncCommand::Now => {
                 let mut client = Client::connect_or_spawn(&layout).await?;

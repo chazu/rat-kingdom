@@ -93,6 +93,7 @@ fn build_reactor_with_space(
             "test-castle".into(),
             "fake".into(),
             rk_ledger::Budget::default(),
+            rk_ledger::FleetBudget::default(),
             space.clone(),
             tickets.clone(),
         )
