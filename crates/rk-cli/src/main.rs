@@ -1,9 +1,11 @@
 //! `rk` — the rat-kingdom CLI.
 
 mod agent_cmds;
+mod observe;
 mod repo_cmds;
 mod space_cmds;
 mod ticket_cmds;
+mod top;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -65,6 +67,23 @@ enum Command {
     /// One ranked triage list of everything awaiting a human, each row carrying
     /// the exact `rk` command that resolves it.
     Inbox,
+    /// Live fleet dashboard: agents, workflows, budget, inbox (q to quit).
+    Top {
+        /// Refresh interval in seconds.
+        #[arg(long, default_value_t = 2)]
+        interval: u64,
+    },
+    /// What the fleet did in the last interval — an async catch-up over the
+    /// event feed, workflows, friction, spend, and inbox.
+    Digest {
+        /// Window to report on, e.g. 30m, 2h, 1d (bare number = minutes).
+        #[arg(long, default_value = "1h")]
+        since: String,
+        /// Summarize the report into prose with a one-shot `claude -p` call
+        /// (falls back to the raw digest if the binary is unavailable).
+        #[arg(long)]
+        llm: bool,
+    },
     /// Show one agent's status.
     Status(agent_cmds::NameArg),
     /// Print an agent's transcript (assistant text, tool calls, retries); --follow to stream.
@@ -217,6 +236,9 @@ enum WorkflowCommand {
     List,
     /// Show one instance.
     Status { id: String },
+    /// Render an instance's step trace: every step labelled and marked
+    /// done/current/pending, plus where the instance is parked.
+    Timeline { id: String },
     /// List available workflow definitions.
     Defs {
         #[arg(long, default_value = ".")]
@@ -363,6 +385,8 @@ async fn main() -> Result<()> {
         Command::Spawn(args) => agent_cmds::spawn(&layout, args, cli.json).await?,
         Command::List => agent_cmds::list(&layout, cli.json).await?,
         Command::Inbox => agent_cmds::inbox(&layout, cli.json).await?,
+        Command::Top { interval } => top::top(&layout, interval).await?,
+        Command::Digest { since, llm } => observe::digest(&layout, &since, llm, cli.json).await?,
         Command::Status(args) => agent_cmds::status(&layout, args, cli.json).await?,
         Command::Log(args) => agent_cmds::log(&layout, args, cli.json).await?,
         Command::Steer(args) => agent_cmds::steer(&layout, args, cli.json).await?,
@@ -461,6 +485,16 @@ async fn main() -> Result<()> {
                 WorkflowCommand::Status { id } => {
                     let result = client.call("workflow.status", json!({"name": id})).await?;
                     println!("{}", result["instance"]);
+                }
+                WorkflowCommand::Timeline { id } => {
+                    let result = client
+                        .call("workflow.timeline", json!({"name": id}))
+                        .await?;
+                    if cli.json {
+                        println!("{result}");
+                    } else {
+                        observe::print_timeline(&result);
+                    }
                 }
                 WorkflowCommand::Defs { repo } => {
                     let repo = std::fs::canonicalize(&repo)?;

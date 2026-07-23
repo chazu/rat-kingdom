@@ -23,6 +23,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
+ratatui.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
