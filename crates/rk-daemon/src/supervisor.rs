@@ -108,6 +108,10 @@ pub struct Supervisor {
     fleet_warned: Mutex<std::collections::HashSet<String>>,
     /// Per-agent liveness-sweep bookkeeping (burn-rate deltas + flag episodes).
     sweep_state: Mutex<HashMap<String, SweepState>>,
+    /// Per-agent self-healing-respawn bookkeeping (attempt count + backoff
+    /// clock + whether the cap has already been escalated). In-memory: a daemon
+    /// restart is a fresh episode, so attempt counts reset with it.
+    respawn_state: Mutex<HashMap<String, RespawnState>>,
     /// Bounded per-agent transcript (assistant text / tool calls / retries),
     /// so the operator can `rk log` a run instead of being blind to it.
     log: crate::agent_log::AgentLog,
@@ -137,6 +141,29 @@ enum SweepAction {
     Soft { kind: &'static str, detail: String },
     /// Still flagged past the grace window: obstacle tuple + kill.
     Hard { kind: &'static str, detail: String },
+}
+
+/// One crashed agent's rolling self-healing-respawn state across sweeps.
+#[derive(Debug, Clone)]
+struct RespawnState {
+    /// How many auto-respawns have fired for this agent this daemon lifetime.
+    attempts: u32,
+    /// When the last auto-respawn fired — the exponential-backoff clock.
+    last_attempt: DateTime<Utc>,
+    /// Set once the attempt cap has been hit and a `need` escalated, so the
+    /// sweep does not re-escalate the same exhausted agent every cycle.
+    escalated: bool,
+}
+
+/// What the respawn sweep decided to do about one crashed agent, computed under
+/// the respawn-state lock and acted on after it is released (respawn launches).
+enum RespawnDecision {
+    /// Within the backoff window (or nothing to do) — leave it for next sweep.
+    Wait,
+    /// Backoff elapsed and attempts remain — relaunch it in its worktree.
+    Respawn,
+    /// Attempt cap exhausted — escalate a `need` for a human, once.
+    Escalate,
 }
 
 /// Serializes merges to the same target branch — the land / merge queue.
@@ -223,6 +250,7 @@ impl Supervisor {
             budget_warned: Mutex::new(std::collections::HashSet::new()),
             fleet_warned: Mutex::new(std::collections::HashSet::new()),
             sweep_state: Mutex::new(HashMap::new()),
+            respawn_state: Mutex::new(HashMap::new()),
             log,
             merge_queue: MergeQueue::default(),
         })
@@ -1150,6 +1178,200 @@ impl Supervisor {
         }
     }
 
+    /// Self-healing respawn sweep: auto-`respawn` agents that crashed out of
+    /// their run — `Orphaned` (a daemon restart killed the process, worktree
+    /// preserved) or `Failed` (the harness died non-zero) — so a transient
+    /// crash stops being a manual `rk respawn` chore.
+    ///
+    /// Bounded by a crash-loop backoff so a genuinely-broken task cannot
+    /// respawn-loop forever: each agent is respawned up to
+    /// `respawn_max_attempts` times, the retries spaced by exponential backoff
+    /// (`respawn_backoff_secs * 2^(attempt-1)`); once the cap is hit the sweep
+    /// escalates a `need` (surfaced by `rk inbox`) for a human and stops.
+    ///
+    /// Guardrail: an agent whose branch already merged is never respawned — its
+    /// work already landed, so a respawn would redo merged work. It is dropped
+    /// from tracking instead.
+    ///
+    /// Shares the liveness-sweep loop (TKT-15): the server calls this right
+    /// after `sweep()` on the same tick.
+    pub fn respawn_sweep(self: &Arc<Self>, cfg: &SupervisorConfig) {
+        if !cfg.respawn_enabled || cfg.respawn_max_attempts == 0 {
+            return;
+        }
+        let now = Utc::now();
+        // Candidates: crashed but not dismissed and not cleanly completed. A
+        // `Completed` rat ran `rk done` — a clean finish we must not relaunch.
+        let candidates: Vec<AgentRecord> = self
+            .lock_registry()
+            .list()
+            .into_iter()
+            .filter(|r| matches!(r.state, AgentState::Orphaned | AgentState::Failed))
+            .cloned()
+            .collect();
+
+        for record in &candidates {
+            // Guardrail: never auto-respawn an agent whose branch already merged
+            // (or was deleted) — its work is done; a respawn would redo it.
+            if self.branch_already_merged(record) {
+                self.lock_respawn_state().remove(&record.name);
+                continue;
+            }
+            match self.decide_respawn(record, now, cfg) {
+                RespawnDecision::Wait => {}
+                RespawnDecision::Respawn => {
+                    // Respect the wallet: an operator who set a fleet/repo cap
+                    // does not want auto-respawn to blow past it. Skip this
+                    // cycle without counting the attempt if we're over the cap.
+                    if self.would_exceed_budget(&record.repo_name) {
+                        warn!(agent = %record.name, "skipping auto-respawn: over budget cap");
+                        continue;
+                    }
+                    let attempt = self.record_respawn_attempt(&record.name, now);
+                    info!(
+                        agent = %record.name,
+                        attempt,
+                        max = cfg.respawn_max_attempts,
+                        "self-healing sweep respawning crashed agent"
+                    );
+                    if let Err(e) = self.respawn(&record.name) {
+                        warn!(agent = %record.name, error = %e, "auto-respawn failed");
+                    }
+                }
+                RespawnDecision::Escalate => {
+                    self.escalate_respawn_cap(record, cfg);
+                }
+            }
+        }
+
+        // Forget bookkeeping for agents that reached a terminal-clean state
+        // (Completed/Dismissed) or vanished; a Running/Failed/Orphaned agent
+        // keeps its counter so the Running->Failed cycle stays bounded.
+        let keep: std::collections::HashSet<String> = self
+            .lock_registry()
+            .list()
+            .into_iter()
+            .filter(|r| !matches!(r.state, AgentState::Completed | AgentState::Dismissed))
+            .map(|r| r.name.clone())
+            .collect();
+        self.lock_respawn_state()
+            .retain(|name, _| keep.contains(name.as_str()));
+    }
+
+    /// Decide what to do about one crashed agent. Reads (does not mutate) the
+    /// respawn-state so the caller can act — the attempt is recorded separately
+    /// via `record_respawn_attempt` only if the respawn actually launches.
+    fn decide_respawn(
+        &self,
+        record: &AgentRecord,
+        now: DateTime<Utc>,
+        cfg: &SupervisorConfig,
+    ) -> RespawnDecision {
+        let state = self.lock_respawn_state();
+        let st = state.get(&record.name);
+        let attempts = st.map(|s| s.attempts).unwrap_or(0);
+
+        if attempts >= cfg.respawn_max_attempts {
+            // Cap hit: escalate once, then stay quiet until a human intervenes.
+            return if st.map(|s| s.escalated).unwrap_or(false) {
+                RespawnDecision::Wait
+            } else {
+                RespawnDecision::Escalate
+            };
+        }
+
+        // First attempt fires immediately; every retry waits out an exponential
+        // backoff measured from the previous attempt.
+        match st {
+            None => RespawnDecision::Respawn,
+            Some(st) => {
+                let backoff = cfg
+                    .respawn_backoff_secs
+                    .saturating_mul(1u64 << (attempts.saturating_sub(1)).min(16));
+                let waited = (now - st.last_attempt).num_seconds().max(0) as u64;
+                if waited >= backoff {
+                    RespawnDecision::Respawn
+                } else {
+                    RespawnDecision::Wait
+                }
+            }
+        }
+    }
+
+    /// Record that an auto-respawn just fired for `name`, bumping its attempt
+    /// count and resetting the backoff clock. Returns the new attempt number.
+    fn record_respawn_attempt(&self, name: &str, now: DateTime<Utc>) -> u32 {
+        let mut state = self.lock_respawn_state();
+        let st = state.entry(name.to_string()).or_insert(RespawnState {
+            attempts: 0,
+            last_attempt: now,
+            escalated: false,
+        });
+        st.attempts += 1;
+        st.last_attempt = now;
+        st.attempts
+    }
+
+    /// The merged-branch guardrail: true if this agent's work already landed
+    /// (so a respawn would redo merged work) or its branch is gone (nothing to
+    /// resume). "Merged" here is precise — the branch is *strictly behind* its
+    /// target: contained in it yet the target has advanced past it. That
+    /// deliberately excludes a branch that merely equals its target (an agent
+    /// that crashed before committing anything: tip == base), which is exactly
+    /// the transient crash we most want to auto-respawn — a plain
+    /// "is-ancestor" test would mis-skip it. An unmerged branch (commits not in
+    /// target) is not an ancestor, so it respawns. Fail-safe: an unresolvable
+    /// repo reads as "not merged" so we never wrongly skip a recoverable agent.
+    fn branch_already_merged(&self, record: &AgentRecord) -> bool {
+        let Some(branch) = record.branch.as_deref() else {
+            return false;
+        };
+        let Ok(repo) = Repo::discover(&record.repo_root) else {
+            return false;
+        };
+        if !repo.branch_exists(branch) {
+            return true; // gone: the worktree can't be resumed onto it.
+        }
+        let target = &record.target_branch;
+        repo.is_ancestor(branch, target) && !repo.is_ancestor(target, branch)
+    }
+
+    /// Escalate an exhausted crash-loop to a human: emit a `need` tuple (which
+    /// `rk inbox` surfaces) and mark the agent escalated so we do it only once.
+    fn escalate_respawn_cap(&self, record: &AgentRecord, cfg: &SupervisorConfig) {
+        {
+            let mut state = self.lock_respawn_state();
+            if let Some(st) = state.get_mut(&record.name) {
+                st.escalated = true;
+            }
+        }
+        warn!(
+            agent = %record.name,
+            attempts = cfg.respawn_max_attempts,
+            "auto-respawn cap exhausted — escalating a need for a human"
+        );
+        let tuple = Tuple::new(
+            Category::Need,
+            record.repo_name.clone(),
+            record.name.clone(),
+            self.castle.clone(),
+            json!({
+                "type": "respawn_exhausted",
+                "agent": record.name,
+                "task": record.task,
+                "attempts": cfg.respawn_max_attempts,
+                "text": format!(
+                    "agent {} crashed and exhausted {} auto-respawn attempts; \
+                     needs a human — investigate then `rk respawn {}`",
+                    record.name, cfg.respawn_max_attempts, record.name
+                ),
+            }),
+        );
+        if let Err(e) = self.space.out(tuple) {
+            warn!(error = %e, "failed to emit respawn-exhausted need");
+        }
+    }
+
     /// Route a completion up the spawn tree: the structural parent gets a
     /// directed message; the repo scope gets the event either way.
     fn route_completion(&self, record: &AgentRecord, is_error: bool) {
@@ -1598,5 +1820,204 @@ impl Supervisor {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }
+    }
+
+    fn lock_respawn_state(&self) -> std::sync::MutexGuard<'_, HashMap<String, RespawnState>> {
+        match self.respawn_state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod respawn_tests {
+    use super::*;
+    use rk_ledger::{Budget, FleetBudget};
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(dir: &Path) {
+        git(dir, &["init", "-b", "main"]);
+        git(dir, &["config", "user.email", "r@x"]);
+        git(dir, &["config", "user.name", "R"]);
+        std::fs::write(dir.join("f"), "0\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "init"]);
+    }
+
+    fn supervisor(home: &Path) -> Arc<Supervisor> {
+        let layout = Layout::at(home);
+        let tickets = Arc::new(crate::tickets::Tickets::new(
+            Space::open_in_memory().unwrap(),
+            "castle".into(),
+        ));
+        Arc::new(
+            Supervisor::new(
+                layout,
+                "castle".into(),
+                "fake".into(),
+                Budget::default(),
+                FleetBudget::default(),
+                Space::open_in_memory().unwrap(),
+                tickets,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn record(repo: &Path, branch: Option<&str>) -> AgentRecord {
+        let now = Utc::now();
+        AgentRecord {
+            name: "Nibble".into(),
+            role: "rat".into(),
+            harness: "fake".into(),
+            model: None,
+            repo_root: repo.to_path_buf(),
+            repo_name: "repo".into(),
+            task: Some("t".into()),
+            branch: branch.map(String::from),
+            worktree: Some(repo.to_path_buf()),
+            target_branch: "main".into(),
+            parent: None,
+            workflow_instance: None,
+            session_id: None,
+            attach_target: None,
+            pid: None,
+            state: AgentState::Failed,
+            result: None,
+            usage: TokenUsage::default(),
+            cost_usd: 0.0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// The merged-branch guardrail is precise: a branch whose work landed (and
+    /// whose target advanced past it) is skipped; a crashed-before-committing
+    /// branch (tip == base) and an unmerged-work branch are both respawnable.
+    #[test]
+    fn guardrail_skips_only_genuinely_merged_branches() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let p = repo.path();
+
+        // (a) A branch that made a commit, then merged into a target that then
+        // advanced past it => genuinely merged => skip.
+        git(p, &["checkout", "-b", "merged", "main"]);
+        std::fs::write(p.join("f"), "merged\n").unwrap();
+        git(p, &["commit", "-am", "work"]);
+        git(p, &["checkout", "main"]);
+        std::fs::write(p.join("g"), "other\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "other-main"]);
+        git(p, &["merge", "--no-ff", "-m", "merge", "merged"]);
+        assert!(
+            sup.branch_already_merged(&record(p, Some("merged"))),
+            "a branch merged into an advanced target must be skipped"
+        );
+
+        // (b) A branch cut from main with NO commits (crashed before work):
+        // tip == base, not strictly behind => respawnable.
+        git(p, &["checkout", "-b", "nowork", "main"]);
+        git(p, &["checkout", "main"]);
+        assert!(
+            !sup.branch_already_merged(&record(p, Some("nowork"))),
+            "a no-commit branch (crashed early) must be respawnable"
+        );
+
+        // (c) A branch with commits NOT in the target => unmerged work => respawn.
+        git(p, &["checkout", "-b", "unmerged", "main"]);
+        std::fs::write(p.join("h"), "wip\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "wip"]);
+        git(p, &["checkout", "main"]);
+        assert!(
+            !sup.branch_already_merged(&record(p, Some("unmerged"))),
+            "unmerged work must be respawnable"
+        );
+
+        // (d) A branch that no longer exists => nothing to resume => skip.
+        assert!(
+            sup.branch_already_merged(&record(p, Some("ghost"))),
+            "a vanished branch must be skipped"
+        );
+
+        // (e) No branch recorded => not merged (fail-safe, respawn preflight handles it).
+        assert!(!sup.branch_already_merged(&record(p, None)));
+    }
+
+    /// Backoff + cap: immediate first attempt, exponential wait between retries,
+    /// escalate-once at the cap.
+    #[test]
+    fn decide_respawn_backs_off_then_caps() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let rec = record(repo.path(), Some("main"));
+        let now = Utc::now();
+        let cfg = SupervisorConfig {
+            respawn_enabled: true,
+            respawn_max_attempts: 3,
+            respawn_backoff_secs: 10,
+            ..SupervisorConfig::default()
+        };
+
+        // No prior state => first attempt fires immediately.
+        assert!(matches!(
+            sup.decide_respawn(&rec, now, &cfg),
+            RespawnDecision::Respawn
+        ));
+
+        // After attempt 1, backoff = 10 * 2^0 = 10s: too soon => Wait.
+        sup.record_respawn_attempt(&rec.name, now);
+        assert!(matches!(
+            sup.decide_respawn(&rec, now, &cfg),
+            RespawnDecision::Wait
+        ));
+        // Past the 10s backoff => Respawn.
+        assert!(matches!(
+            sup.decide_respawn(&rec, now + chrono::Duration::seconds(11), &cfg),
+            RespawnDecision::Respawn
+        ));
+
+        // Attempt 2: backoff doubles to 20s. 15s is still too soon.
+        sup.record_respawn_attempt(&rec.name, now);
+        assert!(matches!(
+            sup.decide_respawn(&rec, now + chrono::Duration::seconds(15), &cfg),
+            RespawnDecision::Wait
+        ));
+
+        // Reach the cap (attempts == max) => escalate once, then stay quiet.
+        sup.record_respawn_attempt(&rec.name, now); // attempts now 3 == max
+        assert!(matches!(
+            sup.decide_respawn(&rec, now + chrono::Duration::seconds(999), &cfg),
+            RespawnDecision::Escalate
+        ));
+        sup.lock_respawn_state()
+            .get_mut(&rec.name)
+            .unwrap()
+            .escalated = true;
+        assert!(matches!(
+            sup.decide_respawn(&rec, now + chrono::Duration::seconds(999), &cfg),
+            RespawnDecision::Wait
+        ));
     }
 }

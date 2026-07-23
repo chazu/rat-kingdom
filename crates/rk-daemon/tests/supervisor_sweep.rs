@@ -121,6 +121,7 @@ async fn silent_rat_is_flagged_stuck_then_killed_after_grace() {
             stuck_after_secs: 1,
             burn_usd_per_min: 0.0,
             kill_grace_secs: 2,
+            ..SupervisorConfig::default()
         },
     )
     .await;
@@ -177,6 +178,7 @@ async fn busy_runaway_rat_is_flagged_runaway_by_burn_rate() {
             stuck_after_secs: 0,
             burn_usd_per_min: 1.0,
             kill_grace_secs: 1,
+            ..SupervisorConfig::default()
         },
     )
     .await;

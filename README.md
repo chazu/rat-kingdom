@@ -217,6 +217,10 @@ interval_secs = 60
 stuck_after_secs = 900           # silence past this => STUCK (0 = off)
 burn_usd_per_min = 0.0           # sustained USD/min => RUNNING AWAY (0 = off)
 kill_grace_secs = 600            # obstacle+steer first, kill only if still flagged
+respawn_enabled = false          # self-heal: auto-respawn crashed/orphaned rats
+                                 # (off by default — it relaunches + spends)
+respawn_max_attempts = 3         # crash-loop cap: give up after N, escalate a need
+respawn_backoff_secs = 60        # base backoff, doubled per attempt (never merged)
 
 [drain]                          # continuous-drain: WIP-limited fleet autoscaler
 enabled = false                  # off by default — turning it on hands the
