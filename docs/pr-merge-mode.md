@@ -209,9 +209,20 @@ Key differences to expect in PR mode:
 ### Watching for opened PRs
 
 The `pull_request_opened` event carries `{agent, branch, target, url, detail}`.
-Until the dedicated inbox row lands (TKT-67), you can watch the event stream or
-read the URL off the `rk dismiss` result / the agent's log to find the PR to
-review.
+Since TKT-67, `rk inbox` surfaces each open PR as an **awaiting-review** row,
+one per `(scope, branch)` (newest wins), co-ranked with a parked approval gate
+and carrying the forge URL to review + merge. You can also watch the event
+stream or read the URL off the `rk dismiss` result / the agent's log.
+
+**Auto-clear (TKT-69).** The daemon never sees the forge merge directly, so an
+awaiting-review row clears by a local git check: once the branch is merged into
+its target (its tip is an ancestor of `target`) or the branch is gone, the row
+drops out of `rk inbox` — no need to wait for the `pull_request_opened` event to
+be pruned. Detection is local-only (no fetch, no forge API), so the row clears
+when the merge reaches your **local** target branch — i.e. after you pull the
+merge, or a Direct-mode fast-forward advances it. If you merge on the forge but
+never pull locally, the row lingers until you do; a fetch-driven variant that
+detects the merge without a local pull is left as a follow-up.
 
 ---
 

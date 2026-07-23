@@ -13,6 +13,7 @@ use crate::workflow_exec::{Instance, InstanceStatus};
 use rk_core::tuple::Tuple;
 use serde::Serialize;
 use serde_json::json;
+use std::collections::HashSet;
 
 /// Urgency ranks. Higher sorts first. Derived at read time from the source, not
 /// stored anywhere. Ordering follows the ticket heuristic:
@@ -55,6 +56,7 @@ pub fn build(
     obstacles: &[Tuple],
     needs: &[Tuple],
     pull_requests: &[Tuple],
+    cleared_prs: &HashSet<(String, String)>,
 ) -> Vec<InboxItem> {
     let mut items = Vec::new();
 
@@ -167,6 +169,10 @@ pub fn build(
     // Dedup by (scope, branch): a re-land emits a fresh event for the same
     // branch, and only the newest matters. `pull_requests` arrives oldest-first
     // (scan order), so a later event overwrites an earlier one for its branch.
+    // `cleared_prs` names (scope, branch) pairs whose branch has since been
+    // merged into its target or deleted (computed against local git by the
+    // caller); those rows have auto-cleared and are dropped, so a merged PR
+    // stops nagging without waiting for its event to be pruned from the store.
     let mut latest_pr: std::collections::HashMap<(String, String), &Tuple> =
         std::collections::HashMap::new();
     for t in pull_requests {
@@ -176,7 +182,11 @@ pub fn build(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        latest_pr.insert((t.scope.clone(), branch), t);
+        let key = (t.scope.clone(), branch);
+        if cleared_prs.contains(&key) {
+            continue;
+        }
+        latest_pr.insert(key, t);
     }
     // Deterministic order: newest PR first (event ids are time-sortable).
     let mut prs: Vec<&Tuple> = latest_pr.into_values().collect();
@@ -327,7 +337,7 @@ mod tests {
         )];
         let needs = vec![need("Scamper", "need a reviewer")];
 
-        let inbox = build(&agents, &instances, &obstacles, &needs, &[]);
+        let inbox = build(&agents, &instances, &obstacles, &needs, &[], &HashSet::new());
         let kinds: Vec<&str> = inbox.iter().map(|i| i.kind.as_str()).collect();
 
         // budget(5) > failed agent/instance(4) > parked gate(3) > need(1).
@@ -352,7 +362,7 @@ mod tests {
             instance("wf-run", InstanceStatus::Running, None),
             instance("wf-ok", InstanceStatus::Completed, None),
         ];
-        let inbox = build(&agents, &instances, &[], &[], &[]);
+        let inbox = build(&agents, &instances, &[], &[], &[], &HashSet::new());
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].subject, "Gone");
         assert_eq!(inbox[0].action, "rk respawn Gone");
@@ -365,7 +375,7 @@ mod tests {
             "main",
             Some("https://forge/x/y/compare/main...rat/rat-9/tkt-9"),
         )];
-        let inbox = build(&[], &[], &[], &[], &prs);
+        let inbox = build(&[], &[], &[], &[], &prs, &HashSet::new());
         assert_eq!(inbox.len(), 1);
         let row = &inbox[0];
         assert_eq!(row.kind, "awaiting-review");
@@ -383,7 +393,7 @@ mod tests {
         // so the last entry for a branch wins.
         let older = pull_request("rat/rat-9/tkt-9", "main", Some("https://forge/pr/1"));
         let newer = pull_request("rat/rat-9/tkt-9", "main", Some("https://forge/pr/2"));
-        let inbox = build(&[], &[], &[], &[], &[older, newer]);
+        let inbox = build(&[], &[], &[], &[], &[older, newer], &HashSet::new());
         let review: Vec<&InboxItem> = inbox
             .iter()
             .filter(|i| i.kind == "awaiting-review")
@@ -393,9 +403,29 @@ mod tests {
     }
 
     #[test]
+    fn merged_or_gone_pr_auto_clears_from_the_queue() {
+        // A branch the caller has resolved as merged/gone (its (scope, branch)
+        // is in `cleared_prs`) drops out entirely, even though its
+        // `pull_request_opened` event is still in the store. A second, still-open
+        // PR on a different branch survives, so clearing is per-branch.
+        let merged = pull_request("rat/rat-9/tkt-9", "main", Some("https://forge/pr/1"));
+        let still_open = pull_request("rat/rat-8/tkt-8", "main", Some("https://forge/pr/2"));
+        let mut cleared = HashSet::new();
+        cleared.insert(("repo".to_string(), "rat/rat-9/tkt-9".to_string()));
+
+        let inbox = build(&[], &[], &[], &[], &[merged, still_open], &cleared);
+        let review: Vec<&InboxItem> = inbox
+            .iter()
+            .filter(|i| i.kind == "awaiting-review")
+            .collect();
+        assert_eq!(review.len(), 1);
+        assert_eq!(review[0].subject, "rat/rat-8/tkt-8");
+    }
+
+    #[test]
     fn plain_obstacle_uses_text_and_obstacle_rank() {
         let obstacles = vec![obstacle("Pip", json!({"text": "merge conflict in lib.rs"}))];
-        let inbox = build(&[], &[], &obstacles, &[], &[]);
+        let inbox = build(&[], &[], &obstacles, &[], &[], &HashSet::new());
         assert_eq!(inbox[0].urgency, urgency::OBSTACLE);
         assert_eq!(inbox[0].detail, "merge conflict in lib.rs");
         assert_eq!(inbox[0].action, "rk status Pip");
