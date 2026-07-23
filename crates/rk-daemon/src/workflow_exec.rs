@@ -1304,17 +1304,21 @@ fn repo_name_of(repo: &str) -> String {
 
 fn parse_duration(s: &str) -> rk_core::Result<Duration> {
     let s = s.trim();
-    let (num, unit) = s.split_at(s.len().saturating_sub(1));
-    let (value, mult) = match unit {
-        "s" => (num, 1u64),
-        "m" => (num, 60),
-        "h" => (num, 3600),
+    let invalid = || rk_core::Error::other(format!("invalid duration: {s}"));
+    // Split on the last *char*, not the last byte: a multibyte suffix (e.g.
+    // "5m²", "10µ") would make byte-index split_at panic on a non-boundary.
+    // The unit chars (s/m/h) are single-byte ASCII, so trimming one byte off
+    // the end when they match is always a valid boundary.
+    let (value, mult) = match s.chars().last() {
+        Some('s') => (&s[..s.len() - 1], 1u64),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 3600),
         _ => (s, 1),
     };
-    value
-        .parse::<u64>()
-        .map(|n| Duration::from_secs(n * mult))
-        .map_err(|_| rk_core::Error::other(format!("invalid duration: {s}")))
+    let n = value.parse::<u64>().map_err(|_| invalid())?;
+    // checked_mul: a huge value like "9223372036854775807m" would otherwise
+    // panic in debug builds and silently wrap in release.
+    n.checked_mul(mult).map(Duration::from_secs).ok_or_else(invalid)
 }
 
 #[cfg(test)]
@@ -1371,5 +1375,39 @@ mod tests {
             interpolate_item(text, &item, &ctx),
             "Work TKT-7: add caching\n\ncache the API layer"
         );
+    }
+
+    #[test]
+    fn parse_duration_handles_units_and_bare_numbers() {
+        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
+        assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86_400));
+        // Bare number with no unit is treated as seconds.
+        assert_eq!(parse_duration("45").unwrap(), Duration::from_secs(45));
+        // Surrounding whitespace is trimmed.
+        assert_eq!(parse_duration("  10m ").unwrap(), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn parse_duration_rejects_multibyte_suffix_without_panicking() {
+        // Non-boundary byte split used to panic here; must return Err instead.
+        assert!(parse_duration("5m²").is_err());
+        assert!(parse_duration("10µ").is_err());
+        assert!(parse_duration("²").is_err());
+    }
+
+    #[test]
+    fn parse_duration_rejects_overflow() {
+        // u64::MAX minutes would overflow the seconds multiplication.
+        assert!(parse_duration("9223372036854775807m").is_err());
+        assert!(parse_duration("18446744073709551615h").is_err());
+    }
+
+    #[test]
+    fn parse_duration_rejects_empty_and_garbage() {
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("   ").is_err());
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("m").is_err());
     }
 }
