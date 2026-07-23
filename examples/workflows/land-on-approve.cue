@@ -106,6 +106,11 @@ workflow: {
 				"true": [
 					{type: "dismiss", noMerge: true},
 					{type: "land", branch: "{{ctx.activeBranch}}", target: _input.target},
+					// GATE THE LAND RESULT. A conflict or moved target lands as a
+					// clean {merged: false} (not an error); fail closed so an
+					// approved-but-unmerged branch surfaces in rk inbox instead of
+					// the run completing as if the work landed.
+					{type: "evaluate", expect: {merged: true}},
 				]
 				// Rejected (or fail-closed timeout): tear down the worktree but
 				// PRESERVE the branch, unmerged, for a human. The run still
