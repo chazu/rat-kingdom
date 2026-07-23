@@ -53,6 +53,11 @@ async fn hot_scan_ranks_strongest_first_and_top_caps() {
         )
         .await
         .unwrap();
+    // ULIDs minted in the same millisecond have undefined ordering (see
+    // store.rs), so nudge the clock forward to guarantee the fact gets a
+    // strictly smaller id than the event. Without this the plain oldest-first
+    // assertion below is flaky.
+    tokio::time::sleep(Duration::from_millis(2)).await;
     client
         .call(
             "space.out",
