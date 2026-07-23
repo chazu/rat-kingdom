@@ -340,8 +340,11 @@ pub struct PolicyConfig {
 
 /// Budget caps. `max_usd`/`max_tokens` are per-agent (graduated warn→steer→kill
 /// mid-run). `fleet_max_usd`/`repo_max_usd` are hierarchical caps layered above:
-/// the SUM of all agents' cost fleet-wide and per-repo, enforced as a dispatch
-/// preflight (once hit, new spawns are refused). Zero = unlimited.
+/// the SUM of the undismissed fleet's cost fleet-wide and per-repo, enforced as
+/// a dispatch preflight (once hit, new spawns are refused). An agent's spend
+/// counts until it is dismissed — a dismissed agent drops off the tally, so
+/// these stay standing guardrails on the current (not-yet-torn-down) fleet
+/// rather than cumulative lifetime ceilings. Zero = unlimited.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct BudgetConfig {
