@@ -796,6 +796,12 @@ impl Supervisor {
             "harness_result",
             json!({
                 "agent": record.name,
+                // The completed agent's role ("rat", "reviewer", ...). Carried so
+                // a reactor trigger can scope reactively — e.g. the steward fires
+                // on `"role":"rat"` completions only, which also breaks its own
+                // re-entrancy: the reviewer it spawns completes as "reviewer" and
+                // never re-triggers the steward on the branch it just reviewed.
+                "role": record.role,
                 "task": record.task,
                 "branch": record.branch,
                 "parent": record.parent,

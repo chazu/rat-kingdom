@@ -109,6 +109,11 @@ forever. Three guards, defence-in-depth:
    `[reactor].window_secs` (default cap 20, hard ceiling 100 — mirroring the
    `repeat` `max<=100` discipline). Over the cap, the reactor records a
    `reactor_rate_capped` obstacle and skips, so a storm is bounded and visible.
+4. **Match scoping.** A trigger can narrow its `match` (a `search` substring, an
+   `identity`, a `scope`) so the tuples its own workflow emits fall outside the
+   predicate entirely. The steward does exactly this — it matches only
+   `"role":"rat"` completions, so the `"reviewer"` completions it spawns never
+   match (see the steward section below).
 
 ## First-boot backlog
 
@@ -116,6 +121,46 @@ On a fresh daemon (no cursor file yet) the reactor baselines its cursor to the
 newest existing tuple, so it does **not** react to the entire pre-existing
 backlog at startup. Only tuples that arrive after boot are dispatched. A restart
 resumes from the persisted cursor.
+
+## Shipped reaction: the steward
+
+The **steward** (`examples/workflows/steward.cue` + the `steward-on-completion`
+trigger in `examples/triggers.cue`) is the reactor's flagship autonomy loop and
+the biggest single reduction in per-task operator attention: it automates the
+most-repeated operator decision, *"is this branch good to merge?"*. It is not a
+Rust built-in — it is a plain trigger + workflow you opt into by copying both
+into place, composing primitives that already exist.
+
+On **every rat completion** (`Event/harness_result`, emitted by
+`route_completion`), the steward reactively triages that rat's branch:
+
+1. spawns a cheap reviewer chained onto the completed branch;
+2. runs a **policy gate** — refuses to auto-merge a diff touching protected
+   paths (`git diff --name-only <target>...HEAD` matched against an ERE);
+3. runs the repo's **real test/lint gate** (`run` step — teeth the harness
+   cannot forge);
+4. `read`s the reviewer's `APPROVE`/`REWORK`/`STOP` verdict artifact and routes:
+   - `APPROVE` → `land` the branch straight onto `main` (auto-merge);
+   - `REWORK` → file a follow-up ticket, hold the branch;
+   - `STOP` / unknown → escalate via a `need` tuple (ranked into `rk inbox`),
+     hold the branch.
+
+Both gates **fail closed**: a protected-path hit or a red suite fails the
+instance so the branch is never merged and the failure surfaces in `rk inbox`.
+Auto-merge is only ever reached through a clean policy gate, a green suite, *and*
+an explicit `APPROVE`.
+
+**Re-entrancy — match scoping.** The steward is the worked example of the fourth
+re-entrancy technique: its trigger's `match.search` is `"role":"rat"`, so it
+fires only on plain-rat completions. The reviewer it spawns completes as a
+`"reviewer"` (a field now carried on every `harness_result`), whose payload the
+search does not contain — so the steward never re-triggers itself on the branch
+it just reviewed. A reworked ticket, once drained, completes as a `"rat"` and
+re-enters the steward: a closed loop, not a runaway.
+
+> Installing the steward makes **all** rat completions auto-merge on a clean
+> verdict. Do not also run an approval-gated workflow (`land-on-approve`) over
+> the same completions, or the two race for the branch.
 
 ## Built-in reaction: quorum promotion
 

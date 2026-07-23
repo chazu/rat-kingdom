@@ -105,6 +105,102 @@ fn reviewer_drives_rework_loads_and_routes() {
 }
 
 #[test]
+fn steward_loads_and_routes() {
+    use rk_workflow::Step;
+    // Trigger passes {taskId, branch, repo}; the rest default. Loads with just
+    // taskId, proving every other param is defaulted (the reactor supplies the
+    // real branch/repo at fire time).
+    let inputs = HashMap::from([("taskId".to_string(), json!("fix-login"))]);
+    let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
+
+    // The reviewer chains onto the completed branch (spawn.branch set), so the
+    // gates below run against that work — not a fresh branch off HEAD.
+    let Step::Spawn(spawn) = &workflow.steps[0] else {
+        panic!("steward must start by spawning the reviewer");
+    };
+    assert_eq!(spawn.role, "reviewer");
+    assert!(
+        spawn.branch.is_some(),
+        "reviewer must chain onto the branch param"
+    );
+
+    // Two fail-closed gates precede the merge decision: a protected-path POLICY
+    // gate and the repo's real RUN gate, each a `run` + `evaluate {exit: 0}`.
+    let runs: Vec<&rk_workflow::RunStep> = workflow
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Run(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        runs.iter()
+            .any(|r| r.command.contains("git diff --name-only")),
+        "a protected-path policy gate must run before merge"
+    );
+    let gate_evaluates = workflow
+        .steps
+        .iter()
+        .filter(|s| matches!(s, Step::Evaluate(e) if e.expect.get("exit").is_some()))
+        .count();
+    assert!(
+        gate_evaluates >= 2,
+        "both the policy and run gates must fail closed on non-zero exit"
+    );
+
+    // The verdict is lifted, then routed on.
+    let read = workflow
+        .steps
+        .iter()
+        .find_map(|s| match s {
+            Step::Read(r) => Some(r),
+            _ => None,
+        })
+        .expect("a read step lifting the verdict");
+    assert_eq!(read.into, "verdict");
+    assert_eq!(read.field.as_deref(), Some("recommendation"));
+
+    let Step::When(when) = workflow.steps.last().unwrap() else {
+        panic!("steward should end in a when routing on the verdict");
+    };
+    assert_eq!(when.var, "verdict");
+    // APPROVE is the ONLY path that lands (auto-merge).
+    assert!(
+        when.cases["APPROVE"]
+            .iter()
+            .any(|s| matches!(s, Step::Land(_))),
+        "APPROVE must land the branch"
+    );
+    assert!(
+        !when.cases["REWORK"]
+            .iter()
+            .any(|s| matches!(s, Step::Land(_))),
+        "REWORK must never land"
+    );
+    // REWORK files a durable ticket rather than looping a rework rat here.
+    assert!(
+        when.cases["REWORK"]
+            .iter()
+            .any(|s| matches!(s, Step::Run(r) if r.command.contains("rk ticket new"))),
+        "REWORK must file a follow-up ticket"
+    );
+    // STOP escalates to the operator via a need tuple and holds the branch.
+    assert!(
+        when.cases["STOP"]
+            .iter()
+            .any(|s| matches!(s, Step::Run(r) if r.command.contains("rk out need"))),
+        "STOP must escalate via a need tuple"
+    );
+    // Unknown verdict: escalate and fail loudly.
+    assert!(
+        !when.default.is_empty(),
+        "unknown verdicts must route to a default arm"
+    );
+    assert!(when.default.iter().any(|s| matches!(s, Step::Stop(_))));
+}
+
+#[test]
 fn code_review_resolves_reviewer_profile() {
     let inputs = HashMap::from([("taskId".to_string(), json!("t1"))]);
     let workflow = rk_workflow::load(&examples_dir().join("code-review.cue"), &inputs).unwrap();

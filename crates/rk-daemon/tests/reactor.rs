@@ -343,6 +343,73 @@ async fn per_trigger_rate_cap_bounds_a_storm() {
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
+/// The steward's re-entrancy break (TKT-19): its trigger scopes to
+/// `harness_result` completions carrying `"role":"rat"` via the match `search`.
+/// A rat completion fires it; a reviewer completion (the very agent the steward
+/// spawns) does NOT — so the steward never re-triggers itself on the branch it
+/// just reviewed. This pins the `search`-substring scoping the whole design
+/// rests on, without needing the reviewer's verdict artifact.
+#[tokio::test]
+async fn steward_trigger_fires_on_rat_completion_not_reviewer() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+
+    // A minimal steward stand-in: same match predicate the shipped trigger uses
+    // (harness_result + `"role":"rat"` payload search), firing the count-only
+    // react-work workflow instead of the real steward.
+    let dir = layout.triggers_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("steward.cue"),
+        r#"triggers: [{name: "steward-on-completion", match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}, run: "react-work", repo: "myrepo"}]"#,
+    )
+    .unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+
+    // The reviewer the steward would spawn completes first: role "reviewer".
+    // serde_json serializes map keys in insertion order, so the payload renders
+    // `"role":"reviewer"` — which the `"role":"rat"` search does NOT contain.
+    space
+        .out(Tuple::new(
+            Category::Event,
+            "myrepo",
+            "harness_result",
+            "test-castle",
+            json!({"agent": "reviewer-1", "role": "reviewer", "branch": "rat/x/rev"}),
+        ))
+        .unwrap();
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        0,
+        "a reviewer completion must NOT fire the steward (re-entrancy break)"
+    );
+
+    // A plain rat completion: role "rat" — the search matches, steward fires.
+    space
+        .out(Tuple::new(
+            Category::Event,
+            "myrepo",
+            "harness_result",
+            "test-castle",
+            json!({"agent": "rat-1", "role": "rat", "branch": "rat/x/work"}),
+        ))
+        .unwrap();
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        1,
+        "a rat completion fires the steward exactly once"
+    );
+    assert_eq!(reactor.engine_instance_count(), 1);
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
 /// Full path over the wire: suggestion + three distinct endorsers land via
 /// `space.out`; the live daemon's reactor loop promotes a convention on its own.
 #[tokio::test]

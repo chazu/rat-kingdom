@@ -36,4 +36,36 @@ triggers: [
 		repo:  "rat-kingdom"
 		maxFires: 3
 	},
+
+	// THE STEWARD (leverage #2). On every rat completion, reactively triage that
+	// rat's branch: a cheap reviewer + the repo's real gate + a protected-path
+	// policy check decide auto-merge / rework-ticket / escalate — so the operator
+	// reviews exceptions, not every branch.
+	//
+	// `"role":"rat"` scopes the fire to plain-rat completions, which is also the
+	// re-entrancy break: the reviewer the steward spawns completes as a
+	// "reviewer" (not "rat"), so its own harness_result never re-triggers the
+	// steward on the branch it just reviewed. (`is_error` is NOT filtered here —
+	// an errored rat's branch is still triaged, and its broken work is caught by
+	// the run gate and held unmerged, not merged.)
+	//
+	// NOTE: installing this makes ALL rat completions auto-merge on a clean
+	// verdict. Do not also run an approval-gated workflow (land-on-approve) over
+	// the same completions, or the two race for the branch.
+	{
+		name:  "steward-on-completion"
+		match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}
+		run:   "steward"
+		params: {
+			// String-interpolated (always a string) so a taskless rat still loads.
+			taskId: "{{tuple.payload.task}}"
+			// Raw pass-through: the exact branch the reviewer must chain onto.
+			branch: "{{tuple.payload.branch}}"
+			// The repo the completion is scoped to.
+			repo: "{{tuple.scope}}"
+		}
+		// A completion storm must not spawn a steward storm; each fire is still
+		// idempotent per completion tuple, this caps the rolling window.
+		maxFires: 20
+	},
 ]
