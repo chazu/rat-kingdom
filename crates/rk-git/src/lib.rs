@@ -4,7 +4,16 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
+
+/// Per-merge sequence, so two `merge_branch` calls running at once (e.g. a
+/// `dismiss` into `main` and a `land` into `develop`) never collide on the same
+/// temporary worktree path. Process id alone is shared by every thread/task, so
+/// concurrent in-process merges would otherwise reuse one path and the second
+/// `worktree add` would fail. Merges to the *same* target are additionally
+/// serialized upstream by the daemon's merge queue.
+static MERGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub const PROTECTED_BRANCHES: [&str; 4] = ["main", "master", "develop", "HEAD"];
 
@@ -144,10 +153,11 @@ impl Repo {
     /// `target`: run the merge in a temporary detached worktree, then
     /// fast-forward the target ref if it was not moved concurrently.
     pub fn merge_branch(&self, branch: &str, target: &str) -> rk_core::Result<MergeOutcome> {
+        let seq = MERGE_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = self
             .root
             .join(".git")
-            .join(format!("rk-merge-{}", std::process::id()));
+            .join(format!("rk-merge-{}-{}", std::process::id(), seq));
         // Detached checkout of target — never conflicts with existing checkouts.
         self.git(&[
             "worktree",
@@ -637,6 +647,47 @@ mod tests {
         assert!(outcome.detail.contains("conflict"), "{}", outcome.detail);
         // Branch preserved for humans to resolve.
         assert!(repo.branch_exists(&branch));
+    }
+
+    #[test]
+    fn concurrent_merges_to_distinct_targets_dont_collide() {
+        // Two merges running at once into *different* targets must not reuse one
+        // temporary worktree path. Before the per-merge sequence, both used
+        // `.git/rk-merge-<pid>` and the second `worktree add` failed hard.
+        let (dir, repo) = scratch_repo();
+        run(dir.path(), &["branch", "develop"]);
+        // Park the root on neither target so both merges take the bare ref-move
+        // path (no shared index.lock) — the temp-path collision is what's tested.
+        run(dir.path(), &["checkout", "-q", "-b", "scratch-head"]);
+
+        let wt_a = dir.path().join("wt-a");
+        let wt_b = dir.path().join("wt-b");
+        let branch_a = agent_branch("A", "t");
+        let branch_b = agent_branch("B", "t");
+        repo.create_worktree(&wt_a, &branch_a, "main").unwrap();
+        repo.create_worktree(&wt_b, &branch_b, "develop").unwrap();
+        std::fs::write(wt_a.join("a.txt"), "a\n").unwrap();
+        run(&wt_a, &["add", "."]);
+        run(&wt_a, &["commit", "-m", "a"]);
+        std::fs::write(wt_b.join("b.txt"), "b\n").unwrap();
+        run(&wt_b, &["add", "."]);
+        run(&wt_b, &["commit", "-m", "b"]);
+
+        let (repo_a, repo_b) = (repo.clone(), repo.clone());
+        let (ba, bb) = (branch_a.clone(), branch_b.clone());
+        let h1 = std::thread::spawn(move || repo_a.merge_branch(&ba, "main").unwrap());
+        let h2 = std::thread::spawn(move || repo_b.merge_branch(&bb, "develop").unwrap());
+        let out_a = h1.join().unwrap();
+        let out_b = h2.join().unwrap();
+
+        assert!(out_a.merged, "merge into main: {}", out_a.detail);
+        assert!(out_b.merged, "merge into develop: {}", out_b.detail);
+        assert!(git_in(dir.path(), &["ls-tree", "--name-only", "main"])
+            .unwrap()
+            .contains("a.txt"));
+        assert!(git_in(dir.path(), &["ls-tree", "--name-only", "develop"])
+            .unwrap()
+            .contains("b.txt"));
     }
 
     #[test]
