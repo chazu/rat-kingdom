@@ -1,5 +1,5 @@
 [tools]
-rust = "1.85"
+rust = "1.95.0"
 
 [tasks.build]
 description = "Build an optimized release build of rk"
