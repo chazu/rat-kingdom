@@ -12,6 +12,7 @@ use std::process::Command;
 
 const SCHEMA: &str = include_str!("schema.cue");
 const TRIGGER_SCHEMA: &str = include_str!("triggers-schema.cue");
+const SCHEDULE_SCHEMA: &str = include_str!("schedules-schema.cue");
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Workflow {
@@ -515,6 +516,54 @@ fn ensure_triggers_package(source: &str) -> String {
         source.to_string()
     } else {
         format!("package triggers\n\n{source}")
+    }
+}
+
+/// A scheduled workflow: a cron cadence plus the workflow to launch on it. The
+/// time-axis counterpart to a [`Trigger`] — where a trigger fires on a matching
+/// tuple, a schedule fires on a clock. Loaded from `#Schedule` CUE definitions,
+/// validated against the embedded schedule schema exactly as triggers are.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Schedule {
+    pub name: String,
+    /// A 5-field cron expression or `@macro`, evaluated in UTC. Its full syntax
+    /// is parsed and validated by the daemon scheduler, not this loader.
+    pub cron: String,
+    /// Workflow definition name to launch on cadence.
+    pub run: String,
+    /// Registered repo to run in; a repo-local schedule file defaults it to that
+    /// repo. A global schedule with no repo cannot resolve and is skipped.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Static params passed to the workflow verbatim (each a string value).
+    #[serde(default)]
+    pub params: HashMap<String, String>,
+}
+
+/// Load and validate every `#Schedule` in one CUE file.
+pub fn load_schedules(file: &Path) -> rk_core::Result<Vec<Schedule>> {
+    let source = std::fs::read_to_string(file)
+        .map_err(|e| rk_core::Error::other(format!("read {}: {e}", file.display())))?;
+    load_schedules_str(&source)
+}
+
+/// Load schedules from source text (see [`load_schedules`]).
+pub fn load_schedules_str(source: &str) -> rk_core::Result<Vec<Schedule>> {
+    let dir = tempfile_dir()?;
+    std::fs::write(dir.join("schema.cue"), SCHEDULE_SCHEMA)?;
+    std::fs::write(dir.join("schedules.cue"), ensure_schedules_package(source))?;
+    let json = cue_export(&dir, "schedules")?;
+    let schedules: Vec<Schedule> = serde_json::from_str(&json)
+        .map_err(|e| rk_core::Error::other(format!("schedules JSON did not match schema: {e}")))?;
+    std::fs::remove_dir_all(&dir).ok();
+    Ok(schedules)
+}
+
+fn ensure_schedules_package(source: &str) -> String {
+    if source.trim_start().starts_with("package ") || source.contains("\npackage ") {
+        source.to_string()
+    } else {
+        format!("package schedules\n\n{source}")
     }
 }
 
@@ -1060,6 +1109,53 @@ triggers: [
     fn trigger_bad_name_is_a_cue_error() {
         let bad = r#"triggers: [{name: "Bad Name", match: {category: "need"}, run: "w"}]"#;
         let err = load_triggers_str(bad).unwrap_err();
+        assert!(err.to_string().contains("cue export failed"), "{err}");
+    }
+
+    const SCHEDULES: &str = r#"
+schedules: [
+    {
+        name: "nightly-drain"
+        cron: "0 3 * * *"
+        run:  "backlog-drain"
+        repo: "rat-kingdom"
+        params: {limit: "5"}
+    },
+    {
+        name: "hourly-groom"
+        cron: "@hourly"
+        run:  "groom"
+    },
+]
+"#;
+
+    #[test]
+    fn loads_schedules_via_cue() {
+        let schedules = load_schedules_str(SCHEDULES).unwrap();
+        assert_eq!(schedules.len(), 2);
+        let first = &schedules[0];
+        assert_eq!(first.name, "nightly-drain");
+        assert_eq!(first.cron, "0 3 * * *");
+        assert_eq!(first.run, "backlog-drain");
+        assert_eq!(first.repo.as_deref(), Some("rat-kingdom"));
+        assert_eq!(first.params["limit"], "5");
+        // A macro cron and an omitted repo both load.
+        assert_eq!(schedules[1].cron, "@hourly");
+        assert_eq!(schedules[1].repo, None);
+        assert!(schedules[1].params.is_empty());
+    }
+
+    #[test]
+    fn schedule_bad_name_is_a_cue_error() {
+        let bad = r#"schedules: [{name: "Bad Name", cron: "* * * * *", run: "w"}]"#;
+        let err = load_schedules_str(bad).unwrap_err();
+        assert!(err.to_string().contains("cue export failed"), "{err}");
+    }
+
+    #[test]
+    fn schedule_empty_cron_is_a_cue_error() {
+        let bad = r#"schedules: [{name: "x", cron: "", run: "w"}]"#;
+        let err = load_schedules_str(bad).unwrap_err();
         assert!(err.to_string().contains("cue export failed"), "{err}");
     }
 }

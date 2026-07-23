@@ -1,0 +1,108 @@
+# The scheduler: cron-driven workflows
+
+The scheduler is the **TIME axis** of autonomy. Where the [reactor](reactor.md)
+fires a workflow when a matching *tuple* lands, the scheduler fires one when a
+*clock* strikes — groom, drain, and prompt-refine on a cadence with zero
+operator initiation. A scheduled fire is a time-sourced trigger: it resolves a
+target repo and calls `engine.run`, the very same dispatch path the reactor
+uses.
+
+## Defining a schedule
+
+A schedule file is a CUE package with a top-level `schedules:` list, validated
+against `crates/rk-workflow/src/schedules-schema.cue` exactly as workflows and
+triggers are. Put them in either place (both are loaded every cycle):
+
+- **Global:** `~/.rat-kingdom/schedules/*.cue`
+- **Repo-local:** `<repo>/.rk/schedules.cue`
+
+```cue
+schedules: [
+    {
+        name: "nightly-drain"   // lowercase-hyphen; also the single-flight key
+        cron: "0 3 * * *"       // 03:00 UTC daily
+        run:  "backlog-drain"   // a workflow definition name
+        repo: "rat-kingdom"     // registered repo to run in
+    },
+    {
+        name: "hourly-groom"
+        cron: "@hourly"
+        run:  "backlog-groom"
+        repo: "rat-kingdom"
+    },
+]
+```
+
+`repo` defaults to the repo a repo-local file was discovered in, so a
+`<repo>/.rk/schedules.cue` entry can omit it. A **global** schedule MUST set
+`repo` — unlike a trigger there is no matched tuple whose scope could stand in,
+so a global schedule with no repo is logged and skipped. Static `params` (all
+string values) are passed to the workflow verbatim.
+
+## Cron syntax
+
+Standard 5-field cron — `minute hour day-of-month month day-of-week` — evaluated
+in **UTC** at minute granularity. Per field:
+
+| form | meaning |
+|------|---------|
+| `*` | any value |
+| `a,b,c` | a list |
+| `a-b` | a range |
+| `*/n`, `a-b/n` | a step |
+
+Day-of-week is `0..=6` with `0` = Sunday (`7` also accepted as Sunday). Names
+(`MON`, `JAN`) are intentionally not supported — numeric only.
+
+The **Vixie day rule** is preserved: when *both* day-of-month and day-of-week
+are restricted (neither is a bare `*`), a day matches if *either* field matches
+(a logical OR). A field counts as restricted iff its literal text is not exactly
+`*`.
+
+Macros: `@yearly`/`@annually`, `@monthly`, `@weekly`, `@daily`/`@midnight`,
+`@hourly`.
+
+## Cursor, catch-up, and single-flight
+
+- **Durable minute-cursor.** The scheduler records the last UTC minute it
+  evaluated in `~/.rat-kingdom/scheduler-cursor`. Each cycle it evaluates every
+  minute in `(cursor, now]` — normally just the one new minute — firing each
+  schedule at most once per cycle.
+- **First boot** baselines the cursor to the current minute, so no backlog
+  fires when the daemon starts.
+- **Catch-up after downtime** is bounded by `catchup_minutes` (default one day):
+  a daemon down overnight runs each missed daily/hourly schedule *once* on the
+  next boot, not a replay of every minute in the gap.
+- **Single-flight.** Each schedule is guarded by a lock keyed on its `name`: if
+  its previous run's workflow instance is still `Running`, the next fire is
+  skipped. A slow nightly drain therefore never stacks a second copy on itself.
+
+Overnight cost is otherwise bounded by the fleet/repo budget caps
+(`rk_ledger::FleetBudget`), which refuse new dispatch once a cap is hit — the
+same pre-dispatch guard every spawn passes through.
+
+## Configuration
+
+```toml
+[scheduler]
+enabled = true          # master switch; false = the scheduler loop never starts
+interval_secs = 30      # how often to check for a new cron minute; clamped [1,60]
+catchup_minutes = 1440  # bound on look-back after downtime; 0 = current minute only
+```
+
+`interval_secs` is clamped to `[1, 60]`: the loop must tick at least once a
+minute or a matching minute would be skipped.
+
+## Where it lives
+
+- Schema: `crates/rk-workflow/src/schedules-schema.cue`; loader
+  `rk_workflow::load_schedules`.
+- Cron evaluator: `crates/rk-daemon/src/cron.rs` (`Cron::parse` / `Cron::matches`).
+- Scheduler: `crates/rk-daemon/src/scheduler.rs` (`Scheduler::run_cycle`),
+  spawned as a loop next to the GC, sync, and reactor loops in
+  `crates/rk-daemon/src/server.rs`.
+- Config: `rk_core::config::SchedulerConfig`; paths `Layout::schedules_dir`.
+- Tests: `crates/rk-daemon/tests/scheduler.rs` (matching-minute fire,
+  catch-up-once, single-flight, unresolvable-repo/bad-cron skip, repo-local
+  default) plus `cron` and `load_schedules` unit tests.
+- Example: `examples/schedules.cue`.

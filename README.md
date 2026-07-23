@@ -319,6 +319,44 @@ exclude_instances = []   # authors never reacted to (besides "reactor")
 See `docs/reactor.md` for the full design (why scan-is-truth, the three
 re-entrancy guards, first-boot backlog skipping).
 
+## Scheduler (cron)
+
+The daemon also runs a background **scheduler** — the TIME axis of the reactor.
+Where a trigger fires on a matching tuple, a schedule fires on a clock: groom,
+drain, and prompt-refine on a cadence with zero operator initiation. Schedules
+go in `~/.rat-kingdom/schedules/*.cue` (global) or `<repo>/.rk/schedules.cue`
+(repo-local), validated against `crates/rk-workflow/src/schedules-schema.cue`.
+
+```cue
+schedules: [
+    {
+        name: "nightly-drain"   // also the single-flight key
+        cron: "0 3 * * *"       // 5-field cron or @hourly/@daily/@weekly/... (UTC)
+        run:  "backlog-drain"   // a workflow definition name
+        repo: "myrepo"          // required for a global schedule
+    },
+]
+```
+
+- **A scheduled fire is a time-sourced trigger** — it reuses the reactor's
+  `engine.run` dispatch path, just clock-sourced instead of tuple-sourced.
+- **Never double-fires, catches up once.** A durable minute-cursor
+  (`~/.rat-kingdom/scheduler-cursor`) baselines to now on first boot (no backlog
+  storm) and, after downtime, fires each missed schedule at most once (bounded by
+  `[scheduler].catchup_minutes`).
+- **Single-flight.** Each schedule is guarded by its `name`: while its previous
+  run is still `Running`, the next fire is skipped — a slow drain never stacks.
+
+```toml
+[scheduler]
+enabled = true
+interval_secs = 30      # cron-minute check cadence; clamped [1,60]
+catchup_minutes = 1440  # look-back bound after downtime; 0 = current minute only
+```
+
+See `docs/scheduler.md` for the full design (cursor/catch-up semantics, the
+Vixie day-of-month/day-of-week rule, single-flight).
+
 ## Attach mode (herdr)
 
 With a running [herdr](https://herdr.dev) server, rats can run interactively

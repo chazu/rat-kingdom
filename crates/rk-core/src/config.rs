@@ -15,6 +15,7 @@ pub struct Config {
     pub budget: BudgetConfig,
     pub sync: SyncConfig,
     pub reactor: ReactorConfig,
+    pub scheduler: SchedulerConfig,
     pub supervisor: SupervisorConfig,
     pub evaporation: EvaporationConfig,
     /// Named agent profiles: [agents.<name>] harness/model/permission_mode.
@@ -118,6 +119,41 @@ impl Default for ReactorConfig {
             exclude_instances: Vec::new(),
             quorum: 3,
             coalesce_quorum: 3,
+        }
+    }
+}
+
+/// The daemon scheduler: fires workflows on a cron cadence, adding the TIME axis
+/// to autonomy (groom/drain/prompt-refine with zero operator initiation). A
+/// scheduled fire is a time-sourced trigger reusing the reactor's dispatch path
+/// (`engine.run`). Overlap is prevented by a per-schedule single-flight guard, so
+/// a slow nightly drain never stacks on itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SchedulerConfig {
+    /// Master switch. When false the scheduler loop never starts.
+    pub enabled: bool,
+    /// How often the scheduler wakes to check whether a cron minute has elapsed.
+    /// Clamped to [1, 60] by the loop: it must tick at least once a minute so a
+    /// matching minute is never skipped.
+    pub interval_secs: u64,
+    /// Bound on catch-up after downtime: on boot (or after a long stall) the
+    /// scheduler looks back at most this many minutes for missed cron minutes,
+    /// firing each schedule at most once. Zero means no catch-up — only the
+    /// current minute is evaluated (plain-cron semantics, like `cron` without
+    /// `anacron`).
+    pub catchup_minutes: u64,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 30,
+            // A day of catch-up: a daemon down overnight still runs each missed
+            // daily/hourly schedule once on the next boot, without replaying a
+            // week of minutes.
+            catchup_minutes: 24 * 60,
         }
     }
 }
