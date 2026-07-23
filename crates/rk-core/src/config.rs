@@ -106,6 +106,12 @@ pub struct ReactorConfig {
     /// topic at scan time, so a hot wall that many rats hit files exactly one
     /// backlog item. Zero disables obstacle coalescence entirely.
     pub coalesce_quorum: u32,
+    /// Active operator push: when the steward escalates a STOP/unknown verdict
+    /// via a `need` (identity `steward`), fire a desktop notification through
+    /// herdr so the operator is pushed at, not only queued in `rk inbox`. A
+    /// no-op when no herdr server is running, so it never blocks a headless
+    /// castle. Set false to keep escalations purely on the passive inbox queue.
+    pub notify_escalations: bool,
 }
 
 impl Default for ReactorConfig {
@@ -119,6 +125,7 @@ impl Default for ReactorConfig {
             exclude_instances: Vec::new(),
             quorum: 3,
             coalesce_quorum: 3,
+            notify_escalations: true,
         }
     }
 }

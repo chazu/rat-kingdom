@@ -786,6 +786,100 @@ async fn zero_quorum_disables_coalescence() {
     assert!(coalesced_tickets(&space).is_empty(), "zero quorum files nothing");
 }
 
+/// A steward escalation `need`: identity "steward", as `rk out need <repo>
+/// steward` writes it (instance = castle, not the escalating agent).
+fn steward_need(scope: &str, task: &str, text: &str) -> Tuple {
+    let mut t = Tuple::new(
+        Category::Need,
+        scope,
+        "steward",
+        "test-castle",
+        json!({"agent": "steward", "task": task, "text": text}),
+    )
+    .with_lifecycle(rk_core::tuple::Lifecycle::Ephemeral);
+    t.strength = Some(1.0);
+    t
+}
+
+/// Count the durable "already notified" markers the escalation push writes.
+fn escalation_markers(space: &rk_space::Space) -> usize {
+    space
+        .scan(&rk_core::tuple::Pattern::category(Category::Event).identity("reactor_fired"))
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.payload.get("kind").and_then(|k| k.as_str()) == Some("notify-escalation"))
+        .count()
+}
+
+/// A steward escalation gets an active push exactly once, and only the steward:
+/// an ordinary rat's `rk need` (identity = agent name) is left on the passive
+/// inbox queue. The push degrades to a no-op with no herdr server, so we assert
+/// on the durable de-dup marker it leaves behind rather than the popup itself.
+#[tokio::test]
+async fn steward_escalation_notifies_once_ordinary_need_does_not() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+
+    // A steward STOP escalation and an ordinary rat help request land together.
+    space
+        .out(steward_need(
+            "myrepo",
+            "TKT-99",
+            "steward: reviewer returned STOP for TKT-99 — needs a human merge decision",
+        ))
+        .unwrap();
+    let mut rat_need = steward_need("myrepo", "TKT-1", "cannot find the socket");
+    rat_need.identity = "Whisker".into(); // an ordinary rat need keys on its agent
+    space.out(rat_need).unwrap();
+
+    reactor.run_cycle().unwrap();
+    assert_eq!(
+        escalation_markers(&space),
+        1,
+        "only the steward escalation is pushed; a rat's own need is not"
+    );
+
+    // Idempotent under at-least-once redelivery: wipe the cursor so both needs
+    // are re-scanned — the durable marker still suppresses a second push.
+    std::fs::remove_file(home.path().join("reactor-cursor")).ok();
+    reactor.run_cycle().unwrap();
+    assert_eq!(
+        escalation_markers(&space),
+        1,
+        "the marker prevents a duplicate popup after cursor loss"
+    );
+}
+
+/// `notify_escalations = false` keeps escalations purely on the `rk inbox`
+/// queue: no active push, no marker.
+#[tokio::test]
+async fn escalation_notify_can_be_disabled() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let config = ReactorConfig {
+        notify_escalations: false,
+        ..Default::default()
+    };
+    let reactor = build_reactor_with_space(&layout, config, space.clone());
+
+    space
+        .out(steward_need("myrepo", "TKT-7", "steward: STOP, needs a human"))
+        .unwrap();
+    reactor.run_cycle().unwrap();
+    assert_eq!(
+        escalation_markers(&space),
+        0,
+        "the push is off, so no notification marker is written"
+    );
+}
+
 async fn connect(layout: &Layout) -> Client {
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(20)).await;
