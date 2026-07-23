@@ -61,8 +61,8 @@ workflow: #Workflow
 #AspectMatch: {
 	// Step type: "spawn" | "wait" | "evaluate" | "dismiss" | "gate" | "read" |
 	// "when" | "repeat" | "break" | "stop" | "for_each" | "wait_all" |
-	// "dismiss_all" | "run". Aspects only weave top-level steps, not steps
-	// nested inside `when`/`repeat`.
+	// "dismiss_all" | "run" | "land". Aspects only weave top-level steps, not
+	// steps nested inside `when`/`repeat`.
 	type?: string
 	// Spawn steps only: match by role.
 	role?: string
@@ -70,7 +70,7 @@ workflow: #Workflow
 
 #Step: #SpawnStep | #WaitStep | #EvaluateStep | #DismissStep | #GateStep |
 	#ReadStep | #WhenStep | #RepeatStep | #BreakStep | #StopStep |
-	#ForEachStep | #WaitAllStep | #DismissAllStep | #RunStep
+	#ForEachStep | #WaitAllStep | #DismissAllStep | #RunStep | #LandStep
 
 // Tuple categories a `read` step may match.
 #Category: "fact" | "convention" | "task" | "available" | "claim" | "obstacle" |
@@ -264,4 +264,32 @@ workflow: #Workflow
 	// Hard wall-clock bound; a suite still running when it elapses is killed
 	// and the step fails closed.
 	timeout: string | *"10m"
+}
+
+// Merge a NAMED branch into a NAMED target directly — "land" the work. Where
+// `dismiss` merges the active agent's branch into ITS OWN base, `land` names
+// both source `branch` and merge `target`, so an APPROVE verdict lands reviewed
+// work straight onto (e.g.) main with no human doing the final merge. This
+// closes the last manual hop when a reviewer is chained off a work branch — its
+// dismiss can only merge into that base, never main.
+//
+// Both fields interpolate {{ctx.*}}: `branch: "{{ctx.activeBranch}}"` lands the
+// branch the workflow is holding. The merge is CAS-safe (a detached worktree;
+// the target ref advances only if it did not move), so it disturbs no live
+// checkout and fails safe under concurrency: a merge conflict or a moved target
+// is a clean {merged: false} in ctx.previousResult ({branch, target, merged,
+// detail, branch_deleted}), NOT an error — gate on it with a following
+// `evaluate {expect: {merged: true}}` or a `when`. On a successful merge the
+// source branch is deleted unless `keepBranch` (a protected or still-checked-out
+// branch is left in place and reported not deleted).
+//
+// SAFETY: `land` merges with no review of its own. Reach it only through an
+// APPROVE `when`-branch or after an approval gate — never as an unconditional
+// step — or unreviewed work lands. A hard policy restriction (and merge-queue
+// serialization) is deferred to the policy engine.
+#LandStep: {
+	type:   "land"
+	branch: string
+	target: string
+	keepBranch?: bool
 }

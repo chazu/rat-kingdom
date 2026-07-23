@@ -79,6 +79,8 @@ pub enum Step {
     /// Run a command (the repo's real test/lint suite) in the active agent's
     /// worktree, capturing `{exit, stdout, stderr}` into `ctx.previousResult`.
     Run(RunStep),
+    /// Merge a NAMED branch into a NAMED target directly — "land" the work.
+    Land(LandStep),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -285,6 +287,40 @@ pub struct RunStep {
 
 fn default_run_timeout() -> String {
     "10m".into()
+}
+
+/// Merge a NAMED branch into a NAMED target — the explicit `{branch, target}`
+/// counterpart to `dismiss`. Where `dismiss` merges the single active agent's
+/// branch into *its own base*, `land` names both the source `branch` and the
+/// merge `target`, so an APPROVE verdict can land reviewed work straight onto
+/// (e.g.) `main` without a human doing the final merge. This closes the last
+/// manual hop when a reviewer is chained off a work branch: its dismiss can only
+/// merge into that base, never main.
+///
+/// Both fields interpolate `{{ctx.*}}` placeholders, so
+/// `branch: "{{ctx.activeBranch}}"` lands the branch the workflow is holding.
+/// The merge is CAS-safe (rk-git's `merge_branch` runs in a detached worktree
+/// and advances the target ref only if it did not move), so it disturbs no live
+/// checkout and fails safe under concurrency: a merge conflict or a moved target
+/// is a clean `{merged: false}` in `ctx.previousResult`, NOT a hard error — gate
+/// on it with a following `evaluate {expect: {merged: true}}` or a `when`. On a
+/// successful merge the source branch is deleted unless `keep_branch` (a
+/// protected or still-checked-out branch is left in place, reported not
+/// deleted).
+///
+/// SAFETY: `land` merges with no review of its own. Reach it only through an
+/// APPROVE `when`-branch or after an approval gate — never as an unconditional
+/// step — or unreviewed work lands. A hard policy restriction (and merge-queue
+/// serialization) is deferred to the policy engine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LandStep {
+    /// Branch to merge; interpolated. Often `{{ctx.activeBranch}}`.
+    pub branch: String,
+    /// Branch to merge it into; interpolated. E.g. `"main"`.
+    pub target: String,
+    /// Keep the source branch after a successful merge instead of deleting it.
+    #[serde(default, rename = "keepBranch")]
+    pub keep_branch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -536,6 +572,7 @@ fn step_matches(step: &Step, matcher: &AspectMatch) -> bool {
             Step::WaitAll(_) => "wait_all",
             Step::DismissAll(_) => "dismiss_all",
             Step::Run(_) => "run",
+            Step::Land(_) => "land",
         };
         if actual != step_type {
             return false;
@@ -756,6 +793,34 @@ workflow: {
                 if r.cwd.as_deref() == Some("crates/x")
                     && r.expect_exit == Some(0)
                     && r.timeout == "10m"
+        ));
+    }
+
+    #[test]
+    fn loads_land_step() {
+        let source = r#"
+workflow: {
+    name: "land-on-approve"
+    steps: [
+        {type: "spawn", role: "rat", task: {title: "T"}},
+        {type: "wait"},
+        {type: "land", branch: "{{ctx.activeBranch}}", target: "main"},
+        {type: "land", branch: "rat/x/feat", target: "release", keepBranch: true},
+    ]
+}
+"#;
+        let wf = load_str(source, &HashMap::new()).unwrap();
+        assert_eq!(wf.steps.len(), 4);
+        // Default land deletes the source branch (keep_branch defaults false).
+        assert!(matches!(
+            &wf.steps[2],
+            Step::Land(l)
+                if l.branch == "{{ctx.activeBranch}}" && l.target == "main" && !l.keep_branch
+        ));
+        // keepBranch preserves the merged source branch.
+        assert!(matches!(
+            &wf.steps[3],
+            Step::Land(l) if l.branch == "rat/x/feat" && l.target == "release" && l.keep_branch
         ));
     }
 
