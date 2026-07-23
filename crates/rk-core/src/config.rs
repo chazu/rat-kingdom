@@ -216,6 +216,12 @@ impl Default for SupervisorConfig {
 /// kill-switch) and the liveness sweep (which reaps stuck rats, freeing slots)
 /// are its safety net, but enabling it still hands the dispatch loop to the
 /// daemon, so it is opt-in.
+///
+/// `max_wip` is the fleet-wide concurrency ceiling. The optional [`repos`] map
+/// partitions that ceiling per repo (per-repo enable + cap dials) so a single
+/// busy repo cannot monopolize the whole fleet.
+///
+/// [`repos`]: DrainConfig::repos
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct DrainConfig {
@@ -234,14 +240,54 @@ pub struct DrainConfig {
     pub interval_secs: u64,
     /// Restrict dispatch to a single repo scope (by name). Unset drains every
     /// registered repo's ready backlog; system-scope tickets, which resolve to
-    /// no registered repo, are never dispatched. The cross-repo WIP-partition
-    /// variant is a follow-up.
+    /// no registered repo, are never dispatched. Ignored when [`repos`] is set —
+    /// the per-repo partition map takes precedence.
+    ///
+    /// [`repos`]: DrainConfig::repos
     pub repo: Option<String>,
+    /// Cross-repo WIP partition: per-repo enable/cap dials keyed by repo name.
+    /// When non-empty this becomes an **allowlist** — only listed, enabled repos
+    /// are drained (`repo` above is ignored) — and each entry's `max_wip`
+    /// subdivides the fleet-wide [`max_wip`] ceiling, so one busy repo cannot
+    /// monopolize the whole fleet. Empty (the default) keeps the fleet-wide
+    /// behaviour: every registered repo (or the single `repo` pin) competes for
+    /// one shared budget. See [`RepoDrainConfig`].
+    ///
+    /// [`max_wip`]: DrainConfig::max_wip
+    #[serde(default)]
+    pub repos: std::collections::HashMap<String, RepoDrainConfig>,
     /// Priority aging: seconds of waiting that buy one level of effective
     /// priority boost, so a low-priority ticket cannot starve behind a steady
     /// stream of higher-priority work. Zero disables aging (strict priority,
     /// oldest ticket first).
     pub aging_secs: u64,
+}
+
+/// Per-repo dial in the cross-repo WIP partition ([`DrainConfig::repos`]). A
+/// `[drain.repos.<name>]` table caps how much of the fleet-wide budget a single
+/// repo may hold and can gate a repo off without unregistering it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RepoDrainConfig {
+    /// Per-repo master switch. A bare `[drain.repos.foo]` (or one that only sets
+    /// a cap) stays enabled; set `false` to keep the repo in the allowlist shape
+    /// while pausing its dispatch.
+    pub enabled: bool,
+    /// Max rats this repo may hold live at once. `0` (the default) means no
+    /// per-repo cap — the repo is bounded only by the fleet-wide
+    /// [`DrainConfig::max_wip`] ceiling. A positive cap partitions WIP: e.g.
+    /// `max_wip=4` fleet-wide with two repos capped at `2` each guarantees
+    /// neither starves the other however deep its backlog.
+    pub max_wip: usize,
+}
+
+impl Default for RepoDrainConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_wip: 0,
+        }
+    }
 }
 
 impl Default for DrainConfig {
@@ -251,6 +297,7 @@ impl Default for DrainConfig {
             max_wip: 0,
             interval_secs: 30,
             repo: None,
+            repos: std::collections::HashMap::new(),
             // An hour of waiting buys one priority level — a low ticket outranks
             // a fresh normal one after ~2h, a fresh high after ~3h.
             aging_secs: 3600,

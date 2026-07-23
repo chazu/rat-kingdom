@@ -221,9 +221,21 @@ max_wip = 0                      # target concurrency W: keep up to this many ra
 interval_secs = 30               # fallback refill cadence; a freed slot also wakes
                                  # a refill via the tuple feed
 # repo = "myrepo"                # restrict to one repo scope (unset = every
-                                 # registered repo; system-scope tickets never run)
+                                 # registered repo; system-scope tickets never run;
+                                 # ignored when [drain.repos] below is set)
 aging_secs = 3600               # seconds of waiting that buy one priority level,
                                  # so low-priority tickets can't starve (0 = strict)
+
+# Cross-repo WIP partitioning: subdivide the fleet-wide max_wip per repo so one
+# busy repo cannot monopolize the fleet. When any [drain.repos.*] table exists it
+# becomes an ALLOWLIST — only listed, enabled repos drain (repo pin above is
+# ignored) — and each cap subdivides max_wip. Below, max_wip=4 fleet-wide with
+# two repos capped at 2 each means neither starves however deep its backlog.
+# [drain.repos.frontend]
+# enabled = true                 # per-repo switch (default true; false pauses it)
+# max_wip = 2                    # per-repo cap (0 = unlimited within max_wip)
+# [drain.repos.backend]
+# max_wip = 2
 
 [sync]                           # multiplayer (git-notes replication)
 enabled = false
