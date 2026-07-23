@@ -255,6 +255,35 @@ Env: `RK_HOME` (state dir), `RK_LOG` (tracing filter), `RK_CONFIG_*`
 (`RK_AGENT`, `RK_TASK`, ...) are reserved for agent identity — set at spawn,
 never read as config.
 
+### `[drain]` — continuous-drain autoscaler
+
+Turning on `[drain]` hands the dispatch loop to the daemon: it keeps up to
+`max_wip` rats live, spawning the highest-priority ready ticket whenever a slot
+frees. Keys:
+
+- `enabled` — opt in (default `false`). While off, the daemon never
+  auto-spawns; you dispatch by hand.
+- `max_wip` — target concurrency (the WIP limit). **`0` is inert even when
+  `enabled = true`** — the loop needs a non-zero cap to spawn anything.
+- `interval_secs` — fallback refill cadence; a freed slot also wakes a refill
+  immediately via the tuple feed, so this is just a backstop.
+- `repo` — restrict draining to one repo scope. Unset drains every registered
+  repo; system-scope tickets never drain. Ignored when `[drain.repos]` is set.
+- `repos` — per-repo partition map (`[drain.repos.<name>]` with `enabled` and
+  `max_wip`). When any entry exists it becomes an **allowlist** (the single
+  `repo` pin is ignored) and each cap subdivides the fleet-wide `max_wip`, so
+  one busy repo cannot monopolize the fleet.
+- `aging_secs` — seconds of waiting that buy one priority level, so
+  low-priority tickets can't starve behind a deep high-priority backlog
+  (`0` = strict priority).
+
+**Pair continuous-drain with guardrails for unattended running.** Because the
+loop spawns rats with no operator in the seat, set `[budget].fleet_max_usd` (a
+fleet-wide wallet kill-switch that refuses new spawns once total spend hits the
+cap) and `[supervisor].burn_usd_per_min` (flags a runaway rat by sustained
+spend) so a stuck or looping fleet stops itself rather than draining the wallet
+overnight.
+
 ## Workflows
 
 CUE-defined, validated by unification against the schema in
