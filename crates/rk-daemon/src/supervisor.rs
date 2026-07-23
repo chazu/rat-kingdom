@@ -701,28 +701,43 @@ impl Supervisor {
         }
     }
 
-    /// Sum of every *undismissed* agent's cost, fleet-wide, for one `repo`, and
-    /// (when given) for one workflow `instance`. A `Dismissed` agent's record
-    /// lingers in the registry (for respawn, `rk log`, history) but its spend
-    /// drops off the tally the moment it is dismissed — spend counts until the
-    /// agent is merged/cleaned up. That keeps the fleet/repo cap a standing
-    /// guardrail on the *current* (not-yet-torn-down) fleet, rather than a
-    /// cumulative lifetime ceiling that would refuse all spawns once lifetime
-    /// spend crossed the cap (the bug that blocked continuous-drain, TKT-39).
+    /// Cost rollups behind the dispatch preflight, for one `repo` and (when
+    /// given) one workflow `instance`.
+    ///
+    /// The **fleet/repo** tallies count only *live* (`Spawning`/`Running`)
+    /// agents (`AgentState::is_live`): a record that has left the live fleet —
+    /// `Completed`, `Failed`, `Dismissed`, or `Orphaned` — lingers in the
+    /// registry (for respawn, `rk log`, history) but its spend drops off. That
+    /// keeps `fleet_max_usd`/`repo_max_usd` standing guardrails on the *current
+    /// live/concurrent* fleet, not cumulative lifetime ceilings that would
+    /// refuse all spawns once lifetime spend crossed the cap. TKT-39 dropped
+    /// only `Dismissed`, but steward-landed rats linger as `Completed` (the
+    /// steward lands via a separate reviewer branch and never dismisses the
+    /// original ticket-rat), so their spend still accumulated and could
+    /// silently block continuous-drain and every other spawn (TKT-40).
+    ///
+    /// The **instance** tally is a different knob (TKT-32): a workflow's
+    /// `budget:` caps the *cumulative* spend of one finite run, so a completed
+    /// sequential step must still count against that run's total. It therefore
+    /// counts every non-dismissed agent under the instance — an instance ends
+    /// with the run, so lingering `Completed` spend can never block an
+    /// unrelated future spawn the way it does for the fleet/repo caps.
     fn cost_rollup(&self, repo: &str, instance: Option<&str>) -> (f64, f64, f64) {
         let reg = self.lock_registry();
         let mut fleet = 0.0;
         let mut repo_total = 0.0;
         let mut instance_total = 0.0;
         for a in reg.list() {
-            if a.state == AgentState::Dismissed {
-                continue;
+            if a.state.is_live() {
+                fleet += a.cost_usd;
+                if a.repo_name == repo {
+                    repo_total += a.cost_usd;
+                }
             }
-            fleet += a.cost_usd;
-            if a.repo_name == repo {
-                repo_total += a.cost_usd;
-            }
-            if instance.is_some() && a.workflow_instance.as_deref() == instance {
+            if instance.is_some()
+                && a.workflow_instance.as_deref() == instance
+                && a.state != AgentState::Dismissed
+            {
                 instance_total += a.cost_usd;
             }
         }
@@ -846,7 +861,11 @@ impl Supervisor {
 
     /// Fleet + per-repo cost rollup against the configured caps, for
     /// `rk cost --fleet`. Read-only; mirrors the denominator `check_dispatch`
-    /// enforces on — so dismissed agents are excluded, matching `cost_rollup`.
+    /// enforces on, matching `cost_rollup`: the fleet/repo totals count only
+    /// live (`Spawning`/`Running`) agents — completed/failed/dismissed/orphaned
+    /// records drop off — while per-instance spend stays cumulative (every
+    /// non-dismissed agent under the instance), since a workflow's `budget:` is
+    /// a lifetime cap on one finite run (TKT-40).
     pub fn fleet_rollup(&self) -> serde_json::Value {
         use std::collections::BTreeMap;
         let mut fleet_spent = 0.0;
@@ -855,13 +874,17 @@ impl Supervisor {
         {
             let reg = self.lock_registry();
             for a in reg.list() {
-                if a.state == AgentState::Dismissed {
-                    continue;
+                if a.state.is_live() {
+                    fleet_spent += a.cost_usd;
+                    *per_repo.entry(a.repo_name.clone()).or_default() += a.cost_usd;
                 }
-                fleet_spent += a.cost_usd;
-                *per_repo.entry(a.repo_name.clone()).or_default() += a.cost_usd;
-                if let Some(inst) = &a.workflow_instance {
-                    *per_instance.entry(inst.clone()).or_default() += a.cost_usd;
+                // Per-instance spend is cumulative over the run (TKT-32): count
+                // every non-dismissed agent, including completed sequential
+                // steps, so it mirrors the instance-cap denominator.
+                if a.state != AgentState::Dismissed {
+                    if let Some(inst) = &a.workflow_instance {
+                        *per_instance.entry(inst.clone()).or_default() += a.cost_usd;
+                    }
                 }
             }
         }

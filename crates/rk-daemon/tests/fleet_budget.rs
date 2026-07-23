@@ -1,6 +1,10 @@
-//! TKT-16: hierarchical fleet/repo budget caps. Once the fleet-wide cost sum
-//! reaches its cap, new spawns are refused (the wallet kill-switch) — even
-//! though each individual agent stayed under its own per-agent budget.
+//! TKT-16/39/40: hierarchical fleet/repo budget caps. Once the *live* fleet's
+//! cost sum reaches its cap, new spawns are refused (the wallet kill-switch) —
+//! even though each individual agent stayed under its own per-agent budget. The
+//! tally counts ONLY live (`Spawning`/`Running`) agents: a record that has left
+//! the live fleet — completed, failed, dismissed, or orphaned — drops off, so
+//! the cap is a standing guardrail on current/concurrent spend rather than a
+//! cumulative lifetime ceiling (TKT-40).
 
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
@@ -35,27 +39,43 @@ async fn connect(layout: &Layout) -> Client {
     panic!("daemon did not come up");
 }
 
-/// Completes immediately, self-reporting a $0.50 authoritative cost — one such
-/// rat alone puts the fleet over a $0.30 cap.
+/// A single process-global fake shared by every test in this file (setting the
+/// process env var to DIFFERENT scripts across parallel tests would race —
+/// mirrors COMBINED_FAKE in supervisor_sweep.rs). It branches on the task,
+/// which the fake harness exports as `$RK_FAKE_PROMPT`:
+///
+/// - `*oneshot*`: self-report a $0.50 authoritative cost via a `result`
+///   message and EXIT — the agent flips to `Completed`, so under the live-only
+///   rule its spend must drop off the tally.
+/// - anything else: emit ONE high-token Usage event (haiku: 200k in + 40k out
+///   ≈ $0.40, over the $0.30 cap) to record cost, then `sleep 120` to stay
+///   `Running` (a usage event keeps state=Running; only a result would flip it
+///   to Completed). One such live rat alone puts the fleet over the cap.
 const SPENDER_FAKE: &str = r#"
 read -r _prompt
 echo '{"type":"system","subtype":"init","session_id":"spender-1"}'
-echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"spender-1","total_cost_usd":0.5,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+case "$RK_FAKE_PROMPT" in
+  *oneshot*)
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"spender-1","total_cost_usd":0.5,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+    ;;
+  *)
+    echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"spending"}],"usage":{"input_tokens":200000,"output_tokens":40000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}'
+    sleep 120
+    ;;
+esac
 "#;
 
-#[tokio::test]
-async fn fleet_cap_refuses_dispatch_once_hit() {
-    let home = tempfile::tempdir().unwrap();
-    let repo_dir = tempfile::tempdir().unwrap();
-    git(repo_dir.path(), &["init", "-b", "main"]);
-    git(repo_dir.path(), &["config", "user.email", "r@x"]);
-    git(repo_dir.path(), &["config", "user.name", "R"]);
-    std::fs::write(repo_dir.path().join("f"), "x\n").unwrap();
-    git(repo_dir.path(), &["add", "."]);
-    git(repo_dir.path(), &["commit", "-m", "init"]);
+fn init_repo(dir: &Path) {
+    git(dir, &["init", "-b", "main"]);
+    git(dir, &["config", "user.email", "r@x"]);
+    git(dir, &["config", "user.name", "R"]);
+    std::fs::write(dir.join("f"), "x\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-m", "init"]);
+}
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", SPENDER_FAKE);
-    let layout = Layout::at(home.path());
+async fn spawn_daemon(home: &Path) -> (Layout, Client) {
+    let layout = Layout::at(home);
     let space = Space::open_in_memory().unwrap();
     let daemon = Daemon::with_fleet_budget_for_tests(
         layout.clone(),
@@ -75,12 +95,38 @@ async fn fleet_cap_refuses_dispatch_once_hit() {
         space,
     )
     .unwrap();
-    let _handle = tokio::spawn(daemon.run());
-    let mut client = connect(&layout).await;
+    tokio::spawn(daemon.run());
+    let client = connect(&layout).await;
+    (layout, client)
+}
+
+/// Wait until agent `name`'s recorded cost crosses the $0.30 cap.
+async fn wait_for_spend(client: &mut Client, name: &str) {
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = client
+            .call("agent.status", json!({"name": name}))
+            .await
+            .unwrap();
+        if status["agent"]["cost_usd"].as_f64().unwrap_or(0.0) >= 0.30 {
+            return;
+        }
+    }
+    panic!("agent {name} did not record its spend");
+}
+
+#[tokio::test]
+async fn fleet_cap_refuses_dispatch_once_hit() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", SPENDER_FAKE);
+    let (_layout, mut client) = spawn_daemon(home.path()).await;
     let repo = repo_dir.path().to_string_lossy().to_string();
 
-    // First spawn is allowed and burns $0.50 (self-reported), putting the fleet
-    // over the $0.30 cap.
+    // First spawn is allowed and burns ≈$0.40 (usage-based), STAYS Running, and
+    // puts the live fleet over the $0.30 cap.
     let spawned = client
         .call(
             "agent.spawn",
@@ -89,23 +135,10 @@ async fn fleet_cap_refuses_dispatch_once_hit() {
         .await
         .unwrap();
     let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+    wait_for_spend(&mut client, &name).await;
 
-    // Wait for it to complete and its cost to land in the registry.
-    let mut done = false;
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let status = client
-            .call("agent.status", json!({"name": name}))
-            .await
-            .unwrap();
-        if status["agent"]["cost_usd"].as_f64().unwrap_or(0.0) >= 0.30 {
-            done = true;
-            break;
-        }
-    }
-    assert!(done, "first agent did not record its spend");
-
-    // Second spawn must be REFUSED — the fleet cap is hit.
+    // The first spender is still LIVE and over the cap, so the second spawn must
+    // be REFUSED.
     let refused = client
         .call(
             "agent.spawn",
@@ -138,7 +171,7 @@ async fn fleet_cap_refuses_dispatch_once_hit() {
         "fleet-exceeded obstacle posted: {kinds:?}"
     );
 
-    // `rk cost --fleet` rollup reflects the spend and the exceeded status.
+    // `rk cost --fleet` rollup reflects the live spend and the exceeded status.
     let rollup = client.call("budget.rollup", json!({})).await.unwrap();
     assert!(rollup["fleet"]["spent_usd"].as_f64().unwrap() >= 0.30);
     assert_eq!(rollup["fleet"]["cap_usd"].as_f64().unwrap(), 0.30);
@@ -147,49 +180,22 @@ async fn fleet_cap_refuses_dispatch_once_hit() {
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
-/// TKT-39: a dismissed agent's spend must drop off the fleet tally. Spend
-/// counts until the agent is dismissed, so the fleet/repo cap is a standing
-/// guardrail on the current (not-yet-torn-down) fleet — not a cumulative
-/// lifetime ceiling that would refuse ALL spawns once lifetime spend crossed
-/// the cap. This proves both directions in one run: an undismissed spender
-/// still counts (2nd spawn refused), and once it is dismissed its spend drops
-/// off (3rd spawn allowed again).
+/// TKT-39: dismissing a LIVE over-budget agent drops its spend off the fleet
+/// tally. Proves both directions in one run: an over-budget agent that is still
+/// LIVE counts (2nd spawn refused), and once it is dismissed — leaving the live
+/// fleet — its spend drops off (3rd spawn allowed again).
 #[tokio::test]
 async fn dismissed_agent_drops_off_fleet_tally() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
-    git(repo_dir.path(), &["init", "-b", "main"]);
-    git(repo_dir.path(), &["config", "user.email", "r@x"]);
-    git(repo_dir.path(), &["config", "user.name", "R"]);
-    std::fs::write(repo_dir.path().join("f"), "x\n").unwrap();
-    git(repo_dir.path(), &["add", "."]);
-    git(repo_dir.path(), &["commit", "-m", "init"]);
+    init_repo(repo_dir.path());
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", SPENDER_FAKE);
-    let layout = Layout::at(home.path());
-    let space = Space::open_in_memory().unwrap();
-    let daemon = Daemon::with_fleet_budget_for_tests(
-        layout.clone(),
-        "test-castle".into(),
-        "fake".into(),
-        Budget {
-            max_usd: 100.0,
-            max_tokens: 0,
-            warn_at: 0.8,
-        },
-        FleetBudget {
-            fleet_max_usd: 0.30,
-            repo_max_usd: 0.0,
-            warn_at: 0.8,
-        },
-        space,
-    )
-    .unwrap();
-    let _handle = tokio::spawn(daemon.run());
-    let mut client = connect(&layout).await;
+    let (_layout, mut client) = spawn_daemon(home.path()).await;
     let repo = repo_dir.path().to_string_lossy().to_string();
 
-    // First spawn burns $0.50, putting the live fleet over the $0.30 cap.
+    // First spawn burns ≈$0.40 and STAYS Running, putting the live fleet over
+    // the $0.30 cap.
     let spawned = client
         .call(
             "agent.spawn",
@@ -198,23 +204,9 @@ async fn dismissed_agent_drops_off_fleet_tally() {
         .await
         .unwrap();
     let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+    wait_for_spend(&mut client, &name).await;
 
-    // Wait for its cost to land in the registry.
-    let mut done = false;
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let status = client
-            .call("agent.status", json!({"name": name}))
-            .await
-            .unwrap();
-        if status["agent"]["cost_usd"].as_f64().unwrap_or(0.0) >= 0.30 {
-            done = true;
-            break;
-        }
-    }
-    assert!(done, "first agent did not record its spend");
-
-    // While it is still undismissed its spend counts: a second spawn is refused.
+    // While it is still live its spend counts: a second spawn is refused.
     let refused = client
         .call(
             "agent.spawn",
@@ -223,7 +215,7 @@ async fn dismissed_agent_drops_off_fleet_tally() {
         .await;
     assert!(
         refused.is_err(),
-        "undismissed agent's spend must count — 2nd spawn should be refused, got {refused:?}"
+        "live agent's spend must count — 2nd spawn should be refused, got {refused:?}"
     );
 
     // Dismiss it: the record lingers (state → dismissed) but leaves the live
@@ -254,6 +246,76 @@ async fn dismissed_agent_drops_off_fleet_tally() {
     assert!(
         allowed.is_ok(),
         "after dismissal the cap is clear — 3rd spawn should be allowed, got {allowed:?}"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+/// TKT-40: a COMPLETED agent's spend must also drop off the fleet tally. The
+/// steward lands a rat via a separate reviewer branch and never dismisses the
+/// original ticket-rat, so it lingers as `Completed` — under the old rule (skip
+/// only `Dismissed`) its spend kept accumulating and could silently block every
+/// spawn. Now that only live agents count, a spender that records cost then
+/// EXITS (Completed) drops off, so a subsequent spawn is ALLOWED even though
+/// lifetime spend exceeded the cap.
+#[tokio::test]
+async fn completed_agent_drops_off_fleet_tally() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", SPENDER_FAKE);
+    let (_layout, mut client) = spawn_daemon(home.path()).await;
+    let repo = repo_dir.path().to_string_lossy().to_string();
+
+    // The `*oneshot*` branch self-reports $0.50 and EXITS → the agent flips to
+    // Completed while its cost ($0.50) exceeds the $0.30 cap.
+    let spawned = client
+        .call(
+            "agent.spawn",
+            json!({"repo": repo, "task": "spend-oneshot", "harness": "fake", "model": "haiku"}),
+        )
+        .await
+        .unwrap();
+    let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+
+    // Wait for it to finish: cost landed AND state is `completed` (not live).
+    let mut completed = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = client
+            .call("agent.status", json!({"name": name}))
+            .await
+            .unwrap();
+        if status["agent"]["cost_usd"].as_f64().unwrap_or(0.0) >= 0.30
+            && status["agent"]["state"].as_str() == Some("completed")
+        {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "oneshot spender did not complete with its spend");
+
+    // Even though the completed record's lifetime spend ($0.50) exceeds the cap,
+    // it has left the live fleet — the rollup reads $0 and is back to ok.
+    let rollup = client.call("budget.rollup", json!({})).await.unwrap();
+    assert_eq!(
+        rollup["fleet"]["spent_usd"].as_f64().unwrap(),
+        0.0,
+        "completed agent must drop off the fleet tally: {rollup}"
+    );
+    assert_eq!(rollup["fleet"]["status"].as_str().unwrap(), "ok");
+
+    // And a fresh spawn is allowed — Completed spend no longer blocks dispatch.
+    let allowed = client
+        .call(
+            "agent.spawn",
+            json!({"repo": repo, "task": "spend-again", "harness": "fake", "model": "haiku"}),
+        )
+        .await;
+    assert!(
+        allowed.is_ok(),
+        "a completed agent's spend must not block a later spawn, got {allowed:?}"
     );
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
