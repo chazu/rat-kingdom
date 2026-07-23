@@ -49,7 +49,11 @@ workflow: #Workflow
 }
 
 #Param: {
-	type:     "string" | "int" | "bool"
+	// Declared value type. CLI --param strings and templated trigger params are
+	// coerced to this at load time; --param-file / already-typed inputs must
+	// unify with it. "list" is any JSON array; "number" allows a fractional
+	// value where "int" does not.
+	type:     "string" | "int" | "number" | "bool" | "list"
 	required: bool | *true
 	default?: _
 }
