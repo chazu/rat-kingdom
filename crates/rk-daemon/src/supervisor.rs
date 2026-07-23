@@ -11,7 +11,7 @@ use rk_core::tuple::{Category, Tuple};
 use rk_git::{agent_branch, Repo};
 use rk_harness::{make_harness, HarnessEvent, LaunchSpec, SessionControl, TokenUsage};
 use rk_ledger::pricing::PricingTable;
-use rk_ledger::{Budget, BudgetAction};
+use rk_ledger::{Budget, BudgetAction, BudgetScope, DispatchCheck, FleetBudget};
 use rk_space::Space;
 use serde::Deserialize;
 use serde_json::json;
@@ -53,6 +53,32 @@ fn default_role() -> String {
     "rat".into()
 }
 
+/// Render one budget scope's rollup for `rk cost --fleet`: spend vs cap, the
+/// remaining headroom, and an "ok"/"warn"/"exceeded"/"unlimited" status. A
+/// `repo` label is attached for per-repo rows and omitted for the fleet total.
+fn scope_json(spent: f64, cap: f64, warn_at: f64, repo: Option<String>) -> serde_json::Value {
+    let warn_frac = if warn_at > 0.0 { warn_at } else { 0.8 };
+    let status = if cap <= 0.0 {
+        "unlimited"
+    } else if spent >= cap {
+        "exceeded"
+    } else if spent >= cap * warn_frac {
+        "warn"
+    } else {
+        "ok"
+    };
+    let mut obj = json!({
+        "spent_usd": spent,
+        "cap_usd": cap,
+        "remaining_usd": if cap > 0.0 { (cap - spent).max(0.0) } else { 0.0 },
+        "status": status,
+    });
+    if let Some(repo) = repo {
+        obj["repo"] = json!(repo);
+    }
+    obj
+}
+
 pub struct Supervisor {
     layout: Layout,
     castle: String,
@@ -65,8 +91,12 @@ pub struct Supervisor {
     tickets: Arc<crate::tickets::Tickets>,
     pricing: PricingTable,
     budget: Budget,
+    /// Hierarchical fleet/repo caps enforced as a pre-dispatch guard.
+    fleet_budget: FleetBudget,
     /// Agents already warned about budget (avoid repeat warnings).
     budget_warned: Mutex<std::collections::HashSet<String>>,
+    /// Fleet/repo scopes already warned at dispatch (avoid repeat obstacles).
+    fleet_warned: Mutex<std::collections::HashSet<String>>,
     /// Per-agent liveness-sweep bookkeeping (burn-rate deltas + flag episodes).
     sweep_state: Mutex<HashMap<String, SweepState>>,
     /// Bounded per-agent transcript (assistant text / tool calls / retries),
@@ -103,6 +133,7 @@ impl Supervisor {
         castle: String,
         default_harness: String,
         budget: Budget,
+        fleet_budget: FleetBudget,
         space: Space,
         tickets: Arc<crate::tickets::Tickets>,
     ) -> rk_core::Result<Self> {
@@ -127,7 +158,9 @@ impl Supervisor {
             tickets,
             pricing,
             budget,
+            fleet_budget,
             budget_warned: Mutex::new(std::collections::HashSet::new()),
+            fleet_warned: Mutex::new(std::collections::HashSet::new()),
             sweep_state: Mutex::new(HashMap::new()),
             log,
         })
@@ -153,6 +186,13 @@ impl Supervisor {
     pub fn spawn(self: &Arc<Self>, params: SpawnParams) -> rk_core::Result<AgentRecord> {
         let repo = Repo::discover(std::path::Path::new(&params.repo))?;
         let repo_name = repo.name();
+
+        // Hierarchical fleet/repo budget guard: the wallet kill-switch. Once the
+        // fleet-wide (or per-repo) cost sum reaches its cap we refuse the spawn
+        // here — before any worktree/branch/name is allocated — so a runaway
+        // autoscaler or nightly drain stops dispatching instead of draining the
+        // account. Single spawns and workflow fan-out both funnel through here.
+        self.check_dispatch_budget(&repo_name)?;
         let target_branch = match &params.base {
             Some(b) => b.clone(),
             None => repo.current_branch()?,
@@ -643,6 +683,115 @@ impl Supervisor {
         if let Err(e) = self.space.out(tuple) {
             warn!(error = %e, "failed to emit budget obstacle");
         }
+    }
+
+    /// Sum of every currently-registered agent's cost, fleet-wide and for one
+    /// `repo`. Registry-scoped: agents removed on dismissal drop off, so this is
+    /// *current* fleet spend — the same denominator `rk cost` reports.
+    fn cost_rollup(&self, repo: &str) -> (f64, f64) {
+        let reg = self.lock_registry();
+        let mut fleet = 0.0;
+        let mut repo_total = 0.0;
+        for a in reg.list() {
+            fleet += a.cost_usd;
+            if a.repo_name == repo {
+                repo_total += a.cost_usd;
+            }
+        }
+        (fleet, repo_total)
+    }
+
+    /// Preflight fleet/repo budget guard run before every spawn. Returns `Err`
+    /// (refusing dispatch) once a cap is hit; posts an obstacle on both the warn
+    /// band and the hard cap so it surfaces in `rk inbox`.
+    fn check_dispatch_budget(&self, repo: &str) -> rk_core::Result<()> {
+        let (fleet_spent, repo_spent) = self.cost_rollup(repo);
+        let check = self.fleet_budget.check_dispatch(fleet_spent, repo_spent);
+        match check.action {
+            BudgetAction::Ok => Ok(()),
+            BudgetAction::Warn => {
+                if let Some(scope) = check.scope {
+                    if self.mark_fleet_warned(scope, repo) {
+                        warn!(scope = scope.as_str(), spent = check.spent_usd, cap = check.cap_usd, "fleet budget warning threshold crossed");
+                        self.emit_dispatch_obstacle(repo, scope, "warning", &check);
+                    }
+                }
+                Ok(())
+            }
+            BudgetAction::Stop => {
+                let scope = check.scope.unwrap_or(BudgetScope::Fleet);
+                warn!(scope = scope.as_str(), spent = check.spent_usd, cap = check.cap_usd, "fleet budget cap hit — refusing dispatch");
+                self.emit_dispatch_obstacle(repo, scope, "exceeded", &check);
+                Err(rk_core::Error::other(format!(
+                    "{} budget cap hit: ${:.4} spent >= ${:.4} cap — dispatch refused",
+                    scope.as_str(),
+                    check.spent_usd,
+                    check.cap_usd
+                )))
+            }
+        }
+    }
+
+    /// Returns true the first time a given fleet/repo scope is warned, so a warn
+    /// obstacle is not re-posted on every subsequent dispatch in the band.
+    fn mark_fleet_warned(&self, scope: BudgetScope, repo: &str) -> bool {
+        let key = match scope {
+            BudgetScope::Fleet => "__fleet__".to_string(),
+            BudgetScope::Repo => format!("__repo__:{repo}"),
+        };
+        match self.fleet_warned.lock() {
+            Ok(mut set) => set.insert(key),
+            Err(p) => p.into_inner().insert(key),
+        }
+    }
+
+    fn emit_dispatch_obstacle(
+        &self,
+        repo: &str,
+        scope: BudgetScope,
+        kind: &str,
+        check: &DispatchCheck,
+    ) {
+        let tuple = Tuple::new(
+            Category::Obstacle,
+            repo.to_string(),
+            format!("budget-{}", scope.as_str()),
+            self.castle.clone(),
+            json!({
+                "type": format!("budget_{}_{kind}", scope.as_str()),
+                "scope": scope.as_str(),
+                "spent_usd": check.spent_usd,
+                "cap_usd": check.cap_usd,
+            }),
+        );
+        if let Err(e) = self.space.out(tuple) {
+            warn!(error = %e, "failed to emit dispatch budget obstacle");
+        }
+    }
+
+    /// Fleet + per-repo cost rollup against the configured caps, for
+    /// `rk cost --fleet`. Read-only; mirrors the denominator `check_dispatch`
+    /// enforces on.
+    pub fn fleet_rollup(&self) -> serde_json::Value {
+        use std::collections::BTreeMap;
+        let mut fleet_spent = 0.0;
+        let mut per_repo: BTreeMap<String, f64> = BTreeMap::new();
+        {
+            let reg = self.lock_registry();
+            for a in reg.list() {
+                fleet_spent += a.cost_usd;
+                *per_repo.entry(a.repo_name.clone()).or_default() += a.cost_usd;
+            }
+        }
+        let fb = &self.fleet_budget;
+        let repos: Vec<serde_json::Value> = per_repo
+            .into_iter()
+            .map(|(repo, spent)| scope_json(spent, fb.repo_max_usd, fb.warn_at, Some(repo)))
+            .collect();
+        json!({
+            "fleet": scope_json(fleet_spent, fb.fleet_max_usd, fb.warn_at, None),
+            "repos": repos,
+        })
     }
 
     /// One liveness/burn-rate sweep over the live, headless (event-pumped) rats.

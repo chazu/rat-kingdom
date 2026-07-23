@@ -53,11 +53,17 @@ impl Daemon {
             max_tokens: config.budget.max_tokens,
             warn_at: config.budget.warn_at,
         };
+        let fleet_budget = rk_ledger::FleetBudget {
+            fleet_max_usd: config.budget.fleet_max_usd,
+            repo_max_usd: config.budget.repo_max_usd,
+            warn_at: config.budget.warn_at,
+        };
         let mut daemon = Self::with_space(
             layout,
             config.castle_name(),
             config.harness.default.clone(),
             budget,
+            fleet_budget,
             space,
         )?;
         daemon.global_agents = config
@@ -109,6 +115,7 @@ impl Daemon {
             castle,
             "fake".into(),
             rk_ledger::Budget::default(),
+            rk_ledger::FleetBudget::default(),
             space,
         )
     }
@@ -121,7 +128,28 @@ impl Daemon {
         budget: rk_ledger::Budget,
         space: Space,
     ) -> rk_core::Result<Self> {
-        Self::with_space(layout, castle, default_harness, budget, space)
+        Self::with_space(
+            layout,
+            castle,
+            default_harness,
+            budget,
+            rk_ledger::FleetBudget::default(),
+            space,
+        )
+    }
+
+    /// Like [`with_space_for_tests`] but with an explicit fleet/repo cap, for
+    /// exercising the pre-dispatch wallet kill-switch.
+    #[doc(hidden)]
+    pub fn with_fleet_budget_for_tests(
+        layout: Layout,
+        castle: String,
+        default_harness: String,
+        budget: rk_ledger::Budget,
+        fleet_budget: rk_ledger::FleetBudget,
+        space: Space,
+    ) -> rk_core::Result<Self> {
+        Self::with_space(layout, castle, default_harness, budget, fleet_budget, space)
     }
 
     #[doc(hidden)]
@@ -134,6 +162,7 @@ impl Daemon {
         castle: String,
         default_harness: String,
         budget: rk_ledger::Budget,
+        fleet_budget: rk_ledger::FleetBudget,
         space: Space,
     ) -> rk_core::Result<Self> {
         layout.ensure()?;
@@ -145,6 +174,7 @@ impl Daemon {
             castle.clone(),
             default_harness.clone(),
             budget,
+            fleet_budget,
             space.clone(),
             tickets.clone(),
         )?);
@@ -499,6 +529,7 @@ impl Daemon {
                 sup.respawn(&name).map(|r| json!({"agent": r}))
             })),
             "agent.list" => reply(Response::ok(id, json!({"agents": self.supervisor.list()}))),
+            "budget.rollup" => reply(Response::ok(id, self.supervisor.fleet_rollup())),
             "inbox.list" => reply(self.handle_inbox(id)),
             "agent.status" => reply(self.handle_named(req, |sup, name| {
                 sup.status(&name)
