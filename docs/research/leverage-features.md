@@ -145,8 +145,9 @@ Grouped by leverage dimension. ★ = selected for the deep-dive top 10.
 21. **Rollback / revert-merge** — `rk revert <agent>` undoes a bad dismissal.
     *Leverage: cheap recovery lowers the cost of trusting auto-merge.*
 22. **Workflow instance restart recovery** — resume running instances across daemon
-    restart (Phase 5 REMAINING). *Leverage: long unattended runs survive a restart
-    instead of dying silently.*
+    restart (LANDED, TKT-52). *Leverage: long unattended runs survive a restart
+    instead of dying silently.* Persisted instances are rehydrated on startup and
+    `Running` ones re-execute from their step cursor (`WorkflowEngine::rehydrate`).
 
 ### Quality — raise the bar per merge
 

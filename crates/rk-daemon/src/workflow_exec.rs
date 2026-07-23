@@ -63,6 +63,16 @@ pub struct Instance {
     /// (single spawn or fan-out) is refused. `None`/0 = unlimited.
     #[serde(default)]
     pub instance_max_usd: Option<f64>,
+    /// The definition name/path `run` was invoked with, used to relocate and
+    /// reload the workflow when resuming after a restart (TKT-52). Persisted so
+    /// a rehydrated instance can re-`load` the exact same steps.
+    #[serde(default)]
+    pub definition: String,
+    /// The original `_input` params this instance launched with, replayed at
+    /// reload so a resumed workflow validates and interpolates identically to
+    /// its first run (TKT-52).
+    #[serde(default)]
+    pub params: HashMap<String, Value>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -209,48 +219,153 @@ impl WorkflowEngine {
             error: None,
             awaiting: None,
             instance_max_usd: workflow.budget.map(|b| b.max_usd),
+            definition: name.to_string(),
+            params,
             started_at: chrono::Utc::now(),
             completed_at: None,
         };
         self.store(instance.clone());
-
-        let engine = Arc::clone(self);
-        let snapshot = instance.clone();
-        tokio::spawn(async move {
-            let id = snapshot.id.clone();
-            let result = engine.execute(&id, workflow, &snapshot.repo).await;
-            let (status, error) = match result {
-                Ok(()) => (InstanceStatus::Completed, None),
-                Err(e) => (InstanceStatus::Failed, Some(e.to_string())),
-            };
-            engine.update(&id, |i| {
-                i.status = status;
-                i.error = error.clone();
-                i.completed_at = Some(chrono::Utc::now());
-            });
-            let final_status = if status == InstanceStatus::Completed {
-                "workflow_complete"
-            } else {
-                "workflow_failed"
-            };
-            info!(instance = %id, status = ?status, "workflow finished");
-            let _ = engine.space.out(rk_core::tuple::Tuple::new(
-                Category::Event,
-                repo_name_of(&snapshot.repo),
-                final_status,
-                "daemon".to_string(),
-                json!({"instance": id, "workflow": snapshot.workflow, "error": error}),
-            ));
-        });
+        self.spawn_execution(instance.id.clone(), workflow, repo.to_string());
         Ok(instance)
     }
 
-    /// Run the top-level step list once. `current_step` tracks top-level
-    /// progress only; steps nested inside `when`/`repeat` execute in place
-    /// without advancing it (they are bounded by the `repeat` cap).
+    /// Drive an instance's steps to completion on a background task, then record
+    /// the terminal status and emit the completion/failure event. Shared by a
+    /// fresh `run` and a post-restart `resume`, so both paths finalize
+    /// identically.
+    fn spawn_execution(self: &Arc<Self>, id: String, workflow: Workflow, repo: String) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = engine.execute(&id, workflow, &repo).await;
+            // The instance record carries the workflow name for the event; read
+            // it back rather than threading it through the moved `workflow`.
+            let workflow_name = engine.status(&id).map(|i| i.workflow).unwrap_or_default();
+            engine.finalize(&id, &repo, &workflow_name, result);
+        });
+    }
+
+    /// Record an instance's terminal status and broadcast its completion event.
+    fn finalize(&self, id: &str, repo: &str, workflow_name: &str, result: rk_core::Result<()>) {
+        let (status, error) = match result {
+            Ok(()) => (InstanceStatus::Completed, None),
+            Err(e) => (InstanceStatus::Failed, Some(e.to_string())),
+        };
+        self.update(id, |i| {
+            i.status = status;
+            i.error = error.clone();
+            i.completed_at = Some(chrono::Utc::now());
+        });
+        let final_status = if status == InstanceStatus::Completed {
+            "workflow_complete"
+        } else {
+            "workflow_failed"
+        };
+        info!(instance = %id, status = ?status, "workflow finished");
+        let _ = self.space.out(rk_core::tuple::Tuple::new(
+            Category::Event,
+            repo_name_of(repo),
+            final_status,
+            "daemon".to_string(),
+            json!({"instance": id, "workflow": workflow_name, "error": error}),
+        ));
+    }
+
+    /// Load persisted instances from disk on daemon startup (TKT-52).
+    ///
+    /// Every mutation already writes each instance to
+    /// `<home>/workflow-instances/<id>.json`; this is the missing read side.
+    /// Completed and failed instances are restored for history — so
+    /// `rk workflow status`/`list` and `rk approve` survive a restart — while
+    /// `Running` instances are additionally *resumed*: re-executed from their
+    /// persisted step cursor so a crash or restart mid-run no longer silently
+    /// drops an in-flight workflow (a parked approval gate, a fan-out waiting on
+    /// `wait_all`). Idempotent: instances already in memory are overwritten by
+    /// their on-disk snapshot, so calling it twice is harmless.
+    pub fn rehydrate(self: &Arc<Self>) {
+        let dir = self.layout.home().join("workflow-instances");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            // No instances persisted yet — a fresh home. Nothing to restore.
+            Err(_) => return,
+        };
+        let mut resumable = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let instance: Instance = match std::fs::read(&path)
+                .ok()
+                .and_then(|data| serde_json::from_slice(&data).ok())
+            {
+                Some(i) => i,
+                None => {
+                    warn!(path = %path.display(), "skipping unreadable workflow instance file");
+                    continue;
+                }
+            };
+            let running = instance.status == InstanceStatus::Running;
+            self.lock().insert(instance.id.clone(), instance.clone());
+            if running {
+                resumable.push(instance);
+            }
+        }
+        if !resumable.is_empty() {
+            info!(
+                count = resumable.len(),
+                "resuming in-flight workflow instances after restart"
+            );
+        }
+        for instance in resumable {
+            self.resume(instance);
+        }
+    }
+
+    /// Resume one rehydrated `Running` instance: reload its definition with the
+    /// original params and continue execution from the persisted step cursor. A
+    /// definition that no longer loads (deleted, or now invalid) fails the
+    /// instance cleanly — surfaced in `rk inbox` — rather than leaving it wedged
+    /// `Running` forever.
+    fn resume(self: &Arc<Self>, instance: Instance) {
+        let id = instance.id.clone();
+        let workflow = match self
+            .find_definition(&instance.definition, &instance.repo)
+            .and_then(|file| rk_workflow::load(&file, &instance.params))
+        {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(instance = %id, error = %e, "cannot resume workflow; failing instance");
+                self.update(&id, |i| {
+                    i.status = InstanceStatus::Failed;
+                    i.error = Some(format!("resume failed: could not reload definition: {e}"));
+                    i.awaiting = None;
+                    i.completed_at = Some(chrono::Utc::now());
+                });
+                return;
+            }
+        };
+        // A stale `awaiting` flag from before the restart is cleared here; the
+        // resumed gate re-sets it if it parks again.
+        self.update(&id, |i| i.awaiting = None);
+        info!(instance = %id, from_step = instance.current_step, "resuming workflow after restart");
+        self.spawn_execution(id, workflow, instance.repo);
+    }
+
+    /// Run the top-level step list once. `current_step` is the resume cursor:
+    /// the count of top-level steps that have fully COMPLETED, i.e. the index of
+    /// the next step to run. Steps already completed before a restart are
+    /// skipped; the step that was in flight when the daemon stopped re-runs
+    /// (at-least-once for the interrupted step). Steps nested inside
+    /// `when`/`repeat` execute in place without advancing the cursor (they are
+    /// bounded by the `repeat` cap), so a resume inside a loop re-enters the
+    /// whole enclosing top-level step.
     async fn execute(&self, id: &str, workflow: Workflow, repo: &str) -> rk_core::Result<()> {
+        let start = self.lock().get(id).map(|i| i.current_step).unwrap_or(0);
         for (index, step) in workflow.steps.iter().enumerate() {
-            self.update(id, |i| i.current_step = index);
+            if index < start {
+                // Already completed on a prior run; do not re-execute it.
+                continue;
+            }
             if let Flow::Break = self
                 .run_step(id, step, repo, &workflow.agents, &workflow.tiers)
                 .await?
@@ -258,6 +373,9 @@ impl WorkflowEngine {
                 // A top-level break ends the workflow (nothing to loop out of).
                 break;
             }
+            // Advance only AFTER the step completes, so a restart resumes at the
+            // interrupted step and never re-runs a finished one.
+            self.update(id, |i| i.current_step = index + 1);
         }
         Ok(())
     }
