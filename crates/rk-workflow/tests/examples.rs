@@ -62,6 +62,98 @@ fn shipped_example_triggers_load() {
 }
 
 #[test]
+fn nightly_self_improve_chains_groom_drain_refine() {
+    use rk_workflow::Step;
+    // All params default, so it loads with no inputs — exactly how the scheduler
+    // fires it (static params only, everything else defaulted).
+    let workflow =
+        rk_workflow::load(&examples_dir().join("nightly-self-improve.cue"), &HashMap::new())
+            .unwrap();
+
+    // Phase 1 GROOM: a single spawn whose merge is a noMerge dismiss (it mutates
+    // the ticket store), with NO abort gate — a groom hiccup must not stop the night.
+    let Step::Spawn(groom) = &workflow.steps[0] else {
+        panic!("phase 1 must open with a groom spawn");
+    };
+    assert_eq!(groom.task.title, "groom-backlog");
+    assert!(
+        matches!(&workflow.steps[2], Step::Dismiss(d) if d.no_merge),
+        "groom dismisses with noMerge (ticket-store mutation, nothing to merge)"
+    );
+
+    // Phase 2 DRAIN: a fan-out over ready tickets, joined and batch-merge gated
+    // on every rat finishing cleanly before dismiss_all.
+    let Some(Step::ForEach(fe)) = workflow.steps.iter().find(|s| matches!(s, Step::ForEach(_)))
+    else {
+        panic!("phase 2 must fan out over ready tickets");
+    };
+    assert_eq!(fe.query.status, "ready");
+    let drain_gate = workflow
+        .steps
+        .iter()
+        .any(|s| matches!(s, Step::Evaluate(e) if e.expect.get("all_ok").is_some()));
+    assert!(drain_gate, "the drain batch merge must be gated on all_ok");
+    assert!(
+        workflow.steps.iter().any(|s| matches!(s, Step::DismissAll(_))),
+        "the drain phase must dismiss_all the fan-out"
+    );
+
+    // Phase 3 REFINE: the LAST spawn proposes prompt/convention edits and merges.
+    let refine = workflow
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Spawn(sp) => Some(sp),
+            _ => None,
+        })
+        .next_back()
+        .expect("phase 3 refine spawn");
+    assert_eq!(refine.task.title, "refine-prompts");
+
+    // The chain is ordered groom-spawn ... for_each ... refine-spawn.
+    let groom_at = 0;
+    let foreach_at = workflow
+        .steps
+        .iter()
+        .position(|s| matches!(s, Step::ForEach(_)))
+        .unwrap();
+    let refine_at = workflow
+        .steps
+        .iter()
+        .rposition(|s| matches!(s, Step::Spawn(_)))
+        .unwrap();
+    assert!(
+        groom_at < foreach_at && foreach_at < refine_at,
+        "phases must run groom -> drain -> refine in order"
+    );
+}
+
+#[test]
+fn shipped_example_schedules_load() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("examples")
+        .join("schedules.cue");
+    let schedules = rk_workflow::load_schedules(&file)
+        .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
+    assert!(!schedules.is_empty(), "example schedules should not be empty");
+    // Every example schedule names a workflow that ships in examples/workflows.
+    let workflows: Vec<String> = rk_workflow::definitions(&examples_dir())
+        .iter()
+        .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+        .collect();
+    for s in &schedules {
+        assert!(
+            workflows.contains(&s.run),
+            "schedule '{}' runs unknown workflow '{}'",
+            s.name,
+            s.run
+        );
+    }
+}
+
+#[test]
 fn reviewer_drives_rework_loads_and_routes() {
     use rk_workflow::Step;
     let inputs = HashMap::from([

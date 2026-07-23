@@ -81,6 +81,35 @@ Overnight cost is otherwise bounded by the fleet/repo budget caps
 (`rk_ledger::FleetBudget`), which refuse new dispatch once a cap is hit — the
 same pre-dispatch guard every spawn passes through.
 
+## The nightly self-improvement chain
+
+The headline use of the scheduler is `nightly-self-improve`
+(`examples/workflows/nightly-self-improve.cue`): one workflow that runs the three
+self-improvement loops back to back — **groom** the backlog, **drain** it in
+parallel, then **refine** prompts/conventions from the night's pain. Welding all
+three into a single workflow (rather than three separate schedules) means the
+whole night is one instance behind **one** single-flight lock, so a slow drain
+can never let the next night's groom stack on top of it.
+
+```cue
+schedules: [{
+    name: "nightly-self-improve"   // the single-flight key for the whole chain
+    cron: "0 3 * * *"
+    run:  "nightly-self-improve"
+    repo: "rat-kingdom"
+    params: {limit: "5", timeout: "45m"}
+}]
+```
+
+Phase semantics are deliberate: the groom phase has no evaluate gate (a grooming
+hiccup must not abort the night), the drain phase gates its batch merge on every
+rat finishing cleanly (a broken batch parks rather than auto-merges, which also
+skips that night's refine — the failed instance then surfaces in `rk inbox`), and
+the refine phase only ever *proposes* edits. If you'd rather each phase be
+independently retryable, schedule `backlog-groom` / `backlog-drain` /
+`prompt-refine` as separate entries instead — `examples/schedules.cue` shows both
+shapes.
+
 ## Configuration
 
 ```toml

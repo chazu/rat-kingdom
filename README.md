@@ -356,6 +356,11 @@ schedules: [
   `[scheduler].catchup_minutes`).
 - **Single-flight.** Each schedule is guarded by its `name`: while its previous
   run is still `Running`, the next fire is skipped — a slow drain never stacks.
+- **The `nightly-self-improve` chain** is the headline schedule: one workflow
+  that grooms the backlog, drains it in parallel, then proposes prompt/convention
+  refinements — the three self-improvement loops welded into a single instance so
+  the whole night runs behind one single-flight lock. See `docs/scheduler.md` and
+  `examples/workflows/nightly-self-improve.cue`.
 
 ```toml
 [scheduler]
