@@ -270,6 +270,42 @@ branch needs a merge decision instead of only on their next inbox check.
   castle is unaffected. Set `notify_escalations = false` to keep escalations
   purely on the passive `rk inbox` queue.
 
+## Built-in reaction: resolution backlinks
+
+The third built-in turns solved walls into **institutional memory as a living,
+decaying structure** (stigmergy P8): the next rat hitting a wall someone already
+fixed is steered to the prior artifact instead of redoing the work.
+
+A rat records the fix with a backlink:
+
+```bash
+rk out artifact <scope> <name> --payload '{...}' --resolves <obstacle-or-need-id>
+```
+
+`--resolves` rides in the artifact payload as `resolves: <id>`. The reactor then
+reacts to the artifact per-tuple, in the same cursor delta loop as trigger firing
+(not a change-gated whole-store recompute):
+
+- **On a resolving `Artifact`** it looks up the exact `Obstacle`/`Need` named by
+  `payload.resolves`, **retires** that wall (a targeted delete — "solved"), and
+  lays a `Resolution` trail keyed on `(scope, normalised-topic)` pointing at the
+  artifact (`artifact_id`, `text`, `resolved`). The trail is written through
+  `reinforce`, so re-resolving a topic refreshes the single trail in place at
+  full strength rather than piling up duplicates.
+- **On a fresh `Obstacle`/`Need`** whose topic already has a `Resolution` trail,
+  it **reinforces** that trail (a rat hit this wall again, so it is still live)
+  and **steers** the reporting rat with a directed `Message`
+  (`type: resolution_steer`, `identity = the rat`) carrying the artifact backlink.
+  One steer per obstacle tuple: a durable guard keyed on the obstacle id
+  suppresses a crash-replay from re-messaging.
+
+The `Resolution` trail is a pheromone like `claim`/`obstacle`/`need` — it carries
+a decaying `strength` and is collected by GC once nobody re-needs it (TKT-14). A
+wall many rats keep hitting keeps its resolution hot; a one-off fix fades. Read
+the live map with `rk scan resolution <scope>` (or `--hot`). The whole reaction
+is naturally idempotent — the wall delete is a no-op once gone, the trail write
+is an upsert, and the steer is guarded — so at-least-once redelivery is safe.
+
 ## Configuration
 
 ```toml
@@ -290,15 +326,19 @@ notify_escalations = true # desktop-push a steward escalation via herdr; false =
 - Schema: `crates/rk-workflow/src/triggers-schema.cue`; loader
   `rk_workflow::load_triggers`.
 - Reactor: `crates/rk-daemon/src/reactor.rs` (`Reactor::run_cycle`, plus the
-  built-ins `Reactor::promote_conventions`, `Reactor::coalesce_obstacles`, and
-  `Reactor::notify_escalation`),
+  built-ins `Reactor::promote_conventions`, `Reactor::coalesce_obstacles`,
+  `Reactor::notify_escalation`, and the resolution backlinks
+  `Reactor::link_resolution` / `Reactor::steer_from_resolution`),
   spawned as a loop next to the GC and sync loops in
   `crates/rk-daemon/src/server.rs`.
-- Suggest/endorse sugar: `crates/rk-cli/src/space_cmds.rs` (`suggest`, `endorse`).
+- Suggest/endorse + `--resolves` sugar: `crates/rk-cli/src/space_cmds.rs`
+  (`suggest`, `endorse`, `out`).
 - Config: `rk_core::config::ReactorConfig`.
 - Tests: `crates/rk-daemon/tests/reactor.rs` (live-daemon fire, idempotency under
   feed loss + cursor reset, re-entrancy/exclusion, rate cap, quorum promotion,
-  and obstacle coalescence — quorum, per-scope/topic separation, idempotent
+  obstacle coalescence — quorum, per-scope/topic separation, idempotent
   re-filing; steward escalation notify — fires once, steward-only, disable
-  switch) plus unit tests in the reactor and workflow modules.
+  switch; and resolution backlinks — retire-and-lay-trail plus
+  steer-and-reinforce with replay idempotency) plus unit tests in the reactor and
+  workflow modules.
 - Example: `examples/triggers.cue`.

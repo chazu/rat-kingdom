@@ -59,7 +59,13 @@ rk done "one-line summary"     # completion — mandatory final step
 rk obstacle "what's blocking"  # blocked but continuing/winding down
 rk need "what would help"      # ask the room
 rk out artifact $RK_REPO name --payload '{"...": "..."}'   # work products
+rk out artifact $RK_REPO fix --resolves <obstacle-id>      # backlink a solved wall
 ```
+
+`--resolves <obstacle/need-id>` retires that wall and lays a decaying
+`topic -> artifact` trail, so the next rat hitting the same wall is steered to the
+prior fix (`rk scan resolution $RK_REPO`) instead of redoing it. See
+[docs/reactor.md](docs/reactor.md#built-in-reaction-resolution-backlinks).
 
 The daemon independently records `harness_result` events from the harness
 protocol, so even a rat that forgets `rk done` is tracked.
