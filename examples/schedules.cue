@@ -16,29 +16,43 @@
 // schedule is single-flight (keyed on its name): if its previous run is still
 // active, the next fire is skipped, so a slow drain never stacks on itself.
 schedules: [
-	// Every night at 03:00 UTC, drain the ready backlog in `rat-kingdom`.
+	// ── Recommended: the whole overnight self-improvement chain as ONE fire ──
+	// Every night at 03:00 UTC, groom the backlog, drain it in parallel, then
+	// propose prompt/convention refinements — a single instance behind a single
+	// single-flight lock, so a slow drain can never let the next night's groom
+	// stack on top of it. Overnight cost is bounded by the fleet/repo budget caps.
 	{
-		name: "nightly-drain"
+		name: "nightly-self-improve"
 		cron: "0 3 * * *"
-		run:  "backlog-drain"
+		run:  "nightly-self-improve"
 		repo: "rat-kingdom"
+		// Optional: cap the drain and its join window.
+		params: {limit: "5", timeout: "45m"}
 	},
 
-	// Every hour on the hour, groom the backlog (dedup/triage stale tickets).
-	{
-		name: "hourly-groom"
-		cron: "@hourly"
-		run:  "backlog-groom"
-		repo: "rat-kingdom"
-	},
-
-	// Weekdays at 09:00 UTC, refine agent prompts from the week's transcripts.
-	// Params are static strings passed to the workflow verbatim.
-	{
-		name: "weekday-prompt-refine"
-		cron: "0 9 * * 1-5"
-		run:  "prompt-refine"
-		repo: "rat-kingdom"
-		params: {window: "7d"}
-	},
+	// ── Or schedule the three phases separately ─────────────────────────────
+	// Use these INSTEAD of nightly-self-improve when you want each phase to be
+	// independently retryable (each gets its own single-flight lock and cadence),
+	// rather than one all-or-nothing nightly instance. Don't run both — you'd
+	// groom/drain/refine twice.
+	//
+	// {
+	//     name: "hourly-groom"
+	//     cron: "@hourly"
+	//     run:  "backlog-groom"
+	//     repo: "rat-kingdom"
+	// },
+	// {
+	//     name: "nightly-drain"
+	//     cron: "0 3 * * *"
+	//     run:  "backlog-drain"
+	//     repo: "rat-kingdom"
+	// },
+	// {
+	//     name: "weekday-prompt-refine"
+	//     cron: "0 9 * * 1-5"
+	//     run:  "prompt-refine"
+	//     repo: "rat-kingdom"
+	//     params: {window: "7d"}
+	// },
 ]
