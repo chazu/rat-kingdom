@@ -322,9 +322,15 @@ enabled = true
 interval_secs = 30       # fallback scan cadence (feed also wakes it)
 window_secs = 60         # rolling rate-cap window
 max_fires = 20           # default per-trigger cap; a #Trigger may lower it
-marker_ttl_secs = 604800 # idempotency marker lifetime
-exclude_instances = []   # authors never reacted to (besides "reactor")
+marker_ttl_secs = 604800  # idempotency marker lifetime
+exclude_instances = []    # authors never reacted to (besides "reactor")
+notify_escalations = true # desktop-push a steward escalation via herdr; false = inbox-only
 ```
+
+- **Active escalation push.** When the steward escalates a `STOP`/unknown
+  verdict as a `need` (identity `steward`), a built-in reaction fires a desktop
+  notification via herdr so the operator is pushed at, not only queued in
+  `rk inbox`. A no-op when no herdr server is running.
 
 See `docs/reactor.md` for the full design (why scan-is-truth, the three
 re-entrancy guards, first-boot backlog skipping).

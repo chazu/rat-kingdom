@@ -171,8 +171,9 @@ On **every rat completion** (`Event/harness_result`, emitted by
 4. `read`s the reviewer's `APPROVE`/`REWORK`/`STOP` verdict artifact and routes:
    - `APPROVE` → `land` the branch straight onto `main` (auto-merge);
    - `REWORK` → file a follow-up ticket, hold the branch;
-   - `STOP` / unknown → escalate via a `need` tuple (ranked into `rk inbox`),
-     hold the branch.
+   - `STOP` / unknown → escalate via a `need` tuple (ranked into `rk inbox`
+     *and* pushed to the operator's desktop by the [escalation-notify
+     built-in](#built-in-reaction-escalation-notification)), hold the branch.
 
 Both gates **fail closed**: a protected-path hit or a red suite fails the
 instance so the branch is never merged and the failure surfaces in `rk inbox`.
@@ -248,6 +249,27 @@ Coalescence never injects synthetic obstacles into the pile — the sub-quorum
 strength, which a strength-sorted scan ranks. This built-in only escalates a
 converged-on wall into durable, closable work.
 
+## Built-in reaction: escalation notification
+
+The third built-in turns a steward escalation into an **active** operator push.
+The steward already surfaces a `STOP`/unknown verdict as a `need` (identity
+`steward`) that `rk inbox` ranks — a *passive* queue the operator polls. This
+built-in adds a desktop notification (via `HerdrMux::notify`, herdr's
+`notification show`) the moment such a `need` lands, so a human is pinged when a
+branch needs a merge decision instead of only on their next inbox check.
+
+- The discriminator is `category = need` **and** `identity = "steward"`. A rat's
+  own `rk need` keys on its agent name, so an ordinary help request is left on
+  the inbox queue and never pops a notification.
+- It fires **at most once per need tuple**, guarded by the same durable
+  idempotency marker (`Event/reactor_fired`) the trigger path uses — an
+  at-least-once re-scan never double-pops. A reinforced escalation keeps its id
+  below the cursor and is never re-seen, so a repeat push only happens after the
+  old `need` evaporates and a fresh one is written (the intended de-spam).
+- It **degrades to a no-op** when no herdr server is reachable, so a headless
+  castle is unaffected. Set `notify_escalations = false` to keep escalations
+  purely on the passive `rk inbox` queue.
+
 ## Configuration
 
 ```toml
@@ -260,6 +282,7 @@ marker_ttl_secs = 604800  # idempotency-marker lifetime (one week)
 exclude_instances = []    # authors never reacted to, besides "reactor"
 quorum = 3                # distinct endorsers that promote a suggestion; 0 = off
 coalesce_quorum = 3       # distinct reporters that coalesce a wall into a ticket; 0 = off
+notify_escalations = true # desktop-push a steward escalation via herdr; false = inbox-only
 ```
 
 ## Where it lives
@@ -267,7 +290,8 @@ coalesce_quorum = 3       # distinct reporters that coalesce a wall into a ticke
 - Schema: `crates/rk-workflow/src/triggers-schema.cue`; loader
   `rk_workflow::load_triggers`.
 - Reactor: `crates/rk-daemon/src/reactor.rs` (`Reactor::run_cycle`, plus the
-  built-ins `Reactor::promote_conventions` and `Reactor::coalesce_obstacles`),
+  built-ins `Reactor::promote_conventions`, `Reactor::coalesce_obstacles`, and
+  `Reactor::notify_escalation`),
   spawned as a loop next to the GC and sync loops in
   `crates/rk-daemon/src/server.rs`.
 - Suggest/endorse sugar: `crates/rk-cli/src/space_cmds.rs` (`suggest`, `endorse`).
@@ -275,5 +299,6 @@ coalesce_quorum = 3       # distinct reporters that coalesce a wall into a ticke
 - Tests: `crates/rk-daemon/tests/reactor.rs` (live-daemon fire, idempotency under
   feed loss + cursor reset, re-entrancy/exclusion, rate cap, quorum promotion,
   and obstacle coalescence — quorum, per-scope/topic separation, idempotent
-  re-filing) plus unit tests in the reactor and workflow modules.
+  re-filing; steward escalation notify — fires once, steward-only, disable
+  switch) plus unit tests in the reactor and workflow modules.
 - Example: `examples/triggers.cue`.

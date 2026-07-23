@@ -44,6 +44,11 @@ use tracing::{info, warn};
 pub const REACTOR_INSTANCE: &str = "reactor";
 /// Identity of the durable idempotency marker tuples (system scope).
 const MARKER_IDENTITY: &str = "reactor_fired";
+/// Identity of a steward escalation `need` (steward.cue writes `rk out need
+/// <repo> steward`): the discriminator for the built-in desktop-push reaction.
+/// A rat's own `rk need` carries identity = its agent name, so this never
+/// collides with an ordinary help request.
+const STEWARD_ESCALATION_IDENTITY: &str = "steward";
 /// Identity of the durable "this topic was already coalesced into a ticket"
 /// marker (system scope). Bridges the window between filing and the ticket
 /// landing so a feed-woken re-scan cannot file the same topic twice.
@@ -163,6 +168,13 @@ impl Reactor {
             });
             if tuple.instance == REACTOR_INSTANCE {
                 continue;
+            }
+            // Built-in active push: a steward escalation gets a desktop
+            // notification on top of its `rk inbox` row. Runs before the
+            // configured triggers (it is orthogonal to them) and never aborts
+            // the cycle — a herdr hiccup must not stall dispatch.
+            if let Err(e) = self.notify_escalation(tuple) {
+                warn!(tuple = %tuple.id, error = %e, "reactor escalation notify failed");
             }
             for loaded in &triggers {
                 match self.try_fire(loaded, tuple, &registry) {
@@ -530,6 +542,71 @@ impl Reactor {
         self.mark_fired(&key, trigger, tuple, &instance.id)?;
         self.record_fire(&trigger.name);
         Ok(true)
+    }
+
+    /// Built-in reaction: push a desktop notification when the steward
+    /// escalates to the operator. TKT-19 surfaces STOP/unknown verdicts as a
+    /// `need` that `rk inbox` ranks — a passive queue. This adds the active
+    /// push the leverage doc calls for, so a human is pinged the moment a
+    /// branch needs a merge decision instead of only on the next inbox check.
+    ///
+    /// Fires at most once per need tuple, guarded by the same durable marker
+    /// the trigger path uses (so an at-least-once re-scan never double-pops).
+    /// A reinforced escalation keeps its id below the cursor, so it is never
+    /// re-seen — repeat pushes only happen after the old need evaporates and a
+    /// fresh one is written, which is the intended de-spam. Degrades to a
+    /// no-op with no herdr server, so a headless castle is unaffected. Returns
+    /// whether a notification was pushed.
+    fn notify_escalation(&self, tuple: &Tuple) -> rk_core::Result<bool> {
+        if !self.config.notify_escalations {
+            return Ok(false);
+        }
+        if tuple.category != Category::Need || tuple.identity != STEWARD_ESCALATION_IDENTITY {
+            return Ok(false);
+        }
+        let key = format!("notify-escalation@{}", tuple.id);
+        if self.already_fired(&key)? {
+            return Ok(false);
+        }
+        let task = tuple
+            .payload
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let body = tuple
+            .payload
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("a completed branch needs a human merge decision");
+        rk_mux::HerdrMux::notify(&format!("steward escalation — {task}"), body);
+        self.mark_notified(&key, tuple)?;
+        info!(tuple = %tuple.id, task, "reactor pushed steward escalation notification");
+        Ok(true)
+    }
+
+    /// Durable "already notified" marker for the built-in escalation push. It
+    /// has no trigger/workflow of its own, so it writes the marker directly,
+    /// sharing `MARKER_IDENTITY` + the `key` field so [`already_fired`] de-dups
+    /// it exactly as it does a fired trigger.
+    fn mark_notified(&self, key: &str, tuple: &Tuple) -> rk_core::Result<()> {
+        let mut marker = Tuple::new(
+            Category::Event,
+            SYSTEM_SCOPE,
+            MARKER_IDENTITY,
+            REACTOR_INSTANCE,
+            json!({
+                "key": key,
+                "kind": "notify-escalation",
+                "tuple": tuple.id.to_string(),
+            }),
+        );
+        marker.lifecycle = Lifecycle::Ephemeral;
+        if self.config.marker_ttl_secs > 0 {
+            marker.expires_at = Some(
+                chrono::Utc::now() + chrono::Duration::seconds(self.config.marker_ttl_secs as i64),
+            );
+        }
+        self.space.out(marker)
     }
 
     /// The ordered candidate trigger files this cycle: every global-dir
