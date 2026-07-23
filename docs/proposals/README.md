@@ -34,11 +34,12 @@ schema (same `cue export -e workflow` path `rk_workflow::load` uses).
    shipped docs is inert and misleads. Removed from the two proposals above; also
    applies to `cost-tiered-drain` and `backlog-groom`.
 
-## Also flagged (ticket only, no proposal — judgment call)
+## Design decision filed for the maintainer
 
-- **`backlog-drain` all-or-nothing merge**: the `evaluate {all_ok: true}` before
-  `dismiss_all` means a single failed rat parks *every* sibling branch unmerged.
-  `dismiss_all` already treats a per-branch conflict as a clean `merged: false`
-  (not an error), so it could run unconditionally and merge the good branches,
-  leaving only failures parked. This trades atomic-batch safety for throughput —
-  filed for a decision rather than forced into a proposal.
+- **`backlog-drain` all-or-nothing merge** (TKT-47): the `evaluate {all_ok: true}`
+  before `dismiss_all` means a single failed rat parks *every* sibling branch
+  unmerged. The design writeup — including the correction that `dismiss_all`
+  merges *every* fanned branch unconditionally, so a bare step-reorder is unsafe,
+  and a recommended opt-in `onlyClean` best-effort primitive — is now filed for a
+  decision rather than forced into a drop-in `.cue`.
+  → `docs/proposals/backlog-drain-best-effort.md`
