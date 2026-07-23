@@ -1480,6 +1480,53 @@ impl Supervisor {
         Ok(result)
     }
 
+    /// Open a pull/merge request for a NAMED branch against a target — the PR
+    /// counterpart to [`land`](Self::land). Where `land` routes on the repo's
+    /// merge mode (so it only opens a PR when the repo is registered PR-mode),
+    /// `open_pr` ALWAYS pushes the branch and opens a pull/merge request,
+    /// regardless of policy. This lets a workflow choose the review-by-PR
+    /// outcome explicitly (e.g. `pr-on-approve.cue`) even in a Direct-merge repo.
+    ///
+    /// The branch is never merged or deleted; it is pushed and left standing for
+    /// review. A push/auth failure is a clean `pr_opened: false` (never an
+    /// error), mirroring `land`'s `merged: false`, so a workflow can gate on the
+    /// result rather than fail. The remote comes from the repo's registered
+    /// policy (defaulting to `origin`); only the merge *mode* is ignored.
+    pub async fn open_pr(
+        &self,
+        repo_root: &std::path::Path,
+        branch: &str,
+        target: &str,
+    ) -> rk_core::Result<serde_json::Value> {
+        let repo = Repo::discover(repo_root)?;
+        let (_merge_mode, remote, _host) = self.merge_policy(&repo.name());
+        let outcome = repo.open_pull_request(branch, target, &remote);
+        let result = json!({
+            "branch": branch,
+            "target": target,
+            "merged": false,
+            "pr_opened": outcome.opened,
+            "pr_url": outcome.url,
+            "detail": outcome.detail,
+        });
+        // Surface an opened PR as its own event, exactly as `land`/`dismiss` do,
+        // so the inbox / steward can pick up the hand-off.
+        if outcome.opened {
+            self.emit_event(
+                &repo.name(),
+                "pull_request_opened",
+                json!({
+                    "branch": branch,
+                    "target": target,
+                    "url": result.get("pr_url"),
+                    "detail": result.get("detail"),
+                }),
+            );
+        }
+        info!(branch, target, pr_opened = outcome.opened, "open_pr");
+        Ok(result)
+    }
+
     pub fn list(&self) -> Vec<AgentRecord> {
         self.lock_registry().list().into_iter().cloned().collect()
     }

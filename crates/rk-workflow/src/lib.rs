@@ -150,6 +150,9 @@ pub enum Step {
     Run(RunStep),
     /// Merge a NAMED branch into a NAMED target directly — "land" the work.
     Land(LandStep),
+    /// Open a pull/merge request for a NAMED branch — the PR counterpart to
+    /// `land`, always opening a PR regardless of the repo's merge mode.
+    OpenPr(OpenPrStep),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -466,6 +469,20 @@ pub struct LandStep {
     pub keep_branch: bool,
 }
 
+/// Open a pull/merge request for a named branch against a named target — the
+/// PR counterpart to [`LandStep`]. Unlike `land`, which routes on the repo's
+/// registered merge mode, `open_pr` always pushes the branch and opens a PR
+/// regardless of repo policy, so a workflow can choose the review-by-PR outcome
+/// explicitly. The branch is left standing; the result is a clean
+/// `{pr_opened: false}` on a push failure, never an error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenPrStep {
+    /// Branch to open a PR for; interpolated. Often `{{ctx.activeBranch}}`.
+    pub branch: String,
+    /// Branch the PR targets; interpolated. E.g. `"main"`.
+    pub target: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Aspect {
     #[serde(rename = "match")]
@@ -764,6 +781,7 @@ fn step_matches(step: &Step, matcher: &AspectMatch) -> bool {
             Step::DismissAll(_) => "dismiss_all",
             Step::Run(_) => "run",
             Step::Land(_) => "land",
+            Step::OpenPr(_) => "open_pr",
         };
         if actual != step_type {
             return false;
