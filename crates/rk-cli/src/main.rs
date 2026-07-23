@@ -142,6 +142,14 @@ enum RepoCommand {
         /// Name to register it under (defaults to the directory name).
         #[arg(long)]
         name: Option<String>,
+        /// How agent branches reach their base: `direct` (git merge, the
+        /// default) or `pr` (open a pull/merge request for review). Omit to use
+        /// the daemon's `[policy] default_merge_mode`.
+        #[arg(long, value_parser = ["direct", "pr"])]
+        merge_mode: Option<String>,
+        /// Remote to push / open PRs against (defaults to origin).
+        #[arg(long)]
+        remote: Option<String>,
     },
     /// List registered repositories.
     List,
@@ -486,9 +494,12 @@ async fn main() -> Result<()> {
             }
         }
         Command::Repo { command } => match command {
-            RepoCommand::Add { path, name } => {
-                repo_cmds::add(&layout, path, name, cli.json).await?
-            }
+            RepoCommand::Add {
+                path,
+                name,
+                merge_mode,
+                remote,
+            } => repo_cmds::add(&layout, path, name, merge_mode, remote, cli.json).await?,
             RepoCommand::List => repo_cmds::list(&layout, cli.json).await?,
             RepoCommand::Show { name } => repo_cmds::show(&layout, name, cli.json).await?,
         },

@@ -5,7 +5,14 @@ use rk_core::paths::Layout;
 use rk_daemon::Client;
 use serde_json::json;
 
-pub async fn add(layout: &Layout, path: String, name: Option<String>, as_json: bool) -> Result<()> {
+pub async fn add(
+    layout: &Layout,
+    path: String,
+    name: Option<String>,
+    merge_mode: Option<String>,
+    remote: Option<String>,
+    as_json: bool,
+) -> Result<()> {
     let canonical = std::fs::canonicalize(&path)
         .map_err(|e| anyhow::anyhow!("cannot resolve path {path}: {e}"))?;
     let name = match name {
@@ -16,21 +23,24 @@ pub async fn add(layout: &Layout, path: String, name: Option<String>, as_json: b
             .map(str::to_string)
             .ok_or_else(|| anyhow::anyhow!("cannot infer a name from {}; pass --name", canonical.display()))?,
     };
+    let mut params = json!({ "name": name, "path": canonical.to_string_lossy() });
+    if let Some(mode) = merge_mode {
+        params["merge_mode"] = json!(mode);
+    }
+    if let Some(remote) = remote {
+        params["remote"] = json!(remote);
+    }
     let mut client = Client::connect_or_spawn(layout).await?;
-    let result = client
-        .call(
-            "repo.add",
-            json!({ "name": name, "path": canonical.to_string_lossy() }),
-        )
-        .await?;
+    let result = client.call("repo.add", params).await?;
     let repo = &result["repo"];
     if as_json {
         println!("{repo}");
     } else {
         println!(
-            "registered {} → {}",
+            "registered {} → {} ({} mode)",
             repo["name"].as_str().unwrap_or("?"),
-            repo["path"].as_str().unwrap_or("?")
+            repo["path"].as_str().unwrap_or("?"),
+            repo["merge_mode"].as_str().unwrap_or("direct")
         );
     }
     Ok(())
@@ -77,6 +87,11 @@ pub async fn show(layout: &Layout, name: String, as_json: bool) -> Result<()> {
     println!("{}", repo["name"].as_str().unwrap_or("?"));
     println!("  path       {}", repo["path"].as_str().unwrap_or("?"));
     println!("  registered {}", repo["created_at"].as_str().unwrap_or("?"));
+    println!("  merge      {}", repo["merge_mode"].as_str().unwrap_or("direct"));
+    println!("  remote     {}", repo["remote"].as_str().unwrap_or("origin"));
+    if let Some(host) = repo["host"].as_str() {
+        println!("  host       {host}");
+    }
     // Show its open tickets as a convenience.
     let tickets = client
         .call("ticket.list", json!({ "scope": name, "status": "open" }))

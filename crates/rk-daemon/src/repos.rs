@@ -6,6 +6,7 @@
 //! registry in [`crate::agents`].
 
 use chrono::{DateTime, Utc};
+use rk_core::config::MergeMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,60 @@ pub struct RepoRecord {
     pub name: String,
     pub path: PathBuf,
     pub created_at: DateTime<Utc>,
+    /// How this repo's agent branches reach their base — a direct git merge
+    /// (default) or an opened pull/merge request left for review. Old registry
+    /// files without the field load as `Direct`.
+    #[serde(default)]
+    pub merge_mode: MergeMode,
+    /// The git remote to push/open-PR against. `None` means the conventional
+    /// `origin`; see [`RepoRecord::remote_or_default`].
+    #[serde(default)]
+    pub remote: Option<String>,
+    /// The git host (e.g. `github.com`, `gitlab.com`) inferred from the remote's
+    /// URL at registration time. `None` if the repo had no such remote.
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+impl RepoRecord {
+    /// The remote to use for push / PR operations, defaulting to `origin` when
+    /// none was configured.
+    pub fn remote_or_default(&self) -> &str {
+        self.remote.as_deref().unwrap_or("origin")
+    }
+}
+
+/// Infer the git host (e.g. `github.com`) from a remote URL, handling the three
+/// forms git accepts: the scp-like `git@github.com:owner/repo.git`, an
+/// `ssh://git@host[:port]/owner/repo.git` URL, and an `https://host/owner/repo`
+/// URL. Returns `None` when no host can be read (empty or malformed input).
+pub fn infer_host(remote_url: &str) -> Option<String> {
+    let url = remote_url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    // scheme://[user@]host[:port]/path — matches ssh://, https://, git://, etc.
+    let authority = if let Some((_, rest)) = url.split_once("://") {
+        rest.split(['/', '?', '#']).next().unwrap_or(rest)
+    } else if let Some((prefix, _)) = url.split_once(':') {
+        // scp-like: [user@]host:path (no scheme, single colon before the path)
+        prefix
+    } else {
+        return None;
+    };
+    // Drop any userinfo and port, keeping just the host.
+    let host = authority
+        .rsplit('@')
+        .next()
+        .unwrap_or(authority)
+        .split(':')
+        .next()
+        .unwrap_or(authority);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
 }
 
 /// JSON-file-backed registry, persisted synchronously on every mutation so the
@@ -74,6 +129,9 @@ mod tests {
             name: name.into(),
             path: path.into(),
             created_at: Utc::now(),
+            merge_mode: MergeMode::default(),
+            remote: None,
+            host: None,
         }
     }
 
@@ -97,5 +155,36 @@ mod tests {
         reg.add(record("r", "/tmp/two")).unwrap();
         assert_eq!(reg.list().len(), 1);
         assert_eq!(reg.get("r").unwrap().path, PathBuf::from("/tmp/two"));
+    }
+
+    #[test]
+    fn defaults_are_backward_compatible() {
+        // A registry file written before merge_mode/remote/host existed loads
+        // with Direct mode and the conventional origin remote.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.json");
+        std::fs::write(
+            &path,
+            r#"{"old":{"name":"old","path":"/tmp/old","created_at":"2020-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let reg = RepoRegistry::load(&path).unwrap();
+        let old = reg.get("old").unwrap();
+        assert_eq!(old.merge_mode, MergeMode::Direct);
+        assert_eq!(old.remote, None);
+        assert_eq!(old.remote_or_default(), "origin");
+        assert_eq!(old.host, None);
+    }
+
+    #[test]
+    fn infer_host_reads_every_remote_form() {
+        assert_eq!(infer_host("git@github.com:owner/repo.git").as_deref(), Some("github.com"));
+        assert_eq!(infer_host("https://gitlab.com/owner/repo.git").as_deref(), Some("gitlab.com"));
+        assert_eq!(infer_host("ssh://git@gitlab.com:2222/owner/repo.git").as_deref(), Some("gitlab.com"));
+        assert_eq!(infer_host("https://user@bitbucket.org/o/r").as_deref(), Some("bitbucket.org"));
+        assert_eq!(infer_host("git://example.com/o/r.git").as_deref(), Some("example.com"));
+        assert_eq!(infer_host(""), None);
+        assert_eq!(infer_host("   "), None);
+        assert_eq!(infer_host("just-a-path"), None);
     }
 }

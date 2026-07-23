@@ -74,6 +74,9 @@ fn register_repo(layout: &Layout, name: &str, path: &Path) {
         name: name.into(),
         path: path.to_path_buf(),
         created_at: chrono::Utc::now(),
+        merge_mode: Default::default(),
+        remote: None,
+        host: None,
     })
     .unwrap();
 }

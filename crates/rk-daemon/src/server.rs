@@ -42,6 +42,9 @@ pub struct Daemon {
     /// When set, workflow `run` steps may only invoke repo-registered named
     /// checks; raw inline commands are refused (TKT-30, `[policy]`).
     require_named_checks: bool,
+    /// Fleet-wide default merge mode a repo is registered with when `rk repo
+    /// add` names no explicit `--merge-mode` (`[policy] default_merge_mode`).
+    default_merge_mode: rk_core::config::MergeMode,
     engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
     repos: std::sync::Mutex<crate::repos::RepoRegistry>,
     tickets: Arc<crate::tickets::Tickets>,
@@ -103,6 +106,7 @@ impl Daemon {
         daemon.drain_config = config.drain.clone();
         daemon.evaporation_decay = config.evaporation.decay;
         daemon.require_named_checks = config.policy.require_named_checks;
+        daemon.default_merge_mode = config.policy.default_merge_mode;
         if config.sync.enabled {
             let syncer = crate::sync::Syncer::new(
                 &daemon.layout,
@@ -216,6 +220,7 @@ impl Daemon {
             tier_routing: Default::default(),
             default_harness,
             require_named_checks: false,
+            default_merge_mode: rk_core::config::MergeMode::default(),
             engine: std::sync::OnceLock::new(),
             repos,
             tickets,
@@ -831,10 +836,16 @@ impl Daemon {
                 format!("path does not exist: {}", params.path),
             );
         }
+        let remote = params.remote;
+        let remote_name = remote.as_deref().unwrap_or("origin");
+        let host = repo_remote_url(&path, remote_name).and_then(|url| crate::repos::infer_host(&url));
         let record = crate::repos::RepoRecord {
             name: params.name,
             path,
             created_at: chrono::Utc::now(),
+            merge_mode: params.merge_mode.unwrap_or(self.default_merge_mode),
+            remote,
+            host,
         };
         let mut reg = match self.repos.lock() {
             Ok(r) => r,
@@ -1181,10 +1192,37 @@ struct BlockingParams {
     timeout_ms: Option<u64>,
 }
 
+/// Read a repo's configured URL for `remote` by shelling to git, so the host
+/// can be inferred at registration time. Returns `None` when the path is not a
+/// repo or has no such remote — host inference is best-effort, never fatal.
+fn repo_remote_url(path: &std::path::Path, remote: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(path)
+        .args(["remote", "get-url", remote])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url)
+    }
+}
+
 #[derive(Deserialize)]
 struct RepoAddParams {
     name: String,
     path: String,
+    /// Explicit merge mode; when absent the daemon's `[policy]` default applies.
+    #[serde(default)]
+    merge_mode: Option<rk_core::config::MergeMode>,
+    /// Explicit remote name; when absent, `origin` is used at operation time.
+    #[serde(default)]
+    remote: Option<String>,
 }
 
 #[derive(Deserialize)]
