@@ -701,16 +701,23 @@ impl Supervisor {
         }
     }
 
-    /// Sum of every currently-registered agent's cost, fleet-wide, for one
-    /// `repo`, and (when given) for one workflow `instance`. Registry-scoped:
-    /// agents removed on dismissal drop off, so this is *current* spend — the
-    /// same denominator `rk cost` reports.
+    /// Sum of every *undismissed* agent's cost, fleet-wide, for one `repo`, and
+    /// (when given) for one workflow `instance`. A `Dismissed` agent's record
+    /// lingers in the registry (for respawn, `rk log`, history) but its spend
+    /// drops off the tally the moment it is dismissed — spend counts until the
+    /// agent is merged/cleaned up. That keeps the fleet/repo cap a standing
+    /// guardrail on the *current* (not-yet-torn-down) fleet, rather than a
+    /// cumulative lifetime ceiling that would refuse all spawns once lifetime
+    /// spend crossed the cap (the bug that blocked continuous-drain, TKT-39).
     fn cost_rollup(&self, repo: &str, instance: Option<&str>) -> (f64, f64, f64) {
         let reg = self.lock_registry();
         let mut fleet = 0.0;
         let mut repo_total = 0.0;
         let mut instance_total = 0.0;
         for a in reg.list() {
+            if a.state == AgentState::Dismissed {
+                continue;
+            }
             fleet += a.cost_usd;
             if a.repo_name == repo {
                 repo_total += a.cost_usd;
@@ -839,7 +846,7 @@ impl Supervisor {
 
     /// Fleet + per-repo cost rollup against the configured caps, for
     /// `rk cost --fleet`. Read-only; mirrors the denominator `check_dispatch`
-    /// enforces on.
+    /// enforces on — so dismissed agents are excluded, matching `cost_rollup`.
     pub fn fleet_rollup(&self) -> serde_json::Value {
         use std::collections::BTreeMap;
         let mut fleet_spent = 0.0;
@@ -848,6 +855,9 @@ impl Supervisor {
         {
             let reg = self.lock_registry();
             for a in reg.list() {
+                if a.state == AgentState::Dismissed {
+                    continue;
+                }
                 fleet_spent += a.cost_usd;
                 *per_repo.entry(a.repo_name.clone()).or_default() += a.cost_usd;
                 if let Some(inst) = &a.workflow_instance {

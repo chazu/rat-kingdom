@@ -146,3 +146,115 @@ async fn fleet_cap_refuses_dispatch_once_hit() {
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
+
+/// TKT-39: a dismissed agent's spend must drop off the fleet tally. Spend
+/// counts until the agent is dismissed, so the fleet/repo cap is a standing
+/// guardrail on the current (not-yet-torn-down) fleet — not a cumulative
+/// lifetime ceiling that would refuse ALL spawns once lifetime spend crossed
+/// the cap. This proves both directions in one run: an undismissed spender
+/// still counts (2nd spawn refused), and once it is dismissed its spend drops
+/// off (3rd spawn allowed again).
+#[tokio::test]
+async fn dismissed_agent_drops_off_fleet_tally() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    git(repo_dir.path(), &["init", "-b", "main"]);
+    git(repo_dir.path(), &["config", "user.email", "r@x"]);
+    git(repo_dir.path(), &["config", "user.name", "R"]);
+    std::fs::write(repo_dir.path().join("f"), "x\n").unwrap();
+    git(repo_dir.path(), &["add", "."]);
+    git(repo_dir.path(), &["commit", "-m", "init"]);
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", SPENDER_FAKE);
+    let layout = Layout::at(home.path());
+    let space = Space::open_in_memory().unwrap();
+    let daemon = Daemon::with_fleet_budget_for_tests(
+        layout.clone(),
+        "test-castle".into(),
+        "fake".into(),
+        Budget {
+            max_usd: 100.0,
+            max_tokens: 0,
+            warn_at: 0.8,
+        },
+        FleetBudget {
+            fleet_max_usd: 0.30,
+            repo_max_usd: 0.0,
+            warn_at: 0.8,
+        },
+        space,
+    )
+    .unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+    let repo = repo_dir.path().to_string_lossy().to_string();
+
+    // First spawn burns $0.50, putting the live fleet over the $0.30 cap.
+    let spawned = client
+        .call(
+            "agent.spawn",
+            json!({"repo": repo, "task": "spend-1", "harness": "fake", "model": "haiku"}),
+        )
+        .await
+        .unwrap();
+    let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+
+    // Wait for its cost to land in the registry.
+    let mut done = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = client
+            .call("agent.status", json!({"name": name}))
+            .await
+            .unwrap();
+        if status["agent"]["cost_usd"].as_f64().unwrap_or(0.0) >= 0.30 {
+            done = true;
+            break;
+        }
+    }
+    assert!(done, "first agent did not record its spend");
+
+    // While it is still undismissed its spend counts: a second spawn is refused.
+    let refused = client
+        .call(
+            "agent.spawn",
+            json!({"repo": repo, "task": "spend-2", "harness": "fake", "model": "haiku"}),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "undismissed agent's spend must count — 2nd spawn should be refused, got {refused:?}"
+    );
+
+    // Dismiss it: the record lingers (state → dismissed) but leaves the live
+    // fleet, so its spend must drop off the tally.
+    client
+        .call("agent.dismiss", json!({"name": name, "no_merge": true}))
+        .await
+        .unwrap();
+
+    // The fleet rollup now reads $0 spent and is back to ok — the dismissed
+    // agent no longer counts even though its record is still registered.
+    let rollup = client.call("budget.rollup", json!({})).await.unwrap();
+    assert_eq!(
+        rollup["fleet"]["spent_usd"].as_f64().unwrap(),
+        0.0,
+        "dismissed agent must drop off the fleet tally: {rollup}"
+    );
+    assert_eq!(rollup["fleet"]["status"].as_str().unwrap(), "ok");
+
+    // And a fresh spawn is allowed again — the cap tracks the live fleet, not
+    // cumulative lifetime spend.
+    let allowed = client
+        .call(
+            "agent.spawn",
+            json!({"repo": repo, "task": "spend-3", "harness": "fake", "model": "haiku"}),
+        )
+        .await;
+    assert!(
+        allowed.is_ok(),
+        "after dismissal the cap is clear — 3rd spawn should be allowed, got {allowed:?}"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
