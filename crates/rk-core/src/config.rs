@@ -70,6 +70,11 @@ pub struct ReactorConfig {
     /// Tuple authors the reactor never reacts to, in addition to its own output
     /// (always excluded). Use this to break re-entrancy from known agents.
     pub exclude_instances: Vec<String>,
+    /// Distinct-endorser count at which a `Suggestion` is promoted to a
+    /// `Convention`. Counted per suggestion at scan time (not off the lossy
+    /// feed), so a proposal that misses quorum before its endorsements decay
+    /// simply never promotes. Zero disables quorum promotion entirely.
+    pub quorum: u32,
 }
 
 impl Default for ReactorConfig {
@@ -81,6 +86,7 @@ impl Default for ReactorConfig {
             max_fires: 20,
             marker_ttl_secs: 7 * 24 * 3600,
             exclude_instances: Vec::new(),
+            quorum: 3,
         }
     }
 }

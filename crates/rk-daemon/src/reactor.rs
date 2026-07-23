@@ -31,7 +31,7 @@ use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, SYSTEM_SCOPE};
 use rk_space::Space;
 use rk_workflow::Trigger;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -139,7 +139,96 @@ impl Reactor {
                 self.save_cursor(m)?;
             }
         }
+        // Quorum promotion recomputes over the *whole* snapshot every cycle, not
+        // the cursor delta: an endorsement counts no matter when the reactor
+        // last ran, and the guard against double-promotion is the durable
+        // Convention itself, not the cursor. Runs even with zero triggers.
+        if let Err(e) = self.promote_conventions(&all) {
+            warn!(error = %e, "reactor quorum promotion failed");
+        }
         Ok(fired)
+    }
+
+    /// Promote any `Suggestion` that has reached quorum into a `Convention`.
+    ///
+    /// The count is DISTINCT endorser (`instance`) per suggestion (`identity`),
+    /// recomputed from the passed snapshot — re-endorsing, or a duplicate
+    /// endorsement tuple, can never inflate the tally. Idempotent: a suggestion
+    /// that already has a `Convention` (matched by identity) is skipped, so the
+    /// permanent Convention is itself the "already promoted" marker. Returns how
+    /// many suggestions were promoted this call.
+    fn promote_conventions(&self, all: &[Tuple]) -> rk_core::Result<usize> {
+        if self.config.quorum == 0 {
+            return Ok(0);
+        }
+        let quorum = self.config.quorum as usize;
+
+        // suggestion id -> distinct endorser instances.
+        let mut endorsers: HashMap<&str, HashSet<&str>> = HashMap::new();
+        // suggestion ids that already have a Convention (idempotency guard).
+        let mut promoted_ids: HashSet<&str> = HashSet::new();
+        // suggestion id -> the Suggestion tuple, for citing its text.
+        let mut suggestions: HashMap<&str, &Tuple> = HashMap::new();
+        for t in all {
+            if t.scope != SYSTEM_SCOPE {
+                continue;
+            }
+            match t.category {
+                Category::Endorsement => {
+                    endorsers
+                        .entry(t.identity.as_str())
+                        .or_default()
+                        .insert(t.instance.as_str());
+                }
+                Category::Convention => {
+                    promoted_ids.insert(t.identity.as_str());
+                }
+                Category::Suggestion => {
+                    suggestions.insert(t.identity.as_str(), t);
+                }
+                _ => {}
+            }
+        }
+
+        let mut promoted = 0usize;
+        for (sug_id, instances) in &endorsers {
+            if instances.len() < quorum || promoted_ids.contains(sug_id) {
+                continue;
+            }
+            // Sorted, deduped endorser list for a stable, replay-safe citation.
+            let endorser_list: BTreeSet<&str> = instances.iter().copied().collect();
+            // The suggestion's own text may already have decayed; cite what we
+            // still have (the endorsements alone carry the quorum).
+            let text = suggestions
+                .get(sug_id)
+                .and_then(|s| s.payload.get("text").cloned())
+                .unwrap_or(Value::Null);
+            let convention = Tuple::new(
+                Category::Convention,
+                SYSTEM_SCOPE,
+                *sug_id,
+                REACTOR_INSTANCE,
+                json!({
+                    "suggestion": sug_id,
+                    "text": text,
+                    "endorsers": endorser_list.iter().collect::<Vec<_>>(),
+                    "count": instances.len(),
+                    "quorum": quorum,
+                }),
+            )
+            // Furniture: a promoted norm is permanent, never `in`-consumable, and
+            // replicates across castles via rk-sync for free.
+            .with_lifecycle(Lifecycle::Furniture);
+            self.space.out(convention)?;
+            promoted += 1;
+            info!(
+                suggestion = %sug_id,
+                count = instances.len(),
+                quorum,
+                "reactor promoted suggestion to convention at quorum"
+            );
+        }
+        Ok(promoted)
     }
 
     /// Decide and, if warranted, dispatch a single trigger against one tuple.

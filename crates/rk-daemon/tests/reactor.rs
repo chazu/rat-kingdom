@@ -342,6 +342,158 @@ async fn per_trigger_rate_cap_bounds_a_storm() {
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
+/// Full path over the wire: suggestion + three distinct endorsers land via
+/// `space.out`; the live daemon's reactor loop promotes a convention on its own.
+#[tokio::test]
+async fn live_daemon_promotes_convention_at_quorum() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let sug = json!({"category": "suggestion", "scope": "system", "identity": "sug-live",
+                     "instance": "Whisker", "payload": {"text": "squash before merge"}});
+    client.call("space.out", sug).await.unwrap();
+    for who in ["Whisker", "Nibbles", "Gouda"] {
+        client
+            .call(
+                "space.out",
+                json!({"category": "endorsement", "scope": "system", "identity": "sug-live",
+                       "instance": who, "payload": {"suggestion": "sug-live"}}),
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut promoted = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let convs = client
+            .call("space.scan", json!({"category": "convention", "scope": "system"}))
+            .await
+            .unwrap();
+        if let Some(arr) = convs["tuples"].as_array() {
+            if let Some(c) = arr.iter().find(|c| c["identity"] == "sug-live") {
+                assert_eq!(c["payload"]["count"], json!(3));
+                assert_eq!(c["lifecycle"], json!("furniture"));
+                promoted = true;
+                break;
+            }
+        }
+    }
+    assert!(promoted, "reactor never promoted the quorum-reached suggestion");
+}
+
+fn suggestion(id: &str, author: &str, text: &str) -> Tuple {
+    Tuple::new(
+        Category::Suggestion,
+        "system",
+        id,
+        author,
+        json!({"text": text, "agent": author}),
+    )
+}
+
+fn endorsement(sug_id: &str, endorser: &str) -> Tuple {
+    Tuple::new(
+        Category::Endorsement,
+        "system",
+        sug_id,
+        endorser,
+        json!({"suggestion": sug_id, "agent": endorser}),
+    )
+}
+
+fn conventions(space: &rk_space::Space) -> Vec<Tuple> {
+    space
+        .scan(&rk_core::tuple::Pattern::category(Category::Convention))
+        .unwrap()
+}
+
+/// The flagship stigmergy loop: distinct endorsers reaching quorum promote a
+/// suggestion into a permanent (Furniture) system-scope convention exactly once,
+/// and a duplicate endorsement from an already-counted agent never inflates the
+/// tally.
+#[tokio::test]
+async fn quorum_promotes_suggestion_to_convention_once() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let config = ReactorConfig {
+        quorum: 3,
+        ..Default::default()
+    };
+    let reactor = build_reactor_with_space(&layout, config, space.clone());
+
+    space.out(suggestion("sug-abc", "Whisker", "rebase, never merge")).unwrap();
+    space.out(endorsement("sug-abc", "Whisker")).unwrap();
+    space.out(endorsement("sug-abc", "Nibbles")).unwrap();
+    // A duplicate endorsement from an already-counted agent: must not count.
+    space.out(endorsement("sug-abc", "Nibbles")).unwrap();
+
+    // Two distinct endorsers: below quorum, no convention yet.
+    reactor.run_cycle().unwrap();
+    assert!(conventions(&space).is_empty(), "sub-quorum must not promote");
+
+    // The third distinct endorser trips quorum.
+    space.out(endorsement("sug-abc", "Gouda")).unwrap();
+    reactor.run_cycle().unwrap();
+    let convs = conventions(&space);
+    assert_eq!(convs.len(), 1, "quorum promotes exactly one convention");
+    let c = &convs[0];
+    assert_eq!(c.identity, "sug-abc");
+    assert_eq!(c.instance, REACTOR_INSTANCE);
+    assert_eq!(c.lifecycle, rk_core::tuple::Lifecycle::Furniture);
+    assert_eq!(c.payload["count"], json!(3));
+    assert_eq!(c.payload["text"], json!("rebase, never merge"));
+    assert_eq!(
+        c.payload["endorsers"],
+        json!(["Gouda", "Nibbles", "Whisker"]),
+        "endorsers are the distinct, sorted set"
+    );
+
+    // Idempotent: re-running (even with more endorsements) never double-promotes.
+    space.out(endorsement("sug-abc", "Brie")).unwrap();
+    reactor.run_cycle().unwrap();
+    assert_eq!(conventions(&space).len(), 1, "convention is the promote-once guard");
+}
+
+/// Quorum promotion still works with the suggestion tuple already decayed: the
+/// endorsements alone carry the vote, and the convention cites a null text.
+#[tokio::test]
+async fn quorum_promotes_even_after_suggestion_decays() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let config = ReactorConfig {
+        quorum: 2,
+        ..Default::default()
+    };
+    let reactor = build_reactor_with_space(&layout, config, space.clone());
+
+    // No Suggestion tuple present (it decayed) — only the endorsements remain.
+    space.out(endorsement("sug-gone", "Whisker")).unwrap();
+    space.out(endorsement("sug-gone", "Nibbles")).unwrap();
+    reactor.run_cycle().unwrap();
+
+    let convs = conventions(&space);
+    assert_eq!(convs.len(), 1);
+    assert_eq!(convs[0].payload["text"], serde_json::Value::Null);
+}
+
 async fn connect(layout: &Layout) -> Client {
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(20)).await;
