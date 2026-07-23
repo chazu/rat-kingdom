@@ -22,6 +22,11 @@ pub struct OutArgs {
     /// JSON payload.
     #[arg(long, default_value = "null")]
     pub payload: String,
+    /// Backlink this artifact to the obstacle/need id it resolves. The reactor
+    /// then retires that wall and lays a decaying (topic -> this artifact) trail
+    /// so the next rat hitting the same wall is steered here (stigmergy P8).
+    #[arg(long, value_name = "OBSTACLE_OR_NEED_ID")]
+    pub resolves: Option<String>,
     /// Lifecycle class: furniture | session | ephemeral.
     #[arg(long)]
     pub lifecycle: Option<String>,
@@ -187,8 +192,17 @@ fn print_tuple_line(t: &Value) {
 }
 
 pub async fn out(layout: &Layout, args: OutArgs, as_json: bool) -> Result<()> {
-    let payload: Value =
+    let mut payload: Value =
         serde_json::from_str(&args.payload).context("--payload must be valid JSON")?;
+    // --resolves rides in the payload as a backlink the reactor keys on. It only
+    // has meaning on an artifact, but we attach it structurally rather than
+    // second-guess the category here — the reactor reacts to artifacts alone.
+    if let Some(resolves) = &args.resolves {
+        if !payload.is_object() {
+            payload = json!({});
+        }
+        payload["resolves"] = json!(resolves);
+    }
     let mut params = json!({
         "category": args.category,
         "scope": args.scope,

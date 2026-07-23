@@ -6,7 +6,7 @@
 
 use rk_core::config::ReactorConfig;
 use rk_core::paths::Layout;
-use rk_core::tuple::{Category, Tuple};
+use rk_core::tuple::{Category, Pattern, Tuple, FULL_STRENGTH};
 use rk_daemon::reactor::{Reactor, REACTOR_INSTANCE};
 use rk_daemon::repos::{RepoRecord, RepoRegistry};
 use rk_daemon::supervisor::Supervisor;
@@ -794,4 +794,137 @@ async fn connect(layout: &Layout) -> Client {
         }
     }
     panic!("daemon did not come up");
+}
+
+// --- Resolution backlinks (TKT-28) ----------------------------------------
+
+/// An artifact that resolves a wall, as `rk out artifact ... --resolves <id>`
+/// writes it: the resolved tuple id rides in `payload.resolves`.
+fn resolving_artifact(name: &str, resolves_id: &str) -> Tuple {
+    Tuple::new(
+        Category::Artifact,
+        "myrepo",
+        name,
+        "Whisker",
+        json!({"note": "fixed it", "resolves": resolves_id}),
+    )
+}
+
+fn resolutions(space: &rk_space::Space) -> Vec<Tuple> {
+    space
+        .scan(&Pattern::category(Category::Resolution))
+        .unwrap()
+}
+
+/// A resolving artifact retires the exact wall it names and lays a decaying
+/// (topic -> artifact) trail, at full strength, authored by the reactor.
+#[tokio::test]
+async fn resolving_artifact_retires_wall_and_lays_resolution_trail() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+
+    // A rat files a wall; an artifact then resolves it.
+    let wall = obstacle("myrepo", "Whisker", "cargo build fails on rk-space");
+    space.out(wall.clone()).unwrap();
+    let art = resolving_artifact("build-fix", &wall.id.to_string());
+    space.out(art.clone()).unwrap();
+
+    reactor.run_cycle().unwrap();
+
+    // The solved wall is retired.
+    let obstacles = space.scan(&Pattern::category(Category::Obstacle)).unwrap();
+    assert!(
+        obstacles.iter().all(|t| t.id != wall.id),
+        "resolved wall is retired"
+    );
+
+    // A single (topic -> artifact) trail was laid, keyed on the normalised topic.
+    let trails = resolutions(&space);
+    assert_eq!(trails.len(), 1, "one resolution trail laid");
+    let trail = &trails[0];
+    assert_eq!(
+        trail.identity, "cargo build fails on rk space",
+        "trail is keyed on the normalised topic"
+    );
+    assert_eq!(trail.payload["artifact_id"], json!(art.id.to_string()));
+    assert_eq!(trail.payload["resolved"], json!(wall.id.to_string()));
+    assert_eq!(trail.instance, REACTOR_INSTANCE);
+    assert_eq!(
+        trail.strength,
+        Some(FULL_STRENGTH),
+        "laid at full strength; a trail nobody re-needs decays via GC (TKT-14)"
+    );
+}
+
+/// A fresh obstacle on an already-resolved topic steers the reporting rat to the
+/// prior fix (a directed message) and reinforces the trail back to full strength
+/// — and the steer is emitted once per obstacle even under cursor-reset replay.
+#[tokio::test]
+async fn fresh_obstacle_on_resolved_topic_steers_and_reinforces() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+
+    // Lay a trail by resolving a first wall.
+    let wall1 = obstacle("myrepo", "Whisker", "flaky sync test");
+    space.out(wall1.clone()).unwrap();
+    let art = resolving_artifact("sync-fix", &wall1.id.to_string());
+    space.out(art.clone()).unwrap();
+    reactor.run_cycle().unwrap();
+    let trail0 = resolutions(&space).pop().expect("trail laid");
+
+    // Decay it so reinforcement is observable.
+    space.gc_expired(0.5).unwrap();
+    let decayed = resolutions(&space).pop().expect("trail survives one decay");
+    assert!(decayed.strength.unwrap() < FULL_STRENGTH, "trail decayed");
+
+    // Another rat hits the same wall (different phrasing, same topic).
+    let wall2 = obstacle("myrepo", "Nibbles", "Flaky SYNC test!!");
+    space.out(wall2.clone()).unwrap();
+    reactor.run_cycle().unwrap();
+
+    // The rat is steered: a directed resolution_steer message pointing at the fix.
+    let steer = space
+        .scan(
+            &Pattern::category(Category::Message)
+                .scope("myrepo")
+                .identity("Nibbles"),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|m| m.payload["type"] == json!("resolution_steer"))
+        .expect("a steer message for the reporting rat");
+    assert_eq!(steer.payload["artifact_id"], json!(art.id.to_string()));
+    assert_eq!(steer.payload["obstacle"], json!(wall2.id.to_string()));
+    assert_eq!(steer.instance, REACTOR_INSTANCE);
+
+    // The trail is reinforced in place, back to full strength.
+    let reinforced = resolutions(&space).pop().expect("trail still present");
+    assert_eq!(reinforced.id, trail0.id, "same trail, refreshed in place");
+    assert_eq!(
+        reinforced.strength,
+        Some(FULL_STRENGTH),
+        "a still-live wall reinforces its resolution trail"
+    );
+
+    // Idempotent: replaying the same obstacle after a cursor reset emits no
+    // second steer.
+    std::fs::remove_file(home.path().join("reactor-cursor")).ok();
+    reactor.run_cycle().unwrap();
+    let steers = space
+        .scan(
+            &Pattern::category(Category::Message)
+                .scope("myrepo")
+                .identity("Nibbles"),
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.payload["type"] == json!("resolution_steer"))
+        .count();
+    assert_eq!(steers, 1, "one steer per obstacle, even after cursor reset");
 }

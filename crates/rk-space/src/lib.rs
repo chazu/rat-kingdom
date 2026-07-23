@@ -159,6 +159,15 @@ impl Space {
         self.lock().store.query(pattern, false, None)
     }
 
+    /// Delete one tuple by id (archive-on-resolution, targeted GC). Returns
+    /// whether a row was removed. Unlike [`Space::take`], this consumes a
+    /// *specific* tuple rather than the oldest pattern match — the reactor uses
+    /// it to retire the exact obstacle/need an artifact resolved. Deletions are
+    /// local (like GC): tuples replicate, their removal does not.
+    pub fn delete(&self, id: rk_core::id::RecordId) -> rk_core::Result<bool> {
+        self.lock().store.delete(id)
+    }
+
     /// Non-blocking ranked read (the `--hot` gradient, stigmergy P7): matching
     /// tuples scored by `category_weight × recency × strength`, strongest first,
     /// optionally capped to the top `limit`. Read-only sugar over [`Space::scan`]

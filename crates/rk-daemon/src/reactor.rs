@@ -173,6 +173,19 @@ impl Reactor {
                     }
                 }
             }
+            // Built-in resolution-backlink reaction (TKT-28): an artifact that
+            // resolves a wall retires it and lays a decaying topic->artifact
+            // trail; a fresh obstacle/need on a topic that already has a trail
+            // steers the reporting rat to the prior fix. Both are idempotent, so
+            // a crash-replay from the saved cursor cannot double-apply them.
+            let outcome = match tuple.category {
+                Category::Artifact => self.link_resolution(tuple),
+                Category::Obstacle | Category::Need => self.steer_from_resolution(tuple),
+                _ => Ok(false),
+            };
+            if let Err(e) = outcome {
+                warn!(tuple = %tuple.id, error = %e, "reactor resolution-backlink failed");
+            }
         }
         if let Some(m) = max_id {
             if cursor.map(|c| m > c).unwrap_or(true) {
@@ -471,6 +484,142 @@ impl Reactor {
             }
         });
         Ok(())
+    }
+
+    /// React to a resolving artifact (TKT-28, stigmergy P8): retire the exact
+    /// obstacle/need it names in `payload.resolves` and lay a decaying
+    /// `(topic -> this artifact)` trail so the next rat hitting the same wall is
+    /// steered to the prior fix instead of redoing it.
+    ///
+    /// Idempotent: the wall delete is a no-op once gone, and the trail write is
+    /// an upsert (reinforce) keyed on `(scope, topic)`, so re-resolving a topic
+    /// refreshes the single trail rather than piling up duplicates — and a
+    /// crash-replay of this artifact simply re-lays the same trail. Returns
+    /// whether a trail was laid.
+    fn link_resolution(&self, artifact: &Tuple) -> rk_core::Result<bool> {
+        let Some(resolves) = artifact.payload.get("resolves").and_then(Value::as_str) else {
+            return Ok(false);
+        };
+        let Ok(target) = resolves.parse::<RecordId>() else {
+            warn!(artifact = %artifact.id, resolves = %resolves, "reactor: --resolves is not a valid tuple id");
+            return Ok(false);
+        };
+        // Find the wall by id. Already retired / evaporated => nothing to key a
+        // trail on; the backlink still lives in the artifact payload.
+        let Some(wall) = self.find_wall(target)? else {
+            return Ok(false);
+        };
+        let Some(text) = wall.payload.get("text").and_then(Value::as_str) else {
+            return Ok(false);
+        };
+        let topic = normalize_topic(text);
+        if topic.is_empty() {
+            return Ok(false);
+        }
+
+        // Retire the solved wall, then lay/reinforce the resolution trail.
+        self.space.delete(wall.id)?;
+        let trail = Tuple::new(
+            Category::Resolution,
+            artifact.scope.clone(),
+            topic.clone(),
+            REACTOR_INSTANCE,
+            json!({
+                "topic": topic,
+                "artifact": artifact.identity,
+                "artifact_id": artifact.id.to_string(),
+                "scope": artifact.scope,
+                "resolved": wall.id.to_string(),
+                "resolved_category": wall.category.as_str(),
+                "text": text,
+            }),
+        )
+        // Ephemeral + a decaying strength (reinforce sets FULL): a trail nobody
+        // re-needs fades on its own via the GC decay (TKT-14), no expiry needed.
+        .with_lifecycle(Lifecycle::Ephemeral);
+        self.space.reinforce(trail)?;
+        info!(artifact = %artifact.id, wall = %wall.id, topic = %topic, "reactor linked resolution and retired the wall");
+        Ok(true)
+    }
+
+    /// React to a fresh obstacle/need (TKT-28): if its topic already has a
+    /// resolution trail, reinforce that trail (a rat hit this wall again, so it
+    /// is still live) and steer the reporting rat to the resolving artifact with
+    /// a directed message. Returns whether a steer was emitted.
+    fn steer_from_resolution(&self, wall: &Tuple) -> rk_core::Result<bool> {
+        let Some(text) = wall.payload.get("text").and_then(Value::as_str) else {
+            return Ok(false);
+        };
+        let topic = normalize_topic(text);
+        if topic.is_empty() {
+            return Ok(false);
+        }
+        // A prior resolution for this exact (scope, topic)?
+        let trail_pat = Pattern::category(Category::Resolution)
+            .scope(&wall.scope)
+            .identity(&topic);
+        let Some(trail) = self.space.scan(&trail_pat)?.into_iter().next() else {
+            return Ok(false);
+        };
+        // Idempotency guard: one steer per (obstacle tuple, resolution). Keyed on
+        // this wall's id, so a crash-replay of THIS tuple is suppressed while a
+        // genuinely new obstacle from another rat still steers (and reinforces).
+        let mut seen = Pattern::category(Category::Message)
+            .scope(&wall.scope)
+            .identity(&wall.instance);
+        seen.payload_search = Some(format!("\"obstacle\":\"{}\"", wall.id));
+        if !self.space.scan(&seen)?.is_empty() {
+            return Ok(false);
+        }
+
+        let refreshed = self.space.reinforce(trail.clone())?;
+        let artifact_id = trail
+            .payload
+            .get("artifact_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let artifact_name = trail
+            .payload
+            .get("artifact")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let steer = Tuple::new(
+            Category::Message,
+            wall.scope.clone(),
+            wall.instance.clone(), // directed at the reporting rat
+            REACTOR_INSTANCE,
+            json!({
+                "type": "resolution_steer",
+                "text": format!(
+                    "This wall was resolved before — see artifact '{artifact_name}' ({artifact_id}) before redoing the work."
+                ),
+                "topic": topic,
+                "artifact": artifact_name,
+                "artifact_id": artifact_id,
+                "resolution": refreshed.id.to_string(),
+                "obstacle": wall.id.to_string(),
+            }),
+        );
+        self.space.out(steer)?;
+        info!(wall = %wall.id, topic = %topic, artifact = %artifact_id, "reactor steered rat to prior resolution");
+        Ok(true)
+    }
+
+    /// Find an obstacle or need by exact tuple id. Resolving artifacts are rare,
+    /// so a per-category scan filtered to the id is cheap enough and avoids a
+    /// dedicated by-id index.
+    fn find_wall(&self, id: RecordId) -> rk_core::Result<Option<Tuple>> {
+        for cat in [Category::Obstacle, Category::Need] {
+            if let Some(t) = self
+                .space
+                .scan(&Pattern::category(cat))?
+                .into_iter()
+                .find(|t| t.id == id)
+            {
+                return Ok(Some(t));
+            }
+        }
+        Ok(None)
     }
 
     /// Decide and, if warranted, dispatch a single trigger against one tuple.

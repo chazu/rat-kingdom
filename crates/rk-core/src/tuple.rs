@@ -30,6 +30,11 @@ pub enum Category {
     Need,
     /// A work product (patch, test results, design decision).
     Artifact,
+    /// A decaying backlink from a resolved wall (topic) to the [`Artifact`] that
+    /// solved it. Written by the reactor when an artifact `--resolves` an
+    /// obstacle/need, reinforced whenever a rat hits the same wall again, and
+    /// evaporated once nobody does — institutional memory as a living structure.
+    Resolution,
     /// A record of something that happened.
     Event,
     /// A directed message for a specific agent or human.
@@ -51,6 +56,7 @@ impl Category {
             Category::Obstacle => "obstacle",
             Category::Need => "need",
             Category::Artifact => "artifact",
+            Category::Resolution => "resolution",
             Category::Event => "event",
             Category::Message => "message",
             Category::Suggestion => "suggestion",
@@ -58,7 +64,7 @@ impl Category {
         }
     }
 
-    pub const ALL: [Category; 12] = [
+    pub const ALL: [Category; 13] = [
         Category::Fact,
         Category::Convention,
         Category::Task,
@@ -67,6 +73,7 @@ impl Category {
         Category::Obstacle,
         Category::Need,
         Category::Artifact,
+        Category::Resolution,
         Category::Event,
         Category::Message,
         Category::Suggestion,
@@ -79,7 +86,10 @@ impl Category {
     /// rat re-issuing the same trail reinforces it back to full strength; an
     /// abandoned one (its author dead) evaporates on its own.
     pub fn evaporates(&self) -> bool {
-        matches!(self, Category::Claim | Category::Obstacle | Category::Need)
+        matches!(
+            self,
+            Category::Claim | Category::Obstacle | Category::Need | Category::Resolution
+        )
     }
 
     /// Epistemic weight for hot-ranking: higher = a stronger trail to follow.
@@ -373,7 +383,12 @@ mod tests {
 
     #[test]
     fn only_claim_obstacle_need_evaporate() {
-        let evaporating = [Category::Claim, Category::Obstacle, Category::Need];
+        let evaporating = [
+            Category::Claim,
+            Category::Obstacle,
+            Category::Need,
+            Category::Resolution,
+        ];
         for c in Category::ALL {
             assert_eq!(
                 c.evaporates(),

@@ -106,7 +106,7 @@ workflow: #Workflow
 
 // Tuple categories a `read` step may match.
 #Category: "fact" | "convention" | "task" | "available" | "claim" | "obstacle" |
-	"need" | "artifact" | "event" | "message" | "suggestion" | "endorsement"
+	"need" | "artifact" | "resolution" | "event" | "message" | "suggestion" | "endorsement"
 
 #SpawnStep: {
 	type: "spawn"
