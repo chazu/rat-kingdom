@@ -957,11 +957,18 @@ impl Daemon {
     }
 
     fn handle_scan(&self, req: Request) -> Response {
-        let params: PatternParams = match parse_params(&req.params) {
+        let params: ScanParams = match parse_params(&req.params) {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
-        match self.space.scan(&params.pattern) {
+        // `--hot`, or any `--top N` cap, follows the strongest trail first;
+        // otherwise the default oldest-first scan is unchanged.
+        let result = if params.hot || params.top.is_some() {
+            self.space.scan_hot(&params.pattern, params.top)
+        } else {
+            self.space.scan(&params.pattern)
+        };
+        match result {
             Ok(tuples) => Response::ok(req.id, json!({"tuples": tuples})),
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
@@ -1044,6 +1051,19 @@ struct OutParams {
 struct PatternParams {
     #[serde(flatten)]
     pattern: Pattern,
+}
+
+/// `space.scan` params: a match pattern plus the optional hot-ranking sugar.
+/// `hot` reorders by `category_weight × recency × strength` (strongest first);
+/// `top` caps to the N strongest and implies `hot`.
+#[derive(Deserialize, Default)]
+struct ScanParams {
+    #[serde(flatten)]
+    pattern: Pattern,
+    #[serde(default)]
+    hot: bool,
+    #[serde(default)]
+    top: Option<usize>,
 }
 
 #[derive(Deserialize)]

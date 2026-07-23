@@ -89,7 +89,9 @@ epistemic weight (`fact` > `convention` > `artifact` > `claim` >
 
 ```bash
 rk out fact myrepo rate-limit --payload '{"discovered": "API caps at 100/s"}'
-rk scan fact myrepo            # non-blocking read
+rk scan fact myrepo            # non-blocking read (oldest first)
+rk scan obstacle myrepo --hot  # ranked: strongest trail first (weight × recency × strength)
+rk scan '' myrepo --top 5      # the 5 hottest tuples in a scope (implies --hot)
 rk rd event '' task_done --search Whisker --timeout 5m   # blocking read
 rk in available myrepo --timeout 30s                     # destructive take
 ```

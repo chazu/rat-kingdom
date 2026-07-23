@@ -42,8 +42,8 @@ enum Command {
     In(space_cmds::ReadArgs),
     /// Read a matching tuple without consuming it (blocks until match or timeout).
     Rd(space_cmds::ReadArgs),
-    /// List all matching tuples (non-blocking).
-    Scan(space_cmds::ScanArgs),
+    /// List all matching tuples (non-blocking; --hot/--top rank strongest-first).
+    Scan(space_cmds::HotScanArgs),
     /// Stream tuples live as they are written.
     Watch(space_cmds::ScanArgs),
     /// Signal task completion (sugar; env-autofilled).
