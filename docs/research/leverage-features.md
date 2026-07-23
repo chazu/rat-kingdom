@@ -100,7 +100,14 @@ Grouped by leverage dimension. ★ = selected for the deep-dive top 10.
     registered repos, not one. *Leverage: one operator drives a multi-repo fleet.*
 11. **Merge queue / serialized land** — order concurrent merges to main. *Leverage:
     parallel drains stop stepping on each other (the CAS at `git/lib.rs:147` already
-    fails-safe, but a queue avoids the wasted re-work).*
+    fails-safe, but a queue avoids the wasted re-work).* **LANDED (TKT-51):** the
+    supervisor holds a per-`(repo, target)` FIFO lock (`MergeQueue`) that every
+    `dismiss`/`dismiss_all` and `land` merge takes its turn in, so concurrent
+    auto-merges into the same target serialize onto the freshly-updated tree
+    instead of CAS-bouncing to a silent `merged: false`. The merge's temp
+    worktree path also gained a per-call sequence so merges into *distinct*
+    targets no longer collide on one `.git/rk-merge-<pid>` path. See
+    `crates/rk-daemon/tests/merge_queue.rs`.
 
 ### Observability — see the fleet without staring at it
 

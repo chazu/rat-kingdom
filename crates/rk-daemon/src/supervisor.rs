@@ -111,6 +111,9 @@ pub struct Supervisor {
     /// Bounded per-agent transcript (assistant text / tool calls / retries),
     /// so the operator can `rk log` a run instead of being blind to it.
     log: crate::agent_log::AgentLog,
+    /// Serializes concurrent land/dismiss merges to the same target branch so
+    /// unattended auto-merges never interleave and lose a branch (TKT-51).
+    merge_queue: MergeQueue,
 }
 
 /// One agent's rolling state across supervisor sweeps.
@@ -134,6 +137,55 @@ enum SweepAction {
     Soft { kind: &'static str, detail: String },
     /// Still flagged past the grace window: obstacle tuple + kill.
     Hard { kind: &'static str, detail: String },
+}
+
+/// Serializes merges to the same target branch — the land / merge queue.
+///
+/// Both the steward's `land` step and `dismiss`/`dismiss_all` merge branches
+/// into `main` (or any base) concurrently and unattended. Without
+/// serialization two auto-merges racing on the same target interleave: each
+/// merges in its own detached worktree captured from the target ref *before*
+/// the other advanced it, so the compare-and-swap in [`Repo::merge_branch`]
+/// bounces the loser to a silent `merged: false` and its branch is left
+/// unmerged (the root cause of the "done ticket never in main" gap). A
+/// per-`(repo, target)` FIFO lock makes every land/dismiss to a given target
+/// take its turn on the *freshly-updated* target, so each merge either applies
+/// cleanly or is a genuine conflict — never a lost race. Merges to distinct
+/// targets keep separate locks and still run concurrently.
+#[derive(Default)]
+struct MergeQueue {
+    /// One async mutex per active target key; entries are created on demand.
+    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl MergeQueue {
+    fn key(repo_root: &std::path::Path, target: &str) -> String {
+        // NUL can't appear in a path or ref name, so it's an unambiguous joiner.
+        format!("{}\u{0}{}", repo_root.display(), target)
+    }
+
+    /// Acquire the serialization lock for `(repo_root, target)`. The returned
+    /// guard is held for the duration of one merge; the next waiter proceeds
+    /// only once it drops. tokio's `Mutex` is FIFO, so callers land in arrival
+    /// order — the "queue" in merge queue.
+    async fn acquire(
+        &self,
+        repo_root: &std::path::Path,
+        target: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let key = Self::key(repo_root, target);
+        // Clone the Arc out under the std mutex, then release it *before*
+        // awaiting the async lock — never hold a std guard across an await.
+        let lock = {
+            let mut locks = self.locks.lock().unwrap();
+            Arc::clone(
+                locks
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        lock.lock_owned().await
+    }
 }
 
 impl Supervisor {
@@ -172,6 +224,7 @@ impl Supervisor {
             fleet_warned: Mutex::new(std::collections::HashSet::new()),
             sweep_state: Mutex::new(HashMap::new()),
             log,
+            merge_queue: MergeQueue::default(),
         })
     }
 
@@ -1188,7 +1241,18 @@ impl Supervisor {
         }
         if let Some(branch) = &record.branch {
             if !no_merge {
-                let outcome = repo.merge_branch(branch, &record.target_branch)?;
+                // Take our turn in the per-target merge queue: only one land or
+                // dismiss into this target runs at a time, so this merge sees a
+                // target no concurrent auto-merge is moving underneath it. Held
+                // only across the merge itself — the kill/worktree cleanup above
+                // and the branch delete below stay parallel across a fan-out.
+                let outcome = {
+                    let _merge_guard = self
+                        .merge_queue
+                        .acquire(repo.root(), &record.target_branch)
+                        .await;
+                    repo.merge_branch(branch, &record.target_branch)?
+                };
                 merged = outcome.merged;
                 detail = outcome.detail;
                 if merged {
@@ -1232,7 +1296,7 @@ impl Supervisor {
     /// deletion is best-effort (a protected or still-checked-out branch is left
     /// in place and reported `branch_deleted: false`) so it never masks the
     /// merge that already succeeded.
-    pub fn land(
+    pub async fn land(
         &self,
         repo_root: &std::path::Path,
         branch: &str,
@@ -1240,7 +1304,13 @@ impl Supervisor {
         keep_branch: bool,
     ) -> rk_core::Result<serde_json::Value> {
         let repo = Repo::discover(repo_root)?;
-        let outcome = repo.merge_branch(branch, target)?;
+        // Same land / merge queue the agent-dismiss path uses: serialize with any
+        // concurrent land/dismiss into this target so the merge runs on the
+        // freshly-updated target rather than racing another auto-merge (TKT-51).
+        let outcome = {
+            let _merge_guard = self.merge_queue.acquire(repo.root(), target).await;
+            repo.merge_branch(branch, target)?
+        };
         let mut branch_deleted = false;
         if outcome.merged && !keep_branch {
             match repo.delete_branch(branch) {

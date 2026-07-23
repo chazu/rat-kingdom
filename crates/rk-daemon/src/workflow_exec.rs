@@ -522,12 +522,10 @@ impl WorkflowEngine {
                     if target.is_empty() {
                         return Err(rk_core::Error::other("land step: target resolved to empty"));
                     }
-                    let result = self.supervisor.land(
-                        std::path::Path::new(repo),
-                        &branch,
-                        &target,
-                        land.keep_branch,
-                    )?;
+                    let result = self
+                        .supervisor
+                        .land(std::path::Path::new(repo), &branch, &target, land.keep_branch)
+                        .await?;
                     self.update(id, |i| i.context.previous_result = Some(result.clone()));
                 }
             }
