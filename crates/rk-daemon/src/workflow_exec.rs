@@ -499,7 +499,9 @@ impl WorkflowEngine {
                     self.update(id, |i| i.context.previous_result = Some(summary.clone()));
                 }
                 Step::DismissAll(dismiss_all) => {
-                    let summary = self.dismiss_fanout(&ctx.fanout, dismiss_all).await?;
+                    let summary = self
+                        .dismiss_fanout(&ctx.fanout, dismiss_all, ctx.previous_result.as_ref())
+                        .await?;
                     self.update(id, |i| {
                         i.context.previous_result = Some(summary.clone());
                         // The fan-out set is spent once its branches are merged.
@@ -670,20 +672,64 @@ impl WorkflowEngine {
     /// Dismiss every agent in the fan-out set in parallel — the fan-out
     /// counterpart to a single `dismiss` over `active_agent`. Each agent is
     /// merged (unless `no_merge`) and cleaned up concurrently, then the caller
-    /// clears the fan-out set. Aggregates into `{count, merged, errors,
+    /// clears the fan-out set. Aggregates into `{count, merged, parked, errors,
     /// all_merged, results}`. A hard dismiss failure (e.g. a git error — a
     /// merge *conflict* is a clean `merged: false`, not an error) fails the
     /// step, symmetric to how `wait_all` fails on a timeout.
+    ///
+    /// When `dismiss_all.only_clean` is set, this reads the preceding
+    /// `wait_all` aggregate (`previous_result`) and merges *only* the branches
+    /// of rats that finished clean (`is_error: false`), parking every failed
+    /// rat's branch with `no_merge` for review instead of failing the whole
+    /// batch. A branch parked because its rat failed is counted in `parked`
+    /// (distinct from a `merged: false` merge *conflict*), and `all_merged`
+    /// stays `merged == count`, so a following `evaluate {all_merged: true}`
+    /// still surfaces the failure in `rk inbox` — but only after the clean
+    /// branches have already merged. `only_clean` requires a preceding
+    /// `wait_all` (its per-agent results supply the clean/failed signal); it
+    /// fails the step if none is present rather than silently merging all.
     async fn dismiss_fanout(
         &self,
         fanout: &[FannedAgent],
         dismiss_all: &DismissAllStep,
+        previous_result: Option<&Value>,
     ) -> rk_core::Result<Value> {
         if fanout.is_empty() {
             return Err(rk_core::Error::other(
                 "dismiss_all step with no fan-out agents (missing or empty for_each)",
             ));
         }
+        // With only_clean, the per-agent no_merge is driven by the preceding
+        // wait_all's results: an agent is parked (no_merge=true) unless its
+        // harness_result reported is_error:false. Without a preceding wait_all
+        // there is no clean/failed signal, so the flag is meaningless — fail
+        // rather than silently merge everything.
+        let clean = if dismiss_all.only_clean {
+            let agg = previous_result.ok_or_else(|| {
+                rk_core::Error::other(
+                    "dismiss_all onlyClean requires a preceding wait_all: no aggregate in \
+                     ctx.previous_result to determine which rats finished clean",
+                )
+            })?;
+            let results = agg.get("results").and_then(Value::as_array).ok_or_else(|| {
+                rk_core::Error::other(
+                    "dismiss_all onlyClean requires a preceding wait_all: ctx.previous_result has \
+                     no `results` array (is the previous step a wait_all?)",
+                )
+            })?;
+            let clean: std::collections::HashSet<String> = results
+                .iter()
+                .filter(|r| r.get("is_error").and_then(Value::as_bool) == Some(false))
+                .filter_map(|r| {
+                    r.get("agent")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect();
+            Some(clean)
+        } else {
+            None
+        };
         // Dismiss all branches concurrently: each dismissal kills its child and
         // merges its branch independently, so serializing them would waste the
         // whole point of a fan-out.
@@ -691,23 +737,34 @@ impl WorkflowEngine {
         for fa in fanout {
             let supervisor = Arc::clone(&self.supervisor);
             let agent = fa.agent.clone();
-            let no_merge = dismiss_all.no_merge;
+            // Base no_merge from the step, plus: under only_clean, park (don't
+            // merge) any agent not in the clean set.
+            let parked = clean
+                .as_ref()
+                .is_some_and(|clean| !clean.contains(&fa.agent));
+            let no_merge = dismiss_all.no_merge || parked;
             set.spawn(async move {
                 let outcome = supervisor.dismiss(&agent, no_merge).await;
-                (agent, outcome)
+                (agent, parked, outcome)
             });
         }
         let count = fanout.len();
         let mut results = Vec::with_capacity(count);
         let mut merged = 0usize;
+        let mut parked = 0usize;
         let mut failures = Vec::new();
         while let Some(joined) = set.join_next().await {
-            let (agent, outcome) = joined
+            let (agent, was_parked, outcome) = joined
                 .map_err(|e| rk_core::Error::other(format!("dismiss_all task join error: {e}")))?;
             match outcome {
                 Ok(value) => {
                     if value.get("merged").and_then(Value::as_bool) == Some(true) {
                         merged += 1;
+                    } else if was_parked {
+                        // Held back because the rat failed, not because the
+                        // branch would not merge — track it separately so a
+                        // following evaluate/report can tell the two apart.
+                        parked += 1;
                     }
                     results.push(value);
                 }
@@ -727,6 +784,7 @@ impl WorkflowEngine {
         Ok(json!({
             "count": count,
             "merged": merged,
+            "parked": parked,
             "errors": count - merged,
             "all_merged": merged == count,
             "results": results,

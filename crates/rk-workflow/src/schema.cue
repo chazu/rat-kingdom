@@ -270,6 +270,12 @@ workflow: #Workflow
 #DismissAllStep: {
 	type: "dismiss_all"
 	noMerge?: bool
+	// When true, merge only the branches of rats that finished clean
+	// (is_error:false in the preceding wait_all) and park the rest with
+	// noMerge, instead of failing the batch on the first error. Requires a
+	// preceding wait_all in the same instance (its per-agent results supply
+	// the clean/failed signal). Default false = atomic-batch (today).
+	onlyClean?: bool
 }
 
 // Run a command in the active agent's worktree — the deterministic quality
