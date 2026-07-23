@@ -45,8 +45,10 @@
   default > global default > [harness] default; unknown profile = error).
   Daemon executor: spawn/wait/evaluate/dismiss/timer-gate, instance
   persistence, `rk workflow run/list/status/defs`. E2E test green.
-  REMAINING from P5: human gates (approval tuples), sub-workflow step,
-  reactive triggers, restart recovery of running instances.
+  Restart recovery LANDED (TKT-52): persisted instances rehydrate on startup
+  and `Running` ones resume from their step cursor (`WorkflowEngine::rehydrate`,
+  called from the daemon `run()` boot path).
+  REMAINING from P5: sub-workflow step.
 - **P3 herdr mux DONE** — rk-mux (shell-out to herdr CLI): `rk spawn
   --attach` runs the harness TUI in a herdr pane (prompt delivered on
   herdr's idle report, completion via the rat's own `rk done` tuple, steer

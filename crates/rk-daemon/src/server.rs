@@ -482,6 +482,14 @@ impl Daemon {
             });
         }
 
+        // Rehydrate persisted workflow instances (TKT-52): restore status/list
+        // history and RESUME any that were mid-run when the daemon last stopped
+        // — a crash/restart no longer silently drops in-flight instances
+        // (parked gates, fan-outs awaiting wait_all). Runs after the socket bind
+        // (shared state is safe to touch) and after the reactor/scheduler are up
+        // so a resumed instance's completion event is observed by them.
+        daemon.engine().rehydrate();
+
         loop {
             tokio::select! {
                 accepted = listener.accept() => {

@@ -224,6 +224,8 @@ mod tests {
             },
             awaiting: awaiting.map(str::to_string),
             instance_max_usd: None,
+            definition: "gated-merge".into(),
+            params: Default::default(),
             started_at: Utc::now(),
             completed_at: None,
         }
