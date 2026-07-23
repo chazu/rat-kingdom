@@ -32,6 +32,7 @@ pub struct Daemon {
     syncer: Option<Arc<crate::sync::Syncer>>,
     sync_interval: Duration,
     reactor_config: rk_core::config::ReactorConfig,
+    scheduler_config: rk_core::config::SchedulerConfig,
     sweep_config: rk_core::config::SupervisorConfig,
     evaporation_decay: f64,
     global_agents: std::collections::HashMap<String, rk_workflow::AgentProfile>,
@@ -93,6 +94,7 @@ impl Daemon {
                 .collect(),
         };
         daemon.reactor_config = config.reactor.clone();
+        daemon.scheduler_config = config.scheduler.clone();
         daemon.sweep_config = config.supervisor.clone();
         daemon.evaporation_decay = config.evaporation.decay;
         if config.sync.enabled {
@@ -190,6 +192,7 @@ impl Daemon {
             syncer: None,
             sync_interval: Duration::from_secs(30),
             reactor_config: rk_core::config::ReactorConfig::default(),
+            scheduler_config: rk_core::config::SchedulerConfig::default(),
             sweep_config: rk_core::config::SupervisorConfig::default(),
             evaporation_decay: rk_core::config::EvaporationConfig::default().decay,
             global_agents: Default::default(),
@@ -361,6 +364,52 @@ impl Daemon {
                         Ok(Ok(n)) => debug!(fired = n, "reactor cycle fired workflows"),
                         Ok(Err(e)) => warn!(error = %e, "reactor cycle failed"),
                         Err(e) => warn!(error = %e, "reactor task panicked"),
+                    }
+                }
+            });
+        }
+
+        // Scheduler loop: fire registered #Schedule workflows on a cron cadence.
+        // The TIME-axis sibling of the reactor — a purely clock-driven trigger.
+        // A durable minute-cursor makes it catch-up-once after downtime, and each
+        // schedule is single-flight so a slow run never stacks on itself.
+        if daemon.scheduler_config.enabled {
+            let scheduler = Arc::new(crate::scheduler::Scheduler::new(
+                daemon.engine(),
+                daemon.layout.clone(),
+                daemon.scheduler_config.clone(),
+            ));
+            // Baseline the cursor so a fresh daemon does not fire schedules for
+            // minutes that elapsed before it started.
+            if let Err(e) = scheduler.initialize_cursor() {
+                warn!(error = %e, "scheduler cursor init failed");
+            }
+            let mut scheduler_shutdown = daemon.shutdown_tx.subscribe();
+            // Must tick at least once a minute or a matching minute is skipped.
+            let interval = Duration::from_secs(daemon.scheduler_config.interval_secs.clamp(1, 60));
+            // A cycle runs on a blocking thread (it shells out to `cue`), and its
+            // dispatch calls `engine.run`, which `tokio::spawn`s the workflow — so
+            // the blocking thread must enter the runtime context first.
+            let handle = tokio::runtime::Handle::current();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        _ = scheduler_shutdown.changed() => break,
+                    }
+                    let scheduler = Arc::clone(&scheduler);
+                    let handle = handle.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let _guard = handle.enter();
+                        scheduler.run_cycle()
+                    })
+                    .await
+                    {
+                        Ok(Ok(0)) => {}
+                        Ok(Ok(n)) => debug!(fired = n, "scheduler cycle fired workflows"),
+                        Ok(Err(e)) => warn!(error = %e, "scheduler cycle failed"),
+                        Err(e) => warn!(error = %e, "scheduler task panicked"),
                     }
                 }
             });

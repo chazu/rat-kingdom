@@ -4,10 +4,12 @@
 pub mod agent_log;
 pub mod agents;
 pub mod client;
+pub mod cron;
 pub mod inbox;
 pub mod proto;
 pub mod reactor;
 pub mod repos;
+pub mod scheduler;
 pub mod server;
 pub mod supervisor;
 pub mod sync;

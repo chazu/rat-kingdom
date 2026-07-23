@@ -64,6 +64,12 @@ impl Layout {
         self.home.join("triggers")
     }
 
+    /// Global `#Schedule` definitions dir (`<home>/schedules/*.cue`). Repo-local
+    /// schedules live at `<repo>/.rk/schedules.cue` instead.
+    pub fn schedules_dir(&self) -> PathBuf {
+        self.home.join("schedules")
+    }
+
     /// Create the directories the daemon needs at startup.
     pub fn ensure(&self) -> crate::Result<()> {
         for dir in [self.home.clone(), self.log_dir(), self.worktrees_dir()] {
