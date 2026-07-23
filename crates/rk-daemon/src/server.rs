@@ -447,6 +447,9 @@ impl Daemon {
                 daemon.tickets.clone(),
                 daemon.layout.clone(),
                 daemon.drain_config.clone(),
+                daemon.tier_routing.clone(),
+                daemon.global_agents.clone(),
+                daemon.default_harness.clone(),
             ));
             let mut feed = daemon.space.subscribe();
             let mut drain_shutdown = daemon.shutdown_tx.subscribe();

@@ -50,7 +50,12 @@ use chrono::{DateTime, Utc};
 use rk_core::config::DrainConfig;
 use rk_core::paths::Layout;
 use rk_core::tuple::Tuple;
+use rk_workflow::{
+    resolve::{resolve_fields, ResolvedAgent},
+    AgentProfile, TierRouting,
+};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -59,6 +64,14 @@ pub struct Drain {
     tickets: Arc<Tickets>,
     layout: Layout,
     config: DrainConfig,
+    /// Cost-tier routing (global `[tiers]`): a drained ticket's labels/priority
+    /// pick a tier (an `[agents.<tier>]` profile), exactly as the workflow
+    /// fan-out routes. Empty = no routing, every ticket drains on the default.
+    tier_routing: TierRouting,
+    /// Named agent profiles (`[agents.<name>]`) a resolved tier binds to.
+    global_agents: HashMap<String, AgentProfile>,
+    /// The harness a spawn falls back to when no profile/tier names one.
+    default_harness: String,
 }
 
 impl Drain {
@@ -67,12 +80,18 @@ impl Drain {
         tickets: Arc<Tickets>,
         layout: Layout,
         config: DrainConfig,
+        tier_routing: TierRouting,
+        global_agents: HashMap<String, AgentProfile>,
+        default_harness: String,
     ) -> Self {
         Self {
             supervisor,
             tickets,
             layout,
             config,
+            tier_routing,
+            global_agents,
+            default_harness,
         }
     }
 
@@ -160,6 +179,12 @@ impl Drain {
             if self.supervisor.would_exceed_budget(&ticket.scope) {
                 continue;
             }
+            // Route this ticket to a cost tier from its labels/priority and
+            // resolve the harness/model/permissions the same way the workflow
+            // fan-out does. Done *before* the claim so a config error (unknown
+            // tier) surfaces without orphaning a claimed ticket; an unknown tier
+            // errors out the whole cycle exactly like an unknown profile.
+            let resolved = self.resolve_tier(ticket)?;
             // Atomic claim before spawn: if a concurrent drain/fan-out already
             // took it we lose the race and skip, so no ticket is double-grabbed.
             if !self.tickets.claim(&ticket.identity).await? {
@@ -175,11 +200,11 @@ impl Drain {
                 task: ticket.identity.clone(),
                 prompt: Some(ticket_prompt(ticket)),
                 role: "rat".to_string(),
-                harness: None,
+                harness: Some(resolved.harness),
                 parent: None,
                 base: None,
-                model: None,
-                permission_mode: None,
+                model: resolved.model,
+                permission_mode: resolved.permission_mode,
                 attach: false,
                 // Drain dispatches standalone tickets, never a workflow instance,
                 // so there is no per-instance budget scope (TKT-32) to key on.
@@ -244,6 +269,31 @@ impl Drain {
             _ => None,
         }
     }
+
+    /// Resolve a ready ticket's harness/model/permissions through the same
+    /// tier-routing → profile-layering path the workflow fan-out uses: route the
+    /// ticket's labels/priority to a tier (an `[agents.<tier>]` profile), then
+    /// resolve that profile over the global agents. A bare drain has no
+    /// workflow-scoped agents, so only global profiles apply. An unknown tier
+    /// name errors, exactly like an unknown profile in a spawn step.
+    fn resolve_tier(&self, ticket: &Tuple) -> rk_core::Result<ResolvedAgent> {
+        let labels = string_array(&ticket.payload, "labels");
+        let priority = field(&ticket.payload, "priority");
+        let tier = self.tier_routing.route(&labels, Some(priority));
+        if let Some(tier) = tier {
+            info!(ticket = %ticket.identity, tier, "drain routed ticket to cost tier");
+        }
+        resolve_fields(
+            None,
+            tier,
+            None,
+            None,
+            None,
+            &HashMap::new(),
+            &self.global_agents,
+            &self.default_harness,
+        )
+    }
 }
 
 /// Base priority level: `high` = 2, `low` = 0, everything else (incl. the
@@ -271,6 +321,22 @@ fn ticket_prompt(ticket: &Tuple) -> String {
 
 fn field<'a>(payload: &'a Value, key: &str) -> &'a str {
     payload.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// The string array under `key` in a ticket payload (e.g. `labels`), empty when
+/// absent or not an array — mirrors the fan-out's `labels` extraction so a
+/// routing rule keys on the same values in the drain as in a workflow.
+fn string_array(payload: &Value, key: &str) -> Vec<String> {
+    payload
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Numeric part of a `TKT-<n>` id, for a FIFO tiebreak (0 if unparseable).
@@ -315,6 +381,9 @@ mod tests {
                 repos: std::collections::HashMap::new(),
                 aging_secs,
             },
+            TierRouting::default(),
+            HashMap::new(),
+            "fake".into(),
         )
     }
 
@@ -337,7 +406,15 @@ mod tests {
                 )
             })
             .collect();
-        Drain::new(d.supervisor, d.tickets, d.layout, config)
+        Drain::new(
+            d.supervisor,
+            d.tickets,
+            d.layout,
+            config,
+            d.tier_routing,
+            d.global_agents,
+            d.default_harness,
+        )
     }
 
     fn ticket(id: &str, priority: &str, created_at: DateTime<Utc>) -> Tuple {
@@ -350,6 +427,58 @@ mod tests {
         );
         t.created_at = created_at;
         t
+    }
+
+    /// A drain whose tier table + global profiles route drained tickets, so the
+    /// per-ticket `resolve_tier` path can be unit-tested without a live spawn.
+    fn tiered_drain(
+        rules: &[(Option<&str>, Option<&str>, &str)],
+        profiles: &[(&str, Option<&str>, Option<&str>)],
+    ) -> Drain {
+        let d = drain(0);
+        let tier_routing = TierRouting {
+            rules: rules
+                .iter()
+                .map(|(priority, label, tier)| rk_workflow::TierRule {
+                    priority: priority.map(String::from),
+                    label: label.map(String::from),
+                    tier: (*tier).to_string(),
+                })
+                .collect(),
+        };
+        let global_agents = profiles
+            .iter()
+            .map(|(name, harness, model)| {
+                (
+                    (*name).to_string(),
+                    AgentProfile {
+                        harness: harness.map(String::from),
+                        model: model.map(String::from),
+                        permission_mode: None,
+                    },
+                )
+            })
+            .collect();
+        Drain::new(
+            d.supervisor,
+            d.tickets,
+            d.layout,
+            d.config,
+            tier_routing,
+            global_agents,
+            "fake".into(),
+        )
+    }
+
+    /// A ticket carrying labels, for tier rules that key on a `label`.
+    fn labeled_ticket(id: &str, priority: &str, labels: &[&str]) -> Tuple {
+        Tuple::new(
+            rk_core::tuple::Category::Task,
+            "repo",
+            id,
+            "castle",
+            json!({"title": id, "priority": priority, "status": "open", "labels": labels}),
+        )
     }
 
     #[test]
@@ -414,6 +543,63 @@ mod tests {
     fn zero_cap_means_unlimited_within_fleet_ceiling() {
         let d = partitioned_drain(&[("alpha", true, 0)]);
         assert_eq!(d.repo_slot_policy("alpha"), Some(None));
+    }
+
+    #[test]
+    fn label_rule_routes_a_drained_ticket_onto_its_tier_profile() {
+        // A `mechanical` label routes to the cheap tier; the drain resolves the
+        // spawn onto that profile's harness/model, exactly like a fan-out.
+        let d = tiered_drain(
+            &[(None, Some("mechanical"), "cheap")],
+            &[("cheap", Some("codex"), Some("gpt-5.5-codex"))],
+        );
+        let resolved = d
+            .resolve_tier(&labeled_ticket("TKT-1", "normal", &["mechanical"]))
+            .unwrap();
+        assert_eq!(resolved.harness, "codex");
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5.5-codex"));
+    }
+
+    #[test]
+    fn priority_rule_routes_a_high_ticket_onto_the_premium_tier() {
+        let d = tiered_drain(
+            &[(Some("high"), None, "premium")],
+            &[("premium", Some("claude"), Some("opus"))],
+        );
+        let resolved = d
+            .resolve_tier(&ticket("TKT-1", "high", Utc::now()))
+            .unwrap();
+        assert_eq!(resolved.harness, "claude");
+        assert_eq!(resolved.model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn no_matching_rule_falls_back_to_the_default_harness() {
+        // A ticket that matches no rule resolves exactly as before the tier layer
+        // existed: the global default harness, no model.
+        let d = tiered_drain(
+            &[(Some("high"), None, "premium")],
+            &[("premium", Some("claude"), Some("opus"))],
+        );
+        let resolved = d
+            .resolve_tier(&ticket("TKT-1", "low", Utc::now()))
+            .unwrap();
+        assert_eq!(resolved.harness, "fake", "falls back to default harness");
+        assert_eq!(resolved.model, None);
+    }
+
+    #[test]
+    fn unknown_tier_name_errors_like_an_unknown_profile() {
+        // A rule points at a tier with no `[agents.<tier>]` profile: resolution
+        // errors rather than silently falling back, so a config typo is loud.
+        let d = tiered_drain(&[(None, None, "ghost")], &[]);
+        let err = d
+            .resolve_tier(&ticket("TKT-1", "normal", Utc::now()))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown tier profile 'ghost'"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
