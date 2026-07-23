@@ -470,6 +470,26 @@ impl WorkflowEngine {
                     let result = self.run_command(&ctx, run).await?;
                     self.update(id, |i| i.context.previous_result = Some(result.clone()));
                 }
+                Step::Land(land) => {
+                    let branch = interpolate(&land.branch, &ctx);
+                    let target = interpolate(&land.target, &ctx);
+                    if branch.is_empty() {
+                        return Err(rk_core::Error::other(
+                            "land step: branch resolved to empty (no branch to land — did an \
+                             earlier step set {{ctx.activeBranch}}?)",
+                        ));
+                    }
+                    if target.is_empty() {
+                        return Err(rk_core::Error::other("land step: target resolved to empty"));
+                    }
+                    let result = self.supervisor.land(
+                        std::path::Path::new(repo),
+                        &branch,
+                        &target,
+                        land.keep_branch,
+                    )?;
+                    self.update(id, |i| i.context.previous_result = Some(result.clone()));
+                }
             }
             Ok(Flow::Next)
         })

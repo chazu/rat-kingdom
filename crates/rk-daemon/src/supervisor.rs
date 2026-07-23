@@ -932,6 +932,55 @@ impl Supervisor {
         Ok(json!({"agent": name, "merged": merged, "detail": detail}))
     }
 
+    /// Land a NAMED branch into a target by merging it directly — the explicit
+    /// `{branch, target}` counterpart to [`dismiss`](Self::dismiss), which
+    /// merges an agent's branch into its own base. Names neither an agent nor a
+    /// worktree: it merges through a detached worktree (CAS-safe) and touches no
+    /// live checkout. A merge conflict or a target that moved mid-merge is a
+    /// clean `merged: false`, not an error, so a workflow can gate on the result
+    /// (`evaluate {expect: {merged: true}}`) and retry rather than fail. On a
+    /// successful merge the source branch is deleted unless `keep_branch`;
+    /// deletion is best-effort (a protected or still-checked-out branch is left
+    /// in place and reported `branch_deleted: false`) so it never masks the
+    /// merge that already succeeded.
+    pub fn land(
+        &self,
+        repo_root: &std::path::Path,
+        branch: &str,
+        target: &str,
+        keep_branch: bool,
+    ) -> rk_core::Result<serde_json::Value> {
+        let repo = Repo::discover(repo_root)?;
+        let outcome = repo.merge_branch(branch, target)?;
+        let mut branch_deleted = false;
+        if outcome.merged && !keep_branch {
+            match repo.delete_branch(branch) {
+                Ok(()) => branch_deleted = true,
+                Err(e) => warn!(
+                    branch,
+                    error = %e,
+                    "land: merged but could not delete source branch"
+                ),
+            }
+        }
+        let result = json!({
+            "branch": branch,
+            "target": target,
+            "merged": outcome.merged,
+            "detail": outcome.detail,
+            "branch_deleted": branch_deleted,
+        });
+        self.emit_event(&repo.name(), "branch_landed", result.clone());
+        info!(
+            branch,
+            target,
+            merged = outcome.merged,
+            branch_deleted,
+            "land"
+        );
+        Ok(result)
+    }
+
     pub fn list(&self) -> Vec<AgentRecord> {
         self.lock_registry().list().into_iter().cloned().collect()
     }
