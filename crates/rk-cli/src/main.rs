@@ -54,6 +54,10 @@ enum Command {
     Need(space_cmds::TextArgs),
     /// Advisory claim marking an area you're editing (evaporates on a TTL; sugar; env-autofilled).
     Claim(space_cmds::ClaimArgs),
+    /// Propose a norm for the fleet; peers endorse it, quorum promotes it to a convention (sugar).
+    Suggest(space_cmds::SuggestArgs),
+    /// Endorse a suggestion by id (idempotent; sugar; env-autofilled).
+    Endorse(space_cmds::EndorseArgs),
     /// Spawn a rat to work on a task in an isolated worktree.
     Spawn(agent_cmds::SpawnArgs),
     /// List all agents.
@@ -333,6 +337,8 @@ async fn main() -> Result<()> {
         Command::Obstacle(args) => space_cmds::report(&layout, args, "obstacle", cli.json).await?,
         Command::Need(args) => space_cmds::report(&layout, args, "need", cli.json).await?,
         Command::Claim(args) => space_cmds::claim(&layout, args, cli.json).await?,
+        Command::Suggest(args) => space_cmds::suggest(&layout, args, cli.json).await?,
+        Command::Endorse(args) => space_cmds::endorse(&layout, args, cli.json).await?,
         Command::Spawn(args) => agent_cmds::spawn(&layout, args, cli.json).await?,
         Command::List => agent_cmds::list(&layout, cli.json).await?,
         Command::Inbox => agent_cmds::inbox(&layout, cli.json).await?,

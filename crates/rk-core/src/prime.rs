@@ -32,6 +32,9 @@ from the environment):
   Claims evaporate on a TTL, so re-run it if you are still working there.
 - `rk obstacle \"<text>\"` — record something blocking you, then continue or wind down.
 - `rk need \"<text>\"` — ask the room for help (not directed at anyone).
+- `rk suggest \"<text>\"` — propose a fleet norm; prints a `sug-…` id for peers to endorse.
+- `rk endorse <sug-id>` — back a suggestion (idempotent). At quorum the daemon
+  promotes it to a `convention` automatically — no operator in the loop.
 - `rk out artifact <scope> <name> --payload '<json>'` — record a work product.
 - `rk done [\"summary\"]` — signal completion. MANDATORY final step.
 ";

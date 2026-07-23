@@ -117,6 +117,31 @@ newest existing tuple, so it does **not** react to the entire pre-existing
 backlog at startup. Only tuples that arrive after boot are dispatched. A restart
 resumes from the persisted cursor.
 
+## Built-in reaction: quorum promotion
+
+Beyond firing `#Trigger` workflows, every cycle the reactor runs one built-in
+reaction: promoting fleet **suggestions** into **conventions** at quorum. This is
+the flagship stigmergy loop — proposals become shared norms with no operator in
+the path.
+
+- `rk suggest '<text>'` writes a `Suggestion` (system scope, authored by
+  `RK_AGENT`) and prints a `sug-…` id. It is **Ephemeral** with a voting-window
+  TTL: a proposal that never reaches quorum simply decays.
+- `rk endorse <sug-id>` writes an `Endorsement` keyed by
+  `(identity = suggestion, instance = RK_AGENT)`. Re-endorsing is idempotent —
+  the CLI skips a duplicate, and the reactor counts **distinct** endorsers
+  regardless, so a double vote can never inflate the tally. Endorsements are
+  Ephemeral too and decay with the voting window.
+- Each cycle the reactor recomputes, **by full scan** (never off the lossy feed),
+  the distinct-endorser count per suggestion. At `quorum` it emits a
+  `Convention` (system scope, **Furniture** — permanent, never `in`-consumable)
+  citing the suggestion text and the sorted endorser set. The Convention is its
+  own promote-once guard: a suggestion that already has one is skipped. System-
+  scope Conventions replicate across castles via `rk sync` for free.
+
+Because the count is recomputed by scan at fire time, promotion is robust to
+missed feed events and to endorsements arriving across many cycles.
+
 ## Configuration
 
 ```toml
@@ -127,14 +152,17 @@ window_secs = 60          # rolling window for the per-trigger rate cap
 max_fires = 20            # default per-trigger cap; a #Trigger may lower it
 marker_ttl_secs = 604800  # idempotency-marker lifetime (one week)
 exclude_instances = []    # authors never reacted to, besides "reactor"
+quorum = 3                # distinct endorsers that promote a suggestion; 0 = off
 ```
 
 ## Where it lives
 
 - Schema: `crates/rk-workflow/src/triggers-schema.cue`; loader
   `rk_workflow::load_triggers`.
-- Reactor: `crates/rk-daemon/src/reactor.rs` (`Reactor::run_cycle`), spawned as a
-  loop next to the GC and sync loops in `crates/rk-daemon/src/server.rs`.
+- Reactor: `crates/rk-daemon/src/reactor.rs` (`Reactor::run_cycle`, plus the
+  built-in `Reactor::promote_conventions`), spawned as a loop next to the GC and
+  sync loops in `crates/rk-daemon/src/server.rs`.
+- Suggest/endorse sugar: `crates/rk-cli/src/space_cmds.rs` (`suggest`, `endorse`).
 - Config: `rk_core::config::ReactorConfig`.
 - Tests: `crates/rk-daemon/tests/reactor.rs` (live-daemon fire, idempotency under
   feed loss + cursor reset, re-entrancy/exclusion, rate cap) plus unit tests in

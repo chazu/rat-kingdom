@@ -80,6 +80,24 @@ pub struct ClaimArgs {
     pub ttl: String,
 }
 
+#[derive(Args)]
+pub struct SuggestArgs {
+    /// The proposed norm, in one line (e.g. "always rebase, never merge").
+    pub text: String,
+    /// Voting window before the proposal decays if it misses quorum.
+    #[arg(long, default_value = "24h")]
+    pub ttl: String,
+}
+
+#[derive(Args)]
+pub struct EndorseArgs {
+    /// The suggestion id to endorse (printed by `rk suggest`).
+    pub suggestion: String,
+    /// Voting window before the endorsement decays.
+    #[arg(long, default_value = "24h")]
+    pub ttl: String,
+}
+
 fn parse_duration(s: &str) -> Result<std::time::Duration> {
     let s = s.trim();
     let (num, unit) = s.split_at(s.len().saturating_sub(1));
@@ -284,6 +302,95 @@ pub async fn claim(layout: &Layout, args: ClaimArgs, as_json: bool) -> Result<()
         as_json,
     )
     .await
+}
+
+/// Propose a norm. Writes a `Suggestion` on the system scope authored by this
+/// agent (`instance = RK_AGENT`, so distinct-endorser counting works), mints a
+/// human-scale suggestion id, and prints it so peers can `rk endorse <id>`.
+pub async fn suggest(layout: &Layout, args: SuggestArgs, as_json: bool) -> Result<()> {
+    if args.text.trim().is_empty() {
+        bail!("suggestion text must not be empty");
+    }
+    let agent = env_required("RK_AGENT")?;
+    let ttl = parse_duration(&args.ttl)?;
+    let sug_id = rk_core::id::prefixed_id("sug");
+    let payload = json!({
+        "agent": agent,
+        "task": std::env::var("RK_TASK").ok(),
+        "text": args.text,
+    });
+    let params = json!({
+        "category": "suggestion",
+        "scope": rk_core::tuple::SYSTEM_SCOPE,
+        "identity": sug_id,
+        "instance": agent,
+        "payload": payload,
+        "ttl_secs": ttl.as_secs(),
+    });
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client.call("space.out", params).await?;
+    if as_json {
+        println!("{}", json!({ "suggestion": sug_id, "id": result["id"] }));
+    } else {
+        println!("suggestion {sug_id} recorded — endorse it with `rk endorse {sug_id}`");
+    }
+    Ok(())
+}
+
+/// Vote for a suggestion. Writes an `Endorsement` keyed by
+/// `(identity = suggestion, instance = RK_AGENT)`, so re-endorsing is
+/// idempotent. The reactor counts distinct endorsers and promotes at quorum.
+pub async fn endorse(layout: &Layout, args: EndorseArgs, as_json: bool) -> Result<()> {
+    let agent = env_required("RK_AGENT")?;
+    let ttl = parse_duration(&args.ttl)?;
+    let mut client = Client::connect_or_spawn(layout).await?;
+
+    // Idempotent: one endorsement per (suggestion, agent). A duplicate would not
+    // inflate the reactor's distinct-instance tally anyway, but skipping it keeps
+    // the space clean and the command honest about being a no-op.
+    let existing = client
+        .call(
+            "space.scan",
+            json!({
+                "category": "endorsement",
+                "scope": rk_core::tuple::SYSTEM_SCOPE,
+                "identity": args.suggestion,
+                "instance": agent,
+            }),
+        )
+        .await?;
+    if existing["tuples"]
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+    {
+        if as_json {
+            println!("{}", json!({ "endorsed": args.suggestion, "already": true }));
+        } else {
+            println!("already endorsed {}", args.suggestion);
+        }
+        return Ok(());
+    }
+
+    let payload = json!({
+        "agent": agent,
+        "suggestion": args.suggestion,
+    });
+    let params = json!({
+        "category": "endorsement",
+        "scope": rk_core::tuple::SYSTEM_SCOPE,
+        "identity": args.suggestion,
+        "instance": agent,
+        "payload": payload,
+        "ttl_secs": ttl.as_secs(),
+    });
+    let result = client.call("space.out", params).await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        println!("endorsed {}", args.suggestion);
+    }
+    Ok(())
 }
 
 async fn write_sugar(
