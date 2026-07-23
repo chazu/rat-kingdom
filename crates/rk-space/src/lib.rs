@@ -39,6 +39,47 @@ struct Inner {
     waiters: Vec<Waiter>,
 }
 
+impl Inner {
+    /// Persist `tuple`, offer it to matching waiters, and (if a destructive
+    /// waiter consumed it) delete it again — all under the caller's lock.
+    /// Returns whether the tuple was consumed. Shared by `out` and the
+    /// fresh-write branch of `reinforce` so both agree on wakeup semantics.
+    fn insert_and_offer(&mut self, tuple: &Tuple) -> rk_core::Result<bool> {
+        self.store.insert(tuple)?;
+
+        let mut consumed = false;
+        let consumable = tuple.lifecycle != Lifecycle::Furniture;
+        // Drain-and-retain: offer to every matching rd waiter, and to the first
+        // matching take waiter still listening. Dropped receivers (timed out)
+        // are pruned as we go.
+        let waiters = std::mem::take(&mut self.waiters);
+        for waiter in waiters {
+            let matches = waiter.pattern.matches(tuple);
+            if !matches {
+                self.waiters.push(waiter);
+                continue;
+            }
+            if waiter.destructive {
+                if consumed || !consumable {
+                    self.waiters.push(waiter);
+                    continue;
+                }
+                // On Err the receiver is gone (timed out); drop the waiter.
+                if waiter.tx.send(tuple.clone()).is_ok() {
+                    consumed = true;
+                }
+            } else {
+                // Non-destructive: deliver and drop the waiter (rd is one-shot).
+                let _ = waiter.tx.send(tuple.clone());
+            }
+        }
+        if consumed {
+            self.store.delete(tuple.id)?;
+        }
+        Ok(consumed)
+    }
+}
+
 /// A shared handle to the tuplespace. Cheap to clone.
 #[derive(Clone)]
 pub struct Space {
@@ -71,41 +112,46 @@ impl Space {
     /// before the lock is released; `rd` waiters observing it still get it.
     pub fn out(&self, tuple: Tuple) -> rk_core::Result<()> {
         let mut inner = self.lock();
-        inner.store.insert(&tuple)?;
-
-        let mut consumed = false;
-        let consumable = tuple.lifecycle != Lifecycle::Furniture;
-        // Drain-and-retain: offer to every matching rd waiter, and to the first
-        // matching take waiter still listening. Dropped receivers (timed out)
-        // are pruned as we go.
-        let waiters = std::mem::take(&mut inner.waiters);
-        for waiter in waiters {
-            let matches = waiter.pattern.matches(&tuple);
-            if !matches {
-                inner.waiters.push(waiter);
-                continue;
-            }
-            if waiter.destructive {
-                if consumed || !consumable {
-                    inner.waiters.push(waiter);
-                    continue;
-                }
-                // On Err the receiver is gone (timed out); drop the waiter.
-                if waiter.tx.send(tuple.clone()).is_ok() {
-                    consumed = true;
-                }
-            } else {
-                // Non-destructive: deliver and drop the waiter (rd is one-shot).
-                let _ = waiter.tx.send(tuple.clone());
-            }
-        }
-        if consumed {
-            inner.store.delete(tuple.id)?;
-        }
+        inner.insert_and_offer(&tuple)?;
         drop(inner);
 
         let _ = self.events.send(tuple);
         Ok(())
+    }
+
+    /// Write a pheromone trail with reinforcement: if a trail already exists on
+    /// this exact `(category, scope, identity, instance)` key, refresh it in
+    /// place (new payload, new TTL, strength back to full) instead of appending
+    /// a duplicate — keeping its id and `created_at` stable so sync's
+    /// earliest-claim-wins arbitration is undisturbed. On a first write this is
+    /// just `out`. Returns the surviving tuple (carrying the id that persisted).
+    ///
+    /// Only the RPC write path routes evaporating categories here; in-process
+    /// writers (the supervisor's budget/liveness obstacles) still use `out` and
+    /// remain append-only, so an agent re-stating its own trail never clobbers a
+    /// distinct supervisor-authored one on the same identity.
+    pub fn reinforce(&self, mut tuple: Tuple) -> rk_core::Result<Tuple> {
+        // Reinforcement is authoritative: a written or re-written trail is at
+        // full strength regardless of what the caller passed. GC decays it from
+        // there until the next reinforcement.
+        tuple.strength = Some(rk_core::tuple::FULL_STRENGTH);
+        let mut inner = self.lock();
+        if let Some(id) = inner.store.newest_trail(
+            tuple.category,
+            &tuple.scope,
+            &tuple.identity,
+            &tuple.instance,
+        )? {
+            inner.store.reinforce(id, &tuple)?;
+            drop(inner);
+            tuple.id = id;
+            let _ = self.events.send(tuple.clone());
+            return Ok(tuple);
+        }
+        inner.insert_and_offer(&tuple)?;
+        drop(inner);
+        let _ = self.events.send(tuple.clone());
+        Ok(tuple)
     }
 
     /// Non-blocking read of all matching tuples, oldest first.
@@ -187,9 +233,16 @@ impl Space {
         self.events.subscribe()
     }
 
-    /// Collect expired ephemeral tuples. Returns the number collected.
-    pub fn gc_expired(&self) -> rk_core::Result<usize> {
-        self.lock().store.delete_expired(chrono::Utc::now())
+    /// One garbage-collection pass: decay every pheromone trail by `decay_step`
+    /// and collect the faded (strength `<= 0`) ones, then sweep any hard-TTL
+    /// expiries. Returns the total number collected. The strength decay is the
+    /// smooth fade; the TTL sweep is the backstop for tuples that carry an
+    /// `expires_at` but no strength (e.g. suggestions, endorsements).
+    pub fn gc_expired(&self, decay_step: f64) -> rk_core::Result<usize> {
+        let inner = self.lock();
+        let faded = inner.store.decay_and_collect(decay_step)?;
+        let expired = inner.store.delete_expired(chrono::Utc::now())?;
+        Ok(faded + expired)
     }
 
     pub fn count(&self) -> rk_core::Result<u64> {
@@ -213,6 +266,13 @@ mod tests {
 
     fn event(identity: &str, payload: serde_json::Value) -> Tuple {
         Tuple::new(Category::Event, "repo", identity, "castle", payload)
+    }
+
+    fn claim(area: &str, agent: &str, strength: f64) -> Tuple {
+        let mut t = Tuple::new(Category::Claim, "repo", area, agent, json!({}))
+            .with_lifecycle(Lifecycle::Ephemeral);
+        t.strength = Some(strength);
+        t
     }
 
     const SHORT: Duration = Duration::from_millis(200);
@@ -361,6 +421,72 @@ mod tests {
             .await
             .unwrap();
         assert!(got.is_some(), "tuple survived the dead waiter");
+    }
+
+    #[test]
+    fn reinforce_upserts_same_key_and_resets_strength() {
+        let space = Space::open_in_memory().unwrap();
+        let first = space
+            .reinforce(claim("src/lib.rs", "Nibbles", 1.0))
+            .unwrap();
+
+        // Same (category, scope, identity, instance): a decayed-then-reinforced
+        // trail refreshes in place — one row, same id, strength back to full.
+        let mut decayed = claim("src/lib.rs", "Nibbles", 0.2);
+        decayed.payload = json!({"note": "refreshed"});
+        let second = space.reinforce(decayed).unwrap();
+
+        assert_eq!(second.id, first.id, "reinforcement keeps the original id");
+        let rows = space.scan(&Pattern::category(Category::Claim)).unwrap();
+        assert_eq!(rows.len(), 1, "no duplicate trail");
+        assert_eq!(rows[0].strength, Some(1.0));
+        assert_eq!(rows[0].payload, json!({"note": "refreshed"}));
+    }
+
+    #[test]
+    fn reinforce_distinct_agents_do_not_collide() {
+        let space = Space::open_in_memory().unwrap();
+        space.reinforce(claim("area", "Nibbles", 1.0)).unwrap();
+        space.reinforce(claim("area", "Whisker", 1.0)).unwrap();
+        // Different instance (agent) => different key => two separate trails.
+        assert_eq!(
+            space
+                .scan(&Pattern::category(Category::Claim))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn reinforce_fresh_write_wakes_a_waiter() {
+        let space = Space::open_in_memory().unwrap();
+        let s2 = space.clone();
+        let waiter =
+            tokio::spawn(async move { s2.rd(&Pattern::default().identity("area"), LONG).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        space.reinforce(claim("area", "Nibbles", 1.0)).unwrap();
+        assert!(
+            waiter.await.unwrap().unwrap().is_some(),
+            "waiter woken by reinforce"
+        );
+    }
+
+    #[test]
+    fn gc_decays_then_collects_faded_trails() {
+        let space = Space::open_in_memory().unwrap();
+        // Seed strengths directly via `out` (reinforce would reset to full).
+        space.out(claim("bright", "Nibbles", 1.0)).unwrap();
+        space.out(claim("faint", "Nibbles", 0.05)).unwrap();
+
+        // One decay step of 0.1: the faint trail crosses zero and is collected;
+        // the bright one survives with reduced strength.
+        let collected = space.gc_expired(0.1).unwrap();
+        assert_eq!(collected, 1);
+        let rows = space.scan(&Pattern::category(Category::Claim)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].identity, "bright");
+        assert!((rows[0].strength.unwrap() - 0.9).abs() < 1e-9);
     }
 
     #[tokio::test]

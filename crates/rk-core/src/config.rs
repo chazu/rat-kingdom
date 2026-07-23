@@ -16,6 +16,7 @@ pub struct Config {
     pub sync: SyncConfig,
     pub reactor: ReactorConfig,
     pub supervisor: SupervisorConfig,
+    pub evaporation: EvaporationConfig,
     /// Named agent profiles: [agents.<name>] harness/model/permission_mode.
     /// The "default" profile applies to all spawns that name no profile.
     pub agents: std::collections::HashMap<String, AgentProfileConfig>,
@@ -127,6 +128,25 @@ impl Default for SupervisorConfig {
             burn_usd_per_min: 0.0,
             kill_grace_secs: 600,
         }
+    }
+}
+
+/// Pheromone evaporation: how fast a refreshable trail (claim / obstacle / need)
+/// loses strength when its author stops reinforcing it. Each GC cycle subtracts
+/// `decay` from every trail's strength (starting at `FULL_STRENGTH` = 1.0) and
+/// collects it at zero. With the 60s GC cadence the default `decay` gives an
+/// unreinforced lifetime of ~30 minutes, matching the default claim TTL, so a
+/// live agent's trail is unaffected while an abandoned one fades on its own.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct EvaporationConfig {
+    pub decay: f64,
+}
+
+impl Default for EvaporationConfig {
+    fn default() -> Self {
+        // ~30 GC cycles (60s each) to fade from full → ~30 min.
+        Self { decay: 1.0 / 30.0 }
     }
 }
 

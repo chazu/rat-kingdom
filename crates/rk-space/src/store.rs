@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use rk_core::id::RecordId;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
 use rk_core::Error;
-use rusqlite::{params_from_iter, Connection, Row};
+use rusqlite::{params_from_iter, Connection, OptionalExtension, Row};
 use std::path::Path;
 
 pub(crate) struct Store {
@@ -28,13 +28,28 @@ CREATE TABLE IF NOT EXISTS tuples (
     lifecycle  TEXT NOT NULL,
     payload    TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    expires_at TEXT
+    expires_at TEXT,
+    strength   REAL
 );
 CREATE INDEX IF NOT EXISTS idx_tuples_prefix
     ON tuples (category, scope, identity, instance);
 CREATE INDEX IF NOT EXISTS idx_tuples_expiry
     ON tuples (expires_at) WHERE expires_at IS NOT NULL;
 ";
+
+/// Bring an older DB up to the current schema. `CREATE TABLE IF NOT EXISTS`
+/// leaves an already-created table untouched, so a DB from before `strength`
+/// existed needs an explicit `ALTER` (the duplicate-column error on an
+/// up-to-date DB is expected and swallowed). The strength index is created here,
+/// after the column is guaranteed to exist, so it cannot fail the initial batch
+/// on a pre-`strength` database.
+fn migrate(conn: &Connection) {
+    let _ = conn.execute("ALTER TABLE tuples ADD COLUMN strength REAL", []);
+    let _ = conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_tuples_strength
+             ON tuples (strength) WHERE strength IS NOT NULL;",
+    );
+}
 
 impl Store {
     pub fn open(path: &Path) -> rk_core::Result<Self> {
@@ -44,12 +59,14 @@ impl Store {
         conn.pragma_update(None, "busy_timeout", 5000)
             .map_err(sql_err)?;
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
+        migrate(&conn);
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> rk_core::Result<Self> {
         let conn = Connection::open_in_memory().map_err(sql_err)?;
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
+        migrate(&conn);
         Ok(Self { conn })
     }
 
@@ -57,8 +74,8 @@ impl Store {
         self.conn
             .execute(
                 "INSERT INTO tuples
-                 (id, category, scope, identity, instance, lifecycle, payload, created_at, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (id, category, scope, identity, instance, lifecycle, payload, created_at, expires_at, strength)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     tuple.id.to_string(),
                     tuple.category.as_str(),
@@ -69,6 +86,7 @@ impl Store {
                     tuple.payload.to_string(),
                     tuple.created_at.to_rfc3339(),
                     tuple.expires_at.map(|t| t.to_rfc3339()),
+                    tuple.strength,
                 ],
             )
             .map_err(sql_err)?;
@@ -106,7 +124,7 @@ impl Store {
         limit: Option<usize>,
     ) -> rk_core::Result<Vec<Tuple>> {
         let mut sql = String::from(
-            "SELECT id, category, scope, identity, instance, lifecycle, payload, created_at, expires_at
+            "SELECT id, category, scope, identity, instance, lifecycle, payload, created_at, expires_at, strength
              FROM tuples WHERE 1=1",
         );
         let mut args: Vec<String> = Vec::new();
@@ -162,6 +180,72 @@ impl Store {
         Ok(n)
     }
 
+    /// The id of the newest existing pheromone trail on this exact
+    /// `(category, scope, identity, instance)` key, if any. Reinforcement
+    /// refreshes that row in place rather than appending a duplicate; keeping
+    /// the id stable also preserves earliest-claim-wins arbitration in sync.
+    pub fn newest_trail(
+        &self,
+        category: Category,
+        scope: &str,
+        identity: &str,
+        instance: &str,
+    ) -> rk_core::Result<Option<RecordId>> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM tuples
+                 WHERE category = ?1 AND scope = ?2 AND identity = ?3 AND instance = ?4
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![category.as_str(), scope, identity, instance],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        Ok(id.and_then(|s| s.parse().ok()))
+    }
+
+    /// Reinforce an existing trail in place: refresh its payload, TTL, and
+    /// lifecycle, and reset strength to `strength`. The id and `created_at`
+    /// stay put so downstream arbitration still sees the original claim.
+    pub fn reinforce(&self, id: RecordId, tuple: &Tuple) -> rk_core::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE tuples SET lifecycle = ?2, payload = ?3, expires_at = ?4, strength = ?5
+                 WHERE id = ?1",
+                rusqlite::params![
+                    id.to_string(),
+                    lifecycle_str(tuple.lifecycle),
+                    tuple.payload.to_string(),
+                    tuple.expires_at.map(|t| t.to_rfc3339()),
+                    tuple.strength,
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(())
+    }
+
+    /// Decay every pheromone trail by `step`, then collect the ones that have
+    /// faded to nothing (strength `<= 0`). Returns how many were collected.
+    /// This is the smooth-fade half of GC: a trail its author stopped
+    /// refreshing loses strength each cycle until it evaporates.
+    pub fn decay_and_collect(&self, step: f64) -> rk_core::Result<usize> {
+        self.conn
+            .execute(
+                "UPDATE tuples SET strength = strength - ?1 WHERE strength IS NOT NULL",
+                [step],
+            )
+            .map_err(sql_err)?;
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM tuples WHERE strength IS NOT NULL AND strength <= 0",
+                [],
+            )
+            .map_err(sql_err)?;
+        Ok(n)
+    }
+
     pub fn count(&self) -> rk_core::Result<u64> {
         self.conn
             .query_row("SELECT COUNT(*) FROM tuples", [], |r| r.get(0))
@@ -198,6 +282,7 @@ fn row_to_tuple(row: &Row<'_>) -> rusqlite::Result<Tuple> {
     let payload: String = row.get(6)?;
     let created_at: String = row.get(7)?;
     let expires_at: Option<String> = row.get(8)?;
+    let strength: Option<f64> = row.get(9)?;
 
     Ok(Tuple {
         id: id.parse().unwrap_or_default(),
@@ -213,6 +298,7 @@ fn row_to_tuple(row: &Row<'_>) -> rusqlite::Result<Tuple> {
         expires_at: expires_at
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|t| t.with_timezone(&Utc)),
+        strength,
     })
 }
 
@@ -332,5 +418,118 @@ mod tests {
         let left = store.query(&Pattern::default(), false, None).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].identity, "new");
+    }
+
+    fn trail(identity: &str, instance: &str, strength: f64) -> Tuple {
+        let mut t = Tuple::new(Category::Claim, "repo", identity, instance, json!({}))
+            .with_lifecycle(Lifecycle::Ephemeral);
+        t.strength = Some(strength);
+        t
+    }
+
+    #[test]
+    fn strength_persists_through_insert_and_query() {
+        let store = Store::open_in_memory().unwrap();
+        let t = trail("area", "rat", 1.0);
+        store.insert(&t).unwrap();
+        let got = store.query(&Pattern::default(), false, None).unwrap();
+        assert_eq!(got[0].strength, Some(1.0));
+    }
+
+    #[test]
+    fn reinforce_refreshes_in_place_keeping_id() {
+        let store = Store::open_in_memory().unwrap();
+        let mut original = trail("area", "rat", 0.3);
+        original.expires_at = Some(Utc::now() + chrono::Duration::seconds(10));
+        store.insert(&original).unwrap();
+
+        // Same key: newest_trail finds it, reinforce refreshes strength/payload/TTL.
+        let found = store
+            .newest_trail(Category::Claim, "repo", "area", "rat")
+            .unwrap();
+        assert_eq!(found, Some(original.id));
+
+        let mut refreshed = trail("area", "rat", 1.0);
+        refreshed.payload = json!({"note": "still working"});
+        refreshed.expires_at = Some(Utc::now() + chrono::Duration::seconds(600));
+        store.reinforce(original.id, &refreshed).unwrap();
+
+        let rows = store.query(&Pattern::default(), false, None).unwrap();
+        assert_eq!(rows.len(), 1, "reinforcement does not duplicate");
+        assert_eq!(rows[0].id, original.id, "id is preserved for arbitration");
+        assert_eq!(rows[0].strength, Some(1.0));
+        assert_eq!(rows[0].payload, json!({"note": "still working"}));
+    }
+
+    #[test]
+    fn newest_trail_none_for_unknown_key() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(
+            store
+                .newest_trail(Category::Claim, "repo", "nope", "rat")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn opens_and_upgrades_a_pre_strength_database() {
+        // Simulate a DB created before the `strength` column existed: the old
+        // table shape and the two original indexes, no strength column/index.
+        let dir = std::env::temp_dir().join(format!("rk-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("space.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tuples (
+                     id TEXT PRIMARY KEY, category TEXT NOT NULL, scope TEXT NOT NULL,
+                     identity TEXT NOT NULL, instance TEXT NOT NULL, lifecycle TEXT NOT NULL,
+                     payload TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT);
+                 INSERT INTO tuples VALUES
+                     ('01', 'fact', 'repo', 'old', 'castle', 'session', '{}', '2020-01-01T00:00:00Z', NULL);",
+            )
+            .unwrap();
+        }
+
+        // Opening runs migrate(): the ALTER + strength index must succeed, the
+        // pre-existing row survives with a NULL strength, and new writes work.
+        let store = Store::open(&path).unwrap();
+        let rows = store.query(&Pattern::default(), false, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].strength, None);
+        store.insert(&trail("area", "rat", 1.0)).unwrap();
+        assert_eq!(store.decay_and_collect(0.5).unwrap(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn decay_reduces_strength_and_collects_at_zero() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&trail("faint", "rat", 0.05)).unwrap();
+        store.insert(&trail("bright", "rat", 1.0)).unwrap();
+        // A non-evaporating tuple (strength NULL) must be untouched by decay.
+        store
+            .insert(&Tuple::new(
+                Category::Fact,
+                "repo",
+                "f",
+                "castle",
+                json!({}),
+            ))
+            .unwrap();
+
+        let collected = store.decay_and_collect(0.1).unwrap();
+        assert_eq!(
+            collected, 1,
+            "the faint trail faded to <= 0 and was collected"
+        );
+
+        let rows = store.query(&Pattern::default(), false, None).unwrap();
+        assert_eq!(rows.len(), 2);
+        let bright = rows.iter().find(|t| t.identity == "bright").unwrap();
+        assert!((bright.strength.unwrap() - 0.9).abs() < 1e-9);
+        let fact = rows.iter().find(|t| t.identity == "f").unwrap();
+        assert_eq!(fact.strength, None, "non-trail strength stays NULL");
     }
 }

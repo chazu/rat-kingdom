@@ -391,6 +391,7 @@ fn with_payload(existing: Tuple, payload: Value) -> Tuple {
         payload,
         created_at: existing.created_at,
         expires_at: existing.expires_at,
+        strength: existing.strength,
     }
 }
 

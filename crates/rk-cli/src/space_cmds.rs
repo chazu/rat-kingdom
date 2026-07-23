@@ -264,7 +264,10 @@ pub async fn done(layout: &Layout, args: DoneArgs, as_json: bool) -> Result<()> 
     if let Some(summary) = args.summary {
         payload["summary"] = json!(summary);
     }
-    write_sugar(layout, "event", &repo, "task_done", payload, None, as_json).await
+    write_sugar(
+        layout, "event", &repo, "task_done", None, payload, None, as_json,
+    )
+    .await
 }
 
 pub async fn report(layout: &Layout, args: TextArgs, category: &str, as_json: bool) -> Result<()> {
@@ -278,14 +281,30 @@ pub async fn report(layout: &Layout, args: TextArgs, category: &str, as_json: bo
         "task": std::env::var("RK_TASK").ok(),
         "text": args.text,
     });
-    write_sugar(layout, category, &repo, &agent, payload, None, as_json).await
+    // instance = agent so a rat's own re-stated obstacle/need reinforces its
+    // one trail, and never collides with a supervisor-authored obstacle on the
+    // same identity (those keep instance = castle). TTL/strength are defaulted
+    // by the daemon for evaporating categories.
+    write_sugar(
+        layout,
+        category,
+        &repo,
+        &agent,
+        Some(&agent),
+        payload,
+        None,
+        as_json,
+    )
+    .await
 }
 
 pub async fn claim(layout: &Layout, args: ClaimArgs, as_json: bool) -> Result<()> {
     let agent = env_required("RK_AGENT")?;
     let repo = env_required("RK_REPO")?;
     // Claims are advisory trails, not locks: written Ephemeral so an abandoned
-    // claim evaporates on its TTL instead of becoming a permanent no-go zone.
+    // claim evaporates instead of becoming a permanent no-go zone. Re-claiming
+    // the same area reinforces the trail (keyed on identity=area, instance=agent)
+    // — refreshing its TTL and strength rather than piling up duplicates.
     let ttl = parse_duration(&args.ttl)?;
     let payload = json!({
         "agent": agent,
@@ -297,6 +316,7 @@ pub async fn claim(layout: &Layout, args: ClaimArgs, as_json: bool) -> Result<()
         "claim",
         &repo,
         &args.area,
+        Some(&agent),
         payload,
         Some(ttl.as_secs()),
         as_json,
@@ -393,11 +413,13 @@ pub async fn endorse(layout: &Layout, args: EndorseArgs, as_json: bool) -> Resul
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_sugar(
     layout: &Layout,
     category: &str,
     scope: &str,
     identity: &str,
+    instance: Option<&str>,
     payload: Value,
     ttl_secs: Option<u64>,
     as_json: bool,
@@ -408,6 +430,9 @@ async fn write_sugar(
         "identity": identity,
         "payload": payload,
     });
+    if let Some(inst) = instance {
+        params["instance"] = json!(inst);
+    }
     if let Some(ttl) = ttl_secs {
         params["ttl_secs"] = json!(ttl);
     }
