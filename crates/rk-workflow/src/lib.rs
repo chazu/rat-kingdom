@@ -22,6 +22,10 @@ pub struct Workflow {
     pub params: HashMap<String, Param>,
     #[serde(default)]
     pub agents: HashMap<String, AgentProfile>,
+    /// Per-workflow cost-tier routing, taking precedence over the global
+    /// `[tiers]` table for this workflow's fan-out spawns.
+    #[serde(default)]
+    pub tiers: TierRouting,
     pub steps: Vec<Step>,
     #[serde(default)]
     pub aspects: Vec<Aspect>,
@@ -50,6 +54,57 @@ pub struct AgentProfile {
     pub model: Option<String>,
     #[serde(default)]
     pub permission_mode: Option<String>,
+}
+
+/// One cost-tier routing rule: when a ticket's metadata satisfies the (AND'd)
+/// predicate, its spawn resolves against the named tier — an agent profile like
+/// any other (`[agents.<tier>]` global, or a workflow `agents:` entry). An empty
+/// predicate (`priority` and `label` both unset) is an unconditional catch-all,
+/// useful as a trailing fallback rule.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TierRule {
+    /// Match when the ticket's `priority` equals this (unset = any priority).
+    #[serde(default)]
+    pub priority: Option<String>,
+    /// Match when the ticket's `labels` contain this (unset = any labels).
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Agent-profile name to resolve the spawn against when this rule matches.
+    pub tier: String,
+}
+
+/// An ordered cost-tier routing table mapping ticket labels/priority to a tier
+/// (an agent profile). Cheap tiers for bounded/mechanical tickets, premium tiers
+/// for hard ones — so a fixed budget runs a wider fleet. First matching rule
+/// wins; earlier rules (e.g. a per-workflow table) shadow later ones (global).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TierRouting {
+    #[serde(default)]
+    pub rules: Vec<TierRule>,
+}
+
+impl TierRouting {
+    /// The tier name for a ticket, or `None` when no rule matches (resolution
+    /// then falls through to the ordinary profile layers, unchanged).
+    pub fn route(&self, labels: &[String], priority: Option<&str>) -> Option<&str> {
+        self.rules
+            .iter()
+            .find(|r| {
+                r.priority.as_deref().is_none_or(|p| priority == Some(p))
+                    && r.label
+                        .as_deref()
+                        .is_none_or(|l| labels.iter().any(|x| x == l))
+            })
+            .map(|r| r.tier.as_str())
+    }
+
+    /// This table's rules followed by `fallback`'s — so a per-workflow table's
+    /// rules take precedence over the global ones without a deep merge.
+    pub fn chained(&self, fallback: &TierRouting) -> TierRouting {
+        TierRouting {
+            rules: self.rules.iter().chain(&fallback.rules).cloned().collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -592,6 +647,64 @@ fn step_matches(step: &Step, matcher: &AspectMatch) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn rule(priority: Option<&str>, label: Option<&str>, tier: &str) -> TierRule {
+        TierRule {
+            priority: priority.map(String::from),
+            label: label.map(String::from),
+            tier: tier.into(),
+        }
+    }
+
+    #[test]
+    fn tier_routing_first_match_wins() {
+        let routing = TierRouting {
+            rules: vec![
+                rule(None, Some("mechanical"), "cheap"),
+                rule(Some("high"), None, "premium"),
+                rule(None, None, "normal"), // catch-all fallback
+            ],
+        };
+        // Label match takes the first rule even though priority would match the
+        // second — first match wins.
+        assert_eq!(
+            routing.route(&["mechanical".into()], Some("high")),
+            Some("cheap")
+        );
+        assert_eq!(routing.route(&[], Some("high")), Some("premium"));
+        // No label/priority match falls to the catch-all.
+        assert_eq!(routing.route(&[], Some("low")), Some("normal"));
+    }
+
+    #[test]
+    fn tier_routing_no_match_is_none() {
+        let routing = TierRouting {
+            rules: vec![rule(Some("high"), None, "premium")],
+        };
+        assert_eq!(routing.route(&["x".into()], Some("low")), None);
+        assert_eq!(TierRouting::default().route(&[], Some("high")), None);
+    }
+
+    #[test]
+    fn tier_routing_chained_prefers_own_rules() {
+        let global = TierRouting {
+            rules: vec![rule(Some("high"), None, "global-premium")],
+        };
+        let wf = TierRouting {
+            rules: vec![rule(Some("high"), None, "wf-premium")],
+        };
+        // The workflow's rule shadows the global one for the same predicate.
+        assert_eq!(
+            wf.chained(&global).route(&[], Some("high")),
+            Some("wf-premium")
+        );
+        // Global rules still apply where the workflow has none.
+        let wf_empty = TierRouting::default();
+        assert_eq!(
+            wf_empty.chained(&global).route(&[], Some("high")),
+            Some("global-premium")
+        );
+    }
 
     const SAMPLE: &str = r#"
 workflow: {

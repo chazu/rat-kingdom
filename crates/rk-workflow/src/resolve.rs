@@ -2,14 +2,17 @@
 //!
 //! Field-wise, most specific wins:
 //! 1. inline step overrides (`harness:`/`model:`/`permission_mode:`)
-//! 2. the step's named profile in the workflow's `agents:`
-//! 3. the same-named profile in global config `[agents.<name>]`
-//! 4. the workflow's `agents.default` profile
-//! 5. global `[agents.default]`
-//! 6. global `[harness] default` for the harness kind
+//! 2. the tier profile a routing rule selected from the ticket's labels/priority
+//! 3. the step's named profile in the workflow's `agents:`
+//! 4. the same-named profile in global config `[agents.<name>]`
+//! 5. the workflow's `agents.default` profile
+//! 6. global `[agents.default]`
+//! 7. global `[harness] default` for the harness kind
 //!
-//! A step naming a profile that exists nowhere is an error (silent fallback
-//! would mask typos).
+//! A step (or tier rule) naming a profile that exists nowhere is an error
+//! (silent fallback would mask typos). The tier layer sits just below inline
+//! overrides so cost-routing beats the static profile defaults, yet an explicit
+//! `model:`/`harness:` on the step still wins.
 
 use crate::{AgentProfile, SpawnStep};
 use std::collections::HashMap;
@@ -29,6 +32,7 @@ pub fn resolve(
 ) -> rk_core::Result<ResolvedAgent> {
     resolve_fields(
         step.agent.as_deref(),
+        None,
         step.harness.as_deref(),
         step.model.as_deref(),
         step.permission_mode.as_deref(),
@@ -44,6 +48,7 @@ pub fn resolve(
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_fields(
     agent: Option<&str>,
+    tier: Option<&str>,
     step_harness: Option<&str>,
     step_model: Option<&str>,
     step_permission_mode: Option<&str>,
@@ -59,12 +64,15 @@ pub fn resolve_fields(
     if let Some(p) = workflow_agents.get("default") {
         layers.push(p);
     }
-    if let Some(name) = &agent {
-        let global_named = global_agents.get(*name);
-        let workflow_named = workflow_agents.get(*name);
+    // The named-profile layer, then the tier layer above it: a routing rule's
+    // tier overrides the step's static profile, but inline overrides still win.
+    for (kind, name) in [("agent profile", agent), ("tier profile", tier)] {
+        let Some(name) = name else { continue };
+        let global_named = global_agents.get(name);
+        let workflow_named = workflow_agents.get(name);
         if global_named.is_none() && workflow_named.is_none() {
             return Err(rk_core::Error::other(format!(
-                "unknown agent profile '{name}' (not in workflow agents nor global [agents])"
+                "unknown {kind} '{name}' (not in workflow agents nor global [agents])"
             )));
         }
         if let Some(p) = global_named {
@@ -187,6 +195,65 @@ mod tests {
             Some("haiku"),
             "model from workflow layer"
         );
+    }
+
+    #[test]
+    fn tier_layer_beats_named_profile_but_loses_to_inline() {
+        let global = HashMap::from([
+            ("default".into(), profile(Some("claude"), Some("opus"))),
+            ("cheap".into(), profile(Some("axe"), Some("haiku"))),
+            ("premium".into(), profile(Some("claude"), Some("opus"))),
+        ]);
+        // Step names the `premium` profile, but a routing rule selected `cheap`;
+        // the tier wins over the named profile.
+        let resolved = resolve_fields(
+            Some("premium"),
+            Some("cheap"),
+            None,
+            None,
+            None,
+            &HashMap::new(),
+            &global,
+            "fake",
+        )
+        .unwrap();
+        assert_eq!(resolved.harness, "axe", "tier harness beats named profile");
+        assert_eq!(resolved.model.as_deref(), Some("haiku"));
+
+        // An inline model override still beats the tier.
+        let resolved = resolve_fields(
+            None,
+            Some("cheap"),
+            None,
+            Some("sonnet"),
+            None,
+            &HashMap::new(),
+            &global,
+            "fake",
+        )
+        .unwrap();
+        assert_eq!(resolved.harness, "axe", "tier harness applies");
+        assert_eq!(
+            resolved.model.as_deref(),
+            Some("sonnet"),
+            "inline model wins"
+        );
+    }
+
+    #[test]
+    fn unknown_tier_is_an_error() {
+        let err = resolve_fields(
+            None,
+            Some("nope"),
+            None,
+            None,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            "claude",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown tier profile 'nope'"));
     }
 
     #[test]

@@ -30,6 +30,11 @@ workflow: #Workflow
 	// config, then to the global default harness.
 	agents: [string]: #AgentProfile
 
+	// Cost-tier routing: map ticket labels/priority to a tier (an agent profile
+	// name) for this workflow's fan-out spawns. Takes precedence over the global
+	// [tiers] table; see #TierRouting.
+	tiers?: #TierRouting
+
 	// Steps run in sequence. At least one required.
 	steps: [...#Step] & [_, ...]
 
@@ -49,6 +54,21 @@ workflow: #Workflow
 	harness?:         "claude" | "codex" | "axe" | "fake"
 	model?:           string
 	permission_mode?: string
+}
+
+// Cost-tier routing table: an ordered list of rules mapping a ticket's
+// labels/priority to a tier — the name of an agent profile (`agents.<tier>`
+// here, or global `[agents.<tier>]`). First matching rule wins.
+#TierRouting: {
+	rules: [...#TierRule]
+}
+
+// One routing rule. `priority`/`label` are AND'd; either unset means "any".
+// Both unset is an unconditional catch-all (handy as the last rule).
+#TierRule: {
+	priority?: string
+	label?:    string
+	tier:      string
 }
 
 #Aspect: {

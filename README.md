@@ -175,6 +175,13 @@ model = "sonnet"
 harness = "codex"
 model = "gpt-5.5-codex"
 
+[[tiers.rules]]                  # cost-tier routing: ticket labels/priority ->
+label = "mechanical"             # a tier (an [agents.<tier>] profile name).
+tier = "cheap"                   # First matching rule wins; a fan-out spawn
+[[tiers.rules]]                  # resolves its tier just below inline overrides.
+priority = "high"                # A workflow's own `tiers:` field shadows these.
+tier = "default"                 # A rule with no label/priority is the fallback.
+
 [budget]                         # per-agent caps; 0 = unlimited
 max_usd = 5.0
 max_tokens = 0
@@ -249,9 +256,10 @@ workflow: {
   `{{ctx.activeAgent}}`, `{{ctx.activeBranch}}`, `{{ctx.previousResult}}`
   resolve at execution time.
 - **Model/harness resolution**, most specific wins per field: inline step
-  overrides → step's named profile (workflow `agents`, then global
-  `[agents.<name>]`) → workflow `agents.default` → global `[agents.default]`
-  → `[harness] default`. Unknown profile names are errors.
+  overrides → the tier a routing rule picked from the ticket's labels/priority
+  (`[tiers]` / workflow `tiers:`) → step's named profile (workflow `agents`, then
+  global `[agents.<name>]`) → workflow `agents.default` → global `[agents.default]`
+  → `[harness] default`. Unknown profile/tier names are errors.
 - Spawn steps inside a workflow base their worktrees on the previous agent's
   branch (`ctx.activeBranch`), which is how a reviewer sees the rat's work.
 

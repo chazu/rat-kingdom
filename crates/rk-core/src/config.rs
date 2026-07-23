@@ -19,6 +19,10 @@ pub struct Config {
     /// Named agent profiles: [agents.<name>] harness/model/permission_mode.
     /// The "default" profile applies to all spawns that name no profile.
     pub agents: std::collections::HashMap<String, AgentProfileConfig>,
+    /// Cost-tier routing: map ticket labels/priority to an agent-profile name.
+    /// Drives fan-out spawns onto cheap or premium tiers so a fixed budget runs
+    /// a wider fleet. See [`TierRoutingConfig`].
+    pub tiers: TierRoutingConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -27,6 +31,25 @@ pub struct AgentProfileConfig {
     pub harness: Option<String>,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
+}
+
+/// Global cost-tier routing table: `[[tiers.rules]]` in config.toml. Each rule
+/// maps a ticket's labels/priority to a `tier` (an `[agents.<tier>]` profile
+/// name). First matching rule wins.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TierRoutingConfig {
+    pub rules: Vec<TierRuleConfig>,
+}
+
+/// One tier routing rule. `priority` and `label` are AND'd; either unset means
+/// "any". Both unset is an unconditional catch-all.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TierRuleConfig {
+    pub priority: Option<String>,
+    pub label: Option<String>,
+    pub tier: String,
 }
 
 /// Multiplayer sync via git notes in the RK_HOME state repo.
@@ -238,6 +261,42 @@ mod tests {
         let cfg = Config::load(&file).unwrap();
         assert_eq!(cfg.castle_name.as_deref(), Some("burrow"));
         assert_eq!(cfg.log.filter, "debug");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tier_rules_parse_from_toml() {
+        let dir = std::env::temp_dir().join(format!("rk-cfg-tiers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        std::fs::write(
+            &file,
+            r#"
+[agents.cheap]
+harness = "axe"
+model = "haiku"
+
+[[tiers.rules]]
+label = "mechanical"
+tier = "cheap"
+
+[[tiers.rules]]
+priority = "high"
+tier = "premium"
+
+[[tiers.rules]]
+tier = "cheap"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&file).unwrap();
+        assert_eq!(cfg.tiers.rules.len(), 3);
+        assert_eq!(cfg.tiers.rules[0].label.as_deref(), Some("mechanical"));
+        assert_eq!(cfg.tiers.rules[0].tier, "cheap");
+        assert_eq!(cfg.tiers.rules[1].priority.as_deref(), Some("high"));
+        // A rule with neither predicate is the catch-all fallback.
+        assert_eq!(cfg.tiers.rules[2].priority, None);
+        assert_eq!(cfg.tiers.rules[2].label, None);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
