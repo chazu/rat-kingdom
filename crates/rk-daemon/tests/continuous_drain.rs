@@ -90,6 +90,7 @@ async fn continuous_drain_refills_up_to_wip_and_never_exceeds_it() {
         max_wip: 2,
         interval_secs: 1,
         repo: None,
+        repos: std::collections::HashMap::new(),
         aging_secs: 3600,
     });
     tokio::spawn(daemon.run());
@@ -153,7 +154,7 @@ async fn continuous_drain_refills_up_to_wip_and_never_exceeds_it() {
 
     assert!(all_done, "all five ready tickets should be drained to done");
     assert!(
-        peak_live >= 1 && peak_live <= 2,
+        (1..=2).contains(&peak_live),
         "WIP cap of 2 must hold: peak live was {peak_live}"
     );
 
@@ -174,4 +175,156 @@ async fn continuous_drain_refills_up_to_wip_and_never_exceeds_it() {
     assert_eq!(orphan["tickets"][0]["payload"]["status"], "open");
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+/// Cross-repo WIP partitioning: the `repos` map is an allowlist whose per-repo
+/// caps subdivide the fleet-wide ceiling, so one busy repo cannot monopolize the
+/// fleet. Two allowlisted repos are each capped at one live rat; a third
+/// registered-but-unlisted repo is never drained. Asserts:
+///   - neither allowlisted repo ever holds more than its cap of 1 rat live;
+///   - both allowlisted repos' backlogs drain to `done` (fair progress);
+///   - the unlisted repo's tickets stay open (allowlist excludes it).
+#[tokio::test]
+async fn partition_caps_hold_per_repo_and_allowlist_excludes_unlisted() {
+    let home = tempfile::tempdir().unwrap();
+    let make_repo = || {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let name = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        (dir, name)
+    };
+    let (alpha_dir, alpha) = make_repo();
+    let (beta_dir, beta) = make_repo();
+    let (gamma_dir, gamma) = make_repo();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", SLOW_FAKE);
+    let layout = Layout::at(home.path());
+    let space = Space::open_in_memory().unwrap();
+    let mut daemon = Daemon::with_space_for_tests(
+        layout.clone(),
+        "test-castle".into(),
+        "fake".into(),
+        Budget::default(),
+        space,
+    )
+    .unwrap();
+    // Fleet ceiling of 4 would let either repo run away on its own; the per-repo
+    // cap of 1 is what must bind. Gamma is deliberately absent from the map, so
+    // the allowlist excludes it entirely.
+    let mut repos = std::collections::HashMap::new();
+    repos.insert(
+        alpha.clone(),
+        rk_core::config::RepoDrainConfig {
+            enabled: true,
+            max_wip: 1,
+        },
+    );
+    repos.insert(
+        beta.clone(),
+        rk_core::config::RepoDrainConfig {
+            enabled: true,
+            max_wip: 1,
+        },
+    );
+    daemon.set_drain_config(DrainConfig {
+        enabled: true,
+        max_wip: 4,
+        interval_secs: 1,
+        repo: None,
+        repos,
+        aging_secs: 3600,
+    });
+    tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    for (name, dir) in [
+        (&alpha, &alpha_dir),
+        (&beta, &beta_dir),
+        (&gamma, &gamma_dir),
+    ] {
+        client
+            .call(
+                "repo.add",
+                json!({"name": name, "path": dir.path().to_string_lossy()}),
+            )
+            .await
+            .unwrap();
+        for i in 0..3 {
+            client
+                .call(
+                    "ticket.new",
+                    json!({"title": format!("{name} task {i}"), "body": "do it", "scope": name}),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    // Poll: track the peak live count PER repo and wait for the two allowlisted
+    // repos to finish (3 done each).
+    let mut peak_alpha = 0usize;
+    let mut peak_beta = 0usize;
+    let mut both_done = false;
+    for _ in 0..300 {
+        let agents = client.call("agent.list", json!({})).await.unwrap();
+        let mut live_alpha = 0usize;
+        let mut live_beta = 0usize;
+        for a in agents["agents"].as_array().unwrap() {
+            if !matches!(a["state"].as_str(), Some("spawning") | Some("running")) {
+                continue;
+            }
+            match a["repo_name"].as_str() {
+                Some(r) if r == alpha => live_alpha += 1,
+                Some(r) if r == beta => live_beta += 1,
+                _ => {}
+            }
+        }
+        peak_alpha = peak_alpha.max(live_alpha);
+        peak_beta = peak_beta.max(live_beta);
+
+        let a_done = ticket_done_count(&mut client, &alpha).await;
+        let b_done = ticket_done_count(&mut client, &beta).await;
+        if a_done == 3 && b_done == 3 {
+            both_done = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(both_done, "both allowlisted repos should drain to done");
+    assert_eq!(peak_alpha, 1, "alpha cap of 1 must hold (peak {peak_alpha})");
+    assert_eq!(peak_beta, 1, "beta cap of 1 must hold (peak {peak_beta})");
+
+    // Gamma is registered but not in the allowlist → its backlog is untouched.
+    let gamma_tickets = client
+        .call("ticket.list", json!({"scope": gamma}))
+        .await
+        .unwrap();
+    let gamma_open = gamma_tickets["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["payload"]["status"] == "open")
+        .count();
+    assert_eq!(gamma_open, 3, "unlisted repo must never be drained");
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+async fn ticket_done_count(client: &mut Client, scope: &str) -> usize {
+    let tickets = client
+        .call("ticket.list", json!({"scope": scope}))
+        .await
+        .unwrap();
+    tickets["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["payload"]["status"] == "done")
+        .count()
 }

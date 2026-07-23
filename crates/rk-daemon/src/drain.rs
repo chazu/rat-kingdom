@@ -88,15 +88,18 @@ impl Drain {
             return Ok(0);
         }
 
-        // Count the live rats fleet-wide. This is the whole registry, not just
-        // drain-spawned rats: a WIP cap governs total concurrency, so an operator
-        // spawn or a workflow fan-out counts against it too.
-        let live = self
-            .supervisor
-            .list()
-            .iter()
-            .filter(|r| r.state.is_live())
-            .count();
+        // Count the live rats fleet-wide AND per repo. This is the whole
+        // registry, not just drain-spawned rats: a WIP cap governs total
+        // concurrency, so an operator spawn or a workflow fan-out counts against
+        // it too. The per-repo tally seeds the cross-repo partition (each repo's
+        // slots are its cap minus what it already holds).
+        let mut live = 0usize;
+        let mut live_by_repo: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for record in self.supervisor.list().iter().filter(|r| r.state.is_live()) {
+            live += 1;
+            *live_by_repo.entry(record.repo_name.clone()).or_insert(0) += 1;
+        }
         if live >= max_wip {
             return Ok(0);
         }
@@ -106,9 +109,18 @@ impl Drain {
         // after the daemon booted is picked up (mirrors the scheduler).
         let registry = RepoRegistry::load(&self.layout.home().join("repos.json"))?;
 
+        // In partition mode the `repos` map is the allowlist, so scan every
+        // repo's backlog and filter per-ticket; otherwise honour the single-repo
+        // pin (or drain all) exactly as before.
+        let ready_scope = if self.config.repos.is_empty() {
+            self.config.repo.clone()
+        } else {
+            None
+        };
+
         // Dependency-aware ready backlog, optionally pinned to one repo scope,
         // ranked by effective (aged) priority — strongest first.
-        let mut ready = self.tickets.ready(self.config.repo.clone())?;
+        let mut ready = self.tickets.ready(ready_scope)?;
         ready.sort_by(|a, b| {
             let (sa, sb) = (self.score(a, now), self.score(b, now));
             // Highest score first; FIFO (oldest id) on a tie.
@@ -128,6 +140,20 @@ impl Drain {
             let Some(repo) = registry.get(&ticket.scope) else {
                 continue;
             };
+            // Cross-repo partition: in allowlist mode a repo absent or disabled
+            // from the `repos` map is not drained, and a repo already holding its
+            // per-repo cap is skipped (but other repos' tickets still dispatch,
+            // hence `continue` not `break`) so no single repo monopolizes the
+            // fleet. `None` = this repo must be skipped this cycle.
+            let Some(repo_cap) = self.repo_slot_policy(&ticket.scope) else {
+                continue;
+            };
+            if let Some(cap) = repo_cap {
+                let held = *live_by_repo.get(&ticket.scope).unwrap_or(&0);
+                if held >= cap {
+                    continue;
+                }
+            }
             // Preflight the budget so we do not claim a ticket we cannot spawn.
             // A per-repo cap only blocks that repo; the fleet cap blocks every
             // candidate — `continue` handles both without over-claiming.
@@ -165,6 +191,9 @@ impl Drain {
                     info!(ticket = %ticket.identity, agent = %record.name, "drain dispatched ready ticket");
                     spawned += 1;
                     slots -= 1;
+                    // Charge this repo's partition so a second ticket for the
+                    // same repo respects its per-repo cap within this cycle.
+                    *live_by_repo.entry(ticket.scope.clone()).or_insert(0) += 1;
                 }
                 Err(e) => {
                     // The authoritative in-spawn budget guard (or a transient git
@@ -191,6 +220,29 @@ impl Drain {
         // (`with_payload` keeps it), so it is a stable wait-time origin.
         let age_secs = (now - ticket.created_at).num_seconds().max(0) as f64;
         base + age_secs / self.config.aging_secs as f64
+    }
+
+    /// Cross-repo partition policy for a repo scope, evaluated per candidate
+    /// ticket:
+    ///
+    /// - `None` — the repo must be **skipped** this cycle: it is not in the
+    ///   allowlist, or it is present but disabled.
+    /// - `Some(None)` — drain the repo with **no** per-repo cap (bounded only by
+    ///   the fleet-wide ceiling). This is always the case in the legacy,
+    ///   unpartitioned mode (empty `repos` map).
+    /// - `Some(Some(n))` — drain the repo but hold it to at most `n` live rats.
+    fn repo_slot_policy(&self, scope: &str) -> Option<Option<usize>> {
+        if self.config.repos.is_empty() {
+            // Legacy mode: readiness/pin filtering already selected the scope;
+            // every candidate is allowed against the shared fleet budget.
+            return Some(None);
+        }
+        match self.config.repos.get(scope) {
+            // A 0 cap means "unlimited within the fleet ceiling".
+            Some(rc) if rc.enabled => Some((rc.max_wip != 0).then_some(rc.max_wip)),
+            // Absent from the allowlist, or explicitly disabled.
+            _ => None,
+        }
     }
 }
 
@@ -260,9 +312,32 @@ mod tests {
                 max_wip: 2,
                 interval_secs: 30,
                 repo: None,
+                repos: std::collections::HashMap::new(),
                 aging_secs,
             },
         )
+    }
+
+    /// A drain whose per-repo partition map is the given `(repo, enabled, cap)`
+    /// entries. `max_wip` is a generous fleet ceiling so the per-repo caps, not
+    /// the fleet cap, are what the partition tests exercise.
+    fn partitioned_drain(entries: &[(&str, bool, usize)]) -> Drain {
+        let d = drain(0);
+        let mut config = d.config.clone();
+        config.max_wip = 100;
+        config.repos = entries
+            .iter()
+            .map(|(name, enabled, max_wip)| {
+                (
+                    (*name).to_string(),
+                    rk_core::config::RepoDrainConfig {
+                        enabled: *enabled,
+                        max_wip: *max_wip,
+                    },
+                )
+            })
+            .collect();
+        Drain::new(d.supervisor, d.tickets, d.layout, config)
     }
 
     fn ticket(id: &str, priority: &str, created_at: DateTime<Utc>) -> Tuple {
@@ -310,6 +385,35 @@ mod tests {
             d.score(&fresh_normal, now) > d.score(&ancient_low, now),
             "with aging off, age never boosts a lower priority"
         );
+    }
+
+    #[test]
+    fn empty_partition_map_allows_every_repo_uncapped() {
+        // Legacy mode: no `repos` map → every scope drains against the shared
+        // fleet budget with no per-repo cap.
+        let d = drain(0);
+        assert_eq!(d.repo_slot_policy("anything"), Some(None));
+    }
+
+    #[test]
+    fn partition_map_is_an_allowlist() {
+        let d = partitioned_drain(&[("alpha", true, 2)]);
+        // Listed + enabled → drained with its cap.
+        assert_eq!(d.repo_slot_policy("alpha"), Some(Some(2)));
+        // Absent from the allowlist → skipped.
+        assert_eq!(d.repo_slot_policy("beta"), None);
+    }
+
+    #[test]
+    fn disabled_repo_is_skipped_even_when_listed() {
+        let d = partitioned_drain(&[("alpha", false, 2)]);
+        assert_eq!(d.repo_slot_policy("alpha"), None);
+    }
+
+    #[test]
+    fn zero_cap_means_unlimited_within_fleet_ceiling() {
+        let d = partitioned_drain(&[("alpha", true, 0)]);
+        assert_eq!(d.repo_slot_policy("alpha"), Some(None));
     }
 
     #[test]
