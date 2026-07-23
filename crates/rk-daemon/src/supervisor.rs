@@ -4,7 +4,7 @@
 
 use crate::agents::{AgentRecord, AgentState, Registry};
 use chrono::{DateTime, Utc};
-use rk_core::config::SupervisorConfig;
+use rk_core::config::{MergeMode, SupervisorConfig};
 use rk_core::paths::Layout;
 use rk_core::prime::{render, PrimeContext};
 use rk_core::tuple::{Category, Pattern, Tuple, SYSTEM_SCOPE};
@@ -1237,8 +1237,32 @@ impl Supervisor {
         control.interrupt().await
     }
 
-    /// Dismiss: stop the session if live, merge the branch into the target,
-    /// remove the worktree, and (if merged) delete the branch.
+    /// Resolve a repo's merge policy — how a landed branch reaches its base.
+    /// Reads the on-disk repo registry (`repos.json`), which the daemon
+    /// persists synchronously on every `repo add`, so this sees the current
+    /// policy without sharing mutable state with the server. Returns the
+    /// repo's `(merge_mode, remote, host)`; an unregistered repo (or an
+    /// unreadable registry) resolves to the pre-PR-mode default — a direct
+    /// merge into `origin`.
+    fn merge_policy(&self, repo_name: &str) -> (MergeMode, String, Option<String>) {
+        let path = self.layout.home().join("repos.json");
+        match crate::repos::RepoRegistry::load(&path) {
+            Ok(reg) => match reg.get(repo_name) {
+                Some(rec) => (
+                    rec.merge_mode,
+                    rec.remote_or_default().to_string(),
+                    rec.host.clone(),
+                ),
+                None => (MergeMode::Direct, "origin".to_string(), None),
+            },
+            Err(_) => (MergeMode::Direct, "origin".to_string(), None),
+        }
+    }
+
+    /// Dismiss: stop the session if live, then reconcile the branch with its
+    /// target per the repo's merge mode — a `Direct` merge into the target (and
+    /// branch delete on success), or a `Pr` push + opened pull/merge request
+    /// that leaves the branch standing for review. Always removes the worktree.
     pub async fn dismiss(&self, name: &str, no_merge: bool) -> rk_core::Result<serde_json::Value> {
         let record = self
             .lock_registry()
@@ -1258,7 +1282,10 @@ impl Supervisor {
 
         let repo = Repo::discover(&record.repo_root)?;
         let mut merged = false;
+        let mut pr_opened = false;
+        let mut pr_url: Option<String> = None;
         let mut detail = String::from("no merge requested");
+        let (merge_mode, remote, _host) = self.merge_policy(&record.repo_name);
 
         if let Some(worktree) = &record.worktree {
             if worktree.exists() {
@@ -1266,26 +1293,43 @@ impl Supervisor {
             }
         }
         if let Some(branch) = &record.branch {
-            if !no_merge {
-                // Take our turn in the per-target merge queue: only one land or
-                // dismiss into this target runs at a time, so this merge sees a
-                // target no concurrent auto-merge is moving underneath it. Held
-                // only across the merge itself — the kill/worktree cleanup above
-                // and the branch delete below stay parallel across a fan-out.
-                let outcome = {
-                    let _merge_guard = self
-                        .merge_queue
-                        .acquire(repo.root(), &record.target_branch)
-                        .await;
-                    repo.merge_branch(branch, &record.target_branch)?
-                };
-                merged = outcome.merged;
-                detail = outcome.detail;
-                if merged {
-                    repo.delete_branch(branch)?;
-                }
-            } else {
+            if no_merge {
                 detail = format!("branch {branch} preserved (--no-merge)");
+            } else {
+                match merge_mode {
+                    MergeMode::Direct => {
+                        // Take our turn in the per-target merge queue: only one
+                        // land or dismiss into this target runs at a time, so
+                        // this merge sees a target no concurrent auto-merge is
+                        // moving underneath it. Held only across the merge
+                        // itself — the kill/worktree cleanup above and the
+                        // branch delete below stay parallel across a fan-out.
+                        let outcome = {
+                            let _merge_guard = self
+                                .merge_queue
+                                .acquire(repo.root(), &record.target_branch)
+                                .await;
+                            repo.merge_branch(branch, &record.target_branch)?
+                        };
+                        merged = outcome.merged;
+                        detail = outcome.detail;
+                        if merged {
+                            repo.delete_branch(branch)?;
+                        }
+                    }
+                    MergeMode::Pr => {
+                        // PR mode never merges or deletes the branch: it pushes
+                        // and opens a pull/merge request, leaving the branch
+                        // standing for a human to review and merge. A push/auth
+                        // failure is a clean `pr_opened: false` (never an error),
+                        // mirroring the merge path's `merged: false`.
+                        let outcome =
+                            repo.open_pull_request(branch, &record.target_branch, &remote);
+                        pr_opened = outcome.opened;
+                        pr_url = outcome.url;
+                        detail = outcome.detail;
+                    }
+                }
             }
         }
 
@@ -1306,22 +1350,56 @@ impl Supervisor {
         self.emit_event(
             &record.repo_name,
             "agent_dismissed",
-            json!({"agent": name, "merged": merged, "detail": detail, "parent": record.parent}),
+            json!({
+                "agent": name,
+                "merged": merged,
+                "pr_opened": pr_opened,
+                "pr_url": &pr_url,
+                "detail": &detail,
+                "parent": &record.parent,
+            }),
         );
-        Ok(json!({"agent": name, "merged": merged, "detail": detail}))
+        // A PR-mode dismiss hands the branch off for review rather than merging;
+        // surface that as its own event so the inbox / steward can pick it up.
+        if pr_opened {
+            self.emit_event(
+                &record.repo_name,
+                "pull_request_opened",
+                json!({
+                    "agent": name,
+                    "branch": &record.branch,
+                    "target": &record.target_branch,
+                    "url": &pr_url,
+                    "detail": &detail,
+                    "parent": &record.parent,
+                }),
+            );
+        }
+        Ok(json!({
+            "agent": name,
+            "merged": merged,
+            "pr_opened": pr_opened,
+            "pr_url": pr_url,
+            "detail": detail,
+        }))
     }
 
-    /// Land a NAMED branch into a target by merging it directly — the explicit
-    /// `{branch, target}` counterpart to [`dismiss`](Self::dismiss), which
-    /// merges an agent's branch into its own base. Names neither an agent nor a
-    /// worktree: it merges through a detached worktree (CAS-safe) and touches no
-    /// live checkout. A merge conflict or a target that moved mid-merge is a
-    /// clean `merged: false`, not an error, so a workflow can gate on the result
-    /// (`evaluate {expect: {merged: true}}`) and retry rather than fail. On a
-    /// successful merge the source branch is deleted unless `keep_branch`;
-    /// deletion is best-effort (a protected or still-checked-out branch is left
-    /// in place and reported `branch_deleted: false`) so it never masks the
-    /// merge that already succeeded.
+    /// Land a NAMED branch into a target — the explicit `{branch, target}`
+    /// counterpart to [`dismiss`](Self::dismiss), which reconciles an agent's
+    /// branch with its own base. Names neither an agent nor a worktree.
+    ///
+    /// Routes on the repo's merge mode, exactly like `dismiss`:
+    /// - **Direct** — merge through a detached worktree (CAS-safe, touching no
+    ///   live checkout). A merge conflict or a target that moved mid-merge is a
+    ///   clean `merged: false`, not an error, so a workflow can gate on the
+    ///   result (`evaluate {expect: {merged: true}}`) and retry rather than
+    ///   fail. On success the source branch is deleted unless `keep_branch`;
+    ///   deletion is best-effort (a protected or still-checked-out branch is
+    ///   left in place and reported `branch_deleted: false`) so it never masks
+    ///   the merge that already succeeded.
+    /// - **Pr** — push the branch and open a pull/merge request against the
+    ///   target, leaving the branch standing (`keep_branch` is implied) and
+    ///   `merged: false`. A push failure is a clean `pr_opened: false`.
     pub async fn land(
         &self,
         repo_root: &std::path::Path,
@@ -1330,36 +1408,72 @@ impl Supervisor {
         keep_branch: bool,
     ) -> rk_core::Result<serde_json::Value> {
         let repo = Repo::discover(repo_root)?;
-        // Same land / merge queue the agent-dismiss path uses: serialize with any
-        // concurrent land/dismiss into this target so the merge runs on the
-        // freshly-updated target rather than racing another auto-merge (TKT-51).
-        let outcome = {
-            let _merge_guard = self.merge_queue.acquire(repo.root(), target).await;
-            repo.merge_branch(branch, target)?
-        };
+        let (merge_mode, remote, _host) = self.merge_policy(&repo.name());
+        let mut merged = false;
         let mut branch_deleted = false;
-        if outcome.merged && !keep_branch {
-            match repo.delete_branch(branch) {
-                Ok(()) => branch_deleted = true,
-                Err(e) => warn!(
-                    branch,
-                    error = %e,
-                    "land: merged but could not delete source branch"
-                ),
+        let mut pr_opened = false;
+        let mut pr_url: Option<String> = None;
+        let detail;
+        match merge_mode {
+            MergeMode::Direct => {
+                // Same land / merge queue the agent-dismiss path uses: serialize
+                // with any concurrent land/dismiss into this target so the merge
+                // runs on the freshly-updated target rather than racing another
+                // auto-merge (TKT-51).
+                let outcome = {
+                    let _merge_guard = self.merge_queue.acquire(repo.root(), target).await;
+                    repo.merge_branch(branch, target)?
+                };
+                merged = outcome.merged;
+                detail = outcome.detail;
+                if merged && !keep_branch {
+                    match repo.delete_branch(branch) {
+                        Ok(()) => branch_deleted = true,
+                        Err(e) => warn!(
+                            branch,
+                            error = %e,
+                            "land: merged but could not delete source branch"
+                        ),
+                    }
+                }
+            }
+            MergeMode::Pr => {
+                // PR mode never merges or deletes the branch: push and open the
+                // pull/merge request, leaving it for review.
+                let outcome = repo.open_pull_request(branch, target, &remote);
+                pr_opened = outcome.opened;
+                pr_url = outcome.url;
+                detail = outcome.detail;
             }
         }
         let result = json!({
             "branch": branch,
             "target": target,
-            "merged": outcome.merged,
-            "detail": outcome.detail,
+            "merged": merged,
+            "pr_opened": pr_opened,
+            "pr_url": pr_url,
+            "detail": detail,
             "branch_deleted": branch_deleted,
         });
         self.emit_event(&repo.name(), "branch_landed", result.clone());
+        // Surface an opened PR as its own event, mirroring dismiss.
+        if pr_opened {
+            self.emit_event(
+                &repo.name(),
+                "pull_request_opened",
+                json!({
+                    "branch": branch,
+                    "target": target,
+                    "url": result.get("pr_url"),
+                    "detail": result.get("detail"),
+                }),
+            );
+        }
         info!(
             branch,
             target,
-            merged = outcome.merged,
+            merged,
+            pr_opened,
             branch_deleted,
             "land"
         );
