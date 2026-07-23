@@ -61,8 +61,8 @@ workflow: #Workflow
 #AspectMatch: {
 	// Step type: "spawn" | "wait" | "evaluate" | "dismiss" | "gate" | "read" |
 	// "when" | "repeat" | "break" | "stop" | "for_each" | "wait_all" |
-	// "dismiss_all". Aspects only weave top-level steps, not steps nested
-	// inside `when`/`repeat`.
+	// "dismiss_all" | "run". Aspects only weave top-level steps, not steps
+	// nested inside `when`/`repeat`.
 	type?: string
 	// Spawn steps only: match by role.
 	role?: string
@@ -70,7 +70,7 @@ workflow: #Workflow
 
 #Step: #SpawnStep | #WaitStep | #EvaluateStep | #DismissStep | #GateStep |
 	#ReadStep | #WhenStep | #RepeatStep | #BreakStep | #StopStep |
-	#ForEachStep | #WaitAllStep | #DismissAllStep
+	#ForEachStep | #WaitAllStep | #DismissAllStep | #RunStep
 
 // Tuple categories a `read` step may match.
 #Category: "fact" | "convention" | "task" | "available" | "claim" | "obstacle" |
@@ -238,4 +238,30 @@ workflow: #Workflow
 #DismissAllStep: {
 	type: "dismiss_all"
 	noMerge?: bool
+}
+
+// Run a command in the active agent's worktree — the deterministic quality
+// gate. Where `evaluate` unifies only against the harness's self-reported
+// output (it takes the rat's word), `run` executes the repo's real test/lint
+// suite and captures {exit, stdout, stderr} into ctx.previousResult, so a
+// following `evaluate {expect: {exit: 0}}` (or a `when`) can gate the merge on
+// a verdict the runner cannot forge. A non-zero exit fails closed: either via
+// the following evaluate, or inline when `expectExit` is set.
+//
+// SECURITY: `command` is executed verbatim via `sh -c` in the worktree. It is
+// only as trusted as the workflow definition that carries it — a per-repo
+// allowlist / named-check restriction is deferred to the policy engine (#19).
+#RunStep: {
+	type: "run"
+	// Command line, run via `sh -c` in the worktree.
+	command: string
+	// Working directory relative to the worktree root; the root if unset.
+	cwd?: string
+	// If set, the step fails the instance inline when the actual exit code
+	// differs (fail-closed). If unset, the exit is only captured for a
+	// following evaluate/when to route on.
+	expectExit?: int
+	// Hard wall-clock bound; a suite still running when it elapses is killed
+	// and the step fails closed.
+	timeout: string | *"10m"
 }

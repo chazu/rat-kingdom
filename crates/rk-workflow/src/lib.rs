@@ -76,6 +76,9 @@ pub enum Step {
     WaitAll(WaitAllStep),
     /// Parallel dismiss: merge/cleanup every fanned-out agent, clear the set.
     DismissAll(DismissAllStep),
+    /// Run a command (the repo's real test/lint suite) in the active agent's
+    /// worktree, capturing `{exit, stdout, stderr}` into `ctx.previousResult`.
+    Run(RunStep),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -254,6 +257,34 @@ pub struct RepeatStep {
 pub struct StopStep {
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// Run a command in the active agent's worktree — the deterministic quality
+/// gate. Where `evaluate` only unifies against the harness's *self-reported*
+/// output, a `run` step executes the repo's real checks and captures the
+/// verdict the runner cannot forge. The `{exit, stdout, stderr}` result lands
+/// in `ctx.previousResult` so a following `evaluate {expect: {exit: 0}}` (or a
+/// `when`) can gate the merge; a red check fails the instance fail-closed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunStep {
+    /// Command line, executed via `sh -c` in the worktree.
+    pub command: String,
+    /// Working directory relative to the worktree root; the root if unset.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// If set, the step itself fails the instance when the actual exit code
+    /// differs — a fail-closed inline gate. If unset, the exit is only
+    /// captured for a following `evaluate`/`when` to route on.
+    #[serde(default, rename = "expectExit")]
+    pub expect_exit: Option<i64>,
+    /// Hard wall-clock bound; a suite still running when it elapses is killed
+    /// and the step fails closed.
+    #[serde(default = "default_run_timeout")]
+    pub timeout: String,
+}
+
+fn default_run_timeout() -> String {
+    "10m".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -504,6 +535,7 @@ fn step_matches(step: &Step, matcher: &AspectMatch) -> bool {
             Step::ForEach(_) => "for_each",
             Step::WaitAll(_) => "wait_all",
             Step::DismissAll(_) => "dismiss_all",
+            Step::Run(_) => "run",
         };
         if actual != step_type {
             return false;
@@ -691,6 +723,40 @@ workflow: {
         assert!(matches!(&wf.steps[2], Step::DismissAll(d) if !d.no_merge));
         // noMerge parked variant.
         assert!(matches!(&wf.steps[3], Step::DismissAll(d) if d.no_merge));
+    }
+
+    #[test]
+    fn loads_run_step() {
+        let source = r#"
+workflow: {
+    name: "gated-check"
+    steps: [
+        {type: "spawn", role: "rat", task: {title: "T"}},
+        {type: "wait"},
+        {type: "run", command: "cargo test", timeout: "5m"},
+        {type: "run", command: "cargo clippy", cwd: "crates/x", expectExit: 0},
+    ]
+}
+"#;
+        let wf = load_str(source, &HashMap::new()).unwrap();
+        assert_eq!(wf.steps.len(), 4);
+        // Plain run: command captured, cwd/expectExit unset, timeout parsed.
+        assert!(matches!(
+            &wf.steps[2],
+            Step::Run(r)
+                if r.command == "cargo test"
+                    && r.cwd.is_none()
+                    && r.expect_exit.is_none()
+                    && r.timeout == "5m"
+        ));
+        // Run with cwd + inline expectExit gate; timeout defaults to 10m.
+        assert!(matches!(
+            &wf.steps[3],
+            Step::Run(r)
+                if r.cwd.as_deref() == Some("crates/x")
+                    && r.expect_exit == Some(0)
+                    && r.timeout == "10m"
+        ));
     }
 
     #[test]
