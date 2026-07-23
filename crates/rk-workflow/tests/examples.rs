@@ -318,6 +318,24 @@ fn steward_loads_and_routes() {
             .any(|s| matches!(s, Step::Land(_))),
         "APPROVE must land the branch"
     );
+    // The land gate accepts EITHER a Direct-merge {merged:true} or a PR-mode
+    // {pr_opened:true} — the mode-routed land can land or open a PR, and both
+    // are a clean hand-off (TKT-67).
+    let land_gate = when.cases["APPROVE"]
+        .iter()
+        .find_map(|s| match s {
+            Step::Evaluate(e) if e.expect.get("merged").is_some() => Some(e),
+            _ => None,
+        })
+        .expect("APPROVE must gate the land result on merged:true");
+    assert_eq!(land_gate.expect.get("merged"), Some(&json!(true)));
+    assert!(
+        land_gate
+            .any_of
+            .iter()
+            .any(|alt| alt.get("pr_opened") == Some(&json!(true))),
+        "the land gate must also accept a PR-mode {{pr_opened:true}} outcome"
+    );
     assert!(
         !when.cases["REWORK"]
             .iter()

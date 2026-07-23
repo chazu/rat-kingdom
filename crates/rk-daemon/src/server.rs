@@ -814,8 +814,9 @@ impl Daemon {
     }
 
     /// Union everything awaiting a human — failed/orphaned agents, failed or
-    /// gate-parked workflow instances, obstacle and need tuples — into one
-    /// ranked triage list. Pure read-side aggregation; no new storage.
+    /// gate-parked workflow instances, obstacle and need tuples, and open PRs
+    /// awaiting review — into one ranked triage list. Pure read-side
+    /// aggregation; no new storage.
     fn handle_inbox(&self, id: String) -> Response {
         let agents = self.supervisor.list();
         let instances = self.engine().list();
@@ -827,7 +828,17 @@ impl Daemon {
             Ok(t) => t,
             Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
         };
-        let items = crate::inbox::build(&agents, &instances, &obstacles, &needs);
+        // Open PRs/MRs: a PR-mode dismiss/land emits a `pull_request_opened`
+        // event, then the run completes — nothing else tracks the pushed branch.
+        let pull_requests = match self
+            .space
+            .scan(&Pattern::category(Category::Event).identity("pull_request_opened"))
+        {
+            Ok(t) => t,
+            Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
+        };
+        let items =
+            crate::inbox::build(&agents, &instances, &obstacles, &needs, &pull_requests);
         Response::ok(id, crate::inbox::to_json(&items))
     }
 

@@ -106,11 +106,14 @@ workflow: {
 				"true": [
 					{type: "dismiss", noMerge: true},
 					{type: "land", branch: "{{ctx.activeBranch}}", target: _input.target},
-					// GATE THE LAND RESULT. A conflict or moved target lands as a
-					// clean {merged: false} (not an error); fail closed so an
-					// approved-but-unmerged branch surfaces in rk inbox instead of
-					// the run completing as if the work landed.
-					{type: "evaluate", expect: {merged: true}},
+					// GATE THE LAND RESULT. `land` routes on the repo's merge mode:
+					// a Direct-merge repo reports {merged: true}; a PR-mode repo
+					// pushes the branch and opens a PR, reporting {pr_opened: true}
+					// (never merged) — surfaced to the operator as an awaiting-review
+					// row in rk inbox. BOTH are a clean hand-off, so accept either.
+					// Only a conflict / moved target / push failure (merged:false AND
+					// pr_opened:false) fails closed, holding the branch for rk inbox.
+					{type: "evaluate", expect: {merged: true}, anyOf: [{pr_opened: true}]},
 				]
 				// Rejected (or fail-closed timeout): tear down the worktree but
 				// PRESERVE the branch, unmerged, for a human. The run still

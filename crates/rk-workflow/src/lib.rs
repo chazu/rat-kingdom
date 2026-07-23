@@ -251,6 +251,13 @@ fn default_wait_all_timeout() -> String {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvaluateStep {
     pub expect: Value,
+    /// Alternative accepted outcomes. A single `expect` unifies as an AND over
+    /// its fields, so it cannot express "one shape OR another". Listing shapes
+    /// here makes the step pass if the result unifies with `expect` OR with any
+    /// entry — e.g. accepting a PR-mode `land`'s `{pr_opened: true}` alongside a
+    /// Direct-merge `land`'s `{merged: true}`.
+    #[serde(default, rename = "anyOf")]
+    pub any_of: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
