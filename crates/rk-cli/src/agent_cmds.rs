@@ -524,5 +524,19 @@ pub async fn cost_fleet(layout: &Layout, as_json: bool) -> Result<()> {
         let repo = r["repo"].as_str().unwrap_or("?").to_string();
         row(&format!("repo:{repo}"), &r);
     }
+    // Per-workflow-instance spend. The cap lives on each workflow's `budget:`
+    // field (enforced at dispatch), not in the fleet config, so this rollup
+    // reports current burn only — cap/status columns stay blank.
+    for i in rollup["instances"].as_array().cloned().unwrap_or_default() {
+        let inst = i["instance"].as_str().unwrap_or("?").to_string();
+        println!(
+            "{:<20} {:>12} {:>12} {:>12} {:>10}",
+            format!("wf:{inst}"),
+            format!("${:.4}", i["spent_usd"].as_f64().unwrap_or(0.0)),
+            "-",
+            "-",
+            "-",
+        );
+    }
     Ok(())
 }
