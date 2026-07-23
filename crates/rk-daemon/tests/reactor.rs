@@ -101,7 +101,7 @@ fn build_reactor_with_space(
     );
     let engine = Arc::new(WorkflowEngine::new(
         layout.clone(),
-        supervisor,
+        supervisor.clone(),
         space.clone(),
         tickets.clone(),
         Default::default(),
@@ -109,7 +109,14 @@ fn build_reactor_with_space(
         "fake".into(),
         false,
     ));
-    Arc::new(Reactor::new(space, engine, tickets, layout.clone(), config))
+    Arc::new(Reactor::new(
+        space,
+        engine,
+        tickets,
+        Some(supervisor),
+        layout.clone(),
+        config,
+    ))
 }
 
 fn write_trigger(layout: &Layout) {
