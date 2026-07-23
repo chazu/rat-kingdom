@@ -52,7 +52,7 @@ enum Command {
     Obstacle(space_cmds::TextArgs),
     /// Ask the room for help (sugar; env-autofilled).
     Need(space_cmds::TextArgs),
-    /// Advisory claim on a task (sugar; env-autofilled).
+    /// Advisory claim marking an area you're editing (evaporates on a TTL; sugar; env-autofilled).
     Claim(space_cmds::ClaimArgs),
     /// Spawn a rat to work on a task in an isolated worktree.
     Spawn(agent_cmds::SpawnArgs),

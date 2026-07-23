@@ -73,8 +73,11 @@ pub struct TextArgs {
 
 #[derive(Args)]
 pub struct ClaimArgs {
-    /// Task id being claimed.
-    pub task: String,
+    /// The area you are working in (a path, glob, or label) — or a task id.
+    pub area: String,
+    /// How long the claim lives before evaporating, like "30m" or "2h".
+    #[arg(long, default_value = "30m")]
+    pub ttl: String,
 }
 
 fn parse_duration(s: &str) -> Result<std::time::Duration> {
@@ -243,7 +246,7 @@ pub async fn done(layout: &Layout, args: DoneArgs, as_json: bool) -> Result<()> 
     if let Some(summary) = args.summary {
         payload["summary"] = json!(summary);
     }
-    write_sugar(layout, "event", &repo, "task_done", payload, as_json).await
+    write_sugar(layout, "event", &repo, "task_done", payload, None, as_json).await
 }
 
 pub async fn report(layout: &Layout, args: TextArgs, category: &str, as_json: bool) -> Result<()> {
@@ -257,17 +260,30 @@ pub async fn report(layout: &Layout, args: TextArgs, category: &str, as_json: bo
         "task": std::env::var("RK_TASK").ok(),
         "text": args.text,
     });
-    write_sugar(layout, category, &repo, &agent, payload, as_json).await
+    write_sugar(layout, category, &repo, &agent, payload, None, as_json).await
 }
 
 pub async fn claim(layout: &Layout, args: ClaimArgs, as_json: bool) -> Result<()> {
     let agent = env_required("RK_AGENT")?;
     let repo = env_required("RK_REPO")?;
+    // Claims are advisory trails, not locks: written Ephemeral so an abandoned
+    // claim evaporates on its TTL instead of becoming a permanent no-go zone.
+    let ttl = parse_duration(&args.ttl)?;
     let payload = json!({
         "agent": agent,
+        "area": args.area,
         "claimed_at": chrono::Utc::now().to_rfc3339(),
     });
-    write_sugar(layout, "claim", &repo, &args.task, payload, as_json).await
+    write_sugar(
+        layout,
+        "claim",
+        &repo,
+        &args.area,
+        payload,
+        Some(ttl.as_secs()),
+        as_json,
+    )
+    .await
 }
 
 async fn write_sugar(
@@ -276,20 +292,20 @@ async fn write_sugar(
     scope: &str,
     identity: &str,
     payload: Value,
+    ttl_secs: Option<u64>,
     as_json: bool,
 ) -> Result<()> {
+    let mut params = json!({
+        "category": category,
+        "scope": scope,
+        "identity": identity,
+        "payload": payload,
+    });
+    if let Some(ttl) = ttl_secs {
+        params["ttl_secs"] = json!(ttl);
+    }
     let mut client = Client::connect_or_spawn(layout).await?;
-    let result = client
-        .call(
-            "space.out",
-            json!({
-                "category": category,
-                "scope": scope,
-                "identity": identity,
-                "payload": payload,
-            }),
-        )
-        .await?;
+    let result = client.call("space.out", params).await?;
     if as_json {
         println!("{result}");
     } else {

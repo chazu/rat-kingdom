@@ -26,6 +26,10 @@ from the environment):
 
 - `rk scan <category> [scope]` — read tuples. Before starting, read `fact` and
   `convention` tuples for your repo scope and the `system` scope.
+- Before editing an area, `rk scan claim <repo>` and `rk scan artifact <repo>`
+  to see what peers are touching, and steer clear of their files. On entry,
+  mark your area with `rk claim <area>` (a path or glob) so peers avoid it.
+  Claims evaporate on a TTL, so re-run it if you are still working there.
 - `rk obstacle \"<text>\"` — record something blocking you, then continue or wind down.
 - `rk need \"<text>\"` — ask the room for help (not directed at anyone).
 - `rk out artifact <scope> <name> --payload '<json>'` — record a work product.
@@ -211,22 +215,32 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_role_has_no_claim_loop_and_no_single_task_banner() {
+    fn reviewer_role_has_no_single_task_banner() {
         let text = render("reviewer", &ctx());
         assert!(text.contains("APPROVE"));
         assert!(!text.contains("only your task"));
-        // No template may ever teach a directed agent to claim work.
-        assert!(!text.contains("rk claim"));
     }
 
     #[test]
-    fn no_template_teaches_claiming() {
+    fn templates_teach_area_claim_trails_not_work_claiming() {
+        // Claiming is taught only as a fine-grained *area* trail (read peers'
+        // claims before editing, mark your own files on entry) — never as
+        // taking on additional work. The single-task banner still forbids that.
         for role in ["rat", "reviewer"] {
+            let text = render(role, &ctx());
             assert!(
-                !render(role, &ctx()).contains("rk claim"),
-                "{role} template must not teach claiming"
+                text.contains("rk claim <area>"),
+                "{role} template should teach area-claim trails"
+            );
+            assert!(
+                text.contains("rk scan claim"),
+                "{role} template should teach reading peers' claims before editing"
             );
         }
+        // A directed rat is still explicitly forbidden from claiming other work.
+        let rat = render("rat", &ctx());
+        assert!(rat.contains("only your task"));
+        assert!(rat.contains("Do not claim, start, or continue any"));
     }
 
     #[test]
