@@ -3,7 +3,8 @@
 //! merge their work on dismissal.
 
 use crate::agents::{AgentRecord, AgentState, Registry};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use rk_core::config::SupervisorConfig;
 use rk_core::paths::Layout;
 use rk_core::prime::{render, PrimeContext};
 use rk_core::tuple::{Category, Tuple};
@@ -66,6 +67,31 @@ pub struct Supervisor {
     budget: Budget,
     /// Agents already warned about budget (avoid repeat warnings).
     budget_warned: Mutex<std::collections::HashSet<String>>,
+    /// Per-agent liveness-sweep bookkeeping (burn-rate deltas + flag episodes).
+    sweep_state: Mutex<HashMap<String, SweepState>>,
+}
+
+/// One agent's rolling state across supervisor sweeps.
+#[derive(Debug, Clone)]
+struct SweepState {
+    /// Cost at the previous sweep, for the burn-rate delta.
+    last_cost_usd: f64,
+    /// When the previous sweep observed this agent (burn-rate denominator).
+    last_observed: DateTime<Utc>,
+    /// When the current STUCK/RUNAWAY episode was first flagged (soft-steered).
+    /// `None` = not currently flagged. The kill escalation measures from here.
+    flagged_at: Option<DateTime<Utc>>,
+}
+
+/// What a sweep decided to do about one agent, computed under the sweep-state
+/// lock and then acted on after releasing it (steer/kill spawn async tasks).
+enum SweepAction {
+    /// Healthy, or still within the grace window — leave it alone.
+    None,
+    /// First detection this episode: obstacle tuple + soft steer.
+    Soft { kind: &'static str, detail: String },
+    /// Still flagged past the grace window: obstacle tuple + kill.
+    Hard { kind: &'static str, detail: String },
 }
 
 impl Supervisor {
@@ -98,6 +124,7 @@ impl Supervisor {
             pricing,
             budget,
             budget_warned: Mutex::new(std::collections::HashSet::new()),
+            sweep_state: Mutex::new(HashMap::new()),
         })
     }
 
@@ -597,6 +624,170 @@ impl Supervisor {
         }
     }
 
+    /// One liveness/burn-rate sweep over the live, headless (event-pumped) rats.
+    ///
+    /// Budget checks fire only on Usage events, so a rat hung mid-tool-call
+    /// emitting nothing never trips them. This out-of-band pass compares each
+    /// rat's `updated_at` (bumped on every event via `Registry::update`) to now
+    /// — silence past `stuck_after_secs` is STUCK — and tracks cost across
+    /// sweeps — sustained USD/min above `burn_usd_per_min` is RUNNING AWAY.
+    ///
+    /// The response is graduated and mirrors budget enforcement: the first sweep
+    /// to flag an agent posts an obstacle tuple and soft-steers it ("still
+    /// working? wrap up"); only if it is STILL flagged after `kill_grace_secs`
+    /// does the next sweep escalate to a kill. A steer that revives the rat (any
+    /// new event bumps `updated_at`) clears the flag before it can be killed.
+    ///
+    /// Attach-mode rats and any without a live control handle are skipped: their
+    /// liveness isn't tracked through the event pump, so silence proves nothing.
+    pub fn sweep(&self, cfg: &SupervisorConfig) {
+        let now = Utc::now();
+        let live: Vec<AgentRecord> = self
+            .lock_registry()
+            .list()
+            .into_iter()
+            .filter(|r| r.state.is_live())
+            .cloned()
+            .collect();
+        let live_names: std::collections::HashSet<&str> =
+            live.iter().map(|r| r.name.as_str()).collect();
+
+        for record in &live {
+            // Only headless rats we actively control are event-pumped, so only
+            // for them does `updated_at` silence mean anything — and only them
+            // can we steer/kill through this path.
+            if !self.lock_controls().contains_key(&record.name) {
+                continue;
+            }
+            let action = self.decide_sweep(record, now, cfg);
+            match action {
+                SweepAction::None => {}
+                SweepAction::Soft { kind, detail } => {
+                    warn!(agent = %record.name, kind, %detail, "supervisor sweep flagged agent");
+                    self.emit_sweep_obstacle(record, kind, &detail);
+                    self.steer_flagged(record, kind);
+                }
+                SweepAction::Hard { kind, detail } => {
+                    warn!(agent = %record.name, kind, %detail, "supervisor sweep killing agent after grace");
+                    self.emit_sweep_obstacle(record, kind, &format!("{detail} — killed after grace"));
+                    let control = self.lock_controls().remove(&record.name);
+                    if let Some(control) = control {
+                        tokio::spawn(async move {
+                            let _ = control.kill().await;
+                        });
+                    }
+                }
+            }
+        }
+
+        // Drop bookkeeping for agents that are no longer live so a later respawn
+        // starts from a clean episode.
+        self.lock_sweep_state()
+            .retain(|name, _| live_names.contains(name.as_str()));
+    }
+
+    /// Update this agent's rolling sweep state and decide what to do about it.
+    /// All state mutation happens here under the one lock; the caller acts on
+    /// the returned decision after the lock is released.
+    fn decide_sweep(
+        &self,
+        record: &AgentRecord,
+        now: DateTime<Utc>,
+        cfg: &SupervisorConfig,
+    ) -> SweepAction {
+        let mut state = self.lock_sweep_state();
+        let st = state.entry(record.name.clone()).or_insert(SweepState {
+            last_cost_usd: record.cost_usd,
+            last_observed: now,
+            flagged_at: None,
+        });
+
+        // Burn rate (USD/min) since the previous sweep of this agent.
+        let dt_min = (now - st.last_observed).num_milliseconds() as f64 / 60_000.0;
+        let burn = if dt_min > 0.0 {
+            (record.cost_usd - st.last_cost_usd) / dt_min
+        } else {
+            0.0
+        };
+        st.last_cost_usd = record.cost_usd;
+        st.last_observed = now;
+
+        let idle_secs = (now - record.updated_at).num_seconds().max(0) as u64;
+        let stuck = cfg.stuck_after_secs > 0 && idle_secs >= cfg.stuck_after_secs;
+        let running_away = cfg.burn_usd_per_min > 0.0 && burn >= cfg.burn_usd_per_min;
+
+        if !stuck && !running_away {
+            // Recovered (or never flagged): clear any open episode.
+            st.flagged_at = None;
+            return SweepAction::None;
+        }
+
+        // Stuck takes precedence in the message; both post an obstacle whose
+        // `type` a reactor #Trigger can match ("stuck" / "runaway").
+        let (kind, detail): (&'static str, String) = if stuck {
+            ("stuck", format!("no events for {idle_secs}s while still running"))
+        } else {
+            ("runaway", format!("sustained burn ${burn:.2}/min with no completion"))
+        };
+
+        match st.flagged_at {
+            None => {
+                st.flagged_at = Some(now);
+                SweepAction::Soft { kind, detail }
+            }
+            Some(flagged) => {
+                let elapsed = (now - flagged).num_seconds().max(0) as u64;
+                if elapsed >= cfg.kill_grace_secs {
+                    SweepAction::Hard { kind, detail }
+                } else {
+                    SweepAction::None
+                }
+            }
+        }
+    }
+
+    fn steer_flagged(&self, record: &AgentRecord, kind: &str) {
+        let control = self.lock_controls().get(&record.name).cloned();
+        if let Some(control) = control {
+            let name = record.name.clone();
+            let nudge = if kind == "stuck" {
+                format!(
+                    "SUPERVISOR CHECK for {name}: you have gone quiet — still working? \
+                     If you are stuck, record it with `rk obstacle`, then either make \
+                     progress or wrap up: commit what you have and run `rk done` now."
+                )
+            } else {
+                format!(
+                    "SUPERVISOR CHECK for {name}: you are burning cost fast with no \
+                     completion. Wrap up: commit what you have and run `rk done` now."
+                )
+            };
+            tokio::spawn(async move {
+                let _ = control.steer(&nudge).await;
+            });
+        }
+    }
+
+    fn emit_sweep_obstacle(&self, record: &AgentRecord, kind: &str, detail: &str) {
+        let tuple = Tuple::new(
+            Category::Obstacle,
+            record.repo_name.clone(),
+            record.name.clone(),
+            self.castle.clone(),
+            json!({
+                "type": kind,
+                "agent": record.name,
+                "task": record.task,
+                "detail": detail,
+                "cost_usd": record.cost_usd,
+                "tokens": record.usage.total(),
+            }),
+        );
+        if let Err(e) = self.space.out(tuple) {
+            warn!(error = %e, "failed to emit sweep obstacle");
+        }
+    }
+
     /// Route a completion up the spawn tree: the structural parent gets a
     /// directed message; the repo scope gets the event either way.
     fn route_completion(&self, record: &AgentRecord, is_error: bool) {
@@ -802,6 +993,13 @@ impl Supervisor {
 
     fn lock_controls(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionControl>> {
         match self.controls.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    fn lock_sweep_state(&self) -> std::sync::MutexGuard<'_, HashMap<String, SweepState>> {
+        match self.sweep_state.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }
