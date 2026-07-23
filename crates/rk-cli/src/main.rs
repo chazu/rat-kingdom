@@ -203,9 +203,15 @@ enum WorkflowCommand {
         /// Repository the workflow operates on.
         #[arg(long, default_value = ".")]
         repo: String,
-        /// Workflow parameters as key=value (repeatable).
+        /// Workflow parameters as key=value (repeatable). Values are strings,
+        /// coerced to each param's declared type (int/number/bool/list).
         #[arg(long = "param")]
         params: Vec<String>,
+        /// Path to a JSON file (object of key→value) supplying params in bulk.
+        /// Its values keep their JSON types; individual --param flags override
+        /// matching keys.
+        #[arg(long = "param-file")]
+        param_file: Option<String>,
     },
     /// List workflow instances.
     List,
@@ -388,9 +394,31 @@ async fn main() -> Result<()> {
         Command::Workflow { command } => {
             let mut client = Client::connect_or_spawn(&layout).await?;
             match command {
-                WorkflowCommand::Run { name, repo, params } => {
+                WorkflowCommand::Run {
+                    name,
+                    repo,
+                    params,
+                    param_file,
+                } => {
                     let repo = std::fs::canonicalize(&repo)?;
                     let mut map = serde_json::Map::new();
+                    // --param-file seeds the map with natively-typed JSON...
+                    if let Some(path) = param_file {
+                        let text = std::fs::read_to_string(&path)
+                            .map_err(|e| anyhow::anyhow!("read --param-file {path}: {e}"))?;
+                        match serde_json::from_str(&text).map_err(|e| {
+                            anyhow::anyhow!("--param-file {path} is not valid JSON: {e}")
+                        })? {
+                            serde_json::Value::Object(obj) => map.extend(obj),
+                            _ => {
+                                return Err(anyhow::anyhow!(
+                                    "--param-file {path} must contain a JSON object of key→value"
+                                ))
+                            }
+                        }
+                    }
+                    // ...then individual --param flags override, always as strings
+                    // (coerced to the declared type server-side at load time).
                     for pair in params {
                         let (k, v) = pair.split_once('=').ok_or_else(|| {
                             anyhow::anyhow!("--param must be key=value, got: {pair}")

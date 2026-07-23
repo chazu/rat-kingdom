@@ -525,7 +525,12 @@ pub fn load_str(source: &str, inputs: &HashMap<String, Value>) -> rk_core::Resul
     let dir = tempfile_dir()?;
     std::fs::write(dir.join("schema.cue"), SCHEMA)?;
     std::fs::write(dir.join("workflow.cue"), ensure_package(source))?;
-    std::fs::write(dir.join("input.cue"), render_inputs(inputs)?)?;
+    // Pass 1 sees an empty, open `_input`: params never reference `_input`, so
+    // this exports them cleanly, and — crucially — leaves every `_input.<x>` in
+    // the steps *incomplete* rather than concrete. A concrete raw string input
+    // (e.g. count="3" for an `int` field) would otherwise conflict here, before
+    // we ever get the chance to coerce it.
+    std::fs::write(dir.join("input.cue"), render_inputs(&HashMap::new())?)?;
 
     // Pass 1: declared params → required-check + defaults.
     let params_json = cue_export(&dir, "workflow.params")?;
@@ -533,20 +538,33 @@ pub fn load_str(source: &str, inputs: &HashMap<String, Value>) -> rk_core::Resul
         .map_err(|e| rk_core::Error::other(format!("workflow params malformed: {e}")))?;
     let mut effective = inputs.clone();
     for (name, param) in &params {
-        if effective.contains_key(name) {
-            continue;
+        if !effective.contains_key(name) {
+            match &param.default {
+                Some(default) => {
+                    effective.insert(name.clone(), default.clone());
+                }
+                None if param.required => {
+                    std::fs::remove_dir_all(&dir).ok();
+                    return Err(rk_core::Error::other(format!(
+                        "missing required workflow param: {name} (pass --param {name}=...)"
+                    )));
+                }
+                None => continue,
+            }
         }
-        match &param.default {
-            Some(default) => {
-                effective.insert(name.clone(), default.clone());
+        // Coerce the supplied (or defaulted) value to the declared type so a
+        // stringly-encoded --param / trigger value becomes real JSON before it
+        // is rendered into `_input`, and a mistyped --param-file value is
+        // rejected here rather than as an opaque CUE unification error.
+        let raw = &effective[name];
+        match coerce_param(name, &param.param_type, raw) {
+            Ok(coerced) => {
+                effective.insert(name.clone(), coerced);
             }
-            None if param.required => {
+            Err(e) => {
                 std::fs::remove_dir_all(&dir).ok();
-                return Err(rk_core::Error::other(format!(
-                    "missing required workflow param: {name} (pass --param {name}=...)"
-                )));
+                return Err(e);
             }
-            None => {}
         }
     }
     std::fs::write(dir.join("input.cue"), render_inputs(&effective)?)?;
@@ -714,6 +732,73 @@ fn ensure_package(source: &str) -> String {
         source.to_string()
     } else {
         format!("package workflow\n\n{source}")
+    }
+}
+
+/// Coerce a supplied workflow-param value to its declared `#Param` type.
+///
+/// A value already of the right JSON shape passes through unchanged, so bulk
+/// `--param-file` inputs keep their native types. A JSON string is parsed into
+/// the target type, which is how single `--param k=v` flags (always strings)
+/// and reactor-templated params acquire a non-string type. Anything else is a
+/// type error reported against the param name.
+fn coerce_param(name: &str, ty: &str, value: &Value) -> rk_core::Result<Value> {
+    let mismatch = |want: &str| {
+        rk_core::Error::other(format!(
+            "workflow param {name}: expected {want}, got {value}"
+        ))
+    };
+    match ty {
+        "string" => match value {
+            Value::String(_) => Ok(value.clone()),
+            // A number/bool passed for a string param is stringified for
+            // convenience (e.g. a --param-file entry reused across types).
+            Value::Number(_) | Value::Bool(_) => Ok(Value::String(value.to_string())),
+            _ => Err(mismatch("string")),
+        },
+        "int" => match value {
+            Value::Number(n) if n.is_i64() || n.is_u64() => Ok(value.clone()),
+            Value::Number(_) => Err(mismatch("int (got a fractional number)")),
+            Value::String(s) => s
+                .trim()
+                .parse::<i64>()
+                .map(|i| Value::Number(i.into()))
+                .map_err(|_| mismatch("int")),
+            _ => Err(mismatch("int")),
+        },
+        "number" => match value {
+            Value::Number(_) => Ok(value.clone()),
+            Value::String(s) => s
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .and_then(serde_json::Number::from_f64)
+                .map(Value::Number)
+                .ok_or_else(|| mismatch("number")),
+            _ => Err(mismatch("number")),
+        },
+        "bool" => match value {
+            Value::Bool(_) => Ok(value.clone()),
+            Value::String(s) => match s.trim() {
+                "true" => Ok(Value::Bool(true)),
+                "false" => Ok(Value::Bool(false)),
+                _ => Err(mismatch("bool (\"true\" or \"false\")")),
+            },
+            _ => Err(mismatch("bool")),
+        },
+        "list" => match value {
+            Value::Array(_) => Ok(value.clone()),
+            Value::String(s) => match serde_json::from_str::<Value>(s) {
+                Ok(v @ Value::Array(_)) => Ok(v),
+                _ => Err(mismatch("list (a JSON array)")),
+            },
+            _ => Err(mismatch("list")),
+        },
+        // Unreachable while the CUE schema constrains #Param.type, but keep the
+        // Rust side total rather than silently accepting an unknown type.
+        other => Err(rk_core::Error::other(format!(
+            "workflow param {name}: unknown declared type {other:?}"
+        ))),
     }
 }
 
@@ -952,6 +1037,88 @@ workflow: {
     fn missing_required_param_is_rejected() {
         let err = load_str(SAMPLE, &HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("taskId"), "{err}");
+    }
+
+    const TYPED_PARAMS: &str = r#"
+workflow: {
+    name: "typed"
+    params: {
+        count:   {type: "int"}
+        ratio:   {type: "number"}
+        enabled: {type: "bool"}
+        tags:    {type: "list"}
+        label:   {type: "string", required: false, default: "x"}
+    }
+    steps: [
+        {type: "spawn", task: {title: "n=\(_input.count)"}},
+        {type: "repeat", max: _input.count, steps: [{type: "stop"}]},
+    ]
+}
+"#;
+
+    #[test]
+    fn stringly_params_coerce_to_declared_types() {
+        // Exactly what the CLI sends for `--param count=3 --param enabled=true
+        // --param ratio=0.5 --param tags=[1,2]`: every value is a JSON string.
+        let inputs = HashMap::from([
+            ("count".to_string(), json!("3")),
+            ("ratio".to_string(), json!("0.5")),
+            ("enabled".to_string(), json!("true")),
+            ("tags".to_string(), json!("[1,2]")),
+        ]);
+        let wf = load_str(TYPED_PARAMS, &inputs).unwrap();
+        // The int reached CUE as a real int, so `repeat.max: _input.count`
+        // (which requires an int) unified instead of erroring on a string.
+        let Step::Repeat(r) = &wf.steps[1] else {
+            panic!("second step should be repeat");
+        };
+        assert_eq!(r.max, 3);
+        // int interpolated into the title as a bare `3`, not the string "3".
+        let Step::Spawn(s) = &wf.steps[0] else {
+            panic!("first step should be spawn");
+        };
+        assert_eq!(s.task.title, "n=3");
+    }
+
+    #[test]
+    fn param_file_native_types_pass_through() {
+        // What --param-file supplies: already-typed JSON, not strings.
+        let inputs = HashMap::from([
+            ("count".to_string(), json!(7)),
+            ("ratio".to_string(), json!(1.5)),
+            ("enabled".to_string(), json!(false)),
+            ("tags".to_string(), json!(["a", "b"])),
+        ]);
+        let wf = load_str(TYPED_PARAMS, &inputs).unwrap();
+        let Step::Repeat(r) = &wf.steps[1] else {
+            panic!("second step should be repeat");
+        };
+        assert_eq!(r.max, 7);
+    }
+
+    #[test]
+    fn mistyped_param_is_a_clear_error() {
+        let inputs = HashMap::from([
+            ("count".to_string(), json!("not-a-number")),
+            ("ratio".to_string(), json!("0.5")),
+            ("enabled".to_string(), json!("true")),
+            ("tags".to_string(), json!("[]")),
+        ]);
+        let err = load_str(TYPED_PARAMS, &inputs).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("count") && msg.contains("int"), "{msg}");
+    }
+
+    #[test]
+    fn fractional_value_rejected_for_int_param() {
+        let inputs = HashMap::from([
+            ("count".to_string(), json!(2.5)),
+            ("ratio".to_string(), json!("0.5")),
+            ("enabled".to_string(), json!("true")),
+            ("tags".to_string(), json!("[]")),
+        ]);
+        let err = load_str(TYPED_PARAMS, &inputs).unwrap_err();
+        assert!(err.to_string().contains("int"), "{err}");
     }
 
     const CONTROL_FLOW: &str = r#"
