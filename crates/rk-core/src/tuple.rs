@@ -81,6 +81,17 @@ impl Category {
     pub fn evaporates(&self) -> bool {
         matches!(self, Category::Claim | Category::Obstacle | Category::Need)
     }
+
+    /// Epistemic weight for hot-ranking: higher = a stronger trail to follow.
+    /// Derived from the declaration order of [`Category::ALL`] (which runs from
+    /// `Fact` highest through `Endorsement` lowest), so ranking reuses the same
+    /// weighting the enum already encodes rather than a second, drift-prone
+    /// table. Read-only sugar for hot-scans (P7).
+    pub fn weight(&self) -> f64 {
+        let n = Self::ALL.len();
+        let pos = Self::ALL.iter().position(|c| c == self).unwrap_or(n);
+        (n - pos) as f64
+    }
 }
 
 /// Strength a freshly written or reinforced pheromone trail starts at. Each GC
@@ -324,6 +335,20 @@ mod tests {
         assert!(s.contains("strength"));
         let back: Tuple = serde_json::from_str(&s).unwrap();
         assert_eq!(trail, back);
+    }
+
+    #[test]
+    fn weight_is_strictly_descending_in_declaration_order() {
+        // Fact (first) outranks everything; each later category weighs less; all
+        // weights are positive so no category vanishes from a hot-scan.
+        let mut prev = f64::INFINITY;
+        for c in Category::ALL {
+            let w = c.weight();
+            assert!(w > 0.0, "{c:?} weight must be positive");
+            assert!(w < prev, "{c:?} weight {w} must be below the previous {prev}");
+            prev = w;
+        }
+        assert!(Category::Fact.weight() > Category::Endorsement.weight());
     }
 
     #[test]

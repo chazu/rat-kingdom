@@ -60,6 +60,19 @@ pub struct ScanArgs {
 }
 
 #[derive(Args)]
+pub struct HotScanArgs {
+    #[command(flatten)]
+    pub base: ScanArgs,
+    /// Rank strongest-first (category × recency × strength) instead of
+    /// oldest-first — follow the hottest trail (stigmergy P7).
+    #[arg(long)]
+    pub hot: bool,
+    /// Return only the top N strongest matches (implies --hot).
+    #[arg(long, value_name = "N")]
+    pub top: Option<usize>,
+}
+
+#[derive(Args)]
 pub struct DoneArgs {
     /// Optional summary of what was accomplished.
     pub summary: Option<String>,
@@ -229,8 +242,16 @@ pub async fn blocking_read(
     Ok(())
 }
 
-pub async fn scan(layout: &Layout, args: ScanArgs, as_json: bool) -> Result<()> {
-    let params = pattern_params(&args.category, &args.scope, &args.identity, &args.search);
+pub async fn scan(layout: &Layout, args: HotScanArgs, as_json: bool) -> Result<()> {
+    let base = &args.base;
+    let mut params =
+        pattern_params(&base.category, &base.scope, &base.identity, &base.search);
+    if args.hot {
+        params["hot"] = json!(true);
+    }
+    if let Some(n) = args.top {
+        params["top"] = json!(n);
+    }
     let mut client = Client::connect_or_spawn(layout).await?;
     let result = client.call("space.scan", params).await?;
     print_tuples(&result["tuples"], as_json);

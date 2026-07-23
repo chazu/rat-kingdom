@@ -159,6 +159,20 @@ impl Space {
         self.lock().store.query(pattern, false, None)
     }
 
+    /// Non-blocking ranked read (the `--hot` gradient, stigmergy P7): matching
+    /// tuples scored by `category_weight × recency × strength`, strongest first,
+    /// optionally capped to the top `limit`. Read-only sugar over [`Space::scan`]
+    /// — the oldest-first path and the waiter-wake predicate are untouched.
+    pub fn scan_hot(
+        &self,
+        pattern: &Pattern,
+        limit: Option<usize>,
+    ) -> rk_core::Result<Vec<Tuple>> {
+        self.lock()
+            .store
+            .query_ranked(pattern, chrono::Utc::now(), limit)
+    }
+
     /// Idempotent write for replication: inserts (and wakes waiters /
     /// publishes) only if this tuple id is not already present. Returns
     /// whether the tuple was new. Remotely-authored tuples arrive here so

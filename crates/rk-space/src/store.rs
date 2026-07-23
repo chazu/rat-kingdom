@@ -168,6 +168,36 @@ impl Store {
         Ok(out)
     }
 
+    /// Find tuples matching `pattern`, strongest trail first (the `--hot`
+    /// gradient, stigmergy P7). Each tuple is scored by
+    /// `category_weight × recency × strength` — see [`hot_score`] — and returned
+    /// highest-first, optionally capped to the top `limit`.
+    ///
+    /// Read-only sugar layered over [`Store::query`]: it reuses the exact same
+    /// WHERE clause (so the [`Pattern::matches`] mirror invariant is untouched)
+    /// and merely reorders in memory. The default oldest-first `query` path and
+    /// the waiter-wake predicate are deliberately left alone.
+    pub fn query_ranked(
+        &self,
+        pattern: &Pattern,
+        now: DateTime<Utc>,
+        limit: Option<usize>,
+    ) -> rk_core::Result<Vec<Tuple>> {
+        let tuples = self.query(pattern, false, None)?;
+        let mut scored: Vec<(f64, Tuple)> =
+            tuples.into_iter().map(|t| (hot_score(&t, now), t)).collect();
+        // Strongest score first; ties broken newest-id first so a hot-scan is
+        // deterministic. `total_cmp` keeps NaN-free scores well-ordered.
+        scored.sort_by(|a, b| {
+            b.0.total_cmp(&a.0).then_with(|| b.1.id.cmp(&a.1.id))
+        });
+        let mut out: Vec<Tuple> = scored.into_iter().map(|(_, t)| t).collect();
+        if let Some(n) = limit {
+            out.truncate(n);
+        }
+        Ok(out)
+    }
+
     /// Delete expired ephemeral tuples; returns how many were collected.
     pub fn delete_expired(&self, now: DateTime<Utc>) -> rk_core::Result<usize> {
         let n = self
@@ -251,6 +281,29 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM tuples", [], |r| r.get(0))
             .map_err(sql_err)
     }
+}
+
+/// Recency half-life for hot-ranking, in seconds: a tuple's recency factor
+/// halves every this-many seconds of age. Set near the ~30-min unreinforced
+/// pheromone lifetime (TKT-14) so a fresh trail clearly outshines a stale one
+/// without an old-but-strong Fact being buried instantly.
+const HOT_HALF_LIFE_SECS: f64 = 1800.0;
+
+/// The hot-scan gradient score for one tuple: `category_weight × recency ×
+/// strength`, all read-only signals.
+///
+/// * `category_weight` — [`Category::weight`], `Fact` heaviest.
+/// * `recency` — exponential decay `0.5^(age / half_life)`, so a just-written
+///   tuple scores `1.0` and older ones fade smoothly. Future/clock-skewed
+///   `created_at` is clamped to age `0` (recency `1.0`), never above.
+/// * `strength` — the evaporating-trail pheromone strength (TKT-14); tuples
+///   that do not carry one (facts, artifacts, …) count as [`FULL_STRENGTH`],
+///   so their weight and recency alone rank them.
+fn hot_score(tuple: &Tuple, now: DateTime<Utc>) -> f64 {
+    let age_secs = (now - tuple.created_at).num_milliseconds().max(0) as f64 / 1000.0;
+    let recency = 0.5f64.powf(age_secs / HOT_HALF_LIFE_SECS);
+    let strength = tuple.strength.unwrap_or(rk_core::tuple::FULL_STRENGTH);
+    tuple.category.weight() * recency * strength
 }
 
 fn escape_like(s: &str) -> String {
@@ -501,6 +554,72 @@ mod tests {
         store.insert(&trail("area", "rat", 1.0)).unwrap();
         assert_eq!(store.decay_and_collect(0.5).unwrap(), 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hot_ranks_by_category_recency_and_strength() {
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // A fresh strong claim, a fresh fact (heaviest category), and a stale
+        // faint claim. Backdate created_at directly so recency is exercised.
+        let mut fact = Tuple::new(Category::Fact, "repo", "hot-fact", "castle", json!({}));
+        fact.created_at = now;
+        let mut fresh = trail("fresh", "rat", 1.0);
+        fresh.created_at = now;
+        let mut stale = trail("stale", "rat", 0.1);
+        stale.created_at = now - chrono::Duration::hours(6);
+        for t in [&fact, &fresh, &stale] {
+            store.insert(t).unwrap();
+        }
+
+        let ranked = store
+            .query_ranked(&Pattern::default(), now, None)
+            .unwrap();
+        let order: Vec<&str> = ranked.iter().map(|t| t.identity.as_str()).collect();
+        // Fact outweighs the fresh claim; the stale faint claim sinks last.
+        assert_eq!(order, vec!["hot-fact", "fresh", "stale"]);
+
+        // --top N caps to the strongest.
+        let top1 = store
+            .query_ranked(&Pattern::default(), now, Some(1))
+            .unwrap();
+        assert_eq!(top1.len(), 1);
+        assert_eq!(top1[0].identity, "hot-fact");
+    }
+
+    #[test]
+    fn hot_scan_leaves_default_order_untouched() {
+        // The ranked path is additive: the plain oldest-first query still sorts
+        // by id ASC regardless of score.
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        let weak = tuple("weak", json!({}));
+        let strong = Tuple::new(Category::Fact, "repo", "strong", "castle", json!({}));
+        store.insert(&weak).unwrap();
+        store.insert(&strong).unwrap();
+
+        let plain = store.query(&Pattern::default(), false, None).unwrap();
+        let mut expected = vec![weak.clone(), strong.clone()];
+        expected.sort_by_key(|t| t.id);
+        assert_eq!(
+            plain.iter().map(|t| t.id).collect::<Vec<_>>(),
+            expected.iter().map(|t| t.id).collect::<Vec<_>>()
+        );
+        // And the ranked path does not mutate stored rows.
+        let _ = store.query_ranked(&Pattern::default(), now, None).unwrap();
+        assert_eq!(store.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn hot_score_clamps_future_created_at() {
+        // A clock-skewed future timestamp must not score above a fresh one.
+        let mut future = trail("future", "rat", 1.0);
+        let now = Utc::now();
+        future.created_at = now + chrono::Duration::hours(1);
+        let mut fresh = trail("fresh", "rat", 1.0);
+        fresh.created_at = now;
+        assert!((hot_score(&future, now) - hot_score(&fresh, now)).abs() < 1e-9);
     }
 
     #[test]

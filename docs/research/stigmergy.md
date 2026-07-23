@@ -305,7 +305,19 @@ redirects the colony. Without this, P2 produces conventions no one enforces.
 
 ---
 
-### P7 — Gradient / "hot" scans (rank by recency × weight × strength)
+### P7 — Gradient / "hot" scans (rank by recency × weight × strength) — LANDED (TKT-27)
+
+**Landed.** `Store::query_ranked` scores matching tuples by
+`category_weight × recency × strength` in Rust over the exact `Pattern::matches`
+predicate (no SQL divergence), returns strongest-first, and `--top N` caps to
+the hottest N. `rk scan --hot`/`--top N` → `space.scan {hot,top}` →
+`Space::scan_hot`. The default oldest-first `query` path and the waiter-wake
+predicate are untouched — ranking is read-only sugar. Recency is an
+exponential half-life (`HOT_HALF_LIFE_SECS`, ~30 min) so a fresh trail outshines
+a stale one without burying an old-but-heavy fact. Seams: `rk-core` tuple.rs
+`Category::weight`, `rk-space` store.rs `query_ranked`/`hot_score` + lib.rs
+`scan_hot`, `rk-daemon` server.rs `ScanParams`/`handle_scan`, `rk-cli`
+space_cmds.rs `HotScanArgs`. Tests: store.rs unit + `crates/rk-daemon/tests/hot_scan.rs` e2e.
 
 **Mechanism.** Let rats follow the strongest trail instead of the oldest one.
 Add an optional ranked read that scores tuples by
