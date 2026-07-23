@@ -47,6 +47,15 @@ pub struct SpawnParams {
     /// headless. Completion comes from the rat's own `rk done` tuple.
     #[serde(default)]
     pub attach: bool,
+    /// Workflow instance dispatching this spawn (None = not from a workflow).
+    /// Recorded on the agent so its cost sums into the instance's rollup.
+    #[serde(default)]
+    pub workflow_instance: Option<String>,
+    /// Per-instance USD cap for `workflow_instance`, from the workflow's
+    /// `budget:` field. Enforced as a dispatch preflight: once this instance's
+    /// summed cost reaches it, further spawns are refused. `None`/0 = unlimited.
+    #[serde(default)]
+    pub instance_max_usd: Option<f64>,
 }
 
 fn default_role() -> String {
@@ -192,7 +201,12 @@ impl Supervisor {
         // here — before any worktree/branch/name is allocated — so a runaway
         // autoscaler or nightly drain stops dispatching instead of draining the
         // account. Single spawns and workflow fan-out both funnel through here.
-        self.check_dispatch_budget(&repo_name)?;
+        // A workflow's per-instance cap is enforced in the same preflight.
+        self.check_dispatch_budget(
+            &repo_name,
+            params.workflow_instance.as_deref(),
+            params.instance_max_usd,
+        )?;
         let target_branch = match &params.base {
             Some(b) => b.clone(),
             None => repo.current_branch()?,
@@ -291,6 +305,7 @@ impl Supervisor {
             worktree: Some(worktree),
             target_branch,
             parent: params.parent.clone(),
+            workflow_instance: params.workflow_instance.clone(),
             session_id: None,
             attach_target: None,
             pid: session.pid,
@@ -380,6 +395,7 @@ impl Supervisor {
                 None => repo.current_branch()?,
             },
             parent: params.parent.clone(),
+            workflow_instance: params.workflow_instance.clone(),
             session_id: None,
             attach_target: Some(target.clone()),
             pid: None,
@@ -685,43 +701,63 @@ impl Supervisor {
         }
     }
 
-    /// Sum of every currently-registered agent's cost, fleet-wide and for one
-    /// `repo`. Registry-scoped: agents removed on dismissal drop off, so this is
-    /// *current* fleet spend — the same denominator `rk cost` reports.
-    fn cost_rollup(&self, repo: &str) -> (f64, f64) {
+    /// Sum of every currently-registered agent's cost, fleet-wide, for one
+    /// `repo`, and (when given) for one workflow `instance`. Registry-scoped:
+    /// agents removed on dismissal drop off, so this is *current* spend — the
+    /// same denominator `rk cost` reports.
+    fn cost_rollup(&self, repo: &str, instance: Option<&str>) -> (f64, f64, f64) {
         let reg = self.lock_registry();
         let mut fleet = 0.0;
         let mut repo_total = 0.0;
+        let mut instance_total = 0.0;
         for a in reg.list() {
             fleet += a.cost_usd;
             if a.repo_name == repo {
                 repo_total += a.cost_usd;
             }
+            if instance.is_some() && a.workflow_instance.as_deref() == instance {
+                instance_total += a.cost_usd;
+            }
         }
-        (fleet, repo_total)
+        (fleet, repo_total, instance_total)
     }
 
-    /// Preflight fleet/repo budget guard run before every spawn. Returns `Err`
-    /// (refusing dispatch) once a cap is hit; posts an obstacle on both the warn
-    /// band and the hard cap so it surfaces in `rk inbox`.
-    fn check_dispatch_budget(&self, repo: &str) -> rk_core::Result<()> {
-        let (fleet_spent, repo_spent) = self.cost_rollup(repo);
-        let check = self.fleet_budget.check_dispatch(fleet_spent, repo_spent);
+    /// Preflight fleet/repo/instance budget guard run before every spawn.
+    /// Returns `Err` (refusing dispatch) once a cap is hit; posts an obstacle on
+    /// both the warn band and the hard cap so it surfaces in `rk inbox`. When
+    /// `instance`/`instance_cap` are set, the workflow's per-instance cap is
+    /// enforced alongside the global fleet/repo caps.
+    fn check_dispatch_budget(
+        &self,
+        repo: &str,
+        instance: Option<&str>,
+        instance_cap: Option<f64>,
+    ) -> rk_core::Result<()> {
+        let (fleet_spent, repo_spent, instance_spent) = self.cost_rollup(repo, instance);
+        // Only fold in the instance scope when this spawn carries an instance id
+        // and a positive cap; otherwise the check stays fleet/repo-only.
+        let instance_arg = match (instance, instance_cap) {
+            (Some(_), Some(cap)) if cap > 0.0 => Some((instance_spent, cap)),
+            _ => None,
+        };
+        let check =
+            self.fleet_budget
+                .check_dispatch_scoped(fleet_spent, repo_spent, instance_arg);
         match check.action {
             BudgetAction::Ok => Ok(()),
             BudgetAction::Warn => {
                 if let Some(scope) = check.scope {
-                    if self.mark_fleet_warned(scope, repo) {
-                        warn!(scope = scope.as_str(), spent = check.spent_usd, cap = check.cap_usd, "fleet budget warning threshold crossed");
-                        self.emit_dispatch_obstacle(repo, scope, "warning", &check);
+                    if self.mark_fleet_warned(scope, repo, instance) {
+                        warn!(scope = scope.as_str(), spent = check.spent_usd, cap = check.cap_usd, "budget warning threshold crossed");
+                        self.emit_dispatch_obstacle(repo, scope, "warning", &check, instance);
                     }
                 }
                 Ok(())
             }
             BudgetAction::Stop => {
                 let scope = check.scope.unwrap_or(BudgetScope::Fleet);
-                warn!(scope = scope.as_str(), spent = check.spent_usd, cap = check.cap_usd, "fleet budget cap hit — refusing dispatch");
-                self.emit_dispatch_obstacle(repo, scope, "exceeded", &check);
+                warn!(scope = scope.as_str(), spent = check.spent_usd, cap = check.cap_usd, "budget cap hit — refusing dispatch");
+                self.emit_dispatch_obstacle(repo, scope, "exceeded", &check, instance);
                 Err(rk_core::Error::other(format!(
                     "{} budget cap hit: ${:.4} spent >= ${:.4} cap — dispatch refused",
                     scope.as_str(),
@@ -732,12 +768,14 @@ impl Supervisor {
         }
     }
 
-    /// Returns true the first time a given fleet/repo scope is warned, so a warn
-    /// obstacle is not re-posted on every subsequent dispatch in the band.
-    fn mark_fleet_warned(&self, scope: BudgetScope, repo: &str) -> bool {
+    /// Returns true the first time a given scope is warned, so a warn obstacle
+    /// is not re-posted on every subsequent dispatch in the band. The instance
+    /// scope is keyed by instance id so each workflow run warns independently.
+    fn mark_fleet_warned(&self, scope: BudgetScope, repo: &str, instance: Option<&str>) -> bool {
         let key = match scope {
             BudgetScope::Fleet => "__fleet__".to_string(),
             BudgetScope::Repo => format!("__repo__:{repo}"),
+            BudgetScope::Instance => format!("__instance__:{}", instance.unwrap_or("")),
         };
         match self.fleet_warned.lock() {
             Ok(mut set) => set.insert(key),
@@ -751,18 +789,27 @@ impl Supervisor {
         scope: BudgetScope,
         kind: &str,
         check: &DispatchCheck,
+        instance: Option<&str>,
     ) {
+        let mut payload = json!({
+            "type": format!("budget_{}_{kind}", scope.as_str()),
+            "scope": scope.as_str(),
+            "spent_usd": check.spent_usd,
+            "cap_usd": check.cap_usd,
+        });
+        // Name the offending instance on an instance-scoped obstacle so the
+        // operator can tell which workflow run hit its cap.
+        if scope == BudgetScope::Instance {
+            if let Some(id) = instance {
+                payload["instance"] = json!(id);
+            }
+        }
         let tuple = Tuple::new(
             Category::Obstacle,
             repo.to_string(),
             format!("budget-{}", scope.as_str()),
             self.castle.clone(),
-            json!({
-                "type": format!("budget_{}_{kind}", scope.as_str()),
-                "scope": scope.as_str(),
-                "spent_usd": check.spent_usd,
-                "cap_usd": check.cap_usd,
-            }),
+            payload,
         );
         if let Err(e) = self.space.out(tuple) {
             warn!(error = %e, "failed to emit dispatch budget obstacle");
@@ -776,11 +823,15 @@ impl Supervisor {
         use std::collections::BTreeMap;
         let mut fleet_spent = 0.0;
         let mut per_repo: BTreeMap<String, f64> = BTreeMap::new();
+        let mut per_instance: BTreeMap<String, f64> = BTreeMap::new();
         {
             let reg = self.lock_registry();
             for a in reg.list() {
                 fleet_spent += a.cost_usd;
                 *per_repo.entry(a.repo_name.clone()).or_default() += a.cost_usd;
+                if let Some(inst) = &a.workflow_instance {
+                    *per_instance.entry(inst.clone()).or_default() += a.cost_usd;
+                }
             }
         }
         let fb = &self.fleet_budget;
@@ -788,9 +839,17 @@ impl Supervisor {
             .into_iter()
             .map(|(repo, spent)| scope_json(spent, fb.repo_max_usd, fb.warn_at, Some(repo)))
             .collect();
+        // Per-instance spend is reported cap-less: an instance's cap lives on
+        // its workflow definition, not in the fleet config, so this rollup shows
+        // current burn per running workflow (the cap is enforced at dispatch).
+        let instances: Vec<serde_json::Value> = per_instance
+            .into_iter()
+            .map(|(instance, spent)| json!({"instance": instance, "spent_usd": spent}))
+            .collect();
         json!({
             "fleet": scope_json(fleet_spent, fb.fleet_max_usd, fb.warn_at, None),
             "repos": repos,
+            "instances": instances,
         })
     }
 

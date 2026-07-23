@@ -97,6 +97,8 @@ pub struct FleetBudget {
 pub enum BudgetScope {
     Fleet,
     Repo,
+    /// One workflow instance's own spend, capped by its `budget:` field.
+    Instance,
 }
 
 impl BudgetScope {
@@ -104,6 +106,7 @@ impl BudgetScope {
         match self {
             BudgetScope::Fleet => "fleet",
             BudgetScope::Repo => "repo",
+            BudgetScope::Instance => "instance",
         }
     }
 }
@@ -149,12 +152,33 @@ impl FleetBudget {
     /// cap is reported first on a severity tie since it is the broader
     /// guardrail. Zero caps are skipped (unlimited).
     pub fn check_dispatch(&self, fleet_spent_usd: f64, repo_spent_usd: f64) -> DispatchCheck {
+        self.check_dispatch_scoped(fleet_spent_usd, repo_spent_usd, None)
+    }
+
+    /// Like [`check_dispatch`] but also evaluates a per-workflow-instance cap
+    /// when `instance` is `Some((spent, cap))`. The instance cap does not live
+    /// in the fleet config — it rides on a workflow's `budget:` field — so it is
+    /// passed per call. Tie ordering runs broadest-first (fleet > repo >
+    /// instance): the first scope to reach a given severity is reported, so the
+    /// wider guardrail names the refusal on a tie. Zero caps are skipped.
+    ///
+    /// [`check_dispatch`]: FleetBudget::check_dispatch
+    pub fn check_dispatch_scoped(
+        &self,
+        fleet_spent_usd: f64,
+        repo_spent_usd: f64,
+        instance: Option<(f64, f64)>,
+    ) -> DispatchCheck {
         let warn_frac = if self.warn_at > 0.0 { self.warn_at } else { 0.8 };
         let mut worst = DispatchCheck::ok();
-        for (scope, spent, cap) in [
+        let mut entries = vec![
             (BudgetScope::Fleet, fleet_spent_usd, self.fleet_max_usd),
             (BudgetScope::Repo, repo_spent_usd, self.repo_max_usd),
-        ] {
+        ];
+        if let Some((spent, cap)) = instance {
+            entries.push((BudgetScope::Instance, spent, cap));
+        }
+        for (scope, spent, cap) in entries {
             if cap <= 0.0 {
                 continue;
             }
@@ -283,5 +307,51 @@ mod tests {
             FleetBudget::default().check_dispatch(1e9, 1e9).action,
             BudgetAction::Ok
         );
+    }
+
+    #[test]
+    fn instance_cap_denies_dispatch_under_fleet_and_repo() {
+        // Fleet/repo unlimited, but this one workflow instance is over its own
+        // cap: dispatch is refused and the instance scope binds.
+        let fb = FleetBudget::default();
+        let deny = fb.check_dispatch_scoped(1000.0, 1000.0, Some((2.0, 2.0)));
+        assert!(deny.denied());
+        assert_eq!(deny.scope, Some(BudgetScope::Instance));
+        assert_eq!(deny.cap_usd, 2.0);
+
+        let warn = fb.check_dispatch_scoped(0.0, 0.0, Some((1.6, 2.0)));
+        assert_eq!(warn.action, BudgetAction::Warn);
+        assert_eq!(warn.scope, Some(BudgetScope::Instance));
+
+        let ok = fb.check_dispatch_scoped(0.0, 0.0, Some((0.5, 2.0)));
+        assert_eq!(ok.action, BudgetAction::Ok);
+    }
+
+    #[test]
+    fn zero_instance_cap_is_unlimited() {
+        let fb = FleetBudget::default();
+        assert_eq!(
+            fb.check_dispatch_scoped(0.0, 0.0, Some((1e9, 0.0))).action,
+            BudgetAction::Ok
+        );
+        // None instance is identical to the two-arg check.
+        assert_eq!(
+            fb.check_dispatch_scoped(0.0, 0.0, None).action,
+            BudgetAction::Ok
+        );
+    }
+
+    #[test]
+    fn fleet_outranks_instance_on_severity_tie() {
+        // Both fleet and instance are exactly at their caps: the broader fleet
+        // guardrail is reported as the binding scope.
+        let fb = FleetBudget {
+            fleet_max_usd: 10.0,
+            repo_max_usd: 0.0,
+            warn_at: 0.8,
+        };
+        let deny = fb.check_dispatch_scoped(10.0, 0.0, Some((3.0, 3.0)));
+        assert!(deny.denied());
+        assert_eq!(deny.scope, Some(BudgetScope::Fleet));
     }
 }

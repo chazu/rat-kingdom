@@ -26,9 +26,21 @@ pub struct Workflow {
     /// `[tiers]` table for this workflow's fan-out spawns.
     #[serde(default)]
     pub tiers: TierRouting,
+    /// Optional per-instance budget cap: once this instance's summed agent cost
+    /// reaches it, further dispatch is refused. `None` = unlimited.
+    #[serde(default)]
+    pub budget: Option<WorkflowBudget>,
     pub steps: Vec<Step>,
     #[serde(default)]
     pub aspects: Vec<Aspect>,
+}
+
+/// Per-workflow-instance budget cap (the `budget:` field). A USD ceiling on the
+/// summed cost of every agent one instance spawns; enforced as a dispatch
+/// preflight, mirroring the fleet/repo caps but scoped to a single run.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowBudget {
+    pub max_usd: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

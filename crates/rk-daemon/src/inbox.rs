@@ -195,6 +195,7 @@ mod tests {
             worktree: Some(format!("/tmp/wt/{name}").into()),
             target_branch: "main".into(),
             parent: None,
+            workflow_instance: None,
             session_id: None,
             attach_target: None,
             pid: None,
@@ -222,6 +223,7 @@ mod tests {
                 None
             },
             awaiting: awaiting.map(str::to_string),
+            instance_max_usd: None,
             started_at: Utc::now(),
             completed_at: None,
         }

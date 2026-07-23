@@ -193,6 +193,8 @@ fleet_max_usd = 0.0              # fleet-wide wallet kill-switch: once the SUM o
                                  # REFUSED (dispatch stops) — safe for autoscaler/
                                  # nightly runs. See `rk cost --fleet`.
 repo_max_usd = 0.0               # same guard, scoped per-repo
+                                 # (a workflow's own `budget: {max_usd}` field
+                                 # caps one instance's spend, layered below these)
 
 [supervisor]                     # liveness/burn sweep (budget only sees Usage
                                  # events; this catches rats hung emitting nothing)
@@ -269,6 +271,12 @@ workflow: {
   → `[harness] default`. Unknown profile/tier names are errors.
 - Spawn steps inside a workflow base their worktrees on the previous agent's
   branch (`ctx.activeBranch`), which is how a reviewer sees the rat's work.
+- **Per-instance budget**: add `budget: {max_usd: 2.5}` to a workflow to cap the
+  summed cost of every agent one run spawns. Enforced as a dispatch preflight
+  (same machinery as the global fleet/repo caps): once this run's spend reaches
+  the cap, its next spawn — single or fan-out — is refused and the instance
+  fails, surfacing a `budget_instance_exceeded` obstacle in `rk inbox`. Layered
+  below `fleet_max_usd`/`repo_max_usd`; per-run spend shows in `rk cost --fleet`.
 
 ## Reactor (triggers)
 

@@ -44,6 +44,11 @@ pub struct Instance {
     /// status alone can't distinguish a parked gate from active execution.
     #[serde(default)]
     pub awaiting: Option<String>,
+    /// Per-instance budget cap in USD from the workflow's `budget:` field.
+    /// Once this instance's summed agent cost reaches it, further dispatch
+    /// (single spawn or fan-out) is refused. `None`/0 = unlimited.
+    #[serde(default)]
+    pub instance_max_usd: Option<f64>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -183,6 +188,7 @@ impl WorkflowEngine {
             context: WorkflowContext::default(),
             error: None,
             awaiting: None,
+            instance_max_usd: workflow.budget.map(|b| b.max_usd),
             started_at: chrono::Utc::now(),
             completed_at: None,
         };
@@ -288,6 +294,8 @@ impl WorkflowEngine {
                         model: resolved.model,
                         permission_mode: resolved.permission_mode,
                         attach: false,
+                        workflow_instance: Some(id.to_string()),
+                        instance_max_usd: self.instance_budget(id),
                     })?;
                     self.update(id, |i| {
                         i.context.active_agent = Some(record.name.clone());
@@ -534,6 +542,10 @@ impl WorkflowEngine {
         // The workflow's own tier rules shadow the global ones for this fan-out.
         let routing = tiers.chained(&self.tier_routing);
         let ctx = self.context(id);
+        // The per-instance cap is static for the run; spent is recomputed live
+        // in the supervisor per spawn, so later fan-out spawns are refused once
+        // earlier ones have burned the instance past its cap.
+        let instance_cap = self.instance_budget(id);
         let mut fanned = Vec::with_capacity(items.len());
         for item in items {
             // Atomically claim the ticket before spawning. If a concurrent drain
@@ -578,6 +590,8 @@ impl WorkflowEngine {
                 model: resolved.model,
                 permission_mode: resolved.permission_mode,
                 attach: false,
+                workflow_instance: Some(id.to_string()),
+                instance_max_usd: instance_cap,
             })?;
             fanned.push(FannedAgent {
                 agent: record.name.clone(),
@@ -845,6 +859,12 @@ impl WorkflowEngine {
             .get(id)
             .map(|i| i.context.clone())
             .unwrap_or_default()
+    }
+
+    /// This instance's per-run budget cap (from the workflow's `budget:`), used
+    /// as the dispatch preflight ceiling on every spawn it makes.
+    fn instance_budget(&self, id: &str) -> Option<f64> {
+        self.lock().get(id).and_then(|i| i.instance_max_usd)
     }
 
     fn store(&self, instance: Instance) {

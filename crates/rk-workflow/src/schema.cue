@@ -35,6 +35,12 @@ workflow: #Workflow
 	// [tiers] table; see #TierRouting.
 	tiers?: #TierRouting
 
+	// Per-instance budget cap. Once the SUM of this instance's spawned agents'
+	// cost reaches max_usd, further dispatch (single spawn or fan-out) is
+	// refused — the wallet kill-switch scoped to one workflow run, layered
+	// below the global fleet/repo caps.
+	budget?: #WorkflowBudget
+
 	// Steps run in sequence. At least one required.
 	steps: [...#Step] & [_, ...]
 
@@ -46,6 +52,12 @@ workflow: #Workflow
 	type:     "string" | "int" | "bool"
 	required: bool | *true
 	default?: _
+}
+
+// Per-workflow-instance budget cap. Positive USD ceiling on the summed cost of
+// every agent this instance spawns.
+#WorkflowBudget: {
+	max_usd: number & >0
 }
 
 // Which harness/model runs an agent. All fields optional; resolution is
