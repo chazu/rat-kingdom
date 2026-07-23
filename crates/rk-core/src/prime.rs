@@ -127,8 +127,15 @@ const FRAGMENT_COMPLETION: &str = "\
 ## Completion protocol (mandatory, in order)
 
 1. Ensure the working tree is committed (no uncommitted changes).
-2. Run the repo's tests/linters if present; fix what you broke.
-3. `rk done \"<summary>\"` — this is how the orchestrator knows you finished.
+2. Verify with the project's own build, tests, and linters — for a Rust crate
+   that means `cargo build`, `cargo test`, and `cargo clippy` all pass. A
+   partial check (e.g. `cue vet`) is NOT verification: the code must actually
+   compile and the suite must actually run green.
+3. Never `rk done` on a build you broke. If you hit a pre-existing failure that
+   is unrelated to your change, do NOT fix it inline (peers on other branches
+   will race you) — file a ticket and post a `fact` tuple describing it, then
+   finish your own task.
+4. `rk done \"<summary>\"` — this is how the orchestrator knows you finished.
 ";
 
 /// Render role instructions. Roles: "operator" (the human's dispatcher — the
