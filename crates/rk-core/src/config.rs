@@ -14,6 +14,7 @@ pub struct Config {
     pub harness: HarnessConfig,
     pub budget: BudgetConfig,
     pub sync: SyncConfig,
+    pub reactor: ReactorConfig,
     /// Named agent profiles: [agents.<name>] harness/model/permission_mode.
     /// The "default" profile applies to all spawns that name no profile.
     pub agents: std::collections::HashMap<String, AgentProfileConfig>,
@@ -43,6 +44,43 @@ impl Default for SyncConfig {
             enabled: false,
             remote_url: None,
             interval_secs: 30,
+        }
+    }
+}
+
+/// The daemon tuple-reactor: reactions that fire workflows when tuples matching
+/// a registered `#Trigger` land in the space. The live feed is only a wake
+/// signal; dispatch is driven by a durable cursor scan so no event is missed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ReactorConfig {
+    /// Master switch. When false the reactor loop never starts.
+    pub enabled: bool,
+    /// Fallback scan cadence. Feed events also wake a cycle; this bounds the
+    /// worst-case latency if the lossy feed drops the waking event entirely.
+    pub interval_secs: u64,
+    /// Rolling window (seconds) over which a trigger's fires are rate-capped.
+    pub window_secs: u64,
+    /// Default per-trigger fire cap within `window_secs`; a `#Trigger` may lower
+    /// it with `maxFires`. Bounded to <=100 to mirror the `repeat` discipline.
+    pub max_fires: u32,
+    /// How long an idempotency marker (one per fired `(trigger, tuple)`) lives.
+    /// Must outlast any at-least-once redelivery; defaults to a week.
+    pub marker_ttl_secs: u64,
+    /// Tuple authors the reactor never reacts to, in addition to its own output
+    /// (always excluded). Use this to break re-entrancy from known agents.
+    pub exclude_instances: Vec<String>,
+}
+
+impl Default for ReactorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 30,
+            window_secs: 60,
+            max_fires: 20,
+            marker_ttl_secs: 7 * 24 * 3600,
+            exclude_instances: Vec::new(),
         }
     }
 }

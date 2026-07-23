@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SCHEMA: &str = include_str!("schema.cue");
+const TRIGGER_SCHEMA: &str = include_str!("triggers-schema.cue");
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Workflow {
@@ -323,6 +324,76 @@ pub fn load_str(source: &str, inputs: &HashMap<String, Value>) -> rk_core::Resul
     workflow.steps = expand_aspects(workflow.steps, &workflow.aspects);
     std::fs::remove_dir_all(&dir).ok();
     Ok(workflow)
+}
+
+/// A reactor trigger: a match predicate over a landing tuple plus the workflow
+/// to run when it matches. Loaded from `#Trigger` CUE definitions, validated
+/// against the embedded trigger schema exactly as workflows are.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Trigger {
+    pub name: String,
+    #[serde(rename = "match")]
+    pub matcher: TriggerMatch,
+    /// Workflow definition name to launch on a match.
+    pub run: String,
+    /// Registered repo name to run in; falls back to the tuple scope / the
+    /// trigger file's own repo at dispatch time.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Workflow params, each templated from the matched tuple's fields/payload.
+    #[serde(default)]
+    pub params: HashMap<String, String>,
+    /// Tuple authors this trigger never fires for.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Per-trigger fire cap within the reactor window; unset uses the config
+    /// default.
+    #[serde(default, rename = "maxFires")]
+    pub max_fires: Option<u32>,
+}
+
+/// The tuple predicate half of a [`Trigger`]. Every set field must match (AND);
+/// unset fields match anything.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TriggerMatch {
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub identity: Option<String>,
+    #[serde(default)]
+    pub instance: Option<String>,
+    /// Substring the serialized payload must contain.
+    #[serde(default)]
+    pub search: Option<String>,
+}
+
+/// Load and validate every `#Trigger` in one CUE file.
+pub fn load_triggers(file: &Path) -> rk_core::Result<Vec<Trigger>> {
+    let source = std::fs::read_to_string(file)
+        .map_err(|e| rk_core::Error::other(format!("read {}: {e}", file.display())))?;
+    load_triggers_str(&source)
+}
+
+/// Load triggers from source text (see [`load_triggers`]).
+pub fn load_triggers_str(source: &str) -> rk_core::Result<Vec<Trigger>> {
+    let dir = tempfile_dir()?;
+    std::fs::write(dir.join("schema.cue"), TRIGGER_SCHEMA)?;
+    std::fs::write(dir.join("triggers.cue"), ensure_triggers_package(source))?;
+    let json = cue_export(&dir, "triggers")?;
+    let triggers: Vec<Trigger> = serde_json::from_str(&json)
+        .map_err(|e| rk_core::Error::other(format!("triggers JSON did not match schema: {e}")))?;
+    std::fs::remove_dir_all(&dir).ok();
+    Ok(triggers)
+}
+
+fn ensure_triggers_package(source: &str) -> String {
+    if source.trim_start().starts_with("package ") || source.contains("\npackage ") {
+        source.to_string()
+    } else {
+        format!("package triggers\n\n{source}")
+    }
 }
 
 /// List workflow definitions in a directory (files named `<name>.cue`).
@@ -700,5 +771,51 @@ workflow: {
             durations,
             vec!["inner-before", "outer-before", "SPAWN", "inner-after"]
         );
+    }
+
+    const TRIGGERS: &str = r#"
+triggers: [
+    {
+        name: "endorse-quorum"
+        match: {category: "endorsement", scope: "system"}
+        run:  "promote-convention"
+        params: {suggestion: "{{tuple.payload.suggestion}}"}
+        maxFires: 5
+    },
+    {
+        name: "drain-on-ticket"
+        match: {category: "event", identity: "ticket_created"}
+        run:  "backlog-drain"
+        exclude: ["daemon"]
+    },
+]
+"#;
+
+    #[test]
+    fn loads_triggers_via_cue() {
+        let triggers = load_triggers_str(TRIGGERS).unwrap();
+        assert_eq!(triggers.len(), 2);
+        let first = &triggers[0];
+        assert_eq!(first.name, "endorse-quorum");
+        assert_eq!(first.matcher.category.as_deref(), Some("endorsement"));
+        assert_eq!(first.matcher.scope.as_deref(), Some("system"));
+        assert_eq!(first.run, "promote-convention");
+        assert_eq!(first.params["suggestion"], "{{tuple.payload.suggestion}}");
+        assert_eq!(first.max_fires, Some(5));
+        assert_eq!(triggers[1].exclude, vec!["daemon".to_string()]);
+    }
+
+    #[test]
+    fn trigger_maxfires_over_cap_is_a_cue_error() {
+        let bad = r#"triggers: [{name: "x", match: {category: "need"}, run: "w", maxFires: 101}]"#;
+        let err = load_triggers_str(bad).unwrap_err();
+        assert!(err.to_string().contains("cue export failed"), "{err}");
+    }
+
+    #[test]
+    fn trigger_bad_name_is_a_cue_error() {
+        let bad = r#"triggers: [{name: "Bad Name", match: {category: "need"}, run: "w"}]"#;
+        let err = load_triggers_str(bad).unwrap_err();
+        assert!(err.to_string().contains("cue export failed"), "{err}");
     }
 }

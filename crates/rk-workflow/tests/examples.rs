@@ -37,6 +37,31 @@ fn all_shipped_examples_load() {
 }
 
 #[test]
+fn shipped_example_triggers_load() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("examples")
+        .join("triggers.cue");
+    let triggers = rk_workflow::load_triggers(&file)
+        .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
+    assert!(!triggers.is_empty(), "example triggers should not be empty");
+    // Every example trigger names a workflow that ships in examples/workflows.
+    let workflows: Vec<String> = rk_workflow::definitions(&examples_dir())
+        .iter()
+        .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+        .collect();
+    for t in &triggers {
+        assert!(
+            workflows.contains(&t.run),
+            "trigger '{}' runs unknown workflow '{}'",
+            t.name,
+            t.run
+        );
+    }
+}
+
+#[test]
 fn reviewer_drives_rework_loads_and_routes() {
     use rk_workflow::Step;
     let inputs = HashMap::from([

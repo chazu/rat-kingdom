@@ -4,6 +4,7 @@
 pub mod agents;
 pub mod client;
 pub mod proto;
+pub mod reactor;
 pub mod repos;
 pub mod server;
 pub mod supervisor;

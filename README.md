@@ -247,6 +247,55 @@ workflow: {
 - Spawn steps inside a workflow base their worktrees on the previous agent's
   branch (`ctx.activeBranch`), which is how a reviewer sees the rat's work.
 
+## Reactor (triggers)
+
+The daemon runs a background **tuple-reactor**: registered `#Trigger` reactions
+that fire a workflow whenever a matching tuple lands in the space — zero-token,
+zero-model dispatch. This is the keystone the stigmergy proposals (quorum
+promotion, obstacle coalescence, convention injection) build on. Triggers go in
+`~/.rat-kingdom/triggers/*.cue` (global) or `<repo>/.rk/triggers.cue`
+(repo-local), validated against `crates/rk-workflow/src/triggers-schema.cue`.
+
+```cue
+triggers: [
+    {
+        name:  "drain-on-new-ticket"
+        match: {category: "event", identity: "ticket_created", scope: "myrepo"}
+        run:   "backlog-drain"                 // a workflow definition name
+        params: {taskId: "{{tuple.payload.ticket}}"}
+        exclude: ["daemon"]                     // never react to these authors
+        maxFires: 10                            // per-window storm cap (<=100)
+    },
+]
+```
+
+- **Never misses events.** The live feed is only a wake signal; dispatch is
+  driven by a durable cursor scan (`~/.rat-kingdom/reactor-cursor`), so a dropped
+  feed event is still picked up by the next scan.
+- **Idempotent.** Each fired `(trigger, tuple)` writes a durable marker, so an
+  at-least-once redelivery (crash, cursor loss) never double-fires.
+- **No storms.** The reactor tags its own output (`reactor` instance, never
+  reacted to), honours `exclude`/`[reactor].exclude_instances`, and caps each
+  trigger at `maxFires` per `[reactor].window_secs`.
+- **Params** template from the matched tuple: `{{tuple.category|scope|identity|
+  instance|id}}` and `{{tuple.payload.<field>}}` (a lone payload placeholder
+  passes the raw JSON value through; otherwise it is string-interpolated).
+
+Configure in `config.toml`:
+
+```toml
+[reactor]
+enabled = true
+interval_secs = 30       # fallback scan cadence (feed also wakes it)
+window_secs = 60         # rolling rate-cap window
+max_fires = 20           # default per-trigger cap; a #Trigger may lower it
+marker_ttl_secs = 604800 # idempotency marker lifetime
+exclude_instances = []   # authors never reacted to (besides "reactor")
+```
+
+See `docs/reactor.md` for the full design (why scan-is-truth, the three
+re-entrancy guards, first-boot backlog skipping).
+
 ## Attach mode (herdr)
 
 With a running [herdr](https://herdr.dev) server, rats can run interactively

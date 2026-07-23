@@ -28,6 +28,7 @@ pub struct Daemon {
     supervisor: Arc<crate::supervisor::Supervisor>,
     syncer: Option<Arc<crate::sync::Syncer>>,
     sync_interval: Duration,
+    reactor_config: rk_core::config::ReactorConfig,
     global_agents: std::collections::HashMap<String, rk_workflow::AgentProfile>,
     default_harness: String,
     engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
@@ -67,6 +68,7 @@ impl Daemon {
                 )
             })
             .collect();
+        daemon.reactor_config = config.reactor.clone();
         if config.sync.enabled {
             let syncer = crate::sync::Syncer::new(
                 &daemon.layout,
@@ -132,6 +134,7 @@ impl Daemon {
             supervisor,
             syncer: None,
             sync_interval: Duration::from_secs(30),
+            reactor_config: rk_core::config::ReactorConfig::default(),
             global_agents: Default::default(),
             default_harness,
             engine: std::sync::OnceLock::new(),
@@ -222,6 +225,60 @@ impl Daemon {
                             }
                         }
                         _ = sync_shutdown.changed() => break,
+                    }
+                }
+            });
+        }
+
+        // Reactor loop: fire registered #Trigger workflows on matching tuples.
+        // The lossy feed is only a wake signal; a durable cursor scan is the
+        // source of truth, so no event is missed even when the feed drops it.
+        if daemon.reactor_config.enabled {
+            let reactor = Arc::new(crate::reactor::Reactor::new(
+                daemon.space.clone(),
+                daemon.engine(),
+                daemon.layout.clone(),
+                daemon.reactor_config.clone(),
+            ));
+            // Baseline the cursor so a fresh daemon does not react to the whole
+            // pre-existing backlog on first boot.
+            if let Err(e) = reactor.initialize_cursor() {
+                warn!(error = %e, "reactor cursor init failed");
+            }
+            let mut feed = daemon.space.subscribe();
+            let mut reactor_shutdown = daemon.shutdown_tx.subscribe();
+            let interval = Duration::from_secs(daemon.reactor_config.interval_secs.max(1));
+            // A cycle runs on a blocking thread (it shells out to `cue`), but its
+            // dispatch calls `engine.run`, which `tokio::spawn`s the workflow — so
+            // the blocking thread must enter the runtime context first.
+            let handle = tokio::runtime::Handle::current();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        recv = feed.recv() => match recv {
+                            // Coalesce a burst: drain what is already queued so a
+                            // single scan covers the whole batch.
+                            Ok(_) => while feed.try_recv().is_ok() {},
+                            // Dropped events are exactly why dispatch is scan-driven.
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                        _ = reactor_shutdown.changed() => break,
+                    }
+                    let reactor = Arc::clone(&reactor);
+                    let handle = handle.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let _guard = handle.enter();
+                        reactor.run_cycle()
+                    })
+                    .await
+                    {
+                        Ok(Ok(0)) => {}
+                        Ok(Ok(n)) => debug!(fired = n, "reactor cycle fired workflows"),
+                        Ok(Err(e)) => warn!(error = %e, "reactor cycle failed"),
+                        Err(e) => warn!(error = %e, "reactor task panicked"),
                     }
                 }
             });
@@ -555,7 +612,10 @@ impl Daemon {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
-        match self.tickets.list(params.scope, params.status, params.parent) {
+        match self
+            .tickets
+            .list(params.scope, params.status, params.parent)
+        {
             Ok(tickets) => {
                 let blocked = self.tickets.blocked_ids(&tickets).unwrap_or_default();
                 Response::ok(req.id, json!({"tickets": tickets, "blocked": blocked}))

@@ -58,6 +58,12 @@ impl Layout {
         self.home.join("workflows")
     }
 
+    /// Global `#Trigger` definitions dir (`<home>/triggers/*.cue`). Repo-local
+    /// triggers live at `<repo>/.rk/triggers.cue` instead.
+    pub fn triggers_dir(&self) -> PathBuf {
+        self.home.join("triggers")
+    }
+
     /// Create the directories the daemon needs at startup.
     pub fn ensure(&self) -> crate::Result<()> {
         for dir in [self.home.clone(), self.log_dir(), self.worktrees_dir()] {
