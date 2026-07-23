@@ -15,6 +15,7 @@ pub struct Config {
     pub budget: BudgetConfig,
     pub sync: SyncConfig,
     pub reactor: ReactorConfig,
+    pub supervisor: SupervisorConfig,
     /// Named agent profiles: [agents.<name>] harness/model/permission_mode.
     /// The "default" profile applies to all spawns that name no profile.
     pub agents: std::collections::HashMap<String, AgentProfileConfig>,
@@ -81,6 +82,44 @@ impl Default for ReactorConfig {
             max_fires: 20,
             marker_ttl_secs: 7 * 24 * 3600,
             exclude_instances: Vec::new(),
+        }
+    }
+}
+
+/// Supervisor liveness/burn-rate sweep. A periodic pass over live headless rats
+/// that flags ones which have gone silent (STUCK) or are burning cost with no
+/// completion in sight (RUNNING AWAY), and applies the same graduated response
+/// as the budget machinery: obstacle tuple -> steer -> kill after a grace window.
+/// Budget checks fire only on Usage events, so a rat hung mid-tool-call emitting
+/// nothing is invisible to them; this sweep is the out-of-band liveness probe.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SupervisorConfig {
+    /// Master switch. When false the sweep loop never starts.
+    pub enabled: bool,
+    /// Sweep cadence.
+    pub interval_secs: u64,
+    /// A live rat whose last event (usage/started) is older than this is STUCK.
+    /// Zero disables stuck detection. Kept generous: a soft steer fires first,
+    /// so a legitimately-slow silent step (compile/test) is nudged, not killed.
+    pub stuck_after_secs: u64,
+    /// Sustained burn (USD/minute across sweeps) above this is RUNNING AWAY.
+    /// Zero disables burn detection (off by default — it needs per-harness and
+    /// per-pricing tuning, and absolute cost caps already live in `budget`).
+    pub burn_usd_per_min: f64,
+    /// After the first (soft) flag steers the rat, how long to wait before
+    /// escalating to a kill if it is STILL flagged. Prefer steer-then-wait.
+    pub kill_grace_secs: u64,
+}
+
+impl Default for SupervisorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 60,
+            stuck_after_secs: 900,
+            burn_usd_per_min: 0.0,
+            kill_grace_secs: 600,
         }
     }
 }

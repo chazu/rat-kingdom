@@ -180,6 +180,14 @@ max_usd = 5.0
 max_tokens = 0
 warn_at = 0.8                    # warn (obstacle tuple + steer) at 80%, kill at cap
 
+[supervisor]                     # liveness/burn sweep (budget only sees Usage
+                                 # events; this catches rats hung emitting nothing)
+enabled = true
+interval_secs = 60
+stuck_after_secs = 900           # silence past this => STUCK (0 = off)
+burn_usd_per_min = 0.0           # sustained USD/min => RUNNING AWAY (0 = off)
+kill_grace_secs = 600            # obstacle+steer first, kill only if still flagged
+
 [sync]                           # multiplayer (git-notes replication)
 enabled = false
 remote_url = "git@github.com:you/rk-sync-state.git"

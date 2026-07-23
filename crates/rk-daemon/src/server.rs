@@ -29,6 +29,7 @@ pub struct Daemon {
     syncer: Option<Arc<crate::sync::Syncer>>,
     sync_interval: Duration,
     reactor_config: rk_core::config::ReactorConfig,
+    sweep_config: rk_core::config::SupervisorConfig,
     global_agents: std::collections::HashMap<String, rk_workflow::AgentProfile>,
     default_harness: String,
     engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
@@ -69,6 +70,7 @@ impl Daemon {
             })
             .collect();
         daemon.reactor_config = config.reactor.clone();
+        daemon.sweep_config = config.supervisor.clone();
         if config.sync.enabled {
             let syncer = crate::sync::Syncer::new(
                 &daemon.layout,
@@ -104,6 +106,11 @@ impl Daemon {
         Self::with_space(layout, castle, default_harness, budget, space)
     }
 
+    #[doc(hidden)]
+    pub fn set_sweep_config(&mut self, cfg: rk_core::config::SupervisorConfig) {
+        self.sweep_config = cfg;
+    }
+
     fn with_space(
         layout: Layout,
         castle: String,
@@ -135,6 +142,7 @@ impl Daemon {
             syncer: None,
             sync_interval: Duration::from_secs(30),
             reactor_config: rk_core::config::ReactorConfig::default(),
+            sweep_config: rk_core::config::SupervisorConfig::default(),
             global_agents: Default::default(),
             default_harness,
             engine: std::sync::OnceLock::new(),
@@ -197,6 +205,28 @@ impl Daemon {
                             Err(e) => warn!(error = %e, "gc failed"),
                         },
                         _ = gc_shutdown.changed() => break,
+                    }
+                }
+            });
+        }
+
+        // Supervisor liveness/burn-rate sweep: catch rats hung mid-tool-call
+        // (silent, so budget checks never see them) or running cost away with no
+        // completion. Graduated: obstacle + steer, then kill after a grace pass.
+        if daemon.sweep_config.enabled {
+            let supervisor = Arc::clone(&daemon.supervisor);
+            let cfg = daemon.sweep_config.clone();
+            let mut sweep_shutdown = daemon.shutdown_tx.subscribe();
+            let interval = Duration::from_secs(cfg.interval_secs.max(1));
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                // Consume the immediate first tick so freshly-spawned rats get a
+                // full interval of grace before the first sweep looks at them.
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => supervisor.sweep(&cfg),
+                        _ = sweep_shutdown.changed() => break,
                     }
                 }
             });
