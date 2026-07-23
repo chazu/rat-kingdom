@@ -4,7 +4,7 @@
 // the fleet runs, so the same backlog drains at a fraction of the spend and the
 // autoscaler fits more rats under a fixed budget (TKT-26).
 //
-//   rk workflow run cost-tiered-drain --param repo=rat-kingdom
+//   rk workflow run cost-tiered-drain
 //
 // How routing works: the `for_each` enumerates ready tickets and, for each, the
 // `tiers` table below maps its labels/priority to a tier — the name of an agent
@@ -24,7 +24,6 @@ workflow: {
 	description: "fan out one rat per ready ticket, each routed to a cost tier by its labels/priority"
 
 	params: {
-		repo: {type: "string", required: false, default: ""}
 		limit: {type: "int", required: false, default: 5}
 		timeout: {type: "string", required: false, default: "45m"}
 		// Per-instance wallet cap in whole USD. Once this run's spawned agents'

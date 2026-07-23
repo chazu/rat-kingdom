@@ -20,7 +20,7 @@
 // rather each phase be independently retryable, schedule the three phases
 // separately instead (examples/schedules.cue shows both).
 //
-//   rk workflow run nightly-self-improve --param repo=rat-kingdom
+//   rk workflow run nightly-self-improve
 //   rk workflow run nightly-self-improve --param budgetUsd=40
 //
 // Scheduled nightly via examples/schedules.cue. Overnight cost is bounded by the
@@ -37,7 +37,6 @@ workflow: {
 	description: "overnight chain: groom the backlog, drain it in parallel, then propose prompt/convention refinements"
 
 	params: {
-		repo: {type: "string", required: false, default: ""}
 		// Cap on how many ready tickets the drain phase works in one pass.
 		limit: {type: "int", required: false, default: 5}
 		// Drain join timeout — every drained rat must finish within this window.

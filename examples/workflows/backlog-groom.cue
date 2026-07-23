@@ -2,13 +2,12 @@
 // ticket backlog, improving the queue that feeds every other workflow. It does
 // not start any ticket — grooming mutates the ticket store, not the worktree.
 //
-//   rk workflow run backlog-groom --param repo=rat-kingdom
+//   rk workflow run backlog-groom
 //
 // Copy to ~/.rat-kingdom/workflows/ (global) or <repo>/.rk/workflows/.
 workflow: {
 	name:        "backlog-groom"
 	description: "one rat decomposes, dedupes, and tags the ticket backlog"
-	params: {repo: {type: "string", required: false, default: ""}}
 	agents: {default: {harness: "claude"}}
 	steps: [
 		{

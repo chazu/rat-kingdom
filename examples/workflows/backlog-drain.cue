@@ -3,8 +3,8 @@
 // backlog-groom (which keeps the queue decomposed) to turn a well-groomed
 // backlog directly into parallel fleet work.
 //
-//   rk workflow run backlog-drain --param repo=rat-kingdom
-//   rk workflow run backlog-drain --param repo=rat-kingdom --param limit=3
+//   rk workflow run backlog-drain
+//   rk workflow run backlog-drain --param limit=3
 //
 // The `for_each` step enumerates ready tickets (open, dependencies satisfied)
 // in this repo and spawns one rat per ticket with the ticket id as its task
@@ -23,7 +23,6 @@ workflow: {
 	description: "fan out one rat per ready ticket, run in parallel, join and report"
 
 	params: {
-		repo: {type: "string", required: false, default: ""}
 		// Cap on how many ready tickets to drain in one pass.
 		limit: {type: "int", required: false, default: 5}
 		// Join timeout — every rat must finish within this window.
