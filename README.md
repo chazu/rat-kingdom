@@ -120,6 +120,12 @@ rk repo show rat-kingdom               # details + its open tickets
 
 A registered name works anywhere a repo is expected, e.g. `rk spawn --repo rat-kingdom`.
 
+By default a finished rat's branch is merged directly into its base. A repo can
+instead be put in **PR mode** — `rk repo add <path> --merge-mode pr` — so the
+daemon pushes the branch and opens a pull/merge request for human/CI review
+instead of merging. See [docs/pr-merge-mode.md](docs/pr-merge-mode.md) for the
+credential prerequisites and the GitHub/GitLab flows.
+
 ## Tickets
 
 Durable work items — a backlog you and the rats can create, read, and
@@ -248,6 +254,11 @@ require_named_checks = false     # true => a workflow `run` step may ONLY invoke
                                  # raw inline `command` is refused fail-closed, so
                                  # a compromised/untrusted workflow def cannot run
                                  # arbitrary shell in a rat's worktree.
+default_merge_mode = "direct"    # fleet-wide fallback for repos registered
+                                 # without --merge-mode: "direct" merges the
+                                 # branch, "pr" pushes it and opens a pull/merge
+                                 # request for review (see docs/pr-merge-mode.md).
+                                 # A repo's own --merge-mode always overrides this.
 ```
 
 Env: `RK_HOME` (state dir), `RK_LOG` (tracing filter), `RK_CONFIG_*`
