@@ -149,6 +149,13 @@ impl Store {
             sql.push_str(" AND payload LIKE ? ESCAPE '\\'");
             args.push(format!("%{}%", escape_like(search)));
         }
+        if let Some(after) = &pattern.after_id {
+            // id is the TEXT PRIMARY KEY and ULIDs sort lexicographically by
+            // creation time, so this "newer than cursor" bound is answered from
+            // the PK index — a bounded delta scan, not a full-table read.
+            sql.push_str(" AND id > ?");
+            args.push(after.to_string());
+        }
         if consumable_only {
             sql.push_str(" AND lifecycle != 'furniture'");
         }
@@ -251,6 +258,27 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM tuples", [], |r| r.get(0))
             .map_err(sql_err)
     }
+
+    /// Number of tuples whose category is in `categories`, counted in SQL
+    /// without materializing any rows. The reactor uses this as a cheap,
+    /// order-independent "did this category's population change?" gate before
+    /// deciding whether a full whole-store recompute scan is warranted — an
+    /// exact count is immune to the same-millisecond ULID ordering that makes a
+    /// cursor delta an unreliable change signal.
+    pub fn count_in_categories(&self, categories: &[Category]) -> rk_core::Result<u64> {
+        if categories.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = std::iter::repeat("?")
+            .take(categories.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT COUNT(*) FROM tuples WHERE category IN ({placeholders})");
+        let args: Vec<String> = categories.iter().map(|c| c.as_str().to_string()).collect();
+        self.conn
+            .query_row(&sql, params_from_iter(args.iter()), |r| r.get(0))
+            .map_err(sql_err)
+    }
 }
 
 fn escape_like(s: &str) -> String {
@@ -316,6 +344,34 @@ mod tests {
     }
 
     #[test]
+    fn count_in_categories_sums_the_requested_categories_only() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&tuple("a", json!({}))).unwrap(); // Event
+        store.insert(&tuple("b", json!({}))).unwrap(); // Event
+        store
+            .insert(&Tuple::new(Category::Obstacle, "repo", "c", "rat", json!({})))
+            .unwrap();
+        store
+            .insert(&Tuple::new(Category::Need, "repo", "d", "rat", json!({})))
+            .unwrap();
+
+        assert_eq!(store.count_in_categories(&[]).unwrap(), 0, "empty set is zero");
+        assert_eq!(store.count_in_categories(&[Category::Event]).unwrap(), 2);
+        assert_eq!(
+            store
+                .count_in_categories(&[Category::Obstacle, Category::Need])
+                .unwrap(),
+            2,
+            "sums across the requested categories, ignores the rest"
+        );
+        assert_eq!(
+            store.count_in_categories(&[Category::Convention]).unwrap(),
+            0,
+            "absent category counts zero"
+        );
+    }
+
+    #[test]
     fn insert_query_delete_round_trip() {
         let store = Store::open_in_memory().unwrap();
         let t = tuple("task_done", json!({"agent": "Whisker"}));
@@ -375,6 +431,9 @@ mod tests {
                 instance: Some("castle-b".into()),
                 ..Default::default()
             },
+            // Exclusive id lower bound: SQL `id > ?` must agree with the
+            // in-memory `tuple.id <= after` cut over the same ULID total order.
+            Pattern::default().after(Some(tuples[1].id)),
         ];
 
         for p in &patterns {

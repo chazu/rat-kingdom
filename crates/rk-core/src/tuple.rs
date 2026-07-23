@@ -195,6 +195,13 @@ pub struct Pattern {
     /// this field. There is no "cheap" prefix-only match anywhere.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_search: Option<String>,
+    /// Exclusive lower bound on `id`: match only tuples with `id > after_id`.
+    /// Ids are ULIDs (chronologically sortable), so this is a "newer than"
+    /// cursor. The storage query answers it from the `id` PRIMARY KEY index —
+    /// the cheap way to scan just the tuples added since a cursor, instead of
+    /// reading the whole store and discarding the old ones in Rust.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_id: Option<RecordId>,
 }
 
 impl Pattern {
@@ -212,6 +219,14 @@ impl Pattern {
 
     pub fn identity(mut self, identity: impl Into<String>) -> Self {
         self.identity = Some(identity.into());
+        self
+    }
+
+    /// Restrict to tuples newer than `after` (exclusive). `None` leaves the
+    /// pattern unbounded, so `pattern.after(cursor)` is a no-op on a fresh
+    /// cursor and a bounded delta scan once one exists.
+    pub fn after(mut self, after: Option<RecordId>) -> Self {
+        self.after_id = after;
         self
     }
 
@@ -241,6 +256,11 @@ impl Pattern {
         if let Some(search) = &self.payload_search {
             let hay = tuple.payload.to_string();
             if !hay.contains(search.as_str()) {
+                return false;
+            }
+        }
+        if let Some(after) = &self.after_id {
+            if tuple.id <= *after {
                 return false;
             }
         }

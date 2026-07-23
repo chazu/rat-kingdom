@@ -15,7 +15,8 @@ Triggers are CUE, validated against `crates/rk-workflow/src/triggers-schema.cue`
 exactly as workflows are validated against their schema. They live in
 `~/.rat-kingdom/triggers/*.cue` (global) or `<repo>/.rk/triggers.cue`
 (repo-local); both are discovered every cycle, so edits take effect without a
-daemon restart.
+daemon restart. (The parse is cached and refreshed on file change — see
+[Per-cycle cost](#per-cycle-cost).)
 
 ```cue
 triggers: [
@@ -115,6 +116,34 @@ forever. Three guards, defence-in-depth:
    `"role":"rat"` completions, so the `"reviewer"` completions it spawns never
    match (see the steward section below).
 
+## Per-cycle cost
+
+A wake must stay cheap even under a sustained write burst, when the feed wakes
+the reactor on nearly every tuple. Three things keep a cycle bounded:
+
+1. **Bounded firing scan.** The delta scan is `id > cursor` resolved from the
+   `id` PRIMARY KEY index (`Pattern::after`), not a full-table read filtered down
+   in Rust. A wake materialises only the tuples added since the cursor, however
+   large the store.
+2. **Cached trigger parse.** Trigger files are parsed with `cue` (a subprocess
+   per file). The parse is cached and reused until a file's `(mtime, len)` stamp
+   changes, so a steady-state burst reparses nothing — the `cue` shell-outs, the
+   reactor's dominant per-wake cost, run only on an actual edit. (Change
+   detection is `(mtime, len)`: a same-second, same-length content edit is the
+   one case it can miss; trigger files are hand-edited rarely enough that this is
+   the intended "reload on change" tradeoff.)
+3. **Change-gated recomputes.** Quorum promotion and obstacle coalescence still
+   recompute over the **whole store** (so a suggestion / wall that reached quorum
+   while the reactor was down is not missed — their guard is the durable
+   Convention / open ticket, not the cursor), but only when their relevant
+   category population changed since the previous cycle. The gate is an exact SQL
+   `COUNT` over `Endorsement`/`Suggestion` (promotion) and `Obstacle`/`Need`
+   (coalescence) — cheap (no row materialisation) and, unlike a cursor delta,
+   immune to the same-millisecond ULID ordering that could otherwise drop a
+   just-added tuple from the change signal. A wake carrying only unrelated writes
+   (claims, facts, harness results) does no whole-store scan at all. The first
+   cycle after start always recomputes, to catch up on any pre-existing backlog.
+
 ## First-boot backlog
 
 On a fresh daemon (no cursor file yet) the reactor baselines its cursor to the
@@ -177,15 +206,19 @@ the path.
   the CLI skips a duplicate, and the reactor counts **distinct** endorsers
   regardless, so a double vote can never inflate the tally. Endorsements are
   Ephemeral too and decay with the voting window.
-- Each cycle the reactor recomputes, **by full scan** (never off the lossy feed),
-  the distinct-endorser count per suggestion. At `quorum` it emits a
-  `Convention` (system scope, **Furniture** — permanent, never `in`-consumable)
-  citing the suggestion text and the sorted endorser set. The Convention is its
-  own promote-once guard: a suggestion that already has one is skipped. System-
-  scope Conventions replicate across castles via `rk sync` for free.
+- The reactor recomputes, **by full scan** (never off the lossy feed), the
+  distinct-endorser count per suggestion. At `quorum` it emits a `Convention`
+  (system scope, **Furniture** — permanent, never `in`-consumable) citing the
+  suggestion text and the sorted endorser set. The Convention is its own
+  promote-once guard: a suggestion that already has one is skipped. System-scope
+  Conventions replicate across castles via `rk sync` for free.
 
 Because the count is recomputed by scan at fire time, promotion is robust to
-missed feed events and to endorsements arriving across many cycles.
+missed feed events and to endorsements arriving across many cycles. The
+recompute is **change-gated** (see [Per-cycle cost](#per-cycle-cost)): it runs
+only when the `Endorsement`/`Suggestion` population changed since the previous
+cycle, so its input is still the whole store but it no longer re-scans on a wake
+that carried no relevant tuple.
 
 ## Built-in reaction: obstacle coalescence
 
@@ -200,7 +233,8 @@ a wall many rats converge on files exactly one ticket.
 - It counts **distinct reporters** (`instance`) per topic, recomputed by full
   scan — a rat re-stating its own obstacle can never inflate the tally (and, as
   each rat's obstacle is keyed `identity = instance = agent`, it holds one trail
-  per topic anyway).
+  per topic anyway). Like quorum promotion this recompute is **change-gated** on
+  the `Obstacle`/`Need` population (see [Per-cycle cost](#per-cycle-cost)).
 - At `coalesce_quorum` distinct reporters it files **one** `task` ticket (labelled
   `obstacle-coalesce`, authored by `reactor`) whose body links the contributing
   tuples and reporters. Filing is idempotent two ways: a synchronous durable

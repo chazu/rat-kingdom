@@ -219,6 +219,56 @@ async fn dispatch_is_idempotent_under_feed_loss_and_cursor_reset() {
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
+/// Triggers are cached across cycles (skipping the per-file `cue` shell-out),
+/// but an edited trigger file must still take effect. Rewriting the matcher
+/// between cycles changes the file stamp, so the reactor reparses and fires on
+/// the new predicate — proving the cache invalidates rather than pinning a
+/// stale parse.
+#[tokio::test]
+async fn edited_trigger_file_is_reparsed_not_stale() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    write_trigger(&layout); // matches identity "ping"
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+
+    // First cycle parses the file and fires on the "ping" predicate.
+    space.out(ping()).unwrap();
+    assert_eq!(reactor.run_cycle().unwrap(), 1, "original trigger fires");
+
+    // Rewrite the same file to match a different identity ("pong-drain" differs
+    // in both content and length from the original, so the stamp flips).
+    std::fs::write(
+        layout.triggers_dir().join("ping.cue"),
+        r#"triggers: [{name: "pong-drain-trigger", match: {category: "event", scope: "myrepo", identity: "pong"}, run: "react-work"}]"#,
+    )
+    .unwrap();
+
+    // A "ping" tuple no longer matches the (reparsed) trigger.
+    space.out(ping()).unwrap();
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        0,
+        "reparsed trigger no longer matches the old predicate"
+    );
+
+    // A "pong" tuple matches the edited trigger — the cache picked up the edit.
+    let mut pong = ping();
+    pong.identity = "pong".into();
+    space.out(pong).unwrap();
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        1,
+        "edited trigger fires on the new predicate"
+    );
+}
+
 /// Re-entrancy guard: the reactor never reacts to its own output, nor to
 /// authors excluded by config or by the trigger.
 #[tokio::test]
