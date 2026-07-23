@@ -23,6 +23,7 @@
 //! fire cap (`maxFires`, <=100) mirroring the `repeat` discipline.
 
 use crate::repos::RepoRegistry;
+use crate::tickets::{NewTicket, Tickets};
 use crate::workflow_exec::WorkflowEngine;
 use rk_core::config::ReactorConfig;
 use rk_core::id::RecordId;
@@ -43,6 +44,14 @@ use tracing::{info, warn};
 pub const REACTOR_INSTANCE: &str = "reactor";
 /// Identity of the durable idempotency marker tuples (system scope).
 const MARKER_IDENTITY: &str = "reactor_fired";
+/// Identity of the durable "this topic was already coalesced into a ticket"
+/// marker (system scope). Bridges the window between filing and the ticket
+/// landing so a feed-woken re-scan cannot file the same topic twice.
+const COALESCE_FILED_IDENTITY: &str = "reactor_coalesced";
+/// How long the "already filed" marker lives. Only needs to outlast the async
+/// ticket-create + a cycle or two; the still-open ticket is the real
+/// files-once-until-closed guard beyond that.
+const COALESCE_FILED_TTL_SECS: i64 = 10 * 60;
 
 /// A loaded trigger plus where it came from (a repo-local file defaults its
 /// target repo to that repo; a global-dir trigger has no default repo).
@@ -54,6 +63,7 @@ struct Loaded {
 pub struct Reactor {
     space: Space,
     engine: Arc<WorkflowEngine>,
+    tickets: Arc<Tickets>,
     layout: Layout,
     config: ReactorConfig,
     cursor_file: PathBuf,
@@ -66,6 +76,7 @@ impl Reactor {
     pub fn new(
         space: Space,
         engine: Arc<WorkflowEngine>,
+        tickets: Arc<Tickets>,
         layout: Layout,
         config: ReactorConfig,
     ) -> Self {
@@ -73,6 +84,7 @@ impl Reactor {
         Self {
             space,
             engine,
+            tickets,
             layout,
             config,
             cursor_file,
@@ -145,6 +157,12 @@ impl Reactor {
         // Convention itself, not the cursor. Runs even with zero triggers.
         if let Err(e) = self.promote_conventions(&all) {
             warn!(error = %e, "reactor quorum promotion failed");
+        }
+        // Obstacle coalescence recomputes over the whole snapshot too: bucket the
+        // flat obstacle/need pile by topic, refresh a per-topic demand-gradient
+        // marker, and file one durable ticket when a wall reaches quorum.
+        if let Err(e) = self.coalesce_obstacles(&all) {
+            warn!(error = %e, "reactor obstacle coalescence failed");
         }
         Ok(fired)
     }
@@ -229,6 +247,170 @@ impl Reactor {
             );
         }
         Ok(promoted)
+    }
+
+    /// Coalesce the flat obstacle/need pile: repeated reports of one wall become
+    /// a single durable ticket instead of ten equal, signal-less obstacles.
+    ///
+    /// Every cycle this buckets all obstacle/need tuples by a normalised topic
+    /// key (`scope` + normalised `payload.text`), counting DISTINCT reporters
+    /// (`instance`) per topic — recomputed from the passed snapshot, so a
+    /// re-stated obstacle from the same rat can never inflate the tally. When a
+    /// topic reaches `coalesce_quorum` distinct reporters it files ONE ticket
+    /// linking the contributing tuples. (The sub-quorum "how hot is this wall"
+    /// gradient already lives in the raw obstacles' own decaying strength, which
+    /// a strength-sorted scan ranks; coalescence only escalates a wall that many
+    /// rats converge on into the durable backlog — it never injects synthetic
+    /// obstacles that would pollute that pile.)
+    ///
+    /// Filing is idempotent two ways: a synchronous durable "already filed"
+    /// marker written before the (async) create bridges the create latency, and
+    /// an already-open ticket carrying the same `coalesce_key` suppresses
+    /// re-filing until it is closed. Returns how many tickets were filed.
+    fn coalesce_obstacles(&self, all: &[Tuple]) -> rk_core::Result<usize> {
+        let quorum = self.config.coalesce_quorum as usize;
+        if quorum == 0 {
+            return Ok(0);
+        }
+
+        // (scope, topic) -> distinct reporter instances, plus the contributing
+        // tuples for citation. A rat's obstacle is keyed on identity=agent, so it
+        // holds at most one trail per topic; counting distinct instances is
+        // "how many rats hit this wall".
+        struct Bucket<'a> {
+            reporters: BTreeSet<&'a str>,
+            members: Vec<&'a Tuple>,
+            sample: &'a str,
+        }
+        let mut buckets: HashMap<(String, String), Bucket> = HashMap::new();
+        for t in all {
+            if t.instance == REACTOR_INSTANCE {
+                continue;
+            }
+            if !matches!(t.category, Category::Obstacle | Category::Need) {
+                continue;
+            }
+            let Some(text) = t.payload.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            let topic = normalize_topic(text);
+            if topic.is_empty() {
+                continue;
+            }
+            let bucket = buckets
+                .entry((t.scope.clone(), topic))
+                .or_insert_with(|| Bucket {
+                    reporters: BTreeSet::new(),
+                    members: Vec::new(),
+                    sample: text,
+                });
+            bucket.reporters.insert(t.instance.as_str());
+            bucket.members.push(t);
+        }
+
+        // Dedupe: a topic already filed (open ticket carrying its coalesce_key,
+        // OR a still-live "already filed" marker) is not filed again.
+        let open_keys: HashSet<&str> = all
+            .iter()
+            .filter(|t| t.category == Category::Task && !ticket_is_done(t))
+            .filter_map(|t| t.payload.get("coalesce_key").and_then(Value::as_str))
+            .collect();
+        let filed_keys: HashSet<&str> = all
+            .iter()
+            .filter(|t| {
+                t.category == Category::Event
+                    && t.scope == SYSTEM_SCOPE
+                    && t.identity == COALESCE_FILED_IDENTITY
+            })
+            .filter_map(|t| t.payload.get("key").and_then(Value::as_str))
+            .collect();
+
+        let mut filed = 0usize;
+        for ((scope, topic), bucket) in &buckets {
+            let count = bucket.reporters.len();
+            if count < quorum {
+                continue;
+            }
+            let key = coalesce_key(scope, topic);
+            if open_keys.contains(key.as_str()) || filed_keys.contains(key.as_str()) {
+                continue;
+            }
+            match self.file_coalesced_ticket(scope, topic, &key, &bucket.members, bucket.sample) {
+                Ok(()) => {
+                    filed += 1;
+                    info!(topic = %topic, scope = %scope, count, quorum, "reactor coalesced obstacles into a ticket");
+                }
+                Err(e) => warn!(topic = %topic, error = %e, "reactor: coalesced ticket filing failed"),
+            }
+        }
+        Ok(filed)
+    }
+
+    /// File exactly one coalesced ticket for a topic at quorum. Writes the
+    /// synchronous "already filed" guard marker BEFORE spawning the (async)
+    /// ticket create, so a feed-woken re-scan between now and the ticket landing
+    /// still sees the topic as filed and skips it.
+    fn file_coalesced_ticket(
+        &self,
+        scope: &str,
+        topic: &str,
+        key: &str,
+        members: &[&Tuple],
+        sample: &str,
+    ) -> rk_core::Result<()> {
+        let mut reporters: BTreeSet<&str> = BTreeSet::new();
+        let mut tuple_ids: Vec<String> = Vec::new();
+        for m in members {
+            reporters.insert(m.instance.as_str());
+            tuple_ids.push(m.id.to_string());
+        }
+        let body = format!(
+            "Auto-filed by the reactor: {n} rat(s) hit the same wall.\n\n\
+             Topic: {topic}\nScope: {scope}\nExample report: {sample}\n\n\
+             Reporters: {reporters}\nContributing tuples: {tuples}",
+            n = reporters.len(),
+            reporters = reporters.iter().copied().collect::<Vec<_>>().join(", "),
+            tuples = tuple_ids.join(", "),
+        );
+        // The coalesce_key rides in the ticket payload so a still-open ticket is
+        // itself the files-once-until-closed guard on the next cycle.
+        let new = NewTicket {
+            title: format!("Coalesced obstacle: {}", truncate(sample, 80)),
+            body: Some(body),
+            scope: scope.to_string(),
+            parent: None,
+            priority: "normal".to_string(),
+            labels: vec!["obstacle-coalesce".to_string()],
+            depends_on: Vec::new(),
+            created_by: Some(REACTOR_INSTANCE.to_string()),
+            coalesce_key: Some(key.to_string()),
+        };
+
+        // Guard marker first — synchronous and durable, so idempotency does not
+        // depend on the async create having completed.
+        let mut guard = Tuple::new(
+            Category::Event,
+            SYSTEM_SCOPE,
+            COALESCE_FILED_IDENTITY,
+            REACTOR_INSTANCE,
+            json!({"key": key, "topic": topic, "scope": scope}),
+        )
+        .with_lifecycle(Lifecycle::Ephemeral);
+        guard.expires_at =
+            Some(chrono::Utc::now() + chrono::Duration::seconds(COALESCE_FILED_TTL_SECS));
+        self.space.out(guard)?;
+
+        // Create runs through Tickets so ticket-id allocation stays serialized
+        // with every other create. run_cycle executes with the runtime context
+        // entered (server wraps it in `handle.enter()`), so a spawn is safe here;
+        // a synchronous block would deadlock the create's async lock.
+        let tickets = Arc::clone(&self.tickets);
+        tokio::runtime::Handle::current().spawn(async move {
+            if let Err(e) = tickets.create(new).await {
+                warn!(error = %e, "reactor: coalesced ticket create failed");
+            }
+        });
+        Ok(())
     }
 
     /// Decide and, if warranted, dispatch a single trigger against one tuple.
@@ -426,6 +608,51 @@ impl Reactor {
     }
 }
 
+/// Normalise an obstacle/need report into a stable topic key: lowercase, keep
+/// only alphanumeric runs as words, collapse to single spaces, and cap length.
+/// Two rats phrasing the same wall slightly differently ("cargo build fails" vs
+/// "Cargo build FAILS!!") land in the same bucket; length is bounded so the key
+/// stays usable as an identity suffix and payload field.
+fn normalize_topic(text: &str) -> String {
+    let mut out = String::new();
+    let mut prev_space = true; // leading: suppress a leading separator
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            for lc in c.to_lowercase() {
+                out.push(lc);
+            }
+            prev_space = false;
+        } else if !prev_space {
+            out.push(' ');
+            prev_space = true;
+        }
+    }
+    let trimmed = out.trim_end();
+    truncate(trimmed, 80).to_string()
+}
+
+/// Stable dedupe key for a coalesced topic: scope-qualified so the same wall in
+/// two repos files two tickets, not one.
+fn coalesce_key(scope: &str, topic: &str) -> String {
+    format!("{scope}::{topic}")
+}
+
+/// A ticket is "done" (no longer a live dedupe guard) once closed.
+fn ticket_is_done(t: &Tuple) -> bool {
+    matches!(
+        t.payload.get("status").and_then(Value::as_str),
+        Some("done") | Some("closed")
+    )
+}
+
+/// Truncate to at most `max` chars on a char boundary (byte-safe for UTF-8).
+fn truncate(s: &str, max: usize) -> &str {
+    match s.char_indices().nth(max) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 /// Template each workflow param from the matched tuple.
 fn template_params(params: &HashMap<String, String>, tuple: &Tuple) -> HashMap<String, Value> {
     params
@@ -533,5 +760,46 @@ mod tests {
             interpolate_tuple("{{tuple.category}}/{{tuple.scope}}", &t),
             "endorsement/system"
         );
+    }
+
+    #[test]
+    fn normalize_topic_folds_case_and_punctuation() {
+        // Different phrasings of one wall collapse to the same topic key.
+        assert_eq!(normalize_topic("Cargo build FAILS!!"), "cargo build fails");
+        assert_eq!(normalize_topic("  cargo   build  fails  "), "cargo build fails");
+        assert_eq!(
+            normalize_topic("cargo-build: fails (rk-space)"),
+            "cargo build fails rk space"
+        );
+    }
+
+    #[test]
+    fn normalize_topic_empty_when_no_words() {
+        assert_eq!(normalize_topic("!!! ??? ..."), "");
+        assert_eq!(normalize_topic("   "), "");
+    }
+
+    #[test]
+    fn normalize_topic_is_length_bounded() {
+        let long = "word ".repeat(50);
+        assert!(normalize_topic(&long).chars().count() <= 80);
+    }
+
+    #[test]
+    fn coalesce_key_is_scope_qualified() {
+        assert_eq!(coalesce_key("repoA", "flaky test"), "repoA::flaky test");
+        assert_ne!(
+            coalesce_key("repoA", "flaky test"),
+            coalesce_key("repoB", "flaky test"),
+            "same wall in two repos is two keys"
+        );
+    }
+
+    #[test]
+    fn truncate_respects_char_boundaries() {
+        assert_eq!(truncate("hello", 80), "hello");
+        assert_eq!(truncate("hello", 3), "hel");
+        // Multi-byte: must not split a codepoint.
+        assert_eq!(truncate("héllo", 2), "hé");
     }
 }

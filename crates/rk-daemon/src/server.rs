@@ -319,6 +319,7 @@ impl Daemon {
             let reactor = Arc::new(crate::reactor::Reactor::new(
                 daemon.space.clone(),
                 daemon.engine(),
+                daemon.tickets.clone(),
                 daemon.layout.clone(),
                 daemon.reactor_config.clone(),
             ));

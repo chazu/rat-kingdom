@@ -187,6 +187,33 @@ the path.
 Because the count is recomputed by scan at fire time, promotion is robust to
 missed feed events and to endorsements arriving across many cycles.
 
+## Built-in reaction: obstacle coalescence
+
+The second built-in closes the flat **obstacle** pile into the durable backlog.
+Ten rats hitting one wall used to produce ten equal, signal-less obstacles; now
+a wall many rats converge on files exactly one ticket.
+
+- Each cycle the reactor buckets every `Obstacle`/`Need` tuple by a **normalised
+  topic key** — the tuple `scope` plus a case- and punctuation-folded, length-
+  bounded form of `payload.text`. "Cargo build FAILS!!" and "cargo build fails"
+  land in the same bucket; the same wall in two repos does not.
+- It counts **distinct reporters** (`instance`) per topic, recomputed by full
+  scan — a rat re-stating its own obstacle can never inflate the tally (and, as
+  each rat's obstacle is keyed `identity = instance = agent`, it holds one trail
+  per topic anyway).
+- At `coalesce_quorum` distinct reporters it files **one** `task` ticket (labelled
+  `obstacle-coalesce`, authored by `reactor`) whose body links the contributing
+  tuples and reporters. Filing is idempotent two ways: a synchronous durable
+  "already filed" marker written **before** the create bridges the create
+  latency, and the still-open ticket — which carries the topic's `coalesce_key`
+  in its payload — suppresses re-filing until it is closed. So a topic files once
+  until closed, then may re-file only if fresh obstacles re-accumulate.
+
+Coalescence never injects synthetic obstacles into the pile — the sub-quorum
+"how hot is this wall" gradient already lives in the raw obstacles' own decaying
+strength, which a strength-sorted scan ranks. This built-in only escalates a
+converged-on wall into durable, closable work.
+
 ## Configuration
 
 ```toml
@@ -198,6 +225,7 @@ max_fires = 20            # default per-trigger cap; a #Trigger may lower it
 marker_ttl_secs = 604800  # idempotency-marker lifetime (one week)
 exclude_instances = []    # authors never reacted to, besides "reactor"
 quorum = 3                # distinct endorsers that promote a suggestion; 0 = off
+coalesce_quorum = 3       # distinct reporters that coalesce a wall into a ticket; 0 = off
 ```
 
 ## Where it lives
@@ -205,11 +233,13 @@ quorum = 3                # distinct endorsers that promote a suggestion; 0 = of
 - Schema: `crates/rk-workflow/src/triggers-schema.cue`; loader
   `rk_workflow::load_triggers`.
 - Reactor: `crates/rk-daemon/src/reactor.rs` (`Reactor::run_cycle`, plus the
-  built-in `Reactor::promote_conventions`), spawned as a loop next to the GC and
-  sync loops in `crates/rk-daemon/src/server.rs`.
+  built-ins `Reactor::promote_conventions` and `Reactor::coalesce_obstacles`),
+  spawned as a loop next to the GC and sync loops in
+  `crates/rk-daemon/src/server.rs`.
 - Suggest/endorse sugar: `crates/rk-cli/src/space_cmds.rs` (`suggest`, `endorse`).
 - Config: `rk_core::config::ReactorConfig`.
 - Tests: `crates/rk-daemon/tests/reactor.rs` (live-daemon fire, idempotency under
-  feed loss + cursor reset, re-entrancy/exclusion, rate cap) plus unit tests in
-  the reactor and workflow modules.
+  feed loss + cursor reset, re-entrancy/exclusion, rate cap, quorum promotion,
+  and obstacle coalescence — quorum, per-scope/topic separation, idempotent
+  re-filing) plus unit tests in the reactor and workflow modules.
 - Example: `examples/triggers.cue`.
