@@ -15,6 +15,12 @@ pub struct PrimeContext {
     pub task: Option<String>,
     pub branch: Option<String>,
     pub parent: Option<String>,
+    /// Active fleet conventions (promoted norms), pre-scanned by the caller from
+    /// the tuplespace for this rat's repo scope + `system`. Composed verbatim
+    /// into a "Standing conventions" section so a promoted norm changes an
+    /// already-spawned rat's behaviour (stigmergy P6) instead of relying on the
+    /// rat choosing to `rk scan convention`. Empty ⇒ the section is omitted.
+    pub conventions: Vec<String>,
 }
 
 const FRAGMENT_SPACE: &str = "\
@@ -138,6 +144,31 @@ const FRAGMENT_COMPLETION: &str = "\
 4. `rk done \"<summary>\"` — this is how the orchestrator knows you finished.
 ";
 
+/// Compose the active fleet conventions into a binding "Standing conventions"
+/// section, or `None` when there are none. Kept separate so `render` stays a
+/// straight-line composition and the section can be tested in isolation.
+fn render_conventions(conventions: &[String]) -> Option<String> {
+    // Skip blanks (a convention whose source suggestion decayed can carry no
+    // text) and de-duplicate while preserving first-seen order — the same
+    // convention may surface under both the repo and system scopes.
+    let mut seen = std::collections::HashSet::new();
+    let mut section = String::from(
+        "## Standing conventions\n\n\
+         The fleet has promoted these norms to binding conventions. Follow them \
+         as you work — they override your default approach where they conflict:\n\n",
+    );
+    let mut any = false;
+    for text in conventions {
+        let text = text.trim();
+        if text.is_empty() || !seen.insert(text) {
+            continue;
+        }
+        let _ = writeln!(section, "- {text}");
+        any = true;
+    }
+    any.then_some(section)
+}
+
 /// Render role instructions. Roles: "operator" (the human's dispatcher — the
 /// default when no role is otherwise indicated), "rat" (directed worker), and
 /// "reviewer". The operator role addresses a session driving the fleet from the
@@ -159,6 +190,14 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
         ctx.task.as_deref().unwrap_or("(none)"),
         ctx.branch.as_deref().unwrap_or("(none)"),
     );
+
+    // Standing conventions ride high in the prompt (right under the identity
+    // header) so a promoted norm is binding context, not something the rat must
+    // remember to go read. Omitted entirely when there are none.
+    if let Some(section) = render_conventions(&ctx.conventions) {
+        out.push_str(&section);
+        out.push('\n');
+    }
 
     match role {
         "reviewer" => {
@@ -203,6 +242,7 @@ mod tests {
             task: Some(".rk-1".into()),
             branch: Some("rat/whisker/rk-1".into()),
             parent: None,
+            conventions: Vec::new(),
         }
     }
 
@@ -252,6 +292,59 @@ mod tests {
         let rat = render("rat", &ctx());
         assert!(rat.contains("only your task"));
         assert!(rat.contains("Do not claim, start, or continue any"));
+    }
+
+    #[test]
+    fn no_conventions_means_no_standing_section() {
+        // The section is omitted entirely when the fleet has promoted nothing,
+        // so an empty convention set costs the prompt nothing.
+        for role in ["rat", "reviewer"] {
+            let text = render(role, &ctx());
+            assert!(!text.contains("Standing conventions"));
+        }
+    }
+
+    #[test]
+    fn conventions_are_composed_into_a_binding_section() {
+        let mut c = ctx();
+        c.conventions = vec![
+            "Prefer small, reviewable commits.".into(),
+            "Never touch protected paths without a gate.".into(),
+        ];
+        for role in ["rat", "reviewer"] {
+            let text = render(role, &c);
+            assert_eq!(text.matches("## Standing conventions").count(), 1);
+            assert!(text.contains("- Prefer small, reviewable commits."));
+            assert!(text.contains("- Never touch protected paths without a gate."));
+            // Rides above the coordination fragment so it reads as binding
+            // context, not an afterthought.
+            let conv_at = text.find("Standing conventions").unwrap();
+            let space_at = text.find("Coordination: the tuplespace").unwrap();
+            assert!(conv_at < space_at, "{role}: conventions should precede coordination");
+        }
+    }
+
+    #[test]
+    fn conventions_are_deduped_and_blanks_dropped() {
+        let mut c = ctx();
+        // Same norm surfaced under both repo and system scope, plus a decayed
+        // suggestion that carries no text.
+        c.conventions = vec![
+            "Prefer small commits.".into(),
+            "   ".into(),
+            "Prefer small commits.".into(),
+        ];
+        let text = render("rat", &c);
+        assert_eq!(text.matches("- Prefer small commits.").count(), 1);
+        // The blank never produces an empty bullet.
+        assert!(!text.contains("- \n"));
+    }
+
+    #[test]
+    fn all_blank_conventions_omit_the_section() {
+        let mut c = ctx();
+        c.conventions = vec!["".into(), "  ".into()];
+        assert!(!render("rat", &c).contains("Standing conventions"));
     }
 
     #[test]

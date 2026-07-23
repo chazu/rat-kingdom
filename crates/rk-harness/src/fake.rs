@@ -46,6 +46,13 @@ impl Harness for FakeHarness {
         cmd.current_dir(&spec.cwd);
         cmd.envs(&spec.env);
         cmd.env("RK_FAKE_PROMPT", &spec.prompt);
+        // Expose the composed system prompt (role priming) to the fake script,
+        // symmetric with RK_FAKE_PROMPT — lets tests assert on what a spawned
+        // rat is actually primed with (e.g. injected standing conventions).
+        cmd.env(
+            "RK_FAKE_SYSTEM_PROMPT",
+            spec.system_prompt.as_deref().unwrap_or_default(),
+        );
 
         let mut session = runner::launch(runner::Wiring {
             command: cmd,

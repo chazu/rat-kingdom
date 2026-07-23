@@ -338,6 +338,15 @@ the live map with `rk scan resolution <scope>` (or `--hot`). The whole reaction
 is naturally idempotent — the wall delete is a no-op once gone, the trail write
 is an upsert, and the steer is guarded — so at-least-once redelivery is safe.
 
+A promoted norm only matters if it changes behaviour (stigmergy P6). So at spawn
+the supervisor scans active `Convention` tuples for the rat's repo scope and
+`system`, and composes their text directly into the rat's system prompt as a
+**Standing conventions** section (`prime.rs::render`). This makes a
+quorum-promoted convention binding on every rat spawned afterward, instead of
+relying on the rat choosing to `rk scan convention`. A rat already running when a
+convention crosses quorum is unaffected until it is respawned; steering live rats
+on promotion is a possible follow-up.
+
 ## Configuration
 
 ```toml
