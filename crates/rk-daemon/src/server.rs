@@ -16,6 +16,9 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 const GC_INTERVAL: Duration = Duration::from_secs(60);
+/// Default lifetime for a pheromone trail (claim / obstacle / need) written
+/// without an explicit TTL. The hard-TTL backstop for strength decay.
+const DEFAULT_TRAIL_TTL: Duration = Duration::from_secs(30 * 60);
 /// Ceiling for blocking reads so a lost client cannot pin a connection task
 /// forever; clients requesting more get clamped.
 const MAX_BLOCK: Duration = Duration::from_secs(3600);
@@ -30,6 +33,7 @@ pub struct Daemon {
     sync_interval: Duration,
     reactor_config: rk_core::config::ReactorConfig,
     sweep_config: rk_core::config::SupervisorConfig,
+    evaporation_decay: f64,
     global_agents: std::collections::HashMap<String, rk_workflow::AgentProfile>,
     tier_routing: rk_workflow::TierRouting,
     default_harness: String,
@@ -84,6 +88,7 @@ impl Daemon {
         };
         daemon.reactor_config = config.reactor.clone();
         daemon.sweep_config = config.supervisor.clone();
+        daemon.evaporation_decay = config.evaporation.decay;
         if config.sync.enabled {
             let syncer = crate::sync::Syncer::new(
                 &daemon.layout,
@@ -156,6 +161,7 @@ impl Daemon {
             sync_interval: Duration::from_secs(30),
             reactor_config: rk_core::config::ReactorConfig::default(),
             sweep_config: rk_core::config::SupervisorConfig::default(),
+            evaporation_decay: rk_core::config::EvaporationConfig::default().decay,
             global_agents: Default::default(),
             tier_routing: Default::default(),
             default_harness,
@@ -205,17 +211,19 @@ impl Daemon {
         let daemon = Arc::new(self);
         let mut shutdown_rx = daemon.shutdown_tx.subscribe();
 
-        // GC loop: TTL expiry only — escalation/analytics live elsewhere.
+        // GC loop: decay pheromone trails and collect faded/expired tuples —
+        // escalation/analytics live elsewhere.
         {
             let space = daemon.space.clone();
+            let decay = daemon.evaporation_decay;
             let mut gc_shutdown = daemon.shutdown_tx.subscribe();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(GC_INTERVAL);
                 loop {
                     tokio::select! {
-                        _ = tick.tick() => match space.gc_expired() {
+                        _ = tick.tick() => match space.gc_expired(decay) {
                             Ok(0) => {}
-                            Ok(n) => debug!(collected = n, "gc collected expired tuples"),
+                            Ok(n) => debug!(collected = n, "gc collected faded/expired tuples"),
                             Err(e) => warn!(error = %e, "gc failed"),
                         },
                         _ = gc_shutdown.changed() => break,
@@ -788,6 +796,7 @@ impl Daemon {
             params.instance.unwrap_or_else(|| self.castle.clone()),
             params.payload,
         );
+        let explicit_lifecycle = params.lifecycle.is_some() || params.ttl_secs.is_some();
         if let Some(lifecycle) = params.lifecycle {
             tuple = tuple.with_lifecycle(lifecycle);
         }
@@ -796,8 +805,27 @@ impl Daemon {
             tuple.expires_at =
                 Some(chrono::Utc::now() + chrono::Duration::seconds(ttl_secs as i64));
         }
-        match self.space.out(tuple.clone()) {
-            Ok(()) => Response::ok(req.id, json!({"id": tuple.id, "written": true})),
+        // Pheromone trails carry a decaying strength and default to an Ephemeral
+        // lifetime so an abandoned one evaporates instead of lingering forever.
+        if tuple.category.evaporates() {
+            tuple.strength = Some(rk_core::tuple::FULL_STRENGTH);
+            if !explicit_lifecycle {
+                tuple.lifecycle = Lifecycle::Ephemeral;
+                tuple.expires_at = Some(
+                    chrono::Utc::now()
+                        + chrono::Duration::seconds(DEFAULT_TRAIL_TTL.as_secs() as i64),
+                );
+            }
+        }
+        // Evaporating writes reinforce an existing trail in place (refresh, no
+        // duplicate); everything else is a plain append.
+        let written = if tuple.category.evaporates() {
+            self.space.reinforce(tuple)
+        } else {
+            self.space.out(tuple.clone()).map(|()| tuple)
+        };
+        match written {
+            Ok(t) => Response::ok(req.id, json!({"id": t.id, "written": true})),
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
     }

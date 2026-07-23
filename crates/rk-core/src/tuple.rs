@@ -72,7 +72,21 @@ impl Category {
         Category::Suggestion,
         Category::Endorsement,
     ];
+
+    /// Pheromone trails: agent assertions that must be *refreshed* to stay
+    /// alive. They carry a decaying [`Tuple::strength`] and are collected once it
+    /// reaches zero (see [`crate::tuple`] docs and the space GC). A still-active
+    /// rat re-issuing the same trail reinforces it back to full strength; an
+    /// abandoned one (its author dead) evaporates on its own.
+    pub fn evaporates(&self) -> bool {
+        matches!(self, Category::Claim | Category::Obstacle | Category::Need)
+    }
 }
+
+/// Strength a freshly written or reinforced pheromone trail starts at. Each GC
+/// cycle decays it; reinforcement resets it to this. Ranking consumers
+/// (hot-scans, obstacle-coalesce) read [`Tuple::strength`] as the raw signal.
+pub const FULL_STRENGTH: f64 = 1.0;
 
 impl std::str::FromStr for Category {
     type Err = crate::Error;
@@ -127,6 +141,12 @@ pub struct Tuple {
     /// Ephemeral tuples only: collected after this instant if unconsumed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    /// Pheromone strength for [`Category::evaporates`] trails: [`FULL_STRENGTH`]
+    /// when fresh, decayed each GC cycle, reset on reinforcement, collected at
+    /// zero. `None` for tuples that do not evaporate. Carried through reads so
+    /// ranking consumers can weight by how live a trail is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strength: Option<f64>,
 }
 
 impl Tuple {
@@ -147,6 +167,7 @@ impl Tuple {
             payload,
             created_at: Utc::now(),
             expires_at: None,
+            strength: None,
         }
     }
 
@@ -286,5 +307,34 @@ mod tests {
         let s = serde_json::to_string(&tuple).unwrap();
         let back: Tuple = serde_json::from_str(&s).unwrap();
         assert_eq!(tuple, back);
+    }
+
+    #[test]
+    fn strength_round_trips_and_is_omitted_when_absent() {
+        let plain = t();
+        assert_eq!(plain.strength, None);
+        assert!(
+            !serde_json::to_string(&plain).unwrap().contains("strength"),
+            "absent strength is not serialized"
+        );
+
+        let mut trail = t();
+        trail.strength = Some(FULL_STRENGTH);
+        let s = serde_json::to_string(&trail).unwrap();
+        assert!(s.contains("strength"));
+        let back: Tuple = serde_json::from_str(&s).unwrap();
+        assert_eq!(trail, back);
+    }
+
+    #[test]
+    fn only_claim_obstacle_need_evaporate() {
+        let evaporating = [Category::Claim, Category::Obstacle, Category::Need];
+        for c in Category::ALL {
+            assert_eq!(
+                c.evaporates(),
+                evaporating.contains(&c),
+                "{c:?} evaporation flag"
+            );
+        }
     }
 }
