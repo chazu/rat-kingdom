@@ -165,5 +165,30 @@ async fn pr_mode_dismiss_opens_pr_and_keeps_branch() {
         String::from_utf8_lossy(&remote_ref.stderr)
     );
 
+    // TKT-67: the pushed PR is visible attention — `rk inbox` surfaces it as an
+    // awaiting-review row keyed on the branch, carrying the forge URL, so the
+    // completed-run branch is never silently forgotten.
+    let inbox = client.call("inbox.list", json!({})).await.unwrap();
+    let items = inbox["items"].as_array().expect("inbox has items array");
+    let review = items
+        .iter()
+        .find(|it| it["kind"] == "awaiting-review")
+        .unwrap_or_else(|| panic!("open PR must appear as awaiting-review: {inbox}"));
+    assert_eq!(
+        review["subject"], branch,
+        "awaiting-review row is keyed on the branch: {review}"
+    );
+    assert!(
+        review["detail"].as_str().unwrap_or("").contains(&branch),
+        "awaiting-review detail names the branch: {review}"
+    );
+    assert!(
+        review["action"]
+            .as_str()
+            .unwrap_or("")
+            .contains("review & merge"),
+        "awaiting-review action points at the forge merge: {review}"
+    );
+
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }

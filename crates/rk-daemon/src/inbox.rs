@@ -21,6 +21,10 @@ mod urgency {
     pub const BUDGET_EXCEEDED: u8 = 5;
     pub const FAILED: u8 = 4;
     pub const PARKED_GATE: u8 = 3;
+    /// A pushed branch with an open PR/MR awaiting a human review+merge on the
+    /// forge. Co-ranked with a parked gate — both are pushed work blocked on a
+    /// human decision — and above passive obstacles.
+    pub const AWAITING_REVIEW: u8 = 3;
     pub const OBSTACLE: u8 = 2;
     pub const NEED: u8 = 1;
 }
@@ -50,6 +54,7 @@ pub fn build(
     instances: &[Instance],
     obstacles: &[Tuple],
     needs: &[Tuple],
+    pull_requests: &[Tuple],
 ) -> Vec<InboxItem> {
     let mut items = Vec::new();
 
@@ -155,10 +160,64 @@ pub fn build(
         });
     }
 
+    // Open pull/merge requests: a PR-mode `dismiss`/`land` pushed a branch and
+    // opened a PR (a `pull_request_opened` event), then completed — so nothing
+    // else in this queue tracks it. Surface each so a pushed branch is visible
+    // attention, never silently forgotten, carrying the forge URL to review it.
+    // Dedup by (scope, branch): a re-land emits a fresh event for the same
+    // branch, and only the newest matters. `pull_requests` arrives oldest-first
+    // (scan order), so a later event overwrites an earlier one for its branch.
+    let mut latest_pr: std::collections::HashMap<(String, String), &Tuple> =
+        std::collections::HashMap::new();
+    for t in pull_requests {
+        let branch = t
+            .payload
+            .get("branch")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        latest_pr.insert((t.scope.clone(), branch), t);
+    }
+    // Deterministic order: newest PR first (event ids are time-sortable).
+    let mut prs: Vec<&Tuple> = latest_pr.into_values().collect();
+    prs.sort_by(|a, b| b.id.cmp(&a.id));
+    for t in prs {
+        let branch = t.payload.get("branch").and_then(|v| v.as_str());
+        let target = t.payload.get("target").and_then(|v| v.as_str());
+        let url = t.payload.get("url").and_then(|v| v.as_str());
+        let detail = match (branch, target) {
+            (Some(b), Some(tg)) => format!("PR open: {b} → {tg}{}", url_suffix(url)),
+            (Some(b), None) => format!("PR open for {b}{}", url_suffix(url)),
+            _ => format!("PR open{}", url_suffix(url)),
+        };
+        // The resolving action is to review + merge on the forge; the URL is the
+        // one thing the operator needs. Fall back to the branch when unknown.
+        let action = match url {
+            Some(u) => format!("review & merge: {u}"),
+            None => format!(
+                "review & merge branch {} on the forge",
+                branch.unwrap_or("(unknown)")
+            ),
+        };
+        items.push(InboxItem {
+            urgency: urgency::AWAITING_REVIEW,
+            kind: "awaiting-review".into(),
+            subject: branch.unwrap_or(&t.identity).to_string(),
+            scope: t.scope.clone(),
+            detail,
+            action,
+        });
+    }
+
     // Most urgent first; a stable sort keeps each source's own order (agents by
     // spawn time, instances by start time, tuples oldest-first) within a rank.
     items.sort_by(|a, b| b.urgency.cmp(&a.urgency));
     items
+}
+
+/// Render an optional PR URL as a ` (<url>)` suffix, or empty when absent.
+fn url_suffix(url: Option<&str>) -> String {
+    url.map(|u| format!(" ({u})")).unwrap_or_default()
 }
 
 /// Render the inbox as machine-readable JSON.
@@ -245,6 +304,16 @@ mod tests {
         )
     }
 
+    fn pull_request(branch: &str, target: &str, url: Option<&str>) -> Tuple {
+        Tuple::new(
+            Category::Event,
+            "repo",
+            "pull_request_opened",
+            "castle",
+            json!({ "branch": branch, "target": target, "url": url }),
+        )
+    }
+
     #[test]
     fn ranks_budget_exceeded_above_everything_else() {
         let agents = vec![agent("Whisker", AgentState::Failed)];
@@ -258,7 +327,7 @@ mod tests {
         )];
         let needs = vec![need("Scamper", "need a reviewer")];
 
-        let inbox = build(&agents, &instances, &obstacles, &needs);
+        let inbox = build(&agents, &instances, &obstacles, &needs, &[]);
         let kinds: Vec<&str> = inbox.iter().map(|i| i.kind.as_str()).collect();
 
         // budget(5) > failed agent/instance(4) > parked gate(3) > need(1).
@@ -283,16 +352,50 @@ mod tests {
             instance("wf-run", InstanceStatus::Running, None),
             instance("wf-ok", InstanceStatus::Completed, None),
         ];
-        let inbox = build(&agents, &instances, &[], &[]);
+        let inbox = build(&agents, &instances, &[], &[], &[]);
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].subject, "Gone");
         assert_eq!(inbox[0].action, "rk respawn Gone");
     }
 
     #[test]
+    fn open_pr_surfaces_as_awaiting_review_with_url() {
+        let prs = vec![pull_request(
+            "rat/rat-9/tkt-9",
+            "main",
+            Some("https://forge/x/y/compare/main...rat/rat-9/tkt-9"),
+        )];
+        let inbox = build(&[], &[], &[], &[], &prs);
+        assert_eq!(inbox.len(), 1);
+        let row = &inbox[0];
+        assert_eq!(row.kind, "awaiting-review");
+        assert_eq!(row.urgency, urgency::AWAITING_REVIEW);
+        assert_eq!(row.subject, "rat/rat-9/tkt-9");
+        assert!(row.detail.contains("rat/rat-9/tkt-9 → main"));
+        assert!(row.detail.contains("https://forge/x/y/compare"));
+        assert!(row.action.contains("review & merge: https://forge/"));
+    }
+
+    #[test]
+    fn open_pr_dedups_by_branch_keeping_newest() {
+        // A re-land emits a second event for the same branch; only the newest
+        // should surface, as one row. Events arrive oldest-first (scan order),
+        // so the last entry for a branch wins.
+        let older = pull_request("rat/rat-9/tkt-9", "main", Some("https://forge/pr/1"));
+        let newer = pull_request("rat/rat-9/tkt-9", "main", Some("https://forge/pr/2"));
+        let inbox = build(&[], &[], &[], &[], &[older, newer]);
+        let review: Vec<&InboxItem> = inbox
+            .iter()
+            .filter(|i| i.kind == "awaiting-review")
+            .collect();
+        assert_eq!(review.len(), 1);
+        assert!(review[0].detail.contains("https://forge/pr/2"));
+    }
+
+    #[test]
     fn plain_obstacle_uses_text_and_obstacle_rank() {
         let obstacles = vec![obstacle("Pip", json!({"text": "merge conflict in lib.rs"}))];
-        let inbox = build(&[], &[], &obstacles, &[]);
+        let inbox = build(&[], &[], &obstacles, &[], &[]);
         assert_eq!(inbox[0].urgency, urgency::OBSTACLE);
         assert_eq!(inbox[0].detail, "merge conflict in lib.rs");
         assert_eq!(inbox[0].action, "rk status Pip");

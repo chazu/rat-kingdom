@@ -138,6 +138,11 @@ workflow: #Workflow
 #EvaluateStep: {
 	type:   "evaluate"
 	expect: _
+	// Optional disjunction. `expect` is an AND over its fields, so it cannot
+	// express "one success shape OR another". List alternatives here and the
+	// step passes if the result unifies with `expect` OR with any entry — e.g.
+	// a PR-mode land's {pr_opened: true} alongside a Direct-merge {merged: true}.
+	anyOf?: [..._]
 }
 
 #DismissStep: {

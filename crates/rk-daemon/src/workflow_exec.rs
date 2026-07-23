@@ -468,11 +468,21 @@ impl WorkflowEngine {
                 }
                 Step::Evaluate(eval) => {
                     let actual = ctx.previous_result.clone().unwrap_or(Value::Null);
-                    let passed = rk_workflow::unify_concrete(&eval.expect, &actual)?;
+                    // Pass if the result unifies with `expect` OR any `anyOf`
+                    // alternative — a disjunction single-`expect` unification (an
+                    // AND over fields) cannot express. Short-circuits on the
+                    // first match.
+                    let mut passed = rk_workflow::unify_concrete(&eval.expect, &actual)?;
+                    for alt in &eval.any_of {
+                        if passed {
+                            break;
+                        }
+                        passed = rk_workflow::unify_concrete(alt, &actual)?;
+                    }
                     if !passed {
                         return Err(rk_core::Error::other(format!(
-                            "evaluate failed: expect {} did not unify with {}",
-                            eval.expect, actual
+                            "evaluate failed: expect {} (anyOf {:?}) did not unify with {}",
+                            eval.expect, eval.any_of, actual
                         )));
                     }
                 }
