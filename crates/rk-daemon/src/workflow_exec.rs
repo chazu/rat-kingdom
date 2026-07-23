@@ -10,7 +10,8 @@ use rk_core::tuple::{Category, Pattern};
 use rk_space::Space;
 use rk_workflow::{
     resolve::{resolve, resolve_fields},
-    AgentProfile, DismissAllStep, ForEachStep, RunStep, Step, TicketQuery, WaitAllStep, Workflow,
+    AgentProfile, DismissAllStep, ForEachStep, RunStep, Step, TicketQuery, TierRouting,
+    WaitAllStep, Workflow,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -95,6 +96,8 @@ pub struct WorkflowEngine {
     space: Space,
     tickets: Arc<Tickets>,
     global_agents: HashMap<String, AgentProfile>,
+    /// Global cost-tier routing; a workflow's own `tiers:` table shadows it.
+    tier_routing: TierRouting,
     default_harness: String,
     instances: Mutex<HashMap<String, Instance>>,
 }
@@ -106,6 +109,7 @@ impl WorkflowEngine {
         space: Space,
         tickets: Arc<Tickets>,
         global_agents: HashMap<String, AgentProfile>,
+        tier_routing: TierRouting,
         default_harness: String,
     ) -> Self {
         Self {
@@ -114,6 +118,7 @@ impl WorkflowEngine {
             space,
             tickets,
             global_agents,
+            tier_routing,
             default_harness,
             instances: Mutex::new(HashMap::new()),
         }
@@ -220,7 +225,10 @@ impl WorkflowEngine {
     async fn execute(&self, id: &str, workflow: Workflow, repo: &str) -> rk_core::Result<()> {
         for (index, step) in workflow.steps.iter().enumerate() {
             self.update(id, |i| i.current_step = index);
-            if let Flow::Break = self.run_step(id, step, repo, &workflow.agents).await? {
+            if let Flow::Break = self
+                .run_step(id, step, repo, &workflow.agents, &workflow.tiers)
+                .await?
+            {
                 // A top-level break ends the workflow (nothing to loop out of).
                 break;
             }
@@ -235,10 +243,11 @@ impl WorkflowEngine {
         steps: &'a [Step],
         repo: &'a str,
         agents: &'a HashMap<String, AgentProfile>,
+        tiers: &'a TierRouting,
     ) -> StepFuture<'a> {
         Box::pin(async move {
             for step in steps {
-                if let Flow::Break = self.run_step(id, step, repo, agents).await? {
+                if let Flow::Break = self.run_step(id, step, repo, agents, tiers).await? {
                     return Ok(Flow::Break);
                 }
             }
@@ -246,13 +255,15 @@ impl WorkflowEngine {
         })
     }
 
-    /// Execute a single step (recursing for `when`/`repeat`).
+    /// Execute a single step (recursing for `when`/`repeat`). `tiers` is the
+    /// workflow's own tier-routing table, chained over the global one at fan-out.
     fn run_step<'a>(
         &'a self,
         id: &'a str,
         step: &'a Step,
         repo: &'a str,
         agents: &'a HashMap<String, AgentProfile>,
+        tiers: &'a TierRouting,
     ) -> StepFuture<'a> {
         Box::pin(async move {
             let ctx = self.context(id);
@@ -331,9 +342,10 @@ impl WorkflowEngine {
                 }
                 Step::Gate(gate) => match gate.gate_type.as_str() {
                     "timer" => {
-                        let duration = gate.duration.as_deref().ok_or_else(|| {
-                            rk_core::Error::other("timer gate missing duration")
-                        })?;
+                        let duration = gate
+                            .duration
+                            .as_deref()
+                            .ok_or_else(|| rk_core::Error::other("timer gate missing duration"))?;
                         tokio::time::sleep(parse_duration(duration)?).await;
                     }
                     "approval" => {
@@ -385,9 +397,7 @@ impl WorkflowEngine {
                         });
                     }
                     other => {
-                        return Err(rk_core::Error::other(format!(
-                            "unknown gate type: {other}"
-                        )));
+                        return Err(rk_core::Error::other(format!("unknown gate type: {other}")));
                     }
                 },
                 Step::Read(read) => {
@@ -433,11 +443,13 @@ impl WorkflowEngine {
                         .map(value_as_key)
                         .unwrap_or_default();
                     let branch = when.cases.get(&key).unwrap_or(&when.default);
-                    return self.run_steps(id, branch, repo, agents).await;
+                    return self.run_steps(id, branch, repo, agents, tiers).await;
                 }
                 Step::Repeat(repeat) => {
                     for _ in 0..repeat.max {
-                        if let Flow::Break = self.run_steps(id, &repeat.steps, repo, agents).await?
+                        if let Flow::Break = self
+                            .run_steps(id, &repeat.steps, repo, agents, tiers)
+                            .await?
                         {
                             break;
                         }
@@ -451,7 +463,7 @@ impl WorkflowEngine {
                     )));
                 }
                 Step::ForEach(fe) => {
-                    let fanout = self.fan_out(id, agents, repo, fe).await?;
+                    let fanout = self.fan_out(id, agents, tiers, repo, fe).await?;
                     self.update(id, |i| i.context.fanout = fanout);
                 }
                 Step::WaitAll(wait_all) => {
@@ -491,6 +503,7 @@ impl WorkflowEngine {
         &self,
         id: &str,
         agents: &HashMap<String, AgentProfile>,
+        tiers: &TierRouting,
         repo: &str,
         fe: &ForEachStep,
     ) -> rk_core::Result<Vec<FannedAgent>> {
@@ -498,6 +511,8 @@ impl WorkflowEngine {
         if items.is_empty() {
             warn!(instance = %id, "for_each matched no tickets; nothing to fan out");
         }
+        // The workflow's own tier rules shadow the global ones for this fan-out.
+        let routing = tiers.chained(&self.tier_routing);
         let ctx = self.context(id);
         let mut fanned = Vec::with_capacity(items.len());
         for item in items {
@@ -508,8 +523,15 @@ impl WorkflowEngine {
                 info!(instance = %id, ticket = %item.id, "ticket already claimed; skipping");
                 continue;
             }
+            // Route this ticket to a cost tier from its labels/priority. The tier
+            // is an agent profile that resolves just below inline overrides.
+            let tier = routing.route(&item.labels, Some(&item.priority));
+            if let Some(tier) = tier {
+                info!(instance = %id, ticket = %item.id, tier, "routed ticket to cost tier");
+            }
             let resolved = resolve_fields(
                 fe.agent.as_deref(),
+                tier,
                 fe.harness.as_deref(),
                 fe.model.as_deref(),
                 fe.permission_mode.as_deref(),
@@ -550,11 +572,7 @@ impl WorkflowEngine {
     /// then aggregate into `{count, ok, errors, all_ok, results}`. All agents
     /// share one deadline: the step times out if any is still running when it
     /// elapses.
-    async fn join(
-        &self,
-        fanout: &[FannedAgent],
-        wait_all: &WaitAllStep,
-    ) -> rk_core::Result<Value> {
+    async fn join(&self, fanout: &[FannedAgent], wait_all: &WaitAllStep) -> rk_core::Result<Value> {
         if fanout.is_empty() {
             return Err(rk_core::Error::other(
                 "wait_all step with no fan-out agents (missing or empty for_each)",
@@ -671,11 +689,7 @@ impl WorkflowEngine {
     /// Fail-closed: a spawn failure, a timeout (the child is killed on drop),
     /// or an `expect_exit` mismatch all return an `Err` that fails the instance
     /// rather than letting a red — or hung — suite slip through.
-    async fn run_command(
-        &self,
-        ctx: &WorkflowContext,
-        run: &RunStep,
-    ) -> rk_core::Result<Value> {
+    async fn run_command(&self, ctx: &WorkflowContext, run: &RunStep) -> rk_core::Result<Value> {
         let agent = ctx
             .active_agent
             .clone()
@@ -711,9 +725,8 @@ impl WorkflowEngine {
             })?;
 
         let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(res) => {
-                res.map_err(|e| rk_core::Error::other(format!("run step: `{command}` failed: {e}")))?
-            }
+            Ok(res) => res
+                .map_err(|e| rk_core::Error::other(format!("run step: `{command}` failed: {e}")))?,
             Err(_) => {
                 // Fail closed: a suite that outruns its timeout is a red gate.
                 return Err(rk_core::Error::other(format!(
@@ -759,6 +772,8 @@ impl WorkflowEngine {
                 id: t.identity.clone(),
                 title: field(&t.payload, "title"),
                 body: field(&t.payload, "body"),
+                priority: field(&t.payload, "priority"),
+                labels: string_array(&t.payload, "labels"),
             })
             .collect())
     }
@@ -848,11 +863,14 @@ impl WorkflowEngine {
     }
 }
 
-/// A ticket flattened into the fields a fan-out task template can bind.
+/// A ticket flattened into the fields a fan-out task template can bind, plus the
+/// `labels`/`priority` a tier-routing rule keys on.
 struct TicketItem {
     id: String,
     title: String,
     body: String,
+    priority: String,
+    labels: Vec<String>,
 }
 
 fn field(payload: &Value, key: &str) -> String {
@@ -861,6 +879,19 @@ fn field(payload: &Value, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+fn string_array(payload: &Value, key: &str) -> Vec<String> {
+    payload
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Interpolate a fan-out task template: `{{ctx.*}}` first, then the per-ticket
@@ -980,6 +1011,8 @@ mod tests {
             id: "TKT-7".into(),
             title: "add caching".into(),
             body: "cache the API layer".into(),
+            priority: "normal".into(),
+            labels: vec![],
         };
         let text = "Work {{item.id}}: {{item.title}}\n\n{{item.body}}";
         assert_eq!(

@@ -31,6 +31,7 @@ pub struct Daemon {
     reactor_config: rk_core::config::ReactorConfig,
     sweep_config: rk_core::config::SupervisorConfig,
     global_agents: std::collections::HashMap<String, rk_workflow::AgentProfile>,
+    tier_routing: rk_workflow::TierRouting,
     default_harness: String,
     engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
     repos: std::sync::Mutex<crate::repos::RepoRegistry>,
@@ -69,6 +70,18 @@ impl Daemon {
                 )
             })
             .collect();
+        daemon.tier_routing = rk_workflow::TierRouting {
+            rules: config
+                .tiers
+                .rules
+                .iter()
+                .map(|r| rk_workflow::TierRule {
+                    priority: r.priority.clone(),
+                    label: r.label.clone(),
+                    tier: r.tier.clone(),
+                })
+                .collect(),
+        };
         daemon.reactor_config = config.reactor.clone();
         daemon.sweep_config = config.supervisor.clone();
         if config.sync.enabled {
@@ -144,6 +157,7 @@ impl Daemon {
             reactor_config: rk_core::config::ReactorConfig::default(),
             sweep_config: rk_core::config::SupervisorConfig::default(),
             global_agents: Default::default(),
+            tier_routing: Default::default(),
             default_harness,
             engine: std::sync::OnceLock::new(),
             repos,
@@ -362,6 +376,7 @@ impl Daemon {
                 self.space.clone(),
                 Arc::clone(&self.tickets),
                 self.global_agents.clone(),
+                self.tier_routing.clone(),
                 self.default_harness.clone(),
             ))
         }))

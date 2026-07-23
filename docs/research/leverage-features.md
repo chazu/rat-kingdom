@@ -446,6 +446,21 @@ delegation.
 
 ### 8. Model & harness cost-aware tiering
 
+**Landed (TKT-26).** A cost-tier routing table maps a ticket's `labels`/`priority`
+to a *tier* — the name of an agent profile (`[agents.<tier>]` global, or a
+workflow `agents:` entry). `resolve_fields` (`resolve.rs`) gained a tier layer
+just below inline overrides, so a routing rule beats the static profile defaults
+yet an inline `harness:`/`model:` still wins. Global rules live in `[tiers]`
+(`[[tiers.rules]]`, `config.rs`); a workflow's own `tiers:` field
+(`schema.cue #TierRouting`) shadows them. The fan-out (`for_each`) routes each
+ready ticket by its labels/priority (`workflow_exec.rs fan_out`); single spawns
+carry no ticket and route as before. First matching rule wins; a rule with
+neither predicate is an unconditional fallback. Escalation-on-failure needs no
+new machinery — drain cheap, `wait_all`, and on an `evaluate` failure re-run the
+hard tickets on the premium tier. Types + routing (`rk_workflow::TierRouting`),
+example `examples/workflows/cost-tiered-drain.cue`, e2e
+`crates/rk-daemon/tests/tier_routing.rs`.
+
 **What it does.** Route each job to the cheapest harness/model that can do it: a
 one-shot `axe` or a small model (haiku) for bounded/mechanical work (grooming,
 verify, lint, doc fixes), premium claude/opus for hard implementation — driven by
