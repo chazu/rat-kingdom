@@ -1134,6 +1134,21 @@ impl WorkflowEngine {
         self.lock().get(id).cloned()
     }
 
+    /// The instance plus its labelled step trace, for `rk workflow timeline`:
+    /// every step of the definition rendered as a row so the CLI can mark
+    /// done/current/pending against the persisted `current_step` cursor.
+    /// `None` rows = the definition no longer loads (file moved or deleted
+    /// since launch); the CLI then falls back to bare step numbers.
+    pub fn timeline(&self, id: &str) -> Option<(Instance, Option<Vec<TimelineRow>>)> {
+        let instance = self.status(id)?;
+        let rows = self
+            .find_definition(&instance.definition, &instance.repo)
+            .ok()
+            .and_then(|file| rk_workflow::load(&file, &instance.params).ok())
+            .map(|workflow| timeline_rows(&workflow.steps));
+        Some((instance, rows))
+    }
+
     /// Record a human approval decision for a parked instance. Writes a
     /// `workflow_approval` event that an approval gate blocked on this instance
     /// is waiting to read. Idempotent from the caller's view: the first
@@ -1321,6 +1336,132 @@ fn parse_duration(s: &str) -> rk_core::Result<Duration> {
     n.checked_mul(mult).map(Duration::from_secs).ok_or_else(invalid)
 }
 
+/// One row of an instance's rendered step trace. `index` is the TOP-LEVEL
+/// step index the row belongs to — the executor's `current_step` cursor only
+/// counts top-level steps, so nested rows (a `when` case body, a `repeat`
+/// body) carry their parent's index and a deeper `depth` for indentation.
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineRow {
+    pub index: usize,
+    pub depth: usize,
+    pub label: String,
+}
+
+/// Flatten a workflow's steps into labelled timeline rows, recursing into
+/// `when`/`repeat` bodies with increased depth.
+fn timeline_rows(steps: &[Step]) -> Vec<TimelineRow> {
+    let mut rows = Vec::new();
+    for (index, step) in steps.iter().enumerate() {
+        flatten_step(&mut rows, index, 0, step);
+    }
+    rows
+}
+
+fn flatten_step(rows: &mut Vec<TimelineRow>, index: usize, depth: usize, step: &Step) {
+    rows.push(TimelineRow {
+        index,
+        depth,
+        label: step_label(step),
+    });
+    match step {
+        Step::When(when) => {
+            // HashMap order is nondeterministic; sort so the trace is stable.
+            let mut cases: Vec<_> = when.cases.iter().collect();
+            cases.sort_by(|a, b| a.0.cmp(b.0));
+            for (value, body) in cases {
+                rows.push(TimelineRow {
+                    index,
+                    depth: depth + 1,
+                    label: format!("case {value}:"),
+                });
+                for s in body {
+                    flatten_step(rows, index, depth + 2, s);
+                }
+            }
+            if !when.default.is_empty() {
+                rows.push(TimelineRow {
+                    index,
+                    depth: depth + 1,
+                    label: "default:".into(),
+                });
+                for s in &when.default {
+                    flatten_step(rows, index, depth + 2, s);
+                }
+            }
+        }
+        Step::Repeat(repeat) => {
+            for s in &repeat.steps {
+                flatten_step(rows, index, depth + 1, s);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Short human label for one step, mirroring the CUE field names an operator
+/// wrote in the definition.
+fn step_label(step: &Step) -> String {
+    match step {
+        Step::Spawn(s) => format!("spawn {} — \"{}\"", s.role, s.task.title),
+        Step::Wait(w) => format!("wait for result ({})", w.timeout),
+        Step::Evaluate(e) => {
+            if e.any_of.is_empty() {
+                format!("evaluate expect {}", e.expect)
+            } else {
+                format!("evaluate expect {} (+{} anyOf)", e.expect, e.any_of.len())
+            }
+        }
+        Step::Dismiss(d) => {
+            if d.no_merge {
+                "dismiss (no merge)".into()
+            } else {
+                "dismiss (merge)".into()
+            }
+        }
+        Step::Gate(g) => match (&g.duration, &g.timeout) {
+            (Some(d), _) => format!("gate {} ({d})", g.gate_type),
+            (None, Some(t)) => format!("gate {} (timeout {t})", g.gate_type),
+            (None, None) => format!("gate {}", g.gate_type),
+        },
+        Step::Read(r) => {
+            let field = r
+                .field
+                .as_deref()
+                .map(|f| format!(".{f}"))
+                .unwrap_or_default();
+            format!("read {}/{}{} → {}", r.category, r.identity, field, r.into)
+        }
+        Step::When(w) => format!("when {}", w.var),
+        Step::Repeat(r) => format!("repeat ×{}", r.max),
+        Step::Break => "break".into(),
+        Step::Stop(s) => match &s.reason {
+            Some(reason) => format!("stop — {reason}"),
+            None => "stop".into(),
+        },
+        Step::ForEach(f) => format!(
+            "for_each {} tickets (≤{}) → spawn {}",
+            f.query.status, f.query.limit, f.role
+        ),
+        Step::WaitAll(w) => format!("wait_all ({})", w.timeout),
+        Step::DismissAll(d) => {
+            let mut label = String::from("dismiss_all");
+            if d.no_merge {
+                label.push_str(" (no merge)");
+            } else if d.only_clean {
+                label.push_str(" (only clean)");
+            }
+            label
+        }
+        Step::Run(r) => match (&r.check, &r.command) {
+            (Some(check), _) => format!("run check:{check}"),
+            (None, Some(command)) => format!("run `{command}`"),
+            (None, None) => "run".into(),
+        },
+        Step::Land(l) => format!("land {} → {}", l.branch, l.target),
+        Step::OpenPr(p) => format!("open_pr {} → {}", p.branch, p.target),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1409,5 +1550,68 @@ mod tests {
         assert!(parse_duration("   ").is_err());
         assert!(parse_duration("abc").is_err());
         assert!(parse_duration("m").is_err());
+    }
+
+    #[test]
+    fn timeline_rows_flatten_and_label_steps() {
+        let steps: Vec<Step> = serde_json::from_value(serde_json::json!([
+            {"type": "spawn", "task": {"title": "fix the bug"}},
+            {"type": "wait", "timeout": "30m"},
+            {"type": "gate", "gateType": "approval", "timeout": "24h"},
+            {"type": "read", "category": "event", "identity": "workflow_approval",
+             "field": "approved", "into": "verdict"},
+            {"type": "when", "var": "verdict",
+             "cases": {"true": [{"type": "dismiss"}]},
+             "default": [{"type": "dismiss", "noMerge": true}, {"type": "stop", "reason": "rejected"}]},
+        ]))
+        .unwrap();
+
+        let rows = timeline_rows(&steps);
+        let rendered: Vec<(usize, usize, &str)> = rows
+            .iter()
+            .map(|r| (r.index, r.depth, r.label.as_str()))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                (0, 0, "spawn rat — \"fix the bug\""),
+                (1, 0, "wait for result (30m)"),
+                (2, 0, "gate approval (timeout 24h)"),
+                (3, 0, "read event/workflow_approval.approved → verdict"),
+                (4, 0, "when verdict"),
+                (4, 1, "case true:"),
+                (4, 2, "dismiss (merge)"),
+                (4, 1, "default:"),
+                (4, 2, "dismiss (no merge)"),
+                (4, 2, "stop — rejected"),
+            ]
+        );
+    }
+
+    #[test]
+    fn timeline_rows_nest_repeat_bodies() {
+        let steps: Vec<Step> = serde_json::from_value(serde_json::json!([
+            {"type": "repeat", "max": 3, "steps": [
+                {"type": "run", "command": "cargo test"},
+                {"type": "break"},
+            ]},
+            {"type": "land", "branch": "{{ctx.activeBranch}}", "target": "main"},
+        ]))
+        .unwrap();
+
+        let rows = timeline_rows(&steps);
+        let rendered: Vec<(usize, usize, &str)> = rows
+            .iter()
+            .map(|r| (r.index, r.depth, r.label.as_str()))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                (0, 0, "repeat ×3"),
+                (0, 1, "run `cargo test`"),
+                (0, 1, "break"),
+                (1, 0, "land {{ctx.activeBranch}} → main"),
+            ]
+        );
     }
 }

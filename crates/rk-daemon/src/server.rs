@@ -751,6 +751,22 @@ impl Daemon {
                     ),
                 })
             }
+            "workflow.timeline" => {
+                let params: NameParams = match parse_params(&req.params) {
+                    Ok(p) => p,
+                    Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
+                };
+                reply(match self.engine().timeline(&params.name) {
+                    Some((instance, steps)) => {
+                        Response::ok(id, json!({"instance": instance, "steps": steps}))
+                    }
+                    None => Response::err(
+                        id,
+                        codes::INTERNAL,
+                        format!("no such instance: {}", params.name),
+                    ),
+                })
+            }
             "workflow.approve" => {
                 let params: WorkflowApproveParams = match parse_params(&req.params) {
                     Ok(p) => p,
