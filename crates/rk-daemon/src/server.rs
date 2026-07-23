@@ -414,6 +414,10 @@ impl Daemon {
                     write_json_line(&mut write, &response).await?;
                     return self.stream_watch(write, pattern).await;
                 }
+                Outcome::LogFollow { response, agent } => {
+                    write_json_line(&mut write, &response).await?;
+                    return self.stream_log(write, agent).await;
+                }
             }
         }
         Ok(())
@@ -430,6 +434,31 @@ impl Daemon {
             match rx.recv().await {
                 Ok(tuple) if pattern.matches(&tuple) => {
                     let note = json!({"method": "tuple", "params": tuple});
+                    write_json_line(&mut write, &note).await?;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    let note = json!({"method": "lagged", "params": {"missed": missed}});
+                    write_json_line(&mut write, &note).await?;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+            }
+        }
+    }
+
+    /// Push `agent`'s new transcript entries as they land, until the client goes
+    /// away. The backlog was already sent as the `agent.log` reply; this is the
+    /// live tail (there may be a momentary overlap of one boundary entry).
+    async fn stream_log(
+        &self,
+        mut write: tokio::net::unix::OwnedWriteHalf,
+        agent: String,
+    ) -> std::io::Result<()> {
+        let mut rx = self.supervisor.log().subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(rec) if rec.agent == agent => {
+                    let note = json!({"method": "log", "params": rec.entry});
                     write_json_line(&mut write, &note).await?;
                 }
                 Ok(_) => {}
@@ -476,6 +505,22 @@ impl Daemon {
                     .map(|r| json!({"agent": r}))
                     .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))
             })),
+            "agent.log" => {
+                let params: LogParams = match parse_params(&req.params) {
+                    Ok(p) => p,
+                    Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
+                };
+                let backlog = self.supervisor.log().read(&params.name, params.tail);
+                let response = Response::ok(id, json!({"entries": backlog}));
+                if params.follow {
+                    Outcome::LogFollow {
+                        response,
+                        agent: params.name,
+                    }
+                } else {
+                    reply(response)
+                }
+            }
             "agent.steer" => reply(self.handle_steer(req).await),
             "agent.interrupt" => {
                 let params: NameParams = match parse_params(&req.params) {
@@ -881,6 +926,22 @@ enum Outcome {
         response: Response,
         pattern: Pattern,
     },
+    /// Reply with the backlog, then stream that agent's new log entries live.
+    LogFollow {
+        response: Response,
+        agent: String,
+    },
+}
+
+#[derive(Deserialize)]
+struct LogParams {
+    name: String,
+    /// Only the last N entries of the backlog (all if unset).
+    #[serde(default)]
+    tail: Option<usize>,
+    /// Keep the connection open and push new entries as they land.
+    #[serde(default)]
+    follow: bool,
 }
 
 #[derive(Deserialize)]

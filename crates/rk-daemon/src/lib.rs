@@ -1,6 +1,7 @@
 //! rat-kingdom daemon: NDJSON-over-UDS server hosting the tuplespace, plus the
 //! client used by `rk`.
 
+pub mod agent_log;
 pub mod agents;
 pub mod client;
 pub mod inbox;

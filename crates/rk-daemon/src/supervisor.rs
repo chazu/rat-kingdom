@@ -69,6 +69,9 @@ pub struct Supervisor {
     budget_warned: Mutex<std::collections::HashSet<String>>,
     /// Per-agent liveness-sweep bookkeeping (burn-rate deltas + flag episodes).
     sweep_state: Mutex<HashMap<String, SweepState>>,
+    /// Bounded per-agent transcript (assistant text / tool calls / retries),
+    /// so the operator can `rk log` a run instead of being blind to it.
+    log: crate::agent_log::AgentLog,
 }
 
 /// One agent's rolling state across supervisor sweeps.
@@ -113,6 +116,7 @@ impl Supervisor {
                 Err(e) => warn!(error = %e, "invalid pricing.json ignored"),
             }
         }
+        let log = crate::agent_log::AgentLog::new(&layout);
         Ok(Self {
             layout,
             castle,
@@ -125,7 +129,13 @@ impl Supervisor {
             budget,
             budget_warned: Mutex::new(std::collections::HashSet::new()),
             sweep_state: Mutex::new(HashMap::new()),
+            log,
         })
+    }
+
+    /// The per-agent transcript store (for `agent.log` reads and `--follow`).
+    pub fn log(&self) -> &crate::agent_log::AgentLog {
+        &self.log
     }
 
     /// Called once the daemon has WON the socket bind — never earlier. A
@@ -553,9 +563,20 @@ impl Supervisor {
                     }
                 });
             }
-            HarnessEvent::AssistantText { .. }
-            | HarnessEvent::ToolUse { .. }
-            | HarnessEvent::Retry { .. } => {}
+            // Formerly dropped on the floor; now persisted as the agent's
+            // transcript so the operator can `rk log` a run without --attach.
+            HarnessEvent::AssistantText { text } => {
+                self.log
+                    .append(name, crate::agent_log::LogEvent::Text { text });
+            }
+            HarnessEvent::ToolUse { name: tool } => {
+                self.log
+                    .append(name, crate::agent_log::LogEvent::Tool { name: tool });
+            }
+            HarnessEvent::Retry { attempt, error } => {
+                self.log
+                    .append(name, crate::agent_log::LogEvent::Retry { attempt, error });
+            }
         }
     }
 

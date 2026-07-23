@@ -54,6 +54,18 @@ pub struct NameArg {
 }
 
 #[derive(Args)]
+pub struct LogArgs {
+    /// Agent name.
+    pub name: String,
+    /// Stream new entries live as the agent produces them.
+    #[arg(long, short)]
+    pub follow: bool,
+    /// Show only the last N entries (default: all).
+    #[arg(long, short = 'n')]
+    pub tail: Option<usize>,
+}
+
+#[derive(Args)]
 pub struct SteerArgs {
     /// Agent name.
     pub name: String,
@@ -274,6 +286,59 @@ pub async fn status(layout: &Layout, args: NameArg, as_json: bool) -> Result<()>
         }
     }
     Ok(())
+}
+
+/// Print an agent's transcript (assistant text, tool calls, retries). With
+/// `--follow`, print the backlog then stream new entries until interrupted.
+pub async fn log(layout: &Layout, args: LogArgs, as_json: bool) -> Result<()> {
+    let params = json!({"name": args.name, "tail": args.tail, "follow": args.follow});
+    if !args.follow {
+        let mut client = Client::connect_or_spawn(layout).await?;
+        let result = client.call("agent.log", params).await?;
+        print_log_entries(&result["entries"], as_json);
+        return Ok(());
+    }
+    let client = Client::connect_or_spawn(layout).await?;
+    let (backlog, mut stream) = client.call_then_stream("agent.log", params).await?;
+    print_log_entries(&backlog["entries"], as_json);
+    while let Some(note) = stream.next().await? {
+        match note["method"].as_str() {
+            Some("log") => print_log_entry(&note["params"], as_json),
+            Some("lagged") => eprintln!("(log lagged: missed {})", note["params"]["missed"]),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn print_log_entries(entries: &Value, as_json: bool) {
+    match entries.as_array() {
+        Some(arr) if !arr.is_empty() => arr.iter().for_each(|e| print_log_entry(e, as_json)),
+        _ if as_json => {}
+        _ => println!("(no log entries)"),
+    }
+}
+
+/// One transcript line: `HH:MM:SS  KIND  detail`, or raw JSON with --json.
+fn print_log_entry(entry: &Value, as_json: bool) {
+    if as_json {
+        println!("{entry}");
+        return;
+    }
+    let ts = entry["ts"]
+        .as_str()
+        .and_then(|s| s.get(11..19))
+        .unwrap_or("--:--:--");
+    match entry["kind"].as_str() {
+        Some("text") => println!("{ts}  text   {}", entry["text"].as_str().unwrap_or("")),
+        Some("tool") => println!("{ts}  tool   {}", entry["name"].as_str().unwrap_or("?")),
+        Some("retry") => println!(
+            "{ts}  retry  attempt {}: {}",
+            entry["attempt"].as_u64().unwrap_or(0),
+            entry["error"].as_str().unwrap_or("")
+        ),
+        _ => println!("{ts}  {entry}"),
+    }
 }
 
 pub async fn steer(layout: &Layout, args: SteerArgs, as_json: bool) -> Result<()> {
