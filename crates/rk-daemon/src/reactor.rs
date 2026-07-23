@@ -36,7 +36,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{info, warn};
 
 /// The reserved author of every tuple the reactor writes (markers, obstacles).
@@ -55,9 +55,27 @@ const COALESCE_FILED_TTL_SECS: i64 = 10 * 60;
 
 /// A loaded trigger plus where it came from (a repo-local file defaults its
 /// target repo to that repo; a global-dir trigger has no default repo).
+#[derive(Clone)]
 struct Loaded {
     trigger: Trigger,
     source_repo: Option<String>,
+}
+
+/// One candidate trigger file and the repo it belongs to (`None` = global dir).
+type TriggerFile = (PathBuf, Option<String>);
+
+/// A change-detection stamp for one trigger file: its path, owning repo, and
+/// `(mtime, len)`. Reloading the parsed triggers (a `cue` shell-out per file)
+/// is the reactor's dominant per-wake cost, so we reparse only when this stamp
+/// changes. `len` rides alongside `mtime` to catch a same-second edit that
+/// mtime's coarse (often 1s) granularity would otherwise miss.
+type FileStamp = (PathBuf, Option<String>, Option<SystemTime>, Option<u64>);
+
+/// Parsed triggers plus the file stamps they were parsed from. A cycle reuses
+/// `triggers` whenever the freshly-computed stamps equal `stamps`.
+struct TriggerCache {
+    stamps: Vec<FileStamp>,
+    triggers: Vec<Loaded>,
 }
 
 pub struct Reactor {
@@ -70,6 +88,17 @@ pub struct Reactor {
     /// Per-trigger fire timestamps for the rolling rate cap. In-memory: a storm
     /// is a live-daemon phenomenon, and a restart legitimately resets the window.
     fires: Mutex<HashMap<String, Vec<Instant>>>,
+    /// Parsed triggers cached across cycles, reparsed only when a trigger file's
+    /// stamp changes (see [`TriggerCache`]). Skips the `cue` shell-outs on every
+    /// steady-state wake.
+    trigger_cache: Mutex<Option<TriggerCache>>,
+    /// The relevant-category populations observed at the end of the previous
+    /// cycle: `(promote_pop, coalesce_pop)`. `None` before the first cycle. The
+    /// whole-store recomputes (quorum promotion, obstacle coalescence) run only
+    /// when their population changed since last cycle (or on the first cycle, to
+    /// catch up on any backlog that reached quorum while the reactor was down),
+    /// so a burst of unrelated writes no longer forces a full-store rescan.
+    last_pops: Mutex<Option<(u64, u64)>>,
 }
 
 impl Reactor {
@@ -89,6 +118,8 @@ impl Reactor {
             config,
             cursor_file,
             fires: Mutex::new(HashMap::new()),
+            trigger_cache: Mutex::new(None),
+            last_pops: Mutex::new(None),
         }
     }
 
@@ -110,25 +141,22 @@ impl Reactor {
     /// triggers and fire the workflows. Returns how many workflows were fired.
     pub fn run_cycle(&self) -> rk_core::Result<usize> {
         let cursor = self.load_cursor();
-        // Snapshot the tuples, then load triggers (a slow `cue` shell-out) and —
-        // last, so it is the freshest thing relative to the scanned tuples — the
-        // repo registry. Loading the registry after the scan closes the window
-        // where a repo registered just before a tuple landed would be missed and
-        // the tuple dropped as the cursor advances past it.
-        let all = self.space.scan(&Pattern::default())?;
+        // Bounded delta: only tuples newer than the cursor, resolved from the id
+        // PRIMARY KEY index — no full-table scan + Rust-side `id <= cursor` skip.
+        let delta = self.space.scan(&Pattern::default().after(cursor))?;
+        // Load the registry, then the triggers (cache-gated, so a `cue` shell-out
+        // runs only when a trigger file changed), AFTER the delta scan. Loading
+        // them no earlier than the scan closes the window where a repo / trigger
+        // registered just before a tuple landed would be missed and the tuple
+        // dropped as the cursor advances past it.
         let registry = RepoRegistry::load(&self.layout.home().join("repos.json"))?;
-        let triggers = self.load_all_triggers(&registry);
+        let triggers = self.cached_triggers(&registry);
 
         let mut fired = 0usize;
         let mut max_id = cursor;
-        for tuple in &all {
-            if let Some(c) = cursor {
-                if tuple.id <= c {
-                    continue;
-                }
-            }
-            // Advance the cursor past every scanned tuple, including the
-            // reactor's own markers, so they are seen once and never re-scanned.
+        for tuple in &delta {
+            // Advance the cursor past every delta tuple, including the reactor's
+            // own markers, so they are seen once and never re-scanned.
             max_id = Some(match max_id {
                 Some(m) => m.max(tuple.id),
                 None => tuple.id,
@@ -151,18 +179,50 @@ impl Reactor {
                 self.save_cursor(m)?;
             }
         }
-        // Quorum promotion recomputes over the *whole* snapshot every cycle, not
-        // the cursor delta: an endorsement counts no matter when the reactor
-        // last ran, and the guard against double-promotion is the durable
-        // Convention itself, not the cursor. Runs even with zero triggers.
-        if let Err(e) = self.promote_conventions(&all) {
-            warn!(error = %e, "reactor quorum promotion failed");
-        }
-        // Obstacle coalescence recomputes over the whole snapshot too: bucket the
-        // flat obstacle/need pile by topic, refresh a per-topic demand-gradient
-        // marker, and file one durable ticket when a wall reaches quorum.
-        if let Err(e) = self.coalesce_obstacles(&all) {
-            warn!(error = %e, "reactor obstacle coalescence failed");
+
+        // Whole-store recomputes (quorum promotion, obstacle coalescence). Their
+        // INPUT is deliberately the whole store, not the cursor delta: a
+        // suggestion / wall that reached quorum while the reactor was down still
+        // promotes / files, and the promote-once guard is the durable Convention
+        // / open ticket, not the cursor. But re-scanning + materialising the whole
+        // store on EVERY wake is the cost TKT-29 targets. Gate WHETHER to
+        // recompute on whether the relevant category population *changed* since
+        // last cycle — an exact SQL COUNT (no row materialisation, and immune to
+        // the same-millisecond ULID ordering that makes a cursor delta an
+        // unreliable change signal, unlike the firing loop which tolerates it).
+        // A promotion / coalescence can only newly qualify when an endorsement /
+        // obstacle is ADDED, which moves the count; a burst of unrelated writes
+        // leaves it unchanged, so the full scan is skipped. The first cycle
+        // (`None`) always recomputes, catching up any pre-existing backlog.
+        let promote_pop = self
+            .space
+            .count_in_categories(&[Category::Endorsement, Category::Suggestion])?;
+        let coalesce_pop = self
+            .space
+            .count_in_categories(&[Category::Obstacle, Category::Need])?;
+        let (changed_promote, changed_coalesce) = {
+            let mut last = self.last_pops.lock().unwrap_or_else(|p| p.into_inner());
+            let changed = match *last {
+                None => (true, true),
+                Some((lp, lc)) => (promote_pop != lp, coalesce_pop != lc),
+            };
+            *last = Some((promote_pop, coalesce_pop));
+            changed
+        };
+        let need_promote = self.config.quorum > 0 && changed_promote;
+        let need_coalesce = self.config.coalesce_quorum > 0 && changed_coalesce;
+        if need_promote || need_coalesce {
+            let all = self.space.scan(&Pattern::default())?;
+            if need_promote {
+                if let Err(e) = self.promote_conventions(&all) {
+                    warn!(error = %e, "reactor quorum promotion failed");
+                }
+            }
+            if need_coalesce {
+                if let Err(e) = self.coalesce_obstacles(&all) {
+                    warn!(error = %e, "reactor obstacle coalescence failed");
+                }
+            }
         }
         Ok(fired)
     }
@@ -472,32 +532,60 @@ impl Reactor {
         Ok(true)
     }
 
-    /// Discover triggers from the global dir and each registered repo's
-    /// `.rk/triggers.cue`. A malformed file is logged and skipped, never fatal.
-    fn load_all_triggers(&self, registry: &RepoRegistry) -> Vec<Loaded> {
-        let mut out = Vec::new();
-        for file in rk_workflow::definitions(&self.layout.triggers_dir()) {
-            match rk_workflow::load_triggers(&file) {
-                Ok(ts) => out.extend(ts.into_iter().map(|trigger| Loaded {
-                    trigger,
-                    source_repo: None,
-                })),
-                Err(e) => {
-                    warn!(file = %file.display(), error = %e, "reactor: bad global trigger file")
+    /// The ordered candidate trigger files this cycle: every global-dir
+    /// definition (no source repo) then each registered repo's existing
+    /// `.rk/triggers.cue` (source repo = that repo). Enumerated fresh each cycle
+    /// — a cheap `readdir` + `exists`, not a `cue` shell-out — so an added or
+    /// removed file changes the cache stamp and forces a reparse.
+    fn trigger_files(&self, registry: &RepoRegistry) -> Vec<TriggerFile> {
+        let mut files: Vec<TriggerFile> = rk_workflow::definitions(&self.layout.triggers_dir())
+            .into_iter()
+            .map(|file| (file, None))
+            .collect();
+        for repo in registry.list() {
+            let file = repo.path.join(".rk").join("triggers.cue");
+            if file.exists() {
+                files.push((file, Some(repo.name.clone())));
+            }
+        }
+        files
+    }
+
+    /// Parse the candidate trigger files, reusing the cached parse when none of
+    /// their stamps changed. Only the reparse path shells out to `cue`.
+    fn cached_triggers(&self, registry: &RepoRegistry) -> Vec<Loaded> {
+        let files = self.trigger_files(registry);
+        let stamps = file_stamps(&files);
+        {
+            let cache = self.trigger_cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(c) = cache.as_ref() {
+                if c.stamps == stamps {
+                    return c.triggers.clone();
                 }
             }
         }
-        for repo in registry.list() {
-            let file = repo.path.join(".rk").join("triggers.cue");
-            if !file.exists() {
-                continue;
-            }
-            match rk_workflow::load_triggers(&file) {
+        let triggers = self.load_all_triggers(&files);
+        let mut cache = self.trigger_cache.lock().unwrap_or_else(|p| p.into_inner());
+        *cache = Some(TriggerCache {
+            stamps,
+            triggers: triggers.clone(),
+        });
+        triggers
+    }
+
+    /// Load and parse the given trigger files (the `cue` shell-out per file). A
+    /// malformed file is logged and skipped, never fatal.
+    fn load_all_triggers(&self, files: &[TriggerFile]) -> Vec<Loaded> {
+        let mut out = Vec::new();
+        for (file, source_repo) in files {
+            match rk_workflow::load_triggers(file) {
                 Ok(ts) => out.extend(ts.into_iter().map(|trigger| Loaded {
                     trigger,
-                    source_repo: Some(repo.name.clone()),
+                    source_repo: source_repo.clone(),
                 })),
-                Err(e) => warn!(repo = %repo.name, error = %e, "reactor: bad repo trigger file"),
+                Err(e) => {
+                    warn!(file = %file.display(), error = %e, "reactor: bad trigger file")
+                }
             }
         }
         out
@@ -606,6 +694,22 @@ impl Reactor {
         std::fs::write(&self.cursor_file, id.to_string())?;
         Ok(())
     }
+}
+
+/// Stamp each candidate trigger file with `(mtime, len)` for change detection.
+/// A missing/unreadable file stamps as `(None, None)` — appearing or vanishing
+/// still flips the stamp, forcing a reparse. `metadata` is a cheap `stat`, never
+/// a `cue` shell-out.
+fn file_stamps(files: &[TriggerFile]) -> Vec<FileStamp> {
+    files
+        .iter()
+        .map(|(path, repo)| {
+            let meta = std::fs::metadata(path).ok();
+            let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+            let len = meta.as_ref().map(|m| m.len());
+            (path.clone(), repo.clone(), mtime, len)
+        })
+        .collect()
 }
 
 /// Normalise an obstacle/need report into a stable topic key: lowercase, keep

@@ -263,6 +263,15 @@ impl Space {
         self.lock().store.count()
     }
 
+    /// Count tuples in the given categories without materializing them — a
+    /// cheap, order-independent change signal for the reactor's recompute gate.
+    pub fn count_in_categories(
+        &self,
+        categories: &[rk_core::tuple::Category],
+    ) -> rk_core::Result<u64> {
+        self.lock().store.count_in_categories(categories)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         match self.inner.lock() {
             Ok(g) => g,
