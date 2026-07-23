@@ -341,6 +341,9 @@ impl Daemon {
                 daemon.space.clone(),
                 daemon.engine(),
                 daemon.tickets.clone(),
+                // The live-session owner, so a promoted convention can be steered
+                // into already-running rats (TKT-34).
+                Some(Arc::clone(&daemon.supervisor)),
                 daemon.layout.clone(),
                 daemon.reactor_config.clone(),
             ));

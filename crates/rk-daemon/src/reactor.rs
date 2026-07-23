@@ -22,7 +22,9 @@
 //! and config can exclude specific authors, and every trigger has a per-window
 //! fire cap (`maxFires`, <=100) mirroring the `repeat` discipline.
 
+use crate::agents::AgentRecord;
 use crate::repos::RepoRegistry;
+use crate::supervisor::Supervisor;
 use crate::tickets::{NewTicket, Tickets};
 use crate::workflow_exec::WorkflowEngine;
 use rk_core::config::ReactorConfig;
@@ -37,7 +39,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// The reserved author of every tuple the reactor writes (markers, obstacles).
 /// Triggers never react to it, so a reaction can never fire on its own output.
@@ -87,6 +89,9 @@ pub struct Reactor {
     space: Space,
     engine: Arc<WorkflowEngine>,
     tickets: Arc<Tickets>,
+    /// The live-session owner, used to steer running rats when a convention is
+    /// promoted at quorum (TKT-34). `None` in unit tests that never promote.
+    supervisor: Option<Arc<Supervisor>>,
     layout: Layout,
     config: ReactorConfig,
     cursor_file: PathBuf,
@@ -111,6 +116,7 @@ impl Reactor {
         space: Space,
         engine: Arc<WorkflowEngine>,
         tickets: Arc<Tickets>,
+        supervisor: Option<Arc<Supervisor>>,
         layout: Layout,
         config: ReactorConfig,
     ) -> Self {
@@ -119,6 +125,7 @@ impl Reactor {
             space,
             engine,
             tickets,
+            supervisor,
             layout,
             config,
             cursor_file,
@@ -294,6 +301,11 @@ impl Reactor {
         }
 
         let mut promoted = 0usize;
+        // Newly promoted `(scope, text)` for the one steer sweep at the end: a rat
+        // already RUNNING when a suggestion crosses quorum won't see the norm until
+        // respawn (TKT-18 injects only at spawn), so we push the delta into its
+        // live session now (TKT-34).
+        let mut steer_deltas: Vec<(String, String)> = Vec::new();
         for (sug_id, instances) in &endorsers {
             if instances.len() < quorum || promoted_ids.contains(sug_id) {
                 continue;
@@ -322,8 +334,14 @@ impl Reactor {
             // Furniture: a promoted norm is permanent, never `in`-consumable, and
             // replicates across castles via rk-sync for free.
             .with_lifecycle(Lifecycle::Furniture);
+            let scope = convention.scope.clone();
             self.space.out(convention)?;
             promoted += 1;
+            // Only steer on a materially-texted norm: a decayed (blank) suggestion
+            // carries no guidance to inject, matching TKT-18's blank-text drop.
+            if let Some(text) = text.as_str().map(str::trim).filter(|t| !t.is_empty()) {
+                steer_deltas.push((scope, text.to_string()));
+            }
             info!(
                 suggestion = %sug_id,
                 count = instances.len(),
@@ -331,7 +349,44 @@ impl Reactor {
                 "reactor promoted suggestion to convention at quorum"
             );
         }
+
+        // Steer live rats with the newly promoted norms. Best-effort and
+        // fire-and-forget: the durable Convention is the once-per-norm guard (a
+        // replay finds it in `promoted_ids` and never re-steers), so this runs at
+        // most once per promotion. Skipped entirely when no supervisor is wired
+        // (unit tests) or nothing materially new was promoted.
+        if let Some(supervisor) = self.supervisor.clone() {
+            if !steer_deltas.is_empty() {
+                tokio::runtime::Handle::current().spawn(async move {
+                    for (scope, text) in steer_deltas {
+                        Self::steer_convention(&supervisor, &scope, &text).await;
+                    }
+                });
+            }
+        }
         Ok(promoted)
+    }
+
+    /// Push a newly promoted convention into every live rat in its scope via the
+    /// supervisor's `steer` path — the same mid-session injection `rk steer`
+    /// uses. A system-scope norm reaches every live rat; a repo-scope norm only
+    /// rats in that repo. Best-effort: a rat with no live session (raced into
+    /// completion, attach without target) is skipped, never fatal.
+    async fn steer_convention(supervisor: &Supervisor, scope: &str, text: &str) {
+        let message = convention_steer_message(text);
+        let agents = supervisor.list();
+        let targets = convention_steer_targets(&agents, scope);
+        for name in &targets {
+            match supervisor.steer(name, &message).await {
+                Ok(()) => debug!(rat = %name, scope, "reactor steered rat with promoted convention"),
+                Err(e) => {
+                    debug!(rat = %name, error = %e, "reactor convention steer skipped (no live session)")
+                }
+            }
+        }
+        if !targets.is_empty() {
+            info!(scope, rats = targets.len(), "reactor steered live rats with a promoted convention");
+        }
     }
 
     /// Coalesce the flat obstacle/need pile: repeated reports of one wall become
@@ -975,6 +1030,27 @@ fn ticket_is_done(t: &Tuple) -> bool {
     )
 }
 
+/// Compose the mid-session steer message for a newly promoted convention.
+fn convention_steer_message(text: &str) -> String {
+    format!(
+        "📜 New standing convention in effect (promoted at quorum): {text}\n\
+         This is now a binding fleet norm — apply it to your remaining work."
+    )
+}
+
+/// The live rats a promoted convention should reach: every live agent when the
+/// norm is system-scoped, or only agents in the norm's repo otherwise. A pure
+/// selector over a registry snapshot so the scope logic is unit-testable without
+/// a live session.
+fn convention_steer_targets<'a>(agents: &'a [AgentRecord], scope: &str) -> Vec<&'a str> {
+    agents
+        .iter()
+        .filter(|r| r.state.is_live())
+        .filter(|r| scope == SYSTEM_SCOPE || r.repo_name == scope)
+        .map(|r| r.name.as_str())
+        .collect()
+}
+
 /// Truncate to at most `max` chars on a char boundary (byte-safe for UTF-8).
 fn truncate(s: &str, max: usize) -> &str {
     match s.char_indices().nth(max) {
@@ -1131,5 +1207,74 @@ mod tests {
         assert_eq!(truncate("hello", 3), "hel");
         // Multi-byte: must not split a codepoint.
         assert_eq!(truncate("héllo", 2), "hé");
+    }
+
+    fn agent(name: &str, repo: &str, state: crate::agents::AgentState) -> AgentRecord {
+        AgentRecord {
+            name: name.into(),
+            role: "rat".into(),
+            harness: "fake".into(),
+            model: None,
+            repo_root: std::path::PathBuf::from("/tmp"),
+            repo_name: repo.into(),
+            task: None,
+            branch: None,
+            worktree: None,
+            target_branch: "main".into(),
+            parent: None,
+            workflow_instance: None,
+            session_id: None,
+            attach_target: None,
+            pid: None,
+            state,
+            result: None,
+            usage: Default::default(),
+            cost_usd: 0.0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn steer_message_carries_the_norm_text() {
+        let msg = convention_steer_message("always run cargo fmt");
+        assert!(msg.contains("always run cargo fmt"));
+        assert!(msg.contains("binding fleet norm"));
+    }
+
+    #[test]
+    fn system_scope_convention_reaches_every_live_rat_across_repos() {
+        use crate::agents::AgentState::*;
+        let agents = [
+            agent("Whisker", "repoA", Running),
+            agent("Nibbles", "repoB", Running),
+            agent("Gone", "repoA", Completed),
+        ];
+        let targets = convention_steer_targets(&agents, SYSTEM_SCOPE);
+        // Both live rats, regardless of repo; the completed rat is excluded.
+        assert_eq!(targets, vec!["Whisker", "Nibbles"]);
+    }
+
+    #[test]
+    fn repo_scoped_convention_reaches_only_that_repos_live_rats() {
+        use crate::agents::AgentState::*;
+        let agents = [
+            agent("Whisker", "repoA", Running),
+            agent("Nibbles", "repoB", Running),
+            agent("Spawning", "repoA", Spawning),
+        ];
+        let targets = convention_steer_targets(&agents, "repoA");
+        assert_eq!(targets, vec!["Whisker", "Spawning"]);
+    }
+
+    #[test]
+    fn no_live_rats_means_no_steer_targets() {
+        use crate::agents::AgentState::*;
+        let agents = [
+            agent("Gone", "repoA", Completed),
+            agent("Dead", "repoA", Failed),
+            agent("Orphan", "repoA", Orphaned),
+        ];
+        assert!(convention_steer_targets(&agents, SYSTEM_SCOPE).is_empty());
     }
 }
