@@ -102,7 +102,8 @@ workflow: #Workflow
 
 #Step: #SpawnStep | #WaitStep | #EvaluateStep | #DismissStep | #GateStep |
 	#ReadStep | #WhenStep | #RepeatStep | #BreakStep | #StopStep |
-	#ForEachStep | #WaitAllStep | #DismissAllStep | #RunStep | #LandStep
+	#ForEachStep | #WaitAllStep | #DismissAllStep | #RunStep | #LandStep |
+	#OpenPrStep
 
 // Tuple categories a `read` step may match.
 #Category: "fact" | "convention" | "task" | "available" | "claim" | "obstacle" |
@@ -341,4 +342,27 @@ workflow: #Workflow
 	branch: string
 	target: string
 	keepBranch?: bool
+}
+
+// Open a pull/merge request for a NAMED branch against a NAMED target — the
+// PR counterpart to `land`. Where `land` routes on the repo's registered merge
+// mode (a Direct merge, or a PR only if the repo is registered PR-mode),
+// `open_pr` ALWAYS pushes the branch and opens a pull/merge request, regardless
+// of repo policy. This lets a workflow choose the review-by-PR outcome
+// explicitly — e.g. `pr-on-approve.cue` gates on a human then opens a PR even in
+// a repo whose default merge mode is Direct.
+//
+// Both fields interpolate {{ctx.*}}: `branch: "{{ctx.activeBranch}}"` opens a PR
+// for the branch the workflow is holding. The branch is pushed and left standing
+// (never merged, never deleted); the result in ctx.previousResult is {branch,
+// target, merged: false, pr_opened, pr_url, detail}. A push/auth failure is a
+// clean {pr_opened: false} (NOT an error), so gate on it with a following
+// `evaluate {expect: {pr_opened: true}}` if a failed hand-off should surface.
+//
+// SAFETY: like `land`, `open_pr` performs no review of its own — reach it only
+// through an APPROVE `when`-branch or after an approval gate.
+#OpenPrStep: {
+	type:   "open_pr"
+	branch: string
+	target: string
 }

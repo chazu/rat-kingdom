@@ -347,6 +347,54 @@ fn steward_loads_and_routes() {
 }
 
 #[test]
+fn pr_on_approve_opens_a_pr_on_approve_only() {
+    use rk_workflow::Step;
+    let inputs = HashMap::from([
+        ("taskId".to_string(), json!("risky-change")),
+        ("description".to_string(), json!("rework retry logic")),
+    ]);
+    let workflow = rk_workflow::load(&examples_dir().join("pr-on-approve.cue"), &inputs).unwrap();
+
+    // Ends in a `when` routing on the human's approval decision.
+    let Step::When(when) = workflow.steps.last().unwrap() else {
+        panic!("pr-on-approve should end in a when routing on the approval decision");
+    };
+    assert_eq!(when.var, "approved");
+
+    // The PR counterpart to land-on-approve: APPROVE opens a PR (never merges),
+    // and it targets the workflow's `target` param (main by default).
+    let open_pr = when.cases["true"]
+        .iter()
+        .find_map(|s| match s {
+            Step::OpenPr(o) => Some(o),
+            _ => None,
+        })
+        .expect("APPROVE must open a PR");
+    assert_eq!(open_pr.branch, "{{ctx.activeBranch}}");
+    assert_eq!(open_pr.target, "main");
+    // APPROVE must never fall back to a direct land/merge.
+    assert!(
+        !when.cases["true"].iter().any(|s| matches!(s, Step::Land(_))),
+        "pr-on-approve must hand off via a PR, never land directly"
+    );
+    // The PR result is gated: a failed push must fail closed, not complete clean.
+    assert!(
+        when.cases["true"]
+            .iter()
+            .any(|s| matches!(s, Step::Evaluate(e) if e.expect.get("pr_opened").is_some())),
+        "APPROVE must gate on pr_opened so a failed hand-off surfaces"
+    );
+
+    // REJECT holds the branch: no PR, no land — just a no-merge dismiss.
+    assert!(
+        !when.cases["false"]
+            .iter()
+            .any(|s| matches!(s, Step::OpenPr(_) | Step::Land(_))),
+        "REJECT must hold the branch, never open a PR or land"
+    );
+}
+
+#[test]
 fn code_review_resolves_reviewer_profile() {
     let inputs = HashMap::from([("taskId".to_string(), json!("t1"))]);
     let workflow = rk_workflow::load(&examples_dir().join("code-review.cue"), &inputs).unwrap();

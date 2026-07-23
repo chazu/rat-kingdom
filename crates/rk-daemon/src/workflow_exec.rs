@@ -648,6 +648,26 @@ impl WorkflowEngine {
                         .await?;
                     self.update(id, |i| i.context.previous_result = Some(result.clone()));
                 }
+                Step::OpenPr(open_pr) => {
+                    let branch = interpolate(&open_pr.branch, &ctx);
+                    let target = interpolate(&open_pr.target, &ctx);
+                    if branch.is_empty() {
+                        return Err(rk_core::Error::other(
+                            "open_pr step: branch resolved to empty (no branch to open a PR for — \
+                             did an earlier step set {{ctx.activeBranch}}?)",
+                        ));
+                    }
+                    if target.is_empty() {
+                        return Err(rk_core::Error::other(
+                            "open_pr step: target resolved to empty",
+                        ));
+                    }
+                    let result = self
+                        .supervisor
+                        .open_pr(std::path::Path::new(repo), &branch, &target)
+                        .await?;
+                    self.update(id, |i| i.context.previous_result = Some(result.clone()));
+                }
             }
             Ok(Flow::Next)
         })
