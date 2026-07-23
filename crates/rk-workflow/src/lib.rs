@@ -265,6 +265,14 @@ pub struct DismissStep {
 pub struct DismissAllStep {
     #[serde(default, rename = "noMerge")]
     pub no_merge: bool,
+    /// Best-effort merge: when set, merge only the branches of rats that
+    /// finished clean (`is_error: false` in the preceding `wait_all`) and park
+    /// the rest with `no_merge`, instead of failing the batch on the first
+    /// error. Requires a preceding `wait_all` in the same instance — its
+    /// per-agent results supply the clean/failed signal. Default `false` =
+    /// atomic-batch (every branch merged unconditionally).
+    #[serde(default, rename = "onlyClean")]
+    pub only_clean: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -992,15 +1000,18 @@ workflow: {
         {type: "wait_all"},
         {type: "dismiss_all"},
         {type: "dismiss_all", noMerge: true},
+        {type: "dismiss_all", onlyClean: true},
     ]
 }
 "#;
         let wf = load_str(source, &HashMap::new()).unwrap();
-        assert_eq!(wf.steps.len(), 4);
-        // Default dismiss_all merges (no_merge defaults false).
-        assert!(matches!(&wf.steps[2], Step::DismissAll(d) if !d.no_merge));
+        assert_eq!(wf.steps.len(), 5);
+        // Default dismiss_all merges (no_merge defaults false, only_clean off).
+        assert!(matches!(&wf.steps[2], Step::DismissAll(d) if !d.no_merge && !d.only_clean));
         // noMerge parked variant.
         assert!(matches!(&wf.steps[3], Step::DismissAll(d) if d.no_merge));
+        // onlyClean best-effort variant (opt-in; still merges by default).
+        assert!(matches!(&wf.steps[4], Step::DismissAll(d) if d.only_clean && !d.no_merge));
     }
 
     #[test]
