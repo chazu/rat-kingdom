@@ -20,6 +20,34 @@ pub struct MergeOutcome {
     pub detail: String,
 }
 
+/// The remote host kind, inferred from an `origin` URL. Decides how a PR/MR
+/// is opened over plain `git` — GitLab accepts merge-request push options,
+/// GitHub only surfaces a compare URL on push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Host {
+    GitHub,
+    GitLab,
+    /// Any other host (self-hosted, unrecognized): treated like GitHub — push
+    /// and surface whatever URL the remote prints; no PR is created for you.
+    Unknown,
+}
+
+/// Outcome of pushing a branch and opening a pull/merge request over plain
+/// `git`. Mirrors [`MergeOutcome`]: `opened` is the analogue of `merged`
+/// (did the push/PR operation complete cleanly), and failure is a clean
+/// `opened: false` with an explanatory `detail` — never a panic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrOutcome {
+    /// True iff the push (and, on GitLab, the merge-request push option)
+    /// completed successfully.
+    pub opened: bool,
+    /// The PR/MR URL the remote printed, if one was surfaced. On GitLab this
+    /// is the created merge request; on GitHub it is the compare URL a human
+    /// clicks to open the PR.
+    pub url: Option<String>,
+    pub detail: String,
+}
+
 impl Repo {
     /// Open `path`, resolving through worktrees to the main repository root.
     pub fn discover(path: &Path) -> rk_core::Result<Self> {
@@ -169,6 +197,88 @@ impl Repo {
         result
     }
 
+    /// Push `branch` to `remote`, setting upstream (`-u`). Returns git's
+    /// combined output — remote messages (GitHub's compare URL, GitLab's MR
+    /// URL) are printed on stderr, so both streams are captured. Uses the
+    /// repo's already-configured credentials; no separate auth surface.
+    pub fn push_branch(&self, branch: &str, remote: &str) -> rk_core::Result<String> {
+        if branch.trim().is_empty() || remote.trim().is_empty() {
+            return Err(rk_core::Error::other(
+                "push_branch requires a branch and a remote",
+            ));
+        }
+        git_output(&self.root, &["push", "-u", remote, branch])
+    }
+
+    /// The [`Host`] kind of `remote`, inferred from its configured URL.
+    /// Unresolvable remotes report [`Host::Unknown`] rather than erroring.
+    pub fn remote_host(&self, remote: &str) -> Host {
+        self.git(&["remote", "get-url", remote])
+            .map(|u| infer_host(u.trim()))
+            .unwrap_or(Host::Unknown)
+    }
+
+    /// Push `branch` and open a pull/merge request against `target`, using
+    /// plain `git` only — no `gh`/`glab` dependency (operator decision).
+    ///
+    /// - **GitLab:** `git push -o merge_request.create -o
+    ///   merge_request.target=<target> <remote> <branch>` — the push option
+    ///   creates the MR server-side; the URL comes back on stderr.
+    /// - **GitHub / unknown:** `git push -u <remote> <branch>` (no API via
+    ///   push) and surface the compare URL git prints for a human to click.
+    ///
+    /// The host is inferred from the remote's URL. Mirrors [`merge_branch`]'s
+    /// clean-failure contract: a push/auth/remote failure is a
+    /// `PrOutcome { opened: false, .. }`, never a panic.
+    ///
+    /// [`merge_branch`]: Repo::merge_branch
+    pub fn open_pull_request(&self, branch: &str, target: &str, remote: &str) -> PrOutcome {
+        if branch.trim().is_empty() || target.trim().is_empty() || remote.trim().is_empty() {
+            return PrOutcome {
+                opened: false,
+                url: None,
+                detail: "open_pull_request requires a branch, target, and remote".into(),
+            };
+        }
+        let host = self.remote_host(remote);
+        let target_opt = format!("merge_request.target={target}");
+        let args: Vec<&str> = match host {
+            Host::GitLab => vec![
+                "push",
+                "-o",
+                "merge_request.create",
+                "-o",
+                &target_opt,
+                remote,
+                branch,
+            ],
+            // GitHub has no create-PR-via-push; push and surface the compare URL.
+            Host::GitHub | Host::Unknown => vec!["push", "-u", remote, branch],
+        };
+        match git_output(&self.root, &args) {
+            Ok(out) => {
+                let url = extract_pr_url(&out);
+                let detail = match host {
+                    Host::GitLab => "merge request created via push option".into(),
+                    Host::GitHub => "branch pushed; open the pull request via the compare URL".into(),
+                    Host::Unknown => {
+                        "branch pushed to an unrecognized host; open the PR manually".into()
+                    }
+                };
+                PrOutcome {
+                    opened: true,
+                    url,
+                    detail,
+                }
+            }
+            Err(e) => PrOutcome {
+                opened: false,
+                url: None,
+                detail: format!("push failed for {branch} -> {remote}: {e}"),
+            },
+        }
+    }
+
     /// Advance `target` from `expected` to `merged` (a fast-forward — `merged`
     /// descends from `expected`).
     ///
@@ -214,6 +324,61 @@ fn git_in(dir: &Path, args: &[&str]) -> rk_core::Result<String> {
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Like [`git_in`], but returns stdout AND stderr on success. `git push`
+/// writes progress and remote messages (PR/MR URLs) to stderr, so the plain
+/// stdout-only capture would drop exactly the output we need.
+fn git_output(dir: &Path, args: &[&str]) -> rk_core::Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| rk_core::Error::other(format!("git not runnable: {e}")))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        return Err(rk_core::Error::other(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        )));
+    }
+    Ok(format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    ))
+}
+
+/// Infer the [`Host`] from a remote URL (`git@github.com:o/r.git`,
+/// `https://gitlab.example.com/o/r.git`, …). Case-insensitive substring match
+/// on the URL — enough to pick the push strategy; anything else is `Unknown`.
+fn infer_host(remote_url: &str) -> Host {
+    let u = remote_url.to_ascii_lowercase();
+    if u.contains("gitlab") {
+        Host::GitLab
+    } else if u.contains("github") {
+        Host::GitHub
+    } else {
+        Host::Unknown
+    }
+}
+
+/// Pull the first PR/MR URL out of git's push output. GitHub prints a
+/// `.../pull/new/<branch>` compare URL; GitLab prints a `.../merge_requests/N`
+/// URL. Prefer a token that looks like a PR/MR link, else the first URL.
+fn extract_pr_url(push_output: &str) -> Option<String> {
+    let trim = |t: &str| {
+        t.trim_matches(|c: char| c == '.' || c == ',' || c == ')' || c == '"' || c == '\'')
+            .to_string()
+    };
+    let is_url = |t: &str| t.starts_with("http://") || t.starts_with("https://");
+    let tokens = || push_output.split_whitespace();
+    tokens()
+        .find(|t| is_url(t) && (t.contains("merge_request") || t.contains("pull")))
+        .or_else(|| tokens().find(|t| is_url(t)))
+        .map(trim)
 }
 
 /// Branch name for an agent's task work.
@@ -263,6 +428,123 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// Create a bare repo under `dir` named `<name>.git`, register it as a
+    /// remote called `origin` in `repo`, and return the bare repo's path.
+    /// The name lets `infer_host` see "github"/"gitlab" in the local path so
+    /// the host-specific push strategy is exercised end to end.
+    fn bare_remote(parent: &Path, name: &str, repo: &Repo, push_options: bool) -> PathBuf {
+        let bare = parent.join(format!("{name}.git"));
+        run(parent, &["init", "--bare", &bare.to_string_lossy()]);
+        if push_options {
+            run(&bare, &["config", "receive.advertisePushOptions", "true"]);
+        }
+        repo.git(&["remote", "add", "origin", &bare.to_string_lossy()])
+            .unwrap();
+        bare
+    }
+
+    fn commit_on_branch(dir: &Path, repo: &Repo, agent: &str, task: &str) -> String {
+        let wt = dir.join(format!("wt-{agent}"));
+        let branch = agent_branch(agent, task);
+        repo.create_worktree(&wt, &branch, "main").unwrap();
+        std::fs::write(wt.join("feature.txt"), "cheese\n").unwrap();
+        run(&wt, &["add", "."]);
+        run(&wt, &["commit", "-m", "add feature"]);
+        branch
+    }
+
+    #[test]
+    fn infer_host_reads_the_url() {
+        assert_eq!(infer_host("git@github.com:o/r.git"), Host::GitHub);
+        assert_eq!(infer_host("https://github.com/o/r.git"), Host::GitHub);
+        assert_eq!(infer_host("git@gitlab.com:o/r.git"), Host::GitLab);
+        assert_eq!(infer_host("https://gitlab.example.com/o/r"), Host::GitLab);
+        assert_eq!(infer_host("git@bitbucket.org:o/r.git"), Host::Unknown);
+        assert_eq!(infer_host(""), Host::Unknown);
+    }
+
+    #[test]
+    fn extract_pr_url_finds_the_link() {
+        let github = "remote: Create a pull request for 'rat/x/y' on GitHub by visiting:\n\
+                      remote:   https://github.com/o/r/pull/new/rat/x/y\n";
+        assert_eq!(
+            extract_pr_url(github).as_deref(),
+            Some("https://github.com/o/r/pull/new/rat/x/y")
+        );
+        let gitlab = "remote: View merge request for rat/x/y:\n\
+                      remote:   https://gitlab.com/o/r/-/merge_requests/7\n";
+        assert_eq!(
+            extract_pr_url(gitlab).as_deref(),
+            Some("https://gitlab.com/o/r/-/merge_requests/7")
+        );
+        // A push with no PR affordance surfaces nothing.
+        assert_eq!(extract_pr_url("Everything up-to-date\n"), None);
+    }
+
+    #[test]
+    fn push_branch_pushes_to_remote() {
+        let (dir, repo) = scratch_repo();
+        let bare = bare_remote(dir.path(), "plain-remote", &repo, false);
+        let branch = commit_on_branch(dir.path(), &repo, "pip", "task-1");
+
+        repo.push_branch(&branch, "origin").unwrap();
+
+        // The branch now exists on the remote.
+        let refs = git_in(&bare, &["rev-parse", &format!("refs/heads/{branch}")]);
+        assert!(refs.is_ok(), "branch should exist on remote: {refs:?}");
+    }
+
+    #[test]
+    fn open_pr_github_pushes_and_reports_opened() {
+        let (dir, repo) = scratch_repo();
+        // "github" in the path makes infer_host pick the GitHub strategy.
+        let bare = bare_remote(dir.path(), "github-remote", &repo, false);
+        let branch = commit_on_branch(dir.path(), &repo, "nibbles", "task-2");
+        assert_eq!(repo.remote_host("origin"), Host::GitHub);
+
+        let outcome = repo.open_pull_request(&branch, "main", "origin");
+        assert!(outcome.opened, "{}", outcome.detail);
+        // A bare local remote prints no compare URL, so url is absent — but the
+        // branch made it across.
+        assert!(git_in(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).is_ok());
+    }
+
+    #[test]
+    fn open_pr_gitlab_sends_merge_request_push_options() {
+        let (dir, repo) = scratch_repo();
+        // "gitlab" in the path selects the MR-push-option strategy; the bare
+        // remote must advertise push options or it rejects them.
+        let bare = bare_remote(dir.path(), "gitlab-remote", &repo, true);
+        let branch = commit_on_branch(dir.path(), &repo, "whisker", "task-3");
+        assert_eq!(repo.remote_host("origin"), Host::GitLab);
+
+        let outcome = repo.open_pull_request(&branch, "main", "origin");
+        // The bare remote is not a real GitLab, so no MR is created, but the
+        // push with options succeeds cleanly (opened) and the branch lands.
+        assert!(outcome.opened, "{}", outcome.detail);
+        assert!(git_in(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).is_ok());
+    }
+
+    #[test]
+    fn open_pr_missing_remote_fails_cleanly() {
+        let (dir, repo) = scratch_repo();
+        let branch = commit_on_branch(dir.path(), &repo, "dot", "task-4");
+
+        // No remote configured at all — must not panic.
+        let outcome = repo.open_pull_request(&branch, "main", "origin");
+        assert!(!outcome.opened);
+        assert!(outcome.url.is_none());
+        assert!(!outcome.detail.is_empty());
+    }
+
+    #[test]
+    fn open_pr_rejects_empty_args() {
+        let (_dir, repo) = scratch_repo();
+        let outcome = repo.open_pull_request("", "main", "origin");
+        assert!(!outcome.opened);
+        assert!(repo.push_branch("", "origin").is_err());
     }
 
     #[test]
