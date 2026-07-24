@@ -95,6 +95,19 @@ built_).
 - **Escalation push** — a steward escalation fires a desktop notification via
   herdr, so a branch that needs a human decision pings you instead of waiting to
   be noticed.
+- **`rk top`** — live ratatui fleet dashboard: agents (state/task/cost),
+  workflow instances (step cursor, where parked, per-instance spend), fleet
+  budget, and the inbox, refreshed on an interval. Thin by design — per-agent
+  detail stays with `rk log`/herdr.
+- **`rk digest`** — "what happened while you were away": an interval catch-up
+  grouped from the event feed (completions, dismissals, merges, PRs, workflow
+  outcomes), live friction (obstacles/needs), spend, and the inbox.
+  `--llm` pipes the report through a one-shot `claude -p` for prose, degrading
+  to the deterministic report when the binary is absent.
+- **`rk workflow timeline`** — an instance's step trace rendered from its
+  definition: every step labelled and marked done/current/pending against the
+  persisted cursor, with `when`/`repeat` bodies nested and the parked-gate
+  status in the headline. Debug a stuck workflow without reading JSON.
 
 ### Cost
 
