@@ -17,9 +17,11 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 const GC_INTERVAL: Duration = Duration::from_secs(60);
-/// Default lifetime for a pheromone trail (claim / obstacle / need) written
-/// without an explicit TTL. The hard-TTL backstop for strength decay.
-const DEFAULT_TRAIL_TTL: Duration = Duration::from_secs(30 * 60);
+// Default lifetime for a pheromone trail (claim / obstacle / need) written
+// without an explicit TTL — the hard-TTL backstop for strength decay — lives in
+// rk-core so daemon-internal trail writers (supervisor, syncer) age on the same
+// clock as this RPC boundary.
+use rk_core::tuple::DEFAULT_TRAIL_TTL;
 /// Ceiling for blocking reads so a lost client cannot pin a connection task
 /// forever; clients requesting more get clamped.
 const MAX_BLOCK: Duration = Duration::from_secs(3600);

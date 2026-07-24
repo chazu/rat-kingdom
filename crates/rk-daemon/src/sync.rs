@@ -9,7 +9,7 @@
 use rk_core::id::RecordId;
 use rk_core::identity::CastleIdentity;
 use rk_core::paths::Layout;
-use rk_core::tuple::{Lifecycle, Pattern, Tuple};
+use rk_core::tuple::{Lifecycle, Pattern, Tuple, DEFAULT_TRAIL_TTL};
 use rk_space::Space;
 use rk_sync::{NotesSync, SyncOp};
 use std::path::PathBuf;
@@ -184,13 +184,22 @@ impl Syncer {
                     // (the predecessor's silent-stall lesson) — but local export already
                     // happened, so nothing is lost.
                     warn!(error = %e, "remote sync failed");
-                    space.out(Tuple::new(
-                        rk_core::tuple::Category::Obstacle,
-                        rk_core::tuple::SYSTEM_SCOPE,
-                        "sync_failure",
-                        self.castle.clone(),
-                        serde_json::json!({"error": e.to_string()}),
-                    ))?;
+                    // Evaporating + Ephemeral: a "cannot reach remote" signal is
+                    // purely local (only this castle's operator can act on it),
+                    // so it must not replicate — and as a durable Session tuple
+                    // it would export as an undrained Out that re-imports on every
+                    // peer once the remote returns. It re-emits each failed cycle
+                    // while the partition lasts and evaporates once sync recovers.
+                    space.out(
+                        Tuple::new(
+                            rk_core::tuple::Category::Obstacle,
+                            rk_core::tuple::SYSTEM_SCOPE,
+                            "sync_failure",
+                            self.castle.clone(),
+                            serde_json::json!({"error": e.to_string()}),
+                        )
+                        .into_trail(DEFAULT_TRAIL_TTL),
+                    )?;
                 }
             }
         }
@@ -394,6 +403,76 @@ mod tests {
             .peers()
             .unwrap()
             .contains(&syncer_b.actor().to_string()));
+    }
+
+    /// A daemon-authored obstacle (supervisor liveness/budget signal, or the
+    /// syncer's own `sync_failure`) is a LOCAL coordination trail: it names this
+    /// castle's agents or its own connectivity, which only this castle's operator
+    /// can resolve. Shaped by `into_trail` it is Ephemeral, so `run_cycle` never
+    /// exports it and no peer ever imports it — closing TKT-92, where such a
+    /// tuple defaulted to durable Session and replicated forever as an Out that
+    /// nothing ever drained.
+    #[tokio::test]
+    async fn daemon_authored_obstacle_trail_never_replicates() {
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare"]).unwrap();
+        let url = remote.path().to_string_lossy().to_string();
+
+        let home_a = tempfile::tempdir().unwrap();
+        let home_b = tempfile::tempdir().unwrap();
+        let layout_a = Layout::at(home_a.path());
+        let layout_b = Layout::at(home_b.path());
+        layout_a.ensure().unwrap();
+        layout_b.ensure().unwrap();
+
+        let space_a = Space::open_in_memory().unwrap();
+        let space_b = Space::open_in_memory().unwrap();
+        let syncer_a = Syncer::new(&layout_a, "castle-a", Some(&url)).unwrap();
+        let syncer_b = Syncer::new(&layout_b, "castle-b", Some(&url)).unwrap();
+
+        // Exactly the shape the supervisor/syncer now write daemon-internal
+        // obstacles: an evaporating trail via into_trail.
+        space_a
+            .out(
+                Tuple::new(
+                    Category::Obstacle,
+                    rk_core::tuple::SYSTEM_SCOPE,
+                    "sync_failure",
+                    "castle-a",
+                    json!({"error": "cannot reach remote"}),
+                )
+                .into_trail(rk_core::tuple::DEFAULT_TRAIL_TTL),
+            )
+            .unwrap();
+
+        // A's cycle exports only its castle-presence announcement, never the
+        // Ephemeral obstacle.
+        let stats_a = syncer_a.run_cycle(&space_a).unwrap();
+        assert_eq!(stats_a.exported, 0, "ephemeral obstacle is not exported");
+
+        // B imports A's presence fact but sees no obstacle.
+        syncer_b.run_cycle(&space_b).unwrap();
+        assert!(
+            space_b
+                .scan(&Pattern::category(Category::Obstacle))
+                .unwrap()
+                .is_empty(),
+            "daemon obstacle must not cross to a peer"
+        );
+
+        // And it stays absent across further cycles (no resurrection path via an
+        // undrained Out).
+        for _ in 0..3 {
+            syncer_a.run_cycle(&space_a).unwrap();
+            syncer_b.run_cycle(&space_b).unwrap();
+        }
+        assert!(
+            space_b
+                .scan(&Pattern::category(Category::Obstacle))
+                .unwrap()
+                .is_empty(),
+            "obstacle never replicates on repeat cycles"
+        );
     }
 
     /// A durable tuple authored on A, imported by B, then consumed on B, must

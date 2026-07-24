@@ -109,6 +109,13 @@ impl Category {
 /// (hot-scans, obstacle-coalesce) read [`Tuple::strength`] as the raw signal.
 pub const FULL_STRENGTH: f64 = 1.0;
 
+/// Default lifetime backstop for an evaporating pheromone trail (claim /
+/// obstacle / need / resolution) written without an explicit TTL: a trail never
+/// reinforced is hard-collected after this long even if strength decay hasn't
+/// reached zero. Shared by the RPC `out` boundary and daemon-internal writers
+/// so every evaporating write ages on one clock (see [`Tuple::into_trail`]).
+pub const DEFAULT_TRAIL_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 impl std::str::FromStr for Category {
     type Err = crate::Error;
 
@@ -194,6 +201,25 @@ impl Tuple {
 
     pub fn with_lifecycle(mut self, lifecycle: Lifecycle) -> Self {
         self.lifecycle = lifecycle;
+        self
+    }
+
+    /// Shape a freshly-built evaporating pheromone into a live trail: full
+    /// strength, an Ephemeral lifetime, and a `ttl` backstop from now. This is
+    /// the transform the RPC `out` boundary applies to CLI-authored
+    /// claim/obstacle/need writes (see the daemon's `handle_out`); daemon-
+    /// internal writers — the supervisor's budget/liveness obstacles and
+    /// respawn-exhaustion need, the syncer's `sync_failure` obstacle — apply it
+    /// too. Without it those writes default to [`Lifecycle::Session`] (durable),
+    /// so rk-sync exports each as a durable `Out` that no `Take` ever drains,
+    /// piling up in the notes log and re-importing on every peer forever. As an
+    /// Ephemeral trail the write stays LOCAL (Ephemeral tuples never replicate)
+    /// and evaporates on its own, while remaining visible to `rk inbox`, the
+    /// reactor, and hot-scans for as long as the condition it reports persists.
+    pub fn into_trail(mut self, ttl: std::time::Duration) -> Self {
+        self.strength = Some(FULL_STRENGTH);
+        self.lifecycle = Lifecycle::Ephemeral;
+        self.expires_at = Some(Utc::now() + chrono::Duration::seconds(ttl.as_secs() as i64));
         self
     }
 }
@@ -365,6 +391,35 @@ mod tests {
         assert!(s.contains("strength"));
         let back: Tuple = serde_json::from_str(&s).unwrap();
         assert_eq!(trail, back);
+    }
+
+    #[test]
+    fn into_trail_makes_a_fresh_ephemeral_pheromone() {
+        // A daemon-internal obstacle defaults to a durable Session tuple with no
+        // strength — exactly the shape rk-sync would replicate forever. into_trail
+        // gives it the same evaporating shape the RPC boundary applies, so it
+        // stays local (Ephemeral never replicates) and evaporates.
+        let obstacle = Tuple::new(
+            Category::Obstacle,
+            SYSTEM_SCOPE,
+            "sync_failure",
+            "castle-a",
+            serde_json::json!({"error": "boom"}),
+        );
+        assert_eq!(obstacle.lifecycle, Lifecycle::Session);
+        assert_eq!(obstacle.strength, None);
+        assert_eq!(obstacle.expires_at, None);
+
+        let trail = obstacle.into_trail(std::time::Duration::from_secs(1800));
+        assert_eq!(trail.lifecycle, Lifecycle::Ephemeral);
+        assert_eq!(trail.strength, Some(FULL_STRENGTH));
+        let ttl = trail.expires_at.expect("trail carries a TTL backstop");
+        // ~30 min out; generous window keeps this off the wall clock's edge.
+        let secs = (ttl - trail.created_at).num_seconds();
+        assert!(
+            (1795..=1805).contains(&secs),
+            "expires_at is ~ttl from now, got {secs}s"
+        );
     }
 
     #[test]
