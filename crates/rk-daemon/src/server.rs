@@ -727,7 +727,23 @@ impl Daemon {
             "agent.respawn" => reply(self.handle_named(req, |sup, name| {
                 sup.respawn(&name).map(|r| json!({"agent": r}))
             })),
-            "agent.list" => reply(Response::ok(id, json!({"agents": self.supervisor.list()}))),
+            "agent.list" => reply(match parse_params::<AgentListParams>(&req.params) {
+                Ok(p) => {
+                    let agents = if p.archived_only {
+                        self.supervisor.list_archived()
+                    } else if p.include_archived {
+                        self.supervisor.list_all()
+                    } else {
+                        self.supervisor.list()
+                    };
+                    Response::ok(id, json!({ "agents": agents }))
+                }
+                Err(e) => Response::err(id, codes::BAD_PARAMS, e),
+            }),
+            "agent.archive" => reply(self.handle_agent_archive(req)),
+            "agent.unarchive" => {
+                reply(self.handle_named(req, |sup, name| sup.unarchive_agent(&name)))
+            }
             "budget.rollup" => reply(Response::ok(id, self.supervisor.fleet_rollup())),
             "inbox.list" => reply(self.handle_inbox(id)),
             "agent.status" => reply(self.handle_named(req, |sup, name| {
@@ -1284,6 +1300,35 @@ impl Daemon {
         }
     }
 
+    /// `agent.archive` — offload settled terminal records out of the default
+    /// views. The daemon owns `agents.json` and rewrites it on every mutation,
+    /// so this has to be an RPC: an external edit would be clobbered by the
+    /// next `Registry::persist`.
+    fn handle_agent_archive(&self, req: Request) -> Response {
+        let params: AgentArchiveParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let now = chrono::Utc::now();
+        // `all` means "everything eligible right now" — a cutoff of now, since
+        // eligibility is `updated_at < cutoff`.
+        let cutoff = if params.all {
+            now
+        } else {
+            match crate::agents::cutoff_from_spec(params.before.as_deref().unwrap_or("7d"), now) {
+                Ok(c) => c,
+                Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+            }
+        };
+        match self
+            .supervisor
+            .archive_agents(cutoff, params.dry_run, params.reap_git)
+        {
+            Ok(v) => Response::ok(req.id, v),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
     fn handle_named<F>(&self, req: Request, f: F) -> Response
     where
         F: FnOnce(&Arc<crate::supervisor::Supervisor>, String) -> rk_core::Result<Value>,
@@ -1492,6 +1537,32 @@ struct WorkflowApproveParams {
 #[derive(Deserialize)]
 struct NameParams {
     name: String,
+}
+
+/// `agent.list` view selector. Defaults keep the reply to the live registry so
+/// every caller (`rk list`, `rk top`, `rk cost`) gets the current fleet unless
+/// it opts into history.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct AgentListParams {
+    /// Live + archived records.
+    include_archived: bool,
+    /// Archived records only (wins over `include_archived`).
+    archived_only: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct AgentArchiveParams {
+    /// Cutoff: a duration (`7d`, `24h`) or a date. Defaults to `7d`.
+    before: Option<String>,
+    /// Archive every eligible record regardless of age (overrides `before`).
+    all: bool,
+    /// Report what would be archived without mutating the registry.
+    dry_run: bool,
+    /// Also reclaim each archived agent's worktree + local branch, but only
+    /// when the branch has already landed.
+    reap_git: bool,
 }
 
 #[derive(Deserialize)]

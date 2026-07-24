@@ -26,6 +26,19 @@ impl AgentState {
     pub fn is_live(self) -> bool {
         matches!(self, AgentState::Spawning | AgentState::Running)
     }
+
+    /// Whether a record in this state may be archived out of the default views.
+    ///
+    /// Only the three *settled* terminal states qualify. `Spawning`/`Running`
+    /// are live work, and `Orphaned` is deliberately excluded even though it is
+    /// terminal-ish: its worktree/branch/session are preserved precisely so
+    /// `rk respawn` (and the respawn sweep) can pick it back up.
+    pub fn is_archivable(self) -> bool {
+        matches!(
+            self,
+            AgentState::Completed | AgentState::Failed | AgentState::Dismissed
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,13 +80,46 @@ pub struct AgentRecord {
     pub cost_usd: f64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// When this record was moved to the archive store (`None` = live registry).
+    /// Set by [`Registry::archive`] and cleared by [`Registry::unarchive`] —
+    /// nothing else writes it, so it doubles as the "is this row archived?"
+    /// marker in every rendered view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
 }
+
+impl AgentRecord {
+    /// Identity of one *generation* of a name. Archiving frees a name for
+    /// reuse, so `name` alone no longer identifies a record across the live
+    /// registry and the archive; `created_at` disambiguates the generations.
+    fn generation(&self) -> (&str, DateTime<Utc>) {
+        (self.name.as_str(), self.created_at)
+    }
+}
+
+/// Default archive file name, kept beside `agents.json` in the same home.
+const ARCHIVE_FILE: &str = "agents-archive.json";
 
 /// JSON-file-backed registry. All mutation goes through [`Registry::update`],
 /// which persists synchronously — the file is the daemon's restart memory.
+///
+/// Terminal records can be moved out of the live map into a second, append-only
+/// archive store (`agents-archive.json`) by [`archive`](Registry::archive).
+/// Archived records are *preserved, not deleted*: they keep their full
+/// usage/cost/lineage and stay reachable through
+/// [`list_archived`](Registry::list_archived) / [`list_all`](Registry::list_all)
+/// / [`get_any`](Registry::get_any), and can be restored with
+/// [`unarchive`](Registry::unarchive). They just stop inflating the default
+/// views (`rk list`, `rk top`, `rk inbox`) and the [`reserve_name`] name pool.
+///
+/// [`reserve_name`]: Registry::reserve_name
 pub struct Registry {
     path: PathBuf,
+    archive_path: PathBuf,
     agents: HashMap<String, AgentRecord>,
+    /// Archived terminal records. A `Vec`, not a map: archiving frees the name
+    /// for reuse, so several generations of one name can coexist here.
+    archived: Vec<AgentRecord>,
     /// Names handed out by [`Registry::reserve_name`] but not yet [`insert`]ed.
     /// Closes the spawn window where a name is chosen but its worktree/record
     /// don't exist yet, so concurrent spawns can't collide on it. In-memory
@@ -92,9 +138,18 @@ impl Registry {
         } else {
             HashMap::new()
         };
+        let archive_path = path.with_file_name(ARCHIVE_FILE);
+        let archived: Vec<AgentRecord> = if archive_path.exists() {
+            let data = std::fs::read_to_string(&archive_path)?;
+            serde_json::from_str(&data)?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             path: path.to_path_buf(),
+            archive_path,
             agents,
+            archived,
             reserved: HashSet::new(),
         })
     }
@@ -103,6 +158,11 @@ impl Registry {
     /// spawns. Callers hold the registry lock across this call and the
     /// eventual [`insert`](Registry::insert) (which frees the reservation);
     /// if the spawn fails before then, call [`release_name`] to free it.
+    ///
+    /// Deliberately consults only the LIVE map and the outstanding
+    /// reservations — an archived record's name returns to the pool, which is
+    /// the point of archiving (it relieves the name-pool pressure a registry
+    /// that never drops records builds up).
     ///
     /// [`release_name`]: Registry::release_name
     pub fn reserve_name(&mut self) -> String {
@@ -148,10 +208,145 @@ impl Registry {
         self.agents.get(name)
     }
 
+    /// Live record for `name`, falling back to the newest archived generation.
+    ///
+    /// Read-only callers (`rk status`) use this so an archived rat's history
+    /// stays queryable. Every MUTATING path (dismiss/revert/respawn/steer)
+    /// deliberately keeps using [`get`](Registry::get), so an archived record
+    /// reads as "no such agent" until it is explicitly unarchived.
+    pub fn get_any(&self, name: &str) -> Option<&AgentRecord> {
+        self.agents.get(name).or_else(|| {
+            self.archived
+                .iter()
+                .filter(|a| a.name == name)
+                .max_by_key(|a| a.created_at)
+        })
+    }
+
+    /// The live registry, oldest first. Archived records are excluded — this is
+    /// the default view every operator surface renders.
     pub fn list(&self) -> Vec<&AgentRecord> {
         let mut all: Vec<_> = self.agents.values().collect();
         all.sort_by_key(|a| a.created_at);
         all
+    }
+
+    /// Archived records only, oldest first.
+    pub fn list_archived(&self) -> Vec<&AgentRecord> {
+        let mut all: Vec<_> = self
+            .archived
+            .iter()
+            .filter(|a| !self.is_shadowed(a))
+            .collect();
+        all.sort_by_key(|a| a.created_at);
+        all
+    }
+
+    /// Live + archived, oldest first — the full lifetime history. Cost/usage
+    /// rollups read this so archiving never moves a dollar figure.
+    pub fn list_all(&self) -> Vec<&AgentRecord> {
+        let mut all: Vec<_> = self.agents.values().collect();
+        all.extend(self.archived.iter().filter(|a| !self.is_shadowed(a)));
+        all.sort_by_key(|a| a.created_at);
+        all
+    }
+
+    /// Terminal records eligible for archiving: state in
+    /// {Completed, Failed, Dismissed} and last touched strictly before
+    /// `before`. Live and `Orphaned` records are never eligible.
+    pub fn archivable(&self, before: DateTime<Utc>) -> Vec<&AgentRecord> {
+        let mut eligible: Vec<_> = self
+            .agents
+            .values()
+            .filter(|a| a.state.is_archivable() && a.updated_at < before)
+            .collect();
+        eligible.sort_by_key(|a| a.created_at);
+        eligible
+    }
+
+    /// Move every [`archivable`](Registry::archivable) record into the archive
+    /// store, returning the records as archived (with `archived_at` stamped).
+    ///
+    /// Writes the archive file BEFORE the live file: a crash between the two
+    /// leaves the record in both stores, and [`is_shadowed`] resolves that in
+    /// favour of the live copy — i.e. the archive silently no-ops rather than
+    /// losing a record.
+    ///
+    /// [`is_shadowed`]: Registry::is_shadowed
+    pub fn archive(&mut self, before: DateTime<Utc>) -> rk_core::Result<Vec<AgentRecord>> {
+        let names: Vec<String> = self
+            .archivable(before)
+            .into_iter()
+            .map(|a| a.name.clone())
+            .collect();
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = Utc::now();
+        let mut moved = Vec::new();
+        for name in &names {
+            let Some(record) = self.agents.get(name).cloned() else {
+                continue;
+            };
+            let mut record = record;
+            record.archived_at = Some(now);
+            // Idempotent on the crash window above: a generation already in the
+            // archive is not appended twice.
+            if !self
+                .archived
+                .iter()
+                .any(|a| a.generation() == record.generation())
+            {
+                self.archived.push(record.clone());
+            }
+            moved.push(record);
+        }
+        self.persist_archive()?;
+        for record in &moved {
+            self.agents.remove(&record.name);
+        }
+        self.persist()?;
+        Ok(moved)
+    }
+
+    /// Restore the newest archived generation of `name` to the live registry.
+    ///
+    /// Errors if a live record already holds the name (archiving frees names
+    /// for reuse, so this is a real collision, not a no-op).
+    pub fn unarchive(&mut self, name: &str) -> rk_core::Result<Option<AgentRecord>> {
+        if self.agents.contains_key(name) {
+            return Err(rk_core::Error::other(format!(
+                "cannot unarchive {name}: a live agent already holds that name"
+            )));
+        }
+        let Some(index) = self
+            .archived
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.name == name)
+            .max_by_key(|(_, a)| a.created_at)
+            .map(|(i, _)| i)
+        else {
+            return Ok(None);
+        };
+        let mut record = self.archived[index].clone();
+        record.archived_at = None;
+        self.agents.insert(name.to_string(), record.clone());
+        // Live file first: a crash before the archive rewrite leaves the record
+        // in both stores, where the live copy wins — never in neither.
+        self.persist()?;
+        self.archived.remove(index);
+        self.persist_archive()?;
+        Ok(Some(record))
+    }
+
+    /// Whether an archived entry is superseded by a live record of the same
+    /// generation — the reconciliation rule for the crash window in
+    /// [`archive`](Registry::archive) / [`unarchive`](Registry::unarchive).
+    fn is_shadowed(&self, archived: &AgentRecord) -> bool {
+        self.agents
+            .get(&archived.name)
+            .is_some_and(|live| live.generation() == archived.generation())
     }
 
     pub fn update<F>(&mut self, name: &str, mutate: F) -> rk_core::Result<Option<AgentRecord>>
@@ -177,14 +372,72 @@ impl Registry {
     }
 
     fn persist(&self) -> rk_core::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&self.agents)?)?;
-        std::fs::rename(&tmp, &self.path)?;
-        Ok(())
+        write_atomic(&self.path, &serde_json::to_vec_pretty(&self.agents)?)
     }
+
+    fn persist_archive(&self) -> rk_core::Result<()> {
+        write_atomic(
+            &self.archive_path,
+            &serde_json::to_vec_pretty(&self.archived)?,
+        )
+    }
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> rk_core::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Resolve an `rk prune --before` spec into an absolute cutoff: records last
+/// touched strictly before it are eligible.
+///
+/// Accepts a relative duration (`30m`, `24h`, `7d`, `2w`, `90s`) or an absolute
+/// date (`2026-07-24`, or a full RFC3339 timestamp). A bare number is rejected
+/// rather than guessed at — "7" meaning seconds when the operator meant days
+/// would silently archive the whole registry.
+pub fn cutoff_from_spec(spec: &str, now: DateTime<Utc>) -> rk_core::Result<DateTime<Utc>> {
+    let s = spec.trim();
+    let invalid = || {
+        rk_core::Error::other(format!(
+            "invalid time spec: {s} \
+             (want a duration like 30m/24h/7d/2w, a date like 2026-07-24, or an RFC3339 timestamp)"
+        ))
+    };
+    // Duration form. Match on the last CHAR (not byte) so a multibyte suffix
+    // can't split mid-codepoint; the units are single-byte ASCII, so once one
+    // matches, trimming one byte is a valid boundary.
+    let unit = s.chars().last().and_then(|c| match c {
+        's' => Some(1i64),
+        'm' => Some(60),
+        'h' => Some(3_600),
+        'd' => Some(86_400),
+        'w' => Some(604_800),
+        _ => None,
+    });
+    if let Some(mult) = unit {
+        let n: i64 = s[..s.len() - 1].trim().parse().map_err(|_| invalid())?;
+        if n < 0 {
+            return Err(invalid());
+        }
+        let delta = n
+            .checked_mul(mult)
+            .and_then(chrono::TimeDelta::try_seconds)
+            .ok_or_else(invalid)?;
+        return now.checked_sub_signed(delta).ok_or_else(invalid);
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|d| d.and_utc())
+        .ok_or_else(invalid)
 }
 
 #[cfg(test)]
@@ -215,7 +468,20 @@ mod tests {
             cost_usd: 0.0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            archived_at: None,
         }
+    }
+
+    /// A terminal record that went quiet `age_secs` ago.
+    fn aged(name: &str, state: AgentState, age_secs: i64) -> AgentRecord {
+        let mut r = record(name, state);
+        r.created_at = Utc::now() - chrono::TimeDelta::try_seconds(age_secs).unwrap();
+        r.updated_at = r.created_at;
+        r
+    }
+
+    fn names(records: &[&AgentRecord]) -> Vec<String> {
+        records.iter().map(|r| r.name.clone()).collect()
     }
 
     #[test]
@@ -271,5 +537,154 @@ mod tests {
         assert_eq!(reg.get("Whisker").unwrap().state, AgentState::Orphaned);
         assert!(reg.get("Whisker").unwrap().pid.is_none());
         assert_eq!(reg.get("Nibbles").unwrap().state, AgentState::Dismissed);
+    }
+
+    /// The core guardrail: only settled terminal records leave the live view.
+    #[test]
+    fn archive_moves_only_terminal_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load(&dir.path().join("agents.json")).unwrap();
+        for (name, state) in [
+            ("Whisker", AgentState::Running),
+            ("Nibbles", AgentState::Spawning),
+            ("Scurry", AgentState::Orphaned),
+            ("Crumb", AgentState::Completed),
+            ("Gnaw", AgentState::Failed),
+            ("Pip", AgentState::Dismissed),
+        ] {
+            reg.insert(aged(name, state, 3_600)).unwrap();
+        }
+
+        let moved = reg.archive(Utc::now()).unwrap();
+        let mut moved_names: Vec<_> = moved.iter().map(|r| r.name.clone()).collect();
+        moved_names.sort();
+        assert_eq!(moved_names, vec!["Crumb", "Gnaw", "Pip"]);
+
+        let mut live = names(&reg.list());
+        live.sort();
+        assert_eq!(
+            live,
+            vec!["Nibbles", "Scurry", "Whisker"],
+            "live and orphaned records must never be archived"
+        );
+        assert!(moved.iter().all(|r| r.archived_at.is_some()));
+    }
+
+    #[test]
+    fn archive_respects_the_before_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load(&dir.path().join("agents.json")).unwrap();
+        reg.insert(aged("Crumb", AgentState::Completed, 8 * 86_400))
+            .unwrap();
+        reg.insert(aged("Pip", AgentState::Dismissed, 3_600))
+            .unwrap();
+
+        let week_ago = cutoff_from_spec("7d", Utc::now()).unwrap();
+        assert_eq!(names(&reg.archivable(week_ago)), vec!["Crumb"]);
+
+        let moved = reg.archive(week_ago).unwrap();
+        assert_eq!(names(&moved.iter().collect::<Vec<_>>()), vec!["Crumb"]);
+        assert_eq!(names(&reg.list()), vec!["Pip"], "the fresh record stays");
+    }
+
+    /// Archiving preserves history: the record survives with its cost/usage and
+    /// lineage intact, is reloadable from disk, and round-trips back.
+    #[test]
+    fn archived_records_keep_history_and_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.json");
+        {
+            let mut reg = Registry::load(&path).unwrap();
+            let mut rec = aged("Crumb", AgentState::Completed, 3_600);
+            rec.cost_usd = 4.25;
+            rec.usage.input = 1_000;
+            rec.usage.output = 500;
+            rec.parent = Some("Whisker".into());
+            rec.workflow_instance = Some("wf-abc".into());
+            reg.insert(rec).unwrap();
+            reg.archive(Utc::now()).unwrap();
+        }
+
+        // Reload from disk: the archive is its own file beside agents.json.
+        let mut reg = Registry::load(&path).unwrap();
+        assert!(reg.list().is_empty(), "default view is clean");
+        assert_eq!(names(&reg.list_archived()), vec!["Crumb"]);
+        assert_eq!(names(&reg.list_all()), vec!["Crumb"]);
+
+        let archived = reg.get_any("Crumb").unwrap();
+        assert_eq!(archived.cost_usd, 4.25);
+        assert_eq!(archived.usage.total(), 1_500);
+        assert_eq!(archived.parent.as_deref(), Some("Whisker"));
+        assert_eq!(archived.workflow_instance.as_deref(), Some("wf-abc"));
+        assert!(archived.archived_at.is_some());
+        assert!(
+            reg.get("Crumb").is_none(),
+            "mutating lookups must not see an archived record"
+        );
+
+        let restored = reg.unarchive("Crumb").unwrap().unwrap();
+        assert!(restored.archived_at.is_none());
+        assert_eq!(restored.cost_usd, 4.25);
+        assert_eq!(names(&reg.list()), vec!["Crumb"]);
+        assert!(reg.list_archived().is_empty());
+    }
+
+    #[test]
+    fn archiving_returns_the_name_to_the_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load(&dir.path().join("agents.json")).unwrap();
+        let first = reg.reserve_name();
+        reg.insert(aged(&first, AgentState::Dismissed, 3_600))
+            .unwrap();
+        assert_ne!(reg.reserve_name(), first, "a live name stays taken");
+
+        reg.archive(Utc::now()).unwrap();
+        let reused = reg.reserve_name();
+        assert_eq!(reused, first, "archiving frees the name for reuse");
+
+        // Both generations coexist: the new live rat shadows nothing, and the
+        // archived generation keeps its own history.
+        reg.insert(record(&reused, AgentState::Running)).unwrap();
+        assert_eq!(reg.list_archived().len(), 1);
+        assert_eq!(reg.list_all().len(), 2);
+        assert_eq!(reg.get_any(&reused).unwrap().state, AgentState::Running);
+        assert!(
+            reg.unarchive(&reused).is_err(),
+            "unarchiving onto a live name must refuse rather than clobber"
+        );
+    }
+
+    #[test]
+    fn cutoff_from_spec_parses_durations_and_dates() {
+        let now = DateTime::parse_from_rfc3339("2026-07-24T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            cutoff_from_spec("7d", now).unwrap().to_rfc3339(),
+            "2026-07-17T12:00:00+00:00"
+        );
+        assert_eq!(
+            cutoff_from_spec("2h", now).unwrap().to_rfc3339(),
+            "2026-07-24T10:00:00+00:00"
+        );
+        assert_eq!(
+            cutoff_from_spec(" 1w ", now).unwrap().to_rfc3339(),
+            "2026-07-17T12:00:00+00:00"
+        );
+        assert_eq!(
+            cutoff_from_spec("2026-07-01", now).unwrap().to_rfc3339(),
+            "2026-07-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            cutoff_from_spec("2026-07-01T06:30:00Z", now)
+                .unwrap()
+                .to_rfc3339(),
+            "2026-07-01T06:30:00+00:00"
+        );
+        // A bare number is ambiguous, and a multibyte suffix must not panic.
+        assert!(cutoff_from_spec("7", now).is_err());
+        assert!(cutoff_from_spec("-3d", now).is_err());
+        assert!(cutoff_from_spec("5m²", now).is_err());
+        assert!(cutoff_from_spec("", now).is_err());
     }
 }

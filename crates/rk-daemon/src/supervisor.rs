@@ -398,6 +398,7 @@ impl Supervisor {
             cost_usd: 0.0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            archived_at: None,
         };
         self.lock_registry().insert(record.clone())?;
         self.lock_controls()
@@ -489,6 +490,7 @@ impl Supervisor {
             cost_usd: 0.0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            archived_at: None,
         };
         self.lock_registry().insert(record.clone())?;
         self.emit_event(
@@ -836,7 +838,12 @@ impl Supervisor {
         let mut fleet = 0.0;
         let mut repo_total = 0.0;
         let mut instance_total = 0.0;
-        for a in reg.list() {
+        // `list_all`, not `list`: archiving a record must never move a budget
+        // number. It cannot change the fleet/repo tallies (only live agents
+        // count, and archiving never touches a live record), but the instance
+        // tally is cumulative over a run, so an archived Completed step still
+        // has to count against its workflow's `budget:`.
+        for a in reg.list_all() {
             if a.state.is_live() {
                 fleet += a.cost_usd;
                 if a.repo_name == repo {
@@ -982,7 +989,9 @@ impl Supervisor {
         let mut per_instance: BTreeMap<String, f64> = BTreeMap::new();
         {
             let reg = self.lock_registry();
-            for a in reg.list() {
+            // Full history (live + archived), matching `cost_rollup`: archiving
+            // is a UI operation, never a budget one.
+            for a in reg.list_all() {
                 if a.state.is_live() {
                     fleet_spent += a.cost_usd;
                     *per_repo.entry(a.repo_name.clone()).or_default() += a.cost_usd;
@@ -1848,12 +1857,141 @@ impl Supervisor {
         Ok(result)
     }
 
+    /// The live registry — archived records excluded. This is the default view
+    /// every operator surface (`rk list`, `rk top`, `rk inbox`) and every sweep
+    /// reads, so archiving a record retires it from all of them at once.
     pub fn list(&self) -> Vec<AgentRecord> {
         self.lock_registry().list().into_iter().cloned().collect()
     }
 
+    /// Archived records only.
+    pub fn list_archived(&self) -> Vec<AgentRecord> {
+        self.lock_registry()
+            .list_archived()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Live + archived: the full lifetime history, for cost/usage reporting.
+    pub fn list_all(&self) -> Vec<AgentRecord> {
+        self.lock_registry()
+            .list_all()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Read-only status lookup, falling back to the archive so an archived
+    /// rat's history stays inspectable with `rk status`.
     pub fn status(&self, name: &str) -> Option<AgentRecord> {
-        self.lock_registry().get(name).cloned()
+        self.lock_registry().get_any(name).cloned()
+    }
+
+    /// Move settled terminal records (`Completed`/`Failed`/`Dismissed`) last
+    /// touched before `cutoff` into the archive store, so they stop inflating
+    /// the default views. Live and `Orphaned` records are never touched.
+    ///
+    /// With `dry_run` the registry is not mutated at all — the reply lists what
+    /// *would* move, so an operator can preview before committing. `reap_git`
+    /// additionally reclaims each archived agent's worktree and local branch,
+    /// but only when the branch has already landed (see
+    /// [`reap_git`](Supervisor::reap_git)).
+    pub fn archive_agents(
+        &self,
+        cutoff: DateTime<Utc>,
+        dry_run: bool,
+        reap_git: bool,
+    ) -> rk_core::Result<serde_json::Value> {
+        if dry_run {
+            let eligible: Vec<AgentRecord> = self
+                .lock_registry()
+                .archivable(cutoff)
+                .into_iter()
+                .cloned()
+                .collect();
+            return Ok(json!({
+                "dry_run": true,
+                "count": eligible.len(),
+                "agents": eligible,
+                "reaped": [],
+            }));
+        }
+        let archived = self.lock_registry().archive(cutoff)?;
+        let reaped: Vec<serde_json::Value> = if reap_git {
+            archived.iter().map(|r| self.reap_git(r)).collect()
+        } else {
+            Vec::new()
+        };
+        info!(
+            count = archived.len(),
+            cutoff = %cutoff,
+            reaped = reaped.iter().filter(|r| r["reaped"] == json!(true)).count(),
+            "archived terminal agent records"
+        );
+        Ok(json!({
+            "dry_run": false,
+            "count": archived.len(),
+            "agents": archived,
+            "reaped": reaped,
+        }))
+    }
+
+    /// Restore an archived record to the live registry (the undo for
+    /// [`archive_agents`](Supervisor::archive_agents)).
+    pub fn unarchive_agent(&self, name: &str) -> rk_core::Result<serde_json::Value> {
+        let restored = self
+            .lock_registry()
+            .unarchive(name)?
+            .ok_or_else(|| rk_core::Error::other(format!("no archived agent: {name}")))?;
+        info!(agent = name, "unarchived agent record");
+        Ok(json!({ "agent": restored }))
+    }
+
+    /// Reclaim one archived agent's git leftovers — its worktree and local
+    /// branch — but ONLY when the branch has already landed in its target (or
+    /// is already gone). An unmerged branch still holds the only copy of that
+    /// rat's work, so it is left standing and reported as skipped; nothing here
+    /// ever force-deletes unmerged work.
+    ///
+    /// Best-effort by construction: every failure becomes a `reaped: false` row
+    /// with a reason rather than failing the archive that triggered it.
+    fn reap_git(&self, record: &AgentRecord) -> serde_json::Value {
+        let row = |reaped: bool, reason: String| json!({"agent": record.name, "branch": record.branch, "reaped": reaped, "reason": reason});
+        let Some(branch) = record.branch.as_deref() else {
+            return row(false, "no branch recorded".into());
+        };
+        let repo = match Repo::discover(&record.repo_root) {
+            Ok(r) => r,
+            Err(e) => return row(false, format!("repo unavailable: {e}")),
+        };
+        if !repo.branch_merged_or_gone(branch, &record.target_branch) {
+            return row(
+                false,
+                format!(
+                    "branch {branch} is not merged into {} — left standing",
+                    record.target_branch
+                ),
+            );
+        }
+        let mut detail = Vec::new();
+        if let Some(worktree) = &record.worktree {
+            if worktree.exists() {
+                match repo.remove_worktree(worktree) {
+                    Ok(()) => detail.push("worktree removed".to_string()),
+                    Err(e) => return row(false, format!("worktree removal failed: {e}")),
+                }
+            }
+        }
+        if repo.branch_exists(branch) {
+            match repo.delete_branch(branch) {
+                Ok(()) => detail.push(format!("branch {branch} deleted")),
+                Err(e) => return row(false, format!("branch delete failed: {e}")),
+            }
+        } else {
+            detail.push(format!("branch {branch} already gone"));
+        }
+        row(true, detail.join("; "))
     }
 
     /// Standard spawn environment. Prepends the running `rk` binary's
@@ -2004,6 +2142,7 @@ mod respawn_tests {
             cost_usd: 0.0,
             created_at: now,
             updated_at: now,
+            archived_at: None,
         }
     }
 

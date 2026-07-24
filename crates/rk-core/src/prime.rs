@@ -85,6 +85,10 @@ conversation.
 - `rk steer <name> \"...\"` — inject mid-session guidance · `rk interrupt <name>`.
 - `rk dismiss <name>` — stop the rat, merge its branch, clean up.
 - `rk cost` — per-agent and fleet token/cost rollup.
+- `rk prune` — archive settled dead records (completed/failed/dismissed) out of
+  `rk list`/`rk top` once they pile up. Nothing is lost: cost/usage/lineage
+  survive, `rk list --archived` shows them, `rk unarchive <name>` restores one.
+  Live and orphaned rats are never archived. `--dry-run` to preview.
 
 ## Running a piece of work, end to end
 1. `rk repo add` the repository if the system doesn't know it yet.
@@ -333,7 +337,10 @@ mod tests {
             // context, not an afterthought.
             let conv_at = text.find("Standing conventions").unwrap();
             let space_at = text.find("Coordination: the tuplespace").unwrap();
-            assert!(conv_at < space_at, "{role}: conventions should precede coordination");
+            assert!(
+                conv_at < space_at,
+                "{role}: conventions should precede coordination"
+            );
         }
     }
 

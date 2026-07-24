@@ -54,6 +54,35 @@ pub struct NameArg {
 }
 
 #[derive(Args)]
+pub struct ListArgs {
+    /// Include archived records alongside the live fleet.
+    #[arg(long)]
+    pub all: bool,
+    /// Show only archived records.
+    #[arg(long)]
+    pub archived: bool,
+}
+
+#[derive(Args)]
+pub struct PruneArgs {
+    /// Archive terminal records last touched before this point: a duration
+    /// (30m, 24h, 7d, 2w) or a date (2026-07-24 / RFC3339).
+    #[arg(long, default_value = "7d")]
+    pub before: String,
+    /// Archive every eligible record now, regardless of age.
+    #[arg(long)]
+    pub all: bool,
+    /// List what would be archived without touching the registry.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Also reclaim each archived agent's worktree and local branch — but only
+    /// where the branch has already merged into its target (or is gone). An
+    /// unmerged branch is always left standing.
+    #[arg(long)]
+    pub reap_git: bool,
+}
+
+#[derive(Args)]
 pub struct LogArgs {
     /// Agent name.
     pub name: String,
@@ -203,33 +232,132 @@ pub async fn spawn(layout: &Layout, args: SpawnArgs, as_json: bool) -> Result<()
     Ok(())
 }
 
-pub async fn list(layout: &Layout, as_json: bool) -> Result<()> {
+pub async fn list(layout: &Layout, args: ListArgs, as_json: bool) -> Result<()> {
     let mut client = Client::connect_or_spawn(layout).await?;
-    let result = client.call("agent.list", json!({})).await?;
+    let result = client
+        .call(
+            "agent.list",
+            json!({"include_archived": args.all, "archived_only": args.archived}),
+        )
+        .await?;
     if as_json {
         println!("{}", result["agents"]);
         return Ok(());
     }
     let agents = result["agents"].as_array().cloned().unwrap_or_default();
     if agents.is_empty() {
-        println!("(no agents)");
+        println!(
+            "{}",
+            if args.archived {
+                "(no archived agents)"
+            } else {
+                "(no agents)"
+            }
+        );
         return Ok(());
     }
     println!(
         "{:<12} {:<9} {:<8} {:<12} {:<14} {:>10} {:>8}",
         "NAME", "STATE", "ROLE", "REPO", "TASK", "TOKENS", "COST"
     );
-    for a in agents {
+    for a in &agents {
+        // An archived row is only reachable via --all/--archived, so mark it
+        // rather than letting it read as part of the current fleet.
+        let state = match a["archived_at"].as_str() {
+            Some(_) => format!("{}*", a["state"].as_str().unwrap_or("?")),
+            None => a["state"].as_str().unwrap_or("?").to_string(),
+        };
         println!(
             "{:<12} {:<9} {:<8} {:<12} {:<14} {:>10} {:>8}",
             a["name"].as_str().unwrap_or("?"),
-            a["state"].as_str().unwrap_or("?"),
+            state,
             a["role"].as_str().unwrap_or("?"),
             a["repo_name"].as_str().unwrap_or("?"),
             a["task"].as_str().unwrap_or("-"),
             total_tokens(&a["usage"]),
             format!("${:.4}", a["cost_usd"].as_f64().unwrap_or(0.0)),
         );
+    }
+    if agents.iter().any(|a| !a["archived_at"].is_null()) {
+        println!("(* archived — `rk unarchive <name>` restores one)");
+    }
+    Ok(())
+}
+
+/// `rk prune` — offload settled terminal records (Completed/Failed/Dismissed)
+/// into the archive store so `rk list` and `rk top` show only what's current.
+/// Nothing is deleted: archived records keep their cost/usage/lineage and stay
+/// readable via `rk list --archived` / `rk status`.
+pub async fn prune(layout: &Layout, args: PruneArgs, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call(
+            "agent.archive",
+            json!({
+                "before": args.before,
+                "all": args.all,
+                "dry_run": args.dry_run,
+                "reap_git": args.reap_git,
+            }),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+        return Ok(());
+    }
+    let agents = result["agents"].as_array().cloned().unwrap_or_default();
+    let window = if args.all {
+        "all eligible".to_string()
+    } else {
+        format!("older than {}", args.before)
+    };
+    if agents.is_empty() {
+        println!("nothing to archive ({window})");
+        return Ok(());
+    }
+    let verb = if args.dry_run {
+        "would archive"
+    } else {
+        "archived"
+    };
+    println!("{verb} {} record(s) ({window}):", agents.len());
+    for a in &agents {
+        println!(
+            "  {:<12} {:<10} {:<14} ${:.4}",
+            a["name"].as_str().unwrap_or("?"),
+            a["state"].as_str().unwrap_or("?"),
+            a["task"].as_str().unwrap_or("-"),
+            a["cost_usd"].as_f64().unwrap_or(0.0),
+        );
+    }
+    for r in result["reaped"].as_array().cloned().unwrap_or_default() {
+        println!(
+            "  git {:<8} {:<12} {}",
+            if r["reaped"] == json!(true) {
+                "reaped"
+            } else {
+                "kept"
+            },
+            r["agent"].as_str().unwrap_or("?"),
+            r["reason"].as_str().unwrap_or(""),
+        );
+    }
+    if args.dry_run {
+        println!("(dry run — re-run without --dry-run to archive)");
+    }
+    Ok(())
+}
+
+/// `rk unarchive` — restore one archived record to the live registry.
+pub async fn unarchive(layout: &Layout, args: NameArg, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call("agent.unarchive", json!({"name": args.name}))
+        .await?;
+    if as_json {
+        println!("{}", result["agent"]);
+    } else {
+        println!("unarchived {}", args.name);
     }
     Ok(())
 }
@@ -467,7 +595,11 @@ pub async fn attach(layout: &Layout, args: NameArg) -> Result<()> {
 
 pub async fn cost(layout: &Layout, as_json: bool) -> Result<()> {
     let mut client = Client::connect_or_spawn(layout).await?;
-    let result = client.call("agent.list", json!({})).await?;
+    // Lifetime spend, so `include_archived`: `rk prune` retires a record from
+    // the fleet views but must never make spend disappear from the ledger.
+    let result = client
+        .call("agent.list", json!({"include_archived": true}))
+        .await?;
     let agents = result["agents"].as_array().cloned().unwrap_or_default();
     let mut total_tokens_all = 0u64;
     let mut total_cost = 0.0f64;
