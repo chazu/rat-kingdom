@@ -209,8 +209,15 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
         "reviewer" => {
             out.push_str(
                 "Review the changes on your branch against the task requirements. \
-                 Produce a recommendation: APPROVE, REWORK (with specific feedback), \
-                 or STOP (serious problems). Record it with \
+                 Produce exactly one recommendation, choosing by what should happen next:\n\
+                 - APPROVE — clean and safe to auto-merge as-is.\n\
+                 - REWORK — fixable issues remain. Give specific, actionable feedback; \
+                 this is auto-handed-off as a follow-up ticket, no human needed. Prefer \
+                 REWORK for anything a rat could fix.\n\
+                 - STOP — reserve for genuine dead-ends: fundamentally wrong, unsafe, or \
+                 needing a human judgment call. STOP parks the work for a human and pages \
+                 the operator, so do NOT use it for anything REWORK can carry.\n\
+                 Record it with \
                  `rk out artifact <repo> review --payload '{\"recommendation\": ...}'` \
                  before `rk done`.\n\n",
             );
