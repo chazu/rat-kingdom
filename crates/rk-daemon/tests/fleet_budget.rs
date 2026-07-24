@@ -41,8 +41,12 @@ async fn connect(layout: &Layout) -> Client {
 
 /// A single process-global fake shared by every test in this file (setting the
 /// process env var to DIFFERENT scripts across parallel tests would race —
-/// mirrors COMBINED_FAKE in supervisor_sweep.rs). It branches on the task,
-/// which the fake harness exports as `$RK_FAKE_PROMPT`:
+/// mirrors COMBINED_FAKE in supervisor_sweep.rs). Every test sets the SAME
+/// script and NONE ever `remove_var`s it: a `remove_var` in one test would
+/// unset the fake mid-flight for a parallel test's spawning agent, which would
+/// then record no cost and time out (TKT-88). Leaving the identical value set
+/// for the whole process is harmless. It branches on the task, which the fake
+/// harness exports as `$RK_FAKE_PROMPT`:
 ///
 /// - `*oneshot*`: self-report a $0.50 authoritative cost via a `result`
 ///   message and EXIT — the agent flips to `Completed`, so under the live-only
@@ -100,10 +104,19 @@ async fn spawn_daemon(home: &Path) -> (Layout, Client) {
     (layout, client)
 }
 
+/// Polling budget for the spend-recorded loops below. Spawning a real daemon +
+/// agent and waiting for the first usage event to be recorded is scheduler-
+/// bound, so under parallel test load (many test binaries oversubscribing the
+/// CPU) it can take far longer than in isolation. A generous ceiling keeps
+/// these tests reliable without slowing the happy path — every loop returns the
+/// instant the condition holds (TKT-88).
+const SPEND_POLL_ATTEMPTS: usize = 400; // 400 × 50ms = up to 20s
+const SPEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Wait until agent `name`'s recorded cost crosses the $0.30 cap.
 async fn wait_for_spend(client: &mut Client, name: &str) {
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..SPEND_POLL_ATTEMPTS {
+        tokio::time::sleep(SPEND_POLL_INTERVAL).await;
         let status = client
             .call("agent.status", json!({"name": name}))
             .await
@@ -177,7 +190,6 @@ async fn fleet_cap_refuses_dispatch_once_hit() {
     assert_eq!(rollup["fleet"]["cap_usd"].as_f64().unwrap(), 0.30);
     assert_eq!(rollup["fleet"]["status"].as_str().unwrap(), "exceeded");
 
-    std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
 /// TKT-39: dismissing a LIVE over-budget agent drops its spend off the fleet
@@ -248,7 +260,6 @@ async fn dismissed_agent_drops_off_fleet_tally() {
         "after dismissal the cap is clear — 3rd spawn should be allowed, got {allowed:?}"
     );
 
-    std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
 /// TKT-40: a COMPLETED agent's spend must also drop off the fleet tally. The
@@ -281,8 +292,8 @@ async fn completed_agent_drops_off_fleet_tally() {
 
     // Wait for it to finish: cost landed AND state is `completed` (not live).
     let mut completed = false;
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..SPEND_POLL_ATTEMPTS {
+        tokio::time::sleep(SPEND_POLL_INTERVAL).await;
         let status = client
             .call("agent.status", json!({"name": name}))
             .await
@@ -318,5 +329,4 @@ async fn completed_agent_drops_off_fleet_tally() {
         "a completed agent's spend must not block a later spawn, got {allowed:?}"
     );
 
-    std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
