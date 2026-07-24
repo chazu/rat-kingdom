@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use rk_core::config::{MergeMode, SupervisorConfig};
 use rk_core::paths::Layout;
 use rk_core::prime::{render, PrimeContext};
-use rk_core::tuple::{Category, Pattern, Tuple, SYSTEM_SCOPE};
+use rk_core::tuple::{Category, Pattern, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
 use rk_git::{agent_branch, Repo};
 use rk_harness::{make_harness, HarnessEvent, LaunchSpec, SessionControl, TokenUsage};
 use rk_ledger::pricing::PricingTable;
@@ -805,7 +805,7 @@ impl Supervisor {
                 "tokens": record.usage.total(),
             }),
         );
-        if let Err(e) = self.space.out(tuple) {
+        if let Err(e) = self.space.out(tuple.into_trail(DEFAULT_TRAIL_TTL)) {
             warn!(error = %e, "failed to emit budget obstacle");
         }
     }
@@ -963,7 +963,7 @@ impl Supervisor {
             self.castle.clone(),
             payload,
         );
-        if let Err(e) = self.space.out(tuple) {
+        if let Err(e) = self.space.out(tuple.into_trail(DEFAULT_TRAIL_TTL)) {
             warn!(error = %e, "failed to emit dispatch budget obstacle");
         }
     }
@@ -1175,7 +1175,7 @@ impl Supervisor {
                 "tokens": record.usage.total(),
             }),
         );
-        if let Err(e) = self.space.out(tuple) {
+        if let Err(e) = self.space.out(tuple.into_trail(DEFAULT_TRAIL_TTL)) {
             warn!(error = %e, "failed to emit sweep obstacle");
         }
     }
@@ -1369,7 +1369,7 @@ impl Supervisor {
                 ),
             }),
         );
-        if let Err(e) = self.space.out(tuple) {
+        if let Err(e) = self.space.out(tuple.into_trail(DEFAULT_TRAIL_TTL)) {
             warn!(error = %e, "failed to emit respawn-exhausted need");
         }
     }
