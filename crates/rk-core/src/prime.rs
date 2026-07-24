@@ -116,6 +116,12 @@ const FRAGMENT_GIT_SAFETY: &str = "\
 
 - Work ONLY in your worktree (RK_WORKTREE) on your branch (RK_BRANCH).
 - NEVER commit to main/master/develop; never switch branches; never force-push.
+- Keep your diff to the files your task touches. NEVER commit a workspace-wide
+  reformat (e.g. a bare `cargo fmt` that reflows untouched files — a newer
+  toolchain will do this). Format only files you changed, and before you
+  commit, revert any fmt/toolchain churn in files your task did not touch:
+  `git checkout -- <untouched files>`. A reformat sweep races peers editing
+  those same files and buries your real change in review.
 - Commit your work with clear messages as you go; your branch is merged by the
   orchestrator on dismissal.
 ";
