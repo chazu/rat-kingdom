@@ -21,12 +21,12 @@ daemon restart. (The parse is cached and refreshed on file change — see
 ```cue
 triggers: [
     {
-        name:  "drain-on-new-ticket"           // lowercase-hyphen, unique per file
+        name:  "drain-on-unblock"              // lowercase-hyphen, unique per file
         match: {                                // predicate over the landing tuple
             category: "event"                   //   (all set fields AND; unset = any)
-            identity: "ticket_created"
+            identity: "ticket_closed"
             scope:    "myrepo"
-            search:   "priority"                //   substring of the payload
+            search:   "done"                    //   substring of the payload
         }
         run:   "backlog-drain"                  // a workflow definition name
         repo:  "myrepo"                         // target repo (see resolution below)
@@ -61,6 +61,40 @@ order: the trigger's explicit `repo`, else the trigger file's own repo (for a
 repo-local `triggers.cue`), else the matched tuple's `scope`. That name is
 resolved to a path through the machine-local repo registry (`rk repo add`). A
 name that resolves to no registered repo is logged and skipped.
+
+### Ticket lifecycle events: the self-advancing pipeline
+
+The ticket store announces a status transition the reactor can react to. When a
+ticket crosses the **non-terminal → terminal** edge (into `done` or `closed`),
+`Tickets::edit` emits a `ticket_closed` `Event`, scoped to the ticket's repo,
+with `{ticket, status, scope}`. Only the crossing edge fires — a `done → closed`
+re-close, or any non-status edit, is silent — so each closed ticket announces
+itself exactly once.
+
+That edge is the exact moment a ticket's **dependents can unblock**: a dependent
+is ready only once its *last* blocker reaches done/closed. Wiring the shipped
+`drain-on-unblock` trigger (`examples/triggers.cue`) turns that announcement into
+dispatch:
+
+```cue
+{
+    name:  "drain-on-unblock"
+    match: {category: "event", identity: "ticket_closed", scope: "myrepo"}
+    run:   "backlog-drain"
+    repo:  "myrepo"
+    maxFires: 3
+}
+```
+
+`backlog-drain`'s `for_each` recomputes the *dependency-aware* ready set (open
+tickets with every dependency satisfied — `Tickets::ready`) and atomically claims
+each before spawning (`Tickets::claim`, TKT-6). So a just-unblocked dependent is
+picked up the instant its blocker closes, instead of waiting for the next
+continuous-drain sweep or an operator — the dependency DAG advances itself. The
+atomic claim dedups against the continuous drain and any concurrent
+fan-out, so running both is safe; `maxFires` caps a close storm; and because the
+event rides the durable scan cursor (below), a dropped feed event cannot lose a
+close.
 
 ## Why dispatch is scan-driven, not feed-driven
 

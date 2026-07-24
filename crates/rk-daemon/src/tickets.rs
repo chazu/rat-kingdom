@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tracing::warn;
 
 /// The status lifecycle a ticket may move through.
 pub const STATUSES: &[&str] = &[
@@ -373,6 +374,7 @@ impl Tickets {
             .await?
             .ok_or_else(|| rk_core::Error::other(format!("no such ticket: {id}")))?;
 
+        let was_done = is_done(&existing);
         let mut payload = existing.payload.clone();
         let obj = payload
             .as_object_mut()
@@ -382,7 +384,43 @@ impl Tickets {
 
         let updated = with_payload(existing, payload);
         self.space.out(updated.clone())?;
+        // Emit a `ticket_closed` event on the non-terminal → terminal edge — the
+        // moment a ticket's dependents can unblock (TKT-56). A reactor trigger
+        // matching this event hands the now-ready backlog to a drain workflow,
+        // turning the dependency DAG into a self-advancing pipeline instead of
+        // one that waits for the next drain sweep. Only the crossing edge fires
+        // (a done→closed re-close, or a non-status edit, does not), so a closed
+        // ticket's dependents are announced exactly once. Best-effort: a failed
+        // emit never fails the status change that already landed.
+        if is_done(&updated) && !was_done {
+            self.emit_ticket_closed(&updated);
+        }
         Ok(updated)
+    }
+
+    /// Announce a just-closed ticket as an `Event` tuple the reactor can react
+    /// to. Scoped to the ticket's repo so a trigger's repo defaults to that repo
+    /// (and its fan-out drains that repo's newly-ready backlog).
+    fn emit_ticket_closed(&self, ticket: &Tuple) {
+        let status = ticket
+            .payload
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("done");
+        let event = Tuple::new(
+            Category::Event,
+            ticket.scope.clone(),
+            "ticket_closed",
+            self.castle.clone(),
+            json!({
+                "ticket": ticket.identity,
+                "status": status,
+                "scope": ticket.scope,
+            }),
+        );
+        if let Err(e) = self.space.out(event) {
+            warn!(ticket = %ticket.identity, error = %e, "failed to emit ticket_closed event");
+        }
     }
 }
 
@@ -456,6 +494,19 @@ mod tests {
 
     fn tickets() -> Tickets {
         Tickets::new(Space::open_in_memory().unwrap(), "castle".into())
+    }
+
+    /// A `Tickets` plus a handle on its space, so a test can inspect the event
+    /// tuples the ticket lifecycle emits.
+    fn tickets_with_space() -> (Tickets, Space) {
+        let space = Space::open_in_memory().unwrap();
+        (Tickets::new(space.clone(), "castle".into()), space)
+    }
+
+    fn closed_events(space: &Space) -> Vec<Tuple> {
+        let mut p = Pattern::category(Category::Event);
+        p.identity = Some("ticket_closed".into());
+        space.scan(&p).unwrap()
     }
 
     fn new(title: &str, scope: &str, parent: Option<&str>) -> NewTicket {
@@ -638,6 +689,48 @@ mod tests {
             let tk = t.get(id).unwrap().unwrap();
             assert_eq!(tk.payload["status"], "in_progress");
         }
+    }
+
+    #[tokio::test]
+    async fn closing_a_ticket_emits_a_ticket_closed_event() {
+        let (t, space) = tickets_with_space();
+        let a = t.create(new("x", "myrepo", None)).await.unwrap();
+        assert!(closed_events(&space).is_empty(), "no event before close");
+
+        set_status(&t, &a.identity, "done").await;
+        let events = closed_events(&space);
+        assert_eq!(events.len(), 1, "closing emits exactly one event");
+        let ev = &events[0];
+        assert_eq!(ev.scope, "myrepo", "event is scoped to the ticket's repo");
+        assert_eq!(ev.payload["ticket"], json!(a.identity));
+        assert_eq!(ev.payload["status"], json!("done"));
+    }
+
+    #[tokio::test]
+    async fn non_terminal_edits_do_not_emit_a_close() {
+        let (t, space) = tickets_with_space();
+        let a = t.create(new("x", "myrepo", None)).await.unwrap();
+        // Claim (open → in_progress) and a plain in_progress update are both
+        // non-terminal, so neither announces a close.
+        assert!(t.claim(&a.identity).await.unwrap());
+        set_status(&t, &a.identity, "blocked").await;
+        assert!(
+            closed_events(&space).is_empty(),
+            "only the crossing into done/closed emits"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_closing_a_done_ticket_does_not_re_emit() {
+        let (t, space) = tickets_with_space();
+        let a = t.create(new("x", "myrepo", None)).await.unwrap();
+        set_status(&t, &a.identity, "done").await; // non-terminal → done: emits
+        set_status(&t, &a.identity, "closed").await; // done → closed: no re-emit
+        assert_eq!(
+            closed_events(&space).len(),
+            1,
+            "the terminal edge fires once; a done→closed re-close is silent"
+        );
     }
 
     #[tokio::test]
