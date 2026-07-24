@@ -185,7 +185,7 @@ was undone. History stays intact — the revert is a new commit, not a rewrite.
 ## Configuration (`~/.rat-kingdom/config.toml`)
 
 ```toml
-castle_name = "my-laptop"        # this machine's identity (default: hostname)
+castle_name = "my-laptop"        # author label override (default: Ed25519-key-derived actor id)
 
 [harness]
 default = "claude"               # harness when nothing else specifies

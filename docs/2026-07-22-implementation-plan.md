@@ -41,8 +41,13 @@
   Per-actor history compaction DONE (TKT-58): `NotesSync::compact` prunes each
   actor's own ref (drop `Out(T)` once taken; drop `Take(T)` once its `Out` is
   gone from the union) — two-phase, resurrection-free across any fetch order.
-  REMAINING from P6: live multi-machine validation over a real remote,
-  Ed25519 castle identity (currently hostname — sibling ticket).
+  Ed25519 castle identity DONE (TKT-59): each castle persists a keypair at
+  `<home>/castle.key` (0600); the actor id is derived from the public key
+  (`castle-<16 hex>`) instead of the hostname, and every replicated op is
+  signed — a reader drops any record whose signature fails or whose actor does
+  not match its embedded key. `rk_core::identity::CastleIdentity`; a
+  `castle_name` override remains a human-friendly author label.
+  REMAINING from P6: live multi-machine validation over a real remote.
 - **P5 CORE DONE (via `cue` CLI, decided over cuengine)** — rk-workflow:
   top-level `workflow:` field validated against embedded schema.cue; `_input`
   via CUE at load time, `{{ctx.*}}` at runtime; aspects with the predecessor's semantics;

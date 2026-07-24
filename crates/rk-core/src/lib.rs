@@ -3,6 +3,7 @@
 pub mod config;
 pub mod error;
 pub mod id;
+pub mod identity;
 pub mod names;
 pub mod paths;
 pub mod prime;

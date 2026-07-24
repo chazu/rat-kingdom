@@ -7,10 +7,11 @@
 //! never leave the local daemon.
 
 use rk_core::id::RecordId;
+use rk_core::identity::CastleIdentity;
 use rk_core::paths::Layout;
 use rk_core::tuple::{Lifecycle, Pattern, Tuple};
 use rk_space::Space;
-use rk_sync::{NotesSync, SyncOp, SyncRecord};
+use rk_sync::{NotesSync, SyncOp};
 use std::path::PathBuf;
 use std::process::Command;
 use tracing::{debug, info, warn};
@@ -43,6 +44,12 @@ impl Syncer {
     /// Ensure the state repo exists (init + optional origin) and build the
     /// sync handle.
     pub fn new(layout: &Layout, castle: &str, remote_url: Option<&str>) -> rk_core::Result<Self> {
+        // The signing identity is loaded from (or minted into) the RK home, so
+        // every op this castle exports is Ed25519-signed and peers can verify
+        // its origin. The `castle` string is the logical author label written
+        // onto tuples; the identity's actor id is who physically signed/replicated
+        // them — equal by default, distinct only under a `castle_name` override.
+        let identity = CastleIdentity::load_or_create(&layout.castle_key_path())?;
         let sync_repo = layout.home().join("sync");
         if !sync_repo.join(".git").exists() {
             std::fs::create_dir_all(&sync_repo)?;
@@ -71,24 +78,19 @@ impl Syncer {
             }
             remote_configured = true;
         }
-        let notes = NotesSync::new(&sync_repo, castle);
+        let notes = NotesSync::new(&sync_repo, identity);
         // Announce this castle the first time its ref is created, so peers
         // see it even before it exports any work.
         if !notes.has_local_ref() {
-            notes.append(&[SyncRecord {
-                id: RecordId::new(),
-                actor: castle.to_string(),
-                written_at: chrono::Utc::now(),
-                op: SyncOp::Out {
-                    tuple: Tuple::new(
-                        rk_core::tuple::Category::Fact,
-                        rk_core::tuple::SYSTEM_SCOPE,
-                        "castle_presence",
-                        castle.to_string(),
-                        serde_json::json!({"castle": castle, "since": chrono::Utc::now()}),
-                    ),
-                },
-            }])?;
+            notes.append(&[notes.record(SyncOp::Out {
+                tuple: Tuple::new(
+                    rk_core::tuple::Category::Fact,
+                    rk_core::tuple::SYSTEM_SCOPE,
+                    "castle_presence",
+                    castle.to_string(),
+                    serde_json::json!({"castle": castle, "since": chrono::Utc::now()}),
+                ),
+            })])?;
         }
         Ok(Self {
             cursor_file: layout.home().join("sync-cursor"),
@@ -136,15 +138,12 @@ impl Syncer {
             .copied()
             .filter(|t| t.instance == self.castle && cursor.map(|c| t.id > c).unwrap_or(true))
             .collect();
-        let mut records: Vec<SyncRecord> = ours
+        let mut records: Vec<_> = ours
             .iter()
-            .map(|t| SyncRecord {
-                id: RecordId::new(),
-                actor: self.castle.clone(),
-                written_at: chrono::Utc::now(),
-                op: SyncOp::Out {
+            .map(|t| {
+                self.notes.record(SyncOp::Out {
                     tuple: (*t).clone(),
-                },
+                })
             })
             .collect();
         let exported = records.len();
@@ -165,12 +164,7 @@ impl Syncer {
         let mut takes = 0;
         for id in prev_known.difference(&live_ids) {
             if alive_in_log.contains(id) {
-                records.push(SyncRecord {
-                    id: RecordId::new(),
-                    actor: self.castle.clone(),
-                    written_at: chrono::Utc::now(),
-                    op: SyncOp::Take { tuple_id: *id },
-                });
+                records.push(self.notes.record(SyncOp::Take { tuple_id: *id }));
                 takes += 1;
             }
         }
@@ -254,6 +248,12 @@ impl Syncer {
 
     pub fn peers(&self) -> rk_core::Result<Vec<String>> {
         Ok(self.notes.known_actors()?.into_iter().collect())
+    }
+
+    /// This castle's authenticated actor id (its git-notes ref segment), derived
+    /// from its Ed25519 public key.
+    pub fn actor(&self) -> &str {
+        self.notes.actor()
     }
 
     fn load_cursor(&self) -> Option<RecordId> {
@@ -389,7 +389,11 @@ mod tests {
         // Peers are visible on both sides after B pushes.
         let stats_a2 = syncer_a.run_cycle(&space_a).unwrap();
         assert!(stats_a2.actors_seen >= 2);
-        assert!(syncer_a.peers().unwrap().contains(&"castle-b".to_string()));
+        // Peers are keyed by the pubkey-derived actor id, not the hostname.
+        assert!(syncer_a
+            .peers()
+            .unwrap()
+            .contains(&syncer_b.actor().to_string()));
     }
 
     /// A durable tuple authored on A, imported by B, then consumed on B, must
