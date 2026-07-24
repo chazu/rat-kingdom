@@ -35,6 +35,7 @@ pub struct Daemon {
     reactor_config: rk_core::config::ReactorConfig,
     scheduler_config: rk_core::config::SchedulerConfig,
     sweep_config: rk_core::config::SupervisorConfig,
+    review_sweep_config: rk_core::config::ReviewSweepConfig,
     drain_config: rk_core::config::DrainConfig,
     evaporation_decay: f64,
     global_agents: std::collections::HashMap<String, rk_workflow::AgentProfile>,
@@ -104,6 +105,7 @@ impl Daemon {
         daemon.reactor_config = config.reactor.clone();
         daemon.scheduler_config = config.scheduler.clone();
         daemon.sweep_config = config.supervisor.clone();
+        daemon.review_sweep_config = config.review_sweep.clone();
         daemon.drain_config = config.drain.clone();
         daemon.evaporation_decay = config.evaporation.decay;
         daemon.require_named_checks = config.policy.require_named_checks;
@@ -180,6 +182,11 @@ impl Daemon {
         self.drain_config = cfg;
     }
 
+    #[doc(hidden)]
+    pub fn set_review_sweep_config(&mut self, cfg: rk_core::config::ReviewSweepConfig) {
+        self.review_sweep_config = cfg;
+    }
+
     fn with_space(
         layout: Layout,
         castle: String,
@@ -215,6 +222,7 @@ impl Daemon {
             reactor_config: rk_core::config::ReactorConfig::default(),
             scheduler_config: rk_core::config::SchedulerConfig::default(),
             sweep_config: rk_core::config::SupervisorConfig::default(),
+            review_sweep_config: rk_core::config::ReviewSweepConfig::default(),
             drain_config: rk_core::config::DrainConfig::default(),
             evaporation_decay: rk_core::config::EvaporationConfig::default().decay,
             global_agents: Default::default(),
@@ -312,6 +320,37 @@ impl Daemon {
                             supervisor.respawn_sweep(&cfg);
                         }
                         _ = sweep_shutdown.changed() => break,
+                    }
+                }
+            });
+        }
+
+        // Fetch-driven awaiting-review clear (TKT-70). Periodically fetch+prune
+        // each repo with an open PR and check whether the forge merged/deleted
+        // the branch upstream — clearing the inbox row for a merge the operator
+        // never pulled. Off by default (fetch is network + can hang) and coarse;
+        // the fetch stays here, off the hot inbox read path, which only reads the
+        // `pull_request_closed` events this loop emits.
+        if daemon.review_sweep_config.enabled {
+            let daemon_ref = Arc::clone(&daemon);
+            let mut rs_shutdown = daemon.shutdown_tx.subscribe();
+            let interval = Duration::from_secs(daemon.review_sweep_config.interval_secs.max(1));
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                // Consume the immediate first tick: give a freshly-opened PR a
+                // full interval before the first fetch, and don't fetch on boot.
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            let d = Arc::clone(&daemon_ref);
+                            match tokio::task::spawn_blocking(move || d.review_sweep_once()).await {
+                                Ok(0) => {}
+                                Ok(n) => debug!(closed = n, "review sweep cleared awaiting-review rows"),
+                                Err(e) => warn!(error = %e, "review sweep task panicked"),
+                            }
+                        }
+                        _ = rs_shutdown.changed() => break,
                     }
                 }
             });
@@ -872,13 +911,27 @@ impl Daemon {
             Ok(t) => t,
             Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
         };
+        // `pull_request_closed` events are emitted by the fetch-driven review
+        // sweep (TKT-70): a background pass fetched the forge and saw the branch
+        // merged/deleted upstream even though the operator never pulled, so the
+        // LOCAL detection below could not see it. `build` folds their branches
+        // into the same suppression. Reading the events is cheap and stays on
+        // the hot path; the fetch that produces them does not.
+        let pull_requests_closed = match self
+            .space
+            .scan(&Pattern::category(Category::Event).identity("pull_request_closed"))
+        {
+            Ok(t) => t,
+            Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
+        };
         // An awaiting-review row auto-clears once its branch is merged into the
         // target (or gone) — the PR-mode land opened a PR but nothing emits a
         // close event when the human merges on the forge. Detect it locally:
         // resolve each open PR's repo and ask git whether the branch has landed.
         // Local-only (no fetch, no forge API), so the row clears when the merge
         // reaches the local target — the operator's pull or a Direct-mode
-        // fast-forward. Follow-up TKT for fetch-driven detection without a pull.
+        // fast-forward. The `pull_request_closed` events above close the same gap
+        // for a forge merge the operator has NOT pulled (TKT-70).
         let cleared_prs = self.cleared_pull_requests(&pull_requests);
         let items = crate::inbox::build(
             &agents,
@@ -886,6 +939,7 @@ impl Daemon {
             &obstacles,
             &needs,
             &pull_requests,
+            &pull_requests_closed,
             &cleared_prs,
         );
         Response::ok(id, crate::inbox::to_json(&items))
@@ -931,6 +985,140 @@ impl Daemon {
             }
         }
         cleared
+    }
+
+    /// One fetch-driven review-sweep cycle (TKT-70). For each repo carrying an
+    /// open PR/MR whose branch has not already been closed, `git fetch --prune`
+    /// the remote and ask whether the forge has since merged the branch into
+    /// `<remote>/<target>` or deleted it — the case the local-only clear in
+    /// [`cleared_pull_requests`](Daemon::cleared_pull_requests) misses because
+    /// the operator never pulled. Each newly-resolved branch gets a durable
+    /// `pull_request_closed` event, which `handle_inbox` folds into the
+    /// awaiting-review suppression set. Returns the number of events emitted.
+    ///
+    /// Blocking (shells out to `git fetch`), so the caller runs it on a blocking
+    /// thread; each fetch is hard-timeout-bounded. Idempotent: a branch already
+    /// carrying a `pull_request_closed` event is skipped, so the durable event
+    /// (and its rk-sync replication) is written once.
+    fn review_sweep_once(&self) -> usize {
+        let remote = self.review_sweep_config.remote.clone();
+        let timeout = Duration::from_secs(self.review_sweep_config.fetch_timeout_secs.max(1));
+
+        let open = match self
+            .space
+            .scan(&Pattern::category(Category::Event).identity("pull_request_opened"))
+        {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "review sweep: scanning open PRs failed");
+                return 0;
+            }
+        };
+        if open.is_empty() {
+            return 0;
+        }
+        let closed = self
+            .space
+            .scan(&Pattern::category(Category::Event).identity("pull_request_closed"))
+            .unwrap_or_default();
+        // (scope, branch) already resolved — never re-emit. The durable event
+        // also replicates via rk-sync, so this guard keeps the sweep write-once.
+        let mut already: HashSet<(String, String)> = HashSet::new();
+        for t in &closed {
+            if let Some(b) = t.payload.get("branch").and_then(|v| v.as_str()) {
+                already.insert((t.scope.clone(), b.to_string()));
+            }
+        }
+        // Still-open (scope, branch) -> target, deduped (a re-land repeats the
+        // event for one branch; target is stable per branch).
+        let mut pending: std::collections::HashMap<(String, String), String> =
+            std::collections::HashMap::new();
+        for t in &open {
+            let Some(branch) = t.payload.get("branch").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let key = (t.scope.clone(), branch.to_string());
+            if already.contains(&key) {
+                continue;
+            }
+            let target = t
+                .payload
+                .get("target")
+                .and_then(|v| v.as_str())
+                .unwrap_or("main")
+                .to_string();
+            pending.insert(key, target);
+        }
+        if pending.is_empty() {
+            return 0;
+        }
+        // Group by scope so each repo is fetched exactly once per cycle.
+        let mut by_scope: std::collections::HashMap<String, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for ((scope, branch), target) in pending {
+            by_scope.entry(scope).or_default().push((branch, target));
+        }
+        // Resolve scopes to repo paths once, under the registry lock, then
+        // release it before shelling out to git.
+        let mut paths: std::collections::HashMap<String, std::path::PathBuf> =
+            std::collections::HashMap::new();
+        if let Ok(reg) = self.repos.lock() {
+            for scope in by_scope.keys() {
+                if let Some(rec) = reg.get(scope) {
+                    paths.insert(scope.clone(), rec.path.clone());
+                }
+            }
+        }
+
+        let mut emitted = 0;
+        for (scope, branches) in by_scope {
+            // Unregistered scope or unopenable repo: cannot fetch, so the row
+            // stays surfaced (fails toward surfacing, never hiding).
+            let Some(path) = paths.get(&scope) else {
+                continue;
+            };
+            let Ok(repo) = rk_git::Repo::discover(path) else {
+                continue;
+            };
+            if let Err(e) = repo.fetch_prune(&remote, timeout) {
+                // A failed/timed-out fetch leaves every row of this repo intact;
+                // the next cycle retries. Never hide a row on a network hiccup.
+                warn!(error = %e, scope = %scope, "review sweep: fetch failed");
+                continue;
+            }
+            for (branch, target) in branches {
+                if repo.remote_branch_merged_or_gone(&branch, &target, &remote) {
+                    self.emit_event(
+                        &scope,
+                        "pull_request_closed",
+                        json!({
+                            "branch": branch,
+                            "target": target,
+                            "remote": remote,
+                            "reason": "forge merged or deleted the branch",
+                        }),
+                    );
+                    emitted += 1;
+                }
+            }
+        }
+        emitted
+    }
+
+    /// Append an `Event` tuple authored by this castle. Best-effort: a store
+    /// error is logged, not propagated (event emission is never on a caller's
+    /// critical path).
+    fn emit_event(&self, scope: &str, identity: &str, payload: Value) {
+        let tuple = Tuple::new(
+            Category::Event,
+            scope.to_string(),
+            identity.to_string(),
+            self.castle.clone(),
+            payload,
+        );
+        if let Err(e) = self.space.out(tuple) {
+            warn!(error = %e, identity, "failed to emit event tuple");
+        }
     }
 
     fn handle_repo_add(&self, req: Request) -> Response {

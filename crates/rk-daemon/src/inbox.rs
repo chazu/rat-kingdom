@@ -56,6 +56,7 @@ pub fn build(
     obstacles: &[Tuple],
     needs: &[Tuple],
     pull_requests: &[Tuple],
+    pull_requests_closed: &[Tuple],
     cleared_prs: &HashSet<(String, String)>,
 ) -> Vec<InboxItem> {
     let mut items = Vec::new();
@@ -173,6 +174,18 @@ pub fn build(
     // merged into its target or deleted (computed against local git by the
     // caller); those rows have auto-cleared and are dropped, so a merged PR
     // stops nagging without waiting for its event to be pruned from the store.
+    //
+    // `pull_requests_closed` are `pull_request_closed` events emitted by the
+    // fetch-driven review sweep (TKT-70): a background pass fetched the forge
+    // and saw the branch merged/deleted upstream even though the operator never
+    // pulled, so the LOCAL `cleared_prs` check could not see it. Fold their
+    // (scope, branch) into the same suppression — a closed event clears the row.
+    let mut suppressed: HashSet<(String, String)> = cleared_prs.clone();
+    for t in pull_requests_closed {
+        if let Some(branch) = t.payload.get("branch").and_then(|v| v.as_str()) {
+            suppressed.insert((t.scope.clone(), branch.to_string()));
+        }
+    }
     let mut latest_pr: std::collections::HashMap<(String, String), &Tuple> =
         std::collections::HashMap::new();
     for t in pull_requests {
@@ -183,7 +196,7 @@ pub fn build(
             .unwrap_or("")
             .to_string();
         let key = (t.scope.clone(), branch);
-        if cleared_prs.contains(&key) {
+        if suppressed.contains(&key) {
             continue;
         }
         latest_pr.insert(key, t);
@@ -338,7 +351,7 @@ mod tests {
         )];
         let needs = vec![need("Scamper", "need a reviewer")];
 
-        let inbox = build(&agents, &instances, &obstacles, &needs, &[], &HashSet::new());
+        let inbox = build(&agents, &instances, &obstacles, &needs, &[], &[], &HashSet::new());
         let kinds: Vec<&str> = inbox.iter().map(|i| i.kind.as_str()).collect();
 
         // budget(5) > failed agent/instance(4) > parked gate(3) > need(1).
@@ -363,7 +376,7 @@ mod tests {
             instance("wf-run", InstanceStatus::Running, None),
             instance("wf-ok", InstanceStatus::Completed, None),
         ];
-        let inbox = build(&agents, &instances, &[], &[], &[], &HashSet::new());
+        let inbox = build(&agents, &instances, &[], &[], &[], &[], &HashSet::new());
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].subject, "Gone");
         assert_eq!(inbox[0].action, "rk respawn Gone");
@@ -376,7 +389,7 @@ mod tests {
             "main",
             Some("https://forge/x/y/compare/main...rat/rat-9/tkt-9"),
         )];
-        let inbox = build(&[], &[], &[], &[], &prs, &HashSet::new());
+        let inbox = build(&[], &[], &[], &[], &prs, &[], &HashSet::new());
         assert_eq!(inbox.len(), 1);
         let row = &inbox[0];
         assert_eq!(row.kind, "awaiting-review");
@@ -394,7 +407,7 @@ mod tests {
         // so the last entry for a branch wins.
         let older = pull_request("rat/rat-9/tkt-9", "main", Some("https://forge/pr/1"));
         let newer = pull_request("rat/rat-9/tkt-9", "main", Some("https://forge/pr/2"));
-        let inbox = build(&[], &[], &[], &[], &[older, newer], &HashSet::new());
+        let inbox = build(&[], &[], &[], &[], &[older, newer], &[], &HashSet::new());
         let review: Vec<&InboxItem> = inbox
             .iter()
             .filter(|i| i.kind == "awaiting-review")
@@ -414,7 +427,44 @@ mod tests {
         let mut cleared = HashSet::new();
         cleared.insert(("repo".to_string(), "rat/rat-9/tkt-9".to_string()));
 
-        let inbox = build(&[], &[], &[], &[], &[merged, still_open], &cleared);
+        let inbox = build(&[], &[], &[], &[], &[merged, still_open], &[], &cleared);
+        let review: Vec<&InboxItem> = inbox
+            .iter()
+            .filter(|i| i.kind == "awaiting-review")
+            .collect();
+        assert_eq!(review.len(), 1);
+        assert_eq!(review[0].subject, "rat/rat-8/tkt-8");
+    }
+
+    fn pull_request_closed(branch: &str) -> Tuple {
+        Tuple::new(
+            Category::Event,
+            "repo",
+            "pull_request_closed",
+            "castle",
+            json!({ "branch": branch, "target": "main", "reason": "merged" }),
+        )
+    }
+
+    #[test]
+    fn pull_request_closed_event_clears_the_row_without_a_local_pull() {
+        // The fetch-driven sweep (TKT-70) saw a forge merge the operator never
+        // pulled and emitted a `pull_request_closed` event. Even with the
+        // `pull_request_opened` event still present and NOTHING in `cleared_prs`
+        // (the local check cannot see the un-pulled merge), the row is dropped.
+        let merged = pull_request("rat/rat-9/tkt-9", "main", Some("https://forge/pr/1"));
+        let still_open = pull_request("rat/rat-8/tkt-8", "main", Some("https://forge/pr/2"));
+        let closed = vec![pull_request_closed("rat/rat-9/tkt-9")];
+
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[merged, still_open],
+            &closed,
+            &HashSet::new(),
+        );
         let review: Vec<&InboxItem> = inbox
             .iter()
             .filter(|i| i.kind == "awaiting-review")
@@ -426,7 +476,7 @@ mod tests {
     #[test]
     fn plain_obstacle_uses_text_and_obstacle_rank() {
         let obstacles = vec![obstacle("Pip", json!({"text": "merge conflict in lib.rs"}))];
-        let inbox = build(&[], &[], &obstacles, &[], &[], &HashSet::new());
+        let inbox = build(&[], &[], &obstacles, &[], &[], &[], &HashSet::new());
         assert_eq!(inbox[0].urgency, urgency::OBSTACLE);
         assert_eq!(inbox[0].detail, "merge conflict in lib.rs");
         assert_eq!(inbox[0].action, "rk status Pip");

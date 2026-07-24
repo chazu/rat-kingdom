@@ -74,6 +74,12 @@ built_).
   `APPROVE` verdict lands work directly on main instead of only completing.
 - **Named-check allowlist** — restrict `run` steps to per-repo registered checks
   (`[policy] require_named_checks`) rather than arbitrary inline commands.
+- **Fetch-driven awaiting-review clear** — an opt-in background review sweep
+  (`[review_sweep]`) `git fetch --prune`es each repo with an open PR and clears
+  the `rk inbox` awaiting-review row once the forge has merged or deleted the
+  branch — even when you never pulled the merge locally. Emits a
+  `pull_request_closed` event the inbox consults; the fetch is bounded by a hard
+  timeout and stays off the hot inbox read path.
 
 ### Safety & guardrails
 

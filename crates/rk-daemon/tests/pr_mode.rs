@@ -8,8 +8,11 @@
 //! dismiss call, differing only in the repo's registered merge mode, must take
 //! the PR fork instead.
 
+use rk_core::config::ReviewSweepConfig;
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
+use rk_ledger::Budget;
+use rk_space::Space;
 use serde_json::json;
 use std::path::Path;
 use std::process::Command;
@@ -209,6 +212,155 @@ async fn pr_mode_dismiss_opens_pr_and_keeps_branch() {
             .iter()
             .any(|it| it["kind"] == "awaiting-review" && it["subject"] == branch),
         "merged PR must auto-clear from the awaiting-review queue: {inbox}"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+// TKT-70: a human merges the PR on the forge but the operator never pulls, so
+// the LOCAL target never advances and TKT-69's local check cannot clear the
+// row. The opt-in fetch-driven review sweep closes the gap: it `git fetch
+// --prune`es the repo, sees the branch merged into `origin/main` (or pruned),
+// emits a `pull_request_closed` event, and `rk inbox` drops the row — all
+// without a local pull.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_sweep_clears_awaiting_review_on_forge_merge_without_a_pull() {
+    let home = tempfile::tempdir().unwrap();
+
+    // Bare "forge" remote + working repo pushed to it.
+    let origin = tempfile::tempdir().unwrap();
+    git(origin.path(), &["init", "--bare", "-b", "main"]);
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_path = repo_dir.path();
+    git(repo_path, &["init", "-b", "main"]);
+    git(repo_path, &["config", "user.email", "r@x"]);
+    git(repo_path, &["config", "user.name", "R"]);
+    git(
+        repo_path,
+        &["remote", "add", "origin", &origin.path().to_string_lossy()],
+    );
+    std::fs::write(repo_path.join("README.md"), "# x\n").unwrap();
+    git(repo_path, &["add", "."]);
+    git(repo_path, &["commit", "-m", "init"]);
+    git(repo_path, &["push", "-u", "origin", "main"]);
+    let base_head = git(repo_path, &["rev-parse", "main"]).trim().to_string();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    let layout = Layout::at(home.path());
+    let space = Space::open_in_memory().unwrap();
+    let mut daemon = Daemon::with_space_for_tests(
+        layout.clone(),
+        "test-castle".into(),
+        "fake".into(),
+        Budget::default(),
+        space,
+    )
+    .unwrap();
+    // Fetch-driven clear on, fast cadence so the test does not wait minutes.
+    daemon.set_review_sweep_config(ReviewSweepConfig {
+        enabled: true,
+        interval_secs: 1,
+        remote: "origin".into(),
+        fetch_timeout_secs: 30,
+    });
+    tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let repo_name = repo_path.file_name().unwrap().to_string_lossy().to_string();
+    client
+        .call(
+            "repo.add",
+            json!({
+                "name": repo_name,
+                "path": repo_path.to_string_lossy(),
+                "merge_mode": "pr",
+                "remote": "origin",
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Spawn a rat, wait for its commit, dismiss to open the PR (branch pushed).
+    let spawned = client
+        .call(
+            "agent.spawn",
+            json!({"repo": repo_path.to_string_lossy(), "task": "pr-1", "harness": "fake"}),
+        )
+        .await
+        .unwrap();
+    let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+    let branch = spawned["agent"]["branch"].as_str().unwrap().to_string();
+    let mut done = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = client
+            .call("agent.status", json!({"name": name}))
+            .await
+            .unwrap();
+        if status["agent"]["state"] == "completed" {
+            done = true;
+            break;
+        }
+    }
+    assert!(done, "rat {name} never completed");
+    let res = client
+        .call("agent.dismiss", json!({"name": name}))
+        .await
+        .unwrap();
+    assert_eq!(res["pr_opened"], true, "PR mode must open a PR: {res}");
+
+    // The awaiting-review row is present.
+    let inbox = client.call("inbox.list", json!({})).await.unwrap();
+    assert!(
+        inbox["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|it| it["kind"] == "awaiting-review" && it["subject"] == branch),
+        "open PR must show as awaiting-review: {inbox}"
+    );
+
+    // A human merges the PR on the forge: advance ONLY the bare's main via a
+    // throwaway clone. The working repo never pulls, so its local main stays.
+    let forge = tempfile::tempdir().unwrap();
+    git(
+        forge.path(),
+        &["clone", &origin.path().to_string_lossy(), "."],
+    );
+    git(forge.path(), &["config", "user.email", "f@x"]);
+    git(forge.path(), &["config", "user.name", "F"]);
+    git(
+        forge.path(),
+        &["merge", "--no-ff", "-m", "merge PR", &format!("origin/{branch}")],
+    );
+    git(forge.path(), &["push", "origin", "main"]);
+
+    // The local target is unchanged — TKT-69's local check cannot clear the row.
+    assert_eq!(
+        git(repo_path, &["rev-parse", "main"]).trim(),
+        base_head,
+        "sanity: local main must NOT have advanced (no pull happened)"
+    );
+
+    // The review sweep (interval 1s) fetches, sees origin/main now contains the
+    // branch, emits pull_request_closed, and the row clears.
+    let mut cleared = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let inbox = client.call("inbox.list", json!({})).await.unwrap();
+        let still_open = inbox["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|it| it["kind"] == "awaiting-review" && it["subject"] == branch);
+        if !still_open {
+            cleared = true;
+            break;
+        }
+    }
+    assert!(
+        cleared,
+        "the fetch-driven sweep must clear the awaiting-review row after a forge merge with no local pull"
     );
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");

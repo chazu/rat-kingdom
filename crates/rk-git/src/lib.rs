@@ -3,8 +3,9 @@
 //! same binary humans use when they inspect what the rats did.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 /// Per-merge sequence, so two `merge_branch` calls running at once (e.g. a
@@ -137,6 +138,61 @@ impl Repo {
             return true;
         }
         self.is_ancestor(branch, target)
+    }
+
+    /// Fetch `remote` and prune deleted remote-tracking branches, bounded by
+    /// `timeout` so a hung network fetch cannot pin the caller. Non-interactive
+    /// (`GIT_TERMINAL_PROMPT=0`), so a missing-credential prompt fails fast
+    /// instead of blocking forever on stdin. `--quiet` keeps progress off the
+    /// captured stderr so the bounded pipe cannot fill while we poll.
+    ///
+    /// This is the network half of the fetch-driven awaiting-review clear
+    /// (TKT-70): refresh the remote-tracking refs so
+    /// [`remote_branch_merged_or_gone`](Repo::remote_branch_merged_or_gone) can
+    /// see a forge-side merge/delete the operator has not pulled locally.
+    pub fn fetch_prune(&self, remote: &str, timeout: Duration) -> rk_core::Result<()> {
+        if remote.trim().is_empty() {
+            return Err(rk_core::Error::other("fetch_prune requires a remote"));
+        }
+        git_bounded(
+            &self.root,
+            &["fetch", "--prune", "--no-tags", "--quiet", remote],
+            timeout,
+        )
+        .map(|_| ())
+    }
+
+    /// Remote-side analogue of [`branch_merged_or_gone`](Repo::branch_merged_or_gone):
+    /// after a [`fetch_prune`](Repo::fetch_prune), decide whether the forge has
+    /// dealt with `branch` — its remote-tracking ref `<remote>/<branch>` is gone
+    /// (pruned after a forge-side delete) or has been merged into
+    /// `<remote>/<target>`.
+    ///
+    /// Where `branch_merged_or_gone` reads the LOCAL target — which only
+    /// advances when the operator pulls — this reads the remote-tracking refs a
+    /// `fetch --prune` just refreshed, so it sees a human's forge merge with no
+    /// local pull. Pure read over `refs/remotes/*`; run `fetch_prune` first. An
+    /// unresolvable `<remote>/<target>` (never fetched) yields "not merged", so
+    /// the awaiting-review row stays — the same fail-toward-surfacing direction
+    /// as the local check.
+    pub fn remote_branch_merged_or_gone(&self, branch: &str, target: &str, remote: &str) -> bool {
+        let remote_branch = format!("{remote}/{branch}");
+        if !self.remote_ref_exists(&remote_branch) {
+            return true;
+        }
+        self.is_ancestor(&remote_branch, &format!("{remote}/{target}"))
+    }
+
+    /// Whether a remote-tracking ref `<remote>/<name>` exists locally (i.e. the
+    /// last fetch saw it and a prune has not removed it).
+    fn remote_ref_exists(&self, remote_name: &str) -> bool {
+        self.git(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/{remote_name}"),
+        ])
+        .is_ok()
     }
 
     /// Create a worktree at `path` on new `branch` forked from `base`.
@@ -443,6 +499,62 @@ fn git_output(dir: &Path, args: &[&str]) -> rk_core::Result<String> {
         String::from_utf8_lossy(&out.stdout),
         stderr
     ))
+}
+
+/// Like [`git_in`], but kills the child if it runs longer than `timeout`.
+/// For network operations (`fetch`) that can hang indefinitely on an
+/// unreachable remote or a credential prompt; a timeout is a clean `Err`, not a
+/// pinned thread. Polls `try_wait` on a short interval — cheap for an operation
+/// measured in seconds, and the captured output is bounded (`--quiet`) so the
+/// pipe never fills while we poll.
+fn git_bounded(dir: &Path, args: &[&str], timeout: Duration) -> rk_core::Result<String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| rk_core::Error::other(format!("git not runnable: {e}")))?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let out = child.wait_with_output().map_err(|e| {
+                    rk_core::Error::other(format!("git {} output failed: {e}", args.join(" ")))
+                })?;
+                if !status.success() {
+                    return Err(rk_core::Error::other(format!(
+                        "git {} failed: {}",
+                        args.join(" "),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )));
+                }
+                return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(rk_core::Error::other(format!(
+                        "git {} timed out after {timeout:?}",
+                        args.join(" ")
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(rk_core::Error::other(format!(
+                    "git {} wait failed: {e}",
+                    args.join(" ")
+                )));
+            }
+        }
+    }
 }
 
 /// Infer the [`Host`] from a remote URL (`git@github.com:o/r.git`,
@@ -910,5 +1022,82 @@ mod tests {
         // A bad revision must read as "not an ancestor", never merged.
         assert!(!repo.is_ancestor("rat/does-not-exist/tkt", "main"));
         assert!(!repo.is_ancestor("main", "no-such-target"));
+    }
+
+    #[test]
+    fn remote_branch_merged_or_gone_sees_a_forge_merge_without_a_local_pull() {
+        let (dir, repo) = scratch_repo();
+        let bare = bare_remote(dir.path(), "plain-remote", &repo, false);
+        let branch = commit_on_branch(dir.path(), &repo, "pip", "task-1");
+        run(repo.root(), &["push", "origin", "main"]);
+        repo.push_branch(&branch, "origin").unwrap();
+        repo.fetch_prune("origin", Duration::from_secs(30)).unwrap();
+
+        // Open PR: origin/<branch> exists and is not yet in origin/main.
+        assert!(
+            !repo.remote_branch_merged_or_gone(&branch, "main", "origin"),
+            "an open, unmerged PR branch must not auto-clear"
+        );
+
+        // A human merges the PR on the forge — advance ONLY the bare's main
+        // (via a throwaway clone), never the local main. The operator never
+        // pulled, so the local check still cannot see it.
+        let clone = dir.path().join("forge-clone");
+        run(
+            dir.path(),
+            &[
+                "clone",
+                &bare.to_string_lossy(),
+                &clone.to_string_lossy(),
+            ],
+        );
+        run(&clone, &["config", "user.email", "forge@example.com"]);
+        run(&clone, &["config", "user.name", "Forge"]);
+        run(
+            &clone,
+            &[
+                "merge",
+                "--no-ff",
+                "-m",
+                "merge PR",
+                &format!("origin/{branch}"),
+            ],
+        );
+        run(&clone, &["push", "origin", "main"]);
+
+        repo.fetch_prune("origin", Duration::from_secs(30)).unwrap();
+        assert!(
+            repo.remote_branch_merged_or_gone(&branch, "main", "origin"),
+            "a branch merged into origin/main auto-clears after a fetch"
+        );
+        // The whole point of the remote check: the LOCAL target never moved, so
+        // the local-only detection still reports the branch open.
+        assert!(
+            !repo.branch_merged_or_gone(&branch, "main"),
+            "local main did not advance — only the remote check sees the merge"
+        );
+    }
+
+    #[test]
+    fn remote_branch_merged_or_gone_when_branch_pruned() {
+        let (dir, repo) = scratch_repo();
+        let _bare = bare_remote(dir.path(), "plain-remote", &repo, false);
+        let branch = commit_on_branch(dir.path(), &repo, "nibbles", "task-2");
+        run(repo.root(), &["push", "origin", "main"]);
+        repo.push_branch(&branch, "origin").unwrap();
+        repo.fetch_prune("origin", Duration::from_secs(30)).unwrap();
+        assert!(!repo.remote_branch_merged_or_gone(&branch, "main", "origin"));
+
+        // Human deletes the branch on the forge (post-merge cleanup). A prune
+        // drops the stale remote-tracking ref — cleared even without ancestry.
+        run(repo.root(), &["push", "origin", "--delete", &branch]);
+        repo.fetch_prune("origin", Duration::from_secs(30)).unwrap();
+        assert!(repo.remote_branch_merged_or_gone(&branch, "main", "origin"));
+    }
+
+    #[test]
+    fn fetch_prune_requires_a_remote() {
+        let (_dir, repo) = scratch_repo();
+        assert!(repo.fetch_prune("", Duration::from_secs(5)).is_err());
     }
 }

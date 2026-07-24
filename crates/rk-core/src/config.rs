@@ -17,6 +17,7 @@ pub struct Config {
     pub reactor: ReactorConfig,
     pub scheduler: SchedulerConfig,
     pub supervisor: SupervisorConfig,
+    pub review_sweep: ReviewSweepConfig,
     pub drain: DrainConfig,
     pub evaporation: EvaporationConfig,
     pub policy: PolicyConfig,
@@ -163,6 +164,46 @@ impl Default for SchedulerConfig {
             // daily/hourly schedule once on the next boot, without replaying a
             // week of minutes.
             catchup_minutes: 24 * 60,
+        }
+    }
+}
+
+/// Fetch-driven awaiting-review clear (TKT-70). A periodic background pass that
+/// `git fetch --prune`es each repo with an open PR/MR and checks whether the
+/// forge has since merged or deleted the branch — advancing `<remote>/<target>`
+/// where the operator's local target has not moved. On a forge-side merge/delete
+/// it emits a `pull_request_closed` event, which `rk inbox` consults to drop the
+/// stale awaiting-review row without waiting for a local pull.
+///
+/// Off by default and coarse-cadenced: a fetch touches the network and can hang,
+/// so this stays opt-in and out of the hot inbox read path (the read path never
+/// fetches; it only reads the events this sweep emitted).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ReviewSweepConfig {
+    /// Master switch. When false the sweep loop never starts and no fetch runs.
+    pub enabled: bool,
+    /// How often to fetch+prune each repo with open PRs and re-check the forge.
+    /// Coarse by default — a forge merge is not time-critical and each cycle
+    /// shells out to the network.
+    pub interval_secs: u64,
+    /// Remote to fetch and resolve `<remote>/<branch>` / `<remote>/<target>`
+    /// against.
+    pub remote: String,
+    /// Hard timeout for a single `git fetch --prune`, so a stuck network fetch
+    /// (unreachable host, missing credentials) cannot pin the sweep.
+    pub fetch_timeout_secs: u64,
+}
+
+impl Default for ReviewSweepConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // Five minutes: a forge merge takes time for a human to do, and the
+            // fetch is a network cost we do not want to pay every few seconds.
+            interval_secs: 300,
+            remote: "origin".into(),
+            fetch_timeout_secs: 30,
         }
     }
 }
