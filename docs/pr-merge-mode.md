@@ -218,11 +218,29 @@ stream or read the URL off the `rk dismiss` result / the agent's log.
 awaiting-review row clears by a local git check: once the branch is merged into
 its target (its tip is an ancestor of `target`) or the branch is gone, the row
 drops out of `rk inbox` — no need to wait for the `pull_request_opened` event to
-be pruned. Detection is local-only (no fetch, no forge API), so the row clears
-when the merge reaches your **local** target branch — i.e. after you pull the
-merge, or a Direct-mode fast-forward advances it. If you merge on the forge but
-never pull locally, the row lingers until you do; a fetch-driven variant that
-detects the merge without a local pull is left as a follow-up.
+be pruned. This check is local-only (no fetch, no forge API), so on its own it
+clears when the merge reaches your **local** target branch — i.e. after you pull
+the merge, or a Direct-mode fast-forward advances it.
+
+**Fetch-driven auto-clear (TKT-70).** If you merge the PR on the forge but never
+pull locally, the local check above cannot see it — your local target never
+advances. An **opt-in background review sweep** closes that gap: on its cadence
+it `git fetch --prune`es each repo with an open PR and checks the branch against
+the refreshed `<remote>/<target>` (and treats a pruned `<remote>/<branch>` as
+gone). On a forge-side merge or delete it emits a `pull_request_closed` event,
+which `rk inbox` folds into the same suppression — so the row clears without a
+local pull. It stays off by default and coarse-cadenced because a fetch touches
+the network and can hang; the fetch runs only in this sweep, never on the
+`rk inbox` read path (which just reads the emitted events). Enable it in
+`config.toml`:
+
+```toml
+[review_sweep]
+enabled = true          # off by default (fetch is network + can hang)
+interval_secs = 300     # how often to fetch+prune and re-check the forge
+remote = "origin"       # remote to fetch and resolve <remote>/<branch|target>
+fetch_timeout_secs = 30 # hard timeout so a stuck fetch cannot pin the sweep
+```
 
 ---
 
@@ -245,6 +263,7 @@ default_merge_mode = "pr"      # or "direct" (the default)
 | rat's branch | deleted on merge | kept for review |
 | result | `merged: true` | `merged: false, pr_opened: true, pr_url` |
 | event | `agent_dismissed` | `agent_dismissed` + `pull_request_opened` |
+| inbox auto-clear | on merge | local target advances (TKT-69); or forge merge via `[review_sweep]` (TKT-70) |
 | GitHub | — | branch pushed, compare URL surfaced |
 | GitLab | — | MR created via push option |
 | auth | none | repo checkout's own git credentials |
