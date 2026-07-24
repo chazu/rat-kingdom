@@ -62,8 +62,14 @@ enum Command {
     Endorse(space_cmds::EndorseArgs),
     /// Spawn a rat to work on a task in an isolated worktree.
     Spawn(agent_cmds::SpawnArgs),
-    /// List all agents.
-    List,
+    /// List agents (live fleet by default; --all/--archived include archived).
+    List(agent_cmds::ListArgs),
+    /// Archive settled terminal agent records (completed/failed/dismissed) out
+    /// of the default views. Nothing is deleted — cost/usage/lineage survive
+    /// and stay readable via `rk list --archived`.
+    Prune(agent_cmds::PruneArgs),
+    /// Restore an archived agent record to the live registry.
+    Unarchive(agent_cmds::NameArg),
     /// One ranked triage list of everything awaiting a human, each row carrying
     /// the exact `rk` command that resolves it.
     Inbox,
@@ -72,6 +78,9 @@ enum Command {
         /// Refresh interval in seconds.
         #[arg(long, default_value_t = 2)]
         interval: u64,
+        /// Include archived agent records in the agents pane.
+        #[arg(long)]
+        all: bool,
     },
     /// What the fleet did in the last interval — an async catch-up over the
     /// event feed, workflows, friction, spend, and inbox.
@@ -399,9 +408,11 @@ async fn main() -> Result<()> {
         Command::Suggest(args) => space_cmds::suggest(&layout, args, cli.json).await?,
         Command::Endorse(args) => space_cmds::endorse(&layout, args, cli.json).await?,
         Command::Spawn(args) => agent_cmds::spawn(&layout, args, cli.json).await?,
-        Command::List => agent_cmds::list(&layout, cli.json).await?,
+        Command::List(args) => agent_cmds::list(&layout, args, cli.json).await?,
+        Command::Prune(args) => agent_cmds::prune(&layout, args, cli.json).await?,
+        Command::Unarchive(args) => agent_cmds::unarchive(&layout, args, cli.json).await?,
         Command::Inbox => agent_cmds::inbox(&layout, cli.json).await?,
-        Command::Top { interval } => top::top(&layout, interval).await?,
+        Command::Top { interval, all } => top::top(&layout, interval, all).await?,
         Command::Digest { since, llm } => observe::digest(&layout, &since, llm, cli.json).await?,
         Command::Status(args) => agent_cmds::status(&layout, args, cli.json).await?,
         Command::Log(args) => agent_cmds::log(&layout, args, cli.json).await?,

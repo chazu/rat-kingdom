@@ -42,9 +42,35 @@ rk watch                     # live tuple stream — the system's inner monologu
 rk steer Whisker "also check CONTRIBUTING.md"   # mid-session guidance
 rk dismiss Whisker           # stop + merge its branch + clean up
 rk revert Whisker            # undo a bad auto-merge: revert the landed commit, reopen the ticket
-rk cost                      # per-agent token/cost rollup
+rk cost                      # per-agent token/cost rollup (lifetime, archived included)
 rk cost --fleet              # fleet/repo spend vs configured budget caps
+rk prune --dry-run           # preview which dead records would be archived
+rk prune                     # archive terminal records older than 7d out of the default views
 ```
+
+### Keeping the fleet views readable
+
+The agent registry never dropped a record, so after a busy session `rk list`
+and `rk top` filled with dozens of dead rows. `rk prune` archives settled
+terminal records — `completed`, `failed`, `dismissed` — into
+`agents-archive.json` beside `agents.json`. Nothing is deleted: cost, usage,
+and lineage (`parent`, `workflow_instance`) survive, so `rk cost` and the
+budget rollups are unaffected. Archived names also return to the rat-name pool.
+
+```bash
+rk prune --before 24h        # duration (30m/24h/7d/2w) or a date (2026-07-24)
+rk prune --all               # every eligible record, regardless of age
+rk prune --all --reap-git    # also reclaim worktrees + branches that already landed
+rk list --archived           # what's been archived
+rk list --all                # live fleet + archive (archived rows marked with *)
+rk top --all                 # same, in the dashboard
+rk unarchive Whisker         # put one back
+```
+
+A `spawning`/`running` rat is never archived, and neither is an `orphaned` one
+— its worktree and branch are preserved so `rk respawn` can pick it back up.
+`--reap-git` only touches a branch that has already merged into its target (or
+is already gone); an unmerged branch is left standing and reported as skipped.
 
 Spawn options: `--harness claude|codex|axe|fake`, `--model`, `--role
 rat|reviewer`, `--base <branch>`, `--parent <agent>` (completion routing),

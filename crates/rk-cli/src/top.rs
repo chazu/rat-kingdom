@@ -23,10 +23,19 @@ struct Snapshot {
     inbox: Vec<Value>,
 }
 
-pub async fn top(layout: &Layout, interval_secs: u64) -> Result<()> {
+/// `include_archived` widens the agents pane to the full history; by default
+/// `agent.list` returns only the live registry, so archived records stay out of
+/// the dashboard the way `rk list` keeps them out of its table.
+pub async fn top(layout: &Layout, interval_secs: u64, include_archived: bool) -> Result<()> {
     let mut client = Client::connect_or_spawn(layout).await?;
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &mut client, interval_secs.max(1)).await;
+    let result = run(
+        &mut terminal,
+        &mut client,
+        interval_secs.max(1),
+        include_archived,
+    )
+    .await;
     ratatui::restore();
     result
 }
@@ -35,8 +44,9 @@ async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     client: &mut Client,
     interval_secs: u64,
+    include_archived: bool,
 ) -> Result<()> {
-    let mut snapshot = fetch(client).await?;
+    let mut snapshot = fetch(client, include_archived).await?;
     let mut refreshed = Instant::now();
     loop {
         terminal.draw(|f| draw(f, &snapshot))?;
@@ -51,7 +61,7 @@ async fn run(
                             return Ok(())
                         }
                         KeyCode::Char('r') => {
-                            snapshot = fetch(client).await?;
+                            snapshot = fetch(client, include_archived).await?;
                             refreshed = Instant::now();
                         }
                         _ => {}
@@ -60,15 +70,20 @@ async fn run(
             }
         }
         if refreshed.elapsed() >= Duration::from_secs(interval_secs) {
-            snapshot = fetch(client).await?;
+            snapshot = fetch(client, include_archived).await?;
             refreshed = Instant::now();
         }
     }
 }
 
-async fn fetch(client: &mut Client) -> Result<Snapshot> {
+async fn fetch(client: &mut Client, include_archived: bool) -> Result<Snapshot> {
     let status = client.call("status", json!({})).await?;
-    let agents = client.call("agent.list", json!({})).await?["agents"]
+    let agents = client
+        .call(
+            "agent.list",
+            json!({ "include_archived": include_archived }),
+        )
+        .await?["agents"]
         .as_array()
         .cloned()
         .unwrap_or_default();
