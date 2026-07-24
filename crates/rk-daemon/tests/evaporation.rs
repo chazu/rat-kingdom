@@ -57,10 +57,12 @@ async fn claim_reinforcement_refreshes_in_place_without_duplicating() {
         1,
         "reinforcement does not duplicate the claim"
     );
-    assert_eq!(
-        claims[0]["strength"],
-        json!(1.0),
-        "trail carries full strength"
+    // Fresh trails decay with elapsed wall-clock, so this may dip just under
+    // 1.0 by the time the scan lands; assert a fresh-trail range, not exact 1.0.
+    let strength = claims[0]["strength"].as_f64().unwrap();
+    assert!(
+        strength > 0.9 && strength <= 1.0,
+        "trail carries essentially full strength, got {strength}"
     );
     assert!(
         claims[0]["expires_at"].is_string(),
@@ -126,7 +128,13 @@ async fn obstacle_written_without_ttl_defaults_to_an_evaporating_trail() {
         .unwrap();
     let obstacles = scan["tuples"].as_array().unwrap();
     assert_eq!(obstacles.len(), 1);
-    assert_eq!(obstacles[0]["strength"], json!(1.0));
+    // Fresh trails decay with elapsed wall-clock, so this may dip just under
+    // 1.0 by the time the scan lands; assert a fresh-trail range, not exact 1.0.
+    let strength = obstacles[0]["strength"].as_f64().unwrap();
+    assert!(
+        strength > 0.9 && strength <= 1.0,
+        "obstacle carries essentially full strength, got {strength}"
+    );
     assert!(
         obstacles[0]["expires_at"].is_string(),
         "obstacle defaulted to an Ephemeral TTL"
