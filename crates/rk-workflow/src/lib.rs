@@ -153,6 +153,9 @@ pub enum Step {
     /// Open a pull/merge request for a NAMED branch — the PR counterpart to
     /// `land`, always opening a PR regardless of the repo's merge mode.
     OpenPr(OpenPrStep),
+    /// Run another named workflow inline as a step, joining its result into
+    /// `ctx.previousResult` — workflow composition.
+    SubWorkflow(SubWorkflowStep),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -488,6 +491,32 @@ pub struct OpenPrStep {
     pub branch: String,
     /// Branch the PR targets; interpolated. E.g. `"main"`.
     pub target: String,
+}
+
+/// Run another workflow inline as a step of the current one — composition. The
+/// named workflow is resolved and launched exactly like a top-level `run`
+/// (`<repo>/.rk/workflows/<name>.cue` over the global dir), executed to
+/// completion synchronously, and its final `ctx.previous_result` joins back into
+/// the parent's `ctx.previous_result` for a following `evaluate`/`when`. This is
+/// how a macro like "decompose the backlog, then drain it" becomes one step onto
+/// the existing `backlog-drain` definition instead of a copy of its steps.
+///
+/// `params` values are templated with the parent's `{{ctx.*}}` placeholders at
+/// run time, then coerced to the child's declared `#Param` types (exactly like
+/// reactor-templated params). Nesting is bounded at runtime by a hard depth cap
+/// — the depth analog of the `repeat` max cap — so a workflow cycle fails closed
+/// rather than recursing without end.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubWorkflowStep {
+    /// Workflow definition name (or path to a `.cue` file) to run inline.
+    pub workflow: String,
+    /// Repo/path to run the child in; the parent's repo when unset.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Params for the child, each a template string interpolated against the
+    /// parent's ctx before being coerced to the child's declared param type.
+    #[serde(default)]
+    pub params: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -874,6 +903,7 @@ fn step_matches(step: &Step, matcher: &AspectMatch) -> bool {
             Step::Run(_) => "run",
             Step::Land(_) => "land",
             Step::OpenPr(_) => "open_pr",
+            Step::SubWorkflow(_) => "sub_workflow",
         };
         if actual != step_type {
             return false;
@@ -1267,6 +1297,40 @@ workflow: {
             &wf.steps[3],
             Step::Land(l) if l.branch == "rat/x/feat" && l.target == "release" && l.keep_branch
         ));
+    }
+
+    #[test]
+    fn loads_sub_workflow_step() {
+        let source = r#"
+workflow: {
+    name: "decompose-then-drain"
+    params: {limit: {type: "int", required: false, default: 5}}
+    steps: [
+        {type: "spawn", role: "rat", task: {title: "decompose"}},
+        {type: "wait"},
+        {type: "dismiss", noMerge: true},
+        {type: "sub_workflow", workflow: "backlog-drain", params: {limit: "\(_input.limit)"}},
+        {type: "sub_workflow", workflow: "groom", repo: "other-repo"},
+    ]
+}
+"#;
+        let wf = load_str(source, &HashMap::new()).unwrap();
+        assert_eq!(wf.steps.len(), 5);
+        // Param forwarded via CUE interpolation lands as a string, ready for the
+        // child's own #Param coercion; repo defaults to the parent's (None).
+        let Step::SubWorkflow(sub) = &wf.steps[3] else {
+            panic!("step 3 should be sub_workflow");
+        };
+        assert_eq!(sub.workflow, "backlog-drain");
+        assert_eq!(sub.repo, None);
+        assert_eq!(sub.params["limit"], "5");
+        // Explicit repo override, no params.
+        let Step::SubWorkflow(sub) = &wf.steps[4] else {
+            panic!("step 4 should be sub_workflow");
+        };
+        assert_eq!(sub.workflow, "groom");
+        assert_eq!(sub.repo.as_deref(), Some("other-repo"));
+        assert!(sub.params.is_empty());
     }
 
     #[test]

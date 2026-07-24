@@ -59,7 +59,16 @@
   Restart recovery LANDED (TKT-52): persisted instances rehydrate on startup
   and `Running` ones resume from their step cursor (`WorkflowEngine::rehydrate`,
   called from the daemon `run()` boot path).
-  REMAINING from P5: sub-workflow step.
+  Sub-workflow composition LANDED (TKT-57): a `sub_workflow` step
+  (`#SubWorkflowStep`) runs another named workflow inline to completion and joins
+  its final result into the parent's `ctx.previousResult` — resolved like
+  `rk workflow run`, params templated from ctx then coerced to the child's
+  declared types. Nesting is bounded by a hard runtime depth cap
+  (`MAX_SUBWORKFLOW_DEPTH`, the depth analog of the `repeat` max cap) so a
+  workflow cycle fails closed. Enables the auto-decompose→drain macro as a
+  composition (`examples/workflows/decompose-then-drain.cue`);
+  e2e `crates/rk-daemon/tests/sub_workflow.rs`.
+  P5 COMPLETE.
 - **P3 herdr mux DONE** — rk-mux (shell-out to herdr CLI): `rk spawn
   --attach` runs the harness TUI in a herdr pane (prompt delivered on
   herdr's idle report, completion via the rat's own `rk done` tuple, steer

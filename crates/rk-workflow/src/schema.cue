@@ -97,8 +97,8 @@ workflow: #Workflow
 #AspectMatch: {
 	// Step type: "spawn" | "wait" | "evaluate" | "dismiss" | "gate" | "read" |
 	// "when" | "repeat" | "break" | "stop" | "for_each" | "wait_all" |
-	// "dismiss_all" | "run" | "land". Aspects only weave top-level steps, not
-	// steps nested inside `when`/`repeat`.
+	// "dismiss_all" | "run" | "land" | "open_pr" | "sub_workflow". Aspects only
+	// weave top-level steps, not steps nested inside `when`/`repeat`.
 	type?: string
 	// Spawn steps only: match by role.
 	role?: string
@@ -107,7 +107,7 @@ workflow: #Workflow
 #Step: #SpawnStep | #WaitStep | #EvaluateStep | #DismissStep | #GateStep |
 	#ReadStep | #WhenStep | #RepeatStep | #BreakStep | #StopStep |
 	#ForEachStep | #WaitAllStep | #DismissAllStep | #RunStep | #LandStep |
-	#OpenPrStep
+	#OpenPrStep | #SubWorkflowStep
 
 // Tuple categories a `read` step may match.
 #Category: "fact" | "convention" | "task" | "available" | "claim" | "obstacle" |
@@ -374,4 +374,35 @@ workflow: #Workflow
 	type:   "open_pr"
 	branch: string
 	target: string
+}
+
+// Run another workflow as a step of this one — composition, so a macro like
+// "decompose the backlog, then drain it" is one `sub_workflow` step onto the
+// existing `backlog-drain` definition rather than a hand-copied duplicate of its
+// steps. The named workflow is resolved and launched exactly like a top-level
+// `rk workflow run <name>`: `<repo>/.rk/workflows/<name>.cue` wins over the
+// global dir. It runs to completion INLINE (this step blocks on it), and its
+// final result joins back into the parent's `ctx.previousResult` — so a
+// following `evaluate`/`when` can gate on how the child finished, e.g.
+// `evaluate {expect: {all_ok: true}}` after composing a fan-out drain.
+//
+// `params` are templated with the parent's `{{ctx.*}}` placeholders at run time
+// (like a `run` command), then coerced to the child's declared `#Param` types —
+// so forward a parent param with CUE interpolation, `params: {limit: "\(_input.limit)"}`.
+// A child failure fails this step (fail-closed), surfacing in `rk inbox` as its
+// own failed instance plus the parent's failure.
+//
+// SAFETY: nesting is bounded by a hard runtime depth cap (the depth analog of
+// the `repeat` max cap) — a workflow cycle (A→B→A…) fails closed at the cap
+// rather than recursing forever.
+#SubWorkflowStep: {
+	type: "sub_workflow"
+	// Workflow definition name (or a path to a `.cue` file), resolved like
+	// `rk workflow run`.
+	workflow: string
+	// Registered repo/path to run the child in; defaults to the parent's repo.
+	repo?: string
+	// Params for the child, each templated from the parent's ctx then coerced to
+	// the child's declared param type. Omit for a child whose params all default.
+	params?: [string]: string
 }

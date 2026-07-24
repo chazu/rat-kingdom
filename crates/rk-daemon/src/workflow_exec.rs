@@ -10,8 +10,8 @@ use rk_core::tuple::{Category, Pattern};
 use rk_space::Space;
 use rk_workflow::{
     resolve::{resolve, resolve_fields},
-    AgentProfile, DismissAllStep, ForEachStep, RunStep, Step, TicketQuery, TierRouting,
-    WaitAllStep, Workflow,
+    AgentProfile, DismissAllStep, ForEachStep, RunStep, Step, SubWorkflowStep, TicketQuery,
+    TierRouting, WaitAllStep, Workflow,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -30,6 +30,12 @@ type StepFuture<'a> = Pin<Box<dyn Future<Output = rk_core::Result<Flow>> + Send 
 /// Mirrors rk-workflow's `RunStep` timeout default; a referencing `run` step
 /// left at this value defers to a named check's own timeout (TKT-30).
 const DEFAULT_RUN_TIMEOUT: &str = "10m";
+
+/// Hard ceiling on `sub_workflow` nesting depth — the depth analog of the
+/// `repeat` max cap (rk-workflow `#RepeatStep.max`). A top-level `run` is depth
+/// 0; each nested `sub_workflow` is one deeper. A workflow cycle (A→B→A…) hits
+/// this cap and fails closed rather than recursing until it exhausts the stack.
+const MAX_SUBWORKFLOW_DEPTH: usize = 8;
 
 /// The effective parameters of a `run` step after named-check resolution and
 /// policy enforcement — a raw command or a repo-registered check collapse to the
@@ -73,6 +79,12 @@ pub struct Instance {
     /// its first run (TKT-52).
     #[serde(default)]
     pub params: HashMap<String, Value>,
+    /// Sub-workflow nesting depth: 0 for a top-level `run`, incremented for each
+    /// enclosing `sub_workflow` step (TKT-57). Bounded by
+    /// [`MAX_SUBWORKFLOW_DEPTH`] — the depth analog of the `repeat` max cap — so
+    /// a workflow cycle fails closed instead of recursing without end.
+    #[serde(default)]
+    pub depth: usize,
     pub started_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -221,6 +233,7 @@ impl WorkflowEngine {
             instance_max_usd: workflow.budget.map(|b| b.max_usd),
             definition: name.to_string(),
             params,
+            depth: 0,
             started_at: chrono::Utc::now(),
             completed_at: None,
         };
@@ -304,7 +317,12 @@ impl WorkflowEngine {
                     continue;
                 }
             };
-            let running = instance.status == InstanceStatus::Running;
+            // Only top-level (depth 0) instances resume standalone. A nested
+            // sub-workflow child (depth > 0) is re-driven by its parent's
+            // resumed `sub_workflow` step (which re-runs the interrupted step and
+            // launches a fresh child), so resuming it independently here would
+            // double-run its agents. It is still loaded into memory for history.
+            let running = instance.status == InstanceStatus::Running && instance.depth == 0;
             self.lock().insert(instance.id.clone(), instance.clone());
             if running {
                 resumable.push(instance);
@@ -678,9 +696,111 @@ impl WorkflowEngine {
                         .await?;
                     self.update(id, |i| i.context.previous_result = Some(result.clone()));
                 }
+                Step::SubWorkflow(sub) => {
+                    let result = self.run_sub_workflow(id, sub, repo, &ctx).await?;
+                    self.update(id, |i| i.context.previous_result = Some(result.clone()));
+                }
             }
             Ok(Flow::Next)
         })
+    }
+
+    /// Run another workflow inline as a step — composition (TKT-57). Resolves and
+    /// loads the named definition exactly like a top-level `run` (params
+    /// templated from the parent's ctx, then coerced to the child's declared
+    /// types), executes it to completion on THIS task (the parent step blocks on
+    /// it), and returns the child's final `ctx.previous_result` so the caller can
+    /// join it into the parent's context for a following `evaluate`/`when`.
+    ///
+    /// The child gets its own persisted [`Instance`] and its own
+    /// `workflow_complete`/`workflow_failed` event via [`finalize`], so it shows
+    /// up in `rk workflow list`/`status` and (on failure) `rk inbox` just like a
+    /// directly-run workflow — the one difference being that its result flows
+    /// back to a parent. Its budget/agents come from its own definition, so
+    /// running B as a sub-step behaves like running B directly.
+    ///
+    /// Nesting is bounded by [`MAX_SUBWORKFLOW_DEPTH`]: a child one deeper than
+    /// its parent, refused fail-closed past the cap. This is the depth analog of
+    /// the `repeat` max cap and is what keeps a workflow cycle (A→B→A…) finite.
+    /// A child failure is propagated as this step's error (fail-closed).
+    async fn run_sub_workflow(
+        &self,
+        parent_id: &str,
+        sub: &SubWorkflowStep,
+        repo: &str,
+        ctx: &WorkflowContext,
+    ) -> rk_core::Result<Value> {
+        let parent_depth = self.lock().get(parent_id).map(|i| i.depth).unwrap_or(0);
+        let depth = parent_depth + 1;
+        if depth > MAX_SUBWORKFLOW_DEPTH {
+            return Err(rk_core::Error::other(format!(
+                "sub_workflow nesting too deep (depth {depth} > cap {MAX_SUBWORKFLOW_DEPTH}): \
+                 refusing to run '{}' — a workflow cycle? (depth guard, the analog of the \
+                 repeat max cap)",
+                sub.workflow
+            )));
+        }
+        // Repo defaults to the parent's; a child may target another registered
+        // repo/path when set.
+        let child_repo = sub.repo.clone().unwrap_or_else(|| repo.to_string());
+        // Interpolate each param against the parent's ctx, then hand them to the
+        // loader as strings — coerced to the child's declared `#Param` types
+        // exactly like reactor-templated params (a single `--param k=v` is a
+        // string too). Forward a parent param with CUE interpolation in the def.
+        let params: HashMap<String, Value> = sub
+            .params
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::String(interpolate(v, ctx))))
+            .collect();
+        let file = self.find_definition(&sub.workflow, &child_repo)?;
+        let workflow = rk_workflow::load(&file, &params)?;
+        let workflow_name = workflow.name.clone();
+        let child = Instance {
+            id: prefixed_id("wf"),
+            workflow: workflow_name.clone(),
+            repo: child_repo.clone(),
+            status: InstanceStatus::Running,
+            current_step: 0,
+            total_steps: workflow.steps.len(),
+            context: WorkflowContext::default(),
+            error: None,
+            awaiting: None,
+            instance_max_usd: workflow.budget.map(|b| b.max_usd),
+            definition: sub.workflow.clone(),
+            params,
+            depth,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+        };
+        let child_id = child.id.clone();
+        self.store(child);
+        info!(parent = %parent_id, child = %child_id, workflow = %workflow_name, depth, "running sub-workflow inline");
+        // Execute the child on this task so the parent step joins on it. finalize
+        // records the terminal status and emits the child's own completion event,
+        // identical to a top-level run.
+        match self.execute(&child_id, workflow, &child_repo).await {
+            Ok(()) => {
+                self.finalize(&child_id, &child_repo, &workflow_name, Ok(()));
+                // The child's final result is this sub_workflow's return value.
+                Ok(self
+                    .status(&child_id)
+                    .and_then(|i| i.context.previous_result)
+                    .unwrap_or(Value::Null))
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.finalize(
+                    &child_id,
+                    &child_repo,
+                    &workflow_name,
+                    Err(rk_core::Error::other(msg.clone())),
+                );
+                Err(rk_core::Error::other(format!(
+                    "sub_workflow '{}' (instance {child_id}) failed: {msg}",
+                    sub.workflow
+                )))
+            }
+        }
     }
 
     /// Enumerate the matching tickets and spawn one agent per ticket in
@@ -1459,6 +1579,7 @@ fn step_label(step: &Step) -> String {
         },
         Step::Land(l) => format!("land {} → {}", l.branch, l.target),
         Step::OpenPr(p) => format!("open_pr {} → {}", p.branch, p.target),
+        Step::SubWorkflow(s) => format!("sub_workflow {}", s.workflow),
     }
 }
 
