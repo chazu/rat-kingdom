@@ -30,7 +30,13 @@ const DEFAULT_BLOCK: Duration = Duration::from_secs(5);
 pub struct Daemon {
     layout: Layout,
     space: Space,
+    /// The wire identity: this castle's Ed25519 actor id (`castle-<hex>`). Every
+    /// daemon-authored tuple's `instance`, the sync author, and arbitration key
+    /// on it — NEVER the display alias (TKT-124).
     castle: String,
+    /// Operator-facing display string for this castle: the `castle_name` alias if
+    /// set, else `castle` verbatim. Presentation-only — used in `status`/logs.
+    castle_display: String,
     supervisor: Arc<crate::supervisor::Supervisor>,
     syncer: Option<Arc<crate::sync::Syncer>>,
     sync_interval: Duration,
@@ -70,24 +76,26 @@ impl Daemon {
             repo_max_usd: config.budget.repo_max_usd,
             warn_at: config.budget.warn_at,
         };
-        // Castle identity: an explicit `castle_name` override still wins (a
-        // human-friendly author label), but the DEFAULT is now the stable,
-        // authenticated actor id derived from this castle's Ed25519 key —
-        // no longer the fragile hostname (TKT-59).
-        let castle = match config.castle_name.clone() {
-            Some(name) => name,
-            None => rk_core::identity::CastleIdentity::load_or_create(&layout.castle_key_path())?
-                .actor()
-                .to_string(),
-        };
+        // Castle identity: the wire id is ALWAYS the stable, authenticated actor
+        // id derived from this castle's Ed25519 key (TKT-59) — it signs every
+        // replicated op and keys arbitration. A configured `castle_name` is a
+        // PRESENTATION-ONLY alias (TKT-124), applied only at render time; it must
+        // never become the wire id, or it would leak into signed records.
+        let actor = rk_core::identity::CastleIdentity::load_or_create(&layout.castle_key_path())?
+            .actor()
+            .to_string();
+        let display =
+            rk_core::identity::CastleDisplay::new(actor.clone(), config.castle_name.clone());
+        let castle_display = display.own().to_string();
         let mut daemon = Self::with_space(
             layout,
-            castle,
+            actor,
             config.harness.default.clone(),
             budget,
             fleet_budget,
             space,
         )?;
+        daemon.castle_display = castle_display;
         daemon.global_agents = config
             .agents
             .iter()
@@ -227,6 +235,9 @@ impl Daemon {
         Ok(Self {
             layout,
             space,
+            // Default the display to the wire id; Daemon::new overrides it with
+            // the configured alias. Test constructors keep id == display.
+            castle_display: castle.clone(),
             castle,
             supervisor,
             syncer: None,
@@ -281,7 +292,7 @@ impl Daemon {
 
         let listener = UnixListener::bind(&sock)?;
         std::fs::write(self.layout.pid_file(), std::process::id().to_string())?;
-        info!(socket = %sock.display(), pid = std::process::id(), castle = %self.castle, "daemon listening");
+        info!(socket = %sock.display(), pid = std::process::id(), castle = %self.castle_display, "daemon listening");
         // Only now that the bind is won may shared state be touched.
         self.supervisor.on_daemon_started();
 
@@ -1388,7 +1399,9 @@ impl Daemon {
         json!({
             "version": env!("CARGO_PKG_VERSION"),
             "pid": std::process::id(),
-            "castle": self.castle,
+            // Operator-facing: the friendly alias if configured, else the actor
+            // id. The wire id (self.castle) is never exposed here as a name.
+            "castle": self.castle_display,
             "uptime_secs": self.started.elapsed().as_secs(),
             "socket": self.layout.socket_path(),
             "tuples": self.space.count().unwrap_or(0),
@@ -1628,5 +1641,91 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod display_alias_tests {
+    //! TKT-124: the `castle_name` alias is presentation-only. These tests pin the
+    //! load-bearing invariant that the alias is confined to the display field and
+    //! NEVER becomes the wire identity (`self.castle`) — the string handed to the
+    //! syncer and stamped on every daemon-authored tuple's `instance`. If a
+    //! future refactor re-routes `castle_name` back into the wire id, the alias
+    //! would leak into signed `SyncRecord`s; that regression fails here.
+    use super::*;
+    use rk_core::config::Config;
+
+    fn daemon_with_alias(alias: Option<&str>) -> (tempfile::TempDir, Daemon) {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        let config = Config {
+            castle_name: alias.map(|s| s.to_string()),
+            ..Config::default()
+        };
+        let daemon = Daemon::new(layout, &config).unwrap();
+        (dir, daemon)
+    }
+
+    #[test]
+    fn alias_is_the_display_but_never_the_wire_id() {
+        let (_dir, daemon) = daemon_with_alias(Some("Nikaido"));
+        // Wire id is the crypto actor, NOT the alias — so nothing the syncer
+        // exports (author == self.castle) can carry "Nikaido".
+        assert!(daemon.castle.starts_with("castle-"));
+        assert_ne!(daemon.castle, "Nikaido");
+        // Display + the status render path both show the friendly alias.
+        assert_eq!(daemon.castle_display, "Nikaido");
+        assert_eq!(daemon.status()["castle"], json!("Nikaido"));
+    }
+
+    #[test]
+    fn unset_alias_shows_the_actor_id_unchanged() {
+        let (_dir, daemon) = daemon_with_alias(None);
+        assert!(daemon.castle.starts_with("castle-"));
+        // No behaviour change when unset: display == wire id == status.
+        assert_eq!(daemon.castle_display, daemon.castle);
+        assert_eq!(daemon.status()["castle"], json!(daemon.castle));
+    }
+
+    /// The faithful end-to-end regression: with an alias configured AND sync on,
+    /// read back the records this castle actually exported (its own notes ref)
+    /// and assert the alias appears in NONE of them — every record carries only
+    /// the crypto actor id.
+    #[test]
+    fn alias_never_appears_in_an_exported_sync_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        let mut config = Config {
+            castle_name: Some("Nikaido".into()),
+            ..Config::default()
+        };
+        config.sync.enabled = true;
+        let daemon = Daemon::new(layout, &config).unwrap();
+
+        // Syncer::new wrote the castle-presence record at construction. Read it
+        // back through a reader bound to the same identity/ref.
+        let syncer = daemon
+            .syncer
+            .as_ref()
+            .expect("sync enabled → syncer present");
+        let identity =
+            rk_core::identity::CastleIdentity::load_or_create(&daemon.layout.castle_key_path())
+                .unwrap();
+        let reader = rk_sync::NotesSync::new(syncer.repo_path(), identity);
+        let records = reader.own_records().unwrap();
+
+        assert!(!records.is_empty(), "expected at least the presence record");
+        for r in &records {
+            let json = serde_json::to_string(r).unwrap();
+            assert!(
+                !json.contains("Nikaido"),
+                "presentation alias leaked into a SyncRecord: {json}"
+            );
+            assert!(
+                r.actor.starts_with("castle-"),
+                "record actor must be the crypto id, got {}",
+                r.actor
+            );
+        }
     }
 }

@@ -8,7 +8,12 @@ use std::path::Path;
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
-    /// Castle (machine/instance) name; defaults to the hostname at first run.
+    /// Operator-facing DISPLAY alias for this castle (e.g. "Nikaido"), shown in
+    /// `rk status`/`rk top`, log lines, and tuple author columns via
+    /// [`crate::identity::CastleDisplay`]. PRESENTATION-ONLY (TKT-124): the signed
+    /// wire identity is always the Ed25519 actor id (`castle-<hex>`), so the alias
+    /// never enters a `SyncRecord`, a git ref, arbitration, or trust. Unset ⇒ the
+    /// actor id is shown verbatim (no behaviour change).
     pub castle_name: Option<String>,
     pub log: LogConfig,
     pub harness: HarnessConfig,

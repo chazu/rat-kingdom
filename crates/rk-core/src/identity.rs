@@ -98,6 +98,60 @@ impl CastleIdentity {
     pub fn sign(&self, msg: &[u8]) -> String {
         hex::encode(self.signing.sign(msg).to_bytes())
     }
+
+    /// Read the actor id from a persisted key WITHOUT minting one. Returns `None`
+    /// if no key exists yet (e.g. the daemon has never run) or it is unreadable.
+    /// Presentation-only callers (a [`CastleDisplay`] resolver in a read-only CLI
+    /// render path) use this so merely printing a friendly name never has the
+    /// side effect of creating signing material.
+    pub fn actor_at(path: &Path) -> Option<String> {
+        Self::try_load(path).ok().flatten().map(|id| id.actor)
+    }
+}
+
+/// Presentation-only mapping from a wire actor id to an operator-facing display
+/// string (TKT-124). An operator may set a friendly `castle_name` alias (e.g.
+/// "Nikaido"); this resolver rewrites THIS castle's own actor id to that alias at
+/// render time — and nothing else.
+///
+/// The alias is never signed, replicated, written to a git ref, or consulted in
+/// arbitration/trust: those always key on [`CastleIdentity::actor`]. Two castles
+/// that pick the same alias stay unambiguous on the wire because the wire never
+/// sees the alias. Absent an alias every id renders as itself, so unset behaviour
+/// is unchanged. Aliases for REMOTE castles are out of scope: any author that is
+/// not this castle's own actor passes through verbatim.
+#[derive(Debug, Clone)]
+pub struct CastleDisplay {
+    actor: String,
+    alias: Option<String>,
+}
+
+impl CastleDisplay {
+    /// Build a resolver for the local castle from its `actor` id and the
+    /// operator's optional `castle_name`. A blank/whitespace alias is treated as
+    /// unset so a stray `castle_name = ""` cannot erase the id.
+    pub fn new(actor: impl Into<String>, alias: Option<String>) -> Self {
+        let alias = alias.filter(|a| !a.trim().is_empty());
+        Self {
+            actor: actor.into(),
+            alias,
+        }
+    }
+
+    /// This castle's own display string: the alias if set, else its actor id.
+    pub fn own(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.actor)
+    }
+
+    /// Render an author id for an operator: this castle's own actor id becomes its
+    /// alias; every other author (a remote `castle-<hex>`, a rat name, "daemon")
+    /// is returned unchanged.
+    pub fn resolve<'a>(&'a self, author: &'a str) -> &'a str {
+        match &self.alias {
+            Some(alias) if author == self.actor => alias,
+            _ => author,
+        }
+    }
 }
 
 /// Derive the actor id from a public key: `castle-<first 16 hex of key>`.
@@ -169,6 +223,52 @@ mod tests {
         assert!(!verify_sig("not-hex", "also-not-hex", b"x"));
         assert!(!verify_sig("abcd", "ef01", b"x"));
         assert!(actor_from_pubkey_hex("zzzz").is_none());
+    }
+
+    #[test]
+    fn display_resolves_own_actor_to_alias_and_leaves_others_verbatim() {
+        let id = CastleIdentity::generate();
+        let actor = id.actor().to_string();
+        let display = CastleDisplay::new(actor.clone(), Some("Nikaido".into()));
+        // Own name and the own actor id both render as the alias.
+        assert_eq!(display.own(), "Nikaido");
+        assert_eq!(display.resolve(&actor), "Nikaido");
+        // A remote castle and a rat name pass through unchanged (remote aliases
+        // are out of scope).
+        assert_eq!(
+            display.resolve("castle-deadbeefdeadbeef"),
+            "castle-deadbeefdeadbeef"
+        );
+        assert_eq!(display.resolve("Martin"), "Martin");
+        // The alias is purely presentational — the crypto actor id is untouched.
+        assert_eq!(id.actor(), actor);
+    }
+
+    #[test]
+    fn display_without_alias_falls_back_to_the_actor_id() {
+        let id = CastleIdentity::generate();
+        let actor = id.actor().to_string();
+        // Unset, and a blank alias, both fall back to the actor id (no behaviour
+        // change when `castle_name` is absent or empty).
+        for alias in [None, Some(String::new()), Some("  ".into())] {
+            let display = CastleDisplay::new(actor.clone(), alias);
+            assert_eq!(display.own(), actor);
+            assert_eq!(display.resolve(&actor), actor);
+        }
+    }
+
+    #[test]
+    fn actor_at_reads_without_minting_a_key() {
+        let dir = std::env::temp_dir().join(format!("rk-id-at-{}", std::process::id()));
+        let path = dir.join("castle.key");
+        let _ = std::fs::remove_file(&path);
+        // No key yet: a read-only display path must not create one.
+        assert!(CastleIdentity::actor_at(&path).is_none());
+        assert!(!path.exists());
+        // Once the daemon mints one, the same actor id is readable side-effect-free.
+        let id = CastleIdentity::load_or_create(&path).unwrap();
+        assert_eq!(CastleIdentity::actor_at(&path).as_deref(), Some(id.actor()));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
