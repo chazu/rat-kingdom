@@ -166,19 +166,23 @@ On **every rat completion** (`Event/harness_result`, emitted by
 1. spawns a cheap reviewer chained onto the completed branch;
 2. runs a **policy gate** — refuses to auto-merge a diff touching protected
    paths (`git diff --name-only <target>...HEAD` matched against an ERE);
-3. runs the repo's **real test/lint gate** (`run` step — teeth the harness
+3. runs a **diff-scope gate** — refuses to auto-merge a diff over a per-repo
+   size budget (`maxDiffFiles` / `maxDiffLines`, `0` = off), so a runaway rat
+   that dodges protected paths but rewrites half the repo is held for a human
+   rather than auto-merged;
+4. runs the repo's **real test/lint gate** (`run` step — teeth the harness
    cannot forge);
-4. `read`s the reviewer's `APPROVE`/`REWORK`/`STOP` verdict artifact and routes:
+5. `read`s the reviewer's `APPROVE`/`REWORK`/`STOP` verdict artifact and routes:
    - `APPROVE` → `land` the branch straight onto `main` (auto-merge);
    - `REWORK` → file a follow-up ticket, hold the branch;
    - `STOP` / unknown → escalate via a `need` tuple (ranked into `rk inbox`
      *and* pushed to the operator's desktop by the [escalation-notify
      built-in](#built-in-reaction-escalation-notification)), hold the branch.
 
-Both gates **fail closed**: a protected-path hit or a red suite fails the
-instance so the branch is never merged and the failure surfaces in `rk inbox`.
-Auto-merge is only ever reached through a clean policy gate, a green suite, *and*
-an explicit `APPROVE`.
+Every gate **fails closed**: a protected-path hit, an over-budget diff, or a red
+suite fails the instance so the branch is never merged and the failure surfaces
+in `rk inbox`. Auto-merge is only ever reached through a clean policy gate, a
+within-budget diff, a green suite, *and* an explicit `APPROVE`.
 
 **Re-entrancy — match scoping.** The steward is the worked example of the fourth
 re-entrancy technique: its trigger's `match.search` is `"role":"rat"`, so it
