@@ -140,8 +140,11 @@ Grouped by leverage dimension. ★ = selected for the deep-dive top 10.
     review, allowed tools, enforced at spawn/merge. *Leverage: one config makes a
     whole repo safe for broad autonomy.*
 20. **Diff-scope guardrail** — flag/block merges touching sensitive paths or
-    exceeding a size budget. *Leverage: catches the runaway refactor before it
-    lands.*
+    exceeding a size budget (LANDED, TKT-55): the steward now runs a diff-scope
+    gate (`maxDiffFiles` / `maxDiffLines` per-repo budgets, `0` = off) beside the
+    protected-path gate — an over-budget branch fails closed and is held for a
+    human in `rk inbox` instead of auto-merging. *Leverage: catches the runaway
+    refactor before it lands.*
 21. **Rollback / revert-merge** — `rk revert <agent>` undoes a bad dismissal
     (LANDED, TKT-54). *Leverage: cheap recovery lowers the cost of trusting
     auto-merge.* The dismiss-time merge commit is recorded on the agent record;

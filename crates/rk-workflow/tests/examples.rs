@@ -285,14 +285,24 @@ fn steward_loads_and_routes() {
             .is_some_and(|c| c.contains("git diff --name-only"))),
         "a protected-path policy gate must run before merge"
     );
+    // A diff-scope gate bounds the SIZE of the branch's diff (#20): count files
+    // and added+removed lines vs the target and exit non-zero when over budget.
+    // The budget params interpolate to bare integers, so match the numstat probe.
+    assert!(
+        runs.iter().any(|r| r
+            .command
+            .as_deref()
+            .is_some_and(|c| c.contains("git diff --numstat"))),
+        "a diff-scope guardrail must run before merge"
+    );
     let gate_evaluates = workflow
         .steps
         .iter()
         .filter(|s| matches!(s, Step::Evaluate(e) if e.expect.get("exit").is_some()))
         .count();
     assert!(
-        gate_evaluates >= 2,
-        "both the policy and run gates must fail closed on non-zero exit"
+        gate_evaluates >= 3,
+        "the policy, diff-scope, and run gates must each fail closed on non-zero exit"
     );
 
     // The verdict is lifted, then routed on.

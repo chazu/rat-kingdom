@@ -13,6 +13,7 @@
 // Flow (all steps already exist — steward is their reactive application):
 //   spawn a cheap reviewer chained onto the completed branch
 //   -> POLICY GATE (#19): refuse to auto-merge diffs touching protected paths
+//   -> DIFF-SCOPE GATE (#20): refuse to auto-merge diffs over a size budget
 //   -> RUN GATE  (#6):    run the repo's real test/lint suite (real teeth)
 //   -> read the reviewer's APPROVE/REWORK/STOP verdict artifact
 //   -> when verdict:
@@ -21,10 +22,11 @@
 //        STOP    -> escalate to the operator via a `need` tuple, hold the branch
 //        (other) -> escalate + fail loudly (an unknown verdict is a bug)
 //
-// Both gates fail CLOSED: a protected-path violation or a red suite fails the
-// instance, so the branch is never merged and the failure surfaces in
-// `rk inbox`. Auto-merge is only ever reached through a clean policy gate, a
-// green suite, AND an explicit APPROVE — never on a reviewer's word alone.
+// Every gate fails CLOSED: a protected-path violation, an over-budget diff, or
+// a red suite fails the instance, so the branch is never merged and the failure
+// surfaces in `rk inbox`. Auto-merge is only ever reached through a clean policy
+// gate, a within-budget diff, a green suite, AND an explicit APPROVE — never on
+// a reviewer's word alone.
 //
 // Copy to ~/.rat-kingdom/workflows/ (global) or <repo>/.rk/workflows/, and copy
 // the matching trigger into ~/.rat-kingdom/triggers/ (or <repo>/.rk/).
@@ -54,6 +56,15 @@ workflow: {
 		// path, so the steward refuses to auto-merge and escalates to a human.
 		// Tune per repo; the default guards CI, reactor, and migration surfaces.
 		protectedPaths: {type: "string", required: false, default: "(^|/)(\\.github|\\.rk|migrations)/"}
+		// DIFF-SCOPE GUARDRAIL (#20): a per-repo size budget on the branch's diff
+		// vs `target`. A branch that changes MORE than maxDiffFiles files OR adds+
+		// removes MORE than maxDiffLines lines is too big to auto-merge on a cheap
+		// reviewer's word — the steward holds it for a human (surfaced in rk inbox)
+		// instead of APPROVE. This bounds the blast radius of a runaway rat that
+		// dodges protected paths but rewrites half the repo. 0 disables a budget;
+		// tune per repo. A hold is not a reject: the operator merges by hand.
+		maxDiffFiles: {type: "int", required: false, default: 50}
+		maxDiffLines: {type: "int", required: false, default: 2000}
 		reviewTimeout: {type: "string", required: false, default: "15m"}
 		gateTimeout: {type: "string", required: false, default: "20m"}
 	}
@@ -100,6 +111,20 @@ workflow: {
 		{
 			type: "run"
 			command: "! git diff --name-only \(_input.target)...HEAD | grep -qE '\(_input.protectedPaths)'"
+			timeout: "2m"
+		},
+		{type: "evaluate", expect: {exit: 0}},
+
+		// 2b. DIFF-SCOPE GATE (#20). Count the files the branch changes and the
+		//     added+removed lines vs the merge target, and exit non-zero if EITHER
+		//     exceeds its per-repo budget (0 = that budget off). Binary files (a
+		//     `-` in --numstat) count as 0 lines. The following evaluate turns an
+		//     over-budget diff into a fail-closed hold — a sprawling branch goes
+		//     to the operator (rk inbox), never to auto-merge, no matter how clean
+		//     its verdict.
+		{
+			type: "run"
+			command: "files=$(git diff --name-only \(_input.target)...HEAD | wc -l | tr -d ' '); lines=$(git diff --numstat \(_input.target)...HEAD | awk '{a=$1;b=$2;if(a==\"-\")a=0;if(b==\"-\")b=0;s+=a+b} END{print s+0}'); echo \"diff-scope: $files files / $lines lines vs \(_input.target) (budget \(_input.maxDiffFiles)f/\(_input.maxDiffLines)l, 0=off)\"; { [ \(_input.maxDiffFiles) -eq 0 ] || [ $files -le \(_input.maxDiffFiles) ]; } && { [ \(_input.maxDiffLines) -eq 0 ] || [ $lines -le \(_input.maxDiffLines) ]; }"
 			timeout: "2m"
 		},
 		{type: "evaluate", expect: {exit: 0}},
