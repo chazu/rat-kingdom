@@ -34,9 +34,15 @@
   local tuples, fetch-first/push, import via `out_if_new` (wakes local
   waiters), failures as system-scope obstacles. `rk sync now`, `rk peers`,
   [sync] config + interval loop. Two-castle convergence tests pass.
+  Take-op export DONE (TKT-58): the Syncer diffs a durable-tuple presence
+  snapshot each cycle — a replicated tuple that vanished locally (take, delete,
+  or TTL/decay GC) is exported as a `Take` op and dropped on peers via
+  `space.delete`, so consumed tuples no longer resurrect through `out_if_new`.
+  Per-actor history compaction DONE (TKT-58): `NotesSync::compact` prunes each
+  actor's own ref (drop `Out(T)` once taken; drop `Take(T)` once its `Out` is
+  gone from the union) — two-phase, resurrection-free across any fetch order.
   REMAINING from P6: live multi-machine validation over a real remote,
-  Take-op export wiring (consume replication), per-actor history compaction,
-  Ed25519 castle identity (currently hostname).
+  Ed25519 castle identity (currently hostname — sibling ticket).
 - **P5 CORE DONE (via `cue` CLI, decided over cuengine)** — rk-workflow:
   top-level `workflow:` field validated against embedded schema.cue; `_input`
   via CUE at load time, `{{ctx.*}}` at runtime; aspects with the predecessor's semantics;

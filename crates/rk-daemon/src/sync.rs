@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 pub struct Syncer {
     sync_repo: PathBuf,
     cursor_file: PathBuf,
+    presence_file: PathBuf,
     notes: NotesSync,
     castle: String,
     remote_configured: bool,
@@ -26,7 +27,14 @@ pub struct Syncer {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CycleStats {
     pub exported: usize,
+    /// Durable tuples that vanished locally and were exported as `Take` ops so
+    /// their consumption replicates.
+    pub takes: usize,
     pub imported: usize,
+    /// Locally-present tuples dropped because a peer consumed them.
+    pub removed: usize,
+    /// Records pruned from our own notes ref by compaction.
+    pub compacted: usize,
     pub actors_seen: usize,
     pub pushed: bool,
 }
@@ -84,6 +92,7 @@ impl Syncer {
         }
         Ok(Self {
             cursor_file: layout.home().join("sync-cursor"),
+            presence_file: layout.home().join("sync-presence"),
             notes,
             sync_repo,
             castle: castle.to_string(),
@@ -95,22 +104,39 @@ impl Syncer {
         &self.sync_repo
     }
 
-    /// One full cycle: export new local durable tuples → push/fetch → import
-    /// remotely-authored tuples into the space (waking local waiters through
-    /// the normal out path).
+    /// One full cycle: export new local durable tuples and any local
+    /// consumptions (as `Take` ops) → push/fetch → import remotely-authored
+    /// tuples (waking local waiters through the normal out path) and drop tuples
+    /// a peer consumed → compact our own history.
+    ///
+    /// Take-detection is diff-based and lives here, not on the space's `take`
+    /// path, because the syncer's seam is the tuplespace snapshot, not each
+    /// consume: a durable tuple we exported (or imported) that has *disappeared*
+    /// from the space since we last saw it was consumed locally, and its removal
+    /// must replicate or `out_if_new` would resurrect it on the next import.
+    /// This deliberately replicates every local removal of a replicated durable
+    /// tuple — `take`, targeted `delete`, and TTL/decay GC alike — which is the
+    /// correct fix for resurrection in all three cases (the log has no TTL, so a
+    /// locally-expired tuple with a surviving `Out` would otherwise be re-added
+    /// every cycle). Only a survivor still alive in the log is ever turned into
+    /// a Take, so an already-consumed tuple is never re-emitted.
     pub fn run_cycle(&self, space: &Space) -> rk_core::Result<CycleStats> {
         let cursor = self.load_cursor();
         let all = space.scan(&Pattern::default())?;
-        let ours: Vec<&Tuple> = all
+        let durable_live: Vec<&Tuple> = all
             .iter()
-            .filter(|t| {
-                t.instance == self.castle
-                    && t.lifecycle != Lifecycle::Ephemeral
-                    && cursor.map(|c| t.id > c).unwrap_or(true)
-            })
+            .filter(|t| t.lifecycle != Lifecycle::Ephemeral)
             .collect();
+        let live_ids: std::collections::BTreeSet<RecordId> =
+            durable_live.iter().map(|t| t.id).collect();
 
-        let records: Vec<SyncRecord> = ours
+        // (1) Export our own newly-authored durable tuples (cursor-bounded).
+        let ours: Vec<&Tuple> = durable_live
+            .iter()
+            .copied()
+            .filter(|t| t.instance == self.castle && cursor.map(|c| t.id > c).unwrap_or(true))
+            .collect();
+        let mut records: Vec<SyncRecord> = ours
             .iter()
             .map(|t| SyncRecord {
                 id: RecordId::new(),
@@ -121,11 +147,36 @@ impl Syncer {
                 },
             })
             .collect();
-        self.notes.append(&records)?;
+        let exported = records.len();
         if let Some(max) = ours.iter().map(|t| t.id).max() {
             self.save_cursor(max)?;
         }
 
+        // (2) Export takes: durable tuples we knew were live last cycle, still
+        //     alive in the log, but now gone from the space → we consumed them.
+        let prev_known = self.load_presence();
+        let local_view = self.notes.read_log()?;
+        let alive_in_log: std::collections::BTreeSet<RecordId> = local_view
+            .tuples
+            .keys()
+            .copied()
+            .filter(|id| !local_view.taken.contains(id))
+            .collect();
+        let mut takes = 0;
+        for id in prev_known.difference(&live_ids) {
+            if alive_in_log.contains(id) {
+                records.push(SyncRecord {
+                    id: RecordId::new(),
+                    actor: self.castle.clone(),
+                    written_at: chrono::Utc::now(),
+                    op: SyncOp::Take { tuple_id: *id },
+                });
+                takes += 1;
+            }
+        }
+        self.notes.append(&records)?;
+
+        // (3) Push our ref, fetch everyone else's.
         let mut pushed = false;
         let mut actors_seen = 1;
         if self.remote_configured {
@@ -150,19 +201,52 @@ impl Syncer {
             }
         }
 
+        // (4) Import remote knowledge and apply remote consumptions.
+        let view = self.notes.read_log()?;
         let mut imported = 0;
-        for tuple in self.notes.materialize_tuples()? {
-            if tuple.instance == self.castle {
-                continue; // ours already live locally
+        for (id, tuple) in &view.tuples {
+            if view.taken.contains(id) || tuple.instance == self.castle {
+                continue; // consumed, or ours (already live locally)
             }
-            if space.out_if_new(tuple)? {
+            if space.out_if_new(tuple.clone())? {
                 imported += 1;
             }
         }
-        debug!(exported = records.len(), imported, "sync cycle complete");
+        // A tuple a peer consumed must leave our space too, or it lingers as a
+        // ghost. `delete` is local removal (no event, no resurrection) and a
+        // no-op when we already dropped it ourselves.
+        let mut removed = 0;
+        for id in &view.taken {
+            if space.delete(*id)? {
+                removed += 1;
+            }
+        }
+
+        // Record the durable tuples live at end-of-cycle (imports included) so
+        // next cycle can diff against it to spot a local consumption. Must run
+        // AFTER import/delete, or a just-imported tuple would never be tracked
+        // and its later take would go unnoticed.
+        let end_live: std::collections::BTreeSet<RecordId> = space
+            .scan(&Pattern::default())?
+            .into_iter()
+            .filter(|t| t.lifecycle != Lifecycle::Ephemeral)
+            .map(|t| t.id)
+            .collect();
+        self.save_presence(&end_live)?;
+
+        // (5) Bound the log.
+        let compacted = self.notes.compact().unwrap_or(0);
+
+        debug!(
+            exported,
+            takes, imported, removed, compacted, "sync cycle complete"
+        );
         Ok(CycleStats {
-            exported: records.len(),
+            exported,
+            takes,
             imported,
+            removed,
+            compacted,
             actors_seen,
             pushed,
         })
@@ -182,6 +266,26 @@ impl Syncer {
 
     fn save_cursor(&self, id: RecordId) -> rk_core::Result<()> {
         std::fs::write(&self.cursor_file, id.to_string())?;
+        Ok(())
+    }
+
+    /// The durable tuple ids present in our space at the end of the last cycle.
+    /// Diffed against the current space to spot local consumptions. A missing or
+    /// corrupt file yields an empty set, so a lost presence file only delays
+    /// take-detection by a cycle — it never fabricates a spurious Take.
+    fn load_presence(&self) -> std::collections::BTreeSet<RecordId> {
+        std::fs::read_to_string(&self.presence_file)
+            .map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect())
+            .unwrap_or_default()
+    }
+
+    fn save_presence(&self, ids: &std::collections::BTreeSet<RecordId>) -> rk_core::Result<()> {
+        let mut buf = String::with_capacity(ids.len() * 27);
+        for id in ids {
+            buf.push_str(&id.to_string());
+            buf.push('\n');
+        }
+        std::fs::write(&self.presence_file, buf)?;
         Ok(())
     }
 }
@@ -286,5 +390,112 @@ mod tests {
         let stats_a2 = syncer_a.run_cycle(&space_a).unwrap();
         assert!(stats_a2.actors_seen >= 2);
         assert!(syncer_a.peers().unwrap().contains(&"castle-b".to_string()));
+    }
+
+    /// A durable tuple authored on A, imported by B, then consumed on B, must
+    /// (a) leave A's space when the Take replicates back, and (b) never
+    /// resurrect on B — the resurrection bug this ticket closes. Compaction
+    /// then drains both records without changing any view.
+    #[tokio::test]
+    async fn consumption_replicates_and_never_resurrects() {
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare"]).unwrap();
+        let url = remote.path().to_string_lossy().to_string();
+
+        let home_a = tempfile::tempdir().unwrap();
+        let home_b = tempfile::tempdir().unwrap();
+        let layout_a = Layout::at(home_a.path());
+        let layout_b = Layout::at(home_b.path());
+        layout_a.ensure().unwrap();
+        layout_b.ensure().unwrap();
+
+        let space_a = Space::open_in_memory().unwrap();
+        let space_b = Space::open_in_memory().unwrap();
+        let syncer_a = Syncer::new(&layout_a, "castle-a", Some(&url)).unwrap();
+        let syncer_b = Syncer::new(&layout_b, "castle-b", Some(&url)).unwrap();
+
+        // A posts a durable need and replicates it to B.
+        let need = Tuple::new(Category::Need, "repo", "grab-me", "castle-a", json!({}));
+        let need_id = need.id;
+        space_a.out(need).unwrap();
+        syncer_a.run_cycle(&space_a).unwrap();
+        syncer_b.run_cycle(&space_b).unwrap(); // B imports the need
+        assert_eq!(
+            space_b
+                .scan(&Pattern::category(Category::Need).identity("grab-me"))
+                .unwrap()
+                .len(),
+            1,
+            "B imported the need"
+        );
+
+        // B's agent consumes the need (destructive take).
+        let taken = space_b
+            .take(
+                &Pattern::category(Category::Need).identity("grab-me"),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap()
+            .expect("B took the need");
+        assert_eq!(taken.id, need_id);
+
+        // B exports the Take; A imports it and drops the need from its space.
+        let b_stats = syncer_b.run_cycle(&space_b).unwrap();
+        assert_eq!(b_stats.takes, 1, "B replicated the consumption");
+        let a_stats = syncer_a.run_cycle(&space_a).unwrap();
+        assert_eq!(a_stats.removed, 1, "A dropped the consumed need");
+        assert!(
+            space_a
+                .scan(&Pattern::category(Category::Need).identity("grab-me"))
+                .unwrap()
+                .is_empty(),
+            "consumption propagated to the author"
+        );
+
+        // No resurrection on B across further cycles (the core bug).
+        for _ in 0..3 {
+            syncer_b.run_cycle(&space_b).unwrap();
+            assert!(
+                space_b
+                    .scan(&Pattern::category(Category::Need).identity("grab-me"))
+                    .unwrap()
+                    .is_empty(),
+                "consumed need must not resurrect on B"
+            );
+        }
+
+        // Compaction eventually drains the need's Out+Take across both actors,
+        // and the need still stays dead.
+        for _ in 0..4 {
+            syncer_a.run_cycle(&space_a).unwrap();
+            syncer_b.run_cycle(&space_b).unwrap();
+        }
+        assert!(
+            !syncer_a
+                .notes
+                .own_records()
+                .unwrap()
+                .iter()
+                .any(|r| matches!(&r.op, SyncOp::Out { tuple } if tuple.id == need_id)),
+            "A compacted away the consumed Out"
+        );
+        assert!(
+            !syncer_b
+                .notes
+                .own_records()
+                .unwrap()
+                .iter()
+                .any(|r| matches!(&r.op, SyncOp::Take { tuple_id } if *tuple_id == need_id)),
+            "B compacted away the orphaned Take"
+        );
+        let absent = |space: &Space| {
+            !space
+                .scan(&Pattern::default())
+                .unwrap()
+                .iter()
+                .any(|t| t.id == need_id)
+        };
+        assert!(absent(&space_a) && absent(&space_b), "dead on both castles");
     }
 }

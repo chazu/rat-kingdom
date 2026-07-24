@@ -179,10 +179,36 @@ impl NotesSync {
             .collect())
     }
 
-    /// Materialize the union of every actor's records, deduplicated by record
-    /// id, ordered by (id) — i.e. happened-at order. This is the "merge at
-    /// read time" step; no shared ref is ever written.
-    pub fn materialize(&self) -> rk_core::Result<Vec<SyncRecord>> {
+    /// Parse every NDJSON record annotated on one notes ref. A missing ref, an
+    /// unreadable blob, or a malformed line is skipped, not fatal — the union is
+    /// best-effort by construction.
+    fn records_in_ref(&self, notes_ref: &str) -> Vec<SyncRecord> {
+        let mut out = Vec::new();
+        // Each note blob holds NDJSON lines (possibly many after appends).
+        let Ok(list) = git(&self.repo, &["notes", "--ref", notes_ref, "list"], None) else {
+            return out;
+        };
+        for entry in list.lines() {
+            let Some(note_obj) = entry.split_whitespace().next() else {
+                continue;
+            };
+            let Ok(content) = git(&self.repo, &["cat-file", "blob", note_obj], None) else {
+                continue;
+            };
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(record) = serde_json::from_str::<SyncRecord>(line) {
+                    out.push(record);
+                }
+            }
+        }
+        out
+    }
+
+    fn all_refs(&self) -> rk_core::Result<Vec<String>> {
         let refs = git(
             &self.repo,
             &[
@@ -193,58 +219,150 @@ impl NotesSync {
             ],
             None,
         )?;
+        Ok(refs.lines().map(String::from).collect())
+    }
+
+    /// Materialize the union of every actor's records, deduplicated by record
+    /// id, ordered by (id) — i.e. happened-at order. This is the "merge at
+    /// read time" step; no shared ref is ever written.
+    pub fn materialize(&self) -> rk_core::Result<Vec<SyncRecord>> {
         let mut by_id: BTreeMap<RecordId, SyncRecord> = BTreeMap::new();
-        for notes_ref in refs.lines() {
-            // Each note blob holds NDJSON lines (possibly many after appends).
-            let list = match git(&self.repo, &["notes", "--ref", notes_ref, "list"], None) {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-            for entry in list.lines() {
-                let Some(note_obj) = entry.split_whitespace().next() else {
-                    continue;
-                };
-                let Ok(content) = git(&self.repo, &["cat-file", "blob", note_obj], None) else {
-                    continue;
-                };
-                for line in content.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if let Ok(record) = serde_json::from_str::<SyncRecord>(line) {
-                        by_id.insert(record.id, record);
-                    }
-                }
+        for notes_ref in self.all_refs()? {
+            for record in self.records_in_ref(&notes_ref) {
+                by_id.insert(record.id, record);
             }
         }
         Ok(by_id.into_values().collect())
+    }
+
+    /// The raw union of the log: every tuple that was ever `Out` (deduped by
+    /// tuple id) and the set of tuple ids that were later `Take`n. A tuple is a
+    /// "survivor" iff it was Out and its id is not in `taken`. This is the shape
+    /// both `materialize_tuples` (the view) and take-detection / compaction
+    /// (the daemon) consume, so they can never disagree on what is alive.
+    pub fn read_log(&self) -> rk_core::Result<LogView> {
+        let mut tuples: BTreeMap<RecordId, Tuple> = BTreeMap::new();
+        let mut taken: BTreeSet<RecordId> = BTreeSet::new();
+        for record in self.materialize()? {
+            match record.op {
+                SyncOp::Out { tuple } => {
+                    tuples.insert(tuple.id, tuple);
+                }
+                SyncOp::Take { tuple_id } => {
+                    taken.insert(tuple_id);
+                }
+            }
+        }
+        Ok(LogView { tuples, taken })
     }
 
     /// Apply the materialized log to a tuple view: Outs insert, Takes remove.
     /// Claim conflicts (same category/scope/identity from different actors)
     /// resolve earliest-(id, actor)-wins — identical on every castle.
     pub fn materialize_tuples(&self) -> rk_core::Result<Vec<Tuple>> {
-        let records = self.materialize()?;
-        let mut tuples: BTreeMap<RecordId, Tuple> = BTreeMap::new();
-        let mut taken: BTreeSet<RecordId> = BTreeSet::new();
-        for record in &records {
-            match &record.op {
-                SyncOp::Out { tuple } => {
-                    tuples.insert(tuple.id, tuple.clone());
-                }
-                SyncOp::Take { tuple_id } => {
-                    taken.insert(*tuple_id);
-                }
-            }
-        }
-        let mut result: Vec<Tuple> = tuples
-            .into_values()
-            .filter(|t| !taken.contains(&t.id))
+        let view = self.read_log()?;
+        let mut result: Vec<Tuple> = view
+            .tuples
+            .into_iter()
+            .filter(|(id, _)| !view.taken.contains(id))
+            .map(|(_, t)| t)
             .collect();
         arbitrate_claims(&mut result);
         Ok(result)
     }
+
+    /// Every record on this actor's own ref (the only ref it may rewrite).
+    pub fn own_records(&self) -> rk_core::Result<Vec<SyncRecord>> {
+        Ok(self.records_in_ref(&self.local_ref()))
+    }
+
+    /// Replace the entire contents of this actor's own note with `records`
+    /// (or drop the note when empty). Safe because nobody else writes this ref;
+    /// `git notes` records the rewrite as a new commit atop the old one, so the
+    /// ref still only moves forward and pushes stay fast-forward.
+    fn overwrite_own(&self, records: &[SyncRecord]) -> rk_core::Result<()> {
+        let anchor = self.anchor()?;
+        if records.is_empty() {
+            let _ = git(
+                &self.repo,
+                &[
+                    "notes",
+                    "--ref",
+                    &self.local_ref(),
+                    "remove",
+                    "--ignore-missing",
+                    &anchor,
+                ],
+                None,
+            );
+            return Ok(());
+        }
+        let mut lines = String::new();
+        for record in records {
+            lines.push_str(&serde_json::to_string(record)?);
+            lines.push('\n');
+        }
+        git(
+            &self.repo,
+            &[
+                "notes",
+                "--ref",
+                &self.local_ref(),
+                "add",
+                "-f",
+                "-F",
+                "-",
+                &anchor,
+            ],
+            Some(&lines),
+        )?;
+        Ok(())
+    }
+
+    /// Per-actor history compaction: bound the log by dropping records that no
+    /// longer affect any reader's view. An actor may only rewrite its OWN ref,
+    /// so the rules are chosen to converge safely across castles regardless of
+    /// fetch/compaction ordering:
+    ///
+    /// - Drop `Out(T)` once `T` appears in `taken` anywhere — the tuple is gone
+    ///   from every view, so its birth record is dead weight.
+    /// - Drop `Take(T)` only once `T` is no longer `Out` in the union — i.e. the
+    ///   Out's author already compacted it away. Dropping a Take while its Out
+    ///   still exists would resurrect the tuple, so this ordering is mandatory
+    ///   and conservative (a not-yet-fetched Out keeps the Take alive).
+    ///
+    /// Because only the tuple's author ever writes its `Out`, and a `Take` can
+    /// only exist after its `Out` was observed, the two rules drain a
+    /// consumed tuple's records in two phases (Out-author first, Take-author
+    /// second) with no window where the tuple reappears. Returns how many
+    /// records were pruned.
+    pub fn compact(&self) -> rk_core::Result<usize> {
+        let view = self.read_log()?;
+        let out_ids: BTreeSet<RecordId> = view.tuples.keys().copied().collect();
+        let own = self.own_records()?;
+        let before = own.len();
+        let kept: Vec<SyncRecord> = own
+            .into_iter()
+            .filter(|r| match &r.op {
+                SyncOp::Out { tuple } => !view.taken.contains(&tuple.id),
+                SyncOp::Take { tuple_id } => out_ids.contains(tuple_id),
+            })
+            .collect();
+        let removed = before - kept.len();
+        if removed > 0 {
+            self.overwrite_own(&kept)?;
+            debug!(removed, r#ref = %self.local_ref(), "compacted own notes ref");
+        }
+        Ok(removed)
+    }
+}
+
+/// The raw union of the replication log — see [`NotesSync::read_log`].
+pub struct LogView {
+    /// Every tuple ever written, deduplicated by tuple id (pre-take, pre-arbitration).
+    pub tuples: BTreeMap<RecordId, Tuple>,
+    /// Tuple ids that a `Take` op has consumed.
+    pub taken: BTreeSet<RecordId>,
 }
 
 /// Deterministic claim arbitration: for tuples in the `claim` category with
@@ -390,6 +508,93 @@ mod tests {
         }])
         .unwrap();
         assert_eq!(sync.materialize_tuples().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn compaction_drops_consumed_records_and_preserves_the_view() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_repo(dir.path());
+        let sync = NotesSync::new(dir.path(), "castle-a");
+
+        // A durable need is written, replicated, then consumed by a peer.
+        let need = tuple(Category::Need, "help", "castle-a");
+        let need_id = need.id;
+        let kept = tuple(Category::Fact, "still-here", "castle-a");
+        sync.append(&[record("castle-a", need.clone())]).unwrap();
+        sync.append(&[record("castle-a", kept.clone())]).unwrap();
+        sync.append(&[SyncRecord {
+            id: RecordId::new(),
+            actor: "castle-a".into(),
+            written_at: Utc::now(),
+            op: SyncOp::Take { tuple_id: need_id },
+        }])
+        .unwrap();
+
+        // Before compaction: 3 records on the ref, 1 survivor in the view.
+        assert_eq!(sync.own_records().unwrap().len(), 3);
+        let before_view: Vec<_> = sync.materialize_tuples().unwrap();
+        assert_eq!(before_view.len(), 1);
+        assert_eq!(before_view[0].id, kept.id);
+
+        // Pass 1 drops Out(need) (it is taken). Take(need) is kept because the
+        // union still shows Out(need) alive at the moment of this pass — the
+        // same conservative ordering that keeps cross-actor compaction safe.
+        assert_eq!(sync.compact().unwrap(), 1);
+        assert_eq!(sync.own_records().unwrap().len(), 2);
+
+        // The view is unchanged after every pass: the surviving fact is still
+        // there and the consumed need never resurrects.
+        let mid_view: Vec<_> = sync.materialize_tuples().unwrap();
+        assert_eq!(mid_view.len(), 1);
+        assert_eq!(mid_view[0].id, kept.id);
+
+        // Pass 2: with Out(need) gone from the union, the orphaned Take drains.
+        assert_eq!(sync.compact().unwrap(), 1);
+        assert_eq!(sync.own_records().unwrap().len(), 1);
+
+        let after_view: Vec<_> = sync.materialize_tuples().unwrap();
+        assert_eq!(after_view.len(), 1);
+        assert_eq!(after_view[0].id, kept.id);
+
+        // Idempotent: nothing left to prune (only the live fact remains).
+        assert_eq!(sync.compact().unwrap(), 0);
+    }
+
+    #[test]
+    fn compaction_keeps_a_take_until_its_out_is_gone() {
+        // Two actors sharing one repo view (as if fetched): A owns Out, B owns Take.
+        let dir = tempfile::tempdir().unwrap();
+        setup_repo(dir.path());
+        let castle_a = NotesSync::new(dir.path(), "castle-a");
+        let castle_b = NotesSync::new(dir.path(), "castle-b");
+
+        let need = tuple(Category::Need, "help", "castle-a");
+        let need_id = need.id;
+        castle_a.append(&[record("castle-a", need)]).unwrap();
+        castle_b
+            .append(&[SyncRecord {
+                id: RecordId::new(),
+                actor: "castle-b".into(),
+                written_at: Utc::now(),
+                op: SyncOp::Take { tuple_id: need_id },
+            }])
+            .unwrap();
+
+        // B compacts first: A's Out(need) is still in the union, so B MUST keep
+        // its Take — dropping it now would resurrect the need.
+        assert_eq!(castle_b.compact().unwrap(), 0);
+        assert_eq!(castle_b.own_records().unwrap().len(), 1);
+
+        // A compacts: sees the Take, drops its Out.
+        assert_eq!(castle_a.compact().unwrap(), 1);
+        assert_eq!(castle_a.own_records().unwrap().len(), 0);
+
+        // Now B can safely drop the orphaned Take.
+        assert_eq!(castle_b.compact().unwrap(), 1);
+        assert_eq!(castle_b.own_records().unwrap().len(), 0);
+
+        // Fully drained, and the need never reappeared.
+        assert!(castle_a.materialize_tuples().unwrap().is_empty());
     }
 
     /// The headline test: two castles, one bare remote, concurrent claims on
