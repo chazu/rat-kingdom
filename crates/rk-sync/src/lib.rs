@@ -20,6 +20,7 @@
 
 use chrono::{DateTime, Utc};
 use rk_core::id::RecordId;
+use rk_core::identity::{self, CastleIdentity};
 use rk_core::tuple::Tuple;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,16 +31,67 @@ use tracing::debug;
 const NOTES_LOCAL_PREFIX: &str = "refs/notes/rk";
 const NOTES_REMOTE_PREFIX: &str = "refs/notes/rk-remote";
 
-/// One replicated record: a tuple op wrapped with origin metadata.
-/// Serialized as a single NDJSON line — the unit of `cat_sort_uniq` union.
+/// One replicated record: a tuple op wrapped with authenticated origin
+/// metadata. Serialized as a single NDJSON line — the unit of `cat_sort_uniq`
+/// union. Every record is Ed25519-signed by the authoring castle; a reader
+/// verifies the signature (and that the actor matches the embedded key) before
+/// admitting the record, so a peer cannot forge or impersonate another castle.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyncRecord {
     /// Unique, time-ordered id (dedupe key; ULID timestamp = happened-at).
     pub id: RecordId,
-    /// Writing actor (castle name).
+    /// Writing actor — derived from `pubkey` (`castle-<16 hex>`), not a hostname.
     pub actor: String,
+    /// The authoring castle's Ed25519 public key, hex. Travels with the record
+    /// so verification needs no out-of-band key exchange.
+    pub pubkey: String,
+    /// Detached Ed25519 signature (hex) over [`signing_bytes`] of this record.
+    pub sig: String,
     pub written_at: DateTime<Utc>,
     pub op: SyncOp,
+}
+
+/// The canonical byte string a record's signature covers: its id, timestamp,
+/// and op, serialized deterministically. The actor/pubkey are bound separately
+/// (a reader checks `actor == actor_from_pubkey(pubkey)`), so they need not be
+/// in the signed payload. `serde_json` emits struct/enum fields in declaration
+/// order and floats via ryu, so this is stable across a round-trip.
+fn signing_bytes(id: RecordId, written_at: DateTime<Utc>, op: &SyncOp) -> Vec<u8> {
+    serde_json::to_vec(&(id, written_at, op)).unwrap_or_default()
+}
+
+impl SyncRecord {
+    /// Mint a fresh, signed record authored by `identity`. The id and timestamp
+    /// are stamped here (happened-at = now), and the actor/pubkey are taken from
+    /// the identity — a caller cannot author under another castle's name.
+    pub fn signed(identity: &CastleIdentity, op: SyncOp) -> Self {
+        let id = RecordId::new();
+        let written_at = Utc::now();
+        let sig = identity.sign(&signing_bytes(id, written_at, &op));
+        Self {
+            id,
+            actor: identity.actor().to_string(),
+            pubkey: identity.public_key_hex(),
+            sig,
+            written_at,
+            op,
+        }
+    }
+
+    /// Whether this record is authentic: the actor id is the one its public key
+    /// derives to, and the signature verifies over the canonical bytes. A record
+    /// that fails either check is dropped from the union (never trusted).
+    pub fn verify(&self) -> bool {
+        match identity::actor_from_pubkey_hex(&self.pubkey) {
+            Some(a) if a == self.actor => {}
+            _ => return false,
+        }
+        identity::verify_sig(
+            &self.pubkey,
+            &self.sig,
+            &signing_bytes(self.id, self.written_at, &self.op),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,22 +105,32 @@ pub enum SyncOp {
     Take { tuple_id: RecordId },
 }
 
-/// The per-repo sync handle for one actor.
+/// The per-repo sync handle for one castle, holding its signing identity.
 pub struct NotesSync {
     repo: PathBuf,
-    actor: String,
+    identity: CastleIdentity,
 }
 
 impl NotesSync {
-    pub fn new(repo: &Path, actor: &str) -> Self {
+    pub fn new(repo: &Path, identity: CastleIdentity) -> Self {
         Self {
             repo: repo.to_path_buf(),
-            actor: actor.to_string(),
+            identity,
         }
     }
 
+    /// This castle's actor id (the git-ref segment it writes to).
+    pub fn actor(&self) -> &str {
+        self.identity.actor()
+    }
+
+    /// Mint a fresh signed record for `op`, authored by this castle's identity.
+    pub fn record(&self, op: SyncOp) -> SyncRecord {
+        SyncRecord::signed(&self.identity, op)
+    }
+
     fn local_ref(&self) -> String {
-        format!("{NOTES_LOCAL_PREFIX}/{}", self.actor)
+        format!("{NOTES_LOCAL_PREFIX}/{}", self.actor())
     }
 
     /// The well-known anchor object all free-standing records annotate.
@@ -201,7 +263,13 @@ impl NotesSync {
                     continue;
                 }
                 if let Ok(record) = serde_json::from_str::<SyncRecord>(line) {
-                    out.push(record);
+                    // Only authentic records enter the union: a bad signature or
+                    // an actor that does not match its key is dropped, not fatal.
+                    if record.verify() {
+                        out.push(record);
+                    } else {
+                        debug!(r#ref = notes_ref, id = %record.id, "dropped unverifiable sync record");
+                    }
                 }
             }
         }
@@ -458,15 +526,6 @@ mod tests {
         );
     }
 
-    fn record(actor: &str, tuple: Tuple) -> SyncRecord {
-        SyncRecord {
-            id: RecordId::new(),
-            actor: actor.into(),
-            written_at: Utc::now(),
-            op: SyncOp::Out { tuple },
-        }
-    }
-
     fn tuple(category: Category, identity: &str, instance: &str) -> Tuple {
         Tuple::new(category, "repo", identity, instance, json!({"n": 1}))
     }
@@ -475,10 +534,14 @@ mod tests {
     fn append_and_materialize_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         setup_repo(dir.path());
-        let sync = NotesSync::new(dir.path(), "castle-a");
+        let sync = NotesSync::new(dir.path(), CastleIdentity::generate());
 
-        let r1 = record("castle-a", tuple(Category::Event, "e1", "castle-a"));
-        let r2 = record("castle-a", tuple(Category::Fact, "f1", "castle-a"));
+        let r1 = sync.record(SyncOp::Out {
+            tuple: tuple(Category::Event, "e1", "castle-a"),
+        });
+        let r2 = sync.record(SyncOp::Out {
+            tuple: tuple(Category::Fact, "f1", "castle-a"),
+        });
         sync.append(std::slice::from_ref(&r1)).unwrap();
         sync.append(std::slice::from_ref(&r2)).unwrap();
 
@@ -493,20 +556,15 @@ mod tests {
     fn takes_remove_tuples_from_the_view() {
         let dir = tempfile::tempdir().unwrap();
         setup_repo(dir.path());
-        let sync = NotesSync::new(dir.path(), "castle-a");
+        let sync = NotesSync::new(dir.path(), CastleIdentity::generate());
 
         let t = tuple(Category::Need, "help", "castle-a");
         let tid = t.id;
-        sync.append(&[record("castle-a", t)]).unwrap();
+        sync.append(&[sync.record(SyncOp::Out { tuple: t })]).unwrap();
         assert_eq!(sync.materialize_tuples().unwrap().len(), 1);
 
-        sync.append(&[SyncRecord {
-            id: RecordId::new(),
-            actor: "castle-b".into(),
-            written_at: Utc::now(),
-            op: SyncOp::Take { tuple_id: tid },
-        }])
-        .unwrap();
+        sync.append(&[sync.record(SyncOp::Take { tuple_id: tid })])
+            .unwrap();
         assert_eq!(sync.materialize_tuples().unwrap().len(), 0);
     }
 
@@ -514,21 +572,18 @@ mod tests {
     fn compaction_drops_consumed_records_and_preserves_the_view() {
         let dir = tempfile::tempdir().unwrap();
         setup_repo(dir.path());
-        let sync = NotesSync::new(dir.path(), "castle-a");
+        let sync = NotesSync::new(dir.path(), CastleIdentity::generate());
 
         // A durable need is written, replicated, then consumed by a peer.
         let need = tuple(Category::Need, "help", "castle-a");
         let need_id = need.id;
         let kept = tuple(Category::Fact, "still-here", "castle-a");
-        sync.append(&[record("castle-a", need.clone())]).unwrap();
-        sync.append(&[record("castle-a", kept.clone())]).unwrap();
-        sync.append(&[SyncRecord {
-            id: RecordId::new(),
-            actor: "castle-a".into(),
-            written_at: Utc::now(),
-            op: SyncOp::Take { tuple_id: need_id },
-        }])
-        .unwrap();
+        sync.append(&[sync.record(SyncOp::Out { tuple: need.clone() })])
+            .unwrap();
+        sync.append(&[sync.record(SyncOp::Out { tuple: kept.clone() })])
+            .unwrap();
+        sync.append(&[sync.record(SyncOp::Take { tuple_id: need_id })])
+            .unwrap();
 
         // Before compaction: 3 records on the ref, 1 survivor in the view.
         assert_eq!(sync.own_records().unwrap().len(), 3);
@@ -565,19 +620,16 @@ mod tests {
         // Two actors sharing one repo view (as if fetched): A owns Out, B owns Take.
         let dir = tempfile::tempdir().unwrap();
         setup_repo(dir.path());
-        let castle_a = NotesSync::new(dir.path(), "castle-a");
-        let castle_b = NotesSync::new(dir.path(), "castle-b");
+        let castle_a = NotesSync::new(dir.path(), CastleIdentity::generate());
+        let castle_b = NotesSync::new(dir.path(), CastleIdentity::generate());
 
         let need = tuple(Category::Need, "help", "castle-a");
         let need_id = need.id;
-        castle_a.append(&[record("castle-a", need)]).unwrap();
+        castle_a
+            .append(&[castle_a.record(SyncOp::Out { tuple: need })])
+            .unwrap();
         castle_b
-            .append(&[SyncRecord {
-                id: RecordId::new(),
-                actor: "castle-b".into(),
-                written_at: Utc::now(),
-                op: SyncOp::Take { tuple_id: need_id },
-            }])
+            .append(&[castle_b.record(SyncOp::Take { tuple_id: need_id })])
             .unwrap();
 
         // B compacts first: A's Out(need) is still in the union, so B MUST keep
@@ -619,8 +671,8 @@ mod tests {
             );
         }
 
-        let castle_a = NotesSync::new(a_dir.path(), "castle-a");
-        let castle_b = NotesSync::new(b_dir.path(), "castle-b");
+        let castle_a = NotesSync::new(a_dir.path(), CastleIdentity::generate());
+        let castle_b = NotesSync::new(b_dir.path(), CastleIdentity::generate());
 
         // Both claim the same task while partitioned. castle-a's claim is
         // minted first (ULIDs are time-ordered).
@@ -628,17 +680,20 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(3));
         let claim_b = tuple(Category::Claim, "task-42", "castle-b");
         castle_a
-            .append(&[record("castle-a", claim_a.clone())])
+            .append(&[castle_a.record(SyncOp::Out {
+                tuple: claim_a.clone(),
+            })])
             .unwrap();
         castle_b
-            .append(&[record("castle-b", claim_b.clone())])
+            .append(&[castle_b.record(SyncOp::Out {
+                tuple: claim_b.clone(),
+            })])
             .unwrap();
         // Plus some unconflicted traffic.
         castle_b
-            .append(&[record(
-                "castle-b",
-                tuple(Category::Obstacle, "o1", "castle-b"),
-            )])
+            .append(&[castle_b.record(SyncOp::Out {
+                tuple: tuple(Category::Obstacle, "o1", "castle-b"),
+            })])
             .unwrap();
 
         // Rejoin: both sync (push own ref, fetch all).
@@ -684,5 +739,55 @@ mod tests {
         assert_eq!(forward, reversed);
         assert_eq!(forward.len(), 1);
         assert_eq!(forward[0].instance, "zeta-castle");
+    }
+
+    #[test]
+    fn tampered_and_impersonating_records_fail_verification() {
+        let id = CastleIdentity::generate();
+        let rec = SyncRecord::signed(
+            &id,
+            SyncOp::Out {
+                tuple: tuple(Category::Fact, "f", "castle-a"),
+            },
+        );
+        assert!(rec.verify(), "a freshly signed record verifies");
+
+        // Tamper with the op: the signature no longer covers the new payload.
+        let mut tampered = rec.clone();
+        tampered.op = SyncOp::Out {
+            tuple: tuple(Category::Fact, "f", "castle-evil"),
+        };
+        assert!(!tampered.verify(), "a mutated op breaks the signature");
+
+        // Impersonation: keep a valid signature but claim an actor that the
+        // embedded key does not derive to.
+        let mut impersonator = rec.clone();
+        impersonator.actor = "castle-not-mine".into();
+        assert!(!impersonator.verify(), "actor must match its public key");
+    }
+
+    /// Only authentic records survive the read-time union: a valid append is
+    /// visible, and a record whose op was forged after signing is dropped.
+    #[test]
+    fn unverifiable_records_are_dropped_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_repo(dir.path());
+        let sync = NotesSync::new(dir.path(), CastleIdentity::generate());
+
+        let good = sync.record(SyncOp::Out {
+            tuple: tuple(Category::Fact, "real", "castle-a"),
+        });
+        // A record signed over one op but shipped with a different op.
+        let mut forged = sync.record(SyncOp::Out {
+            tuple: tuple(Category::Fact, "decoy", "castle-a"),
+        });
+        forged.op = SyncOp::Out {
+            tuple: tuple(Category::Fact, "forged", "castle-a"),
+        };
+        sync.append(&[good.clone(), forged]).unwrap();
+
+        let seen = sync.materialize().unwrap();
+        assert_eq!(seen.len(), 1, "the forged record was dropped");
+        assert_eq!(seen[0].id, good.id);
     }
 }

@@ -46,6 +46,12 @@ impl Layout {
         self.home.join("space.db")
     }
 
+    /// The persisted per-castle Ed25519 keypair (32-byte seed, hex, 0600). Its
+    /// public key is this castle's stable, authenticated replication actor id.
+    pub fn castle_key_path(&self) -> PathBuf {
+        self.home.join("castle.key")
+    }
+
     pub fn log_dir(&self) -> PathBuf {
         self.home.join("logs")
     }

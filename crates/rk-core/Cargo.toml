@@ -17,6 +17,9 @@ toml.workspace = true
 dirs.workspace = true
 chrono.workspace = true
 schemars.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+hex.workspace = true
 
 [lints]
 workspace = true

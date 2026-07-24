@@ -68,9 +68,19 @@ impl Daemon {
             repo_max_usd: config.budget.repo_max_usd,
             warn_at: config.budget.warn_at,
         };
+        // Castle identity: an explicit `castle_name` override still wins (a
+        // human-friendly author label), but the DEFAULT is now the stable,
+        // authenticated actor id derived from this castle's Ed25519 key —
+        // no longer the fragile hostname (TKT-59).
+        let castle = match config.castle_name.clone() {
+            Some(name) => name,
+            None => rk_core::identity::CastleIdentity::load_or_create(&layout.castle_key_path())?
+                .actor()
+                .to_string(),
+        };
         let mut daemon = Self::with_space(
             layout,
-            config.castle_name(),
+            castle,
             config.harness.default.clone(),
             budget,
             fleet_budget,
