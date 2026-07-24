@@ -317,6 +317,15 @@ async fn main() -> Result<()> {
     let config = Config::load(&layout.config_file())?;
     init_tracing(&config);
 
+    // Presentation-only alias resolver (TKT-124): maps this castle's own actor id
+    // to its friendly `castle_name` in operator-facing output. Reads the actor
+    // side-effect-free (never mints a key just to print a name); absent a key or
+    // alias, every author renders verbatim.
+    let castle_display = rk_core::identity::CastleDisplay::new(
+        rk_core::identity::CastleIdentity::actor_at(&layout.castle_key_path()).unwrap_or_default(),
+        config.castle_name.clone(),
+    );
+
     match cli.command {
         Command::Ping => {
             let mut client = Client::connect_or_spawn(&layout).await?;
@@ -375,9 +384,13 @@ async fn main() -> Result<()> {
             }
         },
         Command::Out(args) => space_cmds::out(&layout, args, cli.json).await?,
-        Command::In(args) => space_cmds::blocking_read(&layout, args, true, cli.json).await?,
-        Command::Rd(args) => space_cmds::blocking_read(&layout, args, false, cli.json).await?,
-        Command::Scan(args) => space_cmds::scan(&layout, args, cli.json).await?,
+        Command::In(args) => {
+            space_cmds::blocking_read(&layout, args, true, cli.json, &castle_display).await?
+        }
+        Command::Rd(args) => {
+            space_cmds::blocking_read(&layout, args, false, cli.json, &castle_display).await?
+        }
+        Command::Scan(args) => space_cmds::scan(&layout, args, cli.json, &castle_display).await?,
         Command::Watch(args) => space_cmds::watch(&layout, args).await?,
         Command::Done(args) => space_cmds::done(&layout, args, cli.json).await?,
         Command::Obstacle(args) => space_cmds::report(&layout, args, "obstacle", cli.json).await?,

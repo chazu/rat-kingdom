@@ -7,6 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use rk_core::identity::CastleDisplay;
 use rk_core::paths::Layout;
 use rk_daemon::Client;
 use serde_json::{json, Value};
@@ -162,7 +163,9 @@ fn env_required(name: &str) -> Result<String> {
     })
 }
 
-fn print_tuples(tuples: &Value, as_json: bool) {
+fn print_tuples(tuples: &Value, as_json: bool, display: &CastleDisplay) {
+    // JSON output is the raw wire shape (author = actor id) so machine consumers
+    // and `--json` piping never see a presentation alias in place of the id.
     if as_json {
         println!("{tuples}");
         return;
@@ -176,17 +179,20 @@ fn print_tuples(tuples: &Value, as_json: bool) {
         return;
     }
     for t in arr {
-        print_tuple_line(t);
+        print_tuple_line(t, display);
     }
 }
 
-fn print_tuple_line(t: &Value) {
+fn print_tuple_line(t: &Value, display: &CastleDisplay) {
+    let author = t["instance"].as_str().unwrap_or("?");
     println!(
         "{:10} {:12} {:24} [{}] {}",
         t["category"].as_str().unwrap_or("?"),
         t["scope"].as_str().unwrap_or("?"),
         t["identity"].as_str().unwrap_or("?"),
-        t["instance"].as_str().unwrap_or("?"),
+        // Author column: resolve THIS castle's own actor id to its friendly alias
+        // for the human; every other author is shown verbatim.
+        display.resolve(author),
         t["payload"]
     );
 }
@@ -230,6 +236,7 @@ pub async fn blocking_read(
     args: ReadArgs,
     destructive: bool,
     as_json: bool,
+    display: &CastleDisplay,
 ) -> Result<()> {
     let mut params = pattern_params(&args.category, &args.scope, &args.identity, &args.search);
     params["timeout_ms"] = json!(parse_duration(&args.timeout)?.as_millis() as u64);
@@ -251,12 +258,17 @@ pub async fn blocking_read(
     if as_json {
         println!("{}", result["tuple"]);
     } else {
-        print_tuple_line(&result["tuple"]);
+        print_tuple_line(&result["tuple"], display);
     }
     Ok(())
 }
 
-pub async fn scan(layout: &Layout, args: HotScanArgs, as_json: bool) -> Result<()> {
+pub async fn scan(
+    layout: &Layout,
+    args: HotScanArgs,
+    as_json: bool,
+    display: &CastleDisplay,
+) -> Result<()> {
     let base = &args.base;
     let mut params =
         pattern_params(&base.category, &base.scope, &base.identity, &base.search);
@@ -268,7 +280,7 @@ pub async fn scan(layout: &Layout, args: HotScanArgs, as_json: bool) -> Result<(
     }
     let mut client = Client::connect_or_spawn(layout).await?;
     let result = client.call("space.scan", params).await?;
-    print_tuples(&result["tuples"], as_json);
+    print_tuples(&result["tuples"], as_json, display);
     Ok(())
 }
 
