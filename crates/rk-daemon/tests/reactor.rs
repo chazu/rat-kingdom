@@ -10,7 +10,7 @@ use rk_core::tuple::{Category, Pattern, Tuple, FULL_STRENGTH};
 use rk_daemon::reactor::{Reactor, REACTOR_INSTANCE};
 use rk_daemon::repos::{RepoRecord, RepoRegistry};
 use rk_daemon::supervisor::Supervisor;
-use rk_daemon::tickets::Tickets;
+use rk_daemon::tickets::{NewTicket, Tickets};
 use rk_daemon::workflow_exec::WorkflowEngine;
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
@@ -132,6 +132,21 @@ fn write_trigger(layout: &Layout) {
     .unwrap();
 }
 
+/// A minimal open ticket in `scope` for the unblock-dispatch test.
+fn new_ticket(title: &str, scope: &str) -> NewTicket {
+    NewTicket {
+        title: title.into(),
+        body: None,
+        scope: scope.into(),
+        parent: None,
+        priority: "normal".into(),
+        labels: vec![],
+        depends_on: vec![],
+        created_by: None,
+        coalesce_key: None,
+    }
+}
+
 fn ping() -> Tuple {
     Tuple::new(
         Category::Event,
@@ -227,6 +242,68 @@ async fn dispatch_is_idempotent_under_feed_loss_and_cursor_reset() {
 
     // Exactly one workflow instance was ever created.
     assert_eq!(reactor.engine_instance_count(), 1);
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+/// Dependency-unblock auto-dispatch (TKT-56): closing a ticket emits a
+/// `ticket_closed` event, and a reactor trigger matching it hands the newly-ready
+/// backlog to a drain workflow. Here TKT-2 depends on TKT-1; closing TKT-1 makes
+/// TKT-2 ready AND fires the drain — the DAG advances itself with no operator and
+/// no wait for the next drain sweep.
+#[tokio::test]
+async fn closing_a_ticket_dispatches_its_newly_ready_dependent() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+
+    // A trigger that fires the drain workflow when a ticket closes in myrepo.
+    let dir = layout.triggers_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("unblock.cue"),
+        r#"triggers: [{name: "drain-on-unblock", match: {category: "event", scope: "myrepo", identity: "ticket_closed"}, run: "react-work"}]"#,
+    )
+    .unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+
+    // A ticket and a dependent that is blocked on it, both in myrepo.
+    let tickets = Tickets::new(space.clone(), "test-castle".into());
+    let a = tickets
+        .create(new_ticket("root", "myrepo"))
+        .await
+        .unwrap();
+    let b = tickets
+        .create(new_ticket("dependent", "myrepo"))
+        .await
+        .unwrap();
+    tickets.add_dep(&b.identity, &a.identity).await.unwrap();
+
+    // Baseline the cursor past the ticket writes (they are tasks, not events, so
+    // nothing fires yet), then confirm the dependent is blocked.
+    assert_eq!(reactor.run_cycle().unwrap(), 0, "no close event yet");
+    assert!(
+        tickets.ready(Some("myrepo".into())).unwrap().iter().all(|t| t.identity != b.identity),
+        "dependent is blocked while its dep is open"
+    );
+
+    // Close the dep. That emits `ticket_closed`, and the next reactor cycle fires
+    // the drain — the dependent is now ready to be picked up.
+    tickets.set_status(&a.identity, "done").await.unwrap();
+    assert!(
+        tickets.ready(Some("myrepo".into())).unwrap().iter().any(|t| t.identity == b.identity),
+        "closing the dep unblocked the dependent"
+    );
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        1,
+        "ticket_closed fired the drain workflow"
+    );
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 

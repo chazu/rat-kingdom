@@ -28,10 +28,22 @@ triggers: [
 		maxFires: 5
 	},
 
-	// When a ticket is created in `rat-kingdom`, drain the ready backlog.
+	// DEPENDENCY-UNBLOCK AUTO-DISPATCH (leverage #6). When a ticket closes in
+	// `rat-kingdom`, drain the now-ready backlog — a ticket's dependents can only
+	// become ready when it (their last blocker) reaches done/closed, so this is
+	// the moment to advance the DAG. `backlog-drain`'s `for_each` recomputes the
+	// dependency-aware ready set (open tickets with every dep satisfied) and
+	// atomically claims each, so a just-unblocked dependent is picked up the
+	// instant its blocker closes instead of waiting for the next drain sweep or an
+	// operator. The claim dedups against the continuous-drain, so both can run.
+	//
+	// `ticket_closed` is emitted by the ticket store on the non-terminal → terminal
+	// edge (Tickets::edit), scoped to the ticket's repo — so `repo` here is
+	// optional (it would default to the event's scope). Idempotent per close via
+	// the reactor's durable marker; `maxFires` caps a close storm.
 	{
-		name:  "drain-on-ticket"
-		match: {category: "event", identity: "ticket_created", scope: "rat-kingdom"}
+		name:  "drain-on-unblock"
+		match: {category: "event", identity: "ticket_closed", scope: "rat-kingdom"}
 		run:   "backlog-drain"
 		repo:  "rat-kingdom"
 		maxFires: 3
