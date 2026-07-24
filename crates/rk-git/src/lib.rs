@@ -205,6 +205,12 @@ impl Repo {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Cute rat names are drawn from a finite pool and reused, so a prior rat
+        // of the same name can leave a worktree directory behind (a crash or a
+        // failed cleanup) at exactly this path; `git worktree add` then fails
+        // hard with "'<path>' already exists". The name was just reserved
+        // atomically upstream, so no live rat holds it — reap the residue first.
+        self.reap_stale_worktree(path);
         self.git(&[
             "worktree",
             "add",
@@ -215,6 +221,28 @@ impl Repo {
         ])?;
         debug!(?path, branch, base, "created worktree");
         Ok(())
+    }
+
+    /// Clear any leftover worktree at `path` so a fresh `worktree add` succeeds.
+    /// Best-effort and never errors — a clean path is a no-op. First prune
+    /// dangling registrations (dirs git still tracks but that are gone), then,
+    /// if the directory is still present, ask git to remove a still-registered
+    /// worktree and finally delete any residual directory outright. Only called
+    /// with a freshly-reserved name's path, so a live rat cannot own it.
+    fn reap_stale_worktree(&self, path: &Path) {
+        let _ = self.git(&["worktree", "prune"]);
+        if !path.exists() {
+            return;
+        }
+        debug!(?path, "reaping stale worktree residue before add");
+        // If git still tracks it as a worktree, this unregisters and removes it.
+        let _ = self.git(&["worktree", "remove", "--force", &path.to_string_lossy()]);
+        // Unregistered leftover (or the remove failed): delete the directory,
+        // then prune again so git forgets any now-dangling registration.
+        if path.exists() {
+            let _ = std::fs::remove_dir_all(path);
+            let _ = self.git(&["worktree", "prune"]);
+        }
     }
 
     /// Remove a worktree (force: uncommitted changes in it are discarded —
@@ -966,6 +994,48 @@ mod tests {
         let wt = dir.path().join("wt-bad");
         assert!(repo.create_worktree(&wt, "main", "main").is_err());
         assert!(repo.delete_branch("master").is_err());
+    }
+
+    #[test]
+    fn create_worktree_reaps_unregistered_leftover_dir() {
+        // A prior rat of the same reused name crashed after its worktree was
+        // unregistered (pruned) but before the directory was deleted, leaving
+        // stale residue on disk. A fresh `worktree add` at that path must not
+        // fail hard — the residue is reaped first.
+        let (dir, repo) = scratch_repo();
+        let wt = dir.path().join("worktrees").join("Nibbles");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("junk.txt"), "leftover\n").unwrap();
+
+        repo.create_worktree(&wt, "rat/Nibbles/task-9", "main")
+            .unwrap();
+        assert!(repo.branch_exists("rat/Nibbles/task-9"));
+        assert_eq!(
+            Repo::discover(&wt).unwrap().root().canonicalize().unwrap(),
+            repo.root().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn create_worktree_reaps_still_registered_worktree() {
+        // Residue that git STILL tracks as a live worktree (the registration
+        // under .git/worktrees survived): reserve reuses the name, so a fresh
+        // add at the same path must reap the registered worktree too, not
+        // collide with it.
+        let (dir, repo) = scratch_repo();
+        let wt = dir.path().join("worktrees").join("Scurry");
+        repo.create_worktree(&wt, "rat/Scurry/old-task", "main")
+            .unwrap();
+        assert!(wt.exists());
+
+        // Same path, new branch — the name was reused for a new task.
+        repo.create_worktree(&wt, "rat/Scurry/new-task", "main")
+            .unwrap();
+        assert!(repo.branch_exists("rat/Scurry/new-task"));
+        assert_eq!(
+            Repo::discover(&wt).unwrap().root().canonicalize().unwrap(),
+            repo.root().canonicalize().unwrap()
+        );
     }
 
     #[test]
