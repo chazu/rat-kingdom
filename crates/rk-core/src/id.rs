@@ -1,6 +1,7 @@
 //! Identifiers. ULIDs everywhere: sortable, unique, embeddable in NDJSON lines,
 //! and safe under `cat_sort_uniq`-style union merges (Phase 6).
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use ulid::Ulid;
@@ -17,6 +18,20 @@ impl RecordId {
 
     pub fn timestamp_ms(&self) -> u64 {
         self.0.timestamp_ms()
+    }
+
+    /// The smallest possible id at instant `at`: that millisecond's timestamp
+    /// with a zero random suffix. Never minted for a real record — it exists to
+    /// be an exclusive `after_id` floor, so `id > floor_at(t)` selects exactly
+    /// the tuples written at or after `t` (a real ULID minted in that same
+    /// millisecond has a nonzero random suffix with overwhelming probability,
+    /// and sorts above the floor either way).
+    ///
+    /// This is how a reader that keys on a reusable identifier (an agent name)
+    /// bounds itself to the CURRENT generation: pin the floor to the moment the
+    /// generation began and a predecessor's records cannot match.
+    pub fn floor_at(at: DateTime<Utc>) -> Self {
+        Self(Ulid::from_parts(at.timestamp_millis().max(0) as u64, 0))
     }
 }
 
@@ -67,6 +82,17 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let b = RecordId::new();
         assert!(a < b);
+    }
+
+    #[test]
+    fn floor_at_sorts_below_ids_minted_after_it() {
+        let before = RecordId::new();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let floor = RecordId::floor_at(Utc::now());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let after = RecordId::new();
+        assert!(before < floor, "an earlier id must sort below the floor");
+        assert!(floor < after, "a later id must sort above the floor");
     }
 
     #[test]

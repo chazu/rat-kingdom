@@ -89,9 +89,10 @@ pub struct AgentRecord {
 }
 
 impl AgentRecord {
-    /// Identity of one *generation* of a name. Archiving frees a name for
-    /// reuse, so `name` alone no longer identifies a record across the live
-    /// registry and the archive; `created_at` disambiguates the generations.
+    /// Identity of one *generation* of a name. Names are not recycled (see
+    /// [`Registry::reserve_name`]), so this exists for the one case that can
+    /// still put two rows under one name: the archive/persist crash window,
+    /// where `created_at` tells the archived copy from the live one.
     fn generation(&self) -> (&str, DateTime<Utc>) {
         (self.name.as_str(), self.created_at)
     }
@@ -110,15 +111,18 @@ const ARCHIVE_FILE: &str = "agents-archive.json";
 /// [`list_archived`](Registry::list_archived) / [`list_all`](Registry::list_all)
 /// / [`get_any`](Registry::get_any), and can be restored with
 /// [`unarchive`](Registry::unarchive). They just stop inflating the default
-/// views (`rk list`, `rk top`, `rk inbox`) and the [`reserve_name`] name pool.
+/// views (`rk list`, `rk top`, `rk inbox`). Archiving does NOT free the name:
+/// see [`reserve_name`].
 ///
 /// [`reserve_name`]: Registry::reserve_name
 pub struct Registry {
     path: PathBuf,
     archive_path: PathBuf,
     agents: HashMap<String, AgentRecord>,
-    /// Archived terminal records. A `Vec`, not a map: archiving frees the name
-    /// for reuse, so several generations of one name can coexist here.
+    /// Archived terminal records. A `Vec`, not a map: an entry is keyed by
+    /// GENERATION (`name`, `created_at`), which lets an archived record and a
+    /// live one of the same name coexist across the archive/persist crash
+    /// window (see [`Registry::is_shadowed`]).
     archived: Vec<AgentRecord>,
     /// Names handed out by [`Registry::reserve_name`] but not yet [`insert`]ed.
     /// Closes the spawn window where a name is chosen but its worktree/record
@@ -159,10 +163,21 @@ impl Registry {
     /// eventual [`insert`](Registry::insert) (which frees the reservation);
     /// if the spawn fails before then, call [`release_name`] to free it.
     ///
-    /// Deliberately consults only the LIVE map and the outstanding
-    /// reservations — an archived record's name returns to the pool, which is
-    /// the point of archiving (it relieves the name-pool pressure a registry
-    /// that never drops records builds up).
+    /// Consults the live map, the ARCHIVE, and the outstanding reservations.
+    /// A rat name is an identity key, not a slot: it is stamped into durable
+    /// tuples (`harness_result`, `task_done`), agent logs, branches and
+    /// worktree paths that outlive the record by design, so `next_name`'s
+    /// contract is that names are never recycled.
+    ///
+    /// TKT-136 briefly narrowed this to the live map, on the theory that
+    /// archiving should return a name to the pool. It cannot: archiving does
+    /// not retract the records the name is stamped into. A recycled name made
+    /// every reader that keys on it ambiguous across time, which is TKT-146
+    /// (a workflow's `wait` matched a two-day-old namesake's result and
+    /// dismissed a one-second-old rat) and TKT-138 (`rk log` appends a reused
+    /// name onto its predecessor's transcript). The pool needs no relief
+    /// anyway — TKT-102 made `next_name` unbounded via generation suffixes
+    /// (`Whisker-2`, `Whisker-3`, …), so uniqueness is free.
     ///
     /// [`release_name`]: Registry::release_name
     pub fn reserve_name(&mut self) -> String {
@@ -171,6 +186,7 @@ impl Registry {
             .keys()
             .chain(self.reserved.iter())
             .map(String::as_str)
+            .chain(self.archived.iter().map(|a| a.name.as_str()))
             .collect();
         let name = rk_core::names::next_name(taken);
         self.reserved.insert(name.clone());
@@ -629,8 +645,12 @@ mod tests {
         assert!(reg.list_archived().is_empty());
     }
 
+    /// TKT-146 regression at the naming layer. A rat name is an identity key
+    /// stamped into durable tuples, logs and branches that outlive its record,
+    /// so archiving must NOT return it to the pool — a recycled name makes
+    /// every reader that keys on it ambiguous across time.
     #[test]
-    fn archiving_returns_the_name_to_the_pool() {
+    fn archiving_never_recycles_the_name() {
         let dir = tempfile::tempdir().unwrap();
         let mut reg = Registry::load(&dir.path().join("agents.json")).unwrap();
         let first = reg.reserve_name();
@@ -639,17 +659,46 @@ mod tests {
         assert_ne!(reg.reserve_name(), first, "a live name stays taken");
 
         reg.archive(Utc::now()).unwrap();
-        let reused = reg.reserve_name();
-        assert_eq!(reused, first, "archiving frees the name for reuse");
-
-        // Both generations coexist: the new live rat shadows nothing, and the
-        // archived generation keeps its own history.
-        reg.insert(record(&reused, AgentState::Running)).unwrap();
         assert_eq!(reg.list_archived().len(), 1);
-        assert_eq!(reg.list_all().len(), 2);
-        assert_eq!(reg.get_any(&reused).unwrap().state, AgentState::Running);
+        let next = reg.reserve_name();
+        assert_ne!(
+            next, first,
+            "an archived name stays taken: it is still stamped into durable records"
+        );
+
+        // The reservation survives a reload — the archive file, not just the
+        // in-memory copy, is what keeps the name spent.
+        reg.insert(record(&next, AgentState::Running)).unwrap();
+        let mut reloaded = Registry::load(&dir.path().join("agents.json")).unwrap();
+        let third = reloaded.reserve_name();
+        assert_ne!(third, first, "reload must not resurrect an archived name");
+        assert_ne!(third, next, "reload must not resurrect a live name");
+    }
+
+    /// The archive is keyed by generation, not by name, so a record present in
+    /// BOTH files (the archive-then-crash window, before `agents.json` was
+    /// rewritten) resolves in favour of the live copy instead of double-counting.
+    /// `reserve_name` can no longer produce this state; a crash still can.
+    #[test]
+    fn a_live_record_shadows_its_archived_twin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load(&dir.path().join("agents.json")).unwrap();
+        let name = reg.reserve_name();
+        let generation = aged(&name, AgentState::Dismissed, 3_600);
+        reg.insert(generation.clone()).unwrap();
+        reg.archive(Utc::now()).unwrap();
+
+        // Simulate the crash window: the archive was written but `agents.json`
+        // was not, so the SAME generation is back in the live map on reload.
+        let mut live = generation;
+        live.state = AgentState::Running;
+        live.archived_at = None;
+        reg.insert(live).unwrap();
+        assert!(reg.list_archived().is_empty(), "the live copy shadows it");
+        assert_eq!(reg.list_all().len(), 1, "no double-count in the rollups");
+        assert_eq!(reg.get_any(&name).unwrap().state, AgentState::Running);
         assert!(
-            reg.unarchive(&reused).is_err(),
+            reg.unarchive(&name).is_err(),
             "unarchiving onto a live name must refuse rather than clobber"
         );
     }

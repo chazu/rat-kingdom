@@ -4,7 +4,7 @@
 
 use crate::supervisor::{SpawnParams, Supervisor};
 use crate::tickets::Tickets;
-use rk_core::id::prefixed_id;
+use rk_core::id::{prefixed_id, RecordId};
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Pattern};
 use rk_space::Space;
@@ -464,11 +464,7 @@ impl WorkflowEngine {
                         .clone()
                         .ok_or_else(|| rk_core::Error::other("wait step with no active agent"))?;
                     let timeout = parse_duration(&wait.timeout)?;
-                    let mut pattern = Pattern::category(Category::Event).identity("harness_result");
-                    // The single authoritative predicate includes this search;
-                    // serde_json serializes maps in key order, so the agent
-                    // field renders exactly like this.
-                    pattern.payload_search = Some(format!("\"agent\":\"{agent}\""));
+                    let pattern = self.result_pattern(&agent);
                     let tuple = self
                         .space
                         .rd(&pattern, timeout)
@@ -890,6 +886,40 @@ impl WorkflowEngine {
         Ok(fanned)
     }
 
+    /// The predicate a `wait`/`wait_all` blocks on: THIS generation of `agent`
+    /// reporting its `harness_result`.
+    ///
+    /// The agent name alone is not enough. `harness_result` events are durable
+    /// and outlive the rat they name forever, so a bare `"agent":"<name>"`
+    /// search matches a PREDECESSOR of the same name and satisfies the wait in
+    /// milliseconds. That is TKT-146: TKT-136 briefly let an archived name be
+    /// reused, the wait returned a two-day-old namesake's tuple, the following
+    /// `evaluate` judged a stranger's work, and the `dismiss` behind it killed
+    /// a rat one second into its task (SIGTERM, so `code None`, no session,
+    /// zero tokens). Whole workflows reported success having done nothing.
+    ///
+    /// `reserve_name` no longer recycles names, so the collision should not
+    /// arise — but a `wait` that can be satisfied by a tuple predating the rat
+    /// it waits on is wrong on its own terms. Bounding the read below the
+    /// agent record's `created_at` makes the predicate generation-exact and
+    /// keeps it correct however the naming policy moves.
+    fn result_pattern(&self, agent: &str) -> Pattern {
+        let mut pattern = Pattern::category(Category::Event).identity("harness_result");
+        // The single authoritative predicate includes this search; serde_json
+        // serializes maps in key order, so the agent field renders exactly
+        // like this.
+        pattern.payload_search = Some(format!("\"agent\":\"{agent}\""));
+        match self.supervisor.status(agent) {
+            Some(record) => pattern.after(Some(RecordId::floor_at(record.created_at))),
+            None => {
+                // Unreachable for an agent we just spawned; degrade to the
+                // unbounded read rather than failing a live workflow on it.
+                warn!(agent, "no record for waited-on agent; wait is unbounded");
+                pattern
+            }
+        }
+    }
+
     /// Block until every fanned-out agent has emitted its `harness_result`,
     /// then aggregate into `{count, ok, errors, all_ok, results}`. All agents
     /// share one deadline: the step times out if any is still running when it
@@ -904,10 +934,8 @@ impl WorkflowEngine {
         let mut results = Vec::with_capacity(fanout.len());
         for fa in fanout {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let mut pattern = Pattern::category(Category::Event).identity("harness_result");
-            // Same authoritative predicate as `wait`: serde renders the agent
-            // field first, so this substring matches exactly one agent.
-            pattern.payload_search = Some(format!("\"agent\":\"{}\"", fa.agent));
+            // Same generation-exact predicate as `wait`.
+            let pattern = self.result_pattern(&fa.agent);
             let tuple = self
                 .space
                 .rd(&pattern, remaining)
@@ -977,20 +1005,19 @@ impl WorkflowEngine {
                      ctx.previous_result to determine which rats finished clean",
                 )
             })?;
-            let results = agg.get("results").and_then(Value::as_array).ok_or_else(|| {
-                rk_core::Error::other(
+            let results = agg
+                .get("results")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    rk_core::Error::other(
                     "dismiss_all onlyClean requires a preceding wait_all: ctx.previous_result has \
                      no `results` array (is the previous step a wait_all?)",
                 )
-            })?;
+                })?;
             let clean: std::collections::HashSet<String> = results
                 .iter()
                 .filter(|r| r.get("is_error").and_then(Value::as_bool) == Some(false))
-                .filter_map(|r| {
-                    r.get("agent")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
+                .filter_map(|r| r.get("agent").and_then(Value::as_str).map(str::to_string))
                 .collect();
             Some(clean)
         } else {
@@ -1453,7 +1480,9 @@ fn parse_duration(s: &str) -> rk_core::Result<Duration> {
     let n = value.parse::<u64>().map_err(|_| invalid())?;
     // checked_mul: a huge value like "9223372036854775807m" would otherwise
     // panic in debug builds and silently wrap in release.
-    n.checked_mul(mult).map(Duration::from_secs).ok_or_else(invalid)
+    n.checked_mul(mult)
+        .map(Duration::from_secs)
+        .ok_or_else(invalid)
 }
 
 /// One row of an instance's rendered step trace. `index` is the TOP-LEVEL
