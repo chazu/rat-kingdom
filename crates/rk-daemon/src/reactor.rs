@@ -1228,6 +1228,7 @@ mod tests {
             pid: None,
             merge_commit: None,
             state,
+            crashed: false,
             result: None,
             usage: Default::default(),
             cost_usd: 0.0,

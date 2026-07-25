@@ -241,6 +241,7 @@ fn terminal_record(name: &str, created_at: DateTime<Utc>) -> AgentRecord {
         merge_commit: None,
         state: AgentState::Dismissed,
         result: None,
+        crashed: false,
         usage: Default::default(),
         cost_usd: 0.0,
         created_at,

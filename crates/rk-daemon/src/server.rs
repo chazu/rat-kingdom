@@ -616,6 +616,9 @@ impl Daemon {
                 self.tier_routing.clone(),
                 self.default_harness.clone(),
                 self.require_named_checks,
+                // A crashed rat may still be revived by the self-healing sweep;
+                // a `wait` only gives up on one when it cannot be (TKT-147).
+                self.sweep_config.respawn_enabled && self.sweep_config.respawn_max_attempts > 0,
             ))
         }))
     }

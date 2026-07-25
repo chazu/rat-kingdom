@@ -2,6 +2,7 @@
 //! tuplespace. Definitions come from rk-workflow (cue CLI); this module owns
 //! instances, context threading, and step semantics.
 
+use crate::agents::AgentState;
 use crate::supervisor::{SpawnParams, Supervisor};
 use crate::tickets::Tickets;
 use chrono::{DateTime, Utc};
@@ -37,6 +38,14 @@ const DEFAULT_RUN_TIMEOUT: &str = "10m";
 /// 0; each nested `sub_workflow` is one deeper. A workflow cycle (A→B→A…) hits
 /// this cap and fails closed rather than recursing until it exhausts the stack.
 const MAX_SUBWORKFLOW_DEPTH: usize = 8;
+
+/// How often a blocking `wait`/`wait_all` comes up for air to check whether the
+/// rat it is waiting on is still capable of reporting (TKT-147). Short enough
+/// that a crash surfaces in seconds instead of at the step's (typically
+/// hours-long) timeout, long enough to cost nothing: the read itself blocks in
+/// the tuplespace for the whole slice, so this is a wake-up cadence, not a spin
+/// — one indexed query and one registry lookup every few seconds per open wait.
+const LIVENESS_POLL: Duration = Duration::from_secs(5);
 
 /// The effective parameters of a `run` step after named-check resolution and
 /// policy enforcement — a raw command or a repo-registered check collapse to the
@@ -114,6 +123,17 @@ pub struct WorkflowContext {
     /// so the single-active-agent path stays untouched.
     #[serde(default)]
     pub fanout: Vec<FannedAgent>,
+    /// The agents whose `harness_result` produced the current
+    /// `previous_result`: one for a `wait`, the whole fan-out for a `wait_all`,
+    /// empty for every other source (a `dismiss` outcome, a `run` exit, an
+    /// approval decision, a sub-workflow's return).
+    ///
+    /// This is the provenance an `evaluate` needs to assert that the result it
+    /// is about to judge came from a rat that actually ran (TKT-147). Without
+    /// it the gate would have to guess from `active_agent`, which lingers past
+    /// the step that set it.
+    #[serde(default)]
+    pub awaited: Vec<String>,
 }
 
 /// One agent in a fan-out set: its name, its branch, and the ticket it drains.
@@ -144,6 +164,11 @@ pub struct WorkflowEngine {
     /// When set, a `run` step may only invoke a repo-registered named check; a
     /// raw inline command is refused fail-closed (TKT-30, `[policy]`).
     require_named_checks: bool,
+    /// Whether the supervisor's self-healing respawn sweep is armed. A crashed
+    /// rat may still come back when it is, so a `wait` on one keeps blocking
+    /// until the sweep gives up; with the sweep disarmed a crash is final and
+    /// the `wait` fails immediately (TKT-147).
+    respawn_enabled: bool,
     instances: Mutex<HashMap<String, Instance>>,
 }
 
@@ -158,6 +183,7 @@ impl WorkflowEngine {
         tier_routing: TierRouting,
         default_harness: String,
         require_named_checks: bool,
+        respawn_enabled: bool,
     ) -> Self {
         Self {
             layout,
@@ -168,6 +194,7 @@ impl WorkflowEngine {
             tier_routing,
             default_harness,
             require_named_checks,
+            respawn_enabled,
             instances: Mutex::new(HashMap::new()),
         }
     }
@@ -464,24 +491,26 @@ impl WorkflowEngine {
                         .active_agent
                         .clone()
                         .ok_or_else(|| rk_core::Error::other("wait step with no active agent"))?;
-                    let timeout = parse_duration(&wait.timeout)?;
-                    let pattern = self.result_pattern(id, &agent);
-                    let tuple = self
-                        .space
-                        .rd(&pattern, timeout)
-                        .await
-                        .map_err(|e| rk_core::Error::other(format!("wait failed: {e}")))?
-                        .ok_or_else(|| {
-                            rk_core::Error::other(format!(
-                                "wait timed out after {} for agent {agent}",
-                                wait.timeout
-                            ))
-                        })?;
+                    let deadline = tokio::time::Instant::now() + parse_duration(&wait.timeout)?;
+                    let payload = self
+                        .await_result(id, &agent, deadline, "wait", &wait.timeout)
+                        .await?;
                     self.update(id, |i| {
-                        i.context.previous_result = Some(tuple.payload.clone());
+                        i.context.previous_result = Some(payload.clone());
+                        i.context.awaited = vec![agent.clone()];
                     });
                 }
                 Step::Evaluate(eval) => {
+                    // Before judging the result, assert it came from a rat that
+                    // actually ran (TKT-147). `expect`/`anyOf` unify against
+                    // whatever landed in previousResult and cannot tell a real
+                    // verdict from a crashed rat's leftovers, so a gate alone
+                    // would pass a silent no-op as a clean run.
+                    for agent in &ctx.awaited {
+                        if let Some(why) = self.liveness_failure(agent) {
+                            return Err(rk_core::Error::other(format!("evaluate failed: {why}")));
+                        }
+                    }
                     let actual = ctx.previous_result.clone().unwrap_or(Value::Null);
                     // Pass if the result unifies with `expect` OR any `anyOf`
                     // alternative — a disjunction single-`expect` unification (an
@@ -508,6 +537,7 @@ impl WorkflowEngine {
                     let outcome = self.supervisor.dismiss(&agent, dismiss.no_merge).await?;
                     self.update(id, |i| {
                         i.context.previous_result = Some(outcome.clone());
+                        i.context.awaited = Vec::new();
                         i.context.active_agent = None;
                     });
                 }
@@ -565,6 +595,7 @@ impl WorkflowEngine {
                         };
                         self.update(id, |i| {
                             i.context.previous_result = Some(decision);
+                            i.context.awaited = Vec::new();
                         });
                     }
                     other => {
@@ -639,7 +670,12 @@ impl WorkflowEngine {
                 }
                 Step::WaitAll(wait_all) => {
                     let summary = self.join(id, &ctx.fanout, wait_all).await?;
-                    self.update(id, |i| i.context.previous_result = Some(summary.clone()));
+                    let awaited: Vec<String> =
+                        ctx.fanout.iter().map(|fa| fa.agent.clone()).collect();
+                    self.update(id, |i| {
+                        i.context.previous_result = Some(summary.clone());
+                        i.context.awaited = awaited.clone();
+                    });
                 }
                 Step::DismissAll(dismiss_all) => {
                     let summary = self
@@ -647,13 +683,17 @@ impl WorkflowEngine {
                         .await?;
                     self.update(id, |i| {
                         i.context.previous_result = Some(summary.clone());
+                        i.context.awaited = Vec::new();
                         // The fan-out set is spent once its branches are merged.
                         i.context.fanout = Vec::new();
                     });
                 }
                 Step::Run(run) => {
                     let result = self.run_command(&ctx, run, repo).await?;
-                    self.update(id, |i| i.context.previous_result = Some(result.clone()));
+                    self.update(id, |i| {
+                        i.context.previous_result = Some(result.clone());
+                        i.context.awaited = Vec::new();
+                    });
                 }
                 Step::Land(land) => {
                     let branch = interpolate(&land.branch, &ctx);
@@ -671,7 +711,10 @@ impl WorkflowEngine {
                         .supervisor
                         .land(std::path::Path::new(repo), &branch, &target, land.keep_branch)
                         .await?;
-                    self.update(id, |i| i.context.previous_result = Some(result.clone()));
+                    self.update(id, |i| {
+                        i.context.previous_result = Some(result.clone());
+                        i.context.awaited = Vec::new();
+                    });
                 }
                 Step::OpenPr(open_pr) => {
                     let branch = interpolate(&open_pr.branch, &ctx);
@@ -691,11 +734,17 @@ impl WorkflowEngine {
                         .supervisor
                         .open_pr(std::path::Path::new(repo), &branch, &target)
                         .await?;
-                    self.update(id, |i| i.context.previous_result = Some(result.clone()));
+                    self.update(id, |i| {
+                        i.context.previous_result = Some(result.clone());
+                        i.context.awaited = Vec::new();
+                    });
                 }
                 Step::SubWorkflow(sub) => {
                     let result = self.run_sub_workflow(id, sub, repo, &ctx).await?;
-                    self.update(id, |i| i.context.previous_result = Some(result.clone()));
+                    self.update(id, |i| {
+                        i.context.previous_result = Some(result.clone());
+                        i.context.awaited = Vec::new();
+                    });
                 }
             }
             Ok(Flow::Next)
@@ -943,6 +992,137 @@ impl WorkflowEngine {
         generation_floor_of(record_created_at, instance_started_at, Utc::now())
     }
 
+    /// The liveness assertion under every result a workflow acts on (TKT-147):
+    /// `Some(diagnostic)` when `agent` did NOT reach a verdict of its own
+    /// through the harness, so nothing attributed to it can be trusted.
+    ///
+    /// A workflow's gates unify against whatever landed in `previous_result`
+    /// and have no notion of "this rat never really ran". That is how TKT-146
+    /// stayed silent: a rat was SIGTERMed one second in — no session, zero
+    /// tokens, `process exited (code None) without completing` — yet the chain
+    /// evaluated clean and reported `Completed`, and nightly-self-improve
+    /// looked green for two runs while grooming nothing. Fixing *why* that rat
+    /// was killed did not teach the chain to notice, so any future path that
+    /// kills or crashes a rat could still be reported as a clean run. A silent
+    /// no-op is the worst failure mode for a self-driving loop; this makes it
+    /// a failure that lands in `rk inbox`.
+    ///
+    /// Two ways to fail the assertion:
+    ///  - the record is still live, so whatever we are holding cannot have come
+    ///    from it (`harness_result` is emitted only *after* the record goes
+    ///    terminal, so a running agent has not produced one);
+    ///  - the record is terminal but crashed out of its run
+    ///    ([`crashed_without_reporting`]), so no result of its own exists.
+    ///
+    /// A missing record degrades to a pass with a warning, exactly like
+    /// [`result_pattern`](Self::result_pattern): a read-side check must not be
+    /// the thing that fails a live workflow.
+    ///
+    /// [`crashed_without_reporting`]: crate::agents::AgentRecord::crashed_without_reporting
+    fn liveness_failure(&self, agent: &str) -> Option<String> {
+        let Some(record) = self.supervisor.status(agent) else {
+            warn!(agent, "no record for waited-on agent; liveness unchecked");
+            return None;
+        };
+        if record.state.is_live() {
+            return Some(format!(
+                "agent {agent} is still {:?}: a result attributed to it cannot have come from it \
+                 (it reports only once it finishes)",
+                record.state
+            ));
+        }
+        if record.crashed_without_reporting() {
+            return Some(format!(
+                "agent {agent} never reported a result of its own — it ended {:?} after burning \
+                 {} tokens, with the harness never reporting: {}. Whatever is in \
+                 ctx.previousResult did not come from this rat; treating it as its work would \
+                 report a no-op as success (`rk log {agent}`)",
+                record.state,
+                record.usage.total(),
+                record
+                    .result
+                    .as_deref()
+                    .unwrap_or("no result recorded")
+                    .trim(),
+            ));
+        }
+        None
+    }
+
+    /// Whether a `wait` on `agent` can no longer be satisfied: it left the
+    /// fleet without reporting and nothing will bring it back, so blocking to
+    /// the step's timeout only delays a failure that is already certain.
+    ///
+    /// Deliberately narrow. `Orphaned` is excluded even though it is terminal:
+    /// its worktree/branch/session are preserved precisely so `rk respawn` (or
+    /// the sweep) can pick it up, and an operator who does that inside the
+    /// step's timeout heals the run. A crashed (`Failed`) agent is likewise
+    /// still revivable while the self-healing sweep is armed and has not yet
+    /// hit its crash-loop cap.
+    fn abandoned(&self, agent: &str) -> Option<String> {
+        let record = self.supervisor.status(agent)?;
+        if record.state == AgentState::Orphaned || !record.crashed_without_reporting() {
+            return None;
+        }
+        if record.state == AgentState::Failed
+            && self.respawn_enabled
+            && !self.supervisor.respawn_exhausted(agent)
+        {
+            return None; // the self-healing sweep may still bring it back
+        }
+        Some(format!(
+            "agent {agent} left the fleet without reporting ({:?}: {}) — no harness_result will \
+             ever arrive, so this wait can only fail (`rk log {agent}`, then `rk respawn {agent}`)",
+            record.state,
+            record
+                .result
+                .as_deref()
+                .unwrap_or("no result recorded")
+                .trim(),
+        ))
+    }
+
+    /// Block for `timeout` on `agent`'s own `harness_result`, giving up early if
+    /// the agent crashes out of its run in the meantime (TKT-147). Returns the
+    /// result payload, or an error naming why no result is coming.
+    async fn await_result(
+        &self,
+        id: &str,
+        agent: &str,
+        deadline: tokio::time::Instant,
+        step: &str,
+        timeout: &str,
+    ) -> rk_core::Result<Value> {
+        let pattern = self.result_pattern(id, agent);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(rk_core::Error::other(format!(
+                    "{step} timed out after {timeout} waiting on agent {agent}"
+                )));
+            }
+            let slice = remaining.min(LIVENESS_POLL);
+            if let Some(tuple) = self
+                .space
+                .rd(&pattern, slice)
+                .await
+                .map_err(|e| rk_core::Error::other(format!("{step} failed: {e}")))?
+            {
+                // The result is this generation's by construction (the pattern
+                // is floored at the record's own created_at); the liveness gate
+                // is the belt to that braces, covering the degraded unbounded
+                // read and any future path that lands a foreign result here.
+                if let Some(why) = self.liveness_failure(agent) {
+                    return Err(rk_core::Error::other(format!("{step} failed: {why}")));
+                }
+                return Ok(tuple.payload);
+            }
+            if let Some(why) = self.abandoned(agent) {
+                return Err(rk_core::Error::other(format!("{step} failed: {why}")));
+            }
+        }
+    }
+
     /// Block until every fanned-out agent has emitted its `harness_result`,
     /// then aggregate into `{count, ok, errors, all_ok, results}`. All agents
     /// share one deadline: the step times out if any is still running when it
@@ -961,21 +1141,13 @@ impl WorkflowEngine {
         let deadline = tokio::time::Instant::now() + parse_duration(&wait_all.timeout)?;
         let mut results = Vec::with_capacity(fanout.len());
         for fa in fanout {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            // Same generation-exact predicate as `wait`.
-            let pattern = self.result_pattern(id, &fa.agent);
-            let tuple = self
-                .space
-                .rd(&pattern, remaining)
-                .await
-                .map_err(|e| rk_core::Error::other(format!("wait_all failed: {e}")))?
-                .ok_or_else(|| {
-                    rk_core::Error::other(format!(
-                        "wait_all timed out after {} waiting on agent {}",
-                        wait_all.timeout, fa.agent
-                    ))
-                })?;
-            results.push(tuple.payload.clone());
+            // Same generation-exact predicate and same liveness gate as `wait`:
+            // one crashed rat fails the join rather than being counted as a
+            // clean member of the batch.
+            results.push(
+                self.await_result(id, &fa.agent, deadline, "wait_all", &wait_all.timeout)
+                    .await?,
+            );
         }
         let ok = results
             .iter()
