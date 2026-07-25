@@ -92,6 +92,10 @@ pub struct LogArgs {
     /// Show only the last N entries (default: all).
     #[arg(long, short = 'n')]
     pub tail: Option<usize>,
+    /// Which rat of this name to read, 1 = oldest (default: the newest). Only
+    /// matters for the handful of names that named two rats.
+    #[arg(long, short = 'g')]
+    pub generation: Option<usize>,
 }
 
 #[derive(Args)]
@@ -429,15 +433,26 @@ pub async fn status(layout: &Layout, args: NameArg, as_json: bool) -> Result<()>
 /// Print an agent's transcript (assistant text, tool calls, retries). With
 /// `--follow`, print the backlog then stream new entries until interrupted.
 pub async fn log(layout: &Layout, args: LogArgs, as_json: bool) -> Result<()> {
-    let params = json!({"name": args.name, "tail": args.tail, "follow": args.follow});
+    let params = json!({
+        "name": args.name,
+        "tail": args.tail,
+        "follow": args.follow,
+        "generation": args.generation,
+    });
     if !args.follow {
         let mut client = Client::connect_or_spawn(layout).await?;
         let result = client.call("agent.log", params).await?;
+        if let Some(note) = generation_note(&result, &args.name, as_json) {
+            eprintln!("{note}");
+        }
         print_log_entries(&result["entries"], as_json);
         return Ok(());
     }
     let client = Client::connect_or_spawn(layout).await?;
     let (backlog, mut stream) = client.call_then_stream("agent.log", params).await?;
+    if let Some(note) = generation_note(&backlog, &args.name, as_json) {
+        eprintln!("{note}");
+    }
     print_log_entries(&backlog["entries"], as_json);
     while let Some(note) = stream.next().await? {
         match note["method"].as_str() {
@@ -447,6 +462,23 @@ pub async fn log(layout: &Layout, args: LogArgs, as_json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Say so when a name is ambiguous, i.e. when it named more than one rat.
+/// Showing the newest silently would read as "this is the whole history of that
+/// name", which for those names it is not. `None` = nothing worth saying; the
+/// caller prints to stderr so piping the transcript stays clean.
+fn generation_note(result: &Value, name: &str, as_json: bool) -> Option<String> {
+    let total = result["generations"].as_u64().unwrap_or(0);
+    if as_json || total <= 1 {
+        return None;
+    }
+    let shown = result["generation"].as_u64().unwrap_or(total);
+    let spawned = result["created_at"].as_str().unwrap_or("?");
+    Some(format!(
+        "note: {total} rats have been named {name}; showing #{shown} (spawned {spawned}). \
+         `rk log {name} --generation N` for another (1 = oldest)."
+    ))
 }
 
 fn print_log_entries(entries: &Value, as_json: bool) {
@@ -715,4 +747,43 @@ pub async fn cost_fleet(layout: &Layout, as_json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reply(generations: u64, generation: u64) -> Value {
+        json!({
+            "entries": [],
+            "generations": generations,
+            "generation": generation,
+            "created_at": "2026-07-23T03:10:47.893987Z",
+        })
+    }
+
+    /// The common case: a name names one rat, so there is nothing to disclose.
+    #[test]
+    fn one_generation_says_nothing() {
+        assert_eq!(generation_note(&reply(1, 1), "Whisker", false), None);
+        assert_eq!(generation_note(&reply(0, 0), "ghost", false), None);
+    }
+
+    /// An ambiguous name must say which rat it is showing, and how to reach the
+    /// other — otherwise a partial answer reads as the whole history.
+    #[test]
+    fn an_ambiguous_name_discloses_the_choice() {
+        let note = generation_note(&reply(2, 2), "Gouda", false).expect("a note");
+        assert!(note.contains("2 rats have been named Gouda"), "{note}");
+        assert!(note.contains("showing #2"), "{note}");
+        assert!(note.contains("2026-07-23T03:10:47"), "{note}");
+        assert!(note.contains("--generation N"), "{note}");
+    }
+
+    /// `--json` output stays machine-clean; the reply already carries the
+    /// generation fields for a caller that wants them.
+    #[test]
+    fn json_output_carries_no_prose() {
+        assert_eq!(generation_note(&reply(2, 2), "Gouda", true), None);
+    }
 }

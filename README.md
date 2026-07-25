@@ -525,6 +525,12 @@ herdr, everything runs headless — but you are not blind to a headless rat:
 and `rk log <name> --follow` streams it live, persisted as a bounded per-agent
 ring under `~/.rat-kingdom/agent-logs/` (local only; never synced).
 
+Transcripts are filed per *generation* — `<name>.<spawn-instant>.jsonl` — not
+per name. A name normally names one rat for good, but 24 names briefly named two
+(see `docs/2026-07-25-agent-log-generations.md`), so `rk log <name>` shows the
+newest by default and says so when there are others; `--generation N` (1 =
+oldest) reads an earlier one.
+
 ## Multiplayer (git-notes sync)
 
 Multiple machines (castles) share one tuplespace through a git remote. Each

@@ -3,6 +3,7 @@
 //! server-push event stream.
 
 use crate::proto::{codes, Request, Response};
+use chrono::{DateTime, Utc};
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
 use rk_space::Space;
@@ -643,9 +644,13 @@ impl Daemon {
                     write_json_line(&mut write, &response).await?;
                     return self.stream_watch(write, pattern).await;
                 }
-                Outcome::LogFollow { response, agent } => {
+                Outcome::LogFollow {
+                    response,
+                    agent,
+                    generation,
+                } => {
                     write_json_line(&mut write, &response).await?;
-                    return self.stream_log(write, agent).await;
+                    return self.stream_log(write, agent, generation).await;
                 }
             }
         }
@@ -682,11 +687,12 @@ impl Daemon {
         &self,
         mut write: tokio::net::unix::OwnedWriteHalf,
         agent: String,
+        generation: Option<DateTime<Utc>>,
     ) -> std::io::Result<()> {
         let mut rx = self.supervisor.log().subscribe();
         loop {
             match rx.recv().await {
-                Ok(rec) if rec.agent == agent => {
+                Ok(rec) if rec.agent == agent && Some(rec.generation) == generation => {
                     let note = json!({"method": "log", "params": rec.entry});
                     write_json_line(&mut write, &note).await?;
                 }
@@ -756,12 +762,46 @@ impl Daemon {
                     Ok(p) => p,
                     Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
                 };
-                let backlog = self.supervisor.log().read(&params.name, params.tail);
-                let response = Response::ok(id, json!({"entries": backlog}));
+                // A name can have named more than one rat (the TKT-136 archiving
+                // window did that to 24 of them), so resolve which generation is
+                // meant instead of keying the read on the name alone. Default:
+                // the newest, which is what an operator typing a name means.
+                let generations = self.supervisor.log_generations(&params.name);
+                let selected = match params.generation {
+                    Some(n) => match n.checked_sub(1).and_then(|i| generations.get(i)) {
+                        Some(g) => g.clone(),
+                        None => {
+                            let msg = format!(
+                                "{} has {} log generation(s); no generation {n} (1 = oldest)",
+                                params.name,
+                                generations.len()
+                            );
+                            return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, msg));
+                        }
+                    },
+                    None => generations
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| crate::agent_log::Generation::unrecorded(&params.name)),
+                };
+                let backlog = self.supervisor.log().read(&selected, params.tail);
+                let response = Response::ok(
+                    id,
+                    json!({
+                        "entries": backlog,
+                        // How many rats have carried this name, and which one
+                        // this is (1 = oldest; 0 = no record at all), so the
+                        // client can disclose that a name is ambiguous.
+                        "generations": generations.len(),
+                        "generation": params.generation.unwrap_or(generations.len()),
+                        "created_at": selected.start,
+                    }),
+                );
                 if params.follow {
                     Outcome::LogFollow {
                         response,
                         agent: params.name,
+                        generation: selected.start,
                     }
                 } else {
                     reply(response)
@@ -1464,6 +1504,10 @@ enum Outcome {
     LogFollow {
         response: Response,
         agent: String,
+        /// The generation being followed. Only the newest generation of a name
+        /// can still be writing, so following an older one correctly streams
+        /// nothing rather than leaking a namesake's live output.
+        generation: Option<DateTime<Utc>>,
     },
 }
 
@@ -1476,6 +1520,10 @@ struct LogParams {
     /// Keep the connection open and push new entries as they land.
     #[serde(default)]
     follow: bool,
+    /// Which generation of this name to read, 1-based oldest-first. Unset = the
+    /// newest, i.e. the rat an operator means when they type a bare name.
+    #[serde(default)]
+    generation: Option<usize>,
 }
 
 #[derive(Deserialize)]
