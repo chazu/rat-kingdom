@@ -277,6 +277,43 @@ impl Pattern {
         self
     }
 
+    /// The one predicate for "the tuple `<identity>` that THIS generation of
+    /// agent `<agent>` wrote" — an agent-name search that cannot match a
+    /// namesake predecessor.
+    ///
+    /// An agent name is an identity key, but it keys a *generation*, not a rat:
+    /// the durable tuples a rat stamps its name into (`harness_result`,
+    /// `task_done`, …) outlive it forever, and [`crate::id::RecordId`] ordering
+    /// means a `LIMIT 1` read returns the OLDEST match. So a bare
+    /// `"agent":"<name>"` search over a durable category is satisfied by a
+    /// stranger's record. That was TKT-146: a workflow `wait` returned a
+    /// two-day-old namesake's `harness_result` in milliseconds, the `evaluate`
+    /// behind it judged a stranger's work, and the `dismiss` killed a live rat
+    /// one second into its task.
+    ///
+    /// `since` must be an instant the wanted tuple provably postdates — the
+    /// agent record's own `created_at`, or (when no record is reachable) the
+    /// start of the workflow instance that spawned it. This constructor exists
+    /// so that bound is not optional: reach for it instead of hand-rolling the
+    /// search, and the unbounded form is unrepresentable.
+    ///
+    /// TKT-159 swept for further unbounded name-keyed reads; see
+    /// `docs/2026-07-24-name-keyed-read-sweep.md`.
+    pub fn for_agent_since(
+        category: Category,
+        identity: impl Into<String>,
+        agent: &str,
+        since: DateTime<Utc>,
+    ) -> Self {
+        let mut pattern = Self::category(category).identity(identity);
+        // The single authoritative predicate includes `payload_search`;
+        // serde_json renders a string field exactly like this regardless of key
+        // order, so the substring is a reliable per-agent test.
+        pattern.payload_search = Some(format!("\"agent\":\"{agent}\""));
+        pattern.after_id = Some(RecordId::floor_at(since));
+        pattern
+    }
+
     /// The single authoritative match predicate. Both the storage query and the
     /// waiter wake path must agree with this exactly.
     pub fn matches(&self, tuple: &Tuple) -> bool {
@@ -350,6 +387,52 @@ mod tests {
             scope: Some(scope.into()),
             ..Default::default()
         }
+    }
+
+    /// The whole point of `for_agent_since` (TKT-146/TKT-159): a namesake
+    /// PREDECESSOR's durable tuple must not satisfy a read for this generation.
+    #[test]
+    fn for_agent_since_rejects_a_namesake_predecessors_tuple() {
+        let spawned_at = Utc::now();
+
+        // A two-day-old `task_done` from an earlier rat that carried this name.
+        let mut predecessor = t();
+        predecessor.id = RecordId::floor_at(spawned_at - chrono::Duration::days(2));
+
+        // This generation's own, written after it was spawned.
+        let mut mine = t();
+        mine.id = RecordId::floor_at(spawned_at + chrono::Duration::seconds(30));
+
+        let p = Pattern::for_agent_since(Category::Event, "task_done", "Whisker", spawned_at);
+        assert!(!p.matches(&predecessor), "matched a predecessor's tuple");
+        assert!(p.matches(&mine), "missed this generation's own tuple");
+    }
+
+    #[test]
+    fn for_agent_since_still_discriminates_by_agent_and_identity() {
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let p = Pattern::for_agent_since(Category::Event, "task_done", "Nibbles", since);
+        // Right generation window, wrong rat.
+        assert!(!p.matches(&t()));
+        let p = Pattern::for_agent_since(Category::Event, "harness_result", "Whisker", since);
+        // Right rat, wrong event.
+        assert!(!p.matches(&t()));
+        let p = Pattern::for_agent_since(Category::Event, "task_done", "Whisker", since);
+        assert!(p.matches(&t()));
+    }
+
+    /// A name that is a substring of another must not match it — the search is
+    /// on the rendered `"agent":"<name>"` pair, not the bare name.
+    #[test]
+    fn for_agent_since_does_not_match_a_name_prefix() {
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let mut generation_two = t();
+        generation_two.payload = json!({"agent": "Whisker-2", "task": ".rk-9"});
+        let p = Pattern::for_agent_since(Category::Event, "task_done", "Whisker", since);
+        assert!(
+            !p.matches(&generation_two),
+            "\"Whisker\" matched \"Whisker-2\""
+        );
     }
 
     #[test]

@@ -528,16 +528,14 @@ impl Supervisor {
             let agent = name.clone();
             let space = self.space.clone();
             // Bound the read to this generation of the name. `task_done` events
-            // are durable and agent names are recycled once an old record is
-            // archived, so an unbounded name search matches a PREDECESSOR's
-            // `rk done` and reports this rat complete the instant it starts —
-            // the attach-mode twin of the TKT-146 workflow-wait bug.
-            let since = rk_core::id::RecordId::floor_at(record.created_at);
+            // are durable and outlive the rat they name, so an unbounded name
+            // search matches a PREDECESSOR's `rk done` and reports this rat
+            // complete the instant it starts — the attach-mode twin of the
+            // TKT-146 workflow-wait bug. `for_agent_since` is the one shared
+            // constructor for that predicate (TKT-159); it has no unbounded form.
+            let since = record.created_at;
             tokio::spawn(async move {
-                let mut pattern =
-                    rk_core::tuple::Pattern::category(Category::Event).identity("task_done");
-                pattern.payload_search = Some(format!("\"agent\":\"{agent}\""));
-                pattern.after_id = Some(since);
+                let pattern = Pattern::for_agent_since(Category::Event, "task_done", &agent, since);
                 match space
                     .rd(&pattern, std::time::Duration::from_secs(24 * 3600))
                     .await
