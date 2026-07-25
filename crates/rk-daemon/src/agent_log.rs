@@ -3,9 +3,33 @@
 //! without `--attach`ing. `handle_event` used to drop these events on the
 //! floor; here they become a durable timeline instead.
 //!
-//! Files live at `<home>/agent-logs/<agent>.jsonl`, are byte-capped ring
-//! buffers (a runaway rat cannot fill the disk), and stay strictly local — the
-//! transcript is never a tuple and never touches `rk-sync`.
+//! Files live at `<home>/agent-logs/<agent>.<generation>.jsonl`, are byte-capped
+//! ring buffers (a runaway rat cannot fill the disk), and stay strictly local —
+//! the transcript is never a tuple and never touches `rk-sync`.
+//!
+//! # Why the file is keyed on a generation, not a name
+//!
+//! A transcript is written under the *generation* that produced it — the
+//! `(name, created_at)` pair the archive has been keyed on since TKT-136 — not
+//! under the bare name. A name is normally an identity key (TKT-146 restored
+//! that: [`Registry::reserve_name`] never recycles), so most of the time the two
+//! keys agree. They came apart once: between the TKT-136 archiving window and
+//! the TKT-146 fix, archiving briefly returned a name to the pool, and 24 names
+//! ended up naming two unrelated rats. Keying the file on the name alone means
+//! their transcripts share a file, so `rk log <name>` can only present one of
+//! them, silently, as if it were the whole story.
+//!
+//! Two consequences worth knowing:
+//!
+//! - A write can no longer land in the wrong rat's file, whatever a future
+//!   naming regression does — the path carries the spawn instant.
+//! - Reads are fixed *retroactively*. [`AgentLog::read`] still reads the legacy
+//!   `<agent>.jsonl` path, but windows it to `[start, end)` of the generation
+//!   asked for. That works because generations of a name never overlap in time
+//!   (the predecessor was terminal-and-archived before the successor spawned),
+//!   so a timestamp alone says which rat wrote a line.
+//!
+//! [`Registry::reserve_name`]: crate::agents::Registry::reserve_name
 
 use chrono::{DateTime, Utc};
 use rk_core::paths::Layout;
@@ -36,12 +60,60 @@ pub enum LogEvent {
     Retry { attempt: u64, error: String },
 }
 
-/// A broadcast record tagging an entry with its agent so `--follow` clients can
-/// filter the shared feed down to the one they asked for.
+/// A broadcast record tagging an entry with the generation that wrote it, so
+/// `--follow` clients can filter the shared feed down to the one they asked for.
 #[derive(Debug, Clone)]
 pub struct LogRecord {
     pub agent: String,
+    /// `created_at` of the writing agent's record — the generation key.
+    pub generation: DateTime<Utc>,
     pub entry: LogEntry,
+}
+
+/// One generation of an agent name: which rat's transcript to read, and the
+/// time window that isolates it inside a legacy name-keyed file.
+///
+/// Build these with [`Supervisor::log_generations`], which reads the bounds off
+/// the registry (live + archive) rather than guessing.
+///
+/// [`Supervisor::log_generations`]: crate::supervisor::Supervisor::log_generations
+#[derive(Debug, Clone)]
+pub struct Generation {
+    pub agent: String,
+    /// The record's `created_at`: the generation key, and the inclusive lower
+    /// bound of its entries in a legacy file. `None` = no registry record for
+    /// this name at all, so there is nothing to window against and the legacy
+    /// file is read whole.
+    pub start: Option<DateTime<Utc>>,
+    /// `created_at` of the NEXT generation of this name, if there is one: the
+    /// exclusive upper bound. `None` = newest generation, unbounded above.
+    pub end: Option<DateTime<Utc>>,
+}
+
+impl Generation {
+    pub fn of(agent: &str, start: DateTime<Utc>, end: Option<DateTime<Utc>>) -> Self {
+        Self {
+            agent: agent.to_string(),
+            start: Some(start),
+            end,
+        }
+    }
+
+    /// A name with no record in the registry or the archive — a hand-pruned
+    /// `agents.json`, or a typo. Reads the legacy file unfiltered so a
+    /// transcript that outlived its record is still legible.
+    pub fn unrecorded(agent: &str) -> Self {
+        Self {
+            agent: agent.to_string(),
+            start: None,
+            end: None,
+        }
+    }
+
+    /// Whether an entry stamped `ts` belongs to this generation.
+    fn contains(&self, ts: DateTime<Utc>) -> bool {
+        self.start.is_none_or(|start| ts >= start) && self.end.is_none_or(|end| ts < end)
+    }
 }
 
 /// Once a transcript grows past `CAP_BYTES`, trim it back to (about) the last
@@ -72,10 +144,11 @@ impl AgentLog {
         self.tx.subscribe()
     }
 
-    /// Append one entry to `agent`'s transcript and publish it to followers.
+    /// Append one entry to the transcript of the `generation` of `agent` that is
+    /// running now (its record's `created_at`), and publish it to followers.
     /// Best-effort: a disk failure is logged, never propagated — the transcript
     /// is a convenience, not a correctness dependency of the run.
-    pub fn append(&self, agent: &str, event: LogEvent) {
+    pub fn append(&self, agent: &str, generation: DateTime<Utc>, event: LogEvent) {
         let entry = LogEntry {
             ts: Utc::now(),
             event,
@@ -84,6 +157,7 @@ impl AgentLog {
         // write below fails.
         let _ = self.tx.send(LogRecord {
             agent: agent.to_string(),
+            generation,
             entry: entry.clone(),
         });
 
@@ -91,7 +165,7 @@ impl AgentLog {
             Ok(s) => s,
             Err(_) => return,
         };
-        let path = self.path_for(agent);
+        let path = self.path_for(agent, generation);
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = self.write_line(&path, &line) {
             warn!(agent, error = %e, "failed to append agent log");
@@ -115,18 +189,25 @@ impl AgentLog {
         Ok(())
     }
 
-    /// Read `agent`'s transcript oldest-first, optionally only the last `tail`
-    /// entries. Malformed lines (e.g. a torn write) are skipped, not fatal.
-    pub fn read(&self, agent: &str, tail: Option<usize>) -> Vec<LogEntry> {
-        let data = match std::fs::read_to_string(self.path_for(agent)) {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
+    /// Read one generation's transcript oldest-first, optionally only the last
+    /// `tail` entries. Malformed lines (e.g. a torn write) are skipped, not
+    /// fatal.
+    ///
+    /// Reads the generation's own file *and* the generation's window of the
+    /// legacy name-keyed file, merged by timestamp. Both exist together only for
+    /// a rat that was mid-run when the daemon upgraded to generation keying;
+    /// after that the legacy path is pure history.
+    pub fn read(&self, generation: &Generation, tail: Option<usize>) -> Vec<LogEntry> {
+        let mut entries = match generation.start {
+            Some(start) => read_entries(&self.path_for(&generation.agent, start)),
+            None => Vec::new(),
         };
-        let mut entries: Vec<LogEntry> = data
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
+        let mut legacy = read_entries(&self.legacy_path(&generation.agent));
+        if !legacy.is_empty() {
+            legacy.retain(|e| generation.contains(e.ts));
+            entries.append(&mut legacy);
+            entries.sort_by_key(|e| e.ts);
+        }
         if let Some(n) = tail {
             if entries.len() > n {
                 entries.drain(0..entries.len() - n);
@@ -135,9 +216,35 @@ impl AgentLog {
         entries
     }
 
-    fn path_for(&self, agent: &str) -> PathBuf {
+    fn path_for(&self, agent: &str, generation: DateTime<Utc>) -> PathBuf {
+        self.dir
+            .join(format!("{}.{}.jsonl", sanitize(agent), stamp(generation)))
+    }
+
+    /// Where transcripts lived before the file was keyed on a generation:
+    /// read-only history, never appended to again.
+    fn legacy_path(&self, agent: &str) -> PathBuf {
         self.dir.join(format!("{}.jsonl", sanitize(agent)))
     }
+}
+
+/// A generation stamp for a file name: sortable, second-and-millisecond precise,
+/// and made only of characters [`sanitize`] would leave alone.
+fn stamp(generation: DateTime<Utc>) -> String {
+    generation.format("%Y%m%dT%H%M%S%3fZ").to_string()
+}
+
+/// Parse a JSONL transcript file, oldest first. A missing file is an empty
+/// transcript, not an error — an agent may simply not have narrated yet.
+fn read_entries(path: &Path) -> Vec<LogEntry> {
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    data.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
 }
 
 /// Keep only the last `keep` bytes of a file, snapped forward to the next line
@@ -179,21 +286,32 @@ mod tests {
         AgentLog::new(&Layout::at(dir))
     }
 
+    fn at(unix_secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(unix_secs, 0).unwrap()
+    }
+
+    /// The only generation of a name, which is the normal case.
+    fn only(agent: &str, start: DateTime<Utc>) -> Generation {
+        Generation::of(agent, start, None)
+    }
+
     #[test]
     fn append_then_read_roundtrips_in_order() {
         let tmp = tempfile::tempdir().unwrap();
         let log = log_at(tmp.path());
-        log.append("cinder", LogEvent::Text { text: "hi".into() });
-        log.append("cinder", LogEvent::Tool { name: "Bash".into() });
+        let gen = at(1000);
+        log.append("cinder", gen, LogEvent::Text { text: "hi".into() });
+        log.append("cinder", gen, LogEvent::Tool { name: "Bash".into() });
         log.append(
             "cinder",
+            gen,
             LogEvent::Retry {
                 attempt: 2,
                 error: "overloaded".into(),
             },
         );
 
-        let entries = log.read("cinder", None);
+        let entries = log.read(&only("cinder", gen), None);
         assert_eq!(entries.len(), 3);
         assert!(matches!(&entries[0].event, LogEvent::Text { text } if text == "hi"));
         assert!(matches!(&entries[1].event, LogEvent::Tool { name } if name == "Bash"));
@@ -204,10 +322,11 @@ mod tests {
     fn read_tail_returns_most_recent() {
         let tmp = tempfile::tempdir().unwrap();
         let log = log_at(tmp.path());
+        let gen = at(1000);
         for i in 0..10 {
-            log.append("r", LogEvent::Tool { name: i.to_string() });
+            log.append("r", gen, LogEvent::Tool { name: i.to_string() });
         }
-        let tail = log.read("r", Some(3));
+        let tail = log.read(&only("r", gen), Some(3));
         assert_eq!(tail.len(), 3);
         assert!(matches!(&tail[0].event, LogEvent::Tool { name } if name == "7"));
         assert!(matches!(&tail[2].event, LogEvent::Tool { name } if name == "9"));
@@ -217,7 +336,8 @@ mod tests {
     fn missing_agent_reads_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let log = log_at(tmp.path());
-        assert!(log.read("nobody", None).is_empty());
+        assert!(log.read(&only("nobody", at(1000)), None).is_empty());
+        assert!(log.read(&Generation::unrecorded("nobody"), None).is_empty());
     }
 
     #[test]
@@ -225,9 +345,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let log = log_at(tmp.path());
         let mut rx = log.subscribe();
-        log.append("cinder", LogEvent::Tool { name: "Read".into() });
+        let gen = at(1000);
+        log.append("cinder", gen, LogEvent::Tool { name: "Read".into() });
         let rec = rx.try_recv().expect("entry should be broadcast");
         assert_eq!(rec.agent, "cinder");
+        // The generation rides along so a follower of one rat is never handed a
+        // namesake's live output.
+        assert_eq!(rec.generation, gen);
         assert!(matches!(rec.entry.event, LogEvent::Tool { name } if name == "Read"));
     }
 
@@ -235,23 +359,153 @@ mod tests {
     fn oversized_log_is_trimmed_to_a_bounded_tail() {
         let tmp = tempfile::tempdir().unwrap();
         let log = log_at(tmp.path());
+        let gen = at(1000);
         // Each entry is ~1 KiB of prose; write well past the 512 KiB cap.
         let big = "x".repeat(1000);
         for _ in 0..1200 {
-            log.append("whale", LogEvent::Text { text: big.clone() });
+            log.append("whale", gen, LogEvent::Text { text: big.clone() });
         }
-        let path = tmp.path().join("agent-logs").join("whale.jsonl");
+        let path = tmp
+            .path()
+            .join("agent-logs")
+            .join(format!("whale.{}.jsonl", stamp(gen)));
         let len = std::fs::metadata(&path).unwrap().len();
         assert!(len <= CAP_BYTES, "log should be capped, got {len} bytes");
         // The tail is still well-formed and the newest entry survived.
-        let entries = log.read("whale", None);
+        let entries = log.read(&only("whale", gen), None);
         assert!(!entries.is_empty());
-        assert!(entries.iter().all(|e| matches!(&e.event, LogEvent::Text { .. })));
+        assert!(entries
+            .iter()
+            .all(|e| matches!(&e.event, LogEvent::Text { .. })));
     }
 
     #[test]
     fn odd_names_cannot_escape_the_log_dir() {
         assert_eq!(sanitize("../etc/passwd"), "___etc_passwd");
         assert_eq!(sanitize("Cinder-2"), "Cinder-2");
+    }
+
+    #[test]
+    fn a_generation_stamp_is_sortable_and_filesystem_safe() {
+        // Alphanumeric, so it survives `sanitize` untouched, and it sorts in
+        // chronological order — the `name.stamp.jsonl` stem stays legible by eye.
+        assert_eq!(stamp(at(1_753_408_412)), "20250725T015332000Z");
+        assert!(stamp(at(1000)) < stamp(at(2000)));
+        assert_eq!(sanitize(&stamp(at(1000))), stamp(at(1000)));
+        // `sanitize` never emits a dot, so the dot separating name from stamp is
+        // unambiguous however odd the name is.
+        assert!(!sanitize("Sable-2").contains('.'));
+    }
+
+    /// The bug this keying exists to prevent: two rats sharing a name must not
+    /// share a transcript.
+    #[test]
+    fn two_generations_of_one_name_keep_separate_transcripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = log_at(tmp.path());
+        let (first, second) = (at(1000), at(2000));
+
+        log.append("Gouda", first, LogEvent::Text { text: "gen1".into() });
+        log.append("Gouda", second, LogEvent::Text { text: "gen2".into() });
+
+        let older = log.read(&Generation::of("Gouda", first, Some(second)), None);
+        assert_eq!(older.len(), 1, "the older rat sees only its own line");
+        assert!(matches!(&older[0].event, LogEvent::Text { text } if text == "gen1"));
+
+        let newer = log.read(&only("Gouda", second), None);
+        assert_eq!(newer.len(), 1, "and the newer rat only its own");
+        assert!(matches!(&newer[0].event, LogEvent::Text { text } if text == "gen2"));
+    }
+
+    /// Retroactive half of the fix: a legacy `<name>.jsonl` written before the
+    /// keying change can hold several generations back to back. Reads split it on
+    /// the generation boundary, so the 24 historical name pairs become legible
+    /// without rewriting a single byte of history.
+    #[test]
+    fn a_legacy_shared_file_is_split_on_the_generation_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = log_at(tmp.path());
+        let (first, second) = (at(1000), at(2000));
+        write_legacy(
+            tmp.path(),
+            "Brie",
+            &[
+                (at(1001), "gen1 opening"),
+                (at(1500), "gen1 closing"),
+                (at(2001), "gen2 opening"),
+            ],
+        );
+
+        let older = log.read(&Generation::of("Brie", first, Some(second)), None);
+        assert_eq!(older.len(), 2, "windowed to the first rat's run");
+        assert!(matches!(&older[0].event, LogEvent::Text { text } if text == "gen1 opening"));
+        assert!(matches!(&older[1].event, LogEvent::Text { text } if text == "gen1 closing"));
+
+        let newer = log.read(&only("Brie", second), None);
+        assert_eq!(newer.len(), 1, "and the second rat's");
+        assert!(matches!(&newer[0].event, LogEvent::Text { text } if text == "gen2 opening"));
+
+        // Entries predating every generation belong to nobody and are dropped,
+        // not silently attributed to the oldest rat.
+        write_legacy(tmp.path(), "Pip", &[(at(500), "orphan")]);
+        assert!(log.read(&only("Pip", first), None).is_empty());
+    }
+
+    /// A name with no record at all (hand-pruned `agents.json`) still reads: the
+    /// legacy file is returned whole rather than the transcript vanishing.
+    #[test]
+    fn an_unrecorded_name_reads_its_legacy_file_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = log_at(tmp.path());
+        write_legacy(tmp.path(), "Ghost", &[(at(10), "a"), (at(20), "b")]);
+        let entries = log.read(&Generation::unrecorded("Ghost"), None);
+        assert_eq!(entries.len(), 2);
+    }
+
+    /// The upgrade boundary: a rat mid-run when the daemon gained generation
+    /// keying has a prefix in the legacy file and a suffix in its own. One read
+    /// merges them in timestamp order.
+    #[test]
+    fn a_run_straddling_the_upgrade_merges_both_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = log_at(tmp.path());
+        let gen = at(1000);
+        write_legacy(tmp.path(), "Twitch", &[(at(1001), "before restart")]);
+        log.append(
+            "Twitch",
+            gen,
+            LogEvent::Text {
+                text: "after restart".into(),
+            },
+        );
+
+        let entries = log.read(&only("Twitch", gen), None);
+        assert_eq!(entries.len(), 2, "both halves of the run");
+        assert!(matches!(&entries[0].event, LogEvent::Text { text } if text == "before restart"));
+        assert!(matches!(&entries[1].event, LogEvent::Text { text } if text == "after restart"));
+        // `tail` applies to the merged transcript, not to one file's share of it.
+        let tail = log.read(&only("Twitch", gen), Some(1));
+        assert_eq!(tail.len(), 1);
+        assert!(matches!(&tail[0].event, LogEvent::Text { text } if text == "after restart"));
+    }
+
+    /// Hand-write the pre-generation file layout: `<agent>.jsonl`, one JSON entry
+    /// per line.
+    fn write_legacy(home: &Path, agent: &str, entries: &[(DateTime<Utc>, &str)]) {
+        let dir = home.join("agent-logs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: String = entries
+            .iter()
+            .map(|(ts, text)| {
+                let entry = LogEntry {
+                    ts: *ts,
+                    event: LogEvent::Text {
+                        text: (*text).to_string(),
+                    },
+                };
+                format!("{}\n", serde_json::to_string(&entry).unwrap())
+            })
+            .collect();
+        std::fs::write(dir.join(format!("{}.jsonl", sanitize(agent))), body).unwrap();
     }
 }

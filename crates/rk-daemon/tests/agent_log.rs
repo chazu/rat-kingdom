@@ -3,9 +3,12 @@
 //! The bounded ring, tail, and follow-broadcast are unit-tested in
 //! `agent_log`; this proves the wiring at the supervisor boundary: assistant
 //! text and tool calls the supervisor used to DROP are now persisted per-agent
-//! and served back by `agent.log`.
+//! and served back by `agent.log`. Plus (TKT-158) that a name which named two
+//! rats serves each of them separately.
 
+use chrono::{DateTime, TimeDelta, Utc};
 use rk_core::paths::Layout;
+use rk_daemon::agents::{AgentRecord, AgentState, Registry};
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
 use std::time::Duration;
@@ -99,8 +102,162 @@ async fn supervisor_persists_transcript_and_log_serves_it() {
         .await
         .unwrap();
     assert!(empty["entries"].as_array().unwrap().is_empty());
+    assert_eq!(empty["generations"], 0, "nothing has carried that name");
+
+    // The reply says which rat of that name this is (TKT-158). One generation is
+    // the normal case, and the client stays quiet about it.
+    assert_eq!(log["generations"], 1);
+    assert_eq!(log["generation"], 1);
+    assert_eq!(
+        log["created_at"].as_str(),
+        spawned["agent"]["created_at"].as_str(),
+        "the generation reported is the record's created_at"
+    );
+
+    // Asking for a generation that never existed is a parameter error, not a
+    // silent fallback to a different rat's transcript.
+    let bad = client
+        .call("agent.log", json!({"name": name, "generation": 2}))
+        .await;
+    assert!(bad.is_err(), "generation 2 of a one-generation name");
+
+    // The transcript is filed under the generation, not the bare name.
+    let logs = home.path().join("agent-logs");
+    let files: Vec<String> = std::fs::read_dir(&logs)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(files.len(), 1, "one transcript file: {files:?}");
+    assert!(
+        files[0].starts_with(&format!("{name}.")) && files[0] != format!("{name}.jsonl"),
+        "transcript must be generation-keyed, got {:?}",
+        files[0]
+    );
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+/// The historical shape TKT-158 exists for: one name, two unrelated rats, and a
+/// single legacy `<name>.jsonl` holding both their transcripts back to back.
+/// `agent.log` must serve each rat its own lines and neither rat the other's.
+///
+/// The fixture is built through `Registry` rather than by spawning, because
+/// spawning can no longer produce it — TKT-146 stopped recycling names. This is
+/// the on-disk state 24 names were left in before that fix.
+#[tokio::test]
+async fn a_name_that_named_two_rats_serves_each_generation_separately() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    let now = Utc::now();
+    let older_at = now - TimeDelta::try_days(2).unwrap();
+    let newer_at = now - TimeDelta::try_hours(1).unwrap();
+
+    {
+        let mut reg = Registry::load(&home.path().join("agents.json")).unwrap();
+        reg.insert(terminal_record("Gouda", older_at)).unwrap();
+        // Archiving is what freed the name back then; it is also what keeps the
+        // older generation discoverable now.
+        reg.archive(now).unwrap();
+        reg.insert(terminal_record("Gouda", newer_at)).unwrap();
+    }
+    // The pre-generation file layout: both rats' lines in one name-keyed file.
+    write_legacy_transcript(
+        home.path(),
+        "Gouda",
+        &[
+            (older_at + TimeDelta::try_seconds(5).unwrap(), "first rat"),
+            (older_at + TimeDelta::try_seconds(9).unwrap(), "first rat again"),
+            (newer_at + TimeDelta::try_seconds(5).unwrap(), "second rat"),
+        ],
+    );
+
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    // A bare name serves the NEWEST rat, and says the name is ambiguous.
+    let newest = client
+        .call("agent.log", json!({"name": "Gouda"}))
+        .await
+        .unwrap();
+    assert_eq!(newest["generations"], 2, "two rats carried this name");
+    assert_eq!(newest["generation"], 2, "the newest is the default");
+    let entries = newest["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "only the second rat's line");
+    assert_eq!(entries[0]["text"], "second rat");
+
+    // ...and the older rat's transcript is reachable, de-interleaved out of the
+    // same legacy file by its generation window.
+    let oldest = client
+        .call("agent.log", json!({"name": "Gouda", "generation": 1}))
+        .await
+        .unwrap();
+    assert_eq!(oldest["generation"], 1);
+    let entries = oldest["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "both of the first rat's lines");
+    assert_eq!(entries[0]["text"], "first rat");
+    assert_eq!(entries[1]["text"], "first rat again");
+    assert_eq!(
+        oldest["created_at"].as_str().unwrap(),
+        older_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+        "and it is labelled with the older rat's spawn instant"
+    );
+
+    // `tail` bounds the selected generation, not the file.
+    let tailed = client
+        .call("agent.log", json!({"name": "Gouda", "generation": 1, "tail": 1}))
+        .await
+        .unwrap();
+    let entries = tailed["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["text"], "first rat again");
+
+    // A generation that never existed is an error, not a quiet fallback to a
+    // different rat's transcript.
+    assert!(client
+        .call("agent.log", json!({"name": "Gouda", "generation": 3}))
+        .await
+        .is_err());
+}
+
+/// A settled record, as a rat that finished two days ago would be left.
+fn terminal_record(name: &str, created_at: DateTime<Utc>) -> AgentRecord {
+    AgentRecord {
+        name: name.into(),
+        role: "rat".into(),
+        harness: "fake".into(),
+        model: None,
+        repo_root: "/tmp/repo".into(),
+        repo_name: "repo".into(),
+        task: Some(format!("task-for-{created_at}")),
+        branch: None,
+        worktree: None,
+        target_branch: "main".into(),
+        parent: None,
+        workflow_instance: None,
+        session_id: None,
+        attach_target: None,
+        pid: None,
+        merge_commit: None,
+        state: AgentState::Dismissed,
+        result: None,
+        usage: Default::default(),
+        cost_usd: 0.0,
+        created_at,
+        updated_at: created_at,
+        archived_at: None,
+    }
+}
+
+/// Write the pre-TKT-158 file layout by hand: `agent-logs/<name>.jsonl`.
+fn write_legacy_transcript(home: &std::path::Path, agent: &str, lines: &[(DateTime<Utc>, &str)]) {
+    let dir = home.join("agent-logs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let body: String = lines
+        .iter()
+        .map(|(ts, text)| format!("{}\n", json!({"ts": ts, "kind": "text", "text": text})))
+        .collect();
+    std::fs::write(dir.join(format!("{agent}.jsonl")), body).unwrap();
 }
 
 fn scratch_repo(dir: &std::path::Path) {

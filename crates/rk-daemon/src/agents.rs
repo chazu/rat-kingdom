@@ -239,6 +239,31 @@ impl Registry {
         })
     }
 
+    /// Every generation of `name` that ever existed, oldest first: the
+    /// `created_at` of each live or archived record carrying it.
+    ///
+    /// Normally one entry — a name is an identity key and
+    /// [`reserve_name`](Registry::reserve_name) never recycles. Two entries mean
+    /// the name genuinely named two rats, which the TKT-136 archiving window did
+    /// to 24 names before TKT-146 closed it. Anything keyed on a name alone is
+    /// ambiguous for exactly those names, so callers that must disambiguate
+    /// (`rk log`) ask here instead of assuming.
+    ///
+    /// Deduped by `created_at`: the archive/persist crash window can leave one
+    /// generation in both stores, and that is one rat, not two.
+    pub fn generations_of(&self, name: &str) -> Vec<DateTime<Utc>> {
+        let mut generations: Vec<DateTime<Utc>> = self
+            .agents
+            .get(name)
+            .into_iter()
+            .chain(self.archived.iter().filter(|a| a.name == name))
+            .map(|a| a.created_at)
+            .collect();
+        generations.sort_unstable();
+        generations.dedup();
+        generations
+    }
+
     /// The live registry, oldest first. Archived records are excluded — this is
     /// the default view every operator surface renders.
     pub fn list(&self) -> Vec<&AgentRecord> {
@@ -701,6 +726,56 @@ mod tests {
             reg.unarchive(&name).is_err(),
             "unarchiving onto a live name must refuse rather than clobber"
         );
+    }
+
+    /// `generations_of` is what lets a name-keyed reader (`rk log`) disambiguate
+    /// the 24 names that carried two rats during the TKT-136 archiving window.
+    #[test]
+    fn generations_of_reports_every_rat_that_carried_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load(&dir.path().join("agents.json")).unwrap();
+
+        assert!(
+            reg.generations_of("Gouda").is_empty(),
+            "a name nobody has carried has no generations"
+        );
+
+        // The historical shape: an older rat archived out of the live map, and a
+        // newer one under the same name still live.
+        let older = aged("Gouda", AgentState::Dismissed, 2 * 86_400);
+        let older_created = older.created_at;
+        reg.insert(older).unwrap();
+        assert_eq!(reg.generations_of("Gouda"), vec![older_created]);
+        reg.archive(Utc::now()).unwrap();
+
+        let newer = record("Gouda", AgentState::Running);
+        let newer_created = newer.created_at;
+        reg.insert(newer).unwrap();
+
+        assert_eq!(
+            reg.generations_of("Gouda"),
+            vec![older_created, newer_created],
+            "both rats, oldest first — the archived one is not lost behind the live one"
+        );
+        assert!(
+            reg.generations_of("Brie").is_empty(),
+            "and a namesake's generations never leak onto another name"
+        );
+    }
+
+    /// One rat sitting in both stores (the archive-then-crash window) is one
+    /// generation, not two — otherwise `rk log` would offer a phantom choice.
+    #[test]
+    fn generations_of_dedupes_a_record_present_in_both_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load(&dir.path().join("agents.json")).unwrap();
+        let generation = aged("Cheddar", AgentState::Dismissed, 3_600);
+        let created = generation.created_at;
+        reg.insert(generation.clone()).unwrap();
+        reg.archive(Utc::now()).unwrap();
+        reg.insert(generation).unwrap();
+
+        assert_eq!(reg.generations_of("Cheddar"), vec![created]);
     }
 
     #[test]

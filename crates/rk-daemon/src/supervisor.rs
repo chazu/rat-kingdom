@@ -261,6 +261,24 @@ impl Supervisor {
         &self.log
     }
 
+    /// Every transcript generation of `name`, oldest first, each carrying the
+    /// exclusive upper bound (the next generation's `created_at`) that isolates
+    /// it inside a legacy name-keyed log file.
+    ///
+    /// Empty when no record — live or archived — carries the name. Callers
+    /// reading a transcript anyway should fall back to
+    /// [`Generation::unrecorded`](crate::agent_log::Generation::unrecorded).
+    pub fn log_generations(&self, name: &str) -> Vec<crate::agent_log::Generation> {
+        let starts = self.lock_registry().generations_of(name);
+        starts
+            .iter()
+            .enumerate()
+            .map(|(i, &start)| {
+                crate::agent_log::Generation::of(name, start, starts.get(i + 1).copied())
+            })
+            .collect()
+    }
+
     /// Called once the daemon has WON the socket bind — never earlier. A
     /// Daemon that loses the bind race must not touch shared registry state.
     pub fn on_daemon_started(&self) {
@@ -412,9 +430,10 @@ impl Supervisor {
 
         let supervisor = Arc::clone(self);
         let mut events = session.events;
+        let generation = record.created_at;
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                supervisor.handle_event(&name, event);
+                supervisor.handle_event(&name, generation, event);
             }
         });
 
@@ -642,15 +661,27 @@ impl Supervisor {
         let supervisor = Arc::clone(self);
         let owned = name.to_string();
         let mut events = session.events;
+        // A respawn continues the SAME generation — the record (and its
+        // `created_at`) is reused — so the second run appends to the transcript
+        // the first run started, which is what an operator expects.
+        let generation = updated.created_at;
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                supervisor.handle_event(&owned, event);
+                supervisor.handle_event(&owned, generation, event);
             }
         });
         Ok(updated)
     }
 
-    fn handle_event(self: &Arc<Self>, name: &str, event: HarnessEvent) {
+    /// `generation` is the agent record's `created_at`, captured once when the
+    /// event loop is wired up: transcript writes are keyed on the generation, not
+    /// the name, so a line can never land in a namesake's file.
+    fn handle_event(
+        self: &Arc<Self>,
+        name: &str,
+        generation: DateTime<Utc>,
+        event: HarnessEvent,
+    ) {
         match event {
             HarnessEvent::Started { session_id } => {
                 let _ = self.lock_registry().update(name, |r| {
@@ -717,15 +748,21 @@ impl Supervisor {
             // transcript so the operator can `rk log` a run without --attach.
             HarnessEvent::AssistantText { text } => {
                 self.log
-                    .append(name, crate::agent_log::LogEvent::Text { text });
+                    .append(name, generation, crate::agent_log::LogEvent::Text { text });
             }
             HarnessEvent::ToolUse { name: tool } => {
-                self.log
-                    .append(name, crate::agent_log::LogEvent::Tool { name: tool });
+                self.log.append(
+                    name,
+                    generation,
+                    crate::agent_log::LogEvent::Tool { name: tool },
+                );
             }
             HarnessEvent::Retry { attempt, error } => {
-                self.log
-                    .append(name, crate::agent_log::LogEvent::Retry { attempt, error });
+                self.log.append(
+                    name,
+                    generation,
+                    crate::agent_log::LogEvent::Retry { attempt, error },
+                );
             }
         }
     }
