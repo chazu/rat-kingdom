@@ -4,7 +4,8 @@
 
 use crate::supervisor::{SpawnParams, Supervisor};
 use crate::tickets::Tickets;
-use rk_core::id::{prefixed_id, RecordId};
+use chrono::{DateTime, Utc};
+use rk_core::id::prefixed_id;
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Pattern};
 use rk_space::Space;
@@ -464,7 +465,7 @@ impl WorkflowEngine {
                         .clone()
                         .ok_or_else(|| rk_core::Error::other("wait step with no active agent"))?;
                     let timeout = parse_duration(&wait.timeout)?;
-                    let pattern = self.result_pattern(&agent);
+                    let pattern = self.result_pattern(id, &agent);
                     let tuple = self
                         .space
                         .rd(&pattern, timeout)
@@ -637,7 +638,7 @@ impl WorkflowEngine {
                     self.update(id, |i| i.context.fanout = fanout);
                 }
                 Step::WaitAll(wait_all) => {
-                    let summary = self.join(&ctx.fanout, wait_all).await?;
+                    let summary = self.join(id, &ctx.fanout, wait_all).await?;
                     self.update(id, |i| i.context.previous_result = Some(summary.clone()));
                 }
                 Step::DismissAll(dismiss_all) => {
@@ -903,28 +904,55 @@ impl WorkflowEngine {
     /// it waits on is wrong on its own terms. Bounding the read below the
     /// agent record's `created_at` makes the predicate generation-exact and
     /// keeps it correct however the naming policy moves.
-    fn result_pattern(&self, agent: &str) -> Pattern {
-        let mut pattern = Pattern::category(Category::Event).identity("harness_result");
-        // The single authoritative predicate includes this search; serde_json
-        // serializes maps in key order, so the agent field renders exactly
-        // like this.
-        pattern.payload_search = Some(format!("\"agent\":\"{agent}\""));
-        match self.supervisor.status(agent) {
-            Some(record) => pattern.after(Some(RecordId::floor_at(record.created_at))),
-            None => {
-                // Unreachable for an agent we just spawned; degrade to the
-                // unbounded read rather than failing a live workflow on it.
-                warn!(agent, "no record for waited-on agent; wait is unbounded");
-                pattern
-            }
+    ///
+    /// TKT-159: the bound is now unconditional. It previously degraded to an
+    /// UNBOUNDED read when the agent's registry record was unreachable, which
+    /// left the exact defect this method exists to prevent live on that path.
+    /// [`generation_floor`](Self::generation_floor) now always yields a valid
+    /// bound, so there is no case in which a `wait` can match a namesake.
+    fn result_pattern(&self, id: &str, agent: &str) -> Pattern {
+        Pattern::for_agent_since(
+            Category::Event,
+            "harness_result",
+            agent,
+            self.generation_floor(id, agent),
+        )
+    }
+
+    /// The instant a waited-on agent's `harness_result` provably postdates.
+    ///
+    /// The agent record's own `created_at` is the exact answer. When no record
+    /// is reachable — it was removed, or the registry file was replaced under a
+    /// resumed instance — fall back to when THIS workflow instance started:
+    /// every agent a `wait`/`wait_all` blocks on was spawned by this instance
+    /// (`ctx.active_agent` is only set by `spawn`, `ctx.fanout` only by
+    /// `for_each`), so its result cannot predate the instance. That makes the
+    /// fallback a sound lower bound rather than no bound at all — never too
+    /// tight to miss the real tuple, and still tight enough to exclude every
+    /// namesake predecessor from before the run.
+    fn generation_floor(&self, id: &str, agent: &str) -> DateTime<Utc> {
+        let record_created_at = self.supervisor.status(agent).map(|r| r.created_at);
+        if record_created_at.is_none() {
+            warn!(
+                agent,
+                instance = id,
+                "no registry record for waited-on agent; falling back to the instance start"
+            );
         }
+        let instance_started_at = self.lock().get(id).map(|i| i.started_at);
+        generation_floor_of(record_created_at, instance_started_at, Utc::now())
     }
 
     /// Block until every fanned-out agent has emitted its `harness_result`,
     /// then aggregate into `{count, ok, errors, all_ok, results}`. All agents
     /// share one deadline: the step times out if any is still running when it
     /// elapses.
-    async fn join(&self, fanout: &[FannedAgent], wait_all: &WaitAllStep) -> rk_core::Result<Value> {
+    async fn join(
+        &self,
+        id: &str,
+        fanout: &[FannedAgent],
+        wait_all: &WaitAllStep,
+    ) -> rk_core::Result<Value> {
         if fanout.is_empty() {
             return Err(rk_core::Error::other(
                 "wait_all step with no fan-out agents (missing or empty for_each)",
@@ -935,7 +963,7 @@ impl WorkflowEngine {
         for fa in fanout {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             // Same generation-exact predicate as `wait`.
-            let pattern = self.result_pattern(&fa.agent);
+            let pattern = self.result_pattern(id, &fa.agent);
             let tuple = self
                 .space
                 .rd(&pattern, remaining)
@@ -1457,6 +1485,31 @@ fn value_as_key(value: &Value) -> String {
     }
 }
 
+/// Pick the lower bound for a generation-exact `harness_result` read, given
+/// what is still known about the waited-on agent. Pure so the choice is
+/// testable without a live supervisor; see
+/// [`WorkflowEngine::generation_floor`].
+///
+/// Ordered by how tight a bound each source gives, and every arm returns SOME
+/// instant — there is deliberately no "unbounded" result. That is the TKT-159
+/// fix: this decision used to fall through to no bound at all when the agent
+/// record was missing, which reinstated the TKT-146 defect (a `wait` satisfied
+/// by a namesake predecessor's two-day-old tuple) on exactly that path.
+fn generation_floor_of(
+    record_created_at: Option<DateTime<Utc>>,
+    instance_started_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    // 1. The agent record's own birth: exact, and the normal case.
+    // 2. The instance's start: every waited-on agent was spawned by this
+    //    instance, so its result cannot predate the run. Looser but sound.
+    // 3. `now`: nothing is known. Cannot admit an older namesake's tuple, which
+    //    is the failure mode that kills a live rat. The cost is a wait that
+    //    times out if the result already landed — fail toward waiting, never
+    //    toward a stranger's record.
+    record_created_at.or(instance_started_at).unwrap_or(now)
+}
+
 fn repo_name_of(repo: &str) -> String {
     PathBuf::from(repo)
         .file_name()
@@ -1615,6 +1668,7 @@ fn step_label(step: &Step) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rk_core::id::RecordId;
 
     #[test]
     fn interpolate_replaces_ctx_placeholders() {
@@ -1642,6 +1696,65 @@ mod tests {
         };
         let text = "verdict={{ctx.var.verdict}} rounds={{ctx.var.rounds}}";
         assert_eq!(interpolate(text, &ctx), "verdict=REWORK rounds=3");
+    }
+
+    /// TKT-159 regression. Reverting the fallback — i.e. leaving the wait
+    /// unbounded when the agent record is gone — makes this read admit a
+    /// namesake predecessor's `harness_result` again, which is the TKT-146
+    /// kill-a-live-rat defect. Every arm must yield a floor that excludes any
+    /// tuple written before the run started.
+    #[test]
+    fn generation_floor_is_never_unbounded() {
+        let started_at = Utc::now();
+        let spawned_at = started_at + chrono::Duration::seconds(5);
+        // A namesake's durable tuple from a previous night — the input that made
+        // TKT-146 fire, and which the 24 duplicated name generations supply today.
+        let predecessor = RecordId::floor_at(started_at - chrono::Duration::days(2));
+
+        // Record present: the exact, tightest bound.
+        assert_eq!(
+            generation_floor_of(Some(spawned_at), Some(started_at), Utc::now()),
+            spawned_at,
+        );
+        // Record gone: fall back to the instance start, which the agent this
+        // instance spawned provably postdates.
+        assert_eq!(
+            generation_floor_of(None, Some(started_at), Utc::now()),
+            started_at,
+        );
+        // Neither survives: `now`, the most conservative bound.
+        let now = Utc::now();
+        assert_eq!(generation_floor_of(None, None, now), now);
+
+        // The property that actually matters on every arm.
+        for floor in [
+            generation_floor_of(Some(spawned_at), Some(started_at), now),
+            generation_floor_of(None, Some(started_at), now),
+            generation_floor_of(None, None, now),
+        ] {
+            assert!(
+                predecessor <= RecordId::floor_at(floor),
+                "floor {floor} would admit a predecessor's tuple",
+            );
+        }
+    }
+
+    /// The fallback must never be so tight that it misses the tuple the wait is
+    /// actually for: a result written after the instance started still matches.
+    #[test]
+    fn instance_start_fallback_still_admits_this_generations_result() {
+        let started_at = Utc::now();
+        let floor = generation_floor_of(None, Some(started_at), Utc::now());
+        let pattern = Pattern::for_agent_since(Category::Event, "harness_result", "Whisker", floor);
+        let mut mine = rk_core::tuple::Tuple::new(
+            Category::Event,
+            "myrepo",
+            "harness_result",
+            "castle",
+            json!({"agent": "Whisker", "is_error": false}),
+        );
+        mine.id = RecordId::floor_at(started_at + chrono::Duration::seconds(90));
+        assert!(pattern.matches(&mine));
     }
 
     #[test]
