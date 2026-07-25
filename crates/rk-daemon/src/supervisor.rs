@@ -527,10 +527,17 @@ impl Supervisor {
             let supervisor = Arc::clone(self);
             let agent = name.clone();
             let space = self.space.clone();
+            // Bound the read to this generation of the name. `task_done` events
+            // are durable and agent names are recycled once an old record is
+            // archived, so an unbounded name search matches a PREDECESSOR's
+            // `rk done` and reports this rat complete the instant it starts —
+            // the attach-mode twin of the TKT-146 workflow-wait bug.
+            let since = rk_core::id::RecordId::floor_at(record.created_at);
             tokio::spawn(async move {
                 let mut pattern =
                     rk_core::tuple::Pattern::category(Category::Event).identity("task_done");
                 pattern.payload_search = Some(format!("\"agent\":\"{agent}\""));
+                pattern.after_id = Some(since);
                 match space
                     .rd(&pattern, std::time::Duration::from_secs(24 * 3600))
                     .await

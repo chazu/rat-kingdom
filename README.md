@@ -55,7 +55,10 @@ and `rk top` filled with dozens of dead rows. `rk prune` archives settled
 terminal records — `completed`, `failed`, `dismissed` — into
 `agents-archive.json` beside `agents.json`. Nothing is deleted: cost, usage,
 and lineage (`parent`, `workflow_instance`) survive, so `rk cost` and the
-budget rollups are unaffected. Archived names also return to the rat-name pool.
+budget rollups are unaffected. Archiving does **not** free the rat's name: a
+name is an identity key stamped into durable tuples, logs and branches that
+outlive the record, so it stays spent forever (the pool is unbounded anyway —
+it grows `Whisker-2`, `Whisker-3`, … as needed).
 
 ```bash
 rk prune --before 24h        # duration (30m/24h/7d/2w) or a date (2026-07-24)
