@@ -7,6 +7,10 @@
 //! ring buffers (a runaway rat cannot fill the disk), and stay strictly local —
 //! the transcript is never a tuple and never touches `rk-sync`.
 //!
+//! Each file is bounded but the *count* is not: one more file per rat, forever.
+//! [`AgentLog::delete_for`] is how `rk prune --reap-logs` reclaims the file of a
+//! record it archives; generation keying is what makes that safe (below).
+//!
 //! # Why the file is keyed on a generation, not a name
 //!
 //! A transcript is written under the *generation* that produced it — the
@@ -216,6 +220,36 @@ impl AgentLog {
         entries
     }
 
+    /// Delete one generation's transcript file — the artifact `rk prune
+    /// --reap-git` leaves behind once it has reclaimed the worktree and the
+    /// branch, and what `rk prune --reap-logs` reclaims. `Ok(false)` means
+    /// there was no file to remove (a rat that never narrated), which is a
+    /// normal outcome, not a failure.
+    ///
+    /// Keyed on the same `(agent, generation)` pair [`append`](Self::append)
+    /// writes under, and rebuilt through [`path_for`](Self::path_for) rather
+    /// than matched by glob, so the only file this can ever unlink is the one
+    /// this exact rat wrote. That is precisely what generation keying bought:
+    /// under the old name-keyed layout, deleting an archived rat's file could
+    /// have taken a live namesake's transcript with it.
+    ///
+    /// The legacy name-keyed file is deliberately never touched. It can still
+    /// hold entries of a generation that is *not* being archived — that is the
+    /// 24 two-rat names of the TKT-136 window — and its path alone cannot tell
+    /// those apart.
+    pub fn delete_for(&self, agent: &str, generation: DateTime<Utc>) -> std::io::Result<bool> {
+        let path = self.path_for(agent, generation);
+        // Share the append lock: an archived record is terminal so nothing
+        // should still be writing, but a delete racing a trim is cheap to rule
+        // out entirely.
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     fn path_for(&self, agent: &str, generation: DateTime<Utc>) -> PathBuf {
         self.dir
             .join(format!("{}.{}.jsonl", sanitize(agent), stamp(generation)))
@@ -377,6 +411,38 @@ mod tests {
         assert!(entries
             .iter()
             .all(|e| matches!(&e.event, LogEvent::Text { .. })));
+    }
+
+    /// The point of generation keying, stated as a deletion: reaping one rat's
+    /// transcript cannot touch a namesake's, and cannot touch the legacy
+    /// name-keyed file that may still hold a generation nobody is archiving.
+    #[test]
+    fn delete_for_removes_only_that_generations_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = log_at(tmp.path());
+        let (old, new) = (at(1000), at(2000));
+        log.append("cinder", old, LogEvent::Text { text: "first".into() });
+        log.append("cinder", new, LogEvent::Text { text: "second".into() });
+        let legacy = tmp.path().join("agent-logs").join("cinder.jsonl");
+        std::fs::write(&legacy, "{\"ts\":\"1970-01-01T00:16:40Z\",\"kind\":\"text\",\"text\":\"legacy\"}\n").unwrap();
+
+        assert!(log.delete_for("cinder", old).unwrap(), "file was there");
+
+        // The namesake's own file is untouched...
+        assert!(matches!(
+            &log.read(&Generation::of("cinder", new, None), None)[0].event,
+            LogEvent::Text { text } if text == "second"
+        ));
+        // ...and so is the legacy file, whichever generation wrote into it.
+        assert!(legacy.exists(), "legacy file must never be reaped");
+    }
+
+    #[test]
+    fn delete_for_reports_a_rat_that_never_narrated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = log_at(tmp.path());
+        // No file, no directory even: absence is a normal outcome, not an error.
+        assert!(!log.delete_for("silent", at(1000)).unwrap());
     }
 
     #[test]

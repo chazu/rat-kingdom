@@ -56,11 +56,15 @@ async fn connect(layout: &Layout) -> Client {
 /// process-global, so tests in this binary running in parallel would clobber
 /// each other's script — the flake class behind TKT-88. Selecting behaviour
 /// from the per-spawn task instead makes the env var write-once and racefree.
+///
+/// Both branches narrate one line of prose, so every rat here leaves a
+/// transcript on disk for `--reap-logs` to have an opinion about.
 const FAKE: &str = r#"
 read -r _prompt
 case "$RK_TASK" in
   hang-*)
     echo '{"type":"system","subtype":"init","session_id":"fake-hang"}'
+    echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"settling in"}]}}'
     sleep 300
     ;;
   *)
@@ -68,6 +72,7 @@ case "$RK_TASK" in
     git add gnawed.txt >/dev/null 2>&1
     git -c user.email=rat@x -c user.name=Rat commit -q -m "rat work: $RK_TASK"
     echo '{"type":"system","subtype":"init","session_id":"fake-archive"}'
+    echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"gnawed it"}]}}'
     echo '{"type":"result","subtype":"success","is_error":false,"result":"committed gnawed.txt","session_id":"fake-archive","total_cost_usd":0.002,"usage":{"input_tokens":50,"output_tokens":25,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
     ;;
 esac
@@ -451,5 +456,112 @@ async fn reap_git_reclaims_merged_branches_and_refuses_unmerged_ones() {
     assert!(
         branches.lines().any(|b| b == stranded_branch),
         "unmerged branch preserved, got: {branches}"
+    );
+}
+
+/// `--reap-logs` (TKT-162) reclaims the last artifact an archived rat leaves
+/// behind: its `agent-logs/` transcript. Each file is a bounded ring, but the
+/// COUNT grew once per rat forever.
+///
+/// The contract has three halves. A record that archives loses its own
+/// generation's file. A record that does not archive keeps its transcript,
+/// whatever else is being swept. And the legacy name-keyed file is never
+/// touched — it can still hold a generation nobody is archiving, which is the
+/// hazard that kept this from being wired up before transcripts were keyed on
+/// a generation.
+#[tokio::test]
+async fn reap_logs_deletes_archived_transcripts_and_spares_retained_ones() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    // One rat that settles (archivable) and one still running (structurally
+    // never archivable). Both narrate, so both have a transcript.
+    let settled = spawn(&mut client, repo_dir.path(), "reap-log-1", json!({})).await;
+    wait_for_state(&mut client, &settled, "completed").await;
+    let running = spawn(&mut client, repo_dir.path(), "hang-reap-log", json!({})).await;
+    wait_for_state(&mut client, &running, "running").await;
+
+    let logs = home.path().join("agent-logs");
+    let files = || -> Vec<String> {
+        std::fs::read_dir(&logs)
+            .map(|d| {
+                d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // Generation-keyed: `<name>.<stamp>.jsonl`. Match on the prefix rather than
+    // recomputing the stamp, so the test does not restate the naming rule.
+    let transcript_of = |name: &str| -> Option<String> {
+        files()
+            .into_iter()
+            .find(|f| f.starts_with(&format!("{name}.")) && f != &format!("{name}.jsonl"))
+    };
+
+    // The running rat's prose arrives asynchronously; wait for both files.
+    let mut both = false;
+    for _ in 0..100 {
+        if transcript_of(&settled).is_some() && transcript_of(&running).is_some() {
+            both = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(both, "both rats should have transcripts, got {:?}", files());
+    let settled_file = logs.join(transcript_of(&settled).unwrap());
+    let running_file = logs.join(transcript_of(&running).unwrap());
+
+    // A pre-TKT-158 file under the settled rat's bare name. It may hold a
+    // generation that is NOT being archived, so a reap must leave it alone.
+    let legacy = logs.join(format!("{settled}.jsonl"));
+    std::fs::write(&legacy, "{\"ts\":\"2020-01-01T00:00:00Z\",\"kind\":\"text\",\"text\":\"an older rat of this name\"}\n").unwrap();
+
+    let result = client
+        .call("agent.archive", json!({"all": true, "reap_logs": true}))
+        .await
+        .unwrap();
+    assert_eq!(result["count"], 1, "only the settled rat archives");
+
+    let reaped_logs = result["reaped_logs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(reaped_logs.len(), 1, "one row per archived record");
+    assert_eq!(reaped_logs[0]["agent"], json!(settled));
+    assert_eq!(
+        reaped_logs[0]["reaped"],
+        json!(true),
+        "reason: {}",
+        reaped_logs[0]["reason"]
+    );
+
+    assert!(
+        !settled_file.exists(),
+        "the archived rat's transcript should be gone"
+    );
+    assert!(
+        running_file.exists(),
+        "a rat that did not archive keeps its transcript"
+    );
+    assert!(
+        legacy.exists(),
+        "the legacy name-keyed file is never reaped"
+    );
+
+    // The two reap passes are independent switches: asking for logs must not
+    // quietly start deleting branches and worktrees too.
+    assert!(
+        result["reaped"]
+            .as_array()
+            .is_none_or(|rows| rows.is_empty()),
+        "no git reap was requested, got {}",
+        result["reaped"]
     );
 }

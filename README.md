@@ -64,6 +64,7 @@ it grows `Whisker-2`, `Whisker-3`, … as needed).
 rk prune --before 24h        # duration (30m/24h/7d/2w) or a date (2026-07-24)
 rk prune --all               # every eligible record, regardless of age
 rk prune --all --reap-git    # also reclaim worktrees + branches that already landed
+rk prune --all --reap-logs   # also delete the archived rats' `rk log` transcripts
 rk list --archived           # what's been archived
 rk list --all                # live fleet + archive (archived rows marked with *)
 rk top --all                 # same, in the dashboard
@@ -74,6 +75,15 @@ A `spawning`/`running` rat is never archived, and neither is an `orphaned` one
 — its worktree and branch are preserved so `rk respawn` can pick it back up.
 `--reap-git` only touches a branch that has already merged into its target (or
 is already gone); an unmerged branch is left standing and reported as skipped.
+
+`--reap-logs` is the same idea for the other leftover. Each `rk log` transcript
+is a bounded ring, but the *count* grows once per rat forever, so the flag
+deletes the transcript of each record it archives — and only those, keyed on
+the exact rat that wrote it. Unlike `--reap-git` it is one-way: `rk unarchive`
+brings the record back but not the transcript. The two are separate switches
+because they answer different questions — a branch may hold the only copy of a
+rat's work, a transcript only narrates work that lives elsewhere — so combine
+them (`--reap-git --reap-logs`) when you want everything reclaimed.
 
 Spawn options: `--harness claude|codex|axe|fake`, `--model`, `--role
 rat|reviewer`, `--base <branch>`, `--parent <agent>` (completion routing),
