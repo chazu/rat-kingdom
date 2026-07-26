@@ -407,6 +407,15 @@ workflow: {
   the cap, its next spawn — single or fan-out — is refused and the instance
   fails, surfacing a `budget_instance_exceeded` obstacle in `rk inbox`. Layered
   below `fleet_max_usd`/`repo_max_usd`; per-run spend shows in `rk cost --fleet`.
+- **Liveness gate on results**: `wait`/`wait_all` block on *that generation* of
+  the agent's own `harness_result`, and `evaluate` refuses to judge a result
+  whose rat never reported one. A rat that was killed or crashed out of its run
+  produces nothing, so a chain that unified against whatever happened to be in
+  `ctx.previousResult` could report `Completed` having done nothing at all — the
+  worst failure mode there is for an unattended loop. Such a run now fails and
+  lands in `rk inbox` instead, and a `wait` gives up as soon as its rat leaves
+  the fleet for good rather than blocking out its whole timeout (an `Orphaned`
+  agent is still waited on: `rk respawn` heals the run).
 - **Named checks (run-step allowlist)**: a `run` step runs a command in the rat's
   worktree to gate the merge on a verdict the runner cannot forge — but a raw
   `command` is only as trusted as the workflow def that carries it. Register the

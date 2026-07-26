@@ -75,6 +75,15 @@ pub struct AgentRecord {
     #[serde(default)]
     pub merge_commit: Option<String>,
     pub state: AgentState,
+    /// The process died (crashed, or was killed) while the agent was still
+    /// live, so the harness never reported a verdict of its own — there is no
+    /// `harness_result` for this generation and there never will be. Written
+    /// once by the `Exited` handler over a live state; cleared by `respawn`,
+    /// which starts a fresh attempt. See [`crashed_without_reporting`].
+    ///
+    /// [`crashed_without_reporting`]: AgentRecord::crashed_without_reporting
+    #[serde(default)]
+    pub crashed: bool,
     pub result: Option<String>,
     pub usage: TokenUsage,
     pub cost_usd: f64,
@@ -89,6 +98,29 @@ pub struct AgentRecord {
 }
 
 impl AgentRecord {
+    /// Whether this agent left its run *without the harness ever reporting a
+    /// verdict* — killed, crashed, or cut off mid-task (TKT-147).
+    ///
+    /// This is the "did this rat actually run?" question a workflow has to ask
+    /// before it acts on a result attributed to the rat. `harness_result` is
+    /// emitted only from a harness `Completed` event, so for a record in this
+    /// shape there is no result of its own anywhere in the space — anything a
+    /// `wait` hands downstream for it came from somewhere else, and a chain
+    /// that reports success off it is a silent no-op (TKT-146's failure mode).
+    ///
+    /// [`crashed`](AgentRecord::crashed) is the authoritative signal, set at
+    /// the one seam that knows (`HarnessEvent::Exited` over a live state). The
+    /// second arm re-derives it for records written before that flag existed:
+    /// a terminal-but-not-`Completed` record with no session id and not one
+    /// token burned never got off the ground.
+    pub fn crashed_without_reporting(&self) -> bool {
+        self.crashed
+            || (!self.state.is_live()
+                && self.state != AgentState::Completed
+                && self.session_id.is_none()
+                && self.usage.total() == 0)
+    }
+
     /// Identity of one *generation* of a name. Names are not recycled (see
     /// [`Registry::reserve_name`]), so this exists for the one case that can
     /// still put two rows under one name: the archive/persist crash window,
@@ -504,6 +536,7 @@ mod tests {
             pid: Some(1234),
             merge_commit: None,
             state,
+            crashed: false,
             result: None,
             usage: TokenUsage::default(),
             cost_usd: 0.0,
@@ -523,6 +556,47 @@ mod tests {
 
     fn names(records: &[&AgentRecord]) -> Vec<String> {
         records.iter().map(|r| r.name.clone()).collect()
+    }
+
+    /// A rat that ran: the harness gave it a session and it burned tokens.
+    fn ran(name: &str, state: AgentState) -> AgentRecord {
+        let mut r = record(name, state);
+        r.session_id = Some("sess-1".into());
+        r.usage.input = 100;
+        r.usage.output = 50;
+        r
+    }
+
+    /// TKT-147: the predicate a workflow gate leans on to tell a rat that
+    /// produced a verdict from one that was killed before it produced anything.
+    #[test]
+    fn crashed_without_reporting_separates_a_real_run_from_a_kill() {
+        // The authoritative signal, as `HarnessEvent::Exited` writes it.
+        let mut killed = ran("Nibbles", AgentState::Failed);
+        killed.crashed = true;
+        killed.result = Some("process exited (code None) without completing".into());
+        assert!(killed.crashed_without_reporting());
+
+        // It survives a later dismiss — exactly the TKT-146 record shape
+        // (state=dismissed, crash-shaped result), which used to sail through
+        // an `evaluate` as if the rat had worked.
+        let mut dismissed = killed.clone();
+        dismissed.state = AgentState::Dismissed;
+        assert!(dismissed.crashed_without_reporting());
+
+        // Records written before the flag existed still read correctly: no
+        // session and not one token means it never got off the ground.
+        let legacy = record("Pip", AgentState::Failed);
+        assert!(!legacy.crashed, "the fallback arm is what is under test");
+        assert!(legacy.crashed_without_reporting());
+
+        // A rat that ran and failed *through the harness* reported a verdict
+        // of its own; the gate must not touch it.
+        assert!(!ran("Squeak", AgentState::Failed).crashed_without_reporting());
+        assert!(!ran("Gnaw", AgentState::Completed).crashed_without_reporting());
+        assert!(!ran("Remy", AgentState::Dismissed).crashed_without_reporting());
+        // Nor a live one that simply has not reported yet.
+        assert!(!record("Twitch", AgentState::Running).crashed_without_reporting());
     }
 
     #[test]

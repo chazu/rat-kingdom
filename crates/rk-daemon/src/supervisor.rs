@@ -429,6 +429,7 @@ impl Supervisor {
             pid: session.pid,
             merge_commit: None,
             state: AgentState::Running,
+            crashed: false,
             result: None,
             usage: TokenUsage::default(),
             cost_usd: 0.0,
@@ -522,6 +523,7 @@ impl Supervisor {
             pid: None,
             merge_commit: None,
             state: AgentState::Running,
+            crashed: false,
             result: None,
             usage: TokenUsage::default(),
             cost_usd: 0.0,
@@ -663,6 +665,10 @@ impl Supervisor {
                 r.state = AgentState::Running;
                 r.pid = session.pid;
                 r.result = None;
+                // A fresh attempt: the previous crash no longer describes this
+                // record, so a workflow waiting on it stops treating it as
+                // abandoned (TKT-147).
+                r.crashed = false;
             })?
             .ok_or_else(|| rk_core::Error::other("record vanished"))?;
         self.lock_controls()
@@ -755,6 +761,13 @@ impl Supervisor {
                     // Exit without a Completed event = crash/kill.
                     if r.state.is_live() {
                         r.state = AgentState::Failed;
+                        // The one place that knows the harness never reported a
+                        // verdict for this generation, so no `harness_result`
+                        // exists or ever will. Recorded as data rather than
+                        // left to be inferred from the result string, because a
+                        // workflow `wait`/`evaluate` has to be able to tell a
+                        // rat that produced nothing from one that ran (TKT-147).
+                        r.crashed = true;
                         r.result =
                             Some(format!("process exited (code {code:?}) without completing"));
                     }
@@ -1381,6 +1394,20 @@ impl Supervisor {
         st.attempts += 1;
         st.last_attempt = now;
         st.attempts
+    }
+
+    /// Whether the self-healing respawn sweep has already given up on `name`:
+    /// its crash-loop cap was hit and escalated to a human, so no further
+    /// auto-respawn will fire and the agent will not come back on its own.
+    ///
+    /// Read by the workflow engine (TKT-147) to tell a crashed rat that may yet
+    /// be revived from one that is gone for good — a `wait` must keep blocking
+    /// for the former and must fail fast on the latter.
+    pub fn respawn_exhausted(&self, name: &str) -> bool {
+        self.lock_respawn_state()
+            .get(name)
+            .map(|st| st.escalated)
+            .unwrap_or(false)
     }
 
     /// The merged-branch guardrail: true if this agent's work already landed
@@ -2228,6 +2255,7 @@ mod respawn_tests {
             pid: None,
             merge_commit: None,
             state: AgentState::Failed,
+            crashed: false,
             result: None,
             usage: TokenUsage::default(),
             cost_usd: 0.0,
