@@ -910,6 +910,16 @@ impl WorkflowEngine {
     /// left the exact defect this method exists to prevent live on that path.
     /// [`generation_floor`](Self::generation_floor) now always yields a valid
     /// bound, so there is no case in which a `wait` can match a namesake.
+    ///
+    /// TKT-160: the generation floor is necessary but NOT sufficient. It
+    /// separates generations; it does not separate the TURNS within one, and a
+    /// harness reports a result per turn — so this read used to be satisfied by
+    /// a mid-flight "tests still running" turn milliseconds after the rat
+    /// started. That is fixed on the producer side (a generation now publishes
+    /// exactly one `harness_result`, the one it finished on — see
+    /// `Supervisor::claim_completion`), because `wait` is not the only reader:
+    /// the reactor's steward trigger and the ticket auto-close read the same
+    /// event. Do not reintroduce a per-turn `harness_result`.
     fn result_pattern(&self, id: &str, agent: &str) -> Pattern {
         Pattern::for_agent_since(
             Category::Event,
