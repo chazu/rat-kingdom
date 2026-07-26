@@ -51,13 +51,22 @@ workflow: {
 		// it. The gate leaves a `workflow_approval` event behind (both for a
 		// real decision and for the fail-closed timeout), so this read resolves
 		// immediately rather than blocking a second time.
+		//
+		// `fromInstance` binds it to THIS run's decision (TKT-172). The gate
+		// above already waits per-instance, but (event, <repo>,
+		// workflow_approval) is shared by every gated instance on the repo, so
+		// an unbound read takes the newest decision in the scope whoever it was
+		// meant for: approve this one while a peer is rejected and the `when`
+		// below holds this branch on the peer's veto — or merges it on the
+		// peer's approval.
 		{
-			type:     "read"
-			category: "event"
-			identity: "workflow_approval"
-			field:    "approved"
-			into:     "approved"
-			timeout:  "5m"
+			type:         "read"
+			category:     "event"
+			identity:     "workflow_approval"
+			fromInstance: true
+			field:        "approved"
+			into:         "approved"
+			timeout:      "5m"
 		},
 		// Route the decision. Either way the run ENDS CLEANLY — the difference
 		// is only whether the branch merges.

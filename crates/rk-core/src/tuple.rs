@@ -314,6 +314,35 @@ impl Pattern {
         pattern
     }
 
+    /// The one predicate for "the tuple that names workflow instance
+    /// `<instance_id>` in its payload" — the per-instance discriminator behind
+    /// approval routing.
+    ///
+    /// Same lesson as [`Pattern::for_agent_since`], one key over: `(category,
+    /// scope, identity)` is not an identity when two instances of a workflow run
+    /// on one repo, and `(event, <repo>, workflow_approval)` is exactly that
+    /// shape. An approval GATE already keys its wait on this predicate, but the
+    /// `read` that lifts the decision behind the gate historically did not, so
+    /// "newest wins" could hand instance A the human's verdict on instance B —
+    /// merging on a stranger's approval, or holding on a stranger's rejection
+    /// (TKT-172). This constructor exists so both sides derive the predicate the
+    /// same way instead of hand-rolling the substring twice.
+    ///
+    /// No `after_id` floor is needed here (unlike `for_agent_since`): an
+    /// instance id is minted once per run and never reused, so it keys a run
+    /// rather than a generation and cannot be satisfied by a namesake.
+    pub fn for_workflow_instance(
+        category: Category,
+        identity: impl Into<String>,
+        instance_id: &str,
+    ) -> Self {
+        let mut pattern = Self::category(category).identity(identity);
+        // serde_json renders a string field exactly like this regardless of key
+        // order, so the substring is a reliable per-instance test.
+        pattern.payload_search = Some(format!("\"instance\":\"{instance_id}\""));
+        pattern
+    }
+
     /// The single authoritative match predicate. Both the storage query and the
     /// waiter wake path must agree with this exactly.
     pub fn matches(&self, tuple: &Tuple) -> bool {
@@ -433,6 +462,35 @@ mod tests {
             !p.matches(&generation_two),
             "\"Whisker\" matched \"Whisker-2\""
         );
+    }
+
+    /// TKT-172: the approval decision for one instance must not satisfy
+    /// another's read. Both the gate's wait and the `read` behind it derive
+    /// their predicate here, so this pins the shape they agree on.
+    fn approval(instance: &str, approved: bool) -> Tuple {
+        let mut tuple = t();
+        tuple.identity = "workflow_approval".into();
+        tuple.payload = json!({"instance": instance, "approved": approved, "by": "operator"});
+        tuple
+    }
+
+    #[test]
+    fn for_workflow_instance_rejects_a_peers_decision() {
+        let p = Pattern::for_workflow_instance(Category::Event, "workflow_approval", "wf-aaa");
+        assert!(p.matches(&approval("wf-aaa", true)), "missed own decision");
+        assert!(
+            !p.matches(&approval("wf-bbb", false)),
+            "matched a peer's decision"
+        );
+        // An id that is a prefix of another must not match it — the search is on
+        // the rendered `"instance":"<id>"` pair, not the bare id.
+        assert!(
+            !p.matches(&approval("wf-aaa-2", true)),
+            "\"wf-aaa\" matched \"wf-aaa-2\""
+        );
+        // Right instance, wrong event.
+        let p = Pattern::for_workflow_instance(Category::Event, "task_done", "wf-aaa");
+        assert!(!p.matches(&approval("wf-aaa", true)));
     }
 
     #[test]

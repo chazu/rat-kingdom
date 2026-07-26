@@ -554,12 +554,16 @@ impl WorkflowEngine {
                         // (via `rk approve`/`rk reject`, which write a
                         // `workflow_approval` event) or the timeout elapses.
                         let timeout = parse_duration(gate.timeout.as_deref().unwrap_or("24h"))?;
-                        let mut pattern =
-                            Pattern::category(Category::Event).identity("workflow_approval");
-                        // Scope the wait to this instance. serde_json renders the
-                        // pair contiguously regardless of key order, so this
-                        // substring is a reliable per-instance predicate.
-                        pattern.payload_search = Some(format!("\"instance\":\"{id}\""));
+                        // Scope the wait to this instance. The `read` that lifts
+                        // the decision behind this gate derives its predicate
+                        // from the SAME constructor (`fromInstance: true`), so
+                        // the two cannot drift apart — which is what let the
+                        // read take a peer's decision in TKT-172.
+                        let pattern = Pattern::for_workflow_instance(
+                            Category::Event,
+                            "workflow_approval",
+                            id,
+                        );
                         // Flag the instance as parked so `rk inbox` can surface
                         // it with the `rk approve`/`rk reject` resolving command.
                         self.update(id, |i| i.awaiting = Some("approval".to_string()));
@@ -605,24 +609,43 @@ impl WorkflowEngine {
                 Step::Read(read) => {
                     let category = Category::from_str(&read.category)?;
                     let scope = read.scope.clone().unwrap_or_else(|| repo_name_of(repo));
-                    // `fromAgent` narrows the read to the tuple THIS instance's
-                    // active agent wrote (TKT-161). Without it the predicate is
-                    // (category, scope, identity), which two instances of one
-                    // workflow on one repo share by construction — the reactor
-                    // fires `steward` per rat completion, so concurrent
-                    // reviewers write `artifact/<repo>/review` at the same time
-                    // and "newest wins" can hand a steward the OTHER steward's
-                    // verdict to route a land on. Same failure shape as TKT-146
-                    // (a read satisfied by a record that is not the one being
-                    // waited on), so it takes the same cure: the agent's name
-                    // plus its generation floor, via `for_agent_since`.
+                    // Bind the read, or it is satisfied by a stranger. Bare
+                    // (category, scope, identity) is NOT an identity: two
+                    // instances of one workflow on one repo share it by
+                    // construction, and "newest wins" then routes an instance on
+                    // a tuple written for its peer. Two discriminators cure it,
+                    // by which key the wanted tuple actually carries:
+                    //
+                    // - `fromAgent` (TKT-161) — what an agent THIS instance
+                    //   spawned wrote. The reactor fires `steward` per rat
+                    //   completion, so concurrent reviewers write
+                    //   `artifact/<repo>/review` at the same time and an unbound
+                    //   read can hand a steward the OTHER steward's verdict to
+                    //   land on. Cured by the agent's name plus its generation
+                    //   floor (`for_agent_since`), since a name keys a
+                    //   generation and not a rat.
+                    // - `fromInstance` (TKT-172) — what was written FOR this
+                    //   run. The `workflow_approval` event behind an approval
+                    //   gate is the case: two gated instances on one repo, one
+                    //   approved and one rejected, and an unbound read routes
+                    //   both on whichever decision landed last. Cured by the
+                    //   instance id (`for_workflow_instance`) — the same
+                    //   predicate the gate itself waits on, so gate and read
+                    //   cannot disagree about whose decision this is. No
+                    //   generation floor: an instance id is never reused.
+                    //
+                    // All three of `search`/`fromAgent`/`fromInstance` write the
+                    // one `payload_search` slot, so at most one may be set.
+                    let bindings = read.from_agent as u8
+                        + read.from_instance as u8
+                        + read.search.is_some() as u8;
+                    if bindings > 1 {
+                        return Err(rk_core::Error::other(
+                            "read step sets more than one of `fromAgent`/`fromInstance`/`search`; \
+                             they claim the same payload predicate — keep one",
+                        ));
+                    }
                     let mut pattern = if read.from_agent {
-                        if read.search.is_some() {
-                            return Err(rk_core::Error::other(
-                                "read step sets both `fromAgent` and `search`; they claim the \
-                                 same payload predicate — drop one",
-                            ));
-                        }
                         let agent = ctx.active_agent.clone().ok_or_else(|| {
                             rk_core::Error::other(
                                 "read step has `fromAgent` but no active agent; only a step \
@@ -635,6 +658,8 @@ impl WorkflowEngine {
                             &agent,
                             self.generation_floor(id, &agent),
                         )
+                    } else if read.from_instance {
+                        Pattern::for_workflow_instance(category, read.identity.clone(), id)
                     } else {
                         let mut pattern =
                             Pattern::category(category).identity(read.identity.clone());
@@ -658,13 +683,15 @@ impl WorkflowEngine {
                             .map_err(|e| rk_core::Error::other(format!("read failed: {e}")))?,
                     };
                     let tuple = tuple.ok_or_else(|| {
-                        // Name the binding in the failure: under `fromAgent` the
-                        // usual cause is an agent that wrote its tuple without
-                        // its own name in the payload, which reads as "nothing
-                        // matched" and is otherwise indistinguishable from an
-                        // agent that never wrote one at all.
+                        // Name the binding in the failure: a bound read that
+                        // matched nothing is otherwise indistinguishable from a
+                        // tuple that was never written. Under `fromAgent` the
+                        // usual cause is an agent that left its own name out of
+                        // the payload; under `fromInstance` it is a decision
+                        // recorded without this run's id.
                         let bound_to = match (read.from_agent, ctx.active_agent.as_deref()) {
                             (true, Some(agent)) => format!(" written by {agent}"),
+                            _ if read.from_instance => format!(" naming instance {id}"),
                             _ => String::new(),
                         };
                         rk_core::Error::other(format!(

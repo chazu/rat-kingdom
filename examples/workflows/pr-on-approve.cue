@@ -92,13 +92,19 @@ workflow: {
 		// Lift the human's verdict into ctx.var.approved. The gate leaves a
 		// workflow_approval event behind (both for a real decision and the
 		// fail-closed timeout), so this read resolves immediately.
+		//
+		// `fromInstance` binds it to THIS run's decision (TKT-172). Unbound,
+		// (event, <repo>, workflow_approval) is shared by every gated instance
+		// on the repo and the newest decision wins whoever it was meant for —
+		// so a peer's approval could open a PR for THIS branch below.
 		{
-			type:     "read"
-			category: "event"
-			identity: "workflow_approval"
-			field:    "approved"
-			into:     "approved"
-			timeout:  "5m"
+			type:         "read"
+			category:     "event"
+			identity:     "workflow_approval"
+			fromInstance: true
+			field:        "approved"
+			into:         "approved"
+			timeout:      "5m"
 		},
 		{
 			type: "when"

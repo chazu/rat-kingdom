@@ -332,6 +332,26 @@ pub struct ReadStep {
     /// tuple it cannot attribute.
     #[serde(default, rename = "fromAgent")]
     pub from_agent: bool,
+    /// Bind the read to the tuple that names THIS workflow instance in its
+    /// payload, instead of the newest tuple any instance left in the scope
+    /// (TKT-172).
+    ///
+    /// The sibling of [`ReadStep::from_agent`], for tuples keyed by the run
+    /// rather than by an agent — `workflow_approval` above all. An approval
+    /// `gate` already waits on `"instance":"<id>"`, but the `read` that lifts
+    /// the decision behind it did not, and `(event, <repo>, workflow_approval)`
+    /// is shared by every gated instance on the repo. Two instances parked on
+    /// one repo would then both route on whichever decision landed last: approve
+    /// A and reject B, and either B merges on A's approval or A is held on B's
+    /// rejection. The fail-closed timeout decision makes it worse, since a
+    /// timing-out instance synthesises an `{approved: false}` its live peer can
+    /// pick up.
+    ///
+    /// Mutually exclusive with [`ReadStep::search`] and [`ReadStep::from_agent`],
+    /// which own the same single predicate slot. Fails closed: a decision tuple
+    /// that does not name this instance times the step out rather than routing.
+    #[serde(default, rename = "fromInstance")]
+    pub from_instance: bool,
     /// JSON payload field to lift; whole payload if unset.
     #[serde(default)]
     pub field: Option<String>,
