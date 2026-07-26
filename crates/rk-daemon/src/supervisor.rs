@@ -112,12 +112,42 @@ pub struct Supervisor {
     /// clock + whether the cap has already been escalated). In-memory: a daemon
     /// restart is a fresh episode, so attempt counts reset with it.
     respawn_state: Mutex<HashMap<String, RespawnState>>,
+    /// Per-agent completion-routing state, so one agent generation emits
+    /// exactly one durable `harness_result` — the one for the turn it actually
+    /// finished on (TKT-160). In-memory: a daemon restart loses the withheld
+    /// turn, which is the same blindness a restart already imposes on the
+    /// harness event stream it came from.
+    completions: Mutex<HashMap<String, CompletionState>>,
     /// Bounded per-agent transcript (assistant text / tool calls / retries),
     /// so the operator can `rk log` a run instead of being blind to it.
     log: crate::agent_log::AgentLog,
     /// Serializes concurrent land/dismiss merges to the same target branch so
     /// unattended auto-merges never interleave and lose a branch (TKT-51).
     merge_queue: MergeQueue,
+}
+
+/// How far one agent generation has got through reporting its completion.
+///
+/// A harness returns control once per TURN, not once per task: a re-armed
+/// monitor, a background test suite finishing, or a task notification all end a
+/// turn and produce a `Completed` event while the rat is still mid-task. Every
+/// one of those used to be published as a durable `harness_result`, and every
+/// reader of that event — the workflow `wait`, the reactor's steward trigger,
+/// the ticket auto-close — takes the OLDEST match, i.e. the mid-flight one.
+/// This is the bookkeeping that reduces a generation's turns to the single turn
+/// it finished on. See [`Supervisor::claim_completion`].
+#[derive(Debug, Clone)]
+struct CompletionState {
+    /// Which generation of the name this state describes (the record's
+    /// `created_at`). A later generation resets it.
+    generation: DateTime<Utc>,
+    /// This generation's `harness_result` has been published; later turns of
+    /// the same generation must not publish a second one.
+    routed: bool,
+    /// A clean turn result is being held back because nothing yet proves the
+    /// session is over. Superseded by each later turn, and flushed if the
+    /// process exits (see the `Exited` arm of [`Supervisor::handle_event`]).
+    withheld: bool,
 }
 
 /// One agent's rolling state across supervisor sweeps.
@@ -269,6 +299,7 @@ impl Supervisor {
             fleet_warned: Mutex::new(std::collections::HashSet::new()),
             sweep_state: Mutex::new(HashMap::new()),
             respawn_state: Mutex::new(HashMap::new()),
+            completions: Mutex::new(HashMap::new()),
             log,
             merge_queue: MergeQueue::default(),
         })
@@ -680,6 +711,11 @@ impl Supervisor {
             json!({"agent": name, "task": updated.task}),
         );
 
+        // The interrupted run's completion bookkeeping does not carry over: its
+        // withheld turn is stale, and (for a manually respawned Completed
+        // record) its `routed` flag would gag the resumed run (TKT-160).
+        self.forget_completion(name);
+
         let supervisor = Arc::clone(self);
         let owned = name.to_string();
         let mut events = session.events;
@@ -750,13 +786,21 @@ impl Supervisor {
                     }
                 });
                 if let Ok(Some(record)) = updated {
-                    info!(agent = name, is_error, "agent completed");
-                    self.route_completion(&record, is_error);
+                    if self.claim_completion(name, generation, is_error) {
+                        info!(agent = name, is_error, "agent completed");
+                        self.route_completion(&record, is_error);
+                    } else {
+                        info!(
+                            agent = name,
+                            "harness returned control without a `rk done`; holding the turn \
+                             result back rather than publishing it as the completion"
+                        );
+                    }
                 }
             }
             HarnessEvent::Exited { code } => {
                 self.lock_controls().remove(name);
-                let _ = self.lock_registry().update(name, |r| {
+                let updated = self.lock_registry().update(name, |r| {
                     r.pid = None;
                     // Exit without a Completed event = crash/kill.
                     if r.state.is_live() {
@@ -772,6 +816,23 @@ impl Supervisor {
                             Some(format!("process exited (code {code:?}) without completing"));
                     }
                 });
+                // The process is gone, so no further turn can follow: a turn
+                // result held back for want of a `rk done` is now provably this
+                // generation's last word, and must be published. Harnesses that
+                // end with the run (codex, axe, the test fake) take this path
+                // for every agent; a Claude session — which stays alive between
+                // turns to receive steers — normally reports at its `rk done`
+                // and only lands here when it is killed mid-task.
+                if let Ok(Some(record)) = updated {
+                    if self.flush_withheld_completion(name, generation) {
+                        let is_error = record.state != AgentState::Completed;
+                        info!(
+                            agent = name,
+                            is_error, "agent exited; publishing its last turn result"
+                        );
+                        self.route_completion(&record, is_error);
+                    }
+                }
             }
             // Formerly dropped on the floor; now persisted as the agent's
             // transcript so the operator can `rk log` a run without --attach.
@@ -1470,8 +1531,120 @@ impl Supervisor {
         }
     }
 
+    /// Decide whether the turn that just ended is the one this generation
+    /// finishes on, and claim the right to publish it. `true` = publish now.
+    ///
+    /// A harness returns control once per TURN. A background test suite
+    /// finishing, a re-armed monitor, or a task notification each end a turn
+    /// mid-task, and the `Completed` event they produce is indistinguishable
+    /// from the real thing: `is_error` is `false` on both, and no other field
+    /// says "still working". Publishing every one of them is TKT-160 — twelve
+    /// agent generations in the live fleet emitted more than one durable
+    /// `harness_result`, and because a `LIMIT 1` read returns the OLDEST match,
+    /// every reader keyed on the agent name gets a MID-FLIGHT turn: a workflow
+    /// `wait` unblocks on "the full cargo test pass is still running", the
+    /// `evaluate` behind it judges that text, and a steward reviewer whose
+    /// APPROVE lands in a later turn is read as having no verdict at all.
+    ///
+    /// Two things prove a turn is the last one, and this is where the first is
+    /// applied:
+    ///
+    /// 1. **The agent said so.** `rk done` writes exactly one `task_done` per
+    ///    generation — the one signal in the system that a harness cannot
+    ///    duplicate, because the rat writes it rather than the harness. Every
+    ///    spawned role is primed with `rk done` as its mandatory final step.
+    /// 2. **The process is gone.** Handled at `Exited`; see
+    ///    [`Self::flush_withheld_completion`].
+    ///
+    /// A failed turn is terminal on its own: the session ended in an error, so
+    /// there is no later turn to prefer, and holding it back would only turn a
+    /// fast, legible failure into a `wait` timeout.
+    fn claim_completion(&self, name: &str, generation: DateTime<Utc>, is_error: bool) -> bool {
+        let terminal = is_error || self.declared_done(name, generation);
+        let mut completions = self.lock_completions();
+        let state = completions
+            .entry(name.to_string())
+            .or_insert_with(|| CompletionState {
+                generation,
+                routed: false,
+                withheld: false,
+            });
+        if state.generation != generation {
+            *state = CompletionState {
+                generation,
+                routed: false,
+                withheld: false,
+            };
+        }
+        if state.routed {
+            // Already published for this generation. A rat that keeps talking
+            // after its `rk done` does not get to report twice.
+            return false;
+        }
+        if terminal {
+            state.routed = true;
+            state.withheld = false;
+        } else {
+            // Superseded by whatever turn comes next, or flushed at `Exited`.
+            state.withheld = true;
+        }
+        terminal
+    }
+
+    /// Whether this generation of `name` has written its `rk done` tuple.
+    ///
+    /// Bounded to the generation via [`Pattern::for_agent_since`]: `task_done`
+    /// is durable and a name is an identity key that outlives the rat wearing
+    /// it, so an unbounded name search here would read a predecessor's `rk done`
+    /// as this rat's (TKT-146/TKT-159).
+    ///
+    /// Fails OPEN — an unreadable space means "publish", which is the behaviour
+    /// that predates this gate. Withholding on a storage error would strand
+    /// every workflow waiting on the agent until its step timeout.
+    fn declared_done(&self, name: &str, generation: DateTime<Utc>) -> bool {
+        let pattern = Pattern::for_agent_since(Category::Event, "task_done", name, generation);
+        match self.space.scan(&pattern) {
+            Ok(tuples) => !tuples.is_empty(),
+            Err(e) => {
+                warn!(error = %e, agent = name, "task_done lookup failed; publishing the turn result anyway");
+                true
+            }
+        }
+    }
+
+    /// Claim the right to publish a turn result that was held back, now that the
+    /// process has exited and no further turn can follow. `true` = publish.
+    fn flush_withheld_completion(&self, name: &str, generation: DateTime<Utc>) -> bool {
+        let mut completions = self.lock_completions();
+        let Some(state) = completions.get_mut(name) else {
+            return false;
+        };
+        if state.generation != generation || state.routed || !state.withheld {
+            return false;
+        }
+        state.routed = true;
+        state.withheld = false;
+        true
+    }
+
+    /// Forget a generation's completion bookkeeping.
+    ///
+    /// Called on a deliberate teardown (`dismiss`), where the held-back turn
+    /// result must NOT surface as a late completion — nothing is waiting on it,
+    /// and a stray `harness_result` carrying `"role":"rat"` would re-fire the
+    /// reactor's steward on a branch that was just merged. Also called on
+    /// `respawn`, which continues the SAME generation in a fresh process: the
+    /// crashed run's withheld turn is stale, and its `routed` flag would
+    /// otherwise gag the resumed run.
+    fn forget_completion(&self, name: &str) {
+        self.lock_completions().remove(name);
+    }
+
     /// Route a completion up the spawn tree: the structural parent gets a
     /// directed message; the repo scope gets the event either way.
+    ///
+    /// Reached exactly once per agent generation — see
+    /// [`Self::claim_completion`] for what "once" means and why it matters.
     fn route_completion(&self, record: &AgentRecord, is_error: bool) {
         self.emit_event(
             &record.repo_name,
@@ -1590,6 +1763,10 @@ impl Supervisor {
             .cloned()
             .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
 
+        // Drop any held-back turn result BEFORE the kill: the `Exited` this
+        // provokes must not publish a late `harness_result` for an agent the
+        // caller is deliberately tearing down (TKT-160).
+        self.forget_completion(name);
         let control = self.lock_controls().remove(name);
         if let Some(control) = control {
             let _ = control.kill().await;
@@ -2172,6 +2349,13 @@ impl Supervisor {
 
     fn lock_sweep_state(&self) -> std::sync::MutexGuard<'_, HashMap<String, SweepState>> {
         match self.sweep_state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    fn lock_completions(&self) -> std::sync::MutexGuard<'_, HashMap<String, CompletionState>> {
+        match self.completions.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }
