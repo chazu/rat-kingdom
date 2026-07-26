@@ -1006,40 +1006,75 @@ impl Daemon {
             Ok(t) => t,
             Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
         };
-        // An awaiting-review row auto-clears once its branch is merged into the
-        // target (or gone) — the PR-mode land opened a PR but nothing emits a
-        // close event when the human merges on the forge. Detect it locally:
-        // resolve each open PR's repo and ask git whether the branch has landed.
-        // Local-only (no fetch, no forge API), so the row clears when the merge
+        // Every `land` step records its own outcome as a `branch_landed` event.
+        // A land that neither merged nor opened a PR left the branch standing
+        // outside the target, and reports that as a clean `{merged: false}`
+        // rather than an error — so unless the workflow definition happened to
+        // carry an `evaluate {expect: {merged: true}}` after its `land`, the
+        // drop is silent (TKT-171). `build` asserts the invariant here instead,
+        // for every workflow.
+        let lands = match self
+            .space
+            .scan(&Pattern::category(Category::Event).identity("branch_landed"))
+        {
+            Ok(t) => t,
+            Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
+        };
+        // Reduce the land events to the branches that are actually candidate
+        // rows BEFORE the git check below. `branch_landed` accumulates one event
+        // per land the fleet has ever performed and never shrinks, while the
+        // drops are a handful; the git check is a subprocess per branch and this
+        // is the hot read path behind `rk top`.
+        let lands: Vec<Tuple> = crate::inbox::dropped_lands(&lands)
+            .into_iter()
+            .cloned()
+            .collect();
+        // Both branch-shaped rows auto-clear once their branch is merged into
+        // the target (or gone), and nothing emits a record when that happens —
+        // no close event when a human merges a PR on the forge, and nothing at
+        // all when a human hand-merges a dropped land. Detect it locally:
+        // resolve each event's repo and ask git whether the branch has landed.
+        // Local-only (no fetch, no forge API), so a row clears when the merge
         // reaches the local target — the operator's pull or a Direct-mode
-        // fast-forward. The `pull_request_closed` events above close the same gap
-        // for a forge merge the operator has NOT pulled (TKT-70).
-        let cleared_prs = self.cleared_pull_requests(&pull_requests);
+        // fast-forward. The `pull_request_closed` events above close the same
+        // gap for a forge merge the operator has NOT pulled (TKT-70).
         let items = crate::inbox::build(
             &agents,
             &instances,
             &obstacles,
             &needs,
-            &pull_requests,
-            &pull_requests_closed,
-            &cleared_prs,
+            &crate::inbox::BranchEvents {
+                cleared: self.cleared_branches(&[&pull_requests, &lands]),
+                pull_requests: &pull_requests,
+                pull_requests_closed: &pull_requests_closed,
+                lands: &lands,
+            },
         );
         Response::ok(id, crate::inbox::to_json(&items))
     }
 
-    /// (scope, branch) pairs among the open-PR events whose branch has since
-    /// been merged into its target or deleted locally — the rows to drop from
-    /// the awaiting-review queue. Resolves each event's scope to a registered
-    /// repo path and asks git; an unregistered scope or unopenable repo means
-    /// "cannot tell", so the row stays (fails toward surfacing, never hiding).
-    fn cleared_pull_requests(&self, pull_requests: &[Tuple]) -> HashSet<(String, String)> {
+    /// (scope, branch) pairs among the given branch-shaped events whose branch
+    /// has since been merged into its target or deleted locally — the rows that
+    /// have auto-cleared and must drop out of the inbox. Resolves each event's
+    /// scope to a registered repo path and asks git; an unregistered scope or
+    /// unopenable repo means "cannot tell", so the row stays (fails toward
+    /// surfacing, never hiding).
+    ///
+    /// Both branch-shaped sources share this check, because they ask the same
+    /// question of git — did this branch reach its target? — about the same
+    /// `{branch, target}` payload shape: `pull_request_opened` events (a PR the
+    /// human merged on the forge, TKT-67/70) and `branch_landed` events (a land
+    /// that dropped its branch and was later resolved by any route, TKT-171).
+    /// One git call per distinct branch covers both.
+    fn cleared_branches(&self, event_sets: &[&[Tuple]]) -> HashSet<(String, String)> {
         let mut cleared = HashSet::new();
+        let events = || event_sets.iter().flat_map(|s| s.iter());
         // Resolve scopes to paths once, under the registry lock, then release it
         // before shelling out to git.
         let mut paths: std::collections::HashMap<String, std::path::PathBuf> =
             std::collections::HashMap::new();
         if let Ok(reg) = self.repos.lock() {
-            for t in pull_requests {
+            for t in events() {
                 if !paths.contains_key(&t.scope) {
                     if let Some(rec) = reg.get(&t.scope) {
                         paths.insert(t.scope.clone(), rec.path.clone());
@@ -1047,7 +1082,11 @@ impl Daemon {
                 }
             }
         }
-        for t in pull_requests {
+        // Ask git once per distinct (scope, branch): the same branch commonly
+        // carries several events (a retried land, a re-push), and the answer
+        // cannot differ between them.
+        let mut asked: HashSet<(String, String)> = HashSet::new();
+        for t in events() {
             let Some(branch) = t.payload.get("branch").and_then(|v| v.as_str()) else {
                 continue;
             };
@@ -1056,6 +1095,10 @@ impl Daemon {
                 .get("target")
                 .and_then(|v| v.as_str())
                 .unwrap_or("main");
+            let key = (t.scope.clone(), branch.to_string());
+            if !asked.insert(key.clone()) {
+                continue;
+            }
             let Some(path) = paths.get(&t.scope) else {
                 continue;
             };
@@ -1063,7 +1106,7 @@ impl Daemon {
                 continue;
             };
             if repo.branch_merged_or_gone(branch, target) {
-                cleared.insert((t.scope.clone(), branch.to_string()));
+                cleared.insert(key);
             }
         }
         cleared

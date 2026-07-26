@@ -498,11 +498,58 @@ fn git_in(dir: &Path, args: &[&str]) -> rk_core::Result<String> {
         return Err(rk_core::Error::other(format!(
             "git {} failed: {}",
             args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+            failure_reason(&out)
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
+
+/// Why a git invocation failed, in one line. Prefers stderr and falls back to
+/// stdout, because a failing `git merge` writes its whole diagnostic
+/// ("CONFLICT (content): Merge conflict in …", "Automatic merge failed") to
+/// STDOUT and leaves stderr empty. Reading stderr alone turned every conflict
+/// into `merge conflict or failure: git merge … failed:` with nothing after the
+/// colon — the outcome recorded on the `branch_landed` event and shown to the
+/// operator, naming neither the conflicting files nor even that it was a
+/// conflict (TKT-171).
+///
+/// Flattened onto one line — callers render it inline in an event payload and
+/// an inbox row — and capped at [`REASON_LINES`], because a merge prints one
+/// line per conflicting path and a hundred-file conflict must not become a
+/// hundred-line "detail" string. A git that fails silently still reports its
+/// exit code, so the reason is never empty.
+fn failure_reason(out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // `git merge` reports conflicts on stdout with an empty stderr; everything
+    // else reports on stderr. Prefer stderr, fall back to stdout.
+    let text = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    };
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return format!("exited {}", out.status.code().unwrap_or(-1));
+    }
+    let head = lines
+        .iter()
+        .take(REASON_LINES)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("; ");
+    match lines.len().checked_sub(REASON_LINES) {
+        Some(rest) if rest > 0 => format!("{head} (+{rest} more lines)"),
+        _ => head,
+    }
+}
+
+/// How many lines of a failing git's output [`failure_reason`] keeps.
+const REASON_LINES: usize = 3;
 
 /// Like [`git_in`], but returns stdout AND stderr on success. `git push`
 /// writes progress and remote messages (PR/MR URLs) to stderr, so the plain
@@ -840,7 +887,9 @@ mod tests {
 
         let outcome = repo.merge_branch(&branch, "main").unwrap();
         assert!(outcome.merged, "{}", outcome.detail);
-        let merge_commit = outcome.commit.expect("merge outcome carries the merge commit");
+        let merge_commit = outcome
+            .commit
+            .expect("merge outcome carries the merge commit");
         repo.remove_worktree(&wt).unwrap();
         repo.delete_branch(&branch).unwrap();
         assert!(dir.path().join("bad.txt").exists());
@@ -943,8 +992,58 @@ mod tests {
         let outcome = repo.merge_branch(&branch, "main").unwrap();
         assert!(!outcome.merged);
         assert!(outcome.detail.contains("conflict"), "{}", outcome.detail);
+        // The REASON must survive into the outcome, not just the word
+        // "conflict" from our own wrapper text (TKT-171). `git merge` writes
+        // its whole diagnostic to stdout and leaves stderr empty, so reading
+        // stderr alone produced `... failed:` with nothing after the colon —
+        // which is what the operator saw on the recorded `branch_landed` event
+        // and had to reconstruct by hand.
+        assert!(
+            outcome.detail.contains("CONFLICT"),
+            "detail must name the conflict git reported: {}",
+            outcome.detail
+        );
+        assert!(
+            outcome.detail.contains("README.md"),
+            "detail must name the conflicting file: {}",
+            outcome.detail
+        );
         // Branch preserved for humans to resolve.
         assert!(repo.branch_exists(&branch));
+    }
+
+    #[test]
+    fn failure_reason_prefers_stderr_and_caps_a_noisy_conflict() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |stdout: &str, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        // Normal git: stderr carries the message.
+        assert_eq!(
+            failure_reason(&out("", "fatal: bad ref\n")),
+            "fatal: bad ref"
+        );
+        // `git merge`: stderr empty, everything on stdout.
+        assert_eq!(
+            failure_reason(&out("CONFLICT (content): Merge conflict in a.rs\n", "")),
+            "CONFLICT (content): Merge conflict in a.rs"
+        );
+        // stderr wins when both are present.
+        assert_eq!(
+            failure_reason(&out("noise\n", "real reason\n")),
+            "real reason"
+        );
+        // A wide conflict is capped, and says so rather than truncating silently.
+        let wide: String = (0..10)
+            .map(|i| format!("Merge conflict in f{i}.rs\n"))
+            .collect();
+        let capped = failure_reason(&out(&wide, ""));
+        assert!(capped.starts_with("Merge conflict in f0.rs; Merge conflict in f1.rs"));
+        assert!(capped.ends_with("(+7 more lines)"), "{capped}");
+        // A git that fails saying nothing at all still reports something.
+        assert_eq!(failure_reason(&out("", "")), "exited 1");
     }
 
     #[test]

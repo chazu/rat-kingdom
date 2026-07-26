@@ -422,6 +422,18 @@ workflow: {
   lands in `rk inbox` instead, and a `wait` gives up as soon as its rat leaves
   the fleet for good rather than blocking out its whole timeout (an `Orphaned`
   agent is still waited on: `rk respawn` heals the run).
+- **Dropped lands surface even if the workflow forgot to gate them**: `land`
+  reports a merge conflict as a clean `{merged: false}`, not an error, so a
+  workflow can gate on the outcome and retry — but that gate
+  (`{type: "evaluate", expect: {merged: true}, anyOf: [{pr_opened: true}]}`)
+  lives in the definition, and a definition can be stale or forked per repo. One
+  that was cost TKT-147 two days off main on a run that completed clean. So the
+  invariant is asserted at read time instead: `rk inbox` shows an
+  **`unlanded-branch`** row for any land that neither merged nor opened a PR,
+  and clears it once git says the branch reached its target or is gone — a
+  hand-merge, a re-land, or a cherry-pick plus a branch delete all retire it.
+  Keep the `evaluate` in your workflows; you are no longer relying on it. See
+  `docs/2026-07-26-tkt-171-dropped-land.md`.
 - **Named checks (run-step allowlist)**: a `run` step runs a command in the rat's
   worktree to gate the merge on a verdict the runner cannot forge — but a raw
   `command` is only as trusted as the workflow def that carries it. Register the
