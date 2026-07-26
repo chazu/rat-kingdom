@@ -73,6 +73,10 @@ case "$RK_TASK" in
   exits-after-one-turn)
     result false "did the work"
     ;;
+  killed-mid-flight)
+    result false "Tests still running - waiting on the monitor"
+    read -r _steer
+    ;;
   fails)
     result true "harness error: max turns exceeded"
     sleep 60
@@ -214,11 +218,85 @@ async fn a_mid_flight_turn_is_not_published_as_the_completion() {
         "the completion should carry the finishing turn's result, got: {result:?}"
     );
     assert_eq!(published[0]["is_error"], json!(false));
+    assert_eq!(
+        published[0]["declared_done"],
+        json!(true),
+        "the rat ran `rk done`, and the event says so (TKT-173)"
+    );
+}
+
+/// TKT-173: a rat KILLED after a clean mid-flight turn must not have that turn
+/// published as a clean completion.
+///
+/// This is the residue TKT-160 left. The mid-flight turn sets the record's state
+/// to `Completed`, so the kill does not read as a crash — TKT-147's
+/// `AgentRecord.crashed` is only set when `Exited` fires over a LIVE state — and
+/// the exit-flush published the withheld turn with `is_error: false`. A workflow
+/// waiting on the rat saw a clean completion, carrying "tests still running",
+/// for a rat that was killed mid-task.
+#[tokio::test]
+async fn a_rat_killed_after_a_clean_turn_reports_a_failure() {
+    let (_home, _repo_dir, mut client, repo, agent) = start("killed-mid-flight").await;
+
+    // Turn 1 ends clean and is withheld: no `rk done`, so nothing proves it is
+    // the last turn.
+    await_recorded_result(&mut client, &agent, "still running").await;
+    let published = results(&mut client, &repo, &agent).await;
+    assert!(
+        published.is_empty(),
+        "a mid-flight turn was published as a completion: {published:?}"
+    );
+
+    // What a budget hard-stop or a supervisor sweep does. `dismiss` is NOT the
+    // path under test: it deliberately forgets the withheld turn, because
+    // nothing is waiting on a torn-down agent.
+    let status = client
+        .call("agent.status", json!({"name": agent}))
+        .await
+        .unwrap();
+    let pid = status["agent"]["pid"]
+        .as_u64()
+        .expect("a live agent has a pid");
+    assert!(Command::new("kill")
+        .arg(pid.to_string())
+        .status()
+        .unwrap()
+        .success());
+
+    let mut published = Vec::new();
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        published = results(&mut client, &repo, &agent).await;
+        if !published.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(published.len(), 1, "expected one completion: {published:?}");
+    assert_eq!(
+        published[0]["is_error"],
+        json!(true),
+        "a rat killed mid-task must not report its last turn as a clean finish: {published:?}"
+    );
+    assert_eq!(
+        published[0]["declared_done"],
+        json!(false),
+        "the generation never ran `rk done`, which is why the turn was withheld"
+    );
+    // The text is still the honest last word — the run is reported as failed,
+    // not blanked — so `rk inbox` shows what the rat was doing when it died.
+    assert!(published[0]["result"]
+        .as_str()
+        .unwrap_or("")
+        .contains("still running"));
 }
 
 /// The second proof that no further turn can follow: the process is gone.
 /// Harnesses that end with the run (codex, axe, the test fake) take this path
 /// for every agent, so a rat that never got to its `rk done` still reports.
+///
+/// It exited 0 — it stopped of its own accord rather than being killed — so
+/// TKT-173 leaves `is_error` alone here and states the weaker fact in
+/// `declared_done`. Flipping this one too is TKT-175.
 #[tokio::test]
 async fn an_agent_that_exits_still_publishes_its_last_turn() {
     let (_home, _repo_dir, mut client, repo, agent) = start("exits-after-one-turn").await;
@@ -236,6 +314,13 @@ async fn an_agent_that_exits_still_publishes_its_last_turn() {
         .as_str()
         .unwrap_or("")
         .contains("did the work"));
+    assert_eq!(published[0]["is_error"], json!(false));
+    assert_eq!(
+        published[0]["declared_done"],
+        json!(false),
+        "it exited without declaring done, and the event says so — that is the \
+         fact a strict gate reads (TKT-173)"
+    );
 }
 
 /// The third proof: a failed turn ended the session, so there is no later turn
@@ -255,4 +340,5 @@ async fn a_failed_turn_publishes_immediately() {
     }
     assert_eq!(published.len(), 1, "expected one completion: {published:?}");
     assert_eq!(published[0]["is_error"], json!(true));
+    assert_eq!(published[0]["declared_done"], json!(false));
 }

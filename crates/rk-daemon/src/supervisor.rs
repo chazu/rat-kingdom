@@ -150,6 +150,17 @@ struct CompletionState {
     withheld: bool,
 }
 
+/// What [`Supervisor::claim_completion`] decided about the turn that just ended.
+#[derive(Debug, Clone, Copy)]
+struct TurnClaim {
+    /// Publish this turn as the generation's `harness_result`.
+    publish: bool,
+    /// This generation wrote its `rk done` — see [`Supervisor::declared_done`].
+    /// Carried onto the published event so a reader can tell a rat that
+    /// declared itself finished from one that merely stopped producing turns.
+    declared_done: bool,
+}
+
 /// One agent's rolling state across supervisor sweeps.
 #[derive(Debug, Clone)]
 struct SweepState {
@@ -619,7 +630,9 @@ impl Supervisor {
                                 .or(Some("done".into()));
                         });
                         if let Ok(Some(record)) = updated {
-                            supervisor.route_completion(&record, false);
+                            // Driven by the rat's own `task_done`, so this one is
+                            // declared by construction.
+                            supervisor.route_completion(&record, false, true);
                             rk_mux::HerdrMux::notify(
                                 &format!("{agent} finished"),
                                 record.result.as_deref().unwrap_or(""),
@@ -786,9 +799,10 @@ impl Supervisor {
                     }
                 });
                 if let Ok(Some(record)) = updated {
-                    if self.claim_completion(name, generation, is_error) {
+                    let claim = self.claim_completion(name, generation, is_error);
+                    if claim.publish {
                         info!(agent = name, is_error, "agent completed");
-                        self.route_completion(&record, is_error);
+                        self.route_completion(&record, is_error, claim.declared_done);
                     } else {
                         info!(
                             agent = name,
@@ -823,14 +837,44 @@ impl Supervisor {
                 // for every agent; a Claude session — which stays alive between
                 // turns to receive steers — normally reports at its `rk done`
                 // and only lands here when it is killed mid-task.
+                //
+                // A KILLED rat publishes that turn as a FAILURE (TKT-173).
+                // Reaching the flush proves the generation never wrote a
+                // `task_done` — that is the only reason a result is withheld —
+                // so the text being published is a mid-flight turn ("the test
+                // suite is still running"). The record's state is `Completed`
+                // from that turn, so a kill here does not look like a crash
+                // (TKT-147's `crashed` is only set over a LIVE state) and the
+                // pre-TKT-173 `record.state != Completed` read it as a clean
+                // finish: a rat stopped by the budget hard-stop or a sweep
+                // reported `is_error: false`, and the workflow waiting on it saw
+                // a clean completion for a rat that was killed mid-task.
+                //
+                // "Killed" is read off the exit status: `status.code()` is
+                // `None` for a signal-terminated child, and both the budget
+                // hard-stop and the sweep's hard escalation SIGTERM the process
+                // group. A rat that ran to completion and exited 0 — every
+                // codex/axe run, whose harness ends with the run — is NOT
+                // reclassified: it stopped of its own accord, and calling that
+                // an error would fail every workflow gating on
+                // `expect {is_error: false}`. What it gets instead is
+                // `declared_done: false`, which states the weaker fact (this
+                // generation never said it was finished) without overloading
+                // `is_error`, so a gate can be as strict as it likes. TKT-175
+                // tracks making that strictness the fleet-wide default; its cost
+                // is 23 fixtures that model rats skipping `rk done`.
                 if let Ok(Some(record)) = updated {
                     if self.flush_withheld_completion(name, generation) {
-                        let is_error = record.state != AgentState::Completed;
+                        let killed = code != Some(0);
+                        let is_error = killed || record.state != AgentState::Completed;
                         info!(
                             agent = name,
-                            is_error, "agent exited; publishing its last turn result"
+                            is_error,
+                            killed,
+                            "agent exited without ever running `rk done`; publishing its last \
+                             turn result"
                         );
-                        self.route_completion(&record, is_error);
+                        self.route_completion(&record, is_error, false);
                     }
                 }
             }
@@ -1532,7 +1576,8 @@ impl Supervisor {
     }
 
     /// Decide whether the turn that just ended is the one this generation
-    /// finishes on, and claim the right to publish it. `true` = publish now.
+    /// finishes on, and claim the right to publish it.
+    /// [`TurnClaim::publish`] = publish now.
     ///
     /// A harness returns control once per TURN. A background test suite
     /// finishing, a re-armed monitor, or a task notification each end a turn
@@ -1559,8 +1604,13 @@ impl Supervisor {
     /// A failed turn is terminal on its own: the session ended in an error, so
     /// there is no later turn to prefer, and holding it back would only turn a
     /// fast, legible failure into a `wait` timeout.
-    fn claim_completion(&self, name: &str, generation: DateTime<Utc>, is_error: bool) -> bool {
-        let terminal = is_error || self.declared_done(name, generation);
+    fn claim_completion(&self, name: &str, generation: DateTime<Utc>, is_error: bool) -> TurnClaim {
+        // Asked unconditionally rather than short-circuited behind `is_error`,
+        // because the answer is published as `declared_done` and a failed turn
+        // has one too: a rat can run `rk done` and then have a later turn error
+        // out. Costs one indexed scan on a path that runs once per turn.
+        let declared_done = self.declared_done(name, generation);
+        let terminal = is_error || declared_done;
         let mut completions = self.lock_completions();
         let state = completions
             .entry(name.to_string())
@@ -1579,7 +1629,10 @@ impl Supervisor {
         if state.routed {
             // Already published for this generation. A rat that keeps talking
             // after its `rk done` does not get to report twice.
-            return false;
+            return TurnClaim {
+                publish: false,
+                declared_done,
+            };
         }
         if terminal {
             state.routed = true;
@@ -1588,7 +1641,10 @@ impl Supervisor {
             // Superseded by whatever turn comes next, or flushed at `Exited`.
             state.withheld = true;
         }
-        terminal
+        TurnClaim {
+            publish: terminal,
+            declared_done,
+        }
     }
 
     /// Whether this generation of `name` has written its `rk done` tuple.
@@ -1614,6 +1670,11 @@ impl Supervisor {
 
     /// Claim the right to publish a turn result that was held back, now that the
     /// process has exited and no further turn can follow. `true` = publish.
+    ///
+    /// A `true` here is also the proof that the generation never declared itself
+    /// done — withholding is the only way a result reaches this path — which is
+    /// why the caller publishes it with `declared_done: false`, and as
+    /// `is_error: true` if the process was killed rather than ended (TKT-173).
     fn flush_withheld_completion(&self, name: &str, generation: DateTime<Utc>) -> bool {
         let mut completions = self.lock_completions();
         let Some(state) = completions.get_mut(name) else {
@@ -1645,7 +1706,7 @@ impl Supervisor {
     ///
     /// Reached exactly once per agent generation — see
     /// [`Self::claim_completion`] for what "once" means and why it matters.
-    fn route_completion(&self, record: &AgentRecord, is_error: bool) {
+    fn route_completion(&self, record: &AgentRecord, is_error: bool, declared_done: bool) {
         self.emit_event(
             &record.repo_name,
             "harness_result",
@@ -1661,6 +1722,14 @@ impl Supervisor {
                 "branch": record.branch,
                 "parent": record.parent,
                 "is_error": is_error,
+                // Whether the agent itself declared the task finished (`rk done`)
+                // in this generation, as opposed to merely stopping — killed by
+                // the budget hard-stop, swept, or exiting mid-task (TKT-173).
+                // Every published failure has this false, but not every false is
+                // a `is_error: true`-because-undeclared: a turn that errored out
+                // is also undeclared. An `evaluate` gate that wants "the rat said
+                // it was done" reads this rather than inferring it from prose.
+                "declared_done": declared_done,
                 "result": record.result,
                 "cost_usd": record.cost_usd,
                 "tokens": record.usage.total(),
@@ -1688,6 +1757,11 @@ impl Supervisor {
         // finish marks it done (which unblocks any dependents), an error leaves
         // it in_progress for inspection. Fire-and-forget so completion routing
         // is never held up by the ticket's serialization lock.
+        //
+        // Since TKT-173 a rat KILLED mid-task reports an error, so it no longer
+        // closes the ticket it never finished — and no dependent is unblocked
+        // behind it. A rat that exits without `rk done` still closes its ticket;
+        // TKT-175 is where that gets revisited.
         if !is_error {
             if let Some(task) = record.task.clone() {
                 if task.starts_with(crate::tickets::ID_PREFIX) {
