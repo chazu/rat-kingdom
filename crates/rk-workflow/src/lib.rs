@@ -313,6 +313,25 @@ pub struct ReadStep {
     /// Optional substring the serialized payload must contain.
     #[serde(default)]
     pub search: Option<String>,
+    /// Bind the read to the tuple THIS instance's active agent wrote, instead of
+    /// the newest tuple any author left in the scope (TKT-161).
+    ///
+    /// `(category, scope, identity)` alone is not an identity: two instances of
+    /// the same workflow running on one repo — which is the *designed* steady
+    /// state, since the reactor fires `steward` per rat completion — have their
+    /// reviewers writing `artifact/<repo>/review` concurrently. "Newest wins"
+    /// then hands one instance the other's verdict, and the `when` behind it
+    /// routes a land on a stranger's review. Setting this narrows the match to
+    /// `"agent":"<ctx.activeAgent>"` above that agent's own generation floor,
+    /// the same bound `wait`/`wait_all` carry (see [`rk_core::tuple::Pattern::
+    /// for_agent_since`]).
+    ///
+    /// Mutually exclusive with [`ReadStep::search`], which owns the same
+    /// predicate slot. Fails closed: no active agent, or an agent whose tuple
+    /// never carries its name, times the step out rather than routing on a
+    /// tuple it cannot attribute.
+    #[serde(default, rename = "fromAgent")]
+    pub from_agent: bool,
     /// JSON payload field to lift; whole payload if unset.
     #[serde(default)]
     pub field: Option<String>,

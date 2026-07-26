@@ -107,6 +107,12 @@ rk out artifact $RK_REPO fix --resolves <obstacle-id>      # backlink a solved w
 prior fix (`rk scan resolution $RK_REPO`) instead of redoing it. See
 [docs/reactor.md](docs/reactor.md#built-in-reaction-resolution-backlinks).
 
+`rk out` stamps `"agent": "$RK_AGENT"` into any object payload that does not
+already name one, so a tuple written from a spawn session says who wrote it
+without the rat having to remember. That stamp is what a workflow `read` with
+`fromAgent: true` keys on to lift the verdict ITS reviewer wrote rather than a
+concurrent instance's. An explicit `agent` in the payload is never overwritten.
+
 The daemon independently records `harness_result` events from the harness
 protocol, so even a rat that forgets `rk done` is tracked.
 

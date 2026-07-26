@@ -136,13 +136,25 @@ workflow: {
 		{type: "evaluate", expect: {exit: 0}},
 
 		// 4. Lift the reviewer's verdict into ctx.var.verdict.
+		//
+		//    `fromAgent` is load-bearing, not decoration (TKT-161). The steward
+		//    is fired PER rat completion, so several instances run against one
+		//    repo at once by design — and they all read
+		//    (artifact, <repo>, review). Without the binding "newest wins"
+		//    hands this steward whichever reviewer finished last, which may be
+		//    a peer instance's, and the APPROVE below lands a branch on a
+		//    stranger's verdict. Bound, the read matches only the tuple the
+		//    reviewer spawned in step 1 wrote (`rk out` stamps every payload
+		//    with its writer's name), and fails CLOSED into `rk inbox` if that
+		//    reviewer recorded nothing — never onto somebody else's word.
 		{
-			type:     "read"
-			category: "artifact"
-			identity: "review"
-			field:    "recommendation"
-			into:     "verdict"
-			timeout:  "5m"
+			type:      "read"
+			category:  "artifact"
+			identity:  "review"
+			fromAgent: true
+			field:     "recommendation"
+			into:      "verdict"
+			timeout:   "5m"
 		},
 
 		// 5. Route on the verdict. Gates already passed, so APPROVE is the ONLY

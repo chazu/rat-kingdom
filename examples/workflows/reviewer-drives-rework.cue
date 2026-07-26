@@ -86,14 +86,23 @@ workflow: {
 				},
 				{type: "wait", timeout: _input.reviewTimeout},
 				{type: "evaluate", expect: {is_error: false}},
-				// Lift the newest review verdict into ctx.var.verdict.
+				// Lift THIS round's review verdict into ctx.var.verdict.
+				// `fromAgent` binds the read to the reviewer just spawned above
+				// (TKT-161): (artifact, <repo>, review) is shared by every
+				// reviewer in the repo, so an unbound "newest wins" read can
+				// lift a concurrent instance's verdict — or, in this loop, the
+				// PREVIOUS round's, if this round's reviewer recorded nothing.
+				// Either way the routing below acts on a review of work it is
+				// not looking at. Bound, a silent reviewer times the step out
+				// and parks the branch instead of looping on a stale verdict.
 				{
-					type:     "read"
-					category: "artifact"
-					identity: "review"
-					field:    "recommendation"
-					into:     "verdict"
-					timeout:  "2m"
+					type:      "read"
+					category:  "artifact"
+					identity:  "review"
+					fromAgent: true
+					field:     "recommendation"
+					into:      "verdict"
+					timeout:   "2m"
 				},
 				{
 					type: "when"

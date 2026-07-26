@@ -197,6 +197,28 @@ fn print_tuple_line(t: &Value, display: &CastleDisplay) {
     );
 }
 
+/// Stamp the writing agent's name into an object payload that does not already
+/// name one — the raw-`rk out` counterpart to the sugar commands' env autofill.
+///
+/// A durable tuple is otherwise anonymous, so nothing downstream can tell one
+/// author's record from a concurrent peer's. That is TKT-161: a `steward`
+/// reviewer records `artifact/<repo>/review`, and with several stewards in
+/// flight on one repo (the reactor fires one per rat completion, by design) the
+/// newest `review` in that scope may be the OTHER instance's. A workflow `read`
+/// with `fromAgent: true` keys on this stamp, so putting it here rather than in
+/// the prompt means no reviewer can forget it and route a land onto a stranger's
+/// verdict.
+///
+/// An explicit `agent` in the payload is left alone: `rk out need … '{"agent":
+/// "steward", …}'` is naming the *role* that speaks, not the process that ran,
+/// and overwriting it would rewrite what `rk inbox` shows the operator.
+fn stamp_author(payload: &mut Value, agent: Option<String>) {
+    let (Some(agent), Some(obj)) = (agent, payload.as_object_mut()) else {
+        return;
+    };
+    obj.entry("agent").or_insert_with(|| json!(agent));
+}
+
 pub async fn out(layout: &Layout, args: OutArgs, as_json: bool) -> Result<()> {
     let mut payload: Value =
         serde_json::from_str(&args.payload).context("--payload must be valid JSON")?;
@@ -209,6 +231,7 @@ pub async fn out(layout: &Layout, args: OutArgs, as_json: bool) -> Result<()> {
         }
         payload["resolves"] = json!(resolves);
     }
+    stamp_author(&mut payload, std::env::var("RK_AGENT").ok());
     let mut params = json!({
         "category": args.category,
         "scope": args.scope,
@@ -504,5 +527,42 @@ mod tests {
         assert_eq!(parse_duration("2h").unwrap().as_secs(), 7200);
         assert_eq!(parse_duration("45").unwrap().as_secs(), 45);
         assert!(parse_duration("nope").is_err());
+    }
+
+    /// The stamp is what makes a durable tuple attributable, so a workflow
+    /// `read` with `fromAgent: true` can tell this instance's reviewer from a
+    /// concurrent instance's (TKT-161).
+    #[test]
+    fn out_stamps_the_writing_agent() {
+        let mut payload = json!({"recommendation": "APPROVE"});
+        stamp_author(&mut payload, Some("Filch-2".into()));
+        assert_eq!(payload["agent"], json!("Filch-2"));
+        assert_eq!(payload["recommendation"], json!("APPROVE"));
+        // Exactly the substring `Pattern::for_agent_since` searches for.
+        assert!(payload.to_string().contains("\"agent\":\"Filch-2\""));
+    }
+
+    #[test]
+    fn out_never_overwrites_an_explicit_agent() {
+        // `rk out need … '{"agent":"steward", …}'` names the role that speaks;
+        // rewriting it would change what `rk inbox` shows the operator.
+        let mut payload = json!({"agent": "steward", "text": "needs a human"});
+        stamp_author(&mut payload, Some("Filch-2".into()));
+        assert_eq!(payload["agent"], json!("steward"));
+    }
+
+    #[test]
+    fn out_leaves_non_objects_and_operator_shells_alone() {
+        // No RK_AGENT: a hand-run `rk out` from an operator shell is not an
+        // agent and must not claim to be one.
+        let mut payload = json!({"recommendation": "APPROVE"});
+        stamp_author(&mut payload, None);
+        assert_eq!(payload, json!({"recommendation": "APPROVE"}));
+
+        // A scalar/null payload has nowhere to put the stamp; leave it as-is
+        // rather than reshaping what the caller asked to write.
+        let mut scalar = json!(null);
+        stamp_author(&mut scalar, Some("Filch-2".into()));
+        assert_eq!(scalar, json!(null));
     }
 }

@@ -180,6 +180,10 @@ workflow: #Workflow
 // recorded as an artifact tuple (`rk out artifact <repo> review ...`) —
 // becomes observable to the workflow. Blocks up to `timeout` if no tuple
 // matches yet; the newest match wins so re-review rounds see the latest verdict.
+//
+// (category, scope, identity) is NOT an identity when two instances of the same
+// workflow run on one repo — set `fromAgent: true` to bind the read to the agent
+// this instance spawned, or the newest match may be a concurrent peer's.
 #ReadStep: {
 	type: "read"
 	// Tuple category to match.
@@ -188,8 +192,18 @@ workflow: #Workflow
 	identity: string
 	// Scope to match; defaults to this workflow's repo name at runtime.
 	scope?: string
-	// Optional substring the serialized payload must contain.
+	// Optional substring the serialized payload must contain. Mutually
+	// exclusive with `fromAgent`, which claims the same predicate slot.
 	search?: string
+	// Match only the tuple THIS instance's active agent wrote — its
+	// `"agent":"<name>"` stamp, bounded below by that agent's own generation,
+	// exactly as `wait` bounds a `harness_result`. Use it for anything a
+	// spawned agent produces for this run to route on (a review verdict), so a
+	// concurrent instance's reviewer cannot satisfy the read. `rk out` stamps
+	// the writer's `RK_AGENT` into every object payload that does not already
+	// name an agent, so no prompt has to remember to add it. Fails CLOSED: an
+	// unattributable tuple times the step out rather than routing.
+	fromAgent?: bool
 	// JSON payload field to lift (e.g. "recommendation"); whole payload if unset.
 	field?: string
 	// ctx variable name to store the value under (referenced by `when.var`).
