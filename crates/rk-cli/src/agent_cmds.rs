@@ -80,6 +80,12 @@ pub struct PruneArgs {
     /// unmerged branch is always left standing.
     #[arg(long)]
     pub reap_git: bool,
+    /// Also delete each archived agent's `rk log` transcript. One-way: the
+    /// record still archives and `rk unarchive` still restores it, but the
+    /// transcript is gone for good. Only a record actually being archived
+    /// loses one.
+    #[arg(long)]
+    pub reap_logs: bool,
 }
 
 #[derive(Args)]
@@ -302,6 +308,7 @@ pub async fn prune(layout: &Layout, args: PruneArgs, as_json: bool) -> Result<()
                 "all": args.all,
                 "dry_run": args.dry_run,
                 "reap_git": args.reap_git,
+                "reap_logs": args.reap_logs,
             }),
         )
         .await?;
@@ -334,17 +341,21 @@ pub async fn prune(layout: &Layout, args: PruneArgs, as_json: bool) -> Result<()
             a["cost_usd"].as_f64().unwrap_or(0.0),
         );
     }
-    for r in result["reaped"].as_array().cloned().unwrap_or_default() {
-        println!(
-            "  git {:<8} {:<12} {}",
-            if r["reaped"] == json!(true) {
-                "reaped"
-            } else {
-                "kept"
-            },
-            r["agent"].as_str().unwrap_or("?"),
-            r["reason"].as_str().unwrap_or(""),
-        );
+    // Both reap passes report the same row shape, so print them the same way;
+    // only the leading tag says which artifact a row is about.
+    for (kind, rows) in [("git", "reaped"), ("log", "reaped_logs")] {
+        for r in result[rows].as_array().cloned().unwrap_or_default() {
+            println!(
+                "  {kind} {:<8} {:<12} {}",
+                if r["reaped"] == json!(true) {
+                    "reaped"
+                } else {
+                    "kept"
+                },
+                r["agent"].as_str().unwrap_or("?"),
+                r["reason"].as_str().unwrap_or(""),
+            );
+        }
     }
     if args.dry_run {
         println!("(dry run — re-run without --dry-run to archive)");

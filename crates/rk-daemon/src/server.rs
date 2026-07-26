@@ -1360,10 +1360,11 @@ impl Daemon {
                 Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
             }
         };
-        match self
-            .supervisor
-            .archive_agents(cutoff, params.dry_run, params.reap_git)
-        {
+        let reap = crate::supervisor::Reap {
+            git: params.reap_git,
+            logs: params.reap_logs,
+        };
+        match self.supervisor.archive_agents(cutoff, params.dry_run, reap) {
             Ok(v) => Response::ok(req.id, v),
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
@@ -1611,6 +1612,8 @@ struct AgentArchiveParams {
     /// Also reclaim each archived agent's worktree + local branch, but only
     /// when the branch has already landed.
     reap_git: bool,
+    /// Also delete each archived agent's transcript file. One-way.
+    reap_logs: bool,
 }
 
 #[derive(Deserialize)]

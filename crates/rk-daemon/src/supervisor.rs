@@ -215,6 +215,24 @@ impl MergeQueue {
     }
 }
 
+/// Which of an archived record's leftovers `rk prune` should reclaim, beyond
+/// the record itself. Named fields rather than two positional `bool`s, because
+/// silently swapping them is exactly the bug worth designing out.
+///
+/// Two switches and not one, because they answer different questions. A branch
+/// can still hold the only copy of a rat's work, so `git` defers to whether it
+/// has landed; a transcript only narrates work that lives elsewhere, so `logs`
+/// has nothing to defer to. Folding them together would mean either deleting
+/// the transcript of the very rat whose branch was kept back for a closer look,
+/// or never reaping the transcript of a rat that had no branch at all.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Reap {
+    /// The worktree and local branch — merged branches only.
+    pub git: bool,
+    /// The generation's transcript file under `agent-logs/`. One-way.
+    pub logs: bool,
+}
+
 impl Supervisor {
     pub fn new(
         layout: Layout,
@@ -1935,15 +1953,14 @@ impl Supervisor {
     /// the default views. Live and `Orphaned` records are never touched.
     ///
     /// With `dry_run` the registry is not mutated at all — the reply lists what
-    /// *would* move, so an operator can preview before committing. `reap_git`
-    /// additionally reclaims each archived agent's worktree and local branch,
-    /// but only when the branch has already landed (see
-    /// [`reap_git`](Supervisor::reap_git)).
+    /// *would* move, so an operator can preview before committing. `reap`
+    /// additionally reclaims the leftovers each archived agent scattered
+    /// outside its record (see [`Reap`]).
     pub fn archive_agents(
         &self,
         cutoff: DateTime<Utc>,
         dry_run: bool,
-        reap_git: bool,
+        reap: Reap,
     ) -> rk_core::Result<serde_json::Value> {
         if dry_run {
             let eligible: Vec<AgentRecord> = self
@@ -1957,18 +1974,27 @@ impl Supervisor {
                 "count": eligible.len(),
                 "agents": eligible,
                 "reaped": [],
+                "reaped_logs": [],
             }));
         }
         let archived = self.lock_registry().archive(cutoff)?;
-        let reaped: Vec<serde_json::Value> = if reap_git {
+        let done =
+            |rows: &[serde_json::Value]| rows.iter().filter(|r| r["reaped"] == json!(true)).count();
+        let reaped: Vec<serde_json::Value> = if reap.git {
             archived.iter().map(|r| self.reap_git(r)).collect()
+        } else {
+            Vec::new()
+        };
+        let reaped_logs: Vec<serde_json::Value> = if reap.logs {
+            archived.iter().map(|r| self.reap_log(r)).collect()
         } else {
             Vec::new()
         };
         info!(
             count = archived.len(),
             cutoff = %cutoff,
-            reaped = reaped.iter().filter(|r| r["reaped"] == json!(true)).count(),
+            reaped = done(&reaped),
+            reaped_logs = done(&reaped_logs),
             "archived terminal agent records"
         );
         Ok(json!({
@@ -1976,6 +2002,7 @@ impl Supervisor {
             "count": archived.len(),
             "agents": archived,
             "reaped": reaped,
+            "reaped_logs": reaped_logs,
         }))
     }
 
@@ -2034,6 +2061,28 @@ impl Supervisor {
             detail.push(format!("branch {branch} already gone"));
         }
         row(true, detail.join("; "))
+    }
+
+    /// Reclaim one archived agent's transcript: the `agent-logs/` file its own
+    /// generation wrote, and nothing else. Each file is a bounded ring, but the
+    /// count grows once per rat forever, so this is the sweep that keeps the
+    /// directory finite.
+    ///
+    /// Unlike [`reap_git`](Supervisor::reap_git) there is no "has it settled
+    /// yet" question to ask first — the branch holds the work, the transcript
+    /// only narrates it — so every record that actually archives loses its own
+    /// file. That makes this strictly one-way: `rk unarchive` restores the
+    /// record but cannot bring the transcript back.
+    ///
+    /// Best-effort in the same shape as `reap_git`: a failure is a
+    /// `reaped: false` row with a reason, never a failed archive.
+    fn reap_log(&self, record: &AgentRecord) -> serde_json::Value {
+        let row = |reaped: bool, reason: String| json!({"agent": record.name, "reaped": reaped, "reason": reason});
+        match self.log.delete_for(&record.name, record.created_at) {
+            Ok(true) => row(true, "transcript deleted".into()),
+            Ok(false) => row(false, "no transcript on disk".into()),
+            Err(e) => row(false, format!("transcript delete failed: {e}")),
+        }
     }
 
     /// Standard spawn environment. Prepends the running `rk` binary's
