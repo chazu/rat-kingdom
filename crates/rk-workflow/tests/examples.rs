@@ -233,6 +233,15 @@ fn reviewer_drives_rework_loads_and_routes() {
         .expect("a read step lifting the verdict");
     assert_eq!(read.into, "verdict");
     assert_eq!(read.field.as_deref(), Some("recommendation"));
+    // TKT-161: bound to the reviewer this round spawned. Unbound, the read
+    // takes the newest (artifact, <repo>, review) in the repo — a concurrent
+    // instance's verdict, or this loop's PREVIOUS round if the current
+    // reviewer recorded nothing — and the `when` below reworks or breaks on a
+    // review of code it is not looking at.
+    assert!(
+        read.from_agent,
+        "the verdict read must be bound to the reviewer that wrote it"
+    );
 
     let Step::When(when) = repeat.steps.last().unwrap() else {
         panic!("loop body should end in a when");
@@ -316,6 +325,14 @@ fn steward_loads_and_routes() {
         .expect("a read step lifting the verdict");
     assert_eq!(read.into, "verdict");
     assert_eq!(read.field.as_deref(), Some("recommendation"));
+    // TKT-161: the steward is fired PER rat completion, so instances run
+    // concurrently on one repo by design and every one of them reads
+    // (artifact, <repo>, review). The binding is what stops the APPROVE arm
+    // below — the only arm that lands — from acting on a peer's verdict.
+    assert!(
+        read.from_agent,
+        "the verdict read must be bound to the reviewer that wrote it"
+    );
 
     let Step::When(when) = workflow.steps.last().unwrap() else {
         panic!("steward should end in a when routing on the verdict");

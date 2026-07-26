@@ -574,10 +574,43 @@ impl WorkflowEngine {
                 Step::Read(read) => {
                     let category = Category::from_str(&read.category)?;
                     let scope = read.scope.clone().unwrap_or_else(|| repo_name_of(repo));
-                    let mut pattern = Pattern::category(category)
-                        .scope(scope)
-                        .identity(read.identity.clone());
-                    pattern.payload_search = read.search.clone();
+                    // `fromAgent` narrows the read to the tuple THIS instance's
+                    // active agent wrote (TKT-161). Without it the predicate is
+                    // (category, scope, identity), which two instances of one
+                    // workflow on one repo share by construction — the reactor
+                    // fires `steward` per rat completion, so concurrent
+                    // reviewers write `artifact/<repo>/review` at the same time
+                    // and "newest wins" can hand a steward the OTHER steward's
+                    // verdict to route a land on. Same failure shape as TKT-146
+                    // (a read satisfied by a record that is not the one being
+                    // waited on), so it takes the same cure: the agent's name
+                    // plus its generation floor, via `for_agent_since`.
+                    let mut pattern = if read.from_agent {
+                        if read.search.is_some() {
+                            return Err(rk_core::Error::other(
+                                "read step sets both `fromAgent` and `search`; they claim the \
+                                 same payload predicate — drop one",
+                            ));
+                        }
+                        let agent = ctx.active_agent.clone().ok_or_else(|| {
+                            rk_core::Error::other(
+                                "read step has `fromAgent` but no active agent; only a step \
+                                 after a `spawn` can bind a read to its author",
+                            )
+                        })?;
+                        Pattern::for_agent_since(
+                            category,
+                            read.identity.clone(),
+                            &agent,
+                            self.generation_floor(id, &agent),
+                        )
+                    } else {
+                        let mut pattern =
+                            Pattern::category(category).identity(read.identity.clone());
+                        pattern.payload_search = read.search.clone();
+                        pattern
+                    };
+                    pattern.scope = Some(scope);
                     // Newest match wins (scan is oldest-first, so pop the tail);
                     // fall back to a blocking read if none is present yet.
                     let tuple = match self
@@ -594,8 +627,17 @@ impl WorkflowEngine {
                             .map_err(|e| rk_core::Error::other(format!("read failed: {e}")))?,
                     };
                     let tuple = tuple.ok_or_else(|| {
+                        // Name the binding in the failure: under `fromAgent` the
+                        // usual cause is an agent that wrote its tuple without
+                        // its own name in the payload, which reads as "nothing
+                        // matched" and is otherwise indistinguishable from an
+                        // agent that never wrote one at all.
+                        let bound_to = match (read.from_agent, ctx.active_agent.as_deref()) {
+                            (true, Some(agent)) => format!(" written by {agent}"),
+                            _ => String::new(),
+                        };
                         rk_core::Error::other(format!(
-                            "read timed out after {} for {} tuple '{}'",
+                            "read timed out after {} for {} tuple '{}'{bound_to}",
                             read.timeout, read.category, read.identity
                         ))
                     })?;
