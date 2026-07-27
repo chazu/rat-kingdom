@@ -16,6 +16,31 @@ daemon **reactor** as the keystone. Most of the work below was delivered by the
 fleet reviewing and merging *itself* through the steward loop (see _How this was
 built_).
 
+### System hardening and remediation (2026-07-26–27)
+
+- **Authenticated daemon IPC** — require per-layout tokens, restrict agent tuple
+  writes and event identities to the authenticated agent, protect the socket
+  with mode `0600`, and keep sync provenance separate from local authorization.
+- **Least-privilege execution** — harnesses default to workspace-scoped
+  permissions; workflow approval, named-check, target-allowlist, and definition
+  digest policies are enforced fail-closed.
+- **Durable recovery** — workflow snapshots are atomic and corruption becomes a
+  visible recovery failure; agent allocation is journaled before side effects;
+  changed workflow definitions cannot be resumed silently.
+- **Reliable coordination** — sync cycles are single-flight with durable cursor
+  and presence updates, reactor dispatch failures retry instead of being
+  acknowledged, and tuplespace waiter/replication races are closed.
+- **Bounded service paths** — request frames, SQLite scans, ranked scans, inbox
+  histories, TTLs, scheduler catch-up, and workflow command output are capped;
+  blocking Git/filesystem work is isolated from Tokio workers.
+- **Git and ticket safety** — checked-out targets cannot be advanced by a stale
+  ref, Git refs and land targets are validated, ticket IDs are globally unique,
+  and ticket state transitions are enforced at the daemon boundary.
+- **Strict data semantics** — migrations and persisted-row decoding fail closed,
+  payload matching is literal and case-sensitive, workflow commands stay inside
+  their worktree, and stale numeric ticket guidance was removed from `rk prime`
+  and examples.
+
 ### The reactive substrate (keystone)
 
 - **Reactive trigger engine** — a daemon tuple-reactor that consumes the live
