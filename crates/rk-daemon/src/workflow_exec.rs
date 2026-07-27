@@ -121,8 +121,16 @@ pub struct WorkflowContext {
     /// `wait_all` join. This is the fan-out counterpart to `active_agent`:
     /// sequential steps keep using `active_agent`; fan-out steps use this list
     /// so the single-active-agent path stays untouched.
+    ///
+    /// `None` and `Some(vec![])` mean different things, which is why this is an
+    /// `Option` and not a bare `Vec` (TKT-170). `None` is "no `for_each` has run
+    /// here" — a `wait_all` in that state is an authoring error and fails the
+    /// instance. `Some(vec![])` is "a `for_each` ran and its query matched
+    /// nothing" — a quiet night, which joins and dismisses as a no-op so the
+    /// steps after the fan-out still run and the instance completes. Cleared
+    /// back to `None` by `dismiss_all`, which spends the set.
     #[serde(default)]
-    pub fanout: Vec<FannedAgent>,
+    pub fanout: Option<Vec<FannedAgent>>,
     /// The agents whose `harness_result` produced the current
     /// `previous_result`: one for a `wait`, the whole fan-out for a `wait_all`,
     /// empty for every other source (a `dismiss` outcome, a `run` exit, an
@@ -735,12 +743,19 @@ impl WorkflowEngine {
                 }
                 Step::ForEach(fe) => {
                     let fanout = self.fan_out(id, agents, tiers, repo, fe).await?;
-                    self.update(id, |i| i.context.fanout = fanout);
+                    // Recorded even when the query matched nothing: an empty set
+                    // is still a set, and it is what tells the following
+                    // `wait_all` that a fan-out ran (TKT-170).
+                    self.update(id, |i| i.context.fanout = Some(fanout));
                 }
                 Step::WaitAll(wait_all) => {
-                    let summary = self.join(id, &ctx.fanout, wait_all).await?;
-                    let awaited: Vec<String> =
-                        ctx.fanout.iter().map(|fa| fa.agent.clone()).collect();
+                    let summary = self.join(id, ctx.fanout.as_deref(), wait_all).await?;
+                    let awaited: Vec<String> = ctx
+                        .fanout
+                        .iter()
+                        .flatten()
+                        .map(|fa| fa.agent.clone())
+                        .collect();
                     self.update(id, |i| {
                         i.context.previous_result = Some(summary.clone());
                         i.context.awaited = awaited.clone();
@@ -748,13 +763,20 @@ impl WorkflowEngine {
                 }
                 Step::DismissAll(dismiss_all) => {
                     let summary = self
-                        .dismiss_fanout(&ctx.fanout, dismiss_all, ctx.previous_result.as_ref())
+                        .dismiss_fanout(
+                            ctx.fanout.as_deref(),
+                            dismiss_all,
+                            ctx.previous_result.as_ref(),
+                        )
                         .await?;
                     self.update(id, |i| {
                         i.context.previous_result = Some(summary.clone());
                         i.context.awaited = Vec::new();
                         // The fan-out set is spent once its branches are merged.
-                        i.context.fanout = Vec::new();
+                        // Back to `None`, not an empty set: a later `wait_all`
+                        // with no `for_each` of its own is an authoring error
+                        // again, not a quiet night.
+                        i.context.fanout = None;
                     });
                 }
                 Step::Run(run) => {
@@ -940,7 +962,10 @@ impl WorkflowEngine {
     ) -> rk_core::Result<Vec<FannedAgent>> {
         let items = self.query_tickets(&fe.query, repo)?;
         if items.is_empty() {
-            warn!(instance = %id, "for_each matched no tickets; nothing to fan out");
+            // Normal, not a fault: a nightly drain over an empty ready queue is
+            // a quiet night. The empty set is still recorded, and the following
+            // wait_all/dismiss_all no-op over it (TKT-170).
+            info!(instance = %id, "for_each matched no tickets; nothing to fan out");
         }
         // The workflow's own tier rules shadow the global ones for this fan-out.
         let routing = tiers.chained(&self.tier_routing);
@@ -1206,16 +1231,26 @@ impl WorkflowEngine {
     /// then aggregate into `{count, ok, errors, all_ok, results}`. All agents
     /// share one deadline: the step times out if any is still running when it
     /// elapses.
+    ///
+    /// `fanout` is `None` only when no `for_each` ran before this step — an
+    /// authoring error, and the one case that fails here. An *empty* fan-out is
+    /// not: a `for_each` whose query matched no tickets is a quiet night, and it
+    /// joins to the vacuous aggregate (`count: 0, all_ok: true`) so the rest of
+    /// the instance runs and the night completes instead of landing in
+    /// `rk inbox` as a failure with nothing to look at (TKT-170).
     async fn join(
         &self,
         id: &str,
-        fanout: &[FannedAgent],
+        fanout: Option<&[FannedAgent]>,
         wait_all: &WaitAllStep,
     ) -> rk_core::Result<Value> {
+        let fanout = fanout.ok_or_else(|| {
+            rk_core::Error::other(
+                "wait_all step with no preceding for_each: there is no fan-out to join",
+            )
+        })?;
         if fanout.is_empty() {
-            return Err(rk_core::Error::other(
-                "wait_all step with no fan-out agents (missing or empty for_each)",
-            ));
+            info!(instance = %id, "wait_all over an empty fan-out; nothing to join");
         }
         let deadline = tokio::time::Instant::now() + parse_duration(&wait_all.timeout)?;
         let mut results = Vec::with_capacity(fanout.len());
@@ -1261,17 +1296,23 @@ impl WorkflowEngine {
     /// branches have already merged. `only_clean` requires a preceding
     /// `wait_all` (its per-agent results supply the clean/failed signal); it
     /// fails the step if none is present rather than silently merging all.
+    ///
+    /// As with [`join`](Self::join), only a missing `for_each` (`None`) fails
+    /// here; an empty fan-out merges nothing and aggregates to `count: 0,
+    /// all_merged: true` (TKT-170). The `only_clean` check still runs first, so
+    /// a `dismiss_all` that wants a `wait_all` it never got is caught on a quiet
+    /// night too, rather than lying dormant until a night with tickets in it.
     async fn dismiss_fanout(
         &self,
-        fanout: &[FannedAgent],
+        fanout: Option<&[FannedAgent]>,
         dismiss_all: &DismissAllStep,
         previous_result: Option<&Value>,
     ) -> rk_core::Result<Value> {
-        if fanout.is_empty() {
-            return Err(rk_core::Error::other(
-                "dismiss_all step with no fan-out agents (missing or empty for_each)",
-            ));
-        }
+        let fanout = fanout.ok_or_else(|| {
+            rk_core::Error::other(
+                "dismiss_all step with no preceding for_each: there is no fan-out to merge",
+            )
+        })?;
         // With only_clean, the per-agent no_merge is driven by the preceding
         // wait_all's results: an agent is parked (no_merge=true) unless its
         // harness_result reported is_error:false. Without a preceding wait_all
@@ -1302,6 +1343,9 @@ impl WorkflowEngine {
         } else {
             None
         };
+        if fanout.is_empty() {
+            info!("dismiss_all over an empty fan-out; nothing to merge");
+        }
         // Dismiss all branches concurrently: each dismissal kills its child and
         // merges its branch independently, so serializing them would waste the
         // whole point of a fan-out.
