@@ -496,6 +496,15 @@ notify_escalations = true # desktop-push a steward escalation via herdr; false =
   verdict as a `need` (identity `steward`), a built-in reaction fires a desktop
   notification via herdr so the operator is pushed at, not only queued in
   `rk inbox`. A no-op when no herdr server is running.
+- **Open ballots reach the operator.** `rk suggest` proposes a norm and the
+  reactor promotes it to a permanent `convention` at `quorum` distinct
+  endorsers — but nothing announced that a vote was open, so proposals decayed
+  on their voting window and the fleet promoted **zero** conventions in 277
+  spawns. `rk inbox` now shows each live proposal as an **`open-suggestion`**
+  row: proposer, text, `n/quorum` tally, time left, and `rk endorse <sug-id>` to
+  back it. Closest-to-decaying sorts first; the row disappears once the norm
+  promotes or the window closes. `rk endorse` works outside a rat too (it votes
+  as `operator`), so the queue's resolving command is one a human can run.
 
 See `docs/reactor.md` for the full design (why scan-is-truth, the three
 re-entrancy guards, first-boot backlog skipping).

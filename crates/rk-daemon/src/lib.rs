@@ -218,6 +218,62 @@ mod tests {
         assert_eq!(items[1]["kind"], "need");
     }
 
+    /// TKT-167: an open ballot reaches the operator over the wire, tallied
+    /// against the reactor's own configured quorum. Without this the whole norms
+    /// program is invisible — a proposal decays on its voting window and the
+    /// only endorser who is always reachable never learns a vote was open.
+    #[tokio::test]
+    async fn open_suggestion_surfaces_in_the_inbox_over_the_wire() {
+        let (_dir, layout, _handle) = start_daemon().await;
+        let mut client = connect(&layout).await;
+
+        // Exactly what `rk suggest` writes: a system-scope Suggestion authored by
+        // the proposing agent, with a voting window.
+        client
+            .call(
+                "space.out",
+                json!({
+                    "category": "suggestion",
+                    "scope": "system",
+                    "identity": "sug-8nsqa4132x",
+                    "instance": "rat-28",
+                    "payload": {"agent": "rat-28", "text": "a pre-existing failure is a ticket"},
+                    "ttl_secs": 86400,
+                }),
+            )
+            .await
+            .unwrap();
+        // ... and what `rk endorse` writes: one vote from a distinct agent.
+        client
+            .call(
+                "space.out",
+                json!({
+                    "category": "endorsement",
+                    "scope": "system",
+                    "identity": "sug-8nsqa4132x",
+                    "instance": "rat-36",
+                    "payload": {"agent": "rat-36", "suggestion": "sug-8nsqa4132x"},
+                    "ttl_secs": 86400,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let inbox = client.call("inbox.list", json!({})).await.unwrap();
+        let items = inbox["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["kind"], "open-suggestion");
+        assert_eq!(items[0]["subject"], "sug-8nsqa4132x");
+        assert_eq!(items[0]["action"], "rk endorse sug-8nsqa4132x");
+        // Tallied against the configured quorum, not a number invented here.
+        let detail = items[0]["detail"].as_str().unwrap();
+        assert!(
+            detail.starts_with("1/3 endorsers (23h"),
+            "unexpected detail: {detail}"
+        );
+        assert!(detail.contains("rat-28 proposes: a pre-existing failure"));
+    }
+
     #[tokio::test]
     async fn ttl_writes_become_ephemeral() {
         let (_dir, layout, _handle) = start_daemon().await;

@@ -1029,6 +1029,25 @@ impl Daemon {
             .into_iter()
             .cloned()
             .collect();
+        // Open ballots (TKT-167). A `Suggestion` promotes to a permanent
+        // `Convention` at quorum and otherwise decays on its voting window, and
+        // nothing else in the fleet announces that a vote is open — so a
+        // proposal is only ever endorsed by a peer who goes looking for one it
+        // has no reason to suspect exists. Measured 2026-07-25: zero conventions
+        // had ever reached quorum over 277 spawns. Surfacing the ballot here
+        // puts the always-reachable endorser — the operator — in front of it.
+        // The three scans are read-side only; `build` does the counting.
+        let ballot_tuples = |category| self.space.scan(&Pattern::category(category));
+        let (suggestions, endorsements, conventions) = match (
+            ballot_tuples(Category::Suggestion),
+            ballot_tuples(Category::Endorsement),
+            ballot_tuples(Category::Convention),
+        ) {
+            (Ok(s), Ok(e), Ok(c)) => (s, e, c),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                return Response::err(id, codes::INTERNAL, e.to_string())
+            }
+        };
         // Both branch-shaped rows auto-clear once their branch is merged into
         // the target (or gone), and nothing emits a record when that happens —
         // no close event when a human merges a PR on the forge, and nothing at
@@ -1048,6 +1067,16 @@ impl Daemon {
                 pull_requests: &pull_requests,
                 pull_requests_closed: &pull_requests_closed,
                 lands: &lands,
+            },
+            &crate::inbox::Ballots {
+                suggestions: &suggestions,
+                endorsements: &endorsements,
+                conventions: &conventions,
+                // The reactor's own quorum, so the tally shown is the tally that
+                // promotes — and a configured 0 (promotion disabled) raises no
+                // rows rather than offering a vote that can never resolve.
+                quorum: self.reactor_config.quorum as usize,
+                now: chrono::Utc::now(),
             },
         );
         Response::ok(id, crate::inbox::to_json(&items))

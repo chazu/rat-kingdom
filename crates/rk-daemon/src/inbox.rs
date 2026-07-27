@@ -1,12 +1,12 @@
 //! Unified operator attention queue.
 //!
-//! `rk inbox` collapses the five surfaces an operator otherwise polls
-//! separately — `rk list` (failed/orphaned agents), `rk workflow list`
-//! (failed instances and gates awaiting a decision), `rk scan obstacle`, and
-//! `rk scan need` — into one ranked triage list. Every row carries the exact
-//! `rk` command that resolves it, and its raw source `kind` so the operator can
-//! override the ranking. This is pure read-side aggregation over data that
-//! already exists: no new storage.
+//! `rk inbox` collapses the surfaces an operator otherwise polls separately —
+//! `rk list` (failed/orphaned agents), `rk workflow list` (failed instances and
+//! gates awaiting a decision), `rk scan obstacle`, `rk scan need`, and
+//! `rk scan suggestion` — into one ranked triage list. Every row carries the
+//! exact `rk` command that resolves it, and its raw source `kind` so the
+//! operator can override the ranking. This is pure read-side aggregation over
+//! data that already exists: no new storage.
 //!
 //! Two of the sources are INVARIANT ASSERTIONS rather than reports of something
 //! that announced itself — a pushed branch with an open PR nobody merged
@@ -15,13 +15,19 @@
 //! finished work that is absent from where it belongs and that no failure
 //! anywhere would have named. Both are checked against local git on every read
 //! and clear themselves the moment the branch actually lands.
+//!
+//! One source is a BALLOT rather than a problem: an open `Suggestion` inside its
+//! voting window (`open-suggestion`). It is here because a proposal that nobody
+//! votes on is indistinguishable from one nobody made — it simply decays — and
+//! the operator is the one endorser who is always available.
 
 use crate::agents::{AgentRecord, AgentState};
 use crate::workflow_exec::{Instance, InstanceStatus};
-use rk_core::tuple::Tuple;
+use chrono::{DateTime, Utc};
+use rk_core::tuple::{Category, Tuple, SYSTEM_SCOPE};
 use serde::Serialize;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Urgency ranks. Higher sorts first. Derived at read time from the source, not
 /// stored anywhere. Ordering follows the ticket heuristic:
@@ -41,6 +47,12 @@ mod urgency {
     pub const AWAITING_REVIEW: u8 = 3;
     pub const OBSTACLE: u8 = 2;
     pub const NEED: u8 = 1;
+    /// An open proposal awaiting endorsements. Co-ranked with `need` — both are
+    /// a rat asking the room for something rather than reporting a problem, and
+    /// neither blocks anything. It earns a row at all because it EXPIRES: unlike
+    /// a need, which someone may answer late, a suggestion that misses quorum
+    /// inside its voting window is gone and the norm with it (TKT-167).
+    pub const OPEN_SUGGESTION: u8 = 1;
 }
 
 /// One row in the operator inbox: something awaiting a human, plus the exact
@@ -87,6 +99,54 @@ pub struct BranchEvents<'a> {
     pub cleared: HashSet<(String, String)>,
 }
 
+/// The suggestion ballots: open proposals, the votes cast on them, and the
+/// promotions that have already settled.
+///
+/// `rk suggest` writes a `Suggestion` on the system scope with a voting window
+/// (default 24h). The reactor promotes it to a permanent `Convention` once
+/// `quorum` DISTINCT agents have endorsed it; otherwise it decays and the norm
+/// is lost. Nothing announces an open ballot, so a proposal only ever promotes
+/// if a peer happens to go looking for one it has no reason to suspect exists —
+/// measured 2026-07-25, ZERO conventions had ever reached quorum over 277
+/// spawns, three separate rats having tried and failed to gather three votes
+/// (TKT-167). These rows are the announcement, and they put the one endorser who
+/// is always reachable — the operator — in front of every ballot before it
+/// decays.
+#[derive(Debug, Clone)]
+pub struct Ballots<'a> {
+    /// `Suggestion` tuples: the open proposals, keyed `identity = <sug-id>`.
+    pub suggestions: &'a [Tuple],
+    /// `Endorsement` tuples, keyed `(identity = <sug-id>, instance = endorser)`.
+    /// Counted DISTINCT by `instance`, exactly as the reactor counts them, so
+    /// the tally shown is the tally that promotes.
+    pub endorsements: &'a [Tuple],
+    /// `Convention` tuples, keyed `identity = <sug-id>`. A promoted proposal is
+    /// settled and must never nag; the permanent Convention is the same
+    /// already-promoted marker the reactor itself uses.
+    pub conventions: &'a [Tuple],
+    /// Distinct-endorser count at which the reactor promotes. Zero disables
+    /// quorum promotion, and a ballot that can never resolve is not a ballot —
+    /// no rows are raised.
+    pub quorum: usize,
+    /// Read-time clock, injected rather than read here so `build` stays pure
+    /// over its inputs and the remaining-window rendering is testable.
+    pub now: DateTime<Utc>,
+}
+
+impl Default for Ballots<'_> {
+    fn default() -> Self {
+        Self {
+            suggestions: &[],
+            endorsements: &[],
+            conventions: &[],
+            // Matches the reactor's "promotion disabled" reading. Safe as a
+            // default because it can only suppress rows, never invent them.
+            quorum: 0,
+            now: Utc::now(),
+        }
+    }
+}
+
 /// Aggregate everything awaiting a human into one ranked list. Pure over its
 /// inputs so it can be unit-tested without a running daemon.
 pub fn build(
@@ -95,6 +155,7 @@ pub fn build(
     obstacles: &[Tuple],
     needs: &[Tuple],
     branches: &BranchEvents<'_>,
+    ballots: &Ballots<'_>,
 ) -> Vec<InboxItem> {
     let (pull_requests, pull_requests_closed, lands) = (
         branches.pull_requests,
@@ -327,10 +388,116 @@ pub fn build(
         });
     }
 
+    items.extend(open_suggestions(ballots));
+
     // Most urgent first; a stable sort keeps each source's own order (agents by
     // spawn time, instances by start time, tuples oldest-first) within a rank.
     items.sort_by(|a, b| b.urgency.cmp(&a.urgency));
     items
+}
+
+/// One row per open ballot: a system-scope `Suggestion` still inside its voting
+/// window that has neither promoted nor decayed (TKT-167).
+///
+/// Three filters, each dropping a ballot the operator cannot usefully act on:
+///
+/// - **quorum 0** — promotion is disabled, so no endorsement can resolve it.
+/// - **already promoted** — a `Convention` carries the suggestion's id, so the
+///   norm is permanent and the vote is over.
+/// - **decayed** — `expires_at` has passed. Expiry is collected by the GC rather
+///   than filtered on read, so a scan returns ballots whose window closed
+///   minutes ago; endorsing one is not what the operator meant.
+///
+/// Scoped to `system`, matching the reactor: `promote_conventions` only ever
+/// considers system-scope tuples, so a suggestion written anywhere else could
+/// not promote no matter who endorsed it, and showing it would offer a vote that
+/// does nothing. `rk suggest` always writes system scope.
+fn open_suggestions(ballots: &Ballots<'_>) -> Vec<InboxItem> {
+    if ballots.quorum == 0 || ballots.suggestions.is_empty() {
+        return Vec::new();
+    }
+    let mut endorsers: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for t in ballots.endorsements {
+        if t.scope == SYSTEM_SCOPE && t.category == Category::Endorsement {
+            endorsers
+                .entry(t.identity.as_str())
+                .or_default()
+                .insert(t.instance.as_str());
+        }
+    }
+    let promoted: HashSet<&str> = ballots
+        .conventions
+        .iter()
+        .filter(|t| t.scope == SYSTEM_SCOPE && t.category == Category::Convention)
+        .map(|t| t.identity.as_str())
+        .collect();
+
+    let mut open: Vec<&Tuple> = ballots
+        .suggestions
+        .iter()
+        .filter(|t| t.scope == SYSTEM_SCOPE && !promoted.contains(t.identity.as_str()))
+        .filter(|t| t.expires_at.is_none_or(|e| e > ballots.now))
+        .collect();
+    // Closest to decaying first, so the ballot the operator is about to lose is
+    // the one they read. A ballot with no window cannot decay and sorts last;
+    // ties fall back to newest-first on the time-sortable id.
+    open.sort_by(|a, b| {
+        a.expires_at
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+            .cmp(&b.expires_at.unwrap_or(DateTime::<Utc>::MAX_UTC))
+            .then_with(|| b.id.cmp(&a.id))
+    });
+
+    let mut rows = Vec::new();
+    for t in open {
+        let count = endorsers
+            .get(t.identity.as_str())
+            .map(HashSet::len)
+            .unwrap_or(0);
+        let text = t
+            .payload
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no text)");
+        // The proposer is one of the endorsers it needs, so name them: an
+        // operator reading two near-duplicate ballots needs to know who is
+        // asking before deciding which one to back.
+        let by = t
+            .payload
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .unwrap_or(t.instance.as_str());
+        rows.push(InboxItem {
+            urgency: urgency::OPEN_SUGGESTION,
+            kind: "open-suggestion".into(),
+            subject: t.identity.clone(),
+            scope: t.scope.clone(),
+            detail: format!(
+                "{count}/{} endorsers{} — {by} proposes: {text}",
+                ballots.quorum,
+                window_left(t.expires_at, ballots.now),
+            ),
+            action: format!("rk endorse {}", t.identity),
+        });
+    }
+    rows
+}
+
+/// Render how long a ballot has left as a ` (6h12m left)` clause, or empty when
+/// it carries no voting window at all. Sub-minute remainders round to `<1m`
+/// rather than `0m`, which would read as decayed.
+fn window_left(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    let Some(expires_at) = expires_at else {
+        return String::new();
+    };
+    let mins = (expires_at - now).num_minutes();
+    if mins < 1 {
+        return " (<1m left)".into();
+    }
+    match (mins / 60, mins % 60) {
+        (0, m) => format!(" ({m}m left)"),
+        (h, m) => format!(" ({h}h{m:02}m left)"),
+    }
 }
 
 /// The `branch_landed` events that describe a DROPPED branch: the newest event
@@ -500,6 +667,7 @@ mod tests {
             &obstacles,
             &needs,
             &BranchEvents::default(),
+            &Ballots::default(),
         );
         let kinds: Vec<&str> = inbox.iter().map(|i| i.kind.as_str()).collect();
 
@@ -525,7 +693,14 @@ mod tests {
             instance("wf-run", InstanceStatus::Running, None),
             instance("wf-ok", InstanceStatus::Completed, None),
         ];
-        let inbox = build(&agents, &instances, &[], &[], &BranchEvents::default());
+        let inbox = build(
+            &agents,
+            &instances,
+            &[],
+            &[],
+            &BranchEvents::default(),
+            &Ballots::default(),
+        );
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].subject, "Gone");
         assert_eq!(inbox[0].action, "rk respawn Gone");
@@ -547,6 +722,7 @@ mod tests {
                 pull_requests: &prs,
                 ..Default::default()
             },
+            &Ballots::default(),
         );
         assert_eq!(inbox.len(), 1);
         let row = &inbox[0];
@@ -574,6 +750,7 @@ mod tests {
                 pull_requests: &[older, newer],
                 ..Default::default()
             },
+            &Ballots::default(),
         );
         let review: Vec<&InboxItem> = inbox
             .iter()
@@ -604,6 +781,7 @@ mod tests {
                 cleared,
                 ..Default::default()
             },
+            &Ballots::default(),
         );
         let review: Vec<&InboxItem> = inbox
             .iter()
@@ -643,6 +821,7 @@ mod tests {
                 pull_requests_closed: &closed,
                 ..Default::default()
             },
+            &Ballots::default(),
         );
         let review: Vec<&InboxItem> = inbox
             .iter()
@@ -689,6 +868,7 @@ mod tests {
                 lands: &lands,
                 ..Default::default()
             },
+            &Ballots::default(),
         );
         assert_eq!(inbox.len(), 1);
         let row = &inbox[0];
@@ -724,6 +904,7 @@ mod tests {
                 lands: &lands,
                 ..Default::default()
             },
+            &Ballots::default(),
         );
         assert!(inbox.is_empty(), "clean hand-offs must not nag: {inbox:?}");
     }
@@ -749,6 +930,7 @@ mod tests {
                 lands: &[old],
                 ..Default::default()
             },
+            &Ballots::default(),
         );
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].kind, "unlanded-branch");
@@ -770,6 +952,7 @@ mod tests {
                 lands: &[failed, retried],
                 ..Default::default()
             },
+            &Ballots::default(),
         );
         assert!(
             inbox.is_empty(),
@@ -798,15 +981,244 @@ mod tests {
                 cleared,
                 ..Default::default()
             },
+            &Ballots::default(),
         );
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].subject, "rat/a/still-stuck");
     }
 
+    fn suggestion(sug_id: &str, by: &str, text: &str, expires_in_mins: Option<i64>) -> Tuple {
+        let mut t = Tuple::new(
+            Category::Suggestion,
+            SYSTEM_SCOPE,
+            sug_id,
+            by,
+            json!({ "agent": by, "text": text }),
+        );
+        t.expires_at = expires_in_mins.map(|m| Utc::now() + chrono::Duration::minutes(m));
+        t
+    }
+
+    fn endorsement(sug_id: &str, by: &str) -> Tuple {
+        Tuple::new(
+            Category::Endorsement,
+            SYSTEM_SCOPE,
+            sug_id,
+            by,
+            json!({ "agent": by, "suggestion": sug_id }),
+        )
+    }
+
+    fn ballots<'a>(suggestions: &'a [Tuple], endorsements: &'a [Tuple]) -> Ballots<'a> {
+        Ballots {
+            suggestions,
+            endorsements,
+            quorum: 3,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_open_ballot_surfaces_with_its_tally_window_and_endorse_command() {
+        // TKT-167: nothing else announces that a vote is open, so a proposal
+        // decays unendorsed. The row must carry enough to decide on: who is
+        // asking, what they propose, how far from quorum, and how long is left.
+        let suggestions = vec![suggestion(
+            "sug-8nsqa4132x",
+            "rat-28",
+            "a pre-existing failure is a ticket, not an inline fix",
+            Some(6 * 60 + 12),
+        )];
+        let endorsements = vec![endorsement("sug-8nsqa4132x", "rat-36")];
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents::default(),
+            &ballots(&suggestions, &endorsements),
+        );
+        assert_eq!(inbox.len(), 1);
+        let row = &inbox[0];
+        assert_eq!(row.kind, "open-suggestion");
+        assert_eq!(row.urgency, urgency::OPEN_SUGGESTION);
+        assert_eq!(row.subject, "sug-8nsqa4132x");
+        assert_eq!(row.scope, SYSTEM_SCOPE);
+        assert!(
+            row.detail.starts_with("1/3 endorsers (6h1"),
+            "{}",
+            row.detail
+        );
+        assert!(row
+            .detail
+            .contains("rat-28 proposes: a pre-existing failure"));
+        assert_eq!(row.action, "rk endorse sug-8nsqa4132x");
+    }
+
+    #[test]
+    fn a_settled_or_decayed_ballot_stops_nagging() {
+        // Three ballots the operator cannot usefully act on: one already promoted
+        // to a permanent Convention (the vote is over), one whose voting window
+        // closed before the GC collected it, and one written outside the system
+        // scope — which `promote_conventions` never considers, so endorsing it
+        // could not promote it. Only the live system-scope ballot survives.
+        let mut off_scope = suggestion("sug-elsewhere", "rat-9", "repo-local idea", Some(60));
+        off_scope.scope = "repo".into();
+        let suggestions = vec![
+            suggestion("sug-promoted", "rat-1", "already a norm", Some(60)),
+            suggestion("sug-decayed", "rat-2", "missed its window", Some(-1)),
+            off_scope,
+            suggestion("sug-live", "rat-3", "still open", Some(60)),
+        ];
+        let conventions = vec![Tuple::new(
+            Category::Convention,
+            SYSTEM_SCOPE,
+            "sug-promoted",
+            "reactor",
+            json!({"text": "already a norm", "count": 3}),
+        )];
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents::default(),
+            &Ballots {
+                suggestions: &suggestions,
+                conventions: &conventions,
+                quorum: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(inbox.len(), 1, "{inbox:?}");
+        assert_eq!(inbox[0].subject, "sug-live");
+        assert!(inbox[0].detail.starts_with("0/3 endorsers"));
+    }
+
+    #[test]
+    fn endorsers_are_counted_distinct_and_per_ballot() {
+        // The tally shown must be the tally that promotes: the reactor counts
+        // DISTINCT `instance` per suggestion, so a re-endorsement cannot inflate
+        // it and another ballot's votes cannot leak in.
+        let suggestions = vec![
+            suggestion("sug-a", "rat-1", "proposal a", Some(60)),
+            suggestion("sug-b", "rat-2", "proposal b", Some(120)),
+        ];
+        let endorsements = vec![
+            endorsement("sug-a", "rat-7"),
+            endorsement("sug-a", "rat-7"),
+            endorsement("sug-a", "rat-8"),
+            endorsement("sug-b", "rat-9"),
+        ];
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents::default(),
+            &ballots(&suggestions, &endorsements),
+        );
+        // Closest to decaying first, so the ballot about to be lost reads first.
+        assert_eq!(inbox[0].subject, "sug-a");
+        assert!(
+            inbox[0].detail.starts_with("2/3 endorsers"),
+            "{:?}",
+            inbox[0]
+        );
+        assert_eq!(inbox[1].subject, "sug-b");
+        assert!(
+            inbox[1].detail.starts_with("1/3 endorsers"),
+            "{:?}",
+            inbox[1]
+        );
+    }
+
+    #[test]
+    fn ballots_never_outrank_a_real_problem() {
+        // A proposal is not a failure. It sits at the bottom of the queue with
+        // the needs, below every obstacle and every dropped branch.
+        let suggestions = vec![suggestion("sug-a", "rat-1", "proposal a", Some(60))];
+        let obstacles = vec![obstacle("Pip", json!({"text": "merge conflict"}))];
+        let inbox = build(
+            &[agent("Whisker", AgentState::Failed)],
+            &[],
+            &obstacles,
+            &[],
+            &BranchEvents::default(),
+            &ballots(&suggestions, &[]),
+        );
+        assert_eq!(*inbox.last().unwrap().kind, *"open-suggestion");
+        assert!(inbox[0].urgency > inbox.last().unwrap().urgency);
+    }
+
+    #[test]
+    fn quorum_zero_raises_no_ballots() {
+        // Promotion disabled: no number of endorsements can resolve the ballot,
+        // so offering the vote would be a lie.
+        let suggestions = vec![suggestion("sug-a", "rat-1", "proposal a", Some(60))];
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents::default(),
+            &Ballots {
+                suggestions: &suggestions,
+                ..Default::default()
+            },
+        );
+        assert!(inbox.is_empty(), "{inbox:?}");
+    }
+
+    #[test]
+    fn a_ballot_in_its_last_seconds_reads_as_still_open() {
+        // Sub-minute remainders must not render as `0m left`, which reads as
+        // decayed — the operator has seconds to save the norm, not none.
+        let suggestions = vec![suggestion("sug-a", "rat-1", "proposal a", None)];
+        let now = Utc::now();
+        let mut expiring = suggestions.clone();
+        expiring[0].expires_at = Some(now + chrono::Duration::seconds(20));
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents::default(),
+            &Ballots {
+                suggestions: &expiring,
+                quorum: 3,
+                now,
+                ..Default::default()
+            },
+        );
+        assert!(inbox[0].detail.contains("(<1m left)"), "{:?}", inbox[0]);
+
+        // A ballot with no window at all renders no clause rather than a bogus one.
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents::default(),
+            &ballots(&suggestions, &[]),
+        );
+        assert_eq!(
+            inbox[0].detail,
+            "0/3 endorsers — rat-1 proposes: proposal a"
+        );
+    }
+
     #[test]
     fn plain_obstacle_uses_text_and_obstacle_rank() {
         let obstacles = vec![obstacle("Pip", json!({"text": "merge conflict in lib.rs"}))];
-        let inbox = build(&[], &[], &obstacles, &[], &BranchEvents::default());
+        let inbox = build(
+            &[],
+            &[],
+            &obstacles,
+            &[],
+            &BranchEvents::default(),
+            &Ballots::default(),
+        );
         assert_eq!(inbox[0].urgency, urgency::OBSTACLE);
         assert_eq!(inbox[0].detail, "merge conflict in lib.rs");
         assert_eq!(inbox[0].action, "rk status Pip");

@@ -276,6 +276,25 @@ in the path**:
    the rendered prompt as a binding **"Standing conventions"** section — so a
    promoted norm changes what the next rat *does*, not just what it *could read*.
 
+Hop 1 has a failure mode the other two do not: it needs **three rats to agree
+inside one voting window**, and nothing tells a rat that a window is open.
+Measured against the live space on 2026-07-25 — `rk scan convention` = 0,
+`rk scan endorsement` = 0, `rk scan suggestion` = 0, over **277 spawns**. A
+`Convention` is Furniture (permanent), so zero conventions means nothing had
+ever reached quorum. Not a broken mechanism: an undriven one. Three separate
+rats had each proposed a norm, asked the room to endorse it, and watched the
+ballot decay unanswered.
+
+So `rk inbox` surfaces every open ballot as an **`open-suggestion`** row
+(TKT-167) — the id, the proposer, the text, the live `n/quorum` tally and how
+long the window has left, with `rk endorse <sug-id>` as the resolving command.
+Rows sort closest-to-decaying first, and drop out the moment the proposal
+promotes (a `Convention` carries its id), decays, or if `quorum = 0` disables
+promotion entirely. This does not replace hop 1 — peers endorsing peers is still
+how a norm should pass — it adds the **one endorser who is always reachable**.
+`rk endorse` therefore does not require the spawn environment: run outside a rat
+(no `RK_AGENT`) it votes as the single distinct endorser `operator`.
+
 The seam between hops 2 and 3 is a real contract: the convention must carry the
 suggestion's **non-blank** `text`, because the injection step drops a blank-text
 convention (a norm whose source text decayed to empty would reach quorum yet

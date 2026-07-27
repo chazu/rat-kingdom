@@ -427,11 +427,24 @@ pub async fn suggest(layout: &Layout, args: SuggestArgs, as_json: bool) -> Resul
     Ok(())
 }
 
+/// Endorser identity for a vote cast outside the spawn environment — a human at
+/// a terminal rather than a rat. Fixed rather than per-shell so the operator is
+/// exactly ONE distinct endorser however many times they run it, and so a repeat
+/// vote stays idempotent.
+const OPERATOR_ENDORSER: &str = "operator";
+
 /// Vote for a suggestion. Writes an `Endorsement` keyed by
 /// `(identity = suggestion, instance = RK_AGENT)`, so re-endorsing is
 /// idempotent. The reactor counts distinct endorsers and promotes at quorum.
+///
+/// Unlike every other sugar command this one does NOT require the spawn
+/// environment: `rk endorse <sug-id>` is the resolving command on an
+/// `open-suggestion` inbox row (TKT-167), so a human runs it from a plain shell.
+/// A row whose action errors out on a missing `RK_AGENT` is not a resolving
+/// command, and the operator is the one endorser who is always reachable when a
+/// ballot is about to decay — so an unset `RK_AGENT` votes as `operator`.
 pub async fn endorse(layout: &Layout, args: EndorseArgs, as_json: bool) -> Result<()> {
-    let agent = env_required("RK_AGENT")?;
+    let agent = std::env::var("RK_AGENT").unwrap_or_else(|_| OPERATOR_ENDORSER.to_string());
     let ttl = parse_duration(&args.ttl)?;
     let mut client = Client::connect_or_spawn(layout).await?;
 
