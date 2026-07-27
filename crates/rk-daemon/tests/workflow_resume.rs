@@ -14,6 +14,8 @@
 //! approval therefore has to be delivered to the *second* daemon, proving the
 //! resumed gate is genuinely live again rather than replaying a stale decision.
 
+mod fixture;
+
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
@@ -62,6 +64,7 @@ echo "work by $RK_AGENT" > "work-$RK_AGENT.txt"
 git add . >/dev/null 2>&1
 git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
 echo '{"type":"system","subtype":"init","session_id":"wf-fake"}'
+rk_done "work done"   # a rat that never declares done fails (TKT-175)
 echo '{"type":"result","subtype":"success","is_error":false,"result":"did the work","session_id":"wf-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
@@ -164,7 +167,7 @@ async fn wait_socket_gone(layout: &Layout) {
 async fn parked_gate_instance_survives_restart_and_completes() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = init_repo();
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     let layout = Layout::at(home.path());
 
     // --- Daemon A: run to the approval gate, then stop mid-run. ---

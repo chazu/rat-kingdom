@@ -8,6 +8,8 @@
 //!   - each ticket is dispatched exactly once (atomic claim, no double-grab);
 //!   - a system-scope ticket (no registered repo) is never dispatched.
 
+mod fixture;
+
 use rk_core::config::DrainConfig;
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
@@ -58,6 +60,7 @@ const SLOW_FAKE: &str = r#"
 read -r _prompt
 sleep 0.4
 echo '{"type":"system","subtype":"init","session_id":"drain-fake"}'
+rk_done "work done"   # a rat that never declares done fails (TKT-175)
 echo '{"type":"result","subtype":"success","is_error":false,"result":"drained","session_id":"drain-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
@@ -73,7 +76,7 @@ async fn continuous_drain_refills_up_to_wip_and_never_exceeds_it() {
         .to_string_lossy()
         .to_string();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", SLOW_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(SLOW_FAKE));
     let layout = Layout::at(home.path());
     let space = Space::open_in_memory().unwrap();
     // Unlimited budget so ONLY the WIP cap governs concurrency here.
@@ -202,7 +205,7 @@ async fn partition_caps_hold_per_repo_and_allowlist_excludes_unlisted() {
     let (beta_dir, beta) = make_repo();
     let (gamma_dir, gamma) = make_repo();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", SLOW_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(SLOW_FAKE));
     let layout = Layout::at(home.path());
     let space = Space::open_in_memory().unwrap();
     let mut daemon = Daemon::with_space_for_tests(

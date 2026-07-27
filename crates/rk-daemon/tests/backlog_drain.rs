@@ -3,6 +3,8 @@
 //! all have finished (`wait_all`), and evaluates the aggregate. Exercises the
 //! new multi-active-agent path against the fake harness.
 
+mod fixture;
+
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
@@ -41,6 +43,7 @@ echo "drained $RK_TASK by $RK_AGENT" > "work-$RK_AGENT.txt"
 git add . >/dev/null 2>&1
 git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
 echo '{"type":"system","subtype":"init","session_id":"drain-fake"}'
+rk_done "work done"   # a rat that never declares done fails (TKT-175)
 echo '{"type":"result","subtype":"success","is_error":false,"result":"drained","session_id":"drain-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
@@ -90,7 +93,7 @@ async fn backlog_drain_fans_out_and_joins() {
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(wf_dir.join("drain-test.cue"), WORKFLOW).unwrap();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());

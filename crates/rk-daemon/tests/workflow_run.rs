@@ -3,6 +3,8 @@
 //! harness, and the runner resolves harness/model through the layered agent
 //! config.
 
+mod fixture;
+
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
@@ -40,6 +42,7 @@ echo "work for $RK_TASK by $RK_AGENT (model: $RK_MODEL_MARKER)" > "work-$RK_AGEN
 git add . >/dev/null 2>&1
 git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
 echo '{"type":"system","subtype":"init","session_id":"wf-fake"}'
+rk_done "work done"   # a rat that never declares done fails (TKT-175)
 echo '{"type":"result","subtype":"success","is_error":false,"result":"did the work","session_id":"wf-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
@@ -80,7 +83,7 @@ async fn cue_workflow_runs_end_to_end_with_agent_resolution() {
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(wf_dir.join("build-and-check.cue"), WORKFLOW).unwrap();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     std::env::set_var("RK_MODEL_MARKER", "unset");
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
@@ -192,7 +195,7 @@ async fn approval_gate_blocks_until_approved_then_merges() {
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(wf_dir.join("gated.cue"), GATED_WORKFLOW).unwrap();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     std::env::set_var("RK_MODEL_MARKER", "unset");
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
@@ -289,7 +292,7 @@ async fn approval_gate_rejection_leaves_branch_unmerged() {
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(wf_dir.join("gated.cue"), GATED_WORKFLOW).unwrap();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     std::env::set_var("RK_MODEL_MARKER", "unset");
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
@@ -402,7 +405,7 @@ async fn run_step_green_check_gates_and_merges() {
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(wf_dir.join("run-green.cue"), RUN_GREEN_WORKFLOW).unwrap();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     std::env::set_var("RK_MODEL_MARKER", "unset");
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
@@ -488,7 +491,7 @@ async fn run_step_red_check_fails_closed_and_holds_branch() {
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(wf_dir.join("run-red.cue"), RUN_RED_WORKFLOW).unwrap();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     std::env::set_var("RK_MODEL_MARKER", "unset");
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();

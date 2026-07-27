@@ -4,6 +4,8 @@
 //! close to the fan-out — where a single `dismiss` merges the one active
 //! branch, `dismiss_all` merges every parked branch (TKT-7).
 
+mod fixture;
+
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
@@ -39,9 +41,14 @@ async fn connect(layout: &Layout) -> Client {
 // Each rat writes a distinct per-agent file (so the merges never conflict) and
 // commits it (so there is a branch to merge or park). Its clean/failed verdict
 // is driven by its prompt: a prompt containing "FAIL" reports is_error:true,
-// anything else reports a clean success. The always-clean test below never uses
-// a FAIL prompt; the mixed test does, so both can share one fake harness value
-// (this file's tests run in one binary and clobber a shared env var otherwise).
+// anything else declares itself done and reports a clean success. The
+// always-clean test below never uses a FAIL prompt; the mixed test does, so both
+// can share one fake harness value (this file's tests run in one binary and
+// clobber a shared env var otherwise).
+//
+// Only the clean branch runs `rk_done`: a rat whose turn errors out never got to
+// declare itself finished, and modelling that faithfully is what makes the two
+// branches differ in the one way `dismiss_all` cares about (TKT-175).
 const WORKING_FAKE: &str = r#"
 read -r prompt
 echo "drained $RK_TASK by $RK_AGENT" > "work-$RK_AGENT.txt"
@@ -50,7 +57,8 @@ git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
 echo '{"type":"system","subtype":"init","session_id":"drain-fake"}'
 case "$prompt" in
   *FAIL*) echo '{"type":"result","subtype":"error","is_error":true,"result":"boom","session_id":"drain-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}' ;;
-  *) echo '{"type":"result","subtype":"success","is_error":false,"result":"drained","session_id":"drain-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}' ;;
+  *) rk_done "drained"
+     echo '{"type":"result","subtype":"success","is_error":false,"result":"drained","session_id":"drain-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}' ;;
 esac
 "#;
 
@@ -135,7 +143,7 @@ async fn dismiss_all_only_clean_merges_clean_parks_failed() {
     )
     .unwrap();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
@@ -251,7 +259,7 @@ async fn dismiss_all_merges_every_fanout_branch() {
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(wf_dir.join("drain-merge-test.cue"), WORKFLOW).unwrap();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());

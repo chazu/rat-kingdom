@@ -47,6 +47,11 @@ else
     git add . >/dev/null 2>&1
     git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
 fi
+# Both roles declare themselves finished before the turn ends, as a real primed
+# rat does. A generation that reaches the exit-flush without a `task_done`
+# publishes as a failure (TKT-175), and the workflow gates on `is_error: false`
+# before it ever reads the reviewer's STOP.
+"{rk_bin}" done "did the work" >/dev/null 2>&1
 echo '{{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"wf-fake","total_cost_usd":0.001,"usage":{{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}'
 "#
     )

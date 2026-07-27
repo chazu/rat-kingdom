@@ -838,43 +838,48 @@ impl Supervisor {
                 // turns to receive steers — normally reports at its `rk done`
                 // and only lands here when it is killed mid-task.
                 //
-                // A KILLED rat publishes that turn as a FAILURE (TKT-173).
-                // Reaching the flush proves the generation never wrote a
-                // `task_done` — that is the only reason a result is withheld —
-                // so the text being published is a mid-flight turn ("the test
-                // suite is still running"). The record's state is `Completed`
-                // from that turn, so a kill here does not look like a crash
-                // (TKT-147's `crashed` is only set over a LIVE state) and the
-                // pre-TKT-173 `record.state != Completed` read it as a clean
-                // finish: a rat stopped by the budget hard-stop or a sweep
-                // reported `is_error: false`, and the workflow waiting on it saw
-                // a clean completion for a rat that was killed mid-task.
+                // Anything flushed here publishes as a FAILURE, whatever the
+                // exit status (TKT-175). Reaching this flush is itself the
+                // proof: a turn result is withheld for exactly one reason —
+                // the generation had not written its `task_done` — so the text
+                // being published is a mid-flight turn ("the test suite is
+                // still running"), and by the fleet's own completion protocol a
+                // rat that never declared itself done did not finish its task.
+                // The honest publication is `is_error: true`.
                 //
-                // "Killed" is read off the exit status: `status.code()` is
-                // `None` for a signal-terminated child, and both the budget
-                // hard-stop and the sweep's hard escalation SIGTERM the process
-                // group. A rat that ran to completion and exited 0 — every
-                // codex/axe run, whose harness ends with the run — is NOT
-                // reclassified: it stopped of its own accord, and calling that
-                // an error would fail every workflow gating on
-                // `expect {is_error: false}`. What it gets instead is
-                // `declared_done: false`, which states the weaker fact (this
-                // generation never said it was finished) without overloading
-                // `is_error`, so a gate can be as strict as it likes. TKT-175
-                // tracks making that strictness the fleet-wide default; its cost
-                // is 23 fixtures that model rats skipping `rk done`.
+                // TKT-173 shipped the narrower half of this, keyed on whether
+                // the process was KILLED (`status.code()` is `None` for a
+                // signal-terminated child, and both the budget hard-stop and the
+                // sweep's hard escalation SIGTERM the process group). That was
+                // the loudest case: the mid-flight turn had already set the
+                // record's state to `Completed`, so the kill did not read as a
+                // crash either — TKT-147's `crashed` is only set over a LIVE
+                // state — and a rat stopped by the budget reported
+                // `is_error: false` to the workflow waiting on it.
+                //
+                // What survived was the same lie told more quietly: a rat that
+                // exited 0 mid-task — every codex/axe run, whose harness ends
+                // with the run rather than staying alive between turns — also
+                // published `is_error: false`, and every workflow gating on
+                // `expect {is_error: false}` accepted an unfinished task. How
+                // the process ended is not the question; whether the rat said it
+                // was finished is.
+                //
+                // The turn's TEXT is still published as-is, so `rk inbox` shows
+                // what the rat had got to; only the verdict changes. A rat that
+                // did declare done never reaches here at all — `claim_completion`
+                // published its turn when it ended — which is what keeps this
+                // from collapsing into "every fake-harness agent fails".
                 if let Ok(Some(record)) = updated {
                     if self.flush_withheld_completion(name, generation) {
-                        let killed = code != Some(0);
-                        let is_error = killed || record.state != AgentState::Completed;
                         info!(
                             agent = name,
-                            is_error,
-                            killed,
-                            "agent exited without ever running `rk done`; publishing its last \
-                             turn result"
+                            killed = code != Some(0),
+                            exit_code = ?code,
+                            "agent ended without ever running `rk done`; publishing its last \
+                             turn result as a failure"
                         );
-                        self.route_completion(&record, is_error, false);
+                        self.route_completion(&record, true, false);
                     }
                 }
             }
@@ -1673,8 +1678,8 @@ impl Supervisor {
     ///
     /// A `true` here is also the proof that the generation never declared itself
     /// done — withholding is the only way a result reaches this path — which is
-    /// why the caller publishes it with `declared_done: false`, and as
-    /// `is_error: true` if the process was killed rather than ended (TKT-173).
+    /// why the caller publishes it with `declared_done: false` and, since
+    /// TKT-175, as `is_error: true` however the process ended.
     fn flush_withheld_completion(&self, name: &str, generation: DateTime<Utc>) -> bool {
         let mut completions = self.lock_completions();
         let Some(state) = completions.get_mut(name) else {
@@ -1725,10 +1730,12 @@ impl Supervisor {
                 // Whether the agent itself declared the task finished (`rk done`)
                 // in this generation, as opposed to merely stopping — killed by
                 // the budget hard-stop, swept, or exiting mid-task (TKT-173).
-                // Every published failure has this false, but not every false is
-                // a `is_error: true`-because-undeclared: a turn that errored out
-                // is also undeclared. An `evaluate` gate that wants "the rat said
-                // it was done" reads this rather than inferring it from prose.
+                // Since TKT-175 every undeclared generation is also
+                // `is_error: true`, so this no longer carries a fact `is_error`
+                // lacks on the exit path. It still discriminates on the OTHER
+                // path: a turn that errored out is undeclared too, so a reader
+                // that wants "the rat said it was done" — rather than "nothing
+                // went wrong" — reads this instead of inferring it from prose.
                 "declared_done": declared_done,
                 "result": record.result,
                 "cost_usd": record.cost_usd,

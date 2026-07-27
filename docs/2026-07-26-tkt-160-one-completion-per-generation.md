@@ -75,6 +75,10 @@ follow. There are exactly three such proofs, and they are complete:
    turn to prefer, and withholding it would turn a fast, legible failure into a
    `wait` timeout.
 
+Only proof 1 is also a proof the rat *finished* — a distinction this document
+originally elided, and which TKT-175 later made load-bearing: see the closing
+section.
+
 Bookkeeping lives in `Supervisor::completions` (`CompletionState`: generation,
 `routed`, `withheld`). `claim_completion` applies proofs 1 and 3 at
 `Completed`; `flush_withheld_completion` applies proof 2 at `Exited`;
@@ -103,11 +107,44 @@ workflow waiting on that agent until its step timeout.
 - Latency for the normal path is unchanged: a rat's `rk done` precedes the turn
   end, so the `task_done` is already in the space when its `Completed` arrives.
 
-## Known residue (not fixed here)
+## Known residue (not fixed here) — closed by TKT-173 and TKT-175
 
-An agent killed *after* a clean mid-flight turn (budget hard-stop) still
-publishes that turn's text with `is_error: false` when its process exits,
-because the record's state is `Completed` from that turn. This is unchanged from
-the pre-fix behaviour (the turn was published even earlier before), and it is
-the same seam TKT-147 addresses with a liveness gate — worth revisiting once
-`64de183` lands.
+> An agent killed *after* a clean mid-flight turn (budget hard-stop) still
+> publishes that turn's text with `is_error: false` when its process exits,
+> because the record's state is `Completed` from that turn. This is unchanged
+> from the pre-fix behaviour (the turn was published even earlier before), and it
+> is the same seam TKT-147 addresses with a liveness gate — worth revisiting once
+> `64de183` lands.
+
+Resolved in two steps, and the second reframed the first.
+
+**TKT-173** took the residue at face value and fixed the killed case, reading
+"killed" off the exit status (`status.code()` is `None` for a signal-terminated
+child; the budget hard-stop and the sweep's hard escalation both SIGTERM the
+process group). It also added `declared_done` to every `harness_result`, so a
+reader could ask whether the rat said it was finished rather than infer it.
+
+**TKT-175** found the framing wrong. The question was never how the process
+ended. Reaching the exit-flush at all is the proof: a turn result is withheld for
+exactly one reason — proof 1 above did not arrive — so anything flushed there
+belongs to a generation that never wrote a `task_done`, and by the fleet's own
+completion protocol that generation did not finish its task. A rat that exited 0
+mid-task was telling the same lie as the killed one, just more quietly, and every
+workflow gating on `expect {is_error: false}` believed it. So the flush now
+publishes `is_error: true` unconditionally. The turn's *text* is untouched, so
+`rk inbox` still shows what the rat had got to.
+
+This is a fleet-wide policy change, and its cost landed on the test surface: 29
+tests across 17 binaries were modelling rats that skip `rk done` and asserting
+that was a clean finish. They now declare done as a real primed rat does —
+`crates/rk-daemon/tests/fixture/mod.rs` and the `rk-fixture-done` helper binary
+exist for that, because a fixture cannot write the tuple from the test process
+(`Pattern::for_agent_since` bounds it to a generation whose name does not exist
+until after the spawn, and a `for_each` fan-out names its rats itself). Which of
+the two things a fixture means — a rat that finished, or one cut off mid-task —
+used to be invisible in these scripts; it is now one line of each.
+
+`declared_done` survives the flip. On the exit path it no longer carries a fact
+`is_error` lacks, but it still discriminates on the other: a turn that errored
+out is undeclared too, so a reader that wants "the rat said it was done" rather
+than "nothing went wrong" reads it instead of parsing prose.

@@ -58,6 +58,11 @@ else
     git add . >/dev/null 2>&1
     git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
 fi
+# Both roles declare themselves finished before the turn ends, as a real primed
+# rat does. A generation that reaches the exit-flush without a `task_done`
+# publishes as a failure (TKT-175), and every `evaluate` in this workflow gates
+# on `is_error: false`.
+"{rk_bin}" done "did the work" >/dev/null 2>&1
 {RESULT_LINE}
 "#
     )

@@ -24,7 +24,20 @@ tokio.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 
+[features]
+# Builds `rk-fixture-done`, the fake harness's stand-in for `rk done`. Off in a
+# normal build; switched on for this package's own tests by the self
+# dev-dependency below, which is what makes `CARGO_BIN_EXE_rk-fixture-done`
+# resolve in `tests/*` (see `tests/fixture/mod.rs`).
+test-fixtures = []
+
+[[bin]]
+name = "rk-fixture-done"
+path = "src/bin/rk-fixture-done.rs"
+required-features = ["test-fixtures"]
+
 [dev-dependencies]
+rk-daemon = { path = ".", features = ["test-fixtures"] }
 tempfile = "3"
 
 [lints]

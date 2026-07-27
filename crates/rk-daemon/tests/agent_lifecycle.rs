@@ -2,6 +2,8 @@
 //! rat into a real worktree, watch it complete, verify parent routing, dismiss
 //! with merge, and confirm main received the work.
 
+mod fixture;
+
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
@@ -60,6 +62,7 @@ echo "gnawed by $RK_AGENT for task $RK_TASK" > gnawed.txt
 git add gnawed.txt >/dev/null 2>&1
 git -c user.email=rat@x -c user.name=Rat commit -q -m "rat work: $RK_TASK"
 echo '{"type":"system","subtype":"init","session_id":"fake-e2e"}'
+rk_done "work done"   # a rat that never declares done fails (TKT-175)
 echo '{"type":"result","subtype":"success","is_error":false,"result":"committed gnawed.txt","session_id":"fake-e2e","total_cost_usd":0.002,"usage":{"input_tokens":50,"output_tokens":25,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
@@ -69,7 +72,7 @@ async fn spawn_complete_route_dismiss_merge() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
@@ -152,7 +155,7 @@ async fn ticket_dispatched_rat_closes_its_ticket() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
