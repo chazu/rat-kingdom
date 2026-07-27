@@ -10,6 +10,15 @@ use rk_core::prime::{render, PrimeContext};
 use rk_core::tuple::{Category, Pattern, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
 use rk_git::{agent_branch, Repo};
 use rk_harness::{make_harness, HarnessEvent, LaunchSpec, SessionControl, TokenUsage};
+use rk_ledger::pricing::PricingTable;
+use rk_ledger::{Budget, BudgetAction, BudgetScope, DispatchCheck, FleetBudget};
+use rk_space::Space;
+use serde::Deserialize;
+use serde_json::json;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use tracing::{info, warn};
 
 fn default_permission_mode(harness: &str) -> &'static str {
     match harness {
@@ -18,14 +27,57 @@ fn default_permission_mode(harness: &str) -> &'static str {
         _ => "workspace-write",
     }
 }
-use rk_ledger::pricing::PricingTable;
-use rk_ledger::{Budget, BudgetAction, BudgetScope, DispatchCheck, FleetBudget};
-use rk_space::Space;
-use serde::Deserialize;
-use serde_json::json;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use tracing::{info, warn};
+
+struct SpawnJournal<'a> {
+    params: &'a SpawnParams,
+    repo: &'a Repo,
+    repo_name: &'a str,
+    name: String,
+    branch: String,
+    worktree: PathBuf,
+    target_branch: String,
+    harness: String,
+}
+
+fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
+    let now = Utc::now();
+    AgentRecord {
+        name: journal.name,
+        role: journal.params.role.clone(),
+        harness: journal.harness,
+        model: journal.params.model.clone(),
+        repo_root: journal.repo.root().to_path_buf(),
+        repo_name: journal.repo_name.to_string(),
+        task: Some(journal.params.task.clone()),
+        branch: Some(journal.branch),
+        worktree: Some(journal.worktree),
+        target_branch: journal.target_branch,
+        parent: journal.params.parent.clone(),
+        workflow_instance: journal.params.workflow_instance.clone(),
+        session_id: None,
+        attach_target: None,
+        pid: None,
+        merge_commit: None,
+        state: AgentState::Spawning,
+        crashed: false,
+        result: None,
+        usage: TokenUsage::default(),
+        cost_usd: 0.0,
+        created_at: now,
+        updated_at: now,
+        archived_at: None,
+    }
+}
+
+async fn blocking_io<T, F>(operation: &'static str, f: F) -> rk_core::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> rk_core::Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| rk_core::Error::other(format!("{operation} task failed: {e}")))?
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpawnParams {
@@ -359,6 +411,33 @@ impl Supervisor {
         }
     }
 
+    fn mark_spawn_failed(&self, name: &str, error: &rk_core::Error) {
+        let detail = error.to_string();
+        if let Err(e) = self.lock_registry().update(name, |record| {
+            record.state = AgentState::Failed;
+            record.result = Some(detail.clone());
+            record.pid = None;
+        }) {
+            warn!(agent = name, error = %e, "failed to record spawn failure");
+        }
+    }
+
+    /// Async callers must not run Git discovery/worktree setup or harness
+    /// launch on a Tokio worker. The synchronous method remains for already
+    /// blocking supervisors and tests.
+    pub async fn spawn_async(
+        self: &Arc<Self>,
+        params: SpawnParams,
+    ) -> rk_core::Result<AgentRecord> {
+        let supervisor = Arc::clone(self);
+        let handle = tokio::runtime::Handle::current();
+        blocking_io("agent spawn", move || {
+            let _entered = handle.enter();
+            supervisor.spawn(params)
+        })
+        .await
+    }
+
     pub fn spawn(self: &Arc<Self>, params: SpawnParams) -> rk_core::Result<AgentRecord> {
         let repo = Repo::discover(std::path::Path::new(&params.repo))?;
         let repo_name = repo.name();
@@ -379,31 +458,40 @@ impl Supervisor {
             None => repo.current_branch()?,
         };
 
-        // Reserve the name atomically: it stays claimed against concurrent
-        // spawns until `insert` records the rat (or a failure path below frees
-        // it). Picking without reserving let two near-simultaneous spawns grab
-        // the same name and collide on the worktree path.
-        let name = self.lock_registry().reserve_name();
-        let branch = agent_branch(&name, &params.task);
-        let worktree = self.layout.worktrees_dir().join(&repo_name).join(&name);
-        if let Err(e) = repo.create_worktree(&worktree, &branch, &target_branch) {
-            self.lock_registry().release_name(&name);
-            return Err(e);
-        }
-
+        // Resolve the harness before journaling so an unknown adapter never
+        // leaves a durable failed row. After this point every side effect has a
+        // registry record to explain it, including a worktree or launch failure.
         let harness_kind = params
             .harness
             .clone()
             .unwrap_or_else(|| self.default_harness.clone());
-        let harness = match make_harness(&harness_kind) {
-            Ok(h) => h,
-            Err(e) => {
-                let _ = repo.remove_worktree(&worktree);
-                let _ = repo.delete_branch(&branch);
-                self.lock_registry().release_name(&name);
-                return Err(e);
-            }
-        };
+        let harness = make_harness(&harness_kind)?;
+
+        // Reserve the name atomically: it stays claimed against concurrent
+        // spawns until the journal row is inserted. Picking without reserving
+        // let two near-simultaneous spawns grab the same name and collide on
+        // the worktree path.
+        let name = self.lock_registry().reserve_name();
+        let branch = agent_branch(&name, &params.task);
+        let worktree = self.layout.worktrees_dir().join(&repo_name).join(&name);
+        let spawning = spawning_record(SpawnJournal {
+            params: &params,
+            repo: &repo,
+            repo_name: &repo_name,
+            name: name.clone(),
+            branch: branch.clone(),
+            worktree: worktree.clone(),
+            target_branch: target_branch.clone(),
+            harness: harness_kind.clone(),
+        });
+        if let Err(e) = self.lock_registry().insert(spawning) {
+            self.lock_registry().release_name(&name);
+            return Err(e);
+        }
+        if let Err(e) = repo.create_worktree(&worktree, &branch, &target_branch) {
+            self.mark_spawn_failed(&name, &e);
+            return Err(e);
+        }
 
         let prime_ctx = PrimeContext {
             agent: name.clone(),
@@ -448,7 +536,16 @@ impl Supervisor {
         };
 
         if params.attach {
-            return self.spawn_attached(params, repo, repo_name, name, branch, worktree, spec);
+            return self.spawn_attached(
+                params,
+                repo,
+                repo_name,
+                name,
+                branch,
+                worktree,
+                target_branch,
+                spec,
+            );
         }
 
         let session = match harness.launch(&spec) {
@@ -456,38 +553,18 @@ impl Supervisor {
             Err(e) => {
                 let _ = repo.remove_worktree(&worktree);
                 let _ = repo.delete_branch(&branch);
-                self.lock_registry().release_name(&name);
+                self.mark_spawn_failed(&name, &e);
                 return Err(e);
             }
         };
 
-        let record = AgentRecord {
-            name: name.clone(),
-            role: params.role.clone(),
-            harness: harness_kind,
-            model: params.model.clone(),
-            repo_root: repo.root().to_path_buf(),
-            repo_name: repo_name.clone(),
-            task: Some(params.task.clone()),
-            branch: Some(branch),
-            worktree: Some(worktree),
-            target_branch,
-            parent: params.parent.clone(),
-            workflow_instance: params.workflow_instance.clone(),
-            session_id: None,
-            attach_target: None,
-            pid: session.pid,
-            merge_commit: None,
-            state: AgentState::Running,
-            crashed: false,
-            result: None,
-            usage: TokenUsage::default(),
-            cost_usd: 0.0,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            archived_at: None,
-        };
-        self.lock_registry().insert(record.clone())?;
+        let record = self
+            .lock_registry()
+            .update(&name, |record| {
+                record.state = AgentState::Running;
+                record.pid = session.pid;
+            })?
+            .ok_or_else(|| rk_core::Error::other("spawn journal row vanished"))?;
         self.lock_controls()
             .insert(name.clone(), session.control.clone());
 
@@ -521,67 +598,53 @@ impl Supervisor {
         name: String,
         branch: String,
         worktree: std::path::PathBuf,
+        target_branch: String,
         spec: LaunchSpec,
     ) -> rk_core::Result<AgentRecord> {
         if !rk_mux::HerdrMux::available() {
             let _ = repo.remove_worktree(&worktree);
             let _ = repo.delete_branch(&branch);
-            self.lock_registry().release_name(&name);
-            return Err(rk_core::Error::other(
+            let error = rk_core::Error::other(
                 "--attach needs a running herdr server (https://herdr.dev); \
                  spawn headless or start herdr first",
-            ));
+            );
+            self.mark_spawn_failed(&name, &error);
+            return Err(error);
         }
         let harness_kind = params
             .harness
             .clone()
             .unwrap_or_else(|| self.default_harness.clone());
-        let argv = rk_mux::interactive_argv(
+        let argv = match rk_mux::interactive_argv(
             &harness_kind,
             spec.system_prompt.as_deref(),
             spec.model.as_deref(),
             spec.permission_mode.as_deref(),
-        )?;
+        ) {
+            Ok(argv) => argv,
+            Err(e) => {
+                self.mark_spawn_failed(&name, &e);
+                return Err(e);
+            }
+        };
         let target = match rk_mux::HerdrMux::start_agent(&name, &worktree, &spec.env, &argv) {
             Ok(t) => t,
             Err(e) => {
                 let _ = repo.remove_worktree(&worktree);
                 let _ = repo.delete_branch(&branch);
-                self.lock_registry().release_name(&name);
+                self.mark_spawn_failed(&name, &e);
                 return Err(e);
             }
         };
 
-        let record = AgentRecord {
-            name: name.clone(),
-            role: params.role.clone(),
-            harness: harness_kind,
-            model: params.model.clone(),
-            repo_root: repo.root().to_path_buf(),
-            repo_name: repo_name.clone(),
-            task: Some(params.task.clone()),
-            branch: Some(branch),
-            worktree: Some(worktree),
-            target_branch: match &params.base {
-                Some(b) => b.clone(),
-                None => repo.current_branch()?,
-            },
-            parent: params.parent.clone(),
-            workflow_instance: params.workflow_instance.clone(),
-            session_id: None,
-            attach_target: Some(target.clone()),
-            pid: None,
-            merge_commit: None,
-            state: AgentState::Running,
-            crashed: false,
-            result: None,
-            usage: TokenUsage::default(),
-            cost_usd: 0.0,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            archived_at: None,
-        };
-        self.lock_registry().insert(record.clone())?;
+        let record = self
+            .lock_registry()
+            .update(&name, |record| {
+                record.state = AgentState::Running;
+                record.attach_target = Some(target.clone());
+                record.target_branch = target_branch.clone();
+            })?
+            .ok_or_else(|| rk_core::Error::other("spawn journal row vanished"))?;
         self.emit_event(
             &repo_name,
             "agent_spawned",
@@ -1866,7 +1929,8 @@ impl Supervisor {
             let _ = tokio::task::spawn_blocking(move || rk_mux::HerdrMux::close(&target)).await;
         }
 
-        let repo = Repo::discover(&record.repo_root)?;
+        let repo_path = record.repo_root.clone();
+        let repo = blocking_io("dismiss repo discovery", move || Repo::discover(&repo_path)).await?;
         let mut merged = false;
         let mut merge_commit: Option<String> = None;
         let mut pr_opened = false;
@@ -1876,7 +1940,12 @@ impl Supervisor {
 
         if let Some(worktree) = &record.worktree {
             if worktree.exists() {
-                repo.remove_worktree(worktree)?;
+                let repo = repo.clone();
+                let worktree = worktree.clone();
+                blocking_io("dismiss worktree cleanup", move || {
+                    repo.remove_worktree(&worktree)
+                })
+                .await?;
             }
         }
         if let Some(branch) = &record.branch {
@@ -1896,13 +1965,24 @@ impl Supervisor {
                                 .merge_queue
                                 .acquire(repo.root(), &record.target_branch)
                                 .await;
-                            repo.merge_branch(branch, &record.target_branch)?
+                            let repo = repo.clone();
+                            let branch = branch.clone();
+                            let target = record.target_branch.clone();
+                            blocking_io("dismiss merge", move || {
+                                repo.merge_branch(&branch, &target)
+                            })
+                            .await?
                         };
                         merged = outcome.merged;
                         merge_commit = outcome.commit;
                         detail = outcome.detail;
                         if merged {
-                            repo.delete_branch(branch)?;
+                            let repo = repo.clone();
+                            let branch = branch.clone();
+                            blocking_io("dismiss branch deletion", move || {
+                                repo.delete_branch(&branch)
+                            })
+                            .await?;
                         }
                     }
                     MergeMode::Pr => {
@@ -1911,8 +1991,14 @@ impl Supervisor {
                         // standing for a human to review and merge. A push/auth
                         // failure is a clean `pr_opened: false` (never an error),
                         // mirroring the merge path's `merged: false`.
-                        let outcome =
-                            repo.open_pull_request(branch, &record.target_branch, &remote);
+                        let repo = repo.clone();
+                        let branch = branch.clone();
+                        let target = record.target_branch.clone();
+                        let remote = remote.clone();
+                        let outcome = blocking_io("dismiss pull request", move || {
+                            Ok(repo.open_pull_request(&branch, &target, &remote))
+                        })
+                        .await?;
                         pr_opened = outcome.opened;
                         pr_url = outcome.url;
                         detail = outcome.detail;
@@ -2002,7 +2088,8 @@ impl Supervisor {
             )));
         };
 
-        let repo = Repo::discover(&record.repo_root)?;
+        let repo_path = record.repo_root.clone();
+        let repo = blocking_io("revert repo discovery", move || Repo::discover(&repo_path)).await?;
         // Same per-target merge queue as land/dismiss: the revert takes its
         // turn so it never races a concurrent auto-merge into this target.
         let outcome = {
@@ -2010,7 +2097,10 @@ impl Supervisor {
                 .merge_queue
                 .acquire(repo.root(), &record.target_branch)
                 .await;
-            repo.revert_merge(&commit, &record.target_branch)?
+            let repo = repo.clone();
+            let target = record.target_branch.clone();
+            let commit = commit.clone();
+            blocking_io("revert merge", move || repo.revert_merge(&commit, &target)).await?
         };
         let reverted = outcome.merged;
 
@@ -2026,7 +2116,7 @@ impl Supervisor {
             if let Some(task) = &record.task {
                 if task.starts_with(crate::tickets::ID_PREFIX) {
                     let status = if block { "blocked" } else { "open" };
-                    match self.tickets.set_status(task, status).await {
+                    match self.tickets.reopen(task, status).await {
                         Ok(_) => ticket_status = Some(status),
                         Err(e) => {
                             warn!(ticket = %task, error = %e, "failed to reopen ticket on revert");
@@ -2090,7 +2180,8 @@ impl Supervisor {
         target: &str,
         keep_branch: bool,
     ) -> rk_core::Result<serde_json::Value> {
-        let repo = Repo::discover(repo_root)?;
+        let repo_path = repo_root.to_path_buf();
+        let repo = blocking_io("land repo discovery", move || Repo::discover(&repo_path)).await?;
         let (merge_mode, remote, _host) = self.merge_policy(&repo.name());
         let mut merged = false;
         let mut branch_deleted = false;
@@ -2105,12 +2196,21 @@ impl Supervisor {
                 // auto-merge (TKT-51).
                 let outcome = {
                     let _merge_guard = self.merge_queue.acquire(repo.root(), target).await;
-                    repo.merge_branch(branch, target)?
+                    let repo = repo.clone();
+                    let branch = branch.to_string();
+                    let target = target.to_string();
+                    blocking_io("land merge", move || repo.merge_branch(&branch, &target)).await?
                 };
                 merged = outcome.merged;
                 detail = outcome.detail;
                 if merged && !keep_branch {
-                    match repo.delete_branch(branch) {
+                    let repo_for_delete = repo.clone();
+                    let branch_to_delete = branch.to_string();
+                    match blocking_io("land branch deletion", move || {
+                        repo_for_delete.delete_branch(&branch_to_delete)
+                    })
+                    .await
+                    {
                         Ok(()) => branch_deleted = true,
                         Err(e) => warn!(
                             branch,
@@ -2123,7 +2223,14 @@ impl Supervisor {
             MergeMode::Pr => {
                 // PR mode never merges or deletes the branch: push and open the
                 // pull/merge request, leaving it for review.
-                let outcome = repo.open_pull_request(branch, target, &remote);
+                let repo_for_pr = repo.clone();
+                let branch = branch.to_string();
+                let target = target.to_string();
+                let remote = remote.clone();
+                let outcome = blocking_io("land pull request", move || {
+                    Ok(repo_for_pr.open_pull_request(&branch, &target, &remote))
+                })
+                .await?;
                 pr_opened = outcome.opened;
                 pr_url = outcome.url;
                 detail = outcome.detail;
@@ -2181,9 +2288,19 @@ impl Supervisor {
         branch: &str,
         target: &str,
     ) -> rk_core::Result<serde_json::Value> {
-        let repo = Repo::discover(repo_root)?;
+        let repo_path = repo_root.to_path_buf();
+        let repo = blocking_io("pull request repo discovery", move || {
+            Repo::discover(&repo_path)
+        })
+        .await?;
         let (_merge_mode, remote, _host) = self.merge_policy(&repo.name());
-        let outcome = repo.open_pull_request(branch, target, &remote);
+        let repo_for_pr = repo.clone();
+        let branch_name = branch.to_string();
+        let target_name = target.to_string();
+        let outcome = blocking_io("pull request", move || {
+            Ok(repo_for_pr.open_pull_request(&branch_name, &target_name, &remote))
+        })
+        .await?;
         let result = json!({
             "branch": branch,
             "target": target,

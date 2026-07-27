@@ -307,7 +307,7 @@ pub fn build(
     }
     // Deterministic order: newest PR first (event ids are time-sortable).
     let mut prs: Vec<&Tuple> = latest_pr.into_values().collect();
-    prs.sort_by(|a, b| b.id.cmp(&a.id));
+    prs.sort_by_key(|b| std::cmp::Reverse(b.id));
     for t in prs {
         let branch = t.payload.get("branch").and_then(|v| v.as_str());
         let target = t.payload.get("target").and_then(|v| v.as_str());
@@ -392,7 +392,7 @@ pub fn build(
 
     // Most urgent first; a stable sort keeps each source's own order (agents by
     // spawn time, instances by start time, tuples oldest-first) within a rank.
-    items.sort_by(|a, b| b.urgency.cmp(&a.urgency));
+    items.sort_by_key(|b| std::cmp::Reverse(b.urgency));
     items
 }
 
@@ -531,7 +531,7 @@ pub fn dropped_lands(lands: &[Tuple]) -> Vec<&Tuple> {
         .filter(|t| !flag(t, "merged") && !flag(t, "pr_opened"))
         .collect();
     // Deterministic order: newest first (event ids are time-sortable).
-    dropped.sort_by(|a, b| b.id.cmp(&a.id));
+    dropped.sort_by_key(|b| std::cmp::Reverse(b.id));
     dropped
 }
 
@@ -617,6 +617,7 @@ mod tests {
             awaiting: awaiting.map(str::to_string),
             instance_max_usd: None,
             definition: "gated-merge".into(),
+            definition_digest: String::new(),
             params: Default::default(),
             depth: 0,
             started_at: Utc::now(),

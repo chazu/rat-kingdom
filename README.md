@@ -175,16 +175,16 @@ credential prerequisites and the GitHub/GitLab flows.
 ## Tickets
 
 Durable work items — a backlog you and the rats can create, read, and
-decompose. A ticket is a `task` tuple (`TKT-<n>`) that persists until closed,
+decompose. A ticket is a `task` tuple (`TKT-<ulid>`) that persists until closed,
 and — because it carries a repo *name*, not a path — it replicates across
 castles as a shared backlog through git-notes sync.
 
 ```bash
 rk ticket new "Fix the login redirect loop" --repo svc --priority high
-rk ticket new "Add SSO" --body "SAML + OIDC" --parent TKT-1   # decompose into sub-tickets
+rk ticket new "Add SSO" --body "SAML + OIDC" --parent TKT-<id>   # use the id returned above
 rk ticket list --repo svc --status open
-rk ticket show TKT-1                                          # details + sub-tickets
-rk ticket update TKT-3 --status in_progress --assignee Whisker
+rk ticket show TKT-<id>                                       # details + sub-tickets
+rk ticket update TKT-<id> --status in_progress --assignee Whisker
 ```
 
 Statuses: `open → claimed → in_progress → blocked → done → closed`. Rats are

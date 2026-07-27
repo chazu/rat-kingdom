@@ -303,7 +303,14 @@ pub async fn scan(
     }
     let mut client = Client::connect_or_spawn(layout).await?;
     let result = client.call("space.scan", params).await?;
-    print_tuples(&result["tuples"], as_json, display);
+    if as_json {
+        println!("{result}");
+    } else {
+        print_tuples(&result["tuples"], false, display);
+        if result["truncated"].as_bool() == Some(true) {
+            eprintln!("(scan truncated at 10,000 tuples; narrow the pattern or use --top)");
+        }
+    }
     Ok(())
 }
 

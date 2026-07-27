@@ -113,6 +113,7 @@ fn build_reactor_with_space(
         false,
         false,
         false,
+        vec!["main".into(), "master".into()],
     ));
     Arc::new(Reactor::new(
         space,

@@ -39,16 +39,28 @@ CREATE INDEX IF NOT EXISTS idx_tuples_expiry
 
 /// Bring an older DB up to the current schema. `CREATE TABLE IF NOT EXISTS`
 /// leaves an already-created table untouched, so a DB from before `strength`
-/// existed needs an explicit `ALTER` (the duplicate-column error on an
-/// up-to-date DB is expected and swallowed). The strength index is created here,
-/// after the column is guaranteed to exist, so it cannot fail the initial batch
-/// on a pre-`strength` database.
-fn migrate(conn: &Connection) {
-    let _ = conn.execute("ALTER TABLE tuples ADD COLUMN strength REAL", []);
-    let _ = conn.execute_batch(
+/// existed needs an explicit `ALTER`. The duplicate-column error on an
+/// up-to-date DB is the one expected exception; every other migration error is
+/// returned so the daemon cannot operate against a partially upgraded store.
+fn migrate(conn: &Connection) -> rk_core::Result<()> {
+    let strength_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('tuples') WHERE name = 'strength'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_err)?;
+    if !strength_exists {
+        conn.execute("ALTER TABLE tuples ADD COLUMN strength REAL", [])
+            .map_err(sql_err)?;
+    }
+    conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_tuples_strength
              ON tuples (strength) WHERE strength IS NOT NULL;",
-    );
+    )
+    .map_err(sql_err)
 }
 
 impl Store {
@@ -59,14 +71,14 @@ impl Store {
         conn.pragma_update(None, "busy_timeout", 5000)
             .map_err(sql_err)?;
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
-        migrate(&conn);
+        migrate(&conn)?;
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> rk_core::Result<Self> {
         let conn = Connection::open_in_memory().map_err(sql_err)?;
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
-        migrate(&conn);
+        migrate(&conn)?;
         Ok(Self { conn })
     }
 
@@ -299,8 +311,7 @@ impl Store {
         if categories.is_empty() {
             return Ok(0);
         }
-        let placeholders = std::iter::repeat("?")
-            .take(categories.len())
+        let placeholders = std::iter::repeat_n("?", categories.len())
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!("SELECT COUNT(*) FROM tuples WHERE category IN ({placeholders})");
@@ -659,7 +670,7 @@ mod tests {
         store.insert(&strong).unwrap();
 
         let plain = store.query(&Pattern::default(), false, None).unwrap();
-        let mut expected = vec![weak.clone(), strong.clone()];
+        let mut expected = [weak.clone(), strong.clone()];
         expected.sort_by_key(|t| t.id);
         assert_eq!(
             plain.iter().map(|t| t.id).collect::<Vec<_>>(),

@@ -54,6 +54,8 @@ pub struct Scheduler {
     running: Mutex<HashMap<String, String>>,
 }
 
+const MAX_CATCHUP_MINUTES: u64 = 7 * 24 * 60;
+
 impl Scheduler {
     pub fn new(engine: Arc<WorkflowEngine>, layout: Layout, config: SchedulerConfig) -> Self {
         let cursor_file = layout.home().join("scheduler-cursor");
@@ -91,7 +93,9 @@ impl Scheduler {
         let start = match cursor {
             Some(c) if c >= now_min => return Ok(0),
             Some(c) => {
-                let earliest = now_min - ChronoDuration::minutes(self.config.catchup_minutes as i64);
+                let catchup = self.config.catchup_minutes.min(MAX_CATCHUP_MINUTES);
+                let earliest = now_min
+                    - ChronoDuration::minutes(i64::try_from(catchup).unwrap_or(i64::MAX));
                 (c + ChronoDuration::minutes(1)).max(earliest)
             }
             // No cursor (initialize_cursor not run): evaluate only this minute.

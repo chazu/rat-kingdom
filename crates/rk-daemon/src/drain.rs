@@ -45,7 +45,7 @@
 
 use crate::repos::RepoRegistry;
 use crate::supervisor::{SpawnParams, Supervisor};
-use crate::tickets::{Tickets, ID_PREFIX};
+use crate::tickets::Tickets;
 use chrono::{DateTime, Utc};
 use rk_core::config::DrainConfig;
 use rk_core::paths::Layout;
@@ -142,10 +142,10 @@ impl Drain {
         let mut ready = self.tickets.ready(ready_scope)?;
         ready.sort_by(|a, b| {
             let (sa, sb) = (self.score(a, now), self.score(b, now));
-            // Highest score first; FIFO (oldest id) on a tie.
+            // Highest score first; FIFO (oldest ticket) on a tie.
             sb.partial_cmp(&sa)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| id_num(&a.identity).cmp(&id_num(&b.identity)))
+                .then_with(|| a.created_at.cmp(&b.created_at))
         });
 
         let mut spawned = 0usize;
@@ -211,7 +211,7 @@ impl Drain {
                 workflow_instance: None,
                 instance_max_usd: None,
             };
-            match self.supervisor.spawn(params) {
+            match self.supervisor.spawn_async(params).await {
                 Ok(record) => {
                     info!(ticket = %ticket.identity, agent = %record.name, "drain dispatched ready ticket");
                     spawned += 1;
@@ -337,14 +337,6 @@ fn string_array(payload: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Numeric part of a `TKT-<n>` id, for a FIFO tiebreak (0 if unparseable).
-fn id_num(identity: &str) -> u64 {
-    identity
-        .strip_prefix(ID_PREFIX)
-        .and_then(|n| n.parse::<u64>().ok())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

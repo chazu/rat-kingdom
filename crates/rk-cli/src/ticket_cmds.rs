@@ -45,7 +45,7 @@ pub struct ListArgs {
 
 #[derive(Args)]
 pub struct UpdateArgs {
-    /// Ticket id (e.g. TKT-12).
+    /// Ticket id (for example, TKT-01J...).
     pub id: String,
     /// New status: open | claimed | in_progress | blocked | done | closed.
     #[arg(long)]

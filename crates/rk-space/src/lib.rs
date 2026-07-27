@@ -162,6 +162,17 @@ impl Space {
         self.lock().store.query(pattern, false, None)
     }
 
+    /// Non-blocking read capped at `limit` rows. RPC callers use this bounded
+    /// form so a broad operator scan cannot materialize an unbounded SQLite
+    /// result before the protocol frame-size guard gets a chance to run.
+    pub fn scan_limited(
+        &self,
+        pattern: &Pattern,
+        limit: usize,
+    ) -> rk_core::Result<Vec<Tuple>> {
+        self.lock().store.query(pattern, false, Some(limit))
+    }
+
     /// Delete one tuple by id (archive-on-resolution, targeted GC). Returns
     /// whether a row was removed. Unlike [`Space::take`], this consumes a
     /// *specific* tuple rather than the oldest pattern match — the reactor uses

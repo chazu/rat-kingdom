@@ -30,7 +30,10 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 async fn connect(layout: &Layout) -> Client {
-    for _ in 0..50 {
+    // Workspace-wide test execution can start several daemon-backed binaries at
+    // once; allow thirty seconds for the socket rather than making startup
+    // depend on a short scheduler window.
+    for _ in 0..1500 {
         tokio::time::sleep(Duration::from_millis(20)).await;
         if let Ok(c) = Client::connect(layout).await {
             return c;

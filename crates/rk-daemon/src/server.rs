@@ -22,12 +22,13 @@ const GC_INTERVAL: Duration = Duration::from_secs(60);
 // without an explicit TTL — the hard-TTL backstop for strength decay — lives in
 // rk-core so daemon-internal trail writers (supervisor, syncer) age on the same
 // clock as this RPC boundary.
-use rk_core::tuple::DEFAULT_TRAIL_TTL;
+use rk_core::tuple::{DEFAULT_TRAIL_TTL, MAX_TRAIL_TTL};
 /// Ceiling for blocking reads so a lost client cannot pin a connection task
 /// forever; clients requesting more get clamped.
 const MAX_BLOCK: Duration = Duration::from_secs(3600);
 const DEFAULT_BLOCK: Duration = Duration::from_secs(5);
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_SCAN_TUPLES: usize = 10_000;
 
 pub struct Daemon {
     layout: Layout,
@@ -58,6 +59,7 @@ pub struct Daemon {
     /// Fleet-wide default merge mode a repo is registered with when `rk repo
     /// add` names no explicit `--merge-mode` (`[policy] default_merge_mode`).
     default_merge_mode: rk_core::config::MergeMode,
+    allowed_target_branches: Vec<String>,
     auth_token: String,
     engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
     repos: std::sync::Mutex<crate::repos::RepoRegistry>,
@@ -135,6 +137,7 @@ impl Daemon {
         daemon.require_named_checks = config.policy.require_named_checks;
         daemon.require_approval_for_landing = config.policy.require_approval_for_landing;
         daemon.default_merge_mode = config.policy.default_merge_mode;
+        daemon.allowed_target_branches = config.policy.allowed_target_branches.clone();
         if config.sync.enabled {
             let syncer = crate::sync::Syncer::new(
                 &daemon.layout,
@@ -260,6 +263,8 @@ impl Daemon {
             require_named_checks: false,
             require_approval_for_landing: true,
             default_merge_mode: rk_core::config::MergeMode::default(),
+            allowed_target_branches: rk_core::config::PolicyConfig::default()
+                .allowed_target_branches,
             auth_token,
             engine: std::sync::OnceLock::new(),
             repos,
@@ -299,6 +304,14 @@ impl Daemon {
         }
 
         let listener = UnixListener::bind(&sock)?;
+        // A Unix socket's mode is otherwise inherited from the process umask.
+        // The token is the primary credential, but filesystem permissions are
+        // the first and cheapest boundary for local clients.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
+        }
         std::fs::write(self.layout.pid_file(), std::process::id().to_string())?;
         info!(socket = %sock.display(), pid = std::process::id(), castle = %self.castle_display, "daemon listening");
         // Only now that the bind is won may shared state be touched.
@@ -344,11 +357,21 @@ impl Daemon {
                 loop {
                     tokio::select! {
                         _ = tick.tick() => {
-                            supervisor.sweep(&cfg);
-                            // Self-healing respawn rides the same tick (TKT-53):
-                            // relaunch crashed/orphaned rats with crash-loop
-                            // backoff. No-op unless [supervisor].respawn_enabled.
-                            supervisor.respawn_sweep(&cfg);
+                            let supervisor = Arc::clone(&supervisor);
+                            let cfg = cfg.clone();
+                            let handle = tokio::runtime::Handle::current();
+                            if let Err(e) = tokio::task::spawn_blocking(move || {
+                                let _entered = handle.enter();
+                                supervisor.sweep(&cfg);
+                                // Self-healing respawn rides the same tick (TKT-53):
+                                // relaunch crashed/orphaned rats with crash-loop
+                                // backoff. No-op unless [supervisor].respawn_enabled.
+                                supervisor.respawn_sweep(&cfg);
+                            })
+                            .await
+                            {
+                                warn!(error = %e, "supervisor sweep task failed");
+                            }
                         }
                         _ = sweep_shutdown.changed() => break,
                     }
@@ -627,6 +650,7 @@ impl Daemon {
                 // a `wait` only gives up on one when it cannot be (TKT-147).
                 self.sweep_config.respawn_enabled && self.sweep_config.respawn_max_attempts > 0,
                 self.require_approval_for_landing,
+                self.allowed_target_branches.clone(),
             ))
         }))
     }
@@ -813,10 +837,8 @@ impl Daemon {
                 },
                 Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
             },
-            "agent.spawn" => reply(self.handle_spawn(req)),
-            "agent.respawn" => reply(self.handle_named(req, |sup, name| {
-                sup.respawn(&name).map(|r| json!({"agent": r}))
-            })),
+            "agent.spawn" => reply(self.handle_spawn(req).await),
+            "agent.respawn" => reply(self.handle_respawn(req).await),
             "agent.list" => reply(match parse_params::<AgentListParams>(&req.params) {
                 Ok(p) => {
                     let agents = if p.archived_only {
@@ -830,7 +852,7 @@ impl Daemon {
                 }
                 Err(e) => Response::err(id, codes::BAD_PARAMS, e),
             }),
-            "agent.archive" => reply(self.handle_agent_archive(req)),
+            "agent.archive" => reply(self.handle_agent_archive(req).await),
             "agent.unarchive" => {
                 reply(self.handle_named(req, |sup, name| sup.unarchive_agent(&name)))
             }
@@ -926,18 +948,7 @@ impl Daemon {
                     },
                 )
             }
-            "workflow.run" => {
-                let params: WorkflowRunParams = match parse_params(&req.params) {
-                    Ok(p) => p,
-                    Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
-                };
-                reply(
-                    match self.engine().run(&params.name, &params.repo, params.params) {
-                        Ok(instance) => Response::ok(id, json!({"instance": instance})),
-                        Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
-                    },
-                )
-            }
+            "workflow.run" => reply(self.handle_workflow_run(req).await),
             "workflow.list" => reply(Response::ok(id, json!({"instances": self.engine().list()}))),
             "workflow.status" => {
                 let params: NameParams = match parse_params(&req.params) {
@@ -958,14 +969,22 @@ impl Daemon {
                     Ok(p) => p,
                     Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
                 };
-                reply(match self.engine().timeline(&params.name) {
-                    Some((instance, steps)) => {
+                let engine = self.engine();
+                let name = params.name;
+                let lookup_name = name.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || engine.timeline(&lookup_name)).await;
+                reply(match result {
+                    Ok(Some((instance, steps))) => {
                         Response::ok(id, json!({"instance": instance, "steps": steps}))
                     }
-                    None => Response::err(
+                    Ok(None) => {
+                        Response::err(id, codes::INTERNAL, format!("no such instance: {name}"))
+                    }
+                    Err(e) => Response::err(
                         id,
                         codes::INTERNAL,
-                        format!("no such instance: {}", params.name),
+                        format!("workflow timeline task failed: {e}"),
                     ),
                 })
             }
@@ -994,10 +1013,17 @@ impl Daemon {
                     Ok(p) => p,
                     Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
                 };
-                reply(Response::ok(
-                    id,
-                    json!({"definitions": self.engine().definitions(&params.repo)}),
-                ))
+                let engine = self.engine();
+                let result =
+                    tokio::task::spawn_blocking(move || engine.definitions(&params.repo)).await;
+                reply(match result {
+                    Ok(definitions) => Response::ok(id, json!({"definitions": definitions})),
+                    Err(e) => Response::err(
+                        id,
+                        codes::INTERNAL,
+                        format!("workflow definitions task failed: {e}"),
+                    ),
+                })
             }
             "sync.now" => {
                 let Some(syncer) = self.syncer.clone() else {
@@ -1030,7 +1056,7 @@ impl Daemon {
                     Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
                 })
             }
-            "repo.add" => reply(self.handle_repo_add(req)),
+            "repo.add" => reply(self.handle_repo_add(req).await),
             "repo.list" => reply(match self.repos.lock() {
                 Ok(reg) => Response::ok(id, json!({"repos": reg.list()})),
                 Err(_) => Response::err(id, codes::INTERNAL, "repo registry lock poisoned"),
@@ -1356,7 +1382,7 @@ impl Daemon {
         }
     }
 
-    fn handle_repo_add(&self, req: Request) -> Response {
+    async fn handle_repo_add(&self, req: Request) -> Response {
         let params: RepoAddParams = match parse_params(&req.params) {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
@@ -1371,7 +1397,23 @@ impl Daemon {
         }
         let remote = params.remote;
         let remote_name = remote.as_deref().unwrap_or("origin");
-        let host = repo_remote_url(&path, remote_name).and_then(|url| crate::repos::infer_host(&url));
+        let path_for_remote = path.clone();
+        let remote_name = remote_name.to_string();
+        let host = match tokio::task::spawn_blocking(move || {
+            repo_remote_url(&path_for_remote, &remote_name)
+                .and_then(|url| crate::repos::infer_host(&url))
+        })
+        .await
+        {
+            Ok(host) => host,
+            Err(e) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    format!("repo inspection task failed: {e}"),
+                )
+            }
+        };
         let record = crate::repos::RepoRecord {
             name: params.name,
             path,
@@ -1485,14 +1527,59 @@ impl Daemon {
         }
     }
 
-    fn handle_spawn(&self, req: Request) -> Response {
+    async fn handle_spawn(&self, req: Request) -> Response {
         let params: crate::supervisor::SpawnParams = match parse_params(&req.params) {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
-        match self.supervisor.spawn(params) {
+        match self.supervisor.spawn_async(params).await {
             Ok(record) => Response::ok(req.id, json!({"agent": record})),
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    async fn handle_respawn(&self, req: Request) -> Response {
+        let params: NameParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let supervisor = Arc::clone(&self.supervisor);
+        let name = params.name;
+        let handle = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
+            let _entered = handle.enter();
+            supervisor
+                .respawn(&name)
+                .map(|record| json!({"agent": record}))
+        })
+        .await;
+        match result {
+            Ok(Ok(value)) => Response::ok(req.id, value),
+            Ok(Err(e)) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+            Err(e) => Response::err(req.id, codes::INTERNAL, format!("respawn task failed: {e}")),
+        }
+    }
+
+    async fn handle_workflow_run(&self, req: Request) -> Response {
+        let params: WorkflowRunParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let engine = self.engine();
+        let handle = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
+            let _entered = handle.enter();
+            engine.run(&params.name, &params.repo, params.params)
+        })
+        .await;
+        match result {
+            Ok(Ok(instance)) => Response::ok(req.id, json!({"instance": instance})),
+            Ok(Err(e)) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+            Err(e) => Response::err(
+                req.id,
+                codes::INTERNAL,
+                format!("workflow task failed: {e}"),
+            ),
         }
     }
 
@@ -1500,7 +1587,7 @@ impl Daemon {
     /// views. The daemon owns `agents.json` and rewrites it on every mutation,
     /// so this has to be an RPC: an external edit would be clobbered by the
     /// next `Registry::persist`.
-    fn handle_agent_archive(&self, req: Request) -> Response {
+    async fn handle_agent_archive(&self, req: Request) -> Response {
         let params: AgentArchiveParams = match parse_params(&req.params) {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
@@ -1520,9 +1607,17 @@ impl Daemon {
             git: params.reap_git,
             logs: params.reap_logs,
         };
-        match self.supervisor.archive_agents(cutoff, params.dry_run, reap) {
-            Ok(v) => Response::ok(req.id, v),
-            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        let supervisor = Arc::clone(&self.supervisor);
+        let handle = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
+            let _entered = handle.enter();
+            supervisor.archive_agents(cutoff, params.dry_run, reap)
+        })
+        .await;
+        match result {
+            Ok(Ok(value)) => Response::ok(req.id, value),
+            Ok(Err(e)) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+            Err(e) => Response::err(req.id, codes::INTERNAL, format!("archive task failed: {e}")),
         }
     }
 
@@ -1598,9 +1693,21 @@ impl Daemon {
             tuple = tuple.with_lifecycle(lifecycle);
         }
         if let Some(ttl_secs) = params.ttl_secs {
+            if ttl_secs > MAX_TRAIL_TTL.as_secs() {
+                return Response::err(
+                    req.id,
+                    codes::BAD_PARAMS,
+                    format!(
+                        "ttl_secs exceeds the maximum supported TTL of {} seconds",
+                        MAX_TRAIL_TTL.as_secs()
+                    ),
+                );
+            }
             tuple.lifecycle = Lifecycle::Ephemeral;
-            tuple.expires_at =
-                Some(chrono::Utc::now() + chrono::Duration::seconds(ttl_secs as i64));
+            tuple.expires_at = chrono::Utc::now().checked_add_signed(
+                chrono::Duration::from_std(Duration::from_secs(ttl_secs))
+                    .expect("MAX_TRAIL_TTL must fit chrono::Duration"),
+            );
         }
         // Pheromone trails carry a decaying strength and default to an Ephemeral
         // lifetime so an abandoned one evaporates instead of lingering forever.
@@ -1608,9 +1715,9 @@ impl Daemon {
             tuple.strength = Some(rk_core::tuple::FULL_STRENGTH);
             if !explicit_lifecycle {
                 tuple.lifecycle = Lifecycle::Ephemeral;
-                tuple.expires_at = Some(
-                    chrono::Utc::now()
-                        + chrono::Duration::seconds(DEFAULT_TRAIL_TTL.as_secs() as i64),
+                tuple.expires_at = chrono::Utc::now().checked_add_signed(
+                    chrono::Duration::from_std(DEFAULT_TRAIL_TTL)
+                        .expect("DEFAULT_TRAIL_TTL must fit chrono::Duration"),
                 );
             }
         }
@@ -1634,13 +1741,22 @@ impl Daemon {
         };
         // `--hot`, or any `--top N` cap, follows the strongest trail first;
         // otherwise the default oldest-first scan is unchanged.
+        let requested_top = params.top;
+        let limit = requested_top.unwrap_or(MAX_SCAN_TUPLES).min(MAX_SCAN_TUPLES);
         let result = if params.hot || params.top.is_some() {
-            self.space.scan_hot(&params.pattern, params.top)
+            self.space
+                .scan_hot(&params.pattern, Some(limit.saturating_add(1)))
         } else {
-            self.space.scan(&params.pattern)
+            self.space
+                .scan_limited(&params.pattern, limit.saturating_add(1))
         };
         match result {
-            Ok(tuples) => Response::ok(req.id, json!({"tuples": tuples})),
+            Ok(mut tuples) => {
+                let truncated = tuples.len() > limit
+                    || requested_top.is_some_and(|requested| requested > MAX_SCAN_TUPLES);
+                tuples.truncate(limit);
+                Response::ok(req.id, json!({"tuples": tuples, "truncated": truncated}))
+            }
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
     }

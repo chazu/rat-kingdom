@@ -199,7 +199,7 @@ enum TicketCommand {
     List(ticket_cmds::ListArgs),
     /// Show one ticket and its sub-tickets.
     Show {
-        /// Ticket id (e.g. TKT-12).
+        /// Ticket id (for example, TKT-01J...).
         id: String,
     },
     /// Update a ticket's status or fields.

@@ -59,6 +59,7 @@ const COALESCE_FILED_IDENTITY: &str = "reactor_coalesced";
 /// ticket-create + a cycle or two; the still-open ticket is the real
 /// files-once-until-closed guard beyond that.
 const COALESCE_FILED_TTL_SECS: i64 = 10 * 60;
+const MAX_MARKER_TTL_SECS: u64 = 365 * 24 * 3600;
 
 /// A loaded trigger plus where it came from (a repo-local file defaults its
 /// target repo to that repo; a global-dir trigger has no default repo).
@@ -816,8 +817,10 @@ impl Reactor {
         );
         marker.lifecycle = Lifecycle::Ephemeral;
         if self.config.marker_ttl_secs > 0 {
+            let ttl_secs = i64::try_from(self.config.marker_ttl_secs.min(MAX_MARKER_TTL_SECS))
+                .expect("MAX_MARKER_TTL_SECS must fit i64");
             marker.expires_at = Some(
-                chrono::Utc::now() + chrono::Duration::seconds(self.config.marker_ttl_secs as i64),
+                chrono::Utc::now() + chrono::Duration::seconds(ttl_secs),
             );
         }
         self.space.out(marker)
@@ -940,8 +943,10 @@ impl Reactor {
         // per-castle, which is correct: each castle runs its own reactor.)
         marker.lifecycle = Lifecycle::Ephemeral;
         if self.config.marker_ttl_secs > 0 {
+            let ttl_secs = i64::try_from(self.config.marker_ttl_secs.min(MAX_MARKER_TTL_SECS))
+                .expect("MAX_MARKER_TTL_SECS must fit i64");
             marker.expires_at = Some(
-                chrono::Utc::now() + chrono::Duration::seconds(self.config.marker_ttl_secs as i64),
+                chrono::Utc::now() + chrono::Duration::seconds(ttl_secs),
             );
         }
         self.space.out(marker)

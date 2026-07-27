@@ -17,6 +17,7 @@ use rk_workflow::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -87,6 +88,10 @@ pub struct Instance {
     /// a rehydrated instance can re-`load` the exact same steps.
     #[serde(default)]
     pub definition: String,
+    /// SHA-256 of the definition bytes used to start this instance. A resumed
+    /// workflow refuses to execute a changed definition after restart.
+    #[serde(default)]
+    pub definition_digest: String,
     /// The original `_input` params this instance launched with, replayed at
     /// reload so a resumed workflow validates and interpolates identically to
     /// its first run (TKT-52).
@@ -186,6 +191,7 @@ pub struct WorkflowEngine {
     /// the `wait` fails immediately (TKT-147).
     respawn_enabled: bool,
     require_approval_for_landing: bool,
+    allowed_target_branches: Vec<String>,
     instances: Mutex<HashMap<String, Instance>>,
 }
 
@@ -202,6 +208,7 @@ impl WorkflowEngine {
         require_named_checks: bool,
         respawn_enabled: bool,
         require_approval_for_landing: bool,
+        allowed_target_branches: Vec<String>,
     ) -> Self {
         Self {
             layout,
@@ -214,6 +221,7 @@ impl WorkflowEngine {
             require_named_checks,
             respawn_enabled,
             require_approval_for_landing,
+            allowed_target_branches,
             instances: Mutex::new(HashMap::new()),
         }
     }
@@ -265,6 +273,7 @@ impl WorkflowEngine {
         params: HashMap<String, Value>,
     ) -> rk_core::Result<Instance> {
         let file = self.find_definition(name, repo)?;
+        let definition_digest = definition_digest(&file)?;
         let workflow = rk_workflow::load(&file, &params)?;
 
         let instance = Instance {
@@ -279,6 +288,7 @@ impl WorkflowEngine {
             awaiting: None,
             instance_max_usd: workflow.budget.map(|b| b.max_usd),
             definition: name.to_string(),
+            definition_digest,
             params,
             depth: 0,
             started_at: chrono::Utc::now(),
@@ -395,11 +405,22 @@ impl WorkflowEngine {
     /// `Running` forever.
     fn resume(self: &Arc<Self>, instance: Instance) {
         let id = instance.id.clone();
-        let workflow = match self
+        let loaded = match self
             .find_definition(&instance.definition, &instance.repo)
-            .and_then(|file| rk_workflow::load(&file, &instance.params))
+            .and_then(|file| {
+                let digest = definition_digest(&file)?;
+                if !instance.definition_digest.is_empty()
+                    && instance.definition_digest != digest
+                {
+                    return Err(rk_core::Error::other(format!(
+                        "definition digest changed (persisted {}, current {})",
+                        instance.definition_digest, digest
+                    )));
+                }
+                Ok((rk_workflow::load(&file, &instance.params)?, digest))
+            })
         {
-            Ok(w) => w,
+            Ok(loaded) => loaded,
             Err(e) => {
                 warn!(instance = %id, error = %e, "cannot resume workflow; failing instance");
                 self.update(&id, |i| {
@@ -411,6 +432,12 @@ impl WorkflowEngine {
                 return;
             }
         };
+        let (workflow, current_digest) = loaded;
+        // Backfill the digest for instances written before this field existed;
+        // subsequent snapshots then carry the restart guard.
+        if instance.definition_digest.is_empty() {
+            self.update(&id, |i| i.definition_digest = current_digest.clone());
+        }
         // A stale `awaiting` flag from before the restart is cleared here; the
         // resumed gate re-sets it if it parks again.
         self.update(&id, |i| i.awaiting = None);
@@ -488,7 +515,7 @@ impl WorkflowEngine {
                         .description
                         .as_ref()
                         .map(|d| interpolate(d, &ctx));
-                    let record = self.supervisor.spawn(SpawnParams {
+                    let record = self.spawn_agent(SpawnParams {
                         repo: repo.to_string(),
                         task: title,
                         prompt,
@@ -501,7 +528,8 @@ impl WorkflowEngine {
                         attach: false,
                         workflow_instance: Some(id.to_string()),
                         instance_max_usd: self.instance_budget(id),
-                    })?;
+                    })
+                    .await?;
                     self.update(id, |i| {
                         i.context.active_agent = Some(record.name.clone());
                         i.context.active_branch = record.branch.clone();
@@ -821,6 +849,7 @@ impl WorkflowEngine {
                     if target.is_empty() {
                         return Err(rk_core::Error::other("land step: target resolved to empty"));
                     }
+                    self.require_allowed_target(&target)?;
                     let result = self
                         .supervisor
                         .land(std::path::Path::new(repo), &branch, &target, land.keep_branch)
@@ -849,6 +878,7 @@ impl WorkflowEngine {
                             "open_pr step: target resolved to empty",
                         ));
                     }
+                    self.require_allowed_target(&target)?;
                     let result = self
                         .supervisor
                         .open_pr(std::path::Path::new(repo), &branch, &target)
@@ -918,6 +948,7 @@ impl WorkflowEngine {
             .map(|(k, v)| (k.clone(), Value::String(interpolate(v, ctx))))
             .collect();
         let file = self.find_definition(&sub.workflow, &child_repo)?;
+        let definition_digest = definition_digest(&file)?;
         let workflow = rk_workflow::load(&file, &params)?;
         let workflow_name = workflow.name.clone();
         let child = Instance {
@@ -932,6 +963,7 @@ impl WorkflowEngine {
             awaiting: None,
             instance_max_usd: workflow.budget.map(|b| b.max_usd),
             definition: sub.workflow.clone(),
+            definition_digest,
             params,
             depth,
             started_at: chrono::Utc::now(),
@@ -1033,7 +1065,7 @@ impl WorkflowEngine {
                 .description
                 .as_ref()
                 .map(|d| interpolate_item(d, &item, &ctx));
-            let record = self.supervisor.spawn(SpawnParams {
+            let record = self.spawn_agent(SpawnParams {
                 repo: repo.to_string(),
                 task: title,
                 prompt,
@@ -1048,7 +1080,8 @@ impl WorkflowEngine {
                 attach: false,
                 workflow_instance: Some(id.to_string()),
                 instance_max_usd: instance_cap,
-            })?;
+            })
+            .await?;
             fanned.push(FannedAgent {
                 agent: record.name.clone(),
                 branch: record.branch.clone(),
@@ -1521,6 +1554,19 @@ impl WorkflowEngine {
         Ok(result)
     }
 
+    fn require_allowed_target(&self, target: &str) -> rk_core::Result<()> {
+        if self
+            .allowed_target_branches
+            .iter()
+            .any(|allowed| allowed == target)
+        {
+            return Ok(());
+        }
+        Err(rk_core::Error::other(format!(
+            "workflow target '{target}' is not in policy.allowed_target_branches"
+        )))
+    }
+
     /// Resolve a `run` step to its effective command, cwd, exit gate, and
     /// timeout — enforcing the named-check policy (TKT-30).
     ///
@@ -1686,6 +1732,13 @@ impl WorkflowEngine {
             .unwrap_or_default()
     }
 
+    async fn spawn_agent(
+        &self,
+        params: SpawnParams,
+    ) -> rk_core::Result<crate::agents::AgentRecord> {
+        self.supervisor.spawn_async(params).await
+    }
+
     /// This instance's per-run budget cap (from the workflow's `budget:`), used
     /// as the dispatch preflight ceiling on every spawn it makes.
     fn instance_budget(&self, id: &str) -> Option<f64> {
@@ -1821,6 +1874,11 @@ fn value_as_key(value: &Value) -> String {
         Value::Null => String::new(),
         other => other.to_string(),
     }
+}
+
+fn definition_digest(path: &Path) -> rk_core::Result<String> {
+    let data = std::fs::read(path)?;
+    Ok(hex::encode(Sha256::digest(data)))
 }
 
 /// Pick the lower bound for a generation-exact `harness_result` read, given

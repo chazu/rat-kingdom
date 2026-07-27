@@ -25,7 +25,8 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 async fn connect(layout: &Layout) -> Client {
-    for _ in 0..50 {
+    // Match the normal daemon-backed integration-test startup budget.
+    for _ in 0..1500 {
         tokio::time::sleep(Duration::from_millis(20)).await;
         if let Ok(c) = Client::connect(layout).await {
             return c;

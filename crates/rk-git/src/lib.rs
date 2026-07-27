@@ -197,6 +197,7 @@ impl Repo {
 
     /// Create a worktree at `path` on new `branch` forked from `base`.
     pub fn create_worktree(&self, path: &Path, branch: &str, base: &str) -> rk_core::Result<()> {
+        self.validate_branch_name(branch, "worktree branch")?;
         if PROTECTED_BRANCHES.contains(&branch) {
             return Err(rk_core::Error::other(format!(
                 "refusing to use protected branch: {branch}"
@@ -258,6 +259,7 @@ impl Repo {
     }
 
     pub fn delete_branch(&self, branch: &str) -> rk_core::Result<()> {
+        self.validate_local_branch(branch, "branch to delete")?;
         if PROTECTED_BRANCHES.contains(&branch) {
             return Err(rk_core::Error::other(format!(
                 "refusing to delete protected branch: {branch}"
@@ -271,6 +273,7 @@ impl Repo {
     /// `target`: run the merge in a temporary detached worktree, then
     /// fast-forward the target ref if it was not moved concurrently.
     pub fn merge_branch(&self, branch: &str, target: &str) -> rk_core::Result<MergeOutcome> {
+        self.validate_local_branch(branch, "merge source")?;
         self.advance_via_worktree(
             target,
             "merge",
@@ -330,6 +333,7 @@ impl Repo {
         op: impl FnOnce(&Path) -> rk_core::Result<()>,
         success_detail: String,
     ) -> rk_core::Result<MergeOutcome> {
+        self.validate_local_branch(target, "merge target")?;
         let seq = MERGE_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = self
             .root
@@ -385,6 +389,7 @@ impl Repo {
                 "push_branch requires a branch and a remote",
             ));
         }
+        self.validate_local_branch(branch, "branch to push")?;
         git_output(&self.root, &["push", "-u", remote, branch])
     }
 
@@ -416,6 +421,16 @@ impl Repo {
                 opened: false,
                 url: None,
                 detail: "open_pull_request requires a branch, target, and remote".into(),
+            };
+        }
+        if let Err(e) = self
+            .validate_local_branch(branch, "pull request source")
+            .and_then(|_| self.validate_local_branch(target, "pull request target"))
+        {
+            return PrOutcome {
+                opened: false,
+                url: None,
+                detail: e.to_string(),
             };
         }
         let host = self.remote_host(remote);
@@ -465,12 +480,14 @@ impl Repo {
     /// live in the new HEAD but not on disk, so `git status` reports them as
     /// deleted. So when the root is on `target`, fast-forward it in place
     /// (`merge --ff-only`), which advances the ref *and* refreshes the working
-    /// tree while preserving any uncommitted local edits. When it isn't (no
-    /// live checkout, or the operator has conflicting uncommitted work that a
-    /// fast-forward would refuse to touch), fall back to a bare ref move.
+    /// tree while preserving any non-conflicting local edits. If Git refuses
+    /// that checkout update, return the error and leave the target ref alone;
+    /// a bare ref move would create a checkout/ref split that lies to the
+    /// operator about what is actually on disk.
     fn advance_target(&self, target: &str, merged: &str, expected: &str) -> rk_core::Result<()> {
         let root_on_target = self.current_branch().ok().as_deref() == Some(target);
-        if root_on_target && self.git(&["merge", "--ff-only", merged]).is_ok() {
+        if root_on_target {
+            self.git(&["merge", "--ff-only", merged])?;
             return Ok(());
         }
         self.git(&[
@@ -480,6 +497,24 @@ impl Repo {
             expected,
         ])?;
         Ok(())
+    }
+
+    fn validate_branch_name(&self, branch: &str, role: &str) -> rk_core::Result<()> {
+        if branch.trim().is_empty() || branch.starts_with('-') || branch.starts_with("refs/") {
+            return Err(rk_core::Error::other(format!(
+                "invalid {role} branch name: {branch:?}"
+            )));
+        }
+        self.git(&["check-ref-format", "--branch", branch])?;
+        Ok(())
+    }
+
+    fn validate_local_branch(&self, branch: &str, role: &str) -> rk_core::Result<()> {
+        self.validate_branch_name(branch, role)?;
+        let reference = format!("refs/heads/{branch}");
+        self.git(["show-ref", "--verify", "--quiet", &reference].as_slice())
+            .map(|_| ())
+            .map_err(|_| rk_core::Error::other(format!("{role} does not exist: {branch}")))
     }
 
     fn git(&self, args: &[&str]) -> rk_core::Result<String> {
@@ -972,6 +1007,32 @@ mod tests {
         assert!(dir.path().join("rat.txt").exists());
         let scratch = std::fs::read_to_string(dir.path().join("scratch.txt")).unwrap();
         assert_eq!(scratch, "wip\n");
+    }
+
+    #[test]
+    fn merge_refuses_a_conflicting_dirty_target_checkout() {
+        let (dir, repo) = scratch_repo();
+        let wt = dir.path().join("wt-scratch");
+        let branch = agent_branch("Scratch", "task-4");
+        repo.create_worktree(&wt, &branch, "main").unwrap();
+
+        std::fs::write(wt.join("README.md"), "rat version\n").unwrap();
+        run(&wt, &["add", "README.md"]);
+        run(&wt, &["commit", "-m", "rat work"]);
+
+        // The operator has an uncommitted edit to the same path in the live
+        // target checkout. Updating refs behind its back would make HEAD and
+        // the files on disk disagree, so the merge must fail closed.
+        std::fs::write(dir.path().join("README.md"), "human work\n").unwrap();
+        let before = git_in(dir.path(), &["rev-parse", "refs/heads/main"]).unwrap();
+        let result = repo.merge_branch(&branch, "main");
+        assert!(result.is_err(), "dirty target checkout must block ref advance");
+        let after = git_in(dir.path(), &["rev-parse", "refs/heads/main"]).unwrap();
+        assert_eq!(after, before, "main ref must remain unchanged");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("README.md")).unwrap(),
+            "human work\n"
+        );
     }
 
     #[test]

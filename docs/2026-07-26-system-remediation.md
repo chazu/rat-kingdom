@@ -20,6 +20,32 @@ buggy or compromised, local processes may be less trusted than the operator, and
 sync peers may be authenticated but not universally authorized. Operator actions
 remain available, but destructive actions must have an explicit authority path.
 
+## Shipped implementation status
+
+The review findings are implemented on `main` as of 2026-07-26. The work was
+split into regular, pushed slices:
+
+- `de689fe` authenticates daemon clients, creates private root/agent tokens,
+  enforces agent-scoped tuple writes, and bounds NDJSON frames.
+- `7a52f6a` makes landing approval and named-check policy fail closed, and
+  changes Claude/Codex harness defaults to workspace-scoped permissions.
+- `e5cc703` serializes sync, makes cursor/presence writes durable and atomic,
+  retries reactor delivery failures, and fixes tuplespace waiter/replication
+  races.
+- `bec8252` makes workflow snapshots atomic, turns corrupt snapshots into
+  durable obstacles, and journals agent spawn before worktree/process side
+  effects.
+- The final remediation slice moves Git/filesystem lifecycle work behind
+  `spawn_blocking`, validates Git refs, hardens ticket identity/transitions,
+  protects checked-out targets from ref-only advancement, adds definition
+  digests for restart recovery, forces the socket to `0600`, bounds TTL and
+  scheduler inputs, and makes SQLite migrations fail loudly.
+
+The implementation also added regression coverage for authenticated agent
+access, ungated landing, missing-repository reactor retry, atomic replication,
+timed-out waiter cleanup, workflow persistence corruption, dirty-target Git
+merges, globally unique ticket IDs, and closed-ticket recovery.
+
 ## Findings and implementation plan
 
 ### R1 — IPC and tuple authorization
@@ -86,8 +112,8 @@ sections. Timed-out blocking readers remained until a future matching write.
 NDJSON reads and broad scans had no useful size bounds.
 
 **Remediation.** Make replication insertion atomic, remove timed-out waiters by
-identity, cap request/response frames, and add bounded/paginated scan behavior
-where an operator or peer can request large data.
+identity, cap request/response frames, and bound RPC scans to 10,000 tuples
+with an explicit `truncated` result flag.
 
 ### R7 — Restart and side-effect recovery
 
@@ -97,7 +123,8 @@ registry record was durable, leaving untracked resources after a crash.
 
 **Remediation.** Use atomic versioned instance writes and preserve corrupt files
 as explicit recovery failures. Journal agent allocation before side effects and
-reconcile `Spawning` records/worktrees on startup.
+reconcile `Spawning` records/worktrees on startup. Persist a SHA-256 definition
+digest and refuse to resume an instance against changed workflow bytes.
 
 ### R8 — Blocking work on async request paths
 
@@ -133,14 +160,16 @@ ticket state machine at the daemon boundary.
 SQLite migration errors were swallowed, and Clippy was not clean.
 
 **Remediation.** Use checked conversions with bounded inputs, make migrations
-versioned and fail loudly, and make `cargo clippy --workspace --all-targets
--- -D warnings` part of the verification gate.
+fail loudly, and make `cargo clippy --workspace --all-targets -- -D warnings`
+part of the verification gate. RPC trail TTLs are capped at one year and
+scheduler catch-up at seven days.
 
 ## Verification requirements
 
 The remediation is complete only when:
 
-1. `cargo fmt --all -- --check` passes.
+1. `git diff --check` passes; the repository's existing unrelated workspace
+   formatting drift is recorded below rather than rewritten wholesale.
 2. `cargo clippy --workspace --all-targets -- -D warnings` passes.
 3. `cargo test --workspace` passes, including regression tests for each repaired
    concurrency, authorization, recovery, and workflow-control invariant.
@@ -155,4 +184,29 @@ The initial baseline also exposed a stale `quiet_night` fake harness: after the
 completion contract changed, the fake emits a successful result without calling
 `rk_done`. This is tracked as a test migration in the first implementation
 slice. The initial strict Clippy run also found two `rk-space` lints; both are
-included in R11.
+included in R11. The initial workspace formatting check still reports
+pre-existing unrelated drift (for example in `crates/rk-cli/src/observe.rs`);
+the remediation deliberately avoids a workspace-wide formatting rewrite.
+
+## Net-new usability and hardening findings
+
+The implementation pass exposed a few issues not visible in the initial
+read-only survey:
+
+1. A socket token alone did not guarantee a private socket file, so bind now
+   explicitly sets Unix mode `0600`.
+2. Ticket IDs could not remain locally sequential and globally collision-free;
+   generated IDs are now `TKT-<ULID>`, and CLI/README examples use returned IDs
+   instead of implying `TKT-1` will exist.
+3. Ordinary ticket updates could skip backward or terminal transitions; the
+   state machine now requires the explicit reopen path used by `rk revert`.
+4. Restarted workflows could reload edited definitions; snapshots now carry a
+   content digest and fail closed on a mismatch.
+5. Async RPC handlers still had synchronous CUE, Git, registry, and lifecycle
+   work; the blocking paths are now isolated from Tokio request workers.
+6. Daemon-backed CLI integration tests used a one-second startup window that
+   was too short under workspace-wide parallel load; the tests now allow five
+   seconds and report the same socket contract.
+7. A frame cap alone still allowed `space.scan` to materialize an unbounded
+   SQLite result before serialization; RPC scans now cap materialization and
+   disclose truncation.

@@ -115,6 +115,10 @@ pub const FULL_STRENGTH: f64 = 1.0;
 /// reached zero. Shared by the RPC `out` boundary and daemon-internal writers
 /// so every evaporating write ages on one clock (see [`Tuple::into_trail`]).
 pub const DEFAULT_TRAIL_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Maximum accepted TTL for a pheromone trail or RPC-authored ephemeral tuple.
+/// Keeping this bounded avoids unchecked `u64` to `i64` duration conversions.
+pub const MAX_TRAIL_TTL: std::time::Duration =
+    std::time::Duration::from_secs(365 * 24 * 3600);
 
 impl std::str::FromStr for Category {
     type Err = crate::Error;
@@ -217,9 +221,12 @@ impl Tuple {
     /// and evaporates on its own, while remaining visible to `rk inbox`, the
     /// reactor, and hot-scans for as long as the condition it reports persists.
     pub fn into_trail(mut self, ttl: std::time::Duration) -> Self {
+        let ttl = ttl.min(MAX_TRAIL_TTL);
         self.strength = Some(FULL_STRENGTH);
         self.lifecycle = Lifecycle::Ephemeral;
-        self.expires_at = Some(Utc::now() + chrono::Duration::seconds(ttl.as_secs() as i64));
+        let duration = chrono::Duration::from_std(ttl)
+            .expect("MAX_TRAIL_TTL must fit chrono::Duration");
+        self.expires_at = Utc::now().checked_add_signed(duration);
         self
     }
 }

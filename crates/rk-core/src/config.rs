@@ -154,9 +154,10 @@ pub struct SchedulerConfig {
     pub interval_secs: u64,
     /// Bound on catch-up after downtime: on boot (or after a long stall) the
     /// scheduler looks back at most this many minutes for missed cron minutes,
-    /// firing each schedule at most once. Zero means no catch-up — only the
-    /// current minute is evaluated (plain-cron semantics, like `cron` without
-    /// `anacron`).
+    /// firing each schedule at most once. The runtime caps this at seven days
+    /// so a malformed or extreme value cannot create an unbounded replay. Zero
+    /// means no catch-up — only the current minute is evaluated (plain-cron
+    /// semantics, like `cron` without `anacron`).
     pub catchup_minutes: u64,
 }
 
@@ -404,7 +405,7 @@ pub enum MergeMode {
 
 /// Workflow-execution policy. The seed of the #19 policy engine: today it gates
 /// the one primitive that can run arbitrary shell — the workflow `run` step.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct PolicyConfig {
     /// When true, a workflow `run` step may ONLY reference a repo-registered
@@ -424,6 +425,11 @@ pub struct PolicyConfig {
     /// `rk repo add --merge-mode`. A repo's own `RepoRecord.merge_mode` overrides
     /// this. Defaults to `Direct` (plain git merge) for backward compatibility.
     pub default_merge_mode: MergeMode,
+    /// Exact branch names workflow `land`/`open_pr` may target. This is an
+    /// explicit allowlist because those steps can change shared repository
+    /// state. Configure the project base branch here when it is not `main` or
+    /// `master`; an empty list denies all workflow landing targets.
+    pub allowed_target_branches: Vec<String>,
 }
 
 impl Default for PolicyConfig {
@@ -432,6 +438,7 @@ impl Default for PolicyConfig {
             require_named_checks: true,
             require_approval_for_landing: true,
             default_merge_mode: MergeMode::default(),
+            allowed_target_branches: vec!["main".into(), "master".into()],
         }
     }
 }

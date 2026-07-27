@@ -1,14 +1,15 @@
 //! Tickets: durable work items, stored as `task` tuples in the tuplespace.
 //!
-//! A ticket is a `task`-category tuple whose `identity` is `TKT-<n>` and whose
-//! payload carries `{title, body, status, parent, ...}`. Nothing collects
+//! A ticket is a `task`-category tuple whose `identity` is `TKT-<ulid>` and whose
+//! payload carries `{title, body, status, parent, ...}`. The ULID is minted
+//! locally but globally unique, so two castles can create tickets concurrently
+//! without identity collisions. Nothing collects
 //! `session`/`furniture` tuples, so a ticket persists as a backlog item until
 //! explicitly closed — and because tickets carry a repo *name* (not a path),
 //! they replicate across castles through git-notes sync as a shared backlog.
 //!
-//! All mutations (create and update) serialize through one lock so ticket-id
-//! allocation and the take-and-replace of an update can never interleave and
-//! mint a duplicate id.
+//! All mutations (create and update) serialize through one lock so the
+//! take-and-replace of an update cannot interleave with another mutation.
 
 use rk_core::id::RecordId;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
@@ -91,13 +92,6 @@ pub struct Tickets {
     lock: Mutex<()>,
 }
 
-fn id_num(identity: &str) -> u64 {
-    identity
-        .strip_prefix(ID_PREFIX)
-        .and_then(|n| n.parse::<u64>().ok())
-        .unwrap_or(0)
-}
-
 impl Tickets {
     pub fn new(space: Space, castle: String) -> Self {
         Self {
@@ -107,12 +101,11 @@ impl Tickets {
         }
     }
 
-    /// Next free ticket id: one past the highest `TKT-<n>` currently in the
-    /// space. Called only while `self.lock` is held.
+    /// Mint a globally unique ticket id. RecordId is a ULID, so the identity
+    /// remains sortable while avoiding the local-maximum collision that used
+    /// to make two castles both create `TKT-1`.
     fn next_id(&self) -> rk_core::Result<String> {
-        let existing = self.space.scan(&Pattern::category(Category::Task))?;
-        let max = existing.iter().map(|t| id_num(&t.identity)).max().unwrap_or(0);
-        Ok(format!("{ID_PREFIX}{}", max + 1))
+        Ok(format!("{ID_PREFIX}{}", RecordId::new()))
     }
 
     pub async fn create(&self, t: NewTicket) -> rk_core::Result<Tuple> {
@@ -180,7 +173,7 @@ impl Tickets {
                     .is_none_or(|p| t.payload.get("parent").and_then(Value::as_str) == Some(p))
             })
             .collect();
-        tickets.sort_by_key(|t| id_num(&t.identity));
+        tickets.sort_by_key(|t| t.created_at);
         Ok(tickets)
     }
 
@@ -194,6 +187,21 @@ impl Tickets {
             }
         }
         let _guard = self.lock.lock().await;
+        if let Some(next) = changes.status.as_deref() {
+            let current = self
+                .get(id)?
+                .ok_or_else(|| rk_core::Error::other(format!("no such ticket: {id}")))?;
+            let previous = current
+                .payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("open");
+            if !valid_transition(previous, next) {
+                return Err(rk_core::Error::other(format!(
+                    "invalid ticket status transition: {previous} -> {next}"
+                )));
+            }
+        }
         self.edit(id, |obj| {
             if let Some(v) = changes.status {
                 obj.insert("status".into(), json!(v));
@@ -256,6 +264,21 @@ impl Tickets {
         .await
     }
 
+    /// Reopen a closed ticket as an explicit recovery action (used by
+    /// `rk revert`). Ordinary updates cannot move a closed ticket backwards.
+    pub async fn reopen(&self, id: &str, status: &str) -> rk_core::Result<Tuple> {
+        if !matches!(status, "open" | "blocked") {
+            return Err(rk_core::Error::other(format!(
+                "reopen status must be open or blocked, got '{status}'"
+            )));
+        }
+        let _guard = self.lock.lock().await;
+        self.edit(id, |obj| {
+            obj.insert("status".into(), json!(status));
+        })
+        .await
+    }
+
     /// Add a `id depends-on dep` edge, rejecting self-loops, missing tickets,
     /// and any edge that would close a cycle.
     pub async fn add_dep(&self, id: &str, dep: &str) -> rk_core::Result<Tuple> {
@@ -310,7 +333,7 @@ impl Tickets {
             .filter(|t| !is_blocked(t, &by_id))
             .cloned()
             .collect();
-        ready.sort_by_key(|t| id_num(&t.identity));
+        ready.sort_by_key(|t| t.created_at);
         Ok(ready)
     }
 
@@ -455,6 +478,21 @@ fn deps_of(ticket: &Tuple) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn valid_transition(previous: &str, next: &str) -> bool {
+    if previous == next {
+        return true;
+    }
+    match previous {
+        "open" => matches!(next, "claimed" | "in_progress" | "blocked" | "done" | "closed"),
+        "claimed" => matches!(next, "in_progress" | "blocked" | "done" | "closed"),
+        "in_progress" => matches!(next, "blocked" | "done" | "closed"),
+        "blocked" => matches!(next, "open" | "in_progress" | "done" | "closed"),
+        "done" => next == "closed",
+        "closed" => false,
+        _ => false,
+    }
+}
+
 fn is_done(ticket: &Tuple) -> bool {
     matches!(
         ticket.payload.get("status").and_then(Value::as_str),
@@ -524,12 +562,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ids_are_monotonic_and_prefixed() {
+    async fn ids_are_unique_and_prefixed() {
         let t = tickets();
         let a = t.create(new("first", "system", None)).await.unwrap();
         let b = t.create(new("second", "system", None)).await.unwrap();
-        assert_eq!(a.identity, "TKT-1");
-        assert_eq!(b.identity, "TKT-2");
+        assert!(a.identity.starts_with(ID_PREFIX));
+        assert!(b.identity.starts_with(ID_PREFIX));
+        assert_ne!(a.identity, b.identity);
     }
 
     #[tokio::test]
@@ -564,6 +603,21 @@ mod tests {
             parent: None,
         };
         assert!(t.update(&a.identity, changes).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_tickets_require_explicit_reopen() {
+        let t = tickets();
+        let a = t.create(new("x", "system", None)).await.unwrap();
+        set_status(&t, &a.identity, "done").await;
+        set_status(&t, &a.identity, "closed").await;
+        let ordinary = TicketChanges {
+            status: Some("open".into()),
+            ..Default::default()
+        };
+        assert!(t.update(&a.identity, ordinary).await.is_err());
+        t.reopen(&a.identity, "open").await.unwrap();
+        assert_eq!(t.get(&a.identity).unwrap().unwrap().payload["status"], "open");
     }
 
     #[tokio::test]
