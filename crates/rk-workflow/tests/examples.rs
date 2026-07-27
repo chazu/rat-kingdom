@@ -391,6 +391,84 @@ fn steward_loads_and_routes() {
     assert!(when.default.iter().any(|s| matches!(s, Step::Stop(_))));
 }
 
+/// TKT-174: EVERY shipped example that routes on a reviewer's verdict must bind
+/// the read to the reviewer that wrote it — swept across the whole example set,
+/// not asserted file by file.
+///
+/// TKT-161 fixed the two examples that carried the unbound read at the time, and
+/// pinned each one in its own test. That is not a guarantee about the class: the
+/// live fleet also ran a hand-copied `steward-grmpl` with no repo source, which
+/// kept the unbound read for three more days and could auto-merge a branch on a
+/// concurrent instance's verdict. A per-file assertion cannot fail for a file
+/// nobody wrote a test for, so assert the property over the directory — the next
+/// steward variant, or a copy-paste of an existing one, is covered the moment it
+/// lands here.
+///
+/// This guards the SHIPPED set. It cannot reach a repo-scoped workflow living in
+/// some other repo's `.rk/workflows/` (which is where `steward-grmpl` belongs —
+/// TKT-178), so a per-repo steward still has to carry the binding on its own.
+///
+/// `(artifact, <repo>, review)` is the shared key: a steward is fired PER rat
+/// completion, so instances run concurrently on one repo by design and all of
+/// them read it. Unbound, "newest match wins" is whichever reviewer finished
+/// last.
+#[test]
+fn every_shipped_verdict_read_is_bound_to_its_reviewer() {
+    use rk_workflow::Step;
+
+    /// Every read of a `review` artifact anywhere in a step tree, including
+    /// inside `when` arms and `repeat` bodies — the binding has to hold wherever
+    /// the read is nested, not just at the top level.
+    fn verdict_reads<'a>(steps: &'a [Step], found: &mut Vec<&'a rk_workflow::ReadStep>) {
+        for step in steps {
+            match step {
+                Step::Read(r) if r.identity == "review" => found.push(r),
+                Step::When(w) => {
+                    for branch in w.cases.values() {
+                        verdict_reads(branch, found);
+                    }
+                    verdict_reads(&w.default, found);
+                }
+                Step::Repeat(r) => verdict_reads(&r.steps, found),
+                _ => {}
+            }
+        }
+    }
+
+    let inputs = HashMap::from([
+        ("taskId".to_string(), json!("example-task")),
+        ("description".to_string(), json!("example description")),
+        (
+            "question".to_string(),
+            json!("How does the tuplespace work?"),
+        ),
+    ]);
+    let mut total = 0;
+    for def in rk_workflow::definitions(&examples_dir()) {
+        let name = def.file_name().unwrap().to_string_lossy().to_string();
+        let workflow = rk_workflow::load(&def, &inputs)
+            .unwrap_or_else(|e| panic!("{name} failed to load: {e}"));
+        let mut reads = Vec::new();
+        verdict_reads(&workflow.steps, &mut reads);
+        for read in &reads {
+            assert!(
+                read.from_agent,
+                "{name}: the verdict read into `{}` must be bound to the reviewer that wrote \
+                 it (`fromAgent: true`), or a concurrent instance's verdict can route it",
+                read.into
+            );
+        }
+        total += reads.len();
+    }
+    // The premise: the shipped set really does contain verdict-routed workflows
+    // (steward + reviewer-drives-rework). Without this the loop above passes
+    // vacuously if they are all renamed away.
+    assert!(
+        total >= 2,
+        "expected the shipped examples to route on reviewer verdicts, found {total}"
+    );
+}
+
 #[test]
 fn pr_on_approve_opens_a_pr_on_approve_only() {
     use rk_workflow::Step;
