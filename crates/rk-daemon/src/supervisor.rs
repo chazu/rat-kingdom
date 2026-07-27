@@ -2384,6 +2384,9 @@ impl Supervisor {
         let mut env = HashMap::new();
         env.insert("RK_HOME".into(), self.layout.home().display().to_string());
         env.insert("RK_AGENT".into(), name.to_string());
+        if let Ok(token) = self.layout.agent_auth_token(name) {
+            env.insert("RK_AUTH_TOKEN".into(), token);
+        }
         // So `rk prime` inside the rat renders this rat's own role automatically.
         env.insert("RK_ROLE".into(), role.to_string());
         env.insert("RK_REPO".into(), repo_name.to_string());

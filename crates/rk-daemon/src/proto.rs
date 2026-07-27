@@ -8,8 +8,20 @@ use serde_json::Value;
 pub struct Request {
     pub id: String,
     pub method: String,
+    /// Per-layout bearer token. Empty/missing tokens are rejected by the
+    /// daemon; the default exists only so old wire fixtures deserialize cleanly.
+    #[serde(default)]
+    pub auth: String,
+    /// Operator or the agent name supplied by the supervised process. This is
+    /// authorization context, not a tuple payload and never a sync identity.
+    #[serde(default = "default_caller")]
+    pub caller: String,
     #[serde(default)]
     pub params: Value,
+}
+
+fn default_caller() -> String {
+    "operator".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +66,9 @@ pub mod codes {
     pub const BAD_PARAMS: &str = "bad_params";
     pub const INTERNAL: &str = "internal";
     pub const SHUTTING_DOWN: &str = "shutting_down";
+    pub const UNAUTHORIZED: &str = "unauthorized";
+    pub const FORBIDDEN: &str = "forbidden";
+    pub const FRAME_TOO_LARGE: &str = "frame_too_large";
 }
 
 #[cfg(test)]

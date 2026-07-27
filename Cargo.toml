@@ -59,6 +59,7 @@ schemars = { version = "0.8", features = ["chrono"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 hex = "0.4"
+sha2 = "0.10"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

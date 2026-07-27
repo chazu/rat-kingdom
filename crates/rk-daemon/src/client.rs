@@ -12,6 +12,8 @@ use tracing::debug;
 pub struct Client {
     stream: BufReader<UnixStream>,
     next_id: u64,
+    auth_token: String,
+    caller: String,
 }
 
 impl Client {
@@ -21,9 +23,17 @@ impl Client {
         let stream = UnixStream::connect(&sock)
             .await
             .map_err(|_| rk_core::Error::DaemonNotRunning(sock.display().to_string()))?;
+        let caller = std::env::var("RK_AGENT").unwrap_or_else(|_| "operator".into());
+        let auth_token = match std::env::var("RK_AUTH_TOKEN") {
+            Ok(token) => token,
+            Err(_) if caller == "operator" => layout.auth_token()?,
+            Err(_) => layout.agent_auth_token(&caller)?,
+        };
         Ok(Self {
             stream: BufReader::new(stream),
             next_id: 0,
+            auth_token,
+            caller,
         })
     }
 
@@ -83,6 +93,8 @@ impl Client {
         let req = Request {
             id: self.next_id.to_string(),
             method: method.to_string(),
+            auth: self.auth_token.clone(),
+            caller: self.caller.clone(),
             params,
         };
         let mut line = serde_json::to_vec(&req)?;

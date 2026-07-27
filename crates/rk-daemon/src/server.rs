@@ -27,6 +27,7 @@ use rk_core::tuple::DEFAULT_TRAIL_TTL;
 /// forever; clients requesting more get clamped.
 const MAX_BLOCK: Duration = Duration::from_secs(3600);
 const DEFAULT_BLOCK: Duration = Duration::from_secs(5);
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 pub struct Daemon {
     layout: Layout,
@@ -56,6 +57,7 @@ pub struct Daemon {
     /// Fleet-wide default merge mode a repo is registered with when `rk repo
     /// add` names no explicit `--merge-mode` (`[policy] default_merge_mode`).
     default_merge_mode: rk_core::config::MergeMode,
+    auth_token: String,
     engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
     repos: std::sync::Mutex<crate::repos::RepoRegistry>,
     tickets: Arc<crate::tickets::Tickets>,
@@ -217,6 +219,7 @@ impl Daemon {
         space: Space,
     ) -> rk_core::Result<Self> {
         layout.ensure()?;
+        let auth_token = layout.auth_token()?;
         // One Tickets instance, shared by the RPC handlers and the supervisor,
         // so ticket-lifecycle writes serialize on a single lock.
         let tickets = Arc::new(crate::tickets::Tickets::new(space.clone(), castle.clone()));
@@ -254,6 +257,7 @@ impl Daemon {
             default_harness,
             require_named_checks: false,
             default_merge_mode: rk_core::config::MergeMode::default(),
+            auth_token,
             engine: std::sync::OnceLock::new(),
             repos,
             tickets,
@@ -625,13 +629,54 @@ impl Daemon {
 
     async fn serve_conn(&self, stream: UnixStream) -> std::io::Result<()> {
         let (read, mut write) = stream.into_split();
-        let mut lines = BufReader::new(read).lines();
+        let mut read = BufReader::new(read);
+        let mut buf = Vec::new();
 
-        while let Some(line) = lines.next_line().await? {
+        loop {
+            buf.clear();
+            loop {
+                let available = tokio::time::timeout(Duration::from_secs(30), read.fill_buf())
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "request timeout")
+                    })??;
+                if available.is_empty() {
+                    if buf.is_empty() {
+                        return Ok(());
+                    }
+                    break;
+                }
+                let newline = available.iter().position(|byte| *byte == b'\n');
+                let take = newline.map_or(available.len(), |position| position + 1);
+                if buf.len() + take > MAX_FRAME_BYTES {
+                    write_json_line(
+                        &mut write,
+                        &Response::err("", codes::FRAME_TOO_LARGE, "request exceeds 1 MiB"),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                buf.extend_from_slice(&available[..take]);
+                read.consume(take);
+                if newline.is_some() {
+                    break;
+                }
+            }
+            let line = String::from_utf8_lossy(&buf);
             if line.trim().is_empty() {
                 continue;
             }
             let outcome = match serde_json::from_str::<Request>(&line) {
+                Ok(req) if !self.authenticated(&req) => Outcome::Reply(Response::err(
+                    req.id,
+                    codes::UNAUTHORIZED,
+                    "invalid daemon token",
+                )),
+                Ok(req) if !self.authorized(&req) => Outcome::Reply(Response::err(
+                    req.id,
+                    codes::FORBIDDEN,
+                    format!("{} is not authorized for {}", req.caller, req.method),
+                )),
                 Ok(req) => self.dispatch(req).await,
                 Err(e) => Outcome::Reply(Response::err(
                     "",
@@ -657,7 +702,39 @@ impl Daemon {
                 }
             }
         }
-        Ok(())
+    }
+
+    fn authorized(&self, req: &Request) -> bool {
+        if req.caller == "operator" || req.caller.is_empty() {
+            return true;
+        }
+        req.auth == rk_core::paths::derive_agent_token(&self.auth_token, &req.caller)
+            && !matches!(
+                req.method.as_str(),
+                "stop"
+                    | "agent.spawn"
+                    | "agent.respawn"
+                    | "agent.dismiss"
+                    | "agent.interrupt"
+                    | "agent.steer"
+                    | "agent.archive"
+                    | "agent.unarchive"
+                    | "agent.revert"
+                    | "repo.add"
+                    | "repo.remove"
+                    | "workflow.run"
+                    | "workflow.approve"
+                    | "sync.now"
+                    | "sync.peers"
+            )
+    }
+
+    fn authenticated(&self, req: &Request) -> bool {
+        if req.caller == "operator" || req.caller.is_empty() {
+            req.auth == self.auth_token
+        } else {
+            req.auth == rk_core::paths::derive_agent_token(&self.auth_token, &req.caller)
+        }
     }
 
     /// Push matching tuples as notification lines until the client goes away.
@@ -1475,11 +1552,41 @@ impl Daemon {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
+        let caller = req.caller.clone();
+        let is_agent = caller != "operator" && !caller.is_empty();
+        if is_agent {
+            if params.lifecycle == Some(Lifecycle::Furniture)
+                || matches!(params.category, Category::Fact | Category::Convention)
+            {
+                return Response::err(
+                    req.id,
+                    codes::FORBIDDEN,
+                    "agents cannot write furniture, fact, or convention tuples",
+                );
+            }
+            if params
+                .instance
+                .as_deref()
+                .is_some_and(|instance| instance != caller)
+            {
+                return Response::err(
+                    req.id,
+                    codes::FORBIDDEN,
+                    "agents may only write tuples for their own instance",
+                );
+            }
+        }
         let mut tuple = Tuple::new(
             params.category,
             params.scope,
             params.identity,
-            params.instance.unwrap_or_else(|| self.castle.clone()),
+            params.instance.unwrap_or_else(|| {
+                if is_agent {
+                    caller
+                } else {
+                    self.castle.clone()
+                }
+            }),
             params.payload,
         );
         let explicit_lifecycle = params.lifecycle.is_some() || params.ttl_secs.is_some();
@@ -1799,6 +1906,12 @@ where
     T: serde::Serialize,
 {
     let mut out = serde_json::to_vec(value)?;
+    if out.len() > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "response exceeds 1 MiB",
+        ));
+    }
     out.push(b'\n');
     write.write_all(&out).await
 }

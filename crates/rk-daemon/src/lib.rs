@@ -24,8 +24,11 @@ pub use server::Daemon;
 mod tests {
     use super::*;
     use rk_core::paths::Layout;
+    use crate::proto::{Request, Response};
     use serde_json::json;
     use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
 
     async fn start_daemon() -> (
         tempfile::TempDir,
@@ -70,6 +73,53 @@ mod tests {
             .unwrap();
         assert!(result.is_ok());
         assert!(!layout.socket_path().exists());
+    }
+
+    #[tokio::test]
+    async fn agent_rpc_is_authenticated_and_instance_scoped() {
+        let (_dir, layout, handle) = start_daemon().await;
+        let agent_token = layout.agent_auth_token("Whisker").unwrap();
+        let mut operator = connect(&layout).await;
+
+        let mut stream = BufReader::new(UnixStream::connect(layout.socket_path()).await.unwrap());
+        let forbidden = Request {
+            id: "1".into(),
+            method: "space.out".into(),
+            auth: agent_token.clone(),
+            caller: "Whisker".into(),
+            params: json!({
+                "category": "need",
+                "scope": "repo",
+                "identity": "help",
+                "instance": "another-agent"
+            }),
+        };
+        let mut line = serde_json::to_vec(&forbidden).unwrap();
+        line.push(b'\n');
+        stream.get_mut().write_all(&line).await.unwrap();
+        let mut response = String::new();
+        stream.read_line(&mut response).await.unwrap();
+        let decoded: Response = serde_json::from_str(&response).unwrap();
+        assert_eq!(decoded.error.unwrap().code, crate::proto::codes::FORBIDDEN);
+
+        let allowed = Request {
+            id: "2".into(),
+            method: "space.out".into(),
+            auth: agent_token,
+            caller: "Whisker".into(),
+            params: json!({"category": "need", "scope": "repo", "identity": "help"}),
+        };
+        let mut line = serde_json::to_vec(&allowed).unwrap();
+        line.push(b'\n');
+        stream.get_mut().write_all(&line).await.unwrap();
+        response.clear();
+        stream.read_line(&mut response).await.unwrap();
+        let decoded: Response = serde_json::from_str(&response).unwrap();
+        assert!(decoded.error.is_none());
+
+        assert_eq!(operator.call("ping", json!({})).await.unwrap(), json!("pong"));
+        operator.call("stop", json!({})).await.unwrap();
+        handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]
