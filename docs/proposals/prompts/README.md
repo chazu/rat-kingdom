@@ -17,7 +17,7 @@ a unified diff, a safety argument against the `prime.rs` tests, and any companio
 | 0001 | Strengthen completion verification | `FRAGMENT_COMPLETION` | landed (TKT-41) |
 | 0002 | Forbid workspace-wide reformatting churn | `FRAGMENT_GIT_SAFETY` | landed (`3690a85`) |
 | 0003 | Reviewer verdict criteria and cost | reviewer role | landed |
-| 0004 | Commit before you verify; `rk done` is not a commit | `FRAGMENT_COMPLETION` | proposed |
+| 0004 | Commit before you verify; `rk done` is not a commit | `FRAGMENT_COMPLETION` | landed (TKT-163) |
 | 0005 | Reviewer: an empty review branch has two causes | reviewer role | proposed |
 | 0006 | Read and endorse open suggestions on entry | `FRAGMENT_SPACE` | proposed |
 | 0007 | `cargo fmt` mechanics for the no-reformat rule | `FRAGMENT_GIT_SAFETY` | proposed |

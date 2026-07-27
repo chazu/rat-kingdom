@@ -142,7 +142,12 @@ or `need` tuple instead and let the orchestrator route it.
 const FRAGMENT_COMPLETION: &str = "\
 ## Completion protocol (mandatory, in order)
 
-1. Ensure the working tree is committed (no uncommitted changes).
+1. Commit BEFORE you verify, not after. Your branch is read by other agents
+   while you are still working — a reviewer chains off it the moment your
+   task is reported done, and an empty branch reads as a lost delivery. Never
+   start a long verification run, and never end a turn, with the work sitting
+   uncommitted in your worktree. Amend or add commits as verification forces
+   changes.
 2. Verify with the project's own build, tests, and linters — for a Rust crate
    that means `cargo build`, `cargo test`, and `cargo clippy` all pass. A
    partial check (e.g. `cue vet`) is NOT verification: the code must actually
@@ -151,7 +156,11 @@ const FRAGMENT_COMPLETION: &str = "\
    is unrelated to your change, do NOT fix it inline (peers on other branches
    will race you) — file a ticket and post a `fact` tuple describing it, then
    finish your own task.
-4. `rk done \"<summary>\"` — this is how the orchestrator knows you finished.
+4. Prove the branch carries the work before you signal. `rk done` is NOT a
+   commit: run `git status --porcelain` (must be empty) and
+   `git log <base>..HEAD` (must be non-empty). If a verification command is
+   still running, wait for it — do not report while it is in flight.
+5. `rk done \"<summary>\"` — this is how the orchestrator knows you finished.
 ";
 
 /// Compose the active fleet conventions into a binding "Standing conventions"
@@ -287,6 +296,34 @@ mod tests {
         let text = render("reviewer", &ctx());
         assert!(text.contains("APPROVE"));
         assert!(!text.contains("only your task"));
+    }
+
+    #[test]
+    fn completion_protocol_puts_the_commit_ahead_of_verification() {
+        // A rat that verifies first and commits after leaves its branch
+        // byte-identical to main for the length of the suite, and a reviewer
+        // chained off it reads the empty diff as a lost delivery (TKT-90,
+        // TKT-113). The order is load-bearing, so pin it for both roles along
+        // with the proof step that makes `rk done` more than a claim.
+        for role in ["rat", "reviewer"] {
+            let text = render(role, &ctx());
+            let commit_at = text
+                .find("Commit BEFORE you verify")
+                .expect("commit-first step");
+            let verify_at = text
+                .find("Verify with the project's own build")
+                .expect("verification step");
+            assert!(
+                commit_at < verify_at,
+                "{role} template should tell the rat to commit before verifying"
+            );
+            assert!(
+                text.contains("`rk done` is NOT a\n   commit"),
+                "{role} template should teach the branch-carries-the-work proof"
+            );
+            assert!(text.contains("git status --porcelain"));
+            assert!(text.contains("git log <base>..HEAD"));
+        }
     }
 
     #[test]
