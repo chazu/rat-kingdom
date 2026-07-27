@@ -2,7 +2,7 @@
 //!
 //! Payload search note: payloads are stored as their exact
 //! `serde_json::Value::to_string()` serialization, and payload search is a
-//! substring `LIKE` over that text — byte-for-byte the same haystack that
+//! literal substring search over that text — byte-for-byte the same haystack that
 //! [`rk_core::tuple::Pattern::matches`] uses in memory. Do not "optimize" this
 //! into FTS tokenization: divergent predicates between the storage query and
 //! the waiter wake path are how the predecessor lost wakeups.
@@ -70,6 +70,7 @@ impl Store {
             .map_err(sql_err)?;
         conn.pragma_update(None, "busy_timeout", 5000)
             .map_err(sql_err)?;
+        register_functions(&conn).map_err(sql_err)?;
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
         migrate(&conn)?;
         Ok(Self { conn })
@@ -77,6 +78,7 @@ impl Store {
 
     pub fn open_in_memory() -> rk_core::Result<Self> {
         let conn = Connection::open_in_memory().map_err(sql_err)?;
+        register_functions(&conn).map_err(sql_err)?;
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
         migrate(&conn)?;
         Ok(Self { conn })
@@ -135,43 +137,71 @@ impl Store {
         consumable_only: bool,
         limit: Option<usize>,
     ) -> rk_core::Result<Vec<Tuple>> {
+        self.query_ordered(pattern, consumable_only, limit, false)
+    }
+
+    /// Find tuples matching `pattern`, newest first, with the same predicate
+    /// semantics as [`Store::query`]. This is used by bounded read-side
+    /// reducers where the newest state supersedes historical events.
+    pub fn query_newest(
+        &self,
+        pattern: &Pattern,
+        consumable_only: bool,
+        limit: Option<usize>,
+    ) -> rk_core::Result<Vec<Tuple>> {
+        self.query_ordered(pattern, consumable_only, limit, true)
+    }
+
+    fn query_ordered(
+        &self,
+        pattern: &Pattern,
+        consumable_only: bool,
+        limit: Option<usize>,
+        newest_first: bool,
+    ) -> rk_core::Result<Vec<Tuple>> {
         let mut sql = String::from(
             "SELECT id, category, scope, identity, instance, lifecycle, payload, created_at, expires_at, strength
              FROM tuples WHERE 1=1",
         );
         let mut args: Vec<String> = Vec::new();
 
-        if let Some(c) = pattern.category {
-            sql.push_str(" AND category = ?");
-            args.push(c.as_str().to_string());
+        append_pattern_filters(&mut sql, &mut args, pattern, consumable_only);
+        sql.push_str(if newest_first {
+            " ORDER BY id DESC"
+        } else {
+            " ORDER BY id ASC"
+        });
+        if let Some(n) = limit {
+            sql.push_str(&format!(" LIMIT {n}"));
         }
-        if let Some(s) = &pattern.scope {
-            sql.push_str(" AND scope = ?");
-            args.push(s.clone());
+
+        let mut stmt = self.conn.prepare(&sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params_from_iter(args.iter()), row_to_tuple)
+            .map_err(sql_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(sql_err)?);
         }
-        if let Some(i) = &pattern.identity {
-            sql.push_str(" AND identity = ?");
-            args.push(i.clone());
-        }
-        if let Some(inst) = &pattern.instance {
-            sql.push_str(" AND instance = ?");
-            args.push(inst.clone());
-        }
-        if let Some(search) = &pattern.payload_search {
-            sql.push_str(" AND payload LIKE ? ESCAPE '\\'");
-            args.push(format!("%{}%", escape_like(search)));
-        }
-        if let Some(after) = &pattern.after_id {
-            // id is the TEXT PRIMARY KEY and ULIDs sort lexicographically by
-            // creation time, so this "newer than cursor" bound is answered from
-            // the PK index — a bounded delta scan, not a full-table read.
-            sql.push_str(" AND id > ?");
-            args.push(after.to_string());
-        }
-        if consumable_only {
-            sql.push_str(" AND lifecycle != 'furniture'");
-        }
-        sql.push_str(" ORDER BY id ASC");
+        Ok(out)
+    }
+
+    fn query_ranked_sql(
+        &self,
+        pattern: &Pattern,
+        now: DateTime<Utc>,
+        limit: Option<usize>,
+    ) -> rk_core::Result<Vec<Tuple>> {
+        let mut sql = String::from(
+            "SELECT id, category, scope, identity, instance, lifecycle, payload, created_at, expires_at, strength
+             FROM tuples WHERE 1=1",
+        );
+        let mut args: Vec<String> = Vec::new();
+        append_pattern_filters(&mut sql, &mut args, pattern, false);
+        // Score and cap in SQLite. Otherwise a hot scan materializes every
+        // matching row before Rust throws all but the requested top N away.
+        sql.push_str(" ORDER BY rk_hot_score(category, created_at, strength, ?) DESC, id DESC");
+        args.push(now.timestamp_millis().to_string());
         if let Some(n) = limit {
             sql.push_str(&format!(" LIMIT {n}"));
         }
@@ -191,30 +221,13 @@ impl Store {
     /// gradient, stigmergy P7). Each tuple is scored by
     /// `category_weight × recency × strength` — see [`hot_score`] — and returned
     /// highest-first, optionally capped to the top `limit`.
-    ///
-    /// Read-only sugar layered over [`Store::query`]: it reuses the exact same
-    /// WHERE clause (so the [`Pattern::matches`] mirror invariant is untouched)
-    /// and merely reorders in memory. The default oldest-first `query` path and
-    /// the waiter-wake predicate are deliberately left alone.
     pub fn query_ranked(
         &self,
         pattern: &Pattern,
         now: DateTime<Utc>,
         limit: Option<usize>,
     ) -> rk_core::Result<Vec<Tuple>> {
-        let tuples = self.query(pattern, false, None)?;
-        let mut scored: Vec<(f64, Tuple)> =
-            tuples.into_iter().map(|t| (hot_score(&t, now), t)).collect();
-        // Strongest score first; ties broken newest-id first so a hot-scan is
-        // deterministic. `total_cmp` keeps NaN-free scores well-ordered.
-        scored.sort_by(|a, b| {
-            b.0.total_cmp(&a.0).then_with(|| b.1.id.cmp(&a.1.id))
-        });
-        let mut out: Vec<Tuple> = scored.into_iter().map(|(_, t)| t).collect();
-        if let Some(n) = limit {
-            out.truncate(n);
-        }
-        Ok(out)
+        self.query_ranked_sql(pattern, now, limit)
     }
 
     /// Delete expired ephemeral tuples; returns how many were collected.
@@ -328,6 +341,77 @@ impl Store {
 /// without an old-but-strong Fact being buried instantly.
 const HOT_HALF_LIFE_SECS: f64 = 1800.0;
 
+fn append_pattern_filters(
+    sql: &mut String,
+    args: &mut Vec<String>,
+    pattern: &Pattern,
+    consumable_only: bool,
+) {
+    if let Some(c) = pattern.category {
+        sql.push_str(" AND category = ?");
+        args.push(c.as_str().to_string());
+    }
+    if let Some(s) = &pattern.scope {
+        sql.push_str(" AND scope = ?");
+        args.push(s.clone());
+    }
+    if let Some(i) = &pattern.identity {
+        sql.push_str(" AND identity = ?");
+        args.push(i.clone());
+    }
+    if let Some(inst) = &pattern.instance {
+        sql.push_str(" AND instance = ?");
+        args.push(inst.clone());
+    }
+    if let Some(search) = &pattern.payload_search {
+        // SQLite LIKE is ASCII-case-insensitive by default and treats `%` and
+        // `_` as wildcards. instr() is the literal, case-sensitive substring
+        // predicate used by Pattern::matches.
+        sql.push_str(" AND instr(payload, ?) > 0");
+        args.push(search.clone());
+    }
+    if let Some(after) = &pattern.after_id {
+        // id is the TEXT PRIMARY KEY and ULIDs sort lexicographically by
+        // creation time, so this "newer than" bound is answered from the PK.
+        sql.push_str(" AND id > ?");
+        args.push(after.to_string());
+    }
+    if consumable_only {
+        sql.push_str(" AND lifecycle != 'furniture'");
+    }
+}
+
+fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+
+    conn.create_scalar_function(
+        "rk_hot_score",
+        4,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let category: String = ctx.get(0)?;
+            let created_at: String = ctx.get(1)?;
+            let strength: Option<f64> = ctx.get(2)?;
+            let now_ms: i64 = ctx
+                .get::<String>(3)?
+                .parse()
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+            let category = category.parse::<Category>().map_err(|e| {
+                rusqlite::Error::UserFunctionError(Box::new(e))
+            })?;
+            let created_at = DateTime::parse_from_rfc3339(&created_at)
+                .map(|t| t.with_timezone(&Utc))
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+            let age_secs = now_ms
+                .saturating_sub(created_at.timestamp_millis())
+                .max(0) as f64
+                / 1000.0;
+            let recency = 0.5f64.powf(age_secs / HOT_HALF_LIFE_SECS);
+            Ok(category.weight() * recency * strength.unwrap_or(rk_core::tuple::FULL_STRENGTH))
+        },
+    )
+}
+
 /// The hot-scan gradient score for one tuple: `category_weight × recency ×
 /// strength`, all read-only signals.
 ///
@@ -338,17 +422,12 @@ const HOT_HALF_LIFE_SECS: f64 = 1800.0;
 /// * `strength` — the evaporating-trail pheromone strength (TKT-14); tuples
 ///   that do not carry one (facts, artifacts, …) count as [`FULL_STRENGTH`],
 ///   so their weight and recency alone rank them.
+#[cfg(test)]
 fn hot_score(tuple: &Tuple, now: DateTime<Utc>) -> f64 {
     let age_secs = (now - tuple.created_at).num_milliseconds().max(0) as f64 / 1000.0;
     let recency = 0.5f64.powf(age_secs / HOT_HALF_LIFE_SECS);
     let strength = tuple.strength.unwrap_or(rk_core::tuple::FULL_STRENGTH);
     tuple.category.weight() * recency * strength
-}
-
-fn escape_like(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
 }
 
 fn lifecycle_str(l: Lifecycle) -> &'static str {
@@ -359,11 +438,12 @@ fn lifecycle_str(l: Lifecycle) -> &'static str {
     }
 }
 
-fn parse_lifecycle(s: &str) -> Lifecycle {
+fn parse_lifecycle(s: &str) -> Result<Lifecycle, Error> {
     match s {
-        "furniture" => Lifecycle::Furniture,
-        "ephemeral" => Lifecycle::Ephemeral,
-        _ => Lifecycle::Session,
+        "furniture" => Ok(Lifecycle::Furniture),
+        "session" => Ok(Lifecycle::Session),
+        "ephemeral" => Ok(Lifecycle::Ephemeral),
+        other => Err(Error::InvalidTuple(format!("unknown lifecycle: {other}"))),
     }
 }
 
@@ -376,22 +456,46 @@ fn row_to_tuple(row: &Row<'_>) -> rusqlite::Result<Tuple> {
     let expires_at: Option<String> = row.get(8)?;
     let strength: Option<f64> = row.get(9)?;
 
+    let id = id
+        .parse()
+        .map_err(|e| conversion_error(0, rusqlite::types::Type::Text, e))?;
+    let category = category
+        .parse::<Category>()
+        .map_err(|e| conversion_error(1, rusqlite::types::Type::Text, e))?;
+    let lifecycle = parse_lifecycle(&lifecycle)
+        .map_err(|e| conversion_error(5, rusqlite::types::Type::Text, e))?;
+    let payload = serde_json::from_str(&payload)
+        .map_err(|e| conversion_error(6, rusqlite::types::Type::Text, e))?;
+    let created_at = DateTime::parse_from_rfc3339(&created_at)
+        .map(|t| t.with_timezone(&Utc))
+        .map_err(|e| conversion_error(7, rusqlite::types::Type::Text, e))?;
+    let expires_at = expires_at
+        .map(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .map(|t| t.with_timezone(&Utc))
+                .map_err(|e| conversion_error(8, rusqlite::types::Type::Text, e))
+        })
+        .transpose()?;
+
     Ok(Tuple {
-        id: id.parse().unwrap_or_default(),
-        category: category.parse::<Category>().unwrap_or(Category::Event),
+        id,
+        category,
         scope: row.get(2)?,
         identity: row.get(3)?,
         instance: row.get(4)?,
-        lifecycle: parse_lifecycle(&lifecycle),
-        payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
-        created_at: DateTime::parse_from_rfc3339(&created_at)
-            .map(|t| t.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now()),
-        expires_at: expires_at
-            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|t| t.with_timezone(&Utc)),
+        lifecycle,
+        payload,
+        created_at,
+        expires_at,
         strength,
     })
+}
+
+fn conversion_error<E>(index: usize, ty: rusqlite::types::Type, error: E) -> rusqlite::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    rusqlite::Error::FromSqlConversionFailure(index, ty, Box::new(error))
 }
 
 fn sql_err(e: rusqlite::Error) -> Error {
@@ -480,7 +584,11 @@ mod tests {
                 payload_search: Some("Whisker".into()),
                 ..Default::default()
             },
-            // LIKE metacharacters must be treated literally.
+            Pattern {
+                payload_search: Some("whisker".into()),
+                ..Default::default()
+            },
+            // Punctuation must be treated literally, not as a wildcard.
             Pattern {
                 payload_search: Some("50%".into()),
                 ..Default::default()
@@ -510,6 +618,22 @@ mod tests {
             from_mem.sort_by_key(|t| t.id);
             assert_eq!(from_sql, from_mem, "pattern diverged: {p:?}");
         }
+    }
+
+    #[test]
+    fn malformed_rows_fail_closed_instead_of_becoming_fake_tuples() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO tuples
+                 (id, category, scope, identity, instance, lifecycle, payload, created_at, expires_at, strength)
+                 VALUES (?1, 'event', 'repo', 'bad', 'castle', 'session', '{', 'not-a-date', NULL, NULL)",
+                ["01ARZ3NDEKTSV4RRFFQ69G5FAV"],
+            )
+            .unwrap();
+
+        assert!(store.query(&Pattern::default(), false, None).is_err());
     }
 
     #[test]
@@ -610,7 +734,7 @@ mod tests {
                      identity TEXT NOT NULL, instance TEXT NOT NULL, lifecycle TEXT NOT NULL,
                      payload TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT);
                  INSERT INTO tuples VALUES
-                     ('01', 'fact', 'repo', 'old', 'castle', 'session', '{}', '2020-01-01T00:00:00Z', NULL);",
+                     ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'fact', 'repo', 'old', 'castle', 'session', '{}', '2020-01-01T00:00:00Z', NULL);",
             )
             .unwrap();
         }

@@ -272,8 +272,8 @@ pub fn build(
     // else in this queue tracks it. Surface each so a pushed branch is visible
     // attention, never silently forgotten, carrying the forge URL to review it.
     // Dedup by (scope, branch): a re-land emits a fresh event for the same
-    // branch, and only the newest matters. `pull_requests` arrives oldest-first
-    // (scan order), so a later event overwrites an earlier one for its branch.
+    // branch, and only the newest matters. Compare ULIDs explicitly so this
+    // reducer remains correct for either storage scan order.
     // `cleared_prs` names (scope, branch) pairs whose branch has since been
     // merged into its target or deleted (computed against local git by the
     // caller); those rows have auto-cleared and are dropped, so a merged PR
@@ -303,7 +303,12 @@ pub fn build(
         if suppressed.contains(&key) {
             continue;
         }
-        latest_pr.insert(key, t);
+        if latest_pr
+            .get(&key)
+            .is_none_or(|previous| previous.id < t.id)
+        {
+            latest_pr.insert(key, t);
+        }
     }
     // Deterministic order: newest PR first (event ids are time-sortable).
     let mut prs: Vec<&Tuple> = latest_pr.into_values().collect();
@@ -506,7 +511,7 @@ fn window_left(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String 
 ///
 /// Newest-wins is what retires a retry: a successful re-land emits a later
 /// `{merged: true}` event for the same branch, which replaces the failed one.
-/// Events arrive oldest-first (scan order), so the last entry for a branch wins.
+/// The newest ULID wins regardless of storage scan order.
 ///
 /// Public because the caller runs a git query per branch to decide which rows
 /// have auto-cleared, and that query is a subprocess: it must run over these —
@@ -519,7 +524,10 @@ pub fn dropped_lands(lands: &[Tuple]) -> Vec<&Tuple> {
         let Some(branch) = t.payload.get("branch").and_then(|v| v.as_str()) else {
             continue;
         };
-        latest.insert((t.scope.clone(), branch.to_string()), t);
+        let key = (t.scope.clone(), branch.to_string());
+        if latest.get(&key).is_none_or(|previous| previous.id < t.id) {
+            latest.insert(key, t);
+        }
     }
     let mut dropped: Vec<&Tuple> = latest
         .into_values()
@@ -532,8 +540,8 @@ pub fn dropped_lands(lands: &[Tuple]) -> Vec<&Tuple> {
         .collect();
     // Deterministic order: newest first (event ids are time-sortable).
     dropped.sort_by_key(|b| std::cmp::Reverse(b.id));
-    dropped
-}
+        dropped
+    }
 
 /// Read a boolean outcome flag off an event payload. A missing or non-boolean
 /// field is `false` — events written before a flag existed must not read as if
@@ -738,10 +746,12 @@ mod tests {
     #[test]
     fn open_pr_dedups_by_branch_keeping_newest() {
         // A re-land emits a second event for the same branch; only the newest
-        // should surface, as one row. Events arrive oldest-first (scan order),
-        // so the last entry for a branch wins.
-        let older = pull_request("rat/rat-9/tkt-9", "main", Some("https://forge/pr/1"));
-        let newer = pull_request("rat/rat-9/tkt-9", "main", Some("https://forge/pr/2"));
+        // should surface, as one row. Make the ULID order deterministic because
+        // two events can otherwise share a millisecond.
+        let mut older = pull_request("rat/rat-9/tkt-9", "main", Some("https://forge/pr/1"));
+        let mut newer = pull_request("rat/rat-9/tkt-9", "main", Some("https://forge/pr/2"));
+        older.id = rk_core::id::RecordId::floor_at(Utc::now());
+        newer.id = rk_core::id::RecordId::floor_at(Utc::now() + chrono::Duration::seconds(1));
         let inbox = build(
             &[],
             &[],
@@ -942,8 +952,10 @@ mod tests {
         // Newest event per branch wins: the retry merged, so the branch is no
         // longer dropped even though the failed event is still in the store.
         // Events arrive oldest-first (scan order).
-        let failed = land("rat/a/tkt-9", false, false, "conflict");
-        let retried = land("rat/a/tkt-9", true, false, "merged rat/a/tkt-9 into main");
+        let mut failed = land("rat/a/tkt-9", false, false, "conflict");
+        let mut retried = land("rat/a/tkt-9", true, false, "merged rat/a/tkt-9 into main");
+        failed.id = rk_core::id::RecordId::floor_at(Utc::now());
+        retried.id = rk_core::id::RecordId::floor_at(Utc::now() + chrono::Duration::seconds(1));
         let inbox = build(
             &[],
             &[],
@@ -959,6 +971,28 @@ mod tests {
             inbox.is_empty(),
             "a successful re-land must clear it: {inbox:?}"
         );
+    }
+
+    #[test]
+    fn newest_land_wins_even_when_storage_returns_newest_first() {
+        let mut failed = land("rat/a/tkt-9", false, false, "conflict");
+        let mut retried = land("rat/a/tkt-9", true, false, "merged");
+        failed.id = rk_core::id::RecordId::floor_at(Utc::now());
+        retried.id = rk_core::id::RecordId::floor_at(Utc::now() + chrono::Duration::seconds(1));
+
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents {
+                // This is the order produced by the bounded newest-first scan.
+                lands: &[retried, failed],
+                ..Default::default()
+            },
+            &Ballots::default(),
+        );
+        assert!(inbox.is_empty(), "newest successful state must win: {inbox:?}");
     }
 
     #[test]

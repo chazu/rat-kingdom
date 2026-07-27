@@ -8,7 +8,7 @@
 //   {{ctx.previousResult}} result text of the last completed wait step
 //   {{ctx.var.<name>}}     a variable lifted by a `read` step
 // Inside a for_each task template, per-ticket placeholders also resolve:
-//   {{item.id}}    the ticket id (e.g. TKT-7)
+//   {{item.id}}    the ticket id (e.g. TKT-<id>)
 //   {{item.title}} the ticket title
 //   {{item.body}}  the ticket body
 // Parameters are referenced as _input.<name> and resolve at load time.

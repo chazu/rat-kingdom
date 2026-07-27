@@ -40,6 +40,10 @@ split into regular, pushed slices:
   protects checked-out targets from ref-only advancement, adds definition
   digests for restart recovery, forces the socket to `0600`, bounds TTL and
   scheduler inputs, and makes SQLite migrations fail loudly.
+- The audit-closure slice bounds ranked and inbox reads in SQLite, makes tuple
+  payload matching literal and row decoding fail closed, confines workflow
+  checks to their worktree with capped child output, isolates inbox Git checks
+  from Tokio workers, and narrows agent-authored event capabilities.
 
 The implementation also added regression coverage for authenticated agent
 access, ungated landing, missing-repository reactor retry, atomic replication,
@@ -205,8 +209,35 @@ read-only survey:
 5. Async RPC handlers still had synchronous CUE, Git, registry, and lifecycle
    work; the blocking paths are now isolated from Tokio request workers.
 6. Daemon-backed CLI integration tests used a one-second startup window that
-   was too short under workspace-wide parallel load; the tests now allow five
+   was too short under workspace-wide parallel load; the tests now allow thirty
    seconds and report the same socket contract.
 7. A frame cap alone still allowed `space.scan` to materialize an unbounded
    SQLite result before serialization; RPC scans now cap materialization and
    disclose truncation.
+8. `rk prime` and the dependency examples still taught numeric ticket ids after
+   ticket creation switched to ULIDs; operator guidance now uses the returned
+   `TKT-<id>` everywhere.
+9. Ranked scans passed a limit only to Rust result truncation, so a broad
+   `--hot` query still materialized the whole table; ranking now happens in
+   SQLite before the bounded result is decoded.
+10. SQLite `LIKE` is ASCII case-insensitive while `Pattern::matches` is not, so
+    a payload search could route a workflow on a tuple the waiter predicate
+    would reject; storage now uses a literal, case-sensitive substring query.
+11. Agent callers could write `task` tuples through `space.out` or mutate
+    arbitrary ticket status through the RPC; task creation remains available,
+    while task tuples and ticket mutation/dependency methods are operator-only.
+12. `inbox.list` still performed local Git branch checks on a Tokio request
+    worker; the branch-resolution portion now runs behind `spawn_blocking`, and
+    newest-first source histories plus a response cap prevent old event buildup
+    from starving the RPC frame.
+13. Workflow `run` steps accepted absolute or symlinked `cwd` values outside an
+    agent worktree and buffered unlimited command output; cwd resolution now
+    canonicalizes and confines the directory, while each output stream is
+    capped and overflow/timeout kills the child.
+14. Malformed SQLite tuple rows silently became default ids, `Event` tuples,
+    `null` payloads, or current timestamps; row decoding now fails closed so
+    persisted corruption cannot silently alter coordination semantics.
+15. Agent-authenticated callers could emit arbitrary `Event` identities and
+    forge workflow lifecycle signals in payloads; agents now have an explicit
+    `task_done` event capability tied to their authenticated identity, while
+    daemon lifecycle events remain daemon-owned.

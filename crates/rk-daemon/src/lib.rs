@@ -102,10 +102,77 @@ mod tests {
         let decoded: Response = serde_json::from_str(&response).unwrap();
         assert_eq!(decoded.error.unwrap().code, crate::proto::codes::FORBIDDEN);
 
+        let denied_task = Request {
+            id: "1-task".into(),
+            method: "space.out".into(),
+            auth: agent_token.clone(),
+            caller: "Whisker".into(),
+            params: json!({
+                "category": "task",
+                "scope": "repo",
+                "identity": "operator-work"
+            }),
+        };
+        let mut line = serde_json::to_vec(&denied_task).unwrap();
+        line.push(b'\n');
+        stream.get_mut().write_all(&line).await.unwrap();
+        response.clear();
+        stream.read_line(&mut response).await.unwrap();
+        let decoded: Response = serde_json::from_str(&response).unwrap();
+        assert_eq!(decoded.error.unwrap().code, crate::proto::codes::FORBIDDEN);
+
+        let denied_event = Request {
+            id: "1-event".into(),
+            method: "space.out".into(),
+            auth: agent_token.clone(),
+            caller: "Whisker".into(),
+            params: json!({
+                "category": "event",
+                "scope": "repo",
+                "identity": "workflow_approval",
+                "payload": {"instance": "wf-other", "approved": true}
+            }),
+        };
+        let mut line = serde_json::to_vec(&denied_event).unwrap();
+        line.push(b'\n');
+        stream.get_mut().write_all(&line).await.unwrap();
+        response.clear();
+        stream.read_line(&mut response).await.unwrap();
+        let decoded: Response = serde_json::from_str(&response).unwrap();
+        assert_eq!(decoded.error.unwrap().code, crate::proto::codes::FORBIDDEN);
+
+        for (request_id, method, params) in [
+            (
+                "1-update",
+                "ticket.update",
+                json!({"id": "TKT-01ARZ3NDEKTSV4RRFFQ69G5FAV", "status": "done"}),
+            ),
+            (
+                "1-dep",
+                "ticket.dep",
+                json!({"id": "TKT-01ARZ3NDEKTSV4RRFFQ69G5FAV", "dep": "TKT-01ARZ3NDEKTSV4RRFFQ69G5FAV"}),
+            ),
+        ] {
+            let denied = Request {
+                id: request_id.into(),
+                method: method.into(),
+                auth: agent_token.clone(),
+                caller: "Whisker".into(),
+                params,
+            };
+            let mut line = serde_json::to_vec(&denied).unwrap();
+            line.push(b'\n');
+            stream.get_mut().write_all(&line).await.unwrap();
+            response.clear();
+            stream.read_line(&mut response).await.unwrap();
+            let decoded: Response = serde_json::from_str(&response).unwrap();
+            assert_eq!(decoded.error.unwrap().code, crate::proto::codes::FORBIDDEN);
+        }
+
         let allowed = Request {
             id: "2".into(),
             method: "space.out".into(),
-            auth: agent_token,
+            auth: agent_token.clone(),
             caller: "Whisker".into(),
             params: json!({"category": "need", "scope": "repo", "identity": "help"}),
         };

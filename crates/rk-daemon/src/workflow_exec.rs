@@ -26,6 +26,8 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 /// A boxed future for hand-rolled async recursion (nested `when` / `repeat`).
@@ -34,6 +36,11 @@ type StepFuture<'a> = Pin<Box<dyn Future<Output = rk_core::Result<Flow>> + Send 
 /// Mirrors rk-workflow's `RunStep` timeout default; a referencing `run` step
 /// left at this value defers to a named check's own timeout (TKT-30).
 const DEFAULT_RUN_TIMEOUT: &str = "10m";
+
+/// Keep a noisy or compromised check from turning the daemon into an
+/// unbounded stdout/stderr buffer. The cap applies independently to each
+/// stream; exceeding it fails the run and kills the child.
+const MAX_RUN_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// Hard ceiling on `sub_workflow` nesting depth — the depth analog of the
 /// `repeat` max cap (rk-workflow `#RepeatStep.max`). A top-level `run` is depth
@@ -157,6 +164,227 @@ pub struct WorkflowContext {
     pub approval_granted: bool,
 }
 
+async fn read_capped<R>(mut reader: R) -> rk_core::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(output);
+        }
+        if output.len().saturating_add(read) > MAX_RUN_OUTPUT_BYTES {
+            return Err(rk_core::Error::other(format!(
+                "run step output exceeds {MAX_RUN_OUTPUT_BYTES} bytes"
+            )));
+        }
+        output.extend_from_slice(&chunk[..read]);
+    }
+}
+
+async fn abort_task<T>(task: &mut JoinHandle<T>) {
+    task.abort();
+    let _ = task.await;
+}
+
+async fn collect_child_output(
+    mut child: tokio::process::Child,
+    timeout: Duration,
+    command: &str,
+    timeout_text: &str,
+) -> rk_core::Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| rk_core::Error::other("run step: child stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| rk_core::Error::other("run step: child stderr was not piped"))?;
+
+    // Put the child in a task whose cancellation/drop semantics own the
+    // process. Reader overflow, join failure, and timeout all abort this task,
+    // dropping the kill_on_drop child and preventing orphaned checks.
+    let mut wait_task = tokio::spawn(async move { child.wait().await });
+    let mut stdout_task = tokio::spawn(read_capped(stdout));
+    let mut stderr_task = tokio::spawn(read_capped(stderr));
+    let mut status = None;
+    let mut stdout = None;
+    let mut stderr = None;
+    let sleep = tokio::time::sleep(timeout);
+    tokio::pin!(sleep);
+
+    while status.is_none() || stdout.is_none() || stderr.is_none() {
+        tokio::select! {
+            result = &mut wait_task, if status.is_none() => {
+                match result {
+                    Ok(Ok(exit)) => status = Some(exit),
+                    Ok(Err(error)) => {
+                        if stdout.is_none() {
+                            abort_task(&mut stdout_task).await;
+                        }
+                        if stderr.is_none() {
+                            abort_task(&mut stderr_task).await;
+                        }
+                        return Err(rk_core::Error::other(format!(
+                            "run step: `{command}` failed: {error}"
+                        )));
+                    }
+                    Err(error) => {
+                        if stdout.is_none() {
+                            abort_task(&mut stdout_task).await;
+                        }
+                        if stderr.is_none() {
+                            abort_task(&mut stderr_task).await;
+                        }
+                        return Err(rk_core::Error::other(format!(
+                            "run step: `{command}` wait task failed: {error}"
+                        )));
+                    }
+                }
+            }
+            result = &mut stdout_task, if stdout.is_none() => {
+                match result {
+                    Ok(Ok(bytes)) => stdout = Some(bytes),
+                    Ok(Err(error)) => {
+                        if status.is_none() {
+                            abort_task(&mut wait_task).await;
+                        }
+                        if stderr.is_none() {
+                            abort_task(&mut stderr_task).await;
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        if status.is_none() {
+                            abort_task(&mut wait_task).await;
+                        }
+                        if stderr.is_none() {
+                            abort_task(&mut stderr_task).await;
+                        }
+                        return Err(rk_core::Error::other(format!(
+                            "run step: stdout task failed: {error}"
+                        )));
+                    }
+                }
+            }
+            result = &mut stderr_task, if stderr.is_none() => {
+                match result {
+                    Ok(Ok(bytes)) => stderr = Some(bytes),
+                    Ok(Err(error)) => {
+                        if status.is_none() {
+                            abort_task(&mut wait_task).await;
+                        }
+                        if stdout.is_none() {
+                            abort_task(&mut stdout_task).await;
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        if status.is_none() {
+                            abort_task(&mut wait_task).await;
+                        }
+                        if stdout.is_none() {
+                            abort_task(&mut stdout_task).await;
+                        }
+                        return Err(rk_core::Error::other(format!(
+                            "run step: stderr task failed: {error}"
+                        )));
+                    }
+                }
+            }
+            _ = &mut sleep => {
+                if status.is_none() {
+                    abort_task(&mut wait_task).await;
+                }
+                if stdout.is_none() {
+                    abort_task(&mut stdout_task).await;
+                }
+                if stderr.is_none() {
+                    abort_task(&mut stderr_task).await;
+                }
+                return Err(rk_core::Error::other(format!(
+                    "run step: `{command}` timed out after {timeout_text}"
+                )));
+            }
+        }
+    }
+
+    Ok((
+        status.expect("status completed with all child tasks"),
+        stdout.expect("stdout completed with all child tasks"),
+        stderr.expect("stderr completed with all child tasks"),
+    ))
+}
+
+fn definition_inside_roots(
+    candidate: &Path,
+    repo: &str,
+    global_root: &Path,
+) -> Option<PathBuf> {
+    let candidate = candidate.canonicalize().ok()?;
+    if !candidate.is_file() {
+        return None;
+    }
+    let repo_root = PathBuf::from(repo)
+        .join(".rk")
+        .join("workflows")
+        .canonicalize()
+        .ok();
+    let global_root = global_root.canonicalize().ok();
+    [repo_root, global_root]
+        .into_iter()
+        .flatten()
+        .any(|root| candidate.starts_with(root))
+        .then_some(candidate)
+}
+
+fn resolve_worktree_cwd(
+    worktree: &Path,
+    requested: Option<&str>,
+    ctx: &WorkflowContext,
+) -> rk_core::Result<PathBuf> {
+    let root = worktree.canonicalize().map_err(|e| {
+        rk_core::Error::other(format!(
+            "run step: cannot resolve worktree '{}': {e}",
+            worktree.display()
+        ))
+    })?;
+    let relative = requested.map(|value| interpolate(value, ctx));
+    let candidate = match relative {
+        None => root.clone(),
+        Some(value) => {
+            let path = Path::new(&value);
+            if path.is_absolute() {
+                return Err(rk_core::Error::other(
+                    "run step: cwd must be relative to the agent worktree",
+                ));
+            }
+            root.join(path)
+        }
+    };
+    let candidate = candidate.canonicalize().map_err(|e| {
+        rk_core::Error::other(format!(
+            "run step: cannot resolve cwd '{}': {e}",
+            candidate.display()
+        ))
+    })?;
+    if !candidate.starts_with(&root) {
+        return Err(rk_core::Error::other(
+            "run step: cwd escapes the agent worktree",
+        ));
+    }
+    if !candidate.is_dir() {
+        return Err(rk_core::Error::other(format!(
+            "run step: cwd '{}' is not a directory",
+            candidate.display()
+        )));
+    }
+    Ok(candidate)
+}
+
 /// One agent in a fan-out set: its name, its branch, and the ticket it drains.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FannedAgent {
@@ -227,22 +455,41 @@ impl WorkflowEngine {
     }
 
     /// Resolve `<name>` to a definition file: `<repo>/.rk/workflows/<name>.cue`
-    /// wins over `~/.rat-kingdom/workflows/<name>.cue`; a path is used as-is.
+    /// wins over `~/.rat-kingdom/workflows/<name>.cue`. Direct `.cue` paths are
+    /// accepted only when they stay inside one of those two roots.
     pub fn find_definition(&self, name: &str, repo: &str) -> rk_core::Result<PathBuf> {
         let as_path = PathBuf::from(name);
         if as_path.extension().map(|e| e == "cue").unwrap_or(false) && as_path.exists() {
-            return Ok(as_path);
+            return definition_inside_roots(&as_path, repo, &self.layout.workflows_dir())
+                .ok_or_else(|| {
+                    rk_core::Error::other(format!(
+                        "workflow definition path '{}' is outside the registered workflow roots",
+                        as_path.display()
+                    ))
+                });
         }
         let repo_local = PathBuf::from(repo)
             .join(".rk")
             .join("workflows")
             .join(format!("{name}.cue"));
         if repo_local.exists() {
-            return Ok(repo_local);
+            return definition_inside_roots(&repo_local, repo, &self.layout.workflows_dir())
+                .ok_or_else(|| {
+                    rk_core::Error::other(format!(
+                        "repo-local workflow '{}' is outside the registered workflow root",
+                        repo_local.display()
+                    ))
+                });
         }
         let global = self.layout.workflows_dir().join(format!("{name}.cue"));
         if global.exists() {
-            return Ok(global);
+            return definition_inside_roots(&global, repo, &self.layout.workflows_dir())
+                .ok_or_else(|| {
+                    rk_core::Error::other(format!(
+                        "global workflow '{}' is outside the registered workflow root",
+                        global.display()
+                    ))
+                });
         }
         Err(rk_core::Error::other(format!(
             "no workflow named '{name}' (looked in {} and {})",
@@ -1498,12 +1745,9 @@ impl WorkflowEngine {
         // either a repo-registered named check or a raw inline command — the
         // latter gated fail-closed by the require_named_checks policy (TKT-30).
         let resolved = self.resolve_run(run, repo)?;
-        // Resolve cwd relative to the worktree root; interpolate ctx
-        // placeholders in both fields for parity with the other steps.
-        let mut dir = worktree.clone();
-        if let Some(sub) = &resolved.cwd {
-            dir = dir.join(interpolate(sub, ctx));
-        }
+        // Resolve cwd relative to the worktree root; interpolation is allowed,
+        // but absolute paths, `..`, and symlinks that leave the worktree are not.
+        let dir = resolve_worktree_cwd(&worktree, resolved.cwd.as_deref(), ctx)?;
         let command = interpolate(&resolved.command, ctx);
         let timeout = parse_duration(&resolved.timeout)?;
 
@@ -1522,21 +1766,11 @@ impl WorkflowEngine {
                 rk_core::Error::other(format!("run step: failed to spawn `{command}`: {e}"))
             })?;
 
-        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(res) => res
-                .map_err(|e| rk_core::Error::other(format!("run step: `{command}` failed: {e}")))?,
-            Err(_) => {
-                // Fail closed: a suite that outruns its timeout is a red gate.
-                return Err(rk_core::Error::other(format!(
-                    "run step: `{command}` timed out after {}",
-                    resolved.timeout
-                )));
-            }
-        };
-
-        let exit = output.status.code().unwrap_or(-1) as i64;
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let (status, stdout, stderr) =
+            collect_child_output(child, timeout, &command, &resolved.timeout).await?;
+        let exit = status.code().unwrap_or(-1) as i64;
+        let stdout = String::from_utf8_lossy(&stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&stderr).into_owned();
         info!(agent = %agent, exit, command = %command, "run step completed");
         let result = json!({"exit": exit, "stdout": stdout, "stderr": stderr});
 
@@ -2209,6 +2443,42 @@ mod tests {
         assert!(parse_duration("   ").is_err());
         assert!(parse_duration("abc").is_err());
         assert!(parse_duration("m").is_err());
+    }
+
+    #[test]
+    fn run_cwd_cannot_escape_the_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("worktree");
+        let nested = worktree.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let ctx = WorkflowContext::default();
+
+        assert_eq!(
+            resolve_worktree_cwd(&worktree, None, &ctx).unwrap(),
+            worktree.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_worktree_cwd(&worktree, Some("src"), &ctx).unwrap(),
+            nested.canonicalize().unwrap()
+        );
+        assert!(resolve_worktree_cwd(&worktree, Some("../"), &ctx).is_err());
+        assert!(resolve_worktree_cwd(&worktree, Some(temp.path().to_str().unwrap()), &ctx).is_err());
+    }
+
+    #[tokio::test]
+    async fn run_output_cap_kills_a_noisy_child() {
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("yes noisy")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let error = collect_child_output(child, Duration::from_secs(2), "yes noisy", "2s")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("output exceeds"));
     }
 
     #[test]

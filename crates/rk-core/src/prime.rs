@@ -61,16 +61,16 @@ conversation.
   repo is expected (e.g. `rk spawn --repo <name>`).
 
 ## Tickets — the durable backlog
-- `rk ticket new \"<title>\" [--body \"...\"] [--repo <name>] [--priority p] [--depends-on TKT-n]`
-- `rk ticket new \"<title>\" --parent <TKT-n>` — decompose into sub-tickets.
-- `rk ticket dep <A> <B>` / `rk ticket undep <A> <B>` — A is blocked by B (cycles rejected).
+- `rk ticket new \"<title>\" [--body \"...\"] [--repo <name>] [--priority p] [--depends-on <TKT-id>]`
+- `rk ticket new \"<title>\" --parent <TKT-id>` — decompose into sub-tickets.
+- `rk ticket dep <TKT-id> <TKT-id>` / `rk ticket undep <TKT-id> <TKT-id>` — the first is blocked by the second (cycles rejected).
 - `rk ticket list [--repo <name>] [--status open]` — 🔒 marks blocked tickets.
 - `rk ticket ready [--repo <name>]` — tickets you can dispatch right now (deps satisfied).
-- `rk ticket show <TKT-n>` — one ticket with its sub-tickets and dependencies.
-- `rk ticket update <TKT-n> --status <s>` — open → claimed → in_progress → blocked → done → closed.
+- `rk ticket show <TKT-id>` — one ticket with its sub-tickets and dependencies.
+- `rk ticket update <TKT-id> --status <s>` — open → claimed → in_progress → blocked → done → closed.
 
 ## Dispatching rats
-- `rk spawn --ticket <TKT-n>` — dispatch a ticket: fills task/prompt from it,
+- `rk spawn --ticket <TKT-id>` — dispatch a ticket: fills task/prompt from it,
   resolves its repo, refuses a blocked ticket (`--force` overrides), and flips
   it to in_progress. Completion marks it done (unblocking dependents); merging
   it on dismiss marks it closed.

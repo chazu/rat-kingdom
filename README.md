@@ -196,14 +196,14 @@ decomposition — this is a DAG of "must finish first" edges). Cycles are
 rejected.
 
 ```bash
-rk ticket new "Build API" --depends-on TKT-1            # blocked-by at creation
-rk ticket dep TKT-3 TKT-2                               # TKT-3 is blocked by TKT-2
-rk ticket undep TKT-3 TKT-2                             # drop the edge
+rk ticket new "Build API" --depends-on TKT-<dependency-id>       # blocked-by at creation
+rk ticket dep TKT-<ticket-id> TKT-<dependency-id>                # first is blocked by second
+rk ticket undep TKT-<ticket-id> TKT-<dependency-id>              # drop the edge
 rk ticket ready --repo svc                              # open tickets with all deps satisfied
 ```
 
 `rk ticket list` marks blocked tickets with 🔒; `rk ticket show` annotates each
-dependency as satisfied (✓) or `blocking`. `rk spawn --ticket TKT-2` refuses a
+dependency as satisfied (✓) or `blocking`. `rk spawn --ticket TKT-<id>` refuses a
 blocked ticket unless you pass `--force`, so `rk ticket ready` is the list of
 what you can actually dispatch right now.
 
@@ -212,7 +212,7 @@ ticket, resolves the repo from the ticket's scope, and flips the ticket to
 `in_progress`:
 
 ```bash
-rk spawn --ticket TKT-3            # no hand-written --task/--prompt/--repo needed
+rk spawn --ticket TKT-<id>         # no hand-written --task/--prompt/--repo needed
 ```
 
 The ticket's lifecycle then closes itself: when the rat finishes (its `rk done`,

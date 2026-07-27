@@ -242,7 +242,7 @@ pub struct Pattern {
     pub identity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
-    /// Substring/FTS search over the serialized payload.
+    /// Literal, case-sensitive substring search over the serialized payload.
     ///
     /// INVARIANT (the predecessor's lesson): every code path that decides whether a tuple
     /// matches a waiting reader MUST use [`Pattern::matches`], which includes
@@ -398,7 +398,7 @@ mod tests {
             Category::Event,
             "myrepo",
             "task_done",
-            "castle-a",
+            "Whisker",
             json!({"agent": "Whisker", "task": ".rk-1"}),
         )
     }

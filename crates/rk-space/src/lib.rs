@@ -173,6 +173,16 @@ impl Space {
         self.lock().store.query(pattern, false, Some(limit))
     }
 
+    /// Non-blocking newest-first read capped at `limit`. Read-side reducers use
+    /// this when recent events supersede older ones and the history is bounded.
+    pub fn scan_newest_limited(
+        &self,
+        pattern: &Pattern,
+        limit: usize,
+    ) -> rk_core::Result<Vec<Tuple>> {
+        self.lock().store.query_newest(pattern, false, Some(limit))
+    }
+
     /// Delete one tuple by id (archive-on-resolution, targeted GC). Returns
     /// whether a row was removed. Unlike [`Space::take`], this consumes a
     /// *specific* tuple rather than the oldest pattern match — the reactor uses

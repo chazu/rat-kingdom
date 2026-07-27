@@ -9,7 +9,7 @@ use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
 use rk_space::Space;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -29,6 +29,10 @@ const MAX_BLOCK: Duration = Duration::from_secs(3600);
 const DEFAULT_BLOCK: Duration = Duration::from_secs(5);
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_SCAN_TUPLES: usize = 10_000;
+/// Inbox is an aggregation endpoint, so cap both its source histories and its
+/// final response. Newest-first source scans preserve the current state of
+/// event reducers when old history is truncated.
+const MAX_INBOX_ITEMS: usize = 2_048;
 
 pub struct Daemon {
     layout: Layout,
@@ -754,6 +758,8 @@ impl Daemon {
                     | "workflow.approve"
                     | "sync.now"
                     | "sync.peers"
+                    | "ticket.update"
+                    | "ticket.dep"
             )
     }
 
@@ -857,7 +863,7 @@ impl Daemon {
                 reply(self.handle_named(req, |sup, name| sup.unarchive_agent(&name)))
             }
             "budget.rollup" => reply(Response::ok(id, self.supervisor.fleet_rollup())),
-            "inbox.list" => reply(self.handle_inbox(id)),
+            "inbox.list" => reply(self.handle_inbox(id).await),
             "agent.status" => reply(self.handle_named(req, |sup, name| {
                 sup.status(&name)
                     .map(|r| json!({"agent": r}))
@@ -1080,23 +1086,35 @@ impl Daemon {
     /// gate-parked workflow instances, obstacle and need tuples, and open PRs
     /// awaiting review — into one ranked triage list. Pure read-side
     /// aggregation; no new storage.
-    fn handle_inbox(&self, id: String) -> Response {
+    async fn handle_inbox(&self, id: String) -> Response {
         let agents = self.supervisor.list();
         let instances = self.engine().list();
-        let obstacles = match self.space.scan(&Pattern::category(Category::Obstacle)) {
+        let mut source_truncated = false;
+        let mut scan = |pattern: &Pattern| {
+            let mut tuples = self
+                .space
+                .scan_newest_limited(pattern, MAX_SCAN_TUPLES.saturating_add(1));
+            if let Ok(rows) = &mut tuples {
+                if rows.len() > MAX_SCAN_TUPLES {
+                    source_truncated = true;
+                    rows.truncate(MAX_SCAN_TUPLES);
+                }
+            }
+            tuples
+        };
+        let obstacles = match scan(&Pattern::category(Category::Obstacle)) {
             Ok(t) => t,
             Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
         };
-        let needs = match self.space.scan(&Pattern::category(Category::Need)) {
+        let needs = match scan(&Pattern::category(Category::Need)) {
             Ok(t) => t,
             Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
         };
         // Open PRs/MRs: a PR-mode dismiss/land emits a `pull_request_opened`
         // event, then the run completes — nothing else tracks the pushed branch.
-        let pull_requests = match self
-            .space
-            .scan(&Pattern::category(Category::Event).identity("pull_request_opened"))
-        {
+        let pull_requests = match scan(
+            &Pattern::category(Category::Event).identity("pull_request_opened"),
+        ) {
             Ok(t) => t,
             Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
         };
@@ -1106,10 +1124,9 @@ impl Daemon {
         // LOCAL detection below could not see it. `build` folds their branches
         // into the same suppression. Reading the events is cheap and stays on
         // the hot path; the fetch that produces them does not.
-        let pull_requests_closed = match self
-            .space
-            .scan(&Pattern::category(Category::Event).identity("pull_request_closed"))
-        {
+        let pull_requests_closed = match scan(
+            &Pattern::category(Category::Event).identity("pull_request_closed"),
+        ) {
             Ok(t) => t,
             Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
         };
@@ -1120,10 +1137,7 @@ impl Daemon {
         // carry an `evaluate {expect: {merged: true}}` after its `land`, the
         // drop is silent (TKT-171). `build` asserts the invariant here instead,
         // for every workflow.
-        let lands = match self
-            .space
-            .scan(&Pattern::category(Category::Event).identity("branch_landed"))
-        {
+        let lands = match scan(&Pattern::category(Category::Event).identity("branch_landed")) {
             Ok(t) => t,
             Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
         };
@@ -1144,7 +1158,7 @@ impl Daemon {
         // had ever reached quorum over 277 spawns. Surfacing the ballot here
         // puts the always-reachable endorser — the operator — in front of it.
         // The three scans are read-side only; `build` does the counting.
-        let ballot_tuples = |category| self.space.scan(&Pattern::category(category));
+        let mut ballot_tuples = |category| scan(&Pattern::category(category));
         let (suggestions, endorsements, conventions) = match (
             ballot_tuples(Category::Suggestion),
             ballot_tuples(Category::Endorsement),
@@ -1164,13 +1178,17 @@ impl Daemon {
         // reaches the local target — the operator's pull or a Direct-mode
         // fast-forward. The `pull_request_closed` events above close the same
         // gap for a forge merge the operator has NOT pulled (TKT-70).
+        let cleared = match self.cleared_branches(&[&pull_requests, &lands]).await {
+            Ok(cleared) => cleared,
+            Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
+        };
         let items = crate::inbox::build(
             &agents,
             &instances,
             &obstacles,
             &needs,
             &crate::inbox::BranchEvents {
-                cleared: self.cleared_branches(&[&pull_requests, &lands]),
+                cleared,
                 pull_requests: &pull_requests,
                 pull_requests_closed: &pull_requests_closed,
                 lands: &lands,
@@ -1186,7 +1204,25 @@ impl Daemon {
                 now: chrono::Utc::now(),
             },
         );
-        Response::ok(id, crate::inbox::to_json(&items))
+        let mut items = items;
+        let mut response_truncated = source_truncated || items.len() > MAX_INBOX_ITEMS;
+        items.truncate(MAX_INBOX_ITEMS);
+        // A single tuple can carry a large operator-authored detail string, so
+        // the item count cap alone does not prove the serialized response fits
+        // the NDJSON frame. Drop lowest-priority tail rows until it does.
+        while serde_json::to_vec(&json!({
+            "items": &items,
+            "truncated": response_truncated,
+        }))
+        .map(|bytes| bytes.len() > MAX_FRAME_BYTES)
+        .unwrap_or(true)
+        {
+            if items.pop().is_none() {
+                break;
+            }
+            response_truncated = true;
+        }
+        Response::ok(id, json!({"items": items, "truncated": response_truncated}))
     }
 
     /// (scope, branch) pairs among the given branch-shaped events whose branch
@@ -1202,50 +1238,44 @@ impl Daemon {
     /// human merged on the forge, TKT-67/70) and `branch_landed` events (a land
     /// that dropped its branch and was later resolved by any route, TKT-171).
     /// One git call per distinct branch covers both.
-    fn cleared_branches(&self, event_sets: &[&[Tuple]]) -> HashSet<(String, String)> {
-        let mut cleared = HashSet::new();
-        let events = || event_sets.iter().flat_map(|s| s.iter());
+    async fn cleared_branches(
+        &self,
+        event_sets: &[&[Tuple]],
+    ) -> rk_core::Result<HashSet<(String, String)>> {
+        let events: Vec<(String, String, String)> = event_sets
+            .iter()
+            .flat_map(|s| s.iter())
+            .filter_map(|t| {
+                let branch = t.payload.get("branch").and_then(|v| v.as_str())?;
+                let target = t
+                    .payload
+                    .get("target")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("main");
+                Some((t.scope.clone(), branch.to_string(), target.to_string()))
+            })
+            .collect();
         // Resolve scopes to paths once, under the registry lock, then release it
-        // before shelling out to git.
-        let mut paths: std::collections::HashMap<String, std::path::PathBuf> =
-            std::collections::HashMap::new();
-        if let Ok(reg) = self.repos.lock() {
-            for t in events() {
-                if !paths.contains_key(&t.scope) {
-                    if let Some(rec) = reg.get(&t.scope) {
-                        paths.insert(t.scope.clone(), rec.path.clone());
+        // before shelling out to git. The actual Git calls run in a blocking
+        // worker so a slow or locked repository cannot starve RPC handling.
+        let paths = {
+            let mut paths: HashMap<String, std::path::PathBuf> = HashMap::new();
+            let reg = self
+                .repos
+                .lock()
+                .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
+            for (scope, _, _) in &events {
+                if !paths.contains_key(scope) {
+                    if let Some(rec) = reg.get(scope) {
+                        paths.insert(scope.clone(), rec.path.clone());
                     }
                 }
             }
-        }
-        // Ask git once per distinct (scope, branch): the same branch commonly
-        // carries several events (a retried land, a re-push), and the answer
-        // cannot differ between them.
-        let mut asked: HashSet<(String, String)> = HashSet::new();
-        for t in events() {
-            let Some(branch) = t.payload.get("branch").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let target = t
-                .payload
-                .get("target")
-                .and_then(|v| v.as_str())
-                .unwrap_or("main");
-            let key = (t.scope.clone(), branch.to_string());
-            if !asked.insert(key.clone()) {
-                continue;
-            }
-            let Some(path) = paths.get(&t.scope) else {
-                continue;
-            };
-            let Ok(repo) = rk_git::Repo::discover(path) else {
-                continue;
-            };
-            if repo.branch_merged_or_gone(branch, target) {
-                cleared.insert(key);
-            }
-        }
-        cleared
+            paths
+        };
+        tokio::task::spawn_blocking(move || cleared_branches_for_paths(events, paths))
+            .await
+            .map_err(|e| rk_core::Error::other(format!("inbox Git check task failed: {e}")))
     }
 
     /// One fetch-driven review-sweep cycle (TKT-70). For each repo carrying an
@@ -1448,10 +1478,16 @@ impl Daemon {
     }
 
     async fn handle_ticket_new(&self, req: Request) -> Response {
-        let params: crate::tickets::NewTicket = match parse_params(&req.params) {
+        let mut params: crate::tickets::NewTicket = match parse_params(&req.params) {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
+        // Filing follow-up work is agent-safe, but the author identity is not a
+        // caller-controlled field. Otherwise an agent could create a ticket
+        // that presents itself as the operator or another castle.
+        if req.caller != "operator" && !req.caller.is_empty() {
+            params.created_by = Some(req.caller.clone());
+        }
         match self.tickets.create(params).await {
             Ok(tuple) => Response::ok(req.id, json!({"ticket": tuple})),
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
@@ -1655,12 +1691,18 @@ impl Daemon {
         let is_agent = caller != "operator" && !caller.is_empty();
         if is_agent {
             if params.lifecycle == Some(Lifecycle::Furniture)
-                || matches!(params.category, Category::Fact | Category::Convention)
+                || matches!(
+                    params.category,
+                    Category::Fact
+                        | Category::Convention
+                        | Category::Task
+                        | Category::Available
+                )
             {
                 return Response::err(
                     req.id,
                     codes::FORBIDDEN,
-                    "agents cannot write furniture, fact, or convention tuples",
+                    "agents cannot write furniture, fact, convention, task, or available tuples",
                 );
             }
             if params
@@ -1673,6 +1715,22 @@ impl Daemon {
                     codes::FORBIDDEN,
                     "agents may only write tuples for their own instance",
                 );
+            }
+            if params.category == Category::Event {
+                if params.identity != "task_done" {
+                    return Response::err(
+                        req.id,
+                        codes::FORBIDDEN,
+                        "agents may only write the task_done event",
+                    );
+                }
+                if params.payload.get("agent").and_then(Value::as_str) != Some(caller.as_str()) {
+                    return Response::err(
+                        req.id,
+                        codes::FORBIDDEN,
+                        "task_done must identify the authenticated agent",
+                    );
+                }
             }
         }
         let mut tuple = Tuple::new(
@@ -1795,6 +1853,33 @@ impl Daemon {
             "tuples": self.space.count().unwrap_or(0),
         })
     }
+}
+
+fn cleared_branches_for_paths(
+    events: Vec<(String, String, String)>,
+    paths: HashMap<String, std::path::PathBuf>,
+) -> HashSet<(String, String)> {
+    let mut cleared = HashSet::new();
+    // Ask git once per distinct (scope, branch): the same branch commonly
+    // carries several events (a retried land, a re-push), and the answer cannot
+    // differ between them.
+    let mut asked: HashSet<(String, String)> = HashSet::new();
+    for (scope, branch, target) in events {
+        let key = (scope.clone(), branch.clone());
+        if !asked.insert(key.clone()) {
+            continue;
+        }
+        let Some(path) = paths.get(&scope) else {
+            continue;
+        };
+        let Ok(repo) = rk_git::Repo::discover(path) else {
+            continue;
+        };
+        if repo.branch_merged_or_gone(&branch, &target) {
+            cleared.insert(key);
+        }
+    }
+    cleared
 }
 
 enum Outcome {
