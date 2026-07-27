@@ -457,3 +457,74 @@ fn code_review_resolves_reviewer_profile() {
     assert_eq!(resolved.harness, "claude");
     assert_eq!(resolved.model.as_deref(), Some("haiku"));
 }
+
+/// TKT-172: every example that parks at an approval gate must bind the `read`
+/// that lifts the decision to its own instance.
+///
+/// The gate itself is already per-instance — it waits on `"instance":"<id>"` —
+/// but `(event, <repo>, workflow_approval)` is shared by every gated instance on
+/// the repo, so an unbound read behind it takes whichever decision landed last.
+/// Approve one run and reject another and both route the same way: the rejected
+/// branch merges on the approval, or the approved one is held on the rejection.
+/// The fail-closed timeout widens it further, since a timing-out instance
+/// synthesises an `{approved: false}` a live peer can then route on.
+///
+/// This is the static half of the guarantee — that the shipped examples carry
+/// the binding, and that a hand-edit dropping it is caught here rather than in a
+/// castle. The dynamic half (two instances, one approved and one rejected,
+/// each routing on its own decision) is
+/// `rk-daemon/tests/workflow_approval_binding.rs`.
+#[test]
+fn approval_gated_examples_bind_their_decision_read_to_the_instance() {
+    use rk_workflow::Step;
+
+    /// Every read of a `workflow_approval` event anywhere in a step tree,
+    /// including inside `when` arms and `repeat` bodies — the binding has to
+    /// hold wherever the read is nested, not just at the top level.
+    fn approval_reads<'a>(steps: &'a [Step], found: &mut Vec<&'a rk_workflow::ReadStep>) {
+        for step in steps {
+            match step {
+                Step::Read(r) if r.identity == "workflow_approval" => found.push(r),
+                Step::When(w) => {
+                    for branch in w.cases.values() {
+                        approval_reads(branch, found);
+                    }
+                    approval_reads(&w.default, found);
+                }
+                Step::Repeat(r) => approval_reads(&r.steps, found),
+                _ => {}
+            }
+        }
+    }
+
+    let inputs = HashMap::from([
+        ("taskId".to_string(), json!("risky-change")),
+        ("description".to_string(), json!("rework retry logic")),
+    ]);
+    for name in ["gated-merge.cue", "land-on-approve.cue", "pr-on-approve.cue"] {
+        let workflow = rk_workflow::load(&examples_dir().join(name), &inputs).unwrap();
+        // The premise: these examples do park at an approval gate. If one stops
+        // doing so the loop below would vacuously pass, so assert it outright.
+        assert!(
+            workflow
+                .steps
+                .iter()
+                .any(|s| matches!(s, Step::Gate(g) if g.gate_type == "approval")),
+            "{name} should park at an approval gate"
+        );
+        let mut reads = Vec::new();
+        approval_reads(&workflow.steps, &mut reads);
+        assert!(
+            !reads.is_empty(),
+            "{name} should lift the approval decision with a read"
+        );
+        for read in reads {
+            assert!(
+                read.from_instance,
+                "{name}: the approval read into `{}` must be bound to this instance, or a \
+                 concurrent instance's decision can route it",
+                read.into
+            );
+        }
+    }
+}

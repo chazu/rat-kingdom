@@ -182,8 +182,9 @@ workflow: #Workflow
 // matches yet; the newest match wins so re-review rounds see the latest verdict.
 //
 // (category, scope, identity) is NOT an identity when two instances of the same
-// workflow run on one repo — set `fromAgent: true` to bind the read to the agent
-// this instance spawned, or the newest match may be a concurrent peer's.
+// workflow run on one repo — bind the read to a discriminator or the newest
+// match may be a concurrent peer's: `fromAgent: true` for what an agent this
+// instance spawned wrote, `fromInstance: true` for what names this run.
 #ReadStep: {
 	type: "read"
 	// Tuple category to match.
@@ -193,7 +194,8 @@ workflow: #Workflow
 	// Scope to match; defaults to this workflow's repo name at runtime.
 	scope?: string
 	// Optional substring the serialized payload must contain. Mutually
-	// exclusive with `fromAgent`, which claims the same predicate slot.
+	// exclusive with `fromAgent`/`fromInstance`, which claim the same
+	// predicate slot.
 	search?: string
 	// Match only the tuple THIS instance's active agent wrote — its
 	// `"agent":"<name>"` stamp, bounded below by that agent's own generation,
@@ -204,6 +206,16 @@ workflow: #Workflow
 	// name an agent, so no prompt has to remember to add it. Fails CLOSED: an
 	// unattributable tuple times the step out rather than routing.
 	fromAgent?: bool
+	// Match only the tuple whose payload names THIS workflow instance — its
+	// `"instance":"<id>"` stamp, the same predicate an approval `gate` waits
+	// on. Use it for anything written FOR this run rather than by an agent of
+	// it: above all the `workflow_approval` event behind an approval gate,
+	// where an unbound read lets two parked instances on one repo route on
+	// each other's human decision (approve one, reject the other, and either
+	// the rejected one merges or the approved one is held). Mutually exclusive
+	// with `search`/`fromAgent`. Fails CLOSED: a decision that does not name
+	// this instance times the step out rather than routing.
+	fromInstance?: bool
 	// JSON payload field to lift (e.g. "recommendation"); whole payload if unset.
 	field?: string
 	// ctx variable name to store the value under (referenced by `when.var`).
