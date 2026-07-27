@@ -8,7 +8,7 @@ use crate::tickets::Tickets;
 use chrono::{DateTime, Utc};
 use rk_core::id::prefixed_id;
 use rk_core::paths::Layout;
-use rk_core::tuple::{Category, Pattern};
+use rk_core::tuple::{Category, Pattern, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
 use rk_space::Space;
 use rk_workflow::{
     resolve::{resolve, resolve_fields},
@@ -19,9 +19,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -46,6 +47,8 @@ const MAX_SUBWORKFLOW_DEPTH: usize = 8;
 /// the tuplespace for the whole slice, so this is a wake-up cadence, not a spin
 /// — one indexed query and one registry lookup every few seconds per open wait.
 const LIVENESS_POLL: Duration = Duration::from_secs(5);
+
+static PERSIST_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The effective parameters of a `run` step after named-check resolution and
 /// policy enforcement — a raw command or a repo-registered check collapse to the
@@ -357,7 +360,9 @@ impl WorkflowEngine {
             {
                 Some(i) => i,
                 None => {
-                    warn!(path = %path.display(), "skipping unreadable workflow instance file");
+                    let error = format!("unreadable persisted workflow instance: {}", path.display());
+                    warn!(path = %path.display(), "{error}");
+                    self.record_persistence_failure(&path, error);
                     continue;
                 }
             };
@@ -1709,10 +1714,25 @@ impl WorkflowEngine {
         }
         let path = dir.join(format!("{}.json", instance.id));
         if let Ok(data) = serde_json::to_vec_pretty(instance) {
-            if let Err(e) = std::fs::write(&path, data) {
+            let sequence = PERSIST_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = dir.join(format!("{}.json.tmp-{}-{sequence}", instance.id, std::process::id()));
+            if let Err(e) = std::fs::write(&tmp, data).and_then(|_| std::fs::rename(&tmp, &path)) {
                 warn!(error = %e, "failed to persist workflow instance");
             }
         }
+    }
+
+    fn record_persistence_failure(&self, path: &Path, error: String) {
+        let _ = self.space.out(
+            rk_core::tuple::Tuple::new(
+                Category::Obstacle,
+                SYSTEM_SCOPE,
+                "workflow_persistence_corrupt",
+                "daemon",
+                json!({"path": path, "error": error}),
+            )
+            .into_trail(DEFAULT_TRAIL_TTL),
+        );
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Instance>> {
