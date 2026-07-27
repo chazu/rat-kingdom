@@ -7,6 +7,14 @@
 //! `rk` command that resolves it, and its raw source `kind` so the operator can
 //! override the ranking. This is pure read-side aggregation over data that
 //! already exists: no new storage.
+//!
+//! Two of the sources are INVARIANT ASSERTIONS rather than reports of something
+//! that announced itself — a pushed branch with an open PR nobody merged
+//! (`awaiting-review`), and a `land` that reported success-with-`merged: false`
+//! and left its branch outside the target (`unlanded-branch`). Both describe
+//! finished work that is absent from where it belongs and that no failure
+//! anywhere would have named. Both are checked against local git on every read
+//! and clear themselves the moment the branch actually lands.
 
 use crate::agents::{AgentRecord, AgentState};
 use crate::workflow_exec::{Instance, InstanceStatus};
@@ -21,6 +29,11 @@ use std::collections::HashSet;
 mod urgency {
     pub const BUDGET_EXCEEDED: u8 = 5;
     pub const FAILED: u8 = 4;
+    /// A `land` that neither merged nor opened a PR, whose branch is still
+    /// standing unmerged. Co-ranked with a failure: the work is finished and
+    /// reviewed but absent from the target, and the cost of leaving it there
+    /// grows with every commit the target advances (TKT-171).
+    pub const UNLANDED: u8 = 4;
     pub const PARKED_GATE: u8 = 3;
     /// A pushed branch with an open PR/MR awaiting a human review+merge on the
     /// forge. Co-ranked with a parked gate — both are pushed work blocked on a
@@ -48,6 +61,32 @@ pub struct InboxItem {
     pub action: String,
 }
 
+/// The branch-shaped inputs: events about work that was pushed or landed, plus
+/// the git-backed answer to "has it reached its target yet?".
+///
+/// These travel together because they are one mechanism. Each names a
+/// `{branch, target}`, each describes finished work that may or may not have
+/// arrived where it belongs, and each row derived from them is retired by the
+/// same question asked of local git — which is why one `cleared` set covers all
+/// of them.
+#[derive(Debug, Default, Clone)]
+pub struct BranchEvents<'a> {
+    /// `pull_request_opened` — a PR-mode land/dismiss pushed a branch and opened
+    /// a request nobody has merged yet (TKT-67).
+    pub pull_requests: &'a [Tuple],
+    /// `pull_request_closed` — the fetch-driven sweep saw the forge merge or
+    /// delete a branch the operator never pulled (TKT-70).
+    pub pull_requests_closed: &'a [Tuple],
+    /// `branch_landed` — every `land` step's own outcome. The ones reporting
+    /// neither a merge nor an opened PR are dropped branches (TKT-171).
+    pub lands: &'a [Tuple],
+    /// (scope, branch) pairs the caller has resolved against local git as
+    /// merged-into-their-target or gone. Suppresses rows from BOTH sources — an
+    /// open PR the human merged on the forge, and a dropped `land` whose branch
+    /// has since landed by any route.
+    pub cleared: HashSet<(String, String)>,
+}
+
 /// Aggregate everything awaiting a human into one ranked list. Pure over its
 /// inputs so it can be unit-tested without a running daemon.
 pub fn build(
@@ -55,10 +94,14 @@ pub fn build(
     instances: &[Instance],
     obstacles: &[Tuple],
     needs: &[Tuple],
-    pull_requests: &[Tuple],
-    pull_requests_closed: &[Tuple],
-    cleared_prs: &HashSet<(String, String)>,
+    branches: &BranchEvents<'_>,
 ) -> Vec<InboxItem> {
+    let (pull_requests, pull_requests_closed, lands) = (
+        branches.pull_requests,
+        branches.pull_requests_closed,
+        branches.lands,
+    );
+    let cleared_branches = &branches.cleared;
     let mut items = Vec::new();
 
     // Registry agents that dropped out of their run and need a hand back up.
@@ -180,7 +223,7 @@ pub fn build(
     // and saw the branch merged/deleted upstream even though the operator never
     // pulled, so the LOCAL `cleared_prs` check could not see it. Fold their
     // (scope, branch) into the same suppression — a closed event clears the row.
-    let mut suppressed: HashSet<(String, String)> = cleared_prs.clone();
+    let mut suppressed: HashSet<(String, String)> = cleared_branches.clone();
     for t in pull_requests_closed {
         if let Some(branch) = t.payload.get("branch").and_then(|v| v.as_str()) {
             suppressed.insert((t.scope.clone(), branch.to_string()));
@@ -232,10 +275,107 @@ pub fn build(
         });
     }
 
+    // Dropped lands (TKT-171). Every `land` step emits a `branch_landed` event
+    // carrying its own outcome, and a land that neither merged nor opened a PR
+    // left the branch standing OUTSIDE the target — reviewed work that is simply
+    // absent. `land` reports that as a clean `{merged: false}` rather than an
+    // error (by design: it lets a workflow gate and retry), so nothing else in
+    // this queue tracks it. Whether the drop surfaces at all has until now
+    // depended on the workflow DEFINITION carrying an
+    // `evaluate {expect: {merged: true}}` after its `land` — and a definition is
+    // a file that can be stale, forked per repo, or hand-edited. TKT-147 is what
+    // that costs: a steward completed cleanly on `{merged: false}` and the fix
+    // sat off main for two days. Asserting it here instead makes the invariant
+    // hold for every workflow, including the ones that forgot the gate.
+    //
+    // `cleared_branches` (the same caller-computed set the PR rows use) holds
+    // the branches git says have since merged into their target or gone — the
+    // `git merge-base --is-ancestor <branch> <target>` assertion. That makes the
+    // row SELF-CLEARING: a hand-merge, a cherry-pick that the operator then
+    // deletes the branch for, or any later land retires it without anything
+    // having to write a "resolved" record.
+    for t in dropped_lands(lands) {
+        let branch = t
+            .payload
+            .get("branch")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unknown)");
+        if cleared_branches.contains(&(t.scope.clone(), branch.to_string())) {
+            continue;
+        }
+        let target = t
+            .payload
+            .get("target")
+            .and_then(|v| v.as_str())
+            .unwrap_or("main");
+        let why = t
+            .payload
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .filter(|d| !d.trim().is_empty())
+            .unwrap_or("no detail recorded");
+        items.push(InboxItem {
+            urgency: urgency::UNLANDED,
+            kind: "unlanded-branch".into(),
+            subject: branch.to_string(),
+            scope: t.scope.clone(),
+            detail: format!("land did not merge {branch} → {target}: {why}"),
+            // No `rk` verb lands a named branch, so name the git that does. The
+            // row also clears if the operator decides the branch is redundant
+            // and deletes it.
+            action: format!("git checkout {target} && git merge {branch}"),
+        });
+    }
+
     // Most urgent first; a stable sort keeps each source's own order (agents by
     // spawn time, instances by start time, tuples oldest-first) within a rank.
     items.sort_by(|a, b| b.urgency.cmp(&a.urgency));
     items
+}
+
+/// The `branch_landed` events that describe a DROPPED branch: the newest event
+/// per (scope, branch), keeping only those where the land neither merged nor
+/// opened a PR, newest first.
+///
+/// Newest-wins is what retires a retry: a successful re-land emits a later
+/// `{merged: true}` event for the same branch, which replaces the failed one.
+/// Events arrive oldest-first (scan order), so the last entry for a branch wins.
+///
+/// Public because the caller runs a git query per branch to decide which rows
+/// have auto-cleared, and that query is a subprocess: it must run over these —
+/// a handful, and self-limiting since resolving one removes it — rather than
+/// over every land the fleet has ever performed.
+pub fn dropped_lands(lands: &[Tuple]) -> Vec<&Tuple> {
+    let mut latest: std::collections::HashMap<(String, String), &Tuple> =
+        std::collections::HashMap::new();
+    for t in lands {
+        let Some(branch) = t.payload.get("branch").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        latest.insert((t.scope.clone(), branch.to_string()), t);
+    }
+    let mut dropped: Vec<&Tuple> = latest
+        .into_values()
+        // A merge, or a PR-mode land that pushed and opened a request, is a
+        // clean hand-off. Only the both-false outcome is a dropped branch.
+        // `pr_opened` is absent on events written before PR mode existed
+        // (TKT-67), which reads as false — the right default for a Direct-mode
+        // land that did not merge.
+        .filter(|t| !flag(t, "merged") && !flag(t, "pr_opened"))
+        .collect();
+    // Deterministic order: newest first (event ids are time-sortable).
+    dropped.sort_by(|a, b| b.id.cmp(&a.id));
+    dropped
+}
+
+/// Read a boolean outcome flag off an event payload. A missing or non-boolean
+/// field is `false` — events written before a flag existed must not read as if
+/// the outcome it names had happened.
+fn flag(t: &Tuple, field: &str) -> bool {
+    t.payload
+        .get(field)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// Render an optional PR URL as a ` (<url>)` suffix, or empty when absent.
@@ -354,7 +494,13 @@ mod tests {
         )];
         let needs = vec![need("Scamper", "need a reviewer")];
 
-        let inbox = build(&agents, &instances, &obstacles, &needs, &[], &[], &HashSet::new());
+        let inbox = build(
+            &agents,
+            &instances,
+            &obstacles,
+            &needs,
+            &BranchEvents::default(),
+        );
         let kinds: Vec<&str> = inbox.iter().map(|i| i.kind.as_str()).collect();
 
         // budget(5) > failed agent/instance(4) > parked gate(3) > need(1).
@@ -379,7 +525,7 @@ mod tests {
             instance("wf-run", InstanceStatus::Running, None),
             instance("wf-ok", InstanceStatus::Completed, None),
         ];
-        let inbox = build(&agents, &instances, &[], &[], &[], &[], &HashSet::new());
+        let inbox = build(&agents, &instances, &[], &[], &BranchEvents::default());
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].subject, "Gone");
         assert_eq!(inbox[0].action, "rk respawn Gone");
@@ -392,7 +538,16 @@ mod tests {
             "main",
             Some("https://forge/x/y/compare/main...rat/rat-9/tkt-9"),
         )];
-        let inbox = build(&[], &[], &[], &[], &prs, &[], &HashSet::new());
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents {
+                pull_requests: &prs,
+                ..Default::default()
+            },
+        );
         assert_eq!(inbox.len(), 1);
         let row = &inbox[0];
         assert_eq!(row.kind, "awaiting-review");
@@ -410,7 +565,16 @@ mod tests {
         // so the last entry for a branch wins.
         let older = pull_request("rat/rat-9/tkt-9", "main", Some("https://forge/pr/1"));
         let newer = pull_request("rat/rat-9/tkt-9", "main", Some("https://forge/pr/2"));
-        let inbox = build(&[], &[], &[], &[], &[older, newer], &[], &HashSet::new());
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents {
+                pull_requests: &[older, newer],
+                ..Default::default()
+            },
+        );
         let review: Vec<&InboxItem> = inbox
             .iter()
             .filter(|i| i.kind == "awaiting-review")
@@ -430,7 +594,17 @@ mod tests {
         let mut cleared = HashSet::new();
         cleared.insert(("repo".to_string(), "rat/rat-9/tkt-9".to_string()));
 
-        let inbox = build(&[], &[], &[], &[], &[merged, still_open], &[], &cleared);
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents {
+                pull_requests: &[merged, still_open],
+                cleared,
+                ..Default::default()
+            },
+        );
         let review: Vec<&InboxItem> = inbox
             .iter()
             .filter(|i| i.kind == "awaiting-review")
@@ -464,9 +638,11 @@ mod tests {
             &[],
             &[],
             &[],
-            &[merged, still_open],
-            &closed,
-            &HashSet::new(),
+            &BranchEvents {
+                pull_requests: &[merged, still_open],
+                pull_requests_closed: &closed,
+                ..Default::default()
+            },
         );
         let review: Vec<&InboxItem> = inbox
             .iter()
@@ -476,10 +652,161 @@ mod tests {
         assert_eq!(review[0].subject, "rat/rat-8/tkt-8");
     }
 
+    fn land(branch: &str, merged: bool, pr_opened: bool, detail: &str) -> Tuple {
+        Tuple::new(
+            Category::Event,
+            "repo",
+            "branch_landed",
+            "castle",
+            json!({
+                "branch": branch,
+                "target": "main",
+                "merged": merged,
+                "pr_opened": pr_opened,
+                "detail": detail,
+            }),
+        )
+    }
+
+    #[test]
+    fn a_land_that_did_not_merge_surfaces_as_a_dropped_branch() {
+        // TKT-171: `land` reports a conflict as a clean `{merged: false}`, not
+        // an error, so a workflow whose definition lacks the post-land
+        // `evaluate` completes as if the work landed. The branch is left
+        // outside main with nothing naming it. Assert it here instead.
+        let lands = vec![land(
+            "rat/dusty-2/steward-review-tkt-147",
+            false,
+            false,
+            "merge conflict or failure: CONFLICT (content): Merge conflict in lib.rs",
+        )];
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents {
+                lands: &lands,
+                ..Default::default()
+            },
+        );
+        assert_eq!(inbox.len(), 1);
+        let row = &inbox[0];
+        assert_eq!(row.kind, "unlanded-branch");
+        // Ranked with the failures: dropped reviewed work, not a passive note.
+        assert_eq!(row.urgency, urgency::UNLANDED);
+        assert_eq!(row.subject, "rat/dusty-2/steward-review-tkt-147");
+        assert!(row
+            .detail
+            .contains("rat/dusty-2/steward-review-tkt-147 → main"));
+        // The reason git gave must reach the operator, not just "it failed".
+        assert!(row.detail.contains("Merge conflict in lib.rs"));
+        assert!(row
+            .action
+            .contains("git merge rat/dusty-2/steward-review-tkt-147"));
+    }
+
+    #[test]
+    fn a_clean_land_hand_off_raises_no_row() {
+        // Both success shapes are clean: a Direct-mode merge, and a PR-mode
+        // land that pushed and opened a request (already tracked by its own
+        // awaiting-review row — this source must not double-count it).
+        let lands = vec![
+            land("rat/a/merged", true, false, "merged rat/a/merged into main"),
+            land("rat/b/pushed", false, true, "opened MR"),
+        ];
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents {
+                lands: &lands,
+                ..Default::default()
+            },
+        );
+        assert!(inbox.is_empty(), "clean hand-offs must not nag: {inbox:?}");
+    }
+
+    #[test]
+    fn a_land_event_predating_pr_mode_still_surfaces() {
+        // Events written before `pr_opened` existed (TKT-67) omit the field.
+        // A missing flag must read as false, or every historical dropped land
+        // would be silently reclassified as a clean PR hand-off.
+        let old = Tuple::new(
+            Category::Event,
+            "repo",
+            "branch_landed",
+            "castle",
+            json!({"branch": "rat/filch/steward-review-tkt-18", "target": "main", "merged": false}),
+        );
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents {
+                lands: &[old],
+                ..Default::default()
+            },
+        );
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].kind, "unlanded-branch");
+    }
+
+    #[test]
+    fn a_successful_re_land_retires_the_dropped_row() {
+        // Newest event per branch wins: the retry merged, so the branch is no
+        // longer dropped even though the failed event is still in the store.
+        // Events arrive oldest-first (scan order).
+        let failed = land("rat/a/tkt-9", false, false, "conflict");
+        let retried = land("rat/a/tkt-9", true, false, "merged rat/a/tkt-9 into main");
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents {
+                lands: &[failed, retried],
+                ..Default::default()
+            },
+        );
+        assert!(
+            inbox.is_empty(),
+            "a successful re-land must clear it: {inbox:?}"
+        );
+    }
+
+    #[test]
+    fn a_hand_merged_branch_clears_without_any_record_of_the_merge() {
+        // The common resolution: a human merges (or cherry-picks and deletes)
+        // the branch. Nothing writes a "resolved" record for that, so the row
+        // must clear off the caller's git check alone. A second still-dropped
+        // branch survives, so clearing is per-branch.
+        let stuck = land("rat/a/still-stuck", false, false, "conflict");
+        let fixed = land("rat/b/hand-merged", false, false, "conflict");
+        let mut cleared = HashSet::new();
+        cleared.insert(("repo".to_string(), "rat/b/hand-merged".to_string()));
+
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents {
+                lands: &[stuck, fixed],
+                cleared,
+                ..Default::default()
+            },
+        );
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].subject, "rat/a/still-stuck");
+    }
+
     #[test]
     fn plain_obstacle_uses_text_and_obstacle_rank() {
         let obstacles = vec![obstacle("Pip", json!({"text": "merge conflict in lib.rs"}))];
-        let inbox = build(&[], &[], &obstacles, &[], &[], &[], &HashSet::new());
+        let inbox = build(&[], &[], &obstacles, &[], &BranchEvents::default());
         assert_eq!(inbox[0].urgency, urgency::OBSTACLE);
         assert_eq!(inbox[0].detail, "merge conflict in lib.rs");
         assert_eq!(inbox[0].action, "rk status Pip");
