@@ -17,6 +17,8 @@
 //! conflicts, and proves the drop surfaces anyway, and then clears itself when
 //! the branch actually reaches main.
 
+mod fixture;
+
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
@@ -57,6 +59,7 @@ echo '# rat version' > README.md
 git add . >/dev/null 2>&1
 git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
 echo '{"type":"system","subtype":"init","session_id":"drop-fake"}'
+rk_done "work done"   # a rat that never declares done fails (TKT-175)
 echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"drop-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
@@ -104,7 +107,10 @@ async fn a_land_that_conflicts_surfaces_even_when_the_workflow_never_gated_it() 
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(wf_dir.join("ungated-land.cue"), UNGATED_LAND).unwrap();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", CONFLICTING_FAKE);
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        fixture::with_rk_done(CONFLICTING_FAKE),
+    );
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());

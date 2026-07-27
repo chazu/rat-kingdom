@@ -4,6 +4,8 @@
 //! finished. A second test proves the nesting depth cap fails a workflow cycle
 //! closed instead of recursing without end.
 
+mod fixture;
+
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
@@ -50,6 +52,7 @@ echo "work for $RK_TASK by $RK_AGENT" > "work-$RK_AGENT.txt"
 git add . >/dev/null 2>&1
 git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
 echo '{"type":"system","subtype":"init","session_id":"wf-fake"}'
+rk_done "work done"   # a rat that never declares done fails (TKT-175)
 echo '{"type":"result","subtype":"success","is_error":false,"result":"did the work","session_id":"wf-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
@@ -95,7 +98,7 @@ async fn sub_workflow_runs_child_and_joins_its_result() {
     std::fs::write(wf_dir.join("child-build.cue"), CHILD).unwrap();
     std::fs::write(wf_dir.join("parent-compose.cue"), PARENT).unwrap();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
@@ -185,7 +188,7 @@ async fn sub_workflow_cycle_fails_closed_at_depth_cap() {
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(wf_dir.join("cycle.cue"), CYCLE).unwrap();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());

@@ -16,8 +16,16 @@
 //!
 //! The gate is in the supervisor rather than in the workflow `wait`, because
 //! `wait` is not the only reader: the reactor's steward trigger and the ticket
-//! auto-close consume the same event. Three proofs let a turn through, one per
-//! test here: the rat ran `rk done`; the process exited; or the turn failed.
+//! auto-close consume the same event. Three proofs let a turn through: the rat
+//! ran `rk done`; the process exited; or the turn failed.
+//!
+//! Only the first of those three is a proof the rat FINISHED, which is the
+//! separate question these tests also pin down. A turn published because the
+//! process exited reached the flush undeclared — that is the only way a result
+//! gets there — so it publishes as a failure whether the process was killed
+//! (TKT-173) or exited 0 of its own accord (TKT-175).
+
+mod fixture;
 
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
@@ -73,6 +81,10 @@ case "$RK_TASK" in
   exits-after-one-turn)
     result false "did the work"
     ;;
+  declares-then-exits)
+    rk_done "finished it"
+    result false "did the work"
+    ;;
   killed-mid-flight)
     result false "Tests still running - waiting on the monitor"
     read -r _steer
@@ -99,7 +111,7 @@ async fn start(task: &str) -> (tempfile::TempDir, tempfile::TempDir, Client, Str
     let repo_dir = tempfile::tempdir().unwrap();
     let repo_name = init_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(FAKE));
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     tokio::spawn(daemon.run());
@@ -294,11 +306,19 @@ async fn a_rat_killed_after_a_clean_turn_reports_a_failure() {
 /// Harnesses that end with the run (codex, axe, the test fake) take this path
 /// for every agent, so a rat that never got to its `rk done` still reports.
 ///
-/// It exited 0 — it stopped of its own accord rather than being killed — so
-/// TKT-173 leaves `is_error` alone here and states the weaker fact in
-/// `declared_done`. Flipping this one too is TKT-175.
+/// TKT-175: it reports as a FAILURE. Reaching the exit-flush is itself the proof
+/// that the generation never wrote a `task_done` — withholding is the only way a
+/// turn result gets here — and by the fleet's own completion protocol a rat that
+/// never declared itself done did not finish its task. TKT-173 flipped only the
+/// killed half of this, reading "killed" off the exit status; the surviving half
+/// was a rat that exited 0 mid-task, which published `is_error: false` and told
+/// every workflow gating on `expect {is_error: false}` that an unfinished task
+/// was finished. How the process ended turns out not to be the question.
+///
+/// Note the text is still the honest last word rather than a blanked result, so
+/// `rk inbox` shows what the rat had got to.
 #[tokio::test]
-async fn an_agent_that_exits_still_publishes_its_last_turn() {
+async fn an_agent_that_exits_undeclared_reports_a_failure() {
     let (_home, _repo_dir, mut client, repo, agent) = start("exits-after-one-turn").await;
 
     let mut published = Vec::new();
@@ -314,13 +334,50 @@ async fn an_agent_that_exits_still_publishes_its_last_turn() {
         .as_str()
         .unwrap_or("")
         .contains("did the work"));
-    assert_eq!(published[0]["is_error"], json!(false));
+    assert_eq!(
+        published[0]["is_error"],
+        json!(true),
+        "a generation that never declared itself done did not finish its task, \
+         however tidily its process ended (TKT-175): {published:?}"
+    );
     assert_eq!(
         published[0]["declared_done"],
         json!(false),
-        "it exited without declaring done, and the event says so — that is the \
-         fact a strict gate reads (TKT-173)"
+        "it exited without declaring done, which is exactly why it failed"
     );
+}
+
+/// The other side of TKT-175, and the reason it is a rule rather than a blanket
+/// failure: the SAME exit path, by a rat that ran its `rk done` first, is clean.
+///
+/// Without this the rule is indistinguishable from "every agent whose harness
+/// ends with the run fails" — which is what the flip would amount to if the
+/// `task_done` lookup were broken, and what 26 fixtures across this crate were
+/// unwittingly asserting was fine before they learned to declare done.
+#[tokio::test]
+async fn an_agent_that_declares_done_then_exits_reports_a_clean_finish() {
+    let (_home, _repo_dir, mut client, repo, agent) = start("declares-then-exits").await;
+
+    let mut published = Vec::new();
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        published = results(&mut client, &repo, &agent).await;
+        if !published.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(published.len(), 1, "expected one completion: {published:?}");
+    assert_eq!(
+        published[0]["is_error"],
+        json!(false),
+        "it declared done before its turn ended, so the exit flushes nothing and \
+         the turn publishes on its own terms: {published:?}"
+    );
+    assert_eq!(published[0]["declared_done"], json!(true));
+    assert!(published[0]["result"]
+        .as_str()
+        .unwrap_or("")
+        .contains("did the work"));
 }
 
 /// The third proof: a failed turn ended the session, so there is no later turn

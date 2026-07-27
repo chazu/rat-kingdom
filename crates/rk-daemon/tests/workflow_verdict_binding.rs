@@ -25,6 +25,8 @@
 //! `RK_AGENT` into any object payload that does not already name an agent — is
 //! pinned by the unit tests on `stamp_author` in `rk-cli/src/space_cmds.rs`.
 
+mod fixture;
+
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
@@ -78,6 +80,7 @@ echo "reviewed by $RK_AGENT" > "review-$RK_AGENT.txt"
 git add . >/dev/null 2>&1
 git -c user.email=r@x -c user.name=R commit -q -m "review: $RK_TASK"
 echo '{"type":"system","subtype":"init","session_id":"verdict-fake"}'
+rk_done "work done"   # a rat that never declares done fails (TKT-175)
 echo '{"type":"result","subtype":"success","is_error":false,"result":"reviewed","session_id":"verdict-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
@@ -241,7 +244,10 @@ async fn concurrent_instances_each_route_on_their_own_reviewers_verdict() {
     let repo_dir = tempfile::tempdir().unwrap();
     let repo_name = init_repo(repo_dir.path(), true);
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", BARRIERED_REVIEWER);
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        fixture::with_rk_done(BARRIERED_REVIEWER),
+    );
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
@@ -317,7 +323,10 @@ async fn an_unbound_read_still_takes_the_newest_strangers_verdict() {
     let repo_dir = tempfile::tempdir().unwrap();
     let repo_name = init_repo(repo_dir.path(), false);
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", BARRIERED_REVIEWER);
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        fixture::with_rk_done(BARRIERED_REVIEWER),
+    );
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
