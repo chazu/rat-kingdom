@@ -11,6 +11,8 @@
 //! the night finishes; a *missing* fan-out (no `for_each` at all) is still an
 //! authoring error and still fails the instance.
 
+mod fixture;
+
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
@@ -75,6 +77,7 @@ echo "$RK_TASK by $RK_AGENT" > "work-$RK_AGENT.txt"
 git add . >/dev/null 2>&1
 git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
 echo '{"type":"system","subtype":"init","session_id":"quiet-fake"}'
+rk_done "work done"
 echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"quiet-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
@@ -118,7 +121,10 @@ async fn quiet_night_completes_and_still_runs_the_phase_after_the_drain() {
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(wf_dir.join("quiet-night-test.cue"), QUIET_WORKFLOW).unwrap();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        fixture::with_rk_done(WORKING_FAKE),
+    );
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());

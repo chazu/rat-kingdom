@@ -112,6 +112,7 @@ fn build_reactor_with_space(
         "fake".into(),
         false,
         false,
+        false,
     ));
     Arc::new(Reactor::new(
         space,

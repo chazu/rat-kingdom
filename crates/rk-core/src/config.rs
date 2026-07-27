@@ -404,7 +404,7 @@ pub enum MergeMode {
 
 /// Workflow-execution policy. The seed of the #19 policy engine: today it gates
 /// the one primitive that can run arbitrary shell — the workflow `run` step.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct PolicyConfig {
     /// When true, a workflow `run` step may ONLY reference a repo-registered
@@ -412,12 +412,28 @@ pub struct PolicyConfig {
     /// raw inline `command` is refused fail-closed. This stops a compromised or
     /// untrusted workflow definition from executing arbitrary shell in an
     /// agent's worktree — it can invoke only the checks the repo owner declared.
-    /// Defaults to false (raw commands allowed) for backward compatibility.
+    /// Defaults to true so an unattended workflow cannot introduce arbitrary
+    /// shell through a definition edit. Set false only for explicitly trusted
+    /// legacy definitions.
     pub require_named_checks: bool,
+    /// Require an explicit human approval gate to have granted access before a
+    /// workflow may land a branch or open a PR. Reviewer verdicts remain useful
+    /// inputs, but are not a substitute for operator authority.
+    pub require_approval_for_landing: bool,
     /// Fleet-wide default merge mode for a repo registered without an explicit
     /// `rk repo add --merge-mode`. A repo's own `RepoRecord.merge_mode` overrides
     /// this. Defaults to `Direct` (plain git merge) for backward compatibility.
     pub default_merge_mode: MergeMode,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            require_named_checks: true,
+            require_approval_for_landing: true,
+            default_merge_mode: MergeMode::default(),
+        }
+    }
 }
 
 /// Budget caps. `max_usd`/`max_tokens` are per-agent (graduated warn→steer→kill

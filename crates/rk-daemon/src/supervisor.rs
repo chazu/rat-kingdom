@@ -10,6 +10,14 @@ use rk_core::prime::{render, PrimeContext};
 use rk_core::tuple::{Category, Pattern, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
 use rk_git::{agent_branch, Repo};
 use rk_harness::{make_harness, HarnessEvent, LaunchSpec, SessionControl, TokenUsage};
+
+fn default_permission_mode(harness: &str) -> &'static str {
+    match harness {
+        "claude" => "acceptEdits",
+        "codex" => "workspace-write",
+        _ => "workspace-write",
+    }
+}
 use rk_ledger::pricing::PricingTable;
 use rk_ledger::{Budget, BudgetAction, BudgetScope, DispatchCheck, FleetBudget};
 use rk_space::Space;
@@ -427,13 +435,13 @@ impl Supervisor {
             system_prompt: Some(render(&params.role, &prime_ctx)),
             cwd: worktree.clone(),
             env,
-            // Rats work in isolated worktrees; autonomous operation is the
-            // default. Override per-spawn for tighter modes.
+            // Keep the harness inside its worktree by default. Explicit
+            // per-spawn modes remain available for operators that need them.
             permission_mode: Some(
                 params
                     .permission_mode
                     .clone()
-                    .unwrap_or_else(|| "bypassPermissions".into()),
+                    .unwrap_or_else(|| default_permission_mode(&harness_kind).into()),
             ),
             model: params.model.clone(),
             resume_session: None,
@@ -697,7 +705,7 @@ impl Supervisor {
             system_prompt: Some(render(&record.role, &prime_ctx)),
             cwd: worktree,
             env,
-            permission_mode: Some("bypassPermissions".into()),
+            permission_mode: Some(default_permission_mode(&record.harness).into()),
             model: None,
             resume_session: resume,
         };

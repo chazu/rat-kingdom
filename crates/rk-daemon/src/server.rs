@@ -54,6 +54,7 @@ pub struct Daemon {
     /// When set, workflow `run` steps may only invoke repo-registered named
     /// checks; raw inline commands are refused (TKT-30, `[policy]`).
     require_named_checks: bool,
+    require_approval_for_landing: bool,
     /// Fleet-wide default merge mode a repo is registered with when `rk repo
     /// add` names no explicit `--merge-mode` (`[policy] default_merge_mode`).
     default_merge_mode: rk_core::config::MergeMode,
@@ -132,6 +133,7 @@ impl Daemon {
         daemon.drain_config = config.drain.clone();
         daemon.evaporation_decay = config.evaporation.decay;
         daemon.require_named_checks = config.policy.require_named_checks;
+        daemon.require_approval_for_landing = config.policy.require_approval_for_landing;
         daemon.default_merge_mode = config.policy.default_merge_mode;
         if config.sync.enabled {
             let syncer = crate::sync::Syncer::new(
@@ -256,6 +258,7 @@ impl Daemon {
             tier_routing: Default::default(),
             default_harness,
             require_named_checks: false,
+            require_approval_for_landing: true,
             default_merge_mode: rk_core::config::MergeMode::default(),
             auth_token,
             engine: std::sync::OnceLock::new(),
@@ -623,6 +626,7 @@ impl Daemon {
                 // A crashed rat may still be revived by the self-healing sweep;
                 // a `wait` only gives up on one when it cannot be (TKT-147).
                 self.sweep_config.respawn_enabled && self.sweep_config.respawn_max_attempts > 0,
+                self.require_approval_for_landing,
             ))
         }))
     }

@@ -179,7 +179,7 @@ pub fn interactive_argv(
             let sandbox = match permission_mode {
                 Some("read-only") => "read-only",
                 Some("workspace-write") => "workspace-write",
-                _ => "danger-full-access",
+                _ => "workspace-write",
             };
             argv.push("--sandbox".into());
             argv.push(sandbox.into());
@@ -205,7 +205,7 @@ mod tests {
 
         let codex = interactive_argv("codex", None, Some("gpt-5.5-codex"), None).unwrap();
         assert_eq!(codex[0], "codex");
-        assert!(codex.contains(&"danger-full-access".to_string()));
+        assert!(codex.contains(&"workspace-write".to_string()));
 
         assert!(interactive_argv("axe", None, None, None).is_err());
     }

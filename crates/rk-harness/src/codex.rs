@@ -39,14 +39,12 @@ impl Harness for CodexHarness {
         if let Some(session) = &spec.resume_session {
             cmd.args(["resume", session]);
         }
-        // permission_mode maps to codex --sandbox. Default is full access:
-        // isolation comes from the per-rat worktree (same trust model as the
-        // Claude adapter's bypassPermissions default), and tighter sandboxes
-        // block the unix socket that `rk done` needs.
+        // permission_mode maps to codex --sandbox. Default to the worktree
+        // sandbox; operators can opt into a wider mode explicitly.
         let sandbox = match spec.permission_mode.as_deref() {
             Some("read-only") => "read-only",
             Some("workspace-write") => "workspace-write",
-            _ => "danger-full-access",
+            _ => "workspace-write",
         };
         cmd.args(["--json", "--skip-git-repo-check", "--sandbox", sandbox]);
         if let Some(model) = &spec.model {

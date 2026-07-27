@@ -142,6 +142,11 @@ pub struct WorkflowContext {
     /// the step that set it.
     #[serde(default)]
     pub awaited: Vec<String>,
+    /// Set only by an approval gate that received `{approved: true}`. This is
+    /// the capability checked by destructive `land`/`open_pr` steps; a reviewer
+    /// payload or an arbitrary CUE `when` branch cannot forge it.
+    #[serde(default)]
+    pub approval_granted: bool,
 }
 
 /// One agent in a fan-out set: its name, its branch, and the ticket it drains.
@@ -177,6 +182,7 @@ pub struct WorkflowEngine {
     /// until the sweep gives up; with the sweep disarmed a crash is final and
     /// the `wait` fails immediately (TKT-147).
     respawn_enabled: bool,
+    require_approval_for_landing: bool,
     instances: Mutex<HashMap<String, Instance>>,
 }
 
@@ -192,6 +198,7 @@ impl WorkflowEngine {
         default_harness: String,
         require_named_checks: bool,
         respawn_enabled: bool,
+        require_approval_for_landing: bool,
     ) -> Self {
         Self {
             layout,
@@ -203,6 +210,7 @@ impl WorkflowEngine {
             default_harness,
             require_named_checks,
             respawn_enabled,
+            require_approval_for_landing,
             instances: Mutex::new(HashMap::new()),
         }
     }
@@ -605,9 +613,14 @@ impl WorkflowEngine {
                                 payload
                             }
                         };
+                        let approval_granted = decision
+                            .get("approved")
+                            .and_then(Value::as_bool)
+                            == Some(true);
                         self.update(id, |i| {
                             i.context.previous_result = Some(decision);
                             i.context.awaited = Vec::new();
+                            i.context.approval_granted = approval_granted;
                         });
                     }
                     other => {
@@ -787,6 +800,11 @@ impl WorkflowEngine {
                     });
                 }
                 Step::Land(land) => {
+                    if self.require_approval_for_landing && !ctx.approval_granted {
+                        return Err(rk_core::Error::other(
+                            "land step requires a prior approved human gate",
+                        ));
+                    }
                     let branch = interpolate(&land.branch, &ctx);
                     let target = interpolate(&land.target, &ctx);
                     if branch.is_empty() {
@@ -808,6 +826,11 @@ impl WorkflowEngine {
                     });
                 }
                 Step::OpenPr(open_pr) => {
+                    if self.require_approval_for_landing && !ctx.approval_granted {
+                        return Err(rk_core::Error::other(
+                            "open_pr step requires a prior approved human gate",
+                        ));
+                    }
                     let branch = interpolate(&open_pr.branch, &ctx);
                     let target = interpolate(&open_pr.target, &ctx);
                     if branch.is_empty() {
