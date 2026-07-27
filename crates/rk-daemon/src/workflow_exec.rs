@@ -8,7 +8,7 @@ use crate::tickets::Tickets;
 use chrono::{DateTime, Utc};
 use rk_core::id::prefixed_id;
 use rk_core::paths::Layout;
-use rk_core::tuple::{Category, Pattern, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
+use rk_core::tuple::{Category, Pattern, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
 use rk_space::Space;
 use rk_workflow::{
     resolve::{resolve, resolve_fields},
@@ -68,12 +68,17 @@ struct ResolvedRun {
     timeout: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Instance {
     pub id: String,
     pub workflow: String,
     pub repo: String,
     pub status: InstanceStatus,
+    /// Monotonic observable-state revision for coordinator consumers. Older
+    /// snapshots deserialize as zero and enter the same sequence on their next
+    /// mutation.
+    #[serde(default)]
+    pub revision: u64,
     pub current_step: usize,
     pub total_steps: usize,
     pub context: WorkflowContext,
@@ -123,7 +128,7 @@ pub enum InstanceStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowContext {
     pub active_agent: Option<String>,
     pub active_branch: Option<String>,
@@ -386,7 +391,7 @@ fn resolve_worktree_cwd(
 }
 
 /// One agent in a fan-out set: its name, its branch, and the ticket it drains.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FannedAgent {
     pub agent: String,
     pub branch: Option<String>,
@@ -528,6 +533,7 @@ impl WorkflowEngine {
             workflow: workflow.name.clone(),
             repo: repo.to_string(),
             status: InstanceStatus::Running,
+            revision: 0,
             current_step: 0,
             total_steps: workflow.steps.len(),
             context: WorkflowContext::default(),
@@ -567,11 +573,15 @@ impl WorkflowEngine {
             Ok(()) => (InstanceStatus::Completed, None),
             Err(e) => (InstanceStatus::Failed, Some(e.to_string())),
         };
-        self.update(id, |i| {
+        let updated = self.update_with_reason(id, "terminal", |i| {
             i.status = status;
             i.error = error.clone();
             i.completed_at = Some(chrono::Utc::now());
         });
+        if !updated {
+            warn!(instance = %id, "workflow terminal state was not persisted; skipping completion event");
+            return;
+        }
         let final_status = if status == InstanceStatus::Completed {
             "workflow_complete"
         } else {
@@ -716,7 +726,7 @@ impl WorkflowEngine {
             }
             // Advance only AFTER the step completes, so a restart resumes at the
             // interrupted step and never re-runs a finished one.
-            self.update(id, |i| i.current_step = index + 1);
+            self.update_with_reason(id, "step_advanced", |i| i.current_step = index + 1);
         }
         Ok(())
     }
@@ -862,9 +872,11 @@ impl WorkflowEngine {
                         );
                         // Flag the instance as parked so `rk inbox` can surface
                         // it with the `rk approve`/`rk reject` resolving command.
-                        self.update(id, |i| i.awaiting = Some("approval".to_string()));
+                        self.update_with_reason(id, "approval_parked", |i| {
+                            i.awaiting = Some("approval".to_string())
+                        });
                         let read = self.space.rd(&pattern, timeout).await;
-                        self.update(id, |i| i.awaiting = None);
+                        self.update_with_reason(id, "approval_resolved", |i| i.awaiting = None);
                         let decision = match read.map_err(|e| {
                             rk_core::Error::other(format!("approval gate failed: {e}"))
                         })? {
@@ -1203,6 +1215,7 @@ impl WorkflowEngine {
             workflow: workflow_name.clone(),
             repo: child_repo.clone(),
             status: InstanceStatus::Running,
+            revision: 0,
             current_step: 0,
             total_steps: workflow.steps.len(),
             context: WorkflowContext::default(),
@@ -1980,33 +1993,94 @@ impl WorkflowEngine {
     }
 
     fn store(&self, instance: Instance) {
-        self.lock().insert(instance.id.clone(), instance.clone());
-        self.persist(&instance);
+        let mut instances = self.lock();
+        instances.insert(instance.id.clone(), instance.clone());
+        if let Err(error) = self.persist(&instance) {
+            warn!(instance = %instance.id, %error, "failed to persist initial workflow state; skipping coordinator event");
+            return;
+        }
+        self.emit_state_event(&instance, "started");
     }
 
     fn update<F: FnOnce(&mut Instance)>(&self, id: &str, mutate: F) {
+        self.update_with_reason(id, "state_changed", mutate);
+    }
+
+    fn update_with_reason<F: FnOnce(&mut Instance)>(
+        &self,
+        id: &str,
+        reason: &str,
+        mutate: F,
+    ) -> bool {
         let mut instances = self.lock();
         if let Some(instance) = instances.get_mut(id) {
+            let before = instance.clone();
             mutate(instance);
+            if *instance == before {
+                return false;
+            }
+            instance.revision = instance.revision.saturating_add(1);
             let snapshot = instance.clone();
-            drop(instances);
-            self.persist(&snapshot);
+            if let Err(error) = self.persist(&snapshot) {
+                *instance = before;
+                warn!(instance = %id, %error, "failed to persist workflow state; skipping coordinator event");
+                return false;
+            }
+            self.emit_state_event(&snapshot, reason);
+            true
+        } else {
+            false
         }
     }
 
-    fn persist(&self, instance: &Instance) {
+    /// Publish a compact, durable coordinator transition after the current
+    /// workflow snapshot has been persisted. The snapshot remains the recovery
+    /// source if the event write fails; callers never infer a false state from
+    /// a notification that was not durably accepted.
+    fn emit_state_event(&self, instance: &Instance, reason: &str) {
+        let payload = json!({
+            "instance": instance.id,
+            "workflow": instance.workflow,
+            "repo": repo_name_of(&instance.repo),
+            "revision": instance.revision,
+            "reason": reason,
+            "status": instance.status,
+            "current_step": instance.current_step,
+            "total_steps": instance.total_steps,
+            "awaiting": instance.awaiting,
+            "active_agent": instance.context.active_agent,
+            "active_branch": instance.context.active_branch,
+            "awaited": instance.context.awaited,
+            "error": instance.error.as_deref().map(|error| error.chars().take(512).collect::<String>()),
+        });
+        if let Err(error) = self.space.out_coordinator(
+            Tuple::new(
+            Category::Event,
+            repo_name_of(&instance.repo),
+            "workflow_state_changed",
+            "daemon",
+            payload,
+            )
+            .with_lifecycle(rk_core::tuple::Lifecycle::Furniture),
+        ) {
+            warn!(
+                instance = %instance.id,
+                error = %error,
+                "failed to emit workflow coordinator state event"
+            );
+        }
+    }
+
+    fn persist(&self, instance: &Instance) -> rk_core::Result<()> {
         let dir = self.layout.home().join("workflow-instances");
-        if std::fs::create_dir_all(&dir).is_err() {
-            return;
-        }
+        std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.json", instance.id));
-        if let Ok(data) = serde_json::to_vec_pretty(instance) {
-            let sequence = PERSIST_SEQ.fetch_add(1, Ordering::Relaxed);
-            let tmp = dir.join(format!("{}.json.tmp-{}-{sequence}", instance.id, std::process::id()));
-            if let Err(e) = std::fs::write(&tmp, data).and_then(|_| std::fs::rename(&tmp, &path)) {
-                warn!(error = %e, "failed to persist workflow instance");
-            }
-        }
+        let data = serde_json::to_vec_pretty(instance)?;
+        let sequence = PERSIST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!("{}.json.tmp-{}-{sequence}", instance.id, std::process::id()));
+        std::fs::write(&tmp, data)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
     }
 
     fn record_persistence_failure(&self, path: &Path, error: String) {

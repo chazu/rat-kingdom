@@ -81,6 +81,14 @@ conversation.
 - `rk list` — the fleet (state, tokens, cost) · `rk status <name>` — one rat.
 - `rk log <name>` — a rat's transcript (prose, tool calls, retries); `--follow` to stream.
 - `rk watch` — live tuple stream, the fleet's inner monologue.
+- `rk workflow watch <wf-id>` — replay the current workflow snapshot, follow
+  durable state transitions, refresh after a lag, and exit when the workflow
+  completes or fails. The plain output prints the coordinator cursor; use
+  `--json` when another agent must save cursors from snapshot/event records.
+  Resume after a disconnect with `--after <cursor>`. If a `lagged` or `resync`
+  record appears, treat the refreshed snapshot as authoritative and continue
+  from its cursor. `rk top` and raw `rk watch` are dashboards, not a reliable
+  replacement for this workflow watch/replay path.
 - `rk scan obstacle <repo>` / `rk scan need <repo>` — what rats have flagged.
 - `rk steer <name> \"...\"` — inject mid-session guidance · `rk interrupt <name>`.
 - `rk dismiss <name>` — stop the rat, merge its branch, clean up.

@@ -513,6 +513,7 @@ impl Supervisor {
             &params.task,
             Some(&branch),
             &worktree,
+            params.workflow_instance.as_deref(),
         );
         if let Some(parent) = &params.parent {
             env.insert("RK_PARENT".into(), parent.clone());
@@ -571,7 +572,13 @@ impl Supervisor {
         self.emit_event(
             &repo_name,
             "agent_spawned",
-            json!({"agent": name, "task": params.task, "role": params.role, "parent": params.parent}),
+            json!({
+                "agent": name,
+                "task": params.task,
+                "role": params.role,
+                "parent": params.parent,
+                "workflow_instance": params.workflow_instance,
+            }),
         );
 
         let supervisor = Arc::clone(self);
@@ -648,7 +655,13 @@ impl Supervisor {
         self.emit_event(
             &repo_name,
             "agent_spawned",
-            json!({"agent": name, "task": params.task, "role": params.role, "attached": true}),
+            json!({
+                "agent": name,
+                "task": params.task,
+                "role": params.role,
+                "attached": true,
+                "workflow_instance": params.workflow_instance,
+            }),
         );
 
         // Deliver the initial prompt once herdr reports the TUI idle (its
@@ -749,6 +762,7 @@ impl Supervisor {
             &task,
             record.branch.as_deref(),
             &worktree,
+            record.workflow_instance.as_deref(),
         );
 
         let prime_ctx = PrimeContext {
@@ -792,7 +806,11 @@ impl Supervisor {
         self.emit_event(
             &updated.repo_name,
             "agent_respawned",
-            json!({"agent": name, "task": updated.task}),
+            json!({
+                "agent": name,
+                "task": updated.task,
+                "workflow_instance": updated.workflow_instance,
+            }),
         );
 
         // The interrupted run's completion bookkeeping does not carry over: its
@@ -1056,6 +1074,7 @@ impl Supervisor {
             json!({
                 "type": format!("budget_{kind}"),
                 "agent": record.name,
+                "workflow_instance": record.workflow_instance,
                 "task": record.task,
                 "cost_usd": record.cost_usd,
                 "tokens": record.usage.total(),
@@ -2031,6 +2050,7 @@ impl Supervisor {
             "agent_dismissed",
             json!({
                 "agent": name,
+                "workflow_instance": record.workflow_instance,
                 "merged": merged,
                 "merge_commit": &merge_commit,
                 "pr_opened": pr_opened,
@@ -2497,6 +2517,7 @@ impl Supervisor {
 
     /// Standard spawn environment. Prepends the running `rk` binary's
     /// directory to PATH so the sugar commands work inside agent sessions.
+    #[allow(clippy::too_many_arguments)]
     fn agent_env(
         &self,
         name: &str,
@@ -2505,6 +2526,7 @@ impl Supervisor {
         task: &str,
         branch: Option<&str>,
         worktree: &std::path::Path,
+        workflow_instance: Option<&str>,
     ) -> HashMap<String, String> {
         let mut env = HashMap::new();
         env.insert("RK_HOME".into(), self.layout.home().display().to_string());
@@ -2520,6 +2542,9 @@ impl Supervisor {
             env.insert("RK_BRANCH".into(), branch.to_string());
         }
         env.insert("RK_WORKTREE".into(), worktree.display().to_string());
+        if let Some(instance) = workflow_instance {
+            env.insert("RK_WORKFLOW_INSTANCE".into(), instance.to_string());
+        }
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 let path = std::env::var("PATH").unwrap_or_default();

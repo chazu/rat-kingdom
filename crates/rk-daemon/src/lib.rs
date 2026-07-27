@@ -4,6 +4,7 @@
 pub mod agent_log;
 pub mod agents;
 pub mod client;
+pub mod coordinator;
 pub mod cron;
 pub mod drain;
 pub mod inbox;
@@ -413,5 +414,73 @@ mod tests {
             .unwrap();
         assert_eq!(scanned["tuples"][0]["lifecycle"], "ephemeral");
         assert!(scanned["tuples"][0]["expires_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn coordinator_watch_replays_from_cursor_and_delivers_live_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+        let space = daemon.space_handle();
+        let _handle = tokio::spawn(daemon.run());
+
+        let first_cursor = space
+            .out_coordinator(
+                rk_core::tuple::Tuple::new(
+                    rk_core::tuple::Category::Event,
+                    "myrepo",
+                    "workflow_state_changed",
+                    "daemon",
+                    json!({"instance": "wf-1", "revision": 1, "status": "running"}),
+                )
+                .with_lifecycle(rk_core::tuple::Lifecycle::Furniture),
+            )
+            .unwrap();
+
+        space
+            .out_coordinator(
+                rk_core::tuple::Tuple::new(
+                    rk_core::tuple::Category::Event,
+                    "myrepo",
+                    "workflow_state_changed",
+                    "daemon",
+                    json!({"instance": "wf-1", "revision": 2, "status": "completed"}),
+                )
+                .with_lifecycle(rk_core::tuple::Lifecycle::Furniture),
+            )
+            .unwrap();
+
+        let watcher = connect(&layout).await;
+        let (initial, mut stream) = watcher
+            .call_then_stream(
+                "coordinator.watch",
+                json!({"repo": "myrepo", "instance": "wf-1", "after": first_cursor}),
+            )
+            .await
+        .unwrap();
+        assert_eq!(initial["events"].as_array().unwrap().len(), 1);
+        assert_eq!(initial["events"][0]["event"]["payload"]["revision"], 2);
+        assert_eq!(initial["snapshot"]["workflows"].as_array().unwrap().len(), 0);
+        assert_eq!(initial["resync_required"], false);
+
+        space
+            .out_coordinator(
+                rk_core::tuple::Tuple::new(
+                    rk_core::tuple::Category::Event,
+                    "myrepo",
+                    "workflow_state_changed",
+                    "daemon",
+                    json!({"instance": "wf-1", "revision": 3, "status": "failed"}),
+                )
+                .with_lifecycle(rk_core::tuple::Lifecycle::Furniture),
+            )
+            .unwrap();
+        let note = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("coordinator event did not arrive")
+            .unwrap()
+            .unwrap();
+        assert_eq!(note["method"], "coordinator.event");
+        assert_eq!(note["params"]["event"]["payload"]["revision"], 3);
     }
 }

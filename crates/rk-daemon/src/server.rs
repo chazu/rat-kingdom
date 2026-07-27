@@ -3,10 +3,11 @@
 //! server-push event stream.
 
 use crate::proto::{codes, Request, Response};
+use crate::coordinator::CoordinatorFilter;
 use chrono::{DateTime, Utc};
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
-use rk_space::Space;
+use rk_space::{CoordinatorEvent, Space};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -14,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tracing::{debug, info, warn};
 
 const GC_INTERVAL: Duration = Duration::from_secs(60);
@@ -73,6 +74,11 @@ pub struct Daemon {
 }
 
 impl Daemon {
+    #[cfg(test)]
+    pub(crate) fn space_handle(&self) -> Space {
+        self.space.clone()
+    }
+
     pub fn new(layout: Layout, config: &rk_core::config::Config) -> rk_core::Result<Self> {
         layout.ensure()?;
         let space = Space::open(&layout.db_path())?;
@@ -724,6 +730,17 @@ impl Daemon {
                     write_json_line(&mut write, &response).await?;
                     return self.stream_watch(write, pattern).await;
                 }
+                Outcome::CoordinatorWatch {
+                    response,
+                    filter,
+                    boundary,
+                    rx,
+                } => {
+                    write_json_line(&mut write, &response).await?;
+                    return self
+                        .stream_coordinator(write, filter, boundary, rx)
+                        .await;
+                }
                 Outcome::LogFollow {
                     response,
                     agent,
@@ -756,6 +773,8 @@ impl Daemon {
                     | "repo.remove"
                     | "workflow.run"
                     | "workflow.approve"
+                    | "coordinator.snapshot"
+                    | "coordinator.watch"
                     | "sync.now"
                     | "sync.peers"
                     | "ticket.update"
@@ -792,6 +811,111 @@ impl Daemon {
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
             }
         }
+    }
+
+    /// Push durable coordinator events after the snapshot/replay response.
+    /// `rx` was subscribed before the durable backlog scan, so the feed is only
+    /// a wake/continuation channel; journal sequences at or before `boundary`
+    /// are skipped as already covered by the response.
+    async fn stream_coordinator(
+        &self,
+        mut write: tokio::net::unix::OwnedWriteHalf,
+        filter: CoordinatorFilter,
+        boundary: Option<u64>,
+        mut rx: broadcast::Receiver<CoordinatorEvent>,
+    ) -> std::io::Result<()> {
+        let mut cursor = boundary;
+        loop {
+            match rx.recv().await {
+                Ok(coordinator_event)
+                    if filter.matches_event(&coordinator_event.event)
+                        && cursor.is_none_or(|seen| coordinator_event.cursor > seen) =>
+                {
+                    cursor = Some(coordinator_event.cursor);
+                    let note = json!({
+                        "method": "coordinator.event",
+                        "params": {
+                            "cursor": coordinator_event.cursor,
+                            "event": coordinator_event.event,
+                        },
+                    });
+                    write_json_line(&mut write, &note).await?;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    let note = json!({
+                        "method": "lagged",
+                        "params": {"missed": missed, "resync_required": true},
+                    });
+                    write_json_line(&mut write, &note).await?;
+                    return Ok(());
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+            }
+        }
+    }
+
+    fn coordinator_snapshot(&self, filter: &CoordinatorFilter) -> Value {
+        let snapshot = crate::coordinator::snapshot(
+            &self.engine().list(),
+            &self.supervisor.list(),
+            filter,
+        );
+        json!({
+            "snapshot": snapshot,
+            "cursor": self.latest_event_cursor(),
+        })
+    }
+
+    fn prepare_coordinator_watch(
+        &self,
+        id: String,
+        filter: CoordinatorFilter,
+    ) -> rk_core::Result<Outcome> {
+        // Subscribe before taking either the cursor boundary or the durable
+        // replay scan. Events written after this point are guaranteed to be in
+        // either the replay result or the live receiver, then deduplicated by
+        // journal sequence in stream_coordinator.
+        let rx = self.space.subscribe_coordinator();
+        let baseline = self.latest_event_cursor();
+        let scanned = if filter.after.is_some() {
+            self.space.coordinator_events_after(
+                filter.after,
+                crate::coordinator::MAX_REPLAY_EVENTS + 1,
+            )?
+        } else {
+            Vec::new()
+        };
+        let replay = crate::coordinator::replay(scanned, &filter);
+        let boundary = max_cursor(baseline, replay.boundary);
+        let snapshot = crate::coordinator::snapshot(
+            &self.engine().list(),
+            &self.supervisor.list(),
+            &filter,
+        );
+        Ok(Outcome::CoordinatorWatch {
+            response: Response::ok(
+                id,
+                json!({
+                    "snapshot": snapshot,
+                    "cursor": boundary,
+                    "events": replay
+                        .events
+                        .iter()
+                        .map(|event| json!({"cursor": event.cursor, "event": event.event}))
+                        .collect::<Vec<_>>(),
+                    "truncated": replay.truncated,
+                    "resync_required": replay.truncated,
+                }),
+            ),
+            filter,
+            boundary,
+            rx,
+        })
+    }
+
+    fn latest_event_cursor(&self) -> Option<u64> {
+        self.space.coordinator_latest_sequence().ok().flatten()
     }
 
     /// Push `agent`'s new transcript entries as they land, until the client goes
@@ -841,6 +965,34 @@ impl Daemon {
                     response: Response::ok(id, json!({"watching": true})),
                     pattern: p.pattern,
                 },
+                Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+            },
+            "coordinator.snapshot" => match parse_params::<CoordinatorFilter>(&req.params) {
+                Ok(filter) if filter.instance.is_some() => reply(Response::ok(
+                    id,
+                    self.coordinator_snapshot(&filter),
+                )),
+                Ok(_) => reply(Response::err(
+                    id,
+                    codes::BAD_PARAMS,
+                    "coordinator.instance is required",
+                )),
+                Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+            },
+            "coordinator.watch" => match parse_params::<CoordinatorFilter>(&req.params) {
+                Ok(filter) if filter.instance.is_some() => match self.prepare_coordinator_watch(id, filter) {
+                    Ok(outcome) => outcome,
+                    Err(e) => reply(Response::err(
+                        req.id,
+                        codes::INTERNAL,
+                        e.to_string(),
+                    )),
+                },
+                Ok(_) => reply(Response::err(
+                    id,
+                    codes::BAD_PARAMS,
+                    "coordinator.instance is required",
+                )),
                 Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
             },
             "agent.spawn" => reply(self.handle_spawn(req).await),
@@ -1882,11 +2034,28 @@ fn cleared_branches_for_paths(
     cleared
 }
 
+fn max_cursor(
+    left: Option<u64>,
+    right: Option<u64>,
+) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, None) => left,
+        (None, right) => right,
+    }
+}
+
 enum Outcome {
     Reply(Response),
     Watch {
         response: Response,
         pattern: Pattern,
+    },
+    CoordinatorWatch {
+        response: Response,
+        filter: CoordinatorFilter,
+        boundary: Option<u64>,
+        rx: broadcast::Receiver<CoordinatorEvent>,
     },
     /// Reply with the backlog, then stream that agent's new log entries live.
     LogFollow {

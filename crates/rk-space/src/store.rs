@@ -35,6 +35,13 @@ CREATE INDEX IF NOT EXISTS idx_tuples_prefix
     ON tuples (category, scope, identity, instance);
 CREATE INDEX IF NOT EXISTS idx_tuples_expiry
     ON tuples (expires_at) WHERE expires_at IS NOT NULL;
+CREATE TABLE IF NOT EXISTS coordinator_events (
+    sequence   INTEGER PRIMARY KEY AUTOINCREMENT,
+    tuple_id   TEXT NOT NULL UNIQUE,
+    tuple_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_coordinator_events_sequence
+    ON coordinator_events (sequence);
 ";
 
 /// Bring an older DB up to the current schema. `CREATE TABLE IF NOT EXISTS`
@@ -105,6 +112,84 @@ impl Store {
             )
             .map_err(sql_err)?;
         Ok(())
+    }
+
+    /// Persist a protected coordinator event and its journal row atomically.
+    /// The SQLite sequence is the coordinator cursor: unlike a ULID it is
+    /// assigned in commit order and remains stable across restart.
+    pub fn insert_coordinator(&mut self, tuple: &Tuple) -> rk_core::Result<u64> {
+        let tx = self.conn.transaction().map_err(sql_err)?;
+        tx.execute(
+            "INSERT INTO tuples
+             (id, category, scope, identity, instance, lifecycle, payload, created_at, expires_at, strength)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                tuple.id.to_string(),
+                tuple.category.as_str(),
+                tuple.scope,
+                tuple.identity,
+                tuple.instance,
+                lifecycle_str(tuple.lifecycle),
+                tuple.payload.to_string(),
+                tuple.created_at.to_rfc3339(),
+                tuple.expires_at.map(|t| t.to_rfc3339()),
+                tuple.strength,
+            ],
+        )
+        .map_err(sql_err)?;
+        let tuple_json = serde_json::to_string(tuple).map_err(|error| Error::Other(error.to_string()))?;
+        tx.execute(
+            "INSERT INTO coordinator_events (tuple_id, tuple_json) VALUES (?1, ?2)",
+            rusqlite::params![tuple.id.to_string(), tuple_json],
+        )
+        .map_err(sql_err)?;
+        let sequence = tx.last_insert_rowid() as u64;
+        tx.commit().map_err(sql_err)?;
+        Ok(sequence)
+    }
+
+    pub fn coordinator_events_after(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> rk_core::Result<Vec<(u64, Tuple)>> {
+        let after = after.unwrap_or(0);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT sequence, tuple_json
+                 FROM coordinator_events
+                 WHERE sequence > ?1
+                 ORDER BY sequence ASC
+                 LIMIT ?2",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map([after as i64, limit as i64], |row| {
+                let sequence: i64 = row.get(0)?;
+                let json: String = row.get(1)?;
+                let tuple = serde_json::from_str(&json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok((sequence as u64, tuple))
+            })
+            .map_err(sql_err)?;
+        rows.map(|row| row.map_err(sql_err)).collect()
+    }
+
+    pub fn coordinator_latest_sequence(&self) -> rk_core::Result<Option<u64>> {
+        self.conn
+            .query_row(
+                "SELECT MAX(sequence) FROM coordinator_events",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map(|sequence| sequence.map(|value| value as u64))
+            .map_err(sql_err)
     }
 
     pub fn exists(&self, id: RecordId) -> rk_core::Result<bool> {

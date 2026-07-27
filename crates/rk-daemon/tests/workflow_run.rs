@@ -136,6 +136,35 @@ async fn cue_workflow_runs_end_to_end_with_agent_resolution() {
     }
     assert!(completed, "workflow did not complete");
 
+    // The coordinator view gets a durable state story from the same run: the
+    // initial snapshot, step mutations, and terminal transition all carry the
+    // workflow instance and a strictly increasing per-instance revision.
+    let transitions = client
+        .call(
+            "space.scan",
+            json!({"category": "event", "identity": "workflow_state_changed"}),
+        )
+        .await
+        .unwrap();
+    let transitions: Vec<_> = transitions["tuples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["payload"]["instance"].as_str() == Some(id.as_str()))
+        .collect();
+    assert!(transitions.len() >= 2, "workflow transitions: {transitions:?}");
+    assert_eq!(transitions[0]["payload"]["reason"], "started");
+    let revisions: Vec<_> = transitions
+        .iter()
+        .map(|event| event["payload"]["revision"].as_u64().unwrap())
+        .collect();
+    let mut sorted = revisions.clone();
+    sorted.sort_unstable();
+    assert!(
+        sorted.windows(2).all(|pair| pair[0] < pair[1]),
+        "workflow revisions were not unique: {revisions:?}"
+    );
+
     // The spawned rat resolved through agents.default (harness fake, model
     // sonnet — recorded on the agent).
     let agents = client.call("agent.list", json!({})).await.unwrap();

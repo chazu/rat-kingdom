@@ -251,6 +251,15 @@ enum WorkflowCommand {
     /// Render an instance's step trace: every step labelled and marked
     /// done/current/pending, plus where the instance is parked.
     Timeline { id: String },
+    /// Replay and follow one workflow's coordinator state until it completes
+    /// or fails; --json emits an NDJSON stream of snapshot/event records.
+    Watch {
+        /// Workflow instance id (from `rk workflow run`).
+        id: String,
+        /// Resume event delivery after this durable coordinator journal cursor.
+        #[arg(long)]
+        after: Option<String>,
+    },
     /// List available workflow definitions.
     Defs {
         #[arg(long, default_value = ".")]
@@ -523,6 +532,9 @@ async fn main() -> Result<()> {
                     } else {
                         observe::print_timeline(&result);
                     }
+                }
+                WorkflowCommand::Watch { id, after } => {
+                    observe::watch_workflow(&layout, &id, after.as_deref(), cli.json).await?;
                 }
                 WorkflowCommand::Defs { repo } => {
                     let repo = std::fs::canonicalize(&repo)?;

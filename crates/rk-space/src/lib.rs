@@ -44,10 +44,19 @@ struct Inner {
 impl Inner {
     /// Persist `tuple`, offer it to matching waiters, and (if a destructive
     /// waiter consumed it) delete it again — all under the caller's lock.
-    /// Returns whether the tuple was consumed. Shared by `out` and the
-    /// fresh-write branch of `reinforce` so both agree on wakeup semantics.
-    fn insert_and_offer(&mut self, tuple: &Tuple) -> rk_core::Result<bool> {
-        self.store.insert(tuple)?;
+    /// Coordinator writes also receive a journal sequence; ordinary writes
+    /// return `None`.
+    fn insert_and_offer(
+        &mut self,
+        tuple: &Tuple,
+        coordinator: bool,
+    ) -> rk_core::Result<Option<u64>> {
+        let sequence = if coordinator {
+            Some(self.store.insert_coordinator(tuple)?)
+        } else {
+            self.store.insert(tuple)?;
+            None
+        };
 
         let mut consumed = false;
         let consumable = tuple.lifecycle != Lifecycle::Furniture;
@@ -78,8 +87,15 @@ impl Inner {
         if consumed {
             self.store.delete(tuple.id)?;
         }
-        Ok(consumed)
+        Ok(sequence)
     }
+}
+
+/// A durable coordinator event paired with its journal-local cursor.
+#[derive(Clone, Debug)]
+pub struct CoordinatorEvent {
+    pub cursor: u64,
+    pub event: Tuple,
 }
 
 /// A shared handle to the tuplespace. Cheap to clone.
@@ -87,6 +103,7 @@ impl Inner {
 pub struct Space {
     inner: Arc<Mutex<Inner>>,
     events: broadcast::Sender<Tuple>,
+    coordinator_events: broadcast::Sender<CoordinatorEvent>,
 }
 
 impl Space {
@@ -100,6 +117,7 @@ impl Space {
 
     fn from_store(store: Store) -> Self {
         let (events, _) = broadcast::channel(EVENT_FEED_CAPACITY);
+        let (coordinator_events, _) = broadcast::channel(EVENT_FEED_CAPACITY);
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 store,
@@ -107,6 +125,7 @@ impl Space {
                 next_waiter_id: 0,
             })),
             events,
+            coordinator_events,
         }
     }
 
@@ -115,7 +134,7 @@ impl Space {
     /// before the lock is released; `rd` waiters observing it still get it.
     pub fn out(&self, tuple: Tuple) -> rk_core::Result<()> {
         let mut inner = self.lock();
-        inner.insert_and_offer(&tuple)?;
+        inner.insert_and_offer(&tuple, false)?;
         drop(inner);
 
         let _ = self.events.send(tuple);
@@ -151,7 +170,7 @@ impl Space {
             let _ = self.events.send(tuple.clone());
             return Ok(tuple);
         }
-        inner.insert_and_offer(&tuple)?;
+        inner.insert_and_offer(&tuple, false)?;
         drop(inner);
         let _ = self.events.send(tuple.clone());
         Ok(tuple)
@@ -215,7 +234,7 @@ impl Space {
         if inner.store.exists(tuple.id)? {
             return Ok(false);
         }
-        inner.insert_and_offer(&tuple)?;
+        inner.insert_and_offer(&tuple, false)?;
         drop(inner);
         let _ = self.events.send(tuple);
         Ok(true)
@@ -284,6 +303,47 @@ impl Space {
     /// acceptable here and only here.
     pub fn subscribe(&self) -> broadcast::Receiver<Tuple> {
         self.events.subscribe()
+    }
+
+    /// Persist and publish a coordinator event. These events are durable,
+    /// non-consumable furniture, so workflow observers can replay them after
+    /// disconnecting without competing with daemon participants.
+    pub fn out_coordinator(&self, tuple: Tuple) -> rk_core::Result<u64> {
+        let tuple = tuple.with_lifecycle(Lifecycle::Furniture);
+        let mut inner = self.lock();
+        let sequence = inner
+            .insert_and_offer(&tuple, true)?
+            .expect("coordinator write must allocate a journal sequence");
+        drop(inner);
+
+        let _ = self.events.send(tuple.clone());
+        let _ = self.coordinator_events.send(CoordinatorEvent {
+            cursor: sequence,
+            event: tuple,
+        });
+        Ok(sequence)
+    }
+
+    pub fn subscribe_coordinator(&self) -> broadcast::Receiver<CoordinatorEvent> {
+        self.coordinator_events.subscribe()
+    }
+
+    pub fn coordinator_events_after(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> rk_core::Result<Vec<CoordinatorEvent>> {
+        Ok(self
+            .lock()
+            .store
+            .coordinator_events_after(after, limit)?
+            .into_iter()
+            .map(|(cursor, event)| CoordinatorEvent { cursor, event })
+            .collect())
+    }
+
+    pub fn coordinator_latest_sequence(&self) -> rk_core::Result<Option<u64>> {
+        self.lock().store.coordinator_latest_sequence()
     }
 
     /// One garbage-collection pass: decay every pheromone trail by `decay_step`
@@ -592,6 +652,42 @@ mod tests {
         space.out(event("two", json!({}))).unwrap();
         assert_eq!(rx.recv().await.unwrap().identity, "one");
         assert_eq!(rx.recv().await.unwrap().identity, "two");
+    }
+
+    #[tokio::test]
+    async fn coordinator_events_are_ordered_durable_and_non_consumable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("space.db");
+        let space = Space::open(&path).unwrap();
+        let first = space
+            .out_coordinator(
+                event("workflow_state_changed", json!({"instance": "wf-1", "revision": 1}))
+                    .with_lifecycle(Lifecycle::Furniture),
+            )
+            .unwrap();
+        let second = space
+            .out_coordinator(
+                event("workflow_state_changed", json!({"instance": "wf-1", "revision": 2}))
+                    .with_lifecycle(Lifecycle::Furniture),
+            )
+            .unwrap();
+        assert!(first < second);
+        assert_eq!(space.coordinator_latest_sequence().unwrap(), Some(second));
+        assert!(space
+            .take(
+                &Pattern::default().identity("workflow_state_changed"),
+                SHORT,
+            )
+            .await
+            .unwrap()
+            .is_none());
+        drop(space);
+
+        let reopened = Space::open(&path).unwrap();
+        let replay = reopened.coordinator_events_after(Some(first), 10).unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].cursor, second);
+        assert_eq!(replay[0].event.payload["revision"], 2);
     }
 
     /// Stress: many concurrent writers and takers with randomized timing;

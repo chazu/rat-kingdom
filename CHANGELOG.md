@@ -139,6 +139,10 @@ built_).
   definition: every step labelled and marked done/current/pending against the
   persisted cursor, with `when`/`repeat` bodies nested and the parked-gate
   status in the headline. Debug a stuck workflow without reading JSON.
+- **`rk workflow watch`** — replay a durable workflow snapshot and its
+  coordinator state transitions, follow live changes, reconnect after feed lag,
+  and exit when the instance completes or fails. Journal cursors are SQLite
+  sequences; coordinator events are protected furniture and bounded summaries.
 
 ### Cost
 

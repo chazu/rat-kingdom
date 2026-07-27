@@ -614,6 +614,7 @@ mod tests {
             workflow: "gated-merge".into(),
             repo: "/home/x/dev/repo".into(),
             status,
+            revision: 0,
             current_step: 2,
             total_steps: 5,
             context: Default::default(),

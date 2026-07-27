@@ -337,6 +337,7 @@ pub async fn done(layout: &Layout, args: DoneArgs, as_json: bool) -> Result<()> 
         "agent": agent,
         "branch": std::env::var("RK_BRANCH").ok(),
         "parent": std::env::var("RK_PARENT").ok(),
+        "workflow_instance": std::env::var("RK_WORKFLOW_INSTANCE").ok(),
     });
     if let Some(summary) = args.summary {
         payload["summary"] = json!(summary);

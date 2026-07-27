@@ -460,6 +460,215 @@ fn llm_summarize(report: &str) -> Result<String> {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+/// Replay a workflow snapshot plus durable lifecycle events, then follow live
+/// coordinator notifications until this workflow reaches a terminal state.
+/// The daemon owns cursor/reconnect semantics; this adapter only renders the
+/// stream and performs a snapshot resync after a lag notification.
+pub async fn watch_workflow(
+    layout: &Layout,
+    instance: &str,
+    after: Option<&str>,
+    as_json: bool,
+) -> Result<()> {
+    let mut cursor = after.map(str::to_owned);
+    loop {
+        match watch_workflow_connection(layout, instance, cursor.as_deref(), as_json).await? {
+            WatchConnection::Done => return Ok(()),
+            WatchConnection::Resync(next) => cursor = Some(next),
+        }
+    }
+}
+
+enum WatchConnection {
+    Done,
+    Resync(String),
+}
+
+async fn watch_workflow_connection(
+    layout: &Layout,
+    instance: &str,
+    after: Option<&str>,
+    as_json: bool,
+) -> Result<WatchConnection> {
+    let mut params = json!({"instance": instance});
+    if let Some(after) = after {
+        let cursor = after
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("invalid coordinator cursor: {after}"))?;
+        params["after"] = json!(cursor);
+    }
+    let client = Client::connect_or_spawn(layout).await?;
+    let (initial, mut stream) = client.call_then_stream("coordinator.watch", params).await?;
+    render_coordinator_snapshot(&initial, as_json);
+    if initial["resync_required"] == true {
+        render_resync_notice(&initial, as_json);
+    }
+    if terminal_in_snapshot(&initial, instance) {
+        return Ok(WatchConnection::Done);
+    }
+
+    // Replay is allowed to describe the path up to the current snapshot. Once
+    // live delivery begins, the snapshot revision becomes the floor so a late
+    // broadcast cannot make the operator's view move backwards.
+    let mut last_revision = 0;
+    if let Some(events) = initial["events"].as_array() {
+        for envelope in events {
+            let event = &envelope["event"];
+            if accept_revision(event, &mut last_revision) {
+                render_coordinator_event(event, envelope["cursor"].as_u64(), as_json);
+                if terminal_event(event, instance) {
+                    return Ok(WatchConnection::Done);
+                }
+            }
+        }
+    }
+    last_revision = last_revision.max(snapshot_revision(&initial, instance));
+
+    while let Some(note) = stream.next().await? {
+        match note["method"].as_str() {
+            Some("coordinator.event") => {
+                let event = &note["params"]["event"];
+                if accept_revision(event, &mut last_revision) {
+                    render_coordinator_event(
+                        event,
+                        note["params"]["cursor"].as_u64(),
+                        as_json,
+                    );
+                    if terminal_event(event, instance) {
+                        return Ok(WatchConnection::Done);
+                    }
+                }
+            }
+            Some("lagged") => {
+                render_resync_notice(&note, as_json);
+                let mut client = Client::connect_or_spawn(layout).await?;
+                let snapshot = client
+                    .call("coordinator.snapshot", json!({"instance": instance}))
+                    .await?;
+                render_coordinator_snapshot(&snapshot, as_json);
+                if terminal_in_snapshot(&snapshot, instance) {
+                    return Ok(WatchConnection::Done);
+                }
+                let next = snapshot["cursor"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("coordinator snapshot did not include a cursor"))?;
+                return Ok(WatchConnection::Resync(next.to_string()));
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("coordinator watch ended before workflow {instance} reached a terminal state")
+}
+
+fn snapshot_revision(result: &Value, instance: &str) -> u64 {
+    result["snapshot"]["workflows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|workflow| workflow["id"].as_str() == Some(instance))
+        .and_then(|workflow| workflow["revision"].as_u64())
+        .unwrap_or(0)
+}
+
+fn accept_revision(event: &Value, last_revision: &mut u64) -> bool {
+    if event["identity"].as_str() != Some("workflow_state_changed") {
+        return true;
+    }
+    let Some(revision) = event["payload"]["revision"].as_u64() else {
+        return true;
+    };
+    if revision <= *last_revision {
+        return false;
+    }
+    *last_revision = revision;
+    true
+}
+
+fn render_coordinator_snapshot(result: &Value, as_json: bool) {
+    if as_json {
+        println!("{}", json!({"kind": "snapshot", "data": result}));
+        return;
+    }
+    let cursor = result["cursor"]
+        .as_u64()
+        .map(|cursor| cursor.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    println!("coordinator cursor {cursor}");
+    let workflows = result["snapshot"]["workflows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if workflows.is_empty() {
+        println!("workflow snapshot: no matching instance");
+        return;
+    }
+    for workflow in workflows {
+        println!(
+            "workflow {} {} {}/{} revision {}{}",
+            workflow["id"].as_str().unwrap_or("?"),
+            workflow["status"].as_str().unwrap_or("?"),
+            workflow["current_step"],
+            workflow["total_steps"],
+            workflow["revision"],
+            workflow["awaiting"]
+                .as_str()
+                .map(|reason| format!(" (awaiting {reason})"))
+                .unwrap_or_default(),
+        );
+    }
+}
+
+fn render_coordinator_event(event: &Value, cursor: Option<u64>, as_json: bool) {
+    if as_json {
+        println!(
+            "{}",
+            json!({"kind": "event", "cursor": cursor, "data": event})
+        );
+        return;
+    }
+    println!(
+        "cursor={} event {} instance={} revision={} status={} reason={}",
+        cursor
+            .map(|cursor| cursor.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        event["identity"].as_str().unwrap_or("?"),
+        event["payload"]["instance"].as_str().unwrap_or("?"),
+        event["payload"]["revision"],
+        event["payload"]["status"].as_str().unwrap_or("?"),
+        event["payload"]["reason"].as_str().unwrap_or("-")
+    );
+}
+
+fn render_resync_notice(result: &Value, as_json: bool) {
+    if as_json {
+        println!("{}", json!({"kind": "resync", "data": result}));
+    } else {
+        eprintln!("coordinator history lagged or was truncated; refreshed snapshot");
+    }
+}
+
+fn terminal_in_snapshot(result: &Value, instance: &str) -> bool {
+    result["snapshot"]["workflows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|workflow| workflow["id"].as_str() == Some(instance))
+        .is_some_and(|workflow| {
+            matches!(workflow["status"].as_str(), Some("completed" | "failed"))
+        })
+}
+
+fn terminal_event(event: &Value, instance: &str) -> bool {
+    event["payload"]["instance"].as_str() == Some(instance)
+        && (matches!(
+            event["identity"].as_str(),
+            Some("workflow_complete" | "workflow_failed")
+        ) || matches!(
+            event["payload"]["status"].as_str(),
+            Some("completed" | "failed")
+        ))
+}
+
 /// Parse a digest window like `30m`, `2h`, `1d` (bare number = minutes).
 pub fn parse_since(s: &str) -> Result<ChronoDuration> {
     let s = s.trim();
