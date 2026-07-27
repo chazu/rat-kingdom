@@ -247,6 +247,36 @@ async fn dispatch_is_idempotent_under_feed_loss_and_cursor_reset() {
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
+/// A matching tuple must remain deliverable when its target repo is briefly
+/// unavailable. The old reactor advanced the cursor while logging a warning,
+/// permanently dropping the event before an operator could register the repo.
+#[tokio::test]
+async fn dispatch_retries_after_a_missing_repo_is_registered() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    write_trigger(&layout);
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+    space.out(ping()).unwrap();
+
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        0,
+        "missing repo must be retryable without firing"
+    );
+    assert!(
+        !home.path().join("reactor-cursor").exists(),
+        "failed dispatch must not advance the durable cursor"
+    );
+
+    register_repo(&layout, "myrepo", repo.path());
+    assert_eq!(reactor.run_cycle().unwrap(), 1);
+}
+
 /// Dependency-unblock auto-dispatch (TKT-56): closing a ticket emits a
 /// `ticket_closed` event, and a reactor trigger matching it hands the newly-ready
 /// backlog to a drain workflow. Here TKT-2 depends on TKT-1; closing TKT-1 makes

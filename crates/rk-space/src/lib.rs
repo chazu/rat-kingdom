@@ -29,6 +29,7 @@ use store::Store;
 const EVENT_FEED_CAPACITY: usize = 1024;
 
 struct Waiter {
+    id: u64,
     pattern: Pattern,
     destructive: bool,
     tx: oneshot::Sender<Tuple>,
@@ -37,6 +38,7 @@ struct Waiter {
 struct Inner {
     store: Store,
     waiters: Vec<Waiter>,
+    next_waiter_id: u64,
 }
 
 impl Inner {
@@ -102,6 +104,7 @@ impl Space {
             inner: Arc::new(Mutex::new(Inner {
                 store,
                 waiters: Vec::new(),
+                next_waiter_id: 0,
             })),
             events,
         }
@@ -187,13 +190,13 @@ impl Space {
     /// whether the tuple was new. Remotely-authored tuples arrive here so
     /// repeated sync cycles cannot duplicate them.
     pub fn out_if_new(&self, tuple: Tuple) -> rk_core::Result<bool> {
-        {
-            let inner = self.lock();
-            if inner.store.exists(tuple.id)? {
-                return Ok(false);
-            }
+        let mut inner = self.lock();
+        if inner.store.exists(tuple.id)? {
+            return Ok(false);
         }
-        self.out(tuple)?;
+        inner.insert_and_offer(&tuple)?;
+        drop(inner);
+        let _ = self.events.send(tuple);
         Ok(true)
     }
 
@@ -220,7 +223,7 @@ impl Space {
         destructive: bool,
     ) -> rk_core::Result<Option<Tuple>> {
         // Check-and-register is one critical section; see module docs.
-        let rx = {
+        let (waiter_id, rx) = {
             let mut inner = self.lock();
             let mut found = inner.store.query(pattern, destructive, Some(1))?;
             if let Some(tuple) = found.pop() {
@@ -230,19 +233,25 @@ impl Space {
                 return Ok(Some(tuple));
             }
             let (tx, rx) = oneshot::channel();
+            let id = inner.next_waiter_id;
+            inner.next_waiter_id = inner.next_waiter_id.wrapping_add(1);
             inner.waiters.push(Waiter {
+                id,
                 pattern: pattern.clone(),
                 destructive,
                 tx,
             });
-            rx
+            (id, rx)
         };
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(tuple)) => Ok(Some(tuple)),
-            // Sender dropped without sending (should not happen) or timeout:
-            // remove our (now dead) waiter entry lazily via out()'s pruning.
+            // Remove timed-out waiters immediately. Waiting for a later write
+            // to prune them made a long-lived daemon retain every expired
+            // reader until the next matching tuple arrived.
             Ok(Err(_)) | Err(_) => {
+                let mut inner = self.lock();
+                inner.waiters.retain(|waiter| waiter.id != waiter_id);
                 debug!(?pattern, destructive, "blocking read timed out");
                 Ok(None)
             }
@@ -453,6 +462,39 @@ mod tests {
             .await
             .unwrap();
         assert!(got.is_some(), "tuple survived the dead waiter");
+    }
+
+    #[tokio::test]
+    async fn timed_out_waiters_are_removed_without_a_later_write() {
+        let space = Space::open_in_memory().unwrap();
+        let got = space
+            .rd(
+                &Pattern::default().identity("never-arrives"),
+                Duration::from_millis(5),
+            )
+            .await
+            .unwrap();
+        assert!(got.is_none());
+        assert_eq!(space.lock().waiters.len(), 0);
+    }
+
+    #[test]
+    fn out_if_new_is_atomic_for_concurrent_replication() {
+        let space = Space::open_in_memory().unwrap();
+        let tuple = event("replicated", json!({"source": "peer"}));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = space.clone();
+            let t = tuple.clone();
+            handles.push(std::thread::spawn(move || s.out_if_new(t).unwrap()));
+        }
+        let inserted = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|inserted| *inserted)
+            .count();
+        assert_eq!(inserted, 1, "exactly one replica write wins");
+        assert_eq!(space.count().unwrap(), 1);
     }
 
     #[test]

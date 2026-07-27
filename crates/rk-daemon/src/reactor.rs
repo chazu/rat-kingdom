@@ -166,6 +166,7 @@ impl Reactor {
 
         let mut fired = 0usize;
         let mut max_id = cursor;
+        let mut retryable_failure = false;
         for tuple in &delta {
             // Advance the cursor past every delta tuple, including the reactor's
             // own markers, so they are seen once and never re-scanned.
@@ -188,6 +189,7 @@ impl Reactor {
                     Ok(true) => fired += 1,
                     Ok(false) => {}
                     Err(e) => {
+                        retryable_failure = true;
                         warn!(trigger = %loaded.trigger.name, error = %e, "reactor dispatch failed")
                     }
                 }
@@ -203,12 +205,15 @@ impl Reactor {
                 _ => Ok(false),
             };
             if let Err(e) = outcome {
+                retryable_failure = true;
                 warn!(tuple = %tuple.id, error = %e, "reactor resolution-backlink failed");
             }
         }
-        if let Some(m) = max_id {
-            if cursor.map(|c| m > c).unwrap_or(true) {
-                self.save_cursor(m)?;
+        if !retryable_failure {
+            if let Some(m) = max_id {
+                if cursor.map(|c| m > c).unwrap_or(true) {
+                    self.save_cursor(m)?;
+                }
             }
         }
 
@@ -718,7 +723,10 @@ impl Reactor {
                 REACTOR_INSTANCE,
                 json!({"trigger": trigger.name, "window_secs": self.config.window_secs}),
             ));
-            return Ok(false);
+            return Err(rk_core::Error::other(format!(
+                "reactor trigger '{}' is rate limited",
+                trigger.name
+            )));
         }
         // Target repo: explicit override > the trigger file's own repo > the
         // matched tuple's scope. It must resolve to a registered repo path.
@@ -728,8 +736,10 @@ impl Reactor {
             .or_else(|| loaded.source_repo.clone())
             .unwrap_or_else(|| tuple.scope.clone());
         let Some(record) = registry.get(&repo_name) else {
-            warn!(trigger = %trigger.name, repo = %repo_name, "reactor: no such registered repo; skipping");
-            return Ok(false);
+            return Err(rk_core::Error::other(format!(
+                "reactor trigger '{}' targets unregistered repo '{}'",
+                trigger.name, repo_name
+            )));
         };
         let repo_path = record.path.to_string_lossy().to_string();
         let params = template_params(&trigger.params, tuple);

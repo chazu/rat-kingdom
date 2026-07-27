@@ -14,6 +14,7 @@ use rk_space::Space;
 use rk_sync::{NotesSync, SyncOp};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
 pub struct Syncer {
@@ -23,6 +24,7 @@ pub struct Syncer {
     notes: NotesSync,
     castle: String,
     remote_configured: bool,
+    cycle_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -99,6 +101,7 @@ impl Syncer {
             sync_repo,
             castle: castle.to_string(),
             remote_configured,
+            cycle_lock: Mutex::new(()),
         })
     }
 
@@ -123,6 +126,7 @@ impl Syncer {
     /// every cycle). Only a survivor still alive in the log is ever turned into
     /// a Take, so an already-consumed tuple is never re-emitted.
     pub fn run_cycle(&self, space: &Space) -> rk_core::Result<CycleStats> {
+        let _cycle = self.cycle_lock.lock().unwrap_or_else(|p| p.into_inner());
         let cursor = self.load_cursor();
         let all = space.scan(&Pattern::default())?;
         let durable_live: Vec<&Tuple> = all
@@ -147,9 +151,7 @@ impl Syncer {
             })
             .collect();
         let exported = records.len();
-        if let Some(max) = ours.iter().map(|t| t.id).max() {
-            self.save_cursor(max)?;
-        }
+        let max_ours = ours.iter().map(|t| t.id).max();
 
         // (2) Export takes: durable tuples we knew were live last cycle, still
         //     alive in the log, but now gone from the space → we consumed them.
@@ -169,6 +171,12 @@ impl Syncer {
             }
         }
         self.notes.append(&records)?;
+        // Advance only after the complete local export is durable. If append
+        // fails, the cursor remains behind the tuple and the next cycle can
+        // retry instead of silently losing the export.
+        if let Some(max) = max_ours {
+            self.save_cursor(max)?;
+        }
 
         // (3) Push our ref, fetch everyone else's.
         let mut pushed = false;
@@ -274,7 +282,7 @@ impl Syncer {
     }
 
     fn save_cursor(&self, id: RecordId) -> rk_core::Result<()> {
-        std::fs::write(&self.cursor_file, id.to_string())?;
+        write_atomic(&self.cursor_file, &format!("{id}\n"))?;
         Ok(())
     }
 
@@ -294,9 +302,16 @@ impl Syncer {
             buf.push_str(&id.to_string());
             buf.push('\n');
         }
-        std::fs::write(&self.presence_file, buf)?;
+        write_atomic(&self.presence_file, &buf)?;
         Ok(())
     }
+}
+
+fn write_atomic(path: &std::path::Path, contents: &str) -> rk_core::Result<()> {
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn run_git(dir: &std::path::Path, args: &[&str]) -> rk_core::Result<String> {
