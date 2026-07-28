@@ -62,7 +62,7 @@ pub fn drift(layout: &Layout, repo: &str, source_dir: Option<&str>) -> Result<Dr
         ("repo-local", repo.join(".rk").join("workflows")),
     ];
     let mut rows = Vec::new();
-    for (label, target_dir) in roots {
+    for (label, target_dir) in &roots {
         for target in cue_files_if_present(&target_dir)? {
             let name = target
                 .file_name()
@@ -85,17 +85,24 @@ pub fn drift(layout: &Layout, repo: &str, source_dir: Option<&str>) -> Result<Dr
                 source_digest,
             });
         }
-        for (name, source) in &sources {
-            let target = target_dir.join(name);
-            if !target.exists() {
-                rows.push(DriftRow {
-                    target: format!("{label}:{}", target.display()),
-                    source: source.display().to_string(),
-                    status: "missing".into(),
-                    deployed_digest: None,
-                    source_digest: Some(digest(source)?),
-                });
-            }
+    }
+    // Global and repo-local definitions are fallback layers, not two required
+    // copies of every workflow. Report one missing row only when neither layer
+    // deploys a source definition; otherwise the rows above compare every copy
+    // that actually exists.
+    for (name, source) in &sources {
+        let deployed = roots
+            .iter()
+            .any(|(_, target_dir)| target_dir.join(name).exists());
+        if !deployed {
+            let target_dir = repo.join(".rk").join("workflows");
+            rows.push(DriftRow {
+                target: format!("repo-local:{}", target_dir.join(name).display()),
+                source: source.display().to_string(),
+                status: "missing".into(),
+                deployed_digest: None,
+                source_digest: Some(digest(source)?),
+            });
         }
     }
     rows.sort_by(|a, b| a.target.cmp(&b.target));
@@ -152,8 +159,9 @@ mod tests {
         install(&layout, source.to_str().unwrap(), None).unwrap();
 
         let clean = drift(&layout, repo.path().to_str().unwrap(), None).unwrap();
-        assert_eq!(clean.drifted, 1, "repo-local copy is still missing");
+        assert_eq!(clean.drifted, 0, "global deployment satisfies the source");
         assert!(clean.rows.iter().any(|row| row.status == "clean"));
+        assert!(!clean.rows.iter().any(|row| row.status == "missing"));
 
         fs::write(
             layout.workflows_dir().join("steward.cue"),

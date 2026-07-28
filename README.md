@@ -379,7 +379,10 @@ wins). Two shipped examples in `examples/workflows/`:
   examines the branch and records an `artifact` verdict; a human merges.
 
 ```bash
-cp examples/workflows/*.cue ~/.rat-kingdom/workflows/
+for workflow in examples/workflows/*.cue; do
+  rk workflow install "$workflow"
+done
+rk workflow drift --repo .
 rk workflow defs
 rk workflow run solo-task --param taskId=fix-login \
   --param description="Fix the login redirect loop"
