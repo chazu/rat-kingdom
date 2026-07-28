@@ -49,10 +49,10 @@ Reporting "already fixed" and stopping would leave the ticket's actual problem
 in place — nothing tells a rat the baseline is clean, and nothing keeps it
 clean. So the deliverable is the durable half:
 
-- **`mise.toml` gains `lint` and `verify` tasks.** `mise run lint` is
+- **`mise.toml` gains `lint`, `test`, and `verify` tasks.** `mise run lint` is
   `cargo clippy --workspace --all-targets -- -D warnings`; `mise run verify` is
   build + test + lint, i.e. step 2 of the completion protocol as one command.
-  Both run through mise, so they get the pinned 1.95.0 rather than whatever
+  All run through mise, so they get the pinned 1.95.0 rather than whatever
   `cargo` is on `PATH`.
 - **README `## Development` rewritten.** It previously showed bare
   `cargo test --workspace` / `cargo clippy --workspace --all-targets`, which is
@@ -65,6 +65,49 @@ clean. So the deliverable is the durable half:
 in `[workspace.lints]`. Denying workspace-wide would mean the next toolchain
 bump breaks `cargo build` for everyone the moment it adds a lint — the failure
 mode this ticket exists to describe, escalated from confusing to blocking.
+
+## Found while verifying: the test suite cannot pass inside a rat (TKT-182)
+
+Running the new `verify` task from this worktree failed — not on clippy, on
+`crates/rk-cli/tests/reviewer_drives_rework.rs`:
+
+```
+Protocol("forbidden: Marbles-2 is not authorized for workflow.run")
+```
+
+`rk_daemon::Client::connect` (`client.rs:26`) reads `RK_AGENT` from the process
+environment and sends it as the RPC `caller`. `Server::authorized`
+(`server.rs:756`) allows anything for caller `operator` or empty, but refuses an
+*agent* caller for the operator-only method list — `workflow.run`,
+`agent.spawn`, `repo.add`, `ticket.update`, and a dozen more. A rat's spawn env
+sets `RK_AGENT`, test processes inherit it, and so every test that drives a test
+daemon through one of those methods is rejected.
+
+Proven by isolation, not inference — same commit, no code change:
+
+| Command | Result |
+| --- | --- |
+| `cargo test -p rk-cli --test reviewer_drives_rework` | FAILED |
+| `env -u RK_AGENT cargo test -p rk-cli --test reviewer_drives_rework` | ok |
+
+The consequence is the same failure class this ticket is about, one level up:
+the completion protocol tells every rat to verify with `cargo test --workspace`,
+and that command **cannot go green inside a rat** — only in an operator shell.
+A rat that runs it sees failures it did not cause and cannot distinguish from a
+real regression.
+
+So the `test` and `verify` tasks wrap the suite in `env -u RK_AGENT`. That is a
+runner-level workaround, deliberately: the daemon's authorization is behaving
+correctly, and the actual defect is that test helpers inherit ambient identity.
+Fixing that properly means an explicit-caller constructor on `Client` rather
+than env mutation (`set_var` in a test process is global and racy under cargo's
+threaded runner). Filed as **TKT-182**, not started here — it touches test
+helpers across crates and would race peers, the same reason TKT-180 asked for
+one deliberate sweep.
+
+`RK_HOME` is *not* affected: `supervisor.rs:2532` sets it per spawned agent from
+the test's own layout and `rk-fixture-done` reads its own env, so an ambient
+`RK_HOME` never points a test at the live fleet store.
 
 ## Relationship to the fmt baseline (TKT-166)
 

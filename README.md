@@ -609,6 +609,12 @@ mise exec -- cargo test --workspace       # integration tests use a scripted fak
 mise exec -- cargo clippy --workspace --all-targets
 ```
 
+Run the suite with `RK_AGENT` unset — `mise run test` does this for you. The
+daemon client sends `$RK_AGENT` as the RPC caller and the daemon refuses
+operator-only methods (`workflow.run`, `agent.spawn`, …) from an agent, so
+inside a rat, where that variable is set, tests fail with `forbidden` for
+reasons that have nothing to do with your change (TKT-182).
+
 The committed tree is clippy-clean under the pinned toolchain, which is why
 `lint` can deny warnings: anything it prints belongs to your change, not to the
 baseline. A toolchain bump may add lints over code that was clean when written

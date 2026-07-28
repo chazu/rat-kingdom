@@ -25,11 +25,20 @@ description = "Clippy over the whole workspace, warnings are errors"
 # -D warnings is safe here and makes any output unambiguously YOUR change.
 run = "cargo clippy --workspace --all-targets -- -D warnings"
 
+[tasks.test]
+description = "Run the workspace test suite"
+# `env -u RK_AGENT` is load-bearing, not hygiene. A rat's spawn env sets
+# RK_AGENT, and rk_daemon::Client::connect reads it as the RPC `caller`; the
+# daemon then refuses operator-only methods (workflow.run, agent.spawn, ...)
+# with `forbidden`. So the suite passes for a human and fails for every rat
+# running the very command its completion protocol demands. Tracked: TKT-182.
+run = "env -u RK_AGENT cargo test --workspace"
+
 [tasks.verify]
 description = "Build, test, and lint — the checks a rat must pass before `rk done`"
 run = """
 cargo build --workspace
-cargo test --workspace
+env -u RK_AGENT cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 """
 
