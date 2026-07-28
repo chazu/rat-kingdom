@@ -60,15 +60,31 @@ name is an identity key stamped into durable tuples, logs and branches that
 outlive the record, so it stays spent forever (the pool is unbounded anyway —
 it grows `Whisker-2`, `Whisker-3`, … as needed).
 
+The same pass clears the other half of the board: settled workflow instances
+(`completed`, `failed`) move from `workflow-instances/` to
+`workflow-instances-archive/` on the same window. A **running** instance is
+never archived — including a targeted `rk workflow prune <id>`, which refuses
+an in-flight or unknown id rather than silently doing nothing.
+
 ```bash
 rk prune --before 24h        # duration (30m/24h/7d/2w) or a date (2026-07-24)
-rk prune --all               # every eligible record, regardless of age
+rk prune --all               # every eligible record + settled instance, regardless of age
 rk prune --all --reap-git    # also reclaim worktrees + branches that already landed
 rk prune --all --reap-logs   # also delete the archived rats' `rk log` transcripts
 rk list --archived           # what's been archived
 rk list --all                # live fleet + archive (archived rows marked with *)
 rk top --all                 # same, in the dashboard
 rk unarchive Whisker         # put one back
+```
+
+Instance-side, with the same shape:
+
+```bash
+rk workflow prune wf-abc123          # clear one failed run — the `rk inbox` row action
+rk workflow prune --all --dry-run    # preview the sweep
+rk workflow list --archived          # what's been pruned (still fully readable)
+rk workflow status wf-abc123         # ...including its error and step trace
+rk workflow unarchive wf-abc123      # put one back
 ```
 
 A `spawning`/`running` rat is never archived, and neither is an `orphaned` one

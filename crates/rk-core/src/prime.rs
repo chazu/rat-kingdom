@@ -101,9 +101,14 @@ conversation.
 - `rk dismiss <name>` — stop the rat, merge its branch, clean up.
 - `rk cost` — per-agent and fleet token/cost rollup.
 - `rk prune` — archive settled dead records (completed/failed/dismissed) out of
-  `rk list`/`rk top` once they pile up. Nothing is lost: cost/usage/lineage
-  survive, `rk list --archived` shows them, `rk unarchive <name>` restores one.
-  Live and orphaned rats are never archived. `--dry-run` to preview.
+  `rk list`/`rk top` once they pile up, AND settled workflow instances out of
+  `rk workflow list`/`rk inbox`. Nothing is lost: cost/usage/lineage survive,
+  `rk list --archived` / `rk workflow list --archived` show them, and
+  `rk unarchive <name>` / `rk workflow unarchive <id>` restore one. Live and
+  orphaned rats, and running instances, are never archived. `--dry-run` to
+  preview.
+- `rk workflow prune <id>` — clear ONE settled instance (the resolving action on
+  an `rk inbox` `workflow-failed` row). Refuses a running or unknown id.
 
 ## Running a piece of work, end to end
 1. `rk repo add` the repository if the system doesn't know it yet.

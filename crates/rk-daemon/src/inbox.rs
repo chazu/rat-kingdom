@@ -199,7 +199,13 @@ pub fn build(
                     i.workflow,
                     i.error.as_deref().unwrap_or("(no error recorded)")
                 ),
-                action: format!("rk workflow status {}", i.id),
+                // Inspect, then clear. Without the second verb this row was
+                // unresolvable: nothing retired a failed instance, so the
+                // board only ever grew (TKT-177).
+                action: format!(
+                    "rk workflow status {id}  |  rk workflow prune {id}",
+                    id = i.id
+                ),
             });
         } else if i.status == InstanceStatus::Running && i.awaiting.as_deref() == Some("approval") {
             items.push(InboxItem {
@@ -631,6 +637,7 @@ mod tests {
             depth: 0,
             started_at: Utc::now(),
             completed_at: None,
+            archived_at: None,
         }
     }
 
