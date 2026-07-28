@@ -19,6 +19,20 @@ RK="${RK_INSTALL_DIR:-$HOME/.local/bin}/rk"
 "$RK" daemon status
 """
 
+[tasks.lint]
+description = "Clippy over the whole workspace, warnings are errors"
+# The committed tree is warning-clean under the pinned toolchain (TKT-180), so
+# -D warnings is safe here and makes any output unambiguously YOUR change.
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.verify]
+description = "Build, test, and lint — the checks a rat must pass before `rk done`"
+run = """
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+"""
+
 [tasks.clean]
 description = "Remove build artifacts"
 run = "cargo clean"

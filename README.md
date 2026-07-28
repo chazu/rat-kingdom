@@ -596,9 +596,24 @@ the local daemon. A blocked `rk rd` wakes when a peer's tuple arrives.
 ## Development
 
 ```bash
-cargo test --workspace     # ~75 tests; integration tests use a scripted fake harness
-cargo clippy --workspace --all-targets
+mise run verify            # build + test + clippy, the full pre-`rk done` check
+mise run lint              # clippy alone, warnings as errors
 ```
+
+The toolchain is pinned to Rust 1.95.0 in `mise.toml`, so run cargo through
+mise — a bare `cargo` picks up whatever is on `PATH` and an older one fails the
+MSRV check before it compiles anything:
+
+```bash
+mise exec -- cargo test --workspace       # integration tests use a scripted fake harness
+mise exec -- cargo clippy --workspace --all-targets
+```
+
+The committed tree is clippy-clean under the pinned toolchain, which is why
+`lint` can deny warnings: anything it prints belongs to your change, not to the
+baseline. A toolchain bump may add lints over code that was clean when written
+— sweep those deliberately in one commit rather than folding them into an
+unrelated change.
 
 Crate map: `rk-core` (tuple model, config, priming), `rk-space` (tuplespace),
 `rk-git` (worktrees/merges), `rk-harness` (claude/codex/axe/fake adapters),
