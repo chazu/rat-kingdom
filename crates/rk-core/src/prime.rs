@@ -32,6 +32,13 @@ from the environment):
 
 - `rk scan <category> [scope]` — read tuples. Before starting, read `fact` and
   `convention` tuples for your repo scope and the `system` scope.
+- On entry, also `rk scan suggestion system` and endorse every open proposal you
+  agree with: `rk endorse <sug-id>`. A suggestion needs 3 DISTINCT endorsers
+  inside its 24h voting window or it decays and the norm is lost — so a proposal
+  only ever becomes binding if passing rats spend the one command on it. This is
+  not extra work: it is a single cheap call, and it is the only way the fleet
+  turns a lesson into a rule without a human. Endorse the existing suggestion
+  rather than minting a near-duplicate.
 - Before editing an area, `rk scan claim <repo>` and `rk scan artifact <repo>`
   to see what peers are touching, and steer clear of their files. On entry,
   mark your area with `rk claim <area>` (a path or glob) so peers avoid it.
@@ -130,10 +137,15 @@ const FRAGMENT_GIT_SAFETY: &str = "\
 - NEVER commit to main/master/develop; never switch branches; never force-push.
 - Keep your diff to the files your task touches. NEVER commit a workspace-wide
   reformat (e.g. a bare `cargo fmt` that reflows untouched files — a newer
-  toolchain will do this). Format only files you changed, and before you
-  commit, revert any fmt/toolchain churn in files your task did not touch:
-  `git checkout -- <untouched files>`. A reformat sweep races peers editing
-  those same files and buries your real change in review.
+  toolchain will do this). `cargo fmt` cannot be scoped — it reflows every
+  target in the workspace whatever paths you pass it. Format by naming your
+  files to the formatter directly (`rustfmt <files you changed>`), not through
+  `cargo fmt`, and before you commit revert any fmt/toolchain churn elsewhere:
+  `git checkout -- <untouched files>`. Expect the committed baseline to be
+  fmt-dirty under a newer toolchain than the one it was written with: a failing
+  `cargo fmt --check` over files you did not touch is the pre-existing state,
+  not a gate you must satisfy and not yours to fix. A reformat sweep races peers
+  editing those same files and buries your real change in review.
 - Commit your work with clear messages as you go; your branch is merged by the
   orchestrator on dismissal.
 ";
@@ -230,6 +242,19 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
         "reviewer" => {
             out.push_str(
                 "Review the changes on your branch against the task requirements. \
+                 FIRST establish there are changes: run `git log <base>..HEAD`. An \
+                 EMPTY branch is not a verdict — it has two causes needing OPPOSITE \
+                 verdicts, so disambiguate before you judge. Find the implementer's \
+                 commit (`rk scan artifact <repo>` records the sha) and run \
+                 `git merge-base --is-ancestor <sha> main`:\n\
+                 - NOT an ancestor ⇒ the work was never committed (check the \
+                 implementer's branch and worktree — it may still be live with the \
+                 work staged). APPROVE would merge a no-op and lose the work: \
+                 REWORK, naming exactly what is missing.\n\
+                 - IS an ancestor ⇒ the work already landed and you are a duplicate \
+                 reviewer. REWORK here manufactures a rework loop for finished work: \
+                 verify the LANDED code against the task, then APPROVE.\n\
+                 Never APPROVE an empty branch you have not disambiguated.\n\
                  Produce exactly one recommendation, choosing by what should happen next:\n\
                  - APPROVE — clean and safe to auto-merge as-is.\n\
                  - REWORK — fixable issues remain. Give specific, actionable feedback; \
@@ -304,6 +329,97 @@ mod tests {
         let text = render("reviewer", &ctx());
         assert!(text.contains("APPROVE"));
         assert!(!text.contains("only your task"));
+    }
+
+    #[test]
+    fn reviewer_disambiguates_an_empty_branch_before_reaching_a_verdict() {
+        // An empty review branch has two causes needing OPPOSITE verdicts
+        // (fact `empty-review-branch-has-two-causes`, TKT-127): work never
+        // committed ⇒ REWORK, work already merged ⇒ APPROVE. Getting it wrong
+        // is expensive in both directions — a wrong REWORK manufactured
+        // TKT-127/128/129, a wrong APPROVE would have silently lost TKT-113's
+        // 283 lines — so the mechanical check is pinned here rather than left
+        // to each reviewer to re-derive from a repo-scoped fact.
+        let text = render("reviewer", &ctx());
+        assert!(text.contains("git merge-base --is-ancestor <sha> main"));
+        assert!(
+            text.contains("NOT an ancestor ⇒ the work was never committed"),
+            "reviewer should be told the uncommitted case is a REWORK"
+        );
+        assert!(
+            text.contains("IS an ancestor ⇒ the work already landed"),
+            "reviewer should be told the already-merged case is an APPROVE"
+        );
+        assert!(text.contains("Never APPROVE an empty branch you have not disambiguated."));
+        // The check is a precondition on *reading* the branch, so it has to
+        // land ahead of the verdict menu it gates.
+        let check_at = text
+            .find("EMPTY branch is not a verdict")
+            .expect("empty-branch check");
+        let verdicts_at = text
+            .find("Produce exactly one recommendation")
+            .expect("verdict menu");
+        assert!(
+            check_at < verdicts_at,
+            "the empty-branch check should precede the verdict criteria it gates"
+        );
+        // Confined to the reviewer arm — a directed rat renders no verdicts.
+        assert!(!render("rat", &ctx()).contains("git merge-base --is-ancestor"));
+    }
+
+    #[test]
+    fn templates_send_rats_to_the_ballot_on_entry() {
+        // The fleet promoted zero conventions in its whole life because
+        // `suggestion` was never in the read-on-entry list: proposing was
+        // taught, endorsing was framed as an optional favour, and the quorum
+        // arithmetic was invisible. Both halves have to be stated or a
+        // proposal can never reach quorum (TKT-165).
+        for role in ["rat", "reviewer"] {
+            let text = render(role, &ctx());
+            assert!(
+                text.contains("rk scan suggestion system"),
+                "{role} template should put suggestions in the on-entry read list"
+            );
+            assert!(
+                text.contains("rk endorse <sug-id>"),
+                "{role} template should teach endorsing by id"
+            );
+            assert!(
+                text.contains("3 DISTINCT endorsers"),
+                "{role} template should make the quorum visible"
+            );
+            assert!(
+                text.contains("24h voting window"),
+                "{role} template should make the deadline visible"
+            );
+        }
+    }
+
+    #[test]
+    fn git_safety_gives_the_no_reformat_rule_its_mechanics() {
+        // "Format only files you changed" is unactionable with `cargo fmt` —
+        // scoping is the one thing it cannot do — and a rat that then runs
+        // `cargo fmt --check` sees a red workspace it did not break. Ten rats
+        // in the drain corpus re-derived both facts; one concluded it should
+        // not format at all (TKT-166).
+        for role in ["rat", "reviewer"] {
+            let text = render(role, &ctx());
+            assert!(
+                text.contains("`cargo fmt` cannot be scoped"),
+                "{role} template should say why cargo fmt is the wrong tool here"
+            );
+            assert!(
+                text.contains("rustfmt <files you changed>"),
+                "{role} template should name the formatter that can be scoped"
+            );
+            assert!(
+                text.contains("not a gate you must satisfy and not yours to fix"),
+                "{role} template should mark the fmt-dirty baseline as pre-existing"
+            );
+            // The rule 0002 landed is refined, not replaced.
+            assert!(text.contains("NEVER commit a workspace-wide"));
+            assert!(text.contains("git checkout -- <untouched files>"));
+        }
     }
 
     #[test]
