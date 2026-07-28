@@ -8,7 +8,12 @@
 workflow: {
 	name:        "prompt-refine"
 	description: "mine obstacle/need tuples and failed runs; propose prompt + convention edits"
-	agents: {default: {harness: "claude"}}
+	agents: {default: {
+		harness: "claude"
+		// This workflow must run rk, git, and repo checks unattended. Keep the
+		// broad permission explicit here rather than changing the fleet default.
+		permission_mode: "bypassPermissions"
+	}}
 	steps: [
 		{
 			type: "spawn"
