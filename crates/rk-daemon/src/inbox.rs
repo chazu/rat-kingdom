@@ -26,7 +26,7 @@
 //! that can never be emptied trains the operator to skip the whole queue.
 
 use crate::agents::{AgentRecord, AgentState};
-use crate::workflow_exec::{Instance, InstanceStatus};
+use crate::workflow_exec::{settled_at, Instance, InstanceStatus};
 use chrono::{DateTime, Utc};
 use rk_core::tuple::{Category, Tuple, SYSTEM_SCOPE};
 use serde::Serialize;
@@ -53,9 +53,13 @@ mod urgency {
     pub const NEED: u8 = 1;
     /// An open proposal awaiting endorsements. Co-ranked with `need` — both are
     /// a rat asking the room for something rather than reporting a problem, and
-    /// neither blocks anything. It earns a row at all because it EXPIRES: unlike
-    /// a need, which someone may answer late, a suggestion that misses quorum
-    /// inside its voting window is gone and the norm with it (TKT-167).
+    /// neither blocks anything. It earns a row at all because nothing else in
+    /// the fleet announces a ballot: a suggestion is only ever endorsed by a
+    /// peer who goes looking for one it has no reason to suspect exists
+    /// (TKT-167). Since TKT-168 a ballot is durable by default and no longer
+    /// races a clock, so the row is no longer a deadline — it is the only
+    /// announcement. A ballot given an explicit `--ttl` still expires, and that
+    /// one IS a deadline; `open_suggestions` sorts it first.
     pub const OPEN_SUGGESTION: u8 = 1;
 }
 
@@ -106,16 +110,23 @@ pub struct BranchEvents<'a> {
 /// The suggestion ballots: open proposals, the votes cast on them, and the
 /// promotions that have already settled.
 ///
-/// `rk suggest` writes a `Suggestion` on the system scope with a voting window
-/// (default 24h). The reactor promotes it to a permanent `Convention` once
-/// `quorum` DISTINCT agents have endorsed it; otherwise it decays and the norm
-/// is lost. Nothing announces an open ballot, so a proposal only ever promotes
-/// if a peer happens to go looking for one it has no reason to suspect exists —
-/// measured 2026-07-25, ZERO conventions had ever reached quorum over 277
-/// spawns, three separate rats having tried and failed to gather three votes
-/// (TKT-167). These rows are the announcement, and they put the one endorser who
-/// is always reachable — the operator — in front of every ballot before it
-/// decays.
+/// `rk suggest` writes a durable `Suggestion` on the system scope. The reactor
+/// promotes it to a permanent `Convention` once `quorum` DISTINCT agents have
+/// endorsed it; until then it stays open. Nothing announces an open ballot, so a
+/// proposal only ever promotes if a peer happens to go looking for one it has no
+/// reason to suspect exists — measured 2026-07-25, ZERO conventions had ever
+/// reached quorum over 277 spawns, three separate rats having tried and failed
+/// to gather three votes (TKT-167). These rows are the announcement, and they
+/// put the one endorser who is always reachable — the operator — in front of
+/// every ballot.
+///
+/// Ballots carried a 24h voting window until TKT-168, which made both categories
+/// durable by default: a vote is a ledger entry, not a pheromone, because no
+/// endorser survives to re-cast it and the `Convention` it promotes to is
+/// permanent regardless. `--ttl` still time-boxes a vote on request, and legacy
+/// Ephemeral ballots already in the space keep the windows they were written
+/// with — so `expires_at` remains `Option` here and is still honoured
+/// throughout, it is simply no longer the common case.
 #[derive(Debug, Clone)]
 pub struct Ballots<'a> {
     /// `Suggestion` tuples: the open proposals, keyed `identity = <sug-id>`.
@@ -198,28 +209,11 @@ pub fn build(
         });
     }
 
-    // Workflow instances: failed runs, and runs parked at an approval gate.
+    // Workflow instances: failures no later run has made good (TKT-187), and
+    // runs parked at an approval gate.
+    items.extend(unresolved_workflow_failures(instances));
     for i in instances {
-        if i.status == InstanceStatus::Failed {
-            items.push(InboxItem {
-                urgency: urgency::FAILED,
-                kind: "workflow-failed".into(),
-                subject: i.id.clone(),
-                scope: repo_name(&i.repo),
-                detail: format!(
-                    "{} failed: {}",
-                    i.workflow,
-                    i.error.as_deref().unwrap_or("(no error recorded)")
-                ),
-                // Inspect, then clear. Without the second verb this row was
-                // unresolvable: nothing retired a failed instance, so the
-                // board only ever grew (TKT-177).
-                action: format!(
-                    "rk workflow status {id}  |  rk workflow prune {id}",
-                    id = i.id
-                ),
-            });
-        } else if i.status == InstanceStatus::Running && i.awaiting.as_deref() == Some("approval") {
+        if i.status == InstanceStatus::Running && i.awaiting.as_deref() == Some("approval") {
             items.push(InboxItem {
                 urgency: urgency::PARKED_GATE,
                 kind: "workflow-gate".into(),
@@ -419,8 +413,8 @@ pub fn build(
     items
 }
 
-/// One row per open ballot: a system-scope `Suggestion` still inside its voting
-/// window that has neither promoted nor decayed (TKT-167).
+/// One row per open ballot: a system-scope `Suggestion` that has neither
+/// promoted nor decayed (TKT-167).
 ///
 /// Four filters, each dropping a ballot the operator cannot usefully act on:
 ///
@@ -537,6 +531,180 @@ fn window_left(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String 
         (0, m) => format!(" ({m}m left)"),
         (h, m) => format!(" ({h}h{m:02}m left)"),
     }
+}
+
+/// One row per workflow failure that is still outstanding: failures a later run
+/// of the SAME WORK has since made good are retired, and repeated attempts at
+/// one piece of work collapse into a single row (TKT-187).
+///
+/// # Why the error text is never read
+///
+/// The obvious way to stop a transient failure nagging forever is to look at
+/// `Instance::error` and decide from its wording whether it was retryable — a
+/// timeout, a killed process, a connection refused. Every part of that is wrong
+/// here. `error` is `e.to_string()` over an arbitrary `rk_core::Error`
+/// (`workflow_exec::finalize`): it is prose, not a contract, produced by code
+/// that has no idea it is being parsed, and it changes the moment anyone rewords
+/// a message. A classifier over it is a guess that starts silently discarding
+/// real failures the first time someone edits a string — and this queue exists
+/// precisely because silently-absent work is the failure mode that keeps costing
+/// the fleet days (TKT-147, TKT-171).
+///
+/// # What is asserted instead
+///
+/// The same shape as the branch-shaped rows above: name a stable identity, then
+/// re-ask an independent authority whether it has resolved. For a branch the
+/// identity is `{scope, branch}` and the authority is local git. For a workflow
+/// the identity is [`Instance::work_key`] — repo, workflow, params — and the
+/// authority is the instance store itself:
+///
+/// > A failure is proven transient exactly when the same work later succeeded.
+///
+/// You cannot tell a transient failure from a permanent one by looking at it;
+/// you can only tell by looking at what happened next. So this takes the latest
+/// TERMINAL attempt at each piece of work and reports only that one. Completed
+/// means the work is done and no row is owed. Failed means it is still owed.
+/// Nothing anywhere inspects *why* anything failed.
+///
+/// Three properties make an auto-clear defensible without a human in the loop:
+///
+/// - **It suppresses a row, it does not delete a run.** The failed instance
+///   stays in the store and `rk workflow status`/`timeline` still read it in
+///   full. The worst case of a wrong suppression is that the operator is not
+///   nagged — never that a failure is lost. That is the same bargain
+///   `BranchEvents::cleared` already makes for branches.
+/// - **It is recomputed on every read.** Prune the successful run and the
+///   failure is owed a row again, because the evidence that retired it is gone.
+///   Nothing writes a "resolved" marker that could outlive its own truth.
+/// - **It fails closed.** An instance whose `work_key` is empty (params that
+///   would not serialize) is grouped alone under its own id, so it can neither
+///   clear another failure nor be cleared by one, and keeps exactly its
+///   pre-TKT-187 behaviour.
+///
+/// A retry that is still RUNNING clears nothing: trying is not succeeding, and
+/// hiding a row because someone is having another go is how TKT-147 lost two
+/// days. The row is annotated with the in-flight id instead, which is what lets
+/// the operator tell "wait" from "fix" without hiding anything.
+fn unresolved_workflow_failures(instances: &[Instance]) -> Vec<InboxItem> {
+    let mut groups: HashMap<String, Vec<&Instance>> = HashMap::new();
+    for i in instances {
+        let work_key = i.work_key();
+        let key = if work_key.is_empty() {
+            // Unknowable work identity: group with nothing but itself.
+            format!("id:{}", i.id)
+        } else {
+            format!("work:{work_key}")
+        };
+        groups.entry(key).or_default().push(i);
+    }
+
+    // Row order must never depend on `HashMap` iteration order. Emit each row at
+    // the position its reported instance occupies in `instances`, which is the
+    // caller's order — instances by start time, as the module contract says.
+    let position: HashMap<&str, usize> = instances
+        .iter()
+        .enumerate()
+        .map(|(n, i)| (i.id.as_str(), n))
+        .collect();
+
+    let mut rows: Vec<(usize, InboxItem)> = Vec::new();
+    for attempts in groups.values() {
+        // The newest attempt that actually settled. `settled_at` is the shared
+        // definition `rk prune` windows on. The id breaks an exact timestamp tie
+        // for determinism only — instance ids carry no time component, so it is
+        // never a recency signal.
+        let Some(newest) = attempts
+            .iter()
+            .copied()
+            .filter(|i| i.status != InstanceStatus::Running)
+            .max_by(|a, b| {
+                settled_at(a)
+                    .cmp(&settled_at(b))
+                    .then_with(|| a.id.cmp(&b.id))
+            })
+        else {
+            // Nothing has settled yet, so no failure has been reported at all.
+            continue;
+        };
+        if newest.status != InstanceStatus::Failed {
+            // The latest word on this work is a success. The failure it
+            // superseded is made good and owes the operator nothing.
+            continue;
+        }
+        let settled = settled_at(newest);
+
+        // Earlier failed attempts at the same work are the same problem, so they
+        // are reported once rather than once each.
+        let mut earlier: Vec<&Instance> = attempts
+            .iter()
+            .copied()
+            .filter(|i| i.status == InstanceStatus::Failed && i.id != newest.id)
+            .collect();
+        earlier.sort_by(|a, b| {
+            settled_at(b)
+                .cmp(&settled_at(a))
+                .then_with(|| b.id.cmp(&a.id))
+        });
+
+        // A retry launched since this failure settled. Annotates, never clears.
+        let in_flight = attempts
+            .iter()
+            .copied()
+            .filter(|i| i.status == InstanceStatus::Running && i.started_at >= settled)
+            .max_by(|a, b| {
+                a.started_at
+                    .cmp(&b.started_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+
+        let mut detail = format!(
+            "{} failed: {}",
+            newest.workflow,
+            newest.error.as_deref().unwrap_or("(no error recorded)")
+        );
+        if !earlier.is_empty() {
+            detail.push_str(&format!(
+                " (+{} earlier failed attempt{} at the same work)",
+                earlier.len(),
+                if earlier.len() == 1 { "" } else { "s" }
+            ));
+        }
+        if let Some(retry) = in_flight {
+            detail.push_str(&format!(" — retry {} in flight", retry.id));
+        }
+
+        // Inspect, then clear. Without the second verb this row was
+        // unresolvable: nothing retired a failed instance, so the board only
+        // ever grew (TKT-177). The prune names EVERY failed attempt in the
+        // group, because pruning just the newest would promote the one before it
+        // to newest-terminal and raise a fresh row in its place.
+        let prune_ids: Vec<&str> = std::iter::once(newest.id.as_str())
+            .chain(earlier.iter().map(|i| i.id.as_str()))
+            .collect();
+        let action = format!(
+            "rk workflow status {}  |  rk workflow prune {}",
+            newest.id,
+            prune_ids.join(" ")
+        );
+
+        let at = position
+            .get(newest.id.as_str())
+            .copied()
+            .unwrap_or(usize::MAX);
+        rows.push((
+            at,
+            InboxItem {
+                urgency: urgency::FAILED,
+                kind: "workflow-failed".into(),
+                subject: newest.id.clone(),
+                scope: repo_name(&newest.repo),
+                detail,
+                action,
+            },
+        ));
+    }
+    rows.sort_by_key(|(at, _)| *at);
+    rows.into_iter().map(|(_, item)| item).collect()
 }
 
 /// The `branch_landed` events that describe a DROPPED branch: the newest event
@@ -667,6 +835,47 @@ mod tests {
             completed_at: None,
             archived_at: None,
         }
+    }
+
+    /// An attempt at a named piece of work, settled (or started, when Running)
+    /// at a fixed offset from a shared base instant.
+    ///
+    /// The three fields that decide work identity — repo, workflow, params — and
+    /// the one that decides recency are all explicit, because every TKT-187
+    /// assertion is about exactly those and nothing else. `instance()` above
+    /// leaves them all at one default, which is deliberate: its instances all
+    /// share a work key, so those tests still exercise the grouping path.
+    fn attempt(
+        id: &str,
+        workflow: &str,
+        params: &[(&str, &str)],
+        status: InstanceStatus,
+        minutes: i64,
+    ) -> Instance {
+        let at = Utc::now() + chrono::Duration::minutes(minutes);
+        let mut i = instance(id, status, None);
+        i.workflow = workflow.into();
+        i.params = params
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), json!(v)))
+            .collect();
+        i.started_at = at;
+        i.completed_at = (status != InstanceStatus::Running).then_some(at);
+        i
+    }
+
+    fn failure_rows(instances: &[Instance]) -> Vec<InboxItem> {
+        build(
+            &[],
+            instances,
+            &[],
+            &[],
+            &BranchEvents::default(),
+            &Ballots::default(),
+        )
+        .into_iter()
+        .filter(|i| i.kind == "workflow-failed")
+        .collect()
     }
 
     fn obstacle(identity: &str, payload: serde_json::Value) -> Tuple {
