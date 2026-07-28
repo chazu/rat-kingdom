@@ -33,9 +33,15 @@ async fn connect(layout: &Layout) -> Client {
     // Workspace-wide test execution can start several daemon-backed binaries at
     // once; allow thirty seconds for the socket rather than making startup
     // depend on a short scheduler window.
+    //
+    // Connect as the operator explicitly (TKT-182): this test drives
+    // `workflow.run`, which is operator-only, and a rat's spawn env sets
+    // `RK_AGENT`, which test processes inherit. Reading identity from the
+    // ambient environment made this test fail inside every rat and pass only
+    // in an operator shell.
     for _ in 0..1500 {
         tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(c) = Client::connect(layout).await {
+        if let Ok(c) = Client::connect_as_operator(layout).await {
             return c;
         }
     }

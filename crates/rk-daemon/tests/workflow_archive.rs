@@ -79,7 +79,7 @@ fn init_repo() -> tempfile::TempDir {
 async fn connect(layout: &Layout) -> Client {
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(c) = Client::connect(layout).await {
+        if let Ok(c) = Client::connect_as_operator(layout).await {
             return c;
         }
     }
