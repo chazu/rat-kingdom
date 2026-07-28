@@ -837,47 +837,6 @@ mod tests {
         }
     }
 
-    /// An attempt at a named piece of work, settled (or started, when Running)
-    /// at a fixed offset from a shared base instant.
-    ///
-    /// The three fields that decide work identity — repo, workflow, params — and
-    /// the one that decides recency are all explicit, because every TKT-187
-    /// assertion is about exactly those and nothing else. `instance()` above
-    /// leaves them all at one default, which is deliberate: its instances all
-    /// share a work key, so those tests still exercise the grouping path.
-    fn attempt(
-        id: &str,
-        workflow: &str,
-        params: &[(&str, &str)],
-        status: InstanceStatus,
-        minutes: i64,
-    ) -> Instance {
-        let at = Utc::now() + chrono::Duration::minutes(minutes);
-        let mut i = instance(id, status, None);
-        i.workflow = workflow.into();
-        i.params = params
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), json!(v)))
-            .collect();
-        i.started_at = at;
-        i.completed_at = (status != InstanceStatus::Running).then_some(at);
-        i
-    }
-
-    fn failure_rows(instances: &[Instance]) -> Vec<InboxItem> {
-        build(
-            &[],
-            instances,
-            &[],
-            &[],
-            &BranchEvents::default(),
-            &Ballots::default(),
-        )
-        .into_iter()
-        .filter(|i| i.kind == "workflow-failed")
-        .collect()
-    }
-
     fn obstacle(identity: &str, payload: serde_json::Value) -> Tuple {
         Tuple::new(Category::Obstacle, "repo", identity, "castle", payload)
     }
