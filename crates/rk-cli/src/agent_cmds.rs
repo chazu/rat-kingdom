@@ -349,7 +349,10 @@ pub async fn prune(layout: &Layout, args: PruneArgs, as_json: bool) -> Result<()
         );
     }
     if !instances.is_empty() {
-        println!("{verb} {} workflow instance(s) ({window}):", instances.len());
+        println!(
+            "{verb} {} workflow instance(s) ({window}):",
+            instances.len()
+        );
         for i in &instances {
             print_pruned_instance(i);
         }

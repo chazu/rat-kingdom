@@ -192,7 +192,10 @@ async fn prune_clears_a_failed_instance_and_round_trips() {
     let unknown = client
         .call("workflow.archive", json!({"ids": ["wf-nope"]}))
         .await;
-    assert!(unknown.is_err(), "an unknown id must be an error, not a no-op");
+    assert!(
+        unknown.is_err(),
+        "an unknown id must be an error, not a no-op"
+    );
 
     // Dry run: reports the instance, touches nothing.
     let preview = client
@@ -204,7 +207,10 @@ async fn prune_clears_a_failed_instance_and_round_trips() {
         .unwrap();
     assert_eq!(preview["dry_run"], true);
     assert_eq!(preview["count"], 1);
-    assert_eq!(ids(preview["instances"].as_array().unwrap()), vec![&failed]);
+    assert_eq!(
+        ids(preview["instances"].as_array().unwrap()),
+        vec![failed.clone()]
+    );
     assert_eq!(
         ids(&list(&mut client, json!({})).await),
         ids(&[json!({"id": &failed}), json!({"id": &running})]),
@@ -223,7 +229,10 @@ async fn prune_clears_a_failed_instance_and_round_trips() {
     );
 
     // Live view: only the running instance. The inbox row is gone with it.
-    assert_eq!(ids(&list(&mut client, json!({})).await), vec![running.clone()]);
+    assert_eq!(
+        ids(&list(&mut client, json!({})).await),
+        vec![running.clone()]
+    );
     assert!(
         inbox_subjects(&mut client, "workflow-failed")
             .await
@@ -278,7 +287,9 @@ async fn prune_clears_a_failed_instance_and_round_trips() {
         "an unarchived failure is a live problem again"
     );
     assert!(
-        list(&mut client, json!({"archived": true})).await.is_empty(),
+        list(&mut client, json!({"archived": true}))
+            .await
+            .is_empty(),
         "unarchiving must empty the archive store, not copy out of it"
     );
 }
@@ -313,7 +324,10 @@ async fn pruned_instance_stays_pruned_across_a_restart() {
         .join("workflow-instances-archive")
         .join(format!("{failed}.json"));
     assert!(!live_file.exists(), "the live snapshot should be gone");
-    assert!(archived_file.exists(), "the run should be preserved, not deleted");
+    assert!(
+        archived_file.exists(),
+        "the run should be preserved, not deleted"
+    );
 
     client.call("stop", json!({})).await.ok();
     wait_socket_gone(&layout).await;

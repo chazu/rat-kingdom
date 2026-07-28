@@ -539,8 +539,7 @@ async fn main() -> Result<()> {
                     if cli.json {
                         println!("{}", result["instances"]);
                     } else {
-                        let instances =
-                            result["instances"].as_array().cloned().unwrap_or_default();
+                        let instances = result["instances"].as_array().cloned().unwrap_or_default();
                         for i in &instances {
                             // A pruned row is only reachable via --archived/--all,
                             // so mark it rather than letting it read as live.
@@ -589,8 +588,7 @@ async fn main() -> Result<()> {
                     if cli.json {
                         println!("{result}");
                     } else {
-                        let instances =
-                            result["instances"].as_array().cloned().unwrap_or_default();
+                        let instances = result["instances"].as_array().cloned().unwrap_or_default();
                         if instances.is_empty() {
                             println!("nothing to prune ({window})");
                         } else {
@@ -606,7 +604,9 @@ async fn main() -> Result<()> {
                     }
                 }
                 WorkflowCommand::Unarchive { id } => {
-                    let result = client.call("workflow.unarchive", json!({"name": id})).await?;
+                    let result = client
+                        .call("workflow.unarchive", json!({"name": id}))
+                        .await?;
                     if cli.json {
                         println!("{}", result["instance"]);
                     } else {

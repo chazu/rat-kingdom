@@ -121,6 +121,13 @@ built_).
 - **`rk inbox`** — one ranked queue of everything awaiting a human (parked gates,
   obstacles, needs, failed/orphaned agents, failed instances), each row carrying
   the command that resolves it. Collapses five polling surfaces into one.
+- **Prunable workflow instances** — a failed instance's inbox row was
+  inspect-only, and nothing else retired one, so the board only ever grew (the
+  clear was: stop the daemon, move the JSON aside). Settled instances now
+  archive exactly as agent records do: `rk workflow prune <id>` clears one,
+  `rk prune` sweeps both halves of the board on one window, and
+  `rk workflow list --archived` / `rk workflow unarchive` keep the run readable
+  and restorable. A running instance is never archived.
 - **`rk log`** — a bounded per-agent transcript (assistant text, tool calls,
   retries) with `--follow`; the events the supervisor previously dropped.
 - **Escalation push** — a steward escalation fires a desktop notification via
