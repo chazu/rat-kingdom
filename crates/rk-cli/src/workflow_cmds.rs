@@ -63,7 +63,7 @@ pub fn drift(layout: &Layout, repo: &str, source_dir: Option<&str>) -> Result<Dr
     ];
     let mut rows = Vec::new();
     for (label, target_dir) in &roots {
-        for target in cue_files_if_present(&target_dir)? {
+        for target in cue_files_if_present(target_dir)? {
             let name = target
                 .file_name()
                 .context("workflow target has no filename")?;

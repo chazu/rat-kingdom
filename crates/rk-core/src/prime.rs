@@ -34,8 +34,8 @@ from the environment):
   `convention` tuples for your repo scope and the `system` scope.
 - On entry, also `rk scan suggestion system` and endorse every open proposal you
   agree with: `rk endorse <sug-id>`. A suggestion needs 3 DISTINCT endorsers to
-  become binding. A ballot stays open until it reaches that quorum — it does not
-  expire on a clock — but it also never promotes on its own, so a proposal only
+  become binding. A ballot stays open until it reaches that quorum — it does \
+  not expire on a clock — but it also never promotes on its own, so a proposal only
   ever becomes a rule if passing rats spend the one command on it. This is not
   extra work: it is a single cheap call, and it is the only way the fleet turns a
   lesson into a rule without a human. Endorse the existing suggestion rather than
