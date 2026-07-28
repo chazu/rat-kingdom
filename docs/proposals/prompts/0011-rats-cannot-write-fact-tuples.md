@@ -4,7 +4,7 @@
 **Target prompt:** `crates/rk-core/src/prime.rs` → `FRAGMENT_SINGLE_TASK` and
 `FRAGMENT_COMPLETION` step 3
 **Companion convention:** `hand-off-through-artifact-and-ticket-not-fact`
-**Status:** proposed (do NOT apply live — an operator/steward lands this)
+**Status:** implemented (daemon-side authorization)
 **Confidence:** high — reproduced first-hand from inside a live rat, twice, in
 two scopes
 
@@ -50,6 +50,15 @@ The prompt was simply never updated to match. This is the same class of drift th
 `prime.rs` suite already has a named regression guard for — TKT-186, where a
 sentence outlived the behaviour it described by nine days — except here the stale
 sentence is not merely wrong, it is an **order that fails**.
+
+## Resolution
+
+The daemon-side alternative was implemented: an authenticated agent may write a
+`fact` tuple when its `instance` is the agent caller. The existing instance check
+still prevents impersonation, `Furniture` lifecycle writes remain denied, and the
+other privileged categories remain operator/daemon-only. The prompt's fact-write
+instructions are therefore valid again; the artifact routing below is retained as
+the historical prompt-side alternative, not as a required substitute.
 
 ## Why it is worse than a wasted command
 

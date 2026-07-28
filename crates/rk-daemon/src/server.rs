@@ -1971,8 +1971,7 @@ impl Daemon {
             if params.lifecycle == Some(Lifecycle::Furniture)
                 || matches!(
                     params.category,
-                    Category::Fact
-                        | Category::Convention
+                    Category::Convention
                         | Category::Task
                         | Category::Available
                         // `Withdrawal` is on this list for a different reason
@@ -1991,7 +1990,7 @@ impl Daemon {
                 return Response::err(
                     req.id,
                     codes::FORBIDDEN,
-                    "agents cannot write furniture, fact, convention, task, or available tuples \
+                    "agents cannot write furniture, convention, task, or available tuples \
                      (withdraw a ballot with `rk withdraw`, which checks authorship)",
                 );
             }
@@ -2659,6 +2658,59 @@ mod withdraw_authorisation_tests {
     fn an_operator_authored_ballot_is_still_operator_only() {
         assert!(may_withdraw(OPERATOR_ACTOR, OPERATOR_ACTOR));
         assert!(!may_withdraw("Gruyere-2", OPERATOR_ACTOR));
+    }
+}
+
+#[cfg(test)]
+mod agent_fact_authorisation_tests {
+    use super::*;
+
+    #[test]
+    fn an_agent_may_write_a_fact_for_its_own_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new_in_memory(Layout::at(dir.path()), "test-castle".into()).unwrap();
+        let response = daemon.handle_out(Request {
+            id: "fact-1".into(),
+            method: "space.out".into(),
+            auth: String::new(),
+            caller: "Whisker".into(),
+            params: json!({
+                "category": "fact",
+                "scope": "rat-kingdom",
+                "identity": "observed-rate-limit",
+                "payload": {"limit": 100}
+            }),
+        });
+
+        assert!(response.error.is_none(), "agent fact was rejected: {response:?}");
+        let facts = daemon
+            .space
+            .scan(&Pattern::category(Category::Fact).identity("observed-rate-limit"))
+            .unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].instance, "Whisker");
+        assert_eq!(facts[0].payload["limit"], 100);
+    }
+
+    #[test]
+    fn an_agent_may_not_impersonate_another_fact_author() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new_in_memory(Layout::at(dir.path()), "test-castle".into()).unwrap();
+        let response = daemon.handle_out(Request {
+            id: "fact-2".into(),
+            method: "space.out".into(),
+            auth: String::new(),
+            caller: "Whisker".into(),
+            params: json!({
+                "category": "fact",
+                "scope": "rat-kingdom",
+                "identity": "forged-observation",
+                "instance": "Nibbles",
+                "payload": {"forged": true}
+            }),
+        });
+
+        assert_eq!(response.error.as_ref().map(|error| error.code.as_str()), Some(codes::FORBIDDEN));
     }
 }
 
