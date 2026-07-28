@@ -118,6 +118,7 @@ impl OnTimeout {
 const TIMEOUT_EXIT: i64 = 124;
 
 /// The outcome of running a `run` step's command to completion or to its bound.
+#[derive(Debug)]
 enum RunOutcome {
     Completed {
         status: std::process::ExitStatus,
@@ -3062,9 +3063,15 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let error = collect_child_output(child, Duration::from_secs(2), "yes noisy", "2s")
-            .await
-            .unwrap_err();
+        let error = collect_child_output(
+            child,
+            Duration::from_secs(2),
+            "yes noisy",
+            "2s",
+            OnTimeout::Fail,
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("output exceeds"));
     }
 
