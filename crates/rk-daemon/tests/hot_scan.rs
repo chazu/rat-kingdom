@@ -12,7 +12,7 @@ use std::time::Duration;
 
 async fn connect(layout: &Layout) -> Client {
     for _ in 0..100 {
-        if let Ok(c) = Client::connect(layout).await {
+        if let Ok(c) = Client::connect_as_operator(layout).await {
             return c;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

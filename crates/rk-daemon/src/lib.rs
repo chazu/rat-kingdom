@@ -43,10 +43,13 @@ mod tests {
         (dir, layout, handle)
     }
 
+    /// Always an explicit operator connection: an ambient `RK_AGENT` (every
+    /// test run inside a supervised rat has one) would otherwise make these
+    /// tests speak as that rat and be refused the operator-only methods.
     async fn connect(layout: &Layout) -> Client {
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            if let Ok(c) = Client::connect(layout).await {
+            if let Ok(c) = Client::connect_as_operator(layout).await {
                 return c;
             }
         }
@@ -188,6 +191,46 @@ mod tests {
         assert_eq!(operator.call("ping", json!({})).await.unwrap(), json!("pong"));
         operator.call("stop", json!({})).await.unwrap();
         handle.await.unwrap().unwrap();
+    }
+
+    /// TKT-182: an operator-only method must succeed on a connection whose
+    /// caller is named by the code, whatever `RK_AGENT` says about the process
+    /// running the test — and must still be refused for a real agent caller.
+    ///
+    /// This is the end-to-end shape of the bug: every test above reaches the
+    /// daemon through `connect`, which used to resolve identity from the
+    /// environment. Inside a rat that env names the rat, so the whole
+    /// daemon-backed suite failed with `forbidden: <Agent> is not authorized`
+    /// — and `cargo test --workspace`, the command the completion protocol
+    /// tells every rat to verify with, could only pass in an operator shell.
+    #[tokio::test]
+    async fn explicit_callers_decide_authority_not_the_environment() {
+        let (_dir, layout, _handle) = start_daemon().await;
+        let snapshot_of = json!({"repo": "myrepo", "instance": "wf-1"});
+
+        // `coordinator.snapshot` is on Server::authorized's operator-only list.
+        let mut operator = connect(&layout).await;
+        let snapshot = operator
+            .call("coordinator.snapshot", snapshot_of.clone())
+            .await
+            .unwrap();
+        assert!(snapshot["workflows"].is_array());
+
+        // Production semantics are untouched: naming an agent caller still
+        // authenticates it and still refuses it the operator-only method.
+        let mut agent = Client::connect_as(&layout, "Whisker").await.unwrap();
+        let err = agent
+            .call("coordinator.snapshot", snapshot_of)
+            .await
+            .expect_err("an agent must not read the coordinator snapshot");
+        assert!(
+            err.to_string().contains("forbidden"),
+            "expected a forbidden error, got: {err}"
+        );
+        // ...while a method agents *are* allowed still works on that same
+        // connection, so the refusal above is about authority, not a broken
+        // token.
+        assert_eq!(agent.call("ping", json!({})).await.unwrap(), json!("pong"));
     }
 
     #[tokio::test]

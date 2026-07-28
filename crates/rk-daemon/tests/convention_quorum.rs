@@ -58,7 +58,7 @@ fn endorse(sug_id: &str, agent: &str) -> Value {
 async fn connect(layout: &Layout) -> Client {
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(c) = Client::connect(layout).await {
+        if let Ok(c) = Client::connect_as_operator(layout).await {
             return c;
         }
     }

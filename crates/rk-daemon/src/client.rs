@@ -16,19 +16,92 @@ pub struct Client {
     caller: String,
 }
 
+/// The caller name a connection carries when no agent identity applies.
+pub const OPERATOR: &str = "operator";
+
+/// Resolve the `(caller, token)` an ambient connection speaks as, reading
+/// identity from `var` rather than the process environment directly so the
+/// rules stay testable without mutating global state.
+///
+/// `RK_AGENT` names the caller; `RK_AUTH_TOKEN` overrides the token the
+/// supervisor already handed the agent, which is why an agent session never
+/// has to read the operator token off disk.
+fn ambient_identity(
+    layout: &Layout,
+    var: impl Fn(&str) -> Option<String>,
+) -> rk_core::Result<(String, String)> {
+    let caller = var("RK_AGENT").unwrap_or_else(|| OPERATOR.into());
+    let auth_token = match var("RK_AUTH_TOKEN") {
+        Some(token) => token,
+        None => token_for(layout, &caller)?,
+    };
+    Ok((caller, auth_token))
+}
+
+/// The token `caller` authenticates with against `layout`, derived from that
+/// layout's own root token — never from the environment.
+fn token_for(layout: &Layout, caller: &str) -> rk_core::Result<String> {
+    if caller == OPERATOR {
+        layout.auth_token()
+    } else {
+        layout.agent_auth_token(caller)
+    }
+}
+
 impl Client {
-    /// Connect to a running daemon; error if none is listening.
+    /// Connect to a running daemon as whoever the environment says we are;
+    /// error if none is listening.
+    ///
+    /// This is the identity `rk` itself should use: inside a supervised agent
+    /// session the spawn env names the rat, and everywhere else the caller is
+    /// the operator. Code that drives a daemon it constructed — tests, above
+    /// all — must use [`Client::connect_as_operator`] instead, so an ambient
+    /// `RK_AGENT` cannot silently downgrade it to an agent caller.
     pub async fn connect(layout: &Layout) -> rk_core::Result<Self> {
+        Self::open(layout, |layout| {
+            ambient_identity(layout, |key| std::env::var(key).ok())
+        })
+        .await
+    }
+
+    /// Connect as an explicitly named caller, ignoring `RK_AGENT` and
+    /// `RK_AUTH_TOKEN` entirely; the token is derived from `layout`.
+    ///
+    /// Use this whenever the identity is a property of the code rather than of
+    /// the process that happens to be running it.
+    pub async fn connect_as(layout: &Layout, caller: &str) -> rk_core::Result<Self> {
+        Self::open(layout, |layout| {
+            Ok((caller.to_string(), token_for(layout, caller)?))
+        })
+        .await
+    }
+
+    /// Connect as the operator, whatever the ambient environment claims.
+    ///
+    /// Tests run inside rats, whose spawn env sets `RK_AGENT`/`RK_AUTH_TOKEN`,
+    /// and test processes inherit it. A test daemon driven through
+    /// [`Client::connect`] would therefore speak as that rat — against the
+    /// *live* fleet's derived token, not the temp layout's — and be refused
+    /// for every operator-only method (`workflow.run`, `agent.spawn`, ...).
+    /// Naming the caller here keeps a test's authority a property of the test.
+    pub async fn connect_as_operator(layout: &Layout) -> rk_core::Result<Self> {
+        Self::connect_as(layout, OPERATOR).await
+    }
+
+    /// Open the socket, then resolve the identity to bind to it.
+    ///
+    /// The socket comes first so a down daemon still reports as
+    /// `DaemonNotRunning` rather than as whatever the token lookup says —
+    /// `connect_or_spawn` and `rk daemon status` both branch on that.
+    async fn open(
+        layout: &Layout,
+        identity: impl FnOnce(&Layout) -> rk_core::Result<(String, String)>,
+    ) -> rk_core::Result<Self> {
         let sock = layout.socket_path();
         let stream = UnixStream::connect(&sock)
             .await
             .map_err(|_| rk_core::Error::DaemonNotRunning(sock.display().to_string()))?;
-        let caller = std::env::var("RK_AGENT").unwrap_or_else(|_| "operator".into());
-        let auth_token = match std::env::var("RK_AUTH_TOKEN") {
-            Ok(token) => token,
-            Err(_) if caller == "operator" => layout.auth_token()?,
-            Err(_) => layout.agent_auth_token(&caller)?,
-        };
+        let (caller, auth_token) = identity(layout)?;
         Ok(Self {
             stream: BufReader::new(stream),
             next_id: 0,
@@ -158,4 +231,93 @@ fn spawn_detached_daemon(layout: &Layout) -> rk_core::Result<()> {
         .process_group(0)
         .spawn()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These exercise identity resolution through an injected lookup rather
+    /// than `std::env::set_var`, which is process-global and races cargo's
+    /// threaded test runner.
+    fn env_of(
+        pairs: Vec<(&'static str, &'static str)>,
+    ) -> impl Fn(&str) -> Option<String> {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn ambient_identity_defaults_to_the_operator_and_its_root_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        let (caller, token) = ambient_identity(&layout, env_of(vec![])).unwrap();
+        assert_eq!(caller, OPERATOR);
+        assert_eq!(token, layout.auth_token().unwrap());
+    }
+
+    /// The production behaviour TKT-182 must not break: a real agent session
+    /// still speaks as its rat, with the token the supervisor handed it.
+    #[test]
+    fn ambient_identity_honours_an_agent_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+
+        let (caller, token) =
+            ambient_identity(&layout, env_of(vec![("RK_AGENT", "Provolone-2")])).unwrap();
+        assert_eq!(caller, "Provolone-2");
+        assert_eq!(token, layout.agent_auth_token("Provolone-2").unwrap());
+
+        // An explicit RK_AUTH_TOKEN wins, so an agent never reads the
+        // operator token off disk.
+        let (caller, token) = ambient_identity(
+            &layout,
+            env_of(vec![
+                ("RK_AGENT", "Provolone-2"),
+                ("RK_AUTH_TOKEN", "handed-down"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(caller, "Provolone-2");
+        assert_eq!(token, "handed-down");
+    }
+
+    /// The fix itself: an explicitly named caller is unmoved by the very
+    /// environment that made `cargo test --workspace` fail inside a rat.
+    #[test]
+    fn explicit_callers_ignore_the_ambient_agent_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        let rat_env = env_of(vec![
+            ("RK_AGENT", "Provolone-2"),
+            ("RK_AUTH_TOKEN", "live-fleet"),
+        ]);
+
+        // What `Client::connect` would have picked up...
+        let (ambient_caller, ambient_token) = ambient_identity(&layout, rat_env).unwrap();
+        assert_eq!(ambient_caller, "Provolone-2");
+        assert_eq!(ambient_token, "live-fleet");
+
+        // ...versus what `connect_as_operator` binds, derived from the layout
+        // under test and nothing else.
+        assert_eq!(
+            token_for(&layout, OPERATOR).unwrap(),
+            layout.auth_token().unwrap()
+        );
+        assert_ne!(token_for(&layout, OPERATOR).unwrap(), ambient_token);
+    }
+
+    #[test]
+    fn explicit_agent_callers_derive_their_token_from_the_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        assert_eq!(
+            token_for(&layout, "Whisker").unwrap(),
+            layout.agent_auth_token("Whisker").unwrap()
+        );
+    }
 }
