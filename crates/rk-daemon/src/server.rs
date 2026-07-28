@@ -1303,8 +1303,8 @@ impl Daemon {
             .cloned()
             .collect();
         // Open ballots (TKT-167). A `Suggestion` promotes to a permanent
-        // `Convention` at quorum and otherwise decays on its voting window, and
-        // nothing else in the fleet announces that a vote is open — so a
+        // `Convention` at quorum and otherwise stays open indefinitely (durable
+        // since TKT-168), and nothing else in the fleet announces a vote — so a
         // proposal is only ever endorsed by a peer who goes looking for one it
         // has no reason to suspect exists. Measured 2026-07-25: zero conventions
         // had ever reached quorum over 277 spawns. Surfacing the ballot here

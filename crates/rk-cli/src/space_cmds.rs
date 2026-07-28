@@ -103,18 +103,20 @@ pub struct ClaimArgs {
 pub struct SuggestArgs {
     /// The proposed norm, in one line (e.g. "always rebase, never merge").
     pub text: String,
-    /// Voting window before the proposal decays if it misses quorum.
-    #[arg(long, default_value = "24h")]
-    pub ttl: String,
+    /// Optional voting window. Omitted (the default) the ballot is durable and
+    /// closes on its outcome, not on a clock — see [`ballot_ttl_secs`].
+    #[arg(long)]
+    pub ttl: Option<String>,
 }
 
 #[derive(Args)]
 pub struct EndorseArgs {
     /// The suggestion id to endorse (printed by `rk suggest`).
     pub suggestion: String,
-    /// Voting window before the endorsement decays.
-    #[arg(long, default_value = "24h")]
-    pub ttl: String,
+    /// Optional lifetime for this vote. Omitted (the default) the vote is
+    /// durable — see [`ballot_ttl_secs`].
+    #[arg(long)]
+    pub ttl: Option<String>,
 }
 
 fn parse_duration(s: &str) -> Result<std::time::Duration> {
@@ -130,6 +132,38 @@ fn parse_duration(s: &str) -> Result<std::time::Duration> {
         .parse()
         .with_context(|| format!("invalid duration: {s}"))?;
     Ok(std::time::Duration::from_secs(n * mult))
+}
+
+/// Resolve the optional voting window a ballot (`rk suggest` / `rk endorse`)
+/// was given into the `ttl_secs` the RPC `out` boundary wants, or `None` to
+/// send no window at all — which lands the tuple `Session`-durable (TKT-168).
+///
+/// Ballots used to default to a 24h window and the whole norms program produced
+/// zero conventions in the fleet's life, because quorum then means *3 distinct
+/// rats inside one overlapping 24h window* — a wall-clock bound on a fleet whose
+/// activity is bursty and whose rats live minutes. Durable is the right default
+/// for three reasons, none of which a longer window would fix:
+///
+/// - **A vote cannot be reinforced.** Every other TTL'd tuple is a pheromone its
+///   author refreshes while the condition holds — a rat re-`claim`s the area it
+///   is still editing. An endorser is dead minutes after voting, so nobody can
+///   ever re-cast its vote; decay destroys information that cannot be
+///   regenerated. Reinforcement is not merely unused here, it is impossible.
+/// - **Decay buys no freshness.** Promotion mints a `Furniture` Convention that
+///   is permanent regardless, so expiring the ballot can never make the *output*
+///   more current. It only ever makes promotion harder: a pure cost.
+/// - **Ephemeral tuples do not replicate.** `ttl_secs` forces `Lifecycle::
+///   Ephemeral` at the `out` boundary, and rk-sync exports durable lifecycles
+///   only — so a windowed ballot was invisible to every other castle while the
+///   Convention it would promote to replicates. Votes could never pool.
+///
+/// So a ballot is a ledger entry, not a trail: it closes when it promotes, and
+/// three rats reach quorum by *ever* agreeing rather than by overlapping.
+/// `--ttl` stays for a deliberately time-boxed vote ("this only holds through
+/// the migration"), which is a real thing to want and now an explicit act.
+fn ballot_ttl_secs(ttl: Option<&str>) -> Result<Option<u64>> {
+    ttl.map(|t| parse_duration(t).map(|d| d.as_secs()))
+        .transpose()
 }
 
 fn pattern_params(
@@ -405,26 +439,32 @@ pub async fn claim(layout: &Layout, args: ClaimArgs, as_json: bool) -> Result<()
 /// Propose a norm. Writes a `Suggestion` on the system scope authored by this
 /// agent (`instance = RK_AGENT`, so distinct-endorser counting works), mints a
 /// human-scale suggestion id, and prints it so peers can `rk endorse <id>`.
+///
+/// Durable unless `--ttl` asks otherwise ([`ballot_ttl_secs`]): the ballot stays
+/// open — and stays visible as an `rk inbox` `open-suggestion` row — until it
+/// promotes, rather than decaying out from under the two endorsements it had.
 pub async fn suggest(layout: &Layout, args: SuggestArgs, as_json: bool) -> Result<()> {
     if args.text.trim().is_empty() {
         bail!("suggestion text must not be empty");
     }
     let agent = env_required("RK_AGENT")?;
-    let ttl = parse_duration(&args.ttl)?;
+    let ttl_secs = ballot_ttl_secs(args.ttl.as_deref())?;
     let sug_id = rk_core::id::prefixed_id("sug");
     let payload = json!({
         "agent": agent,
         "task": std::env::var("RK_TASK").ok(),
         "text": args.text,
     });
-    let params = json!({
+    let mut params = json!({
         "category": "suggestion",
         "scope": rk_core::tuple::SYSTEM_SCOPE,
         "identity": sug_id,
         "instance": agent,
         "payload": payload,
-        "ttl_secs": ttl.as_secs(),
     });
+    if let Some(secs) = ttl_secs {
+        params["ttl_secs"] = json!(secs);
+    }
     let mut client = Client::connect_or_spawn(layout).await?;
     let result = client.call("space.out", params).await?;
     if as_json {
@@ -445,6 +485,9 @@ const OPERATOR_ENDORSER: &str = "operator";
 /// `(identity = suggestion, instance = RK_AGENT)`, so re-endorsing is
 /// idempotent. The reactor counts distinct endorsers and promotes at quorum.
 ///
+/// Durable unless `--ttl` asks otherwise ([`ballot_ttl_secs`]): a cast vote is a
+/// ledger entry, and its author is gone long before any window would close.
+///
 /// Unlike every other sugar command this one does NOT require the spawn
 /// environment: `rk endorse <sug-id>` is the resolving command on an
 /// `open-suggestion` inbox row (TKT-167), so a human runs it from a plain shell.
@@ -453,7 +496,7 @@ const OPERATOR_ENDORSER: &str = "operator";
 /// ballot is about to decay — so an unset `RK_AGENT` votes as `operator`.
 pub async fn endorse(layout: &Layout, args: EndorseArgs, as_json: bool) -> Result<()> {
     let agent = std::env::var("RK_AGENT").unwrap_or_else(|_| OPERATOR_ENDORSER.to_string());
-    let ttl = parse_duration(&args.ttl)?;
+    let ttl_secs = ballot_ttl_secs(args.ttl.as_deref())?;
     let mut client = Client::connect_or_spawn(layout).await?;
 
     // Idempotent: one endorsement per (suggestion, agent). A duplicate would not
@@ -487,14 +530,16 @@ pub async fn endorse(layout: &Layout, args: EndorseArgs, as_json: bool) -> Resul
         "agent": agent,
         "suggestion": args.suggestion,
     });
-    let params = json!({
+    let mut params = json!({
         "category": "endorsement",
         "scope": rk_core::tuple::SYSTEM_SCOPE,
         "identity": args.suggestion,
         "instance": agent,
         "payload": payload,
-        "ttl_secs": ttl.as_secs(),
     });
+    if let Some(secs) = ttl_secs {
+        params["ttl_secs"] = json!(secs);
+    }
     let result = client.call("space.out", params).await?;
     if as_json {
         println!("{result}");
@@ -548,6 +593,41 @@ mod tests {
         assert_eq!(parse_duration("2h").unwrap().as_secs(), 7200);
         assert_eq!(parse_duration("45").unwrap().as_secs(), 45);
         assert!(parse_duration("nope").is_err());
+    }
+
+    /// A ballot carries NO voting window unless one was asked for (TKT-168).
+    /// This is the whole fix: `ttl_secs` is what forces `Lifecycle::Ephemeral`
+    /// at the `out` boundary, and an Ephemeral tuple is GC'd on its clock and
+    /// never replicated — so a defaulted window is exactly the thing that kept
+    /// three rats from ever pooling into one quorum. Asserted through clap so a
+    /// re-added `default_value` fails here rather than silently in the fleet.
+    #[test]
+    fn ballots_carry_no_voting_window_by_default() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct SuggestCli {
+            #[command(flatten)]
+            args: SuggestArgs,
+        }
+        #[derive(clap::Parser)]
+        struct EndorseCli {
+            #[command(flatten)]
+            args: EndorseArgs,
+        }
+
+        let s = SuggestCli::parse_from(["rk", "always rebase"]);
+        assert!(s.args.ttl.is_none(), "a proposal must not default to a window");
+        assert_eq!(ballot_ttl_secs(s.args.ttl.as_deref()).unwrap(), None);
+
+        let e = EndorseCli::parse_from(["rk", "sug-8nsqa4132x"]);
+        assert!(e.args.ttl.is_none(), "a cast vote must not default to a window");
+        assert_eq!(ballot_ttl_secs(e.args.ttl.as_deref()).unwrap(), None);
+
+        // `--ttl` still time-boxes a ballot on purpose, and still validates.
+        let boxed = SuggestCli::parse_from(["rk", "hold through the migration", "--ttl", "2h"]);
+        assert_eq!(ballot_ttl_secs(boxed.args.ttl.as_deref()).unwrap(), Some(7200));
+        assert!(ballot_ttl_secs(Some("nope")).is_err());
     }
 
     /// The stamp is what makes a durable tuple attributable, so a workflow

@@ -238,13 +238,13 @@ the flagship stigmergy loop — proposals become shared norms with no operator i
 the path.
 
 - `rk suggest '<text>'` writes a `Suggestion` (system scope, authored by
-  `RK_AGENT`) and prints a `sug-…` id. It is **Ephemeral** with a voting-window
-  TTL: a proposal that never reaches quorum simply decays.
+  `RK_AGENT`) and prints a `sug-…` id. It is **durable** (`Session`): the ballot
+  closes on its outcome — promotion — not on a clock (TKT-168).
 - `rk endorse <sug-id>` writes an `Endorsement` keyed by
   `(identity = suggestion, instance = RK_AGENT)`. Re-endorsing is idempotent —
   the CLI skips a duplicate, and the reactor counts **distinct** endorsers
   regardless, so a double vote can never inflate the tally. Endorsements are
-  Ephemeral too and decay with the voting window.
+  durable too, so the three endorsers reaching quorum never have to overlap.
 - The reactor recomputes, **by full scan** (never off the lossy feed), the
   distinct-endorser count per suggestion. At `quorum` it emits a `Convention`
   (system scope, **Furniture** — permanent, never `in`-consumable) citing the
@@ -267,7 +267,7 @@ in the path**:
 
 1. **Propose + endorse** (rats). A rat runs `rk suggest '<norm>'` during its
    work; peers who agree run `rk endorse <sug-id>`. Both tuples are system-scope
-   and Ephemeral — a proposal that never gathers support simply decays.
+   and durable — the tally accumulates until the norm passes.
 2. **Promote at quorum** (reactor). The built-in `promote_conventions` above
    mints a Furniture `Convention` once `[reactor] quorum` distinct endorsers back
    one suggestion.
@@ -276,24 +276,37 @@ in the path**:
    the rendered prompt as a binding **"Standing conventions"** section — so a
    promoted norm changes what the next rat *does*, not just what it *could read*.
 
-Hop 1 has a failure mode the other two do not: it needs **three rats to agree
-inside one voting window**, and nothing tells a rat that a window is open.
-Measured against the live space on 2026-07-25 — `rk scan convention` = 0,
-`rk scan endorsement` = 0, `rk scan suggestion` = 0, over **277 spawns**. A
-`Convention` is Furniture (permanent), so zero conventions means nothing had
-ever reached quorum. Not a broken mechanism: an undriven one. Three separate
-rats had each proposed a norm, asked the room to endorse it, and watched the
-ballot decay unanswered.
+Hop 1 has a failure mode the other two do not: it needs three *separate* rats to
+back one proposal, and nothing tells a rat a ballot is open. Measured against the
+live space on 2026-07-25 — `rk scan convention` = 0, `rk scan endorsement` = 0,
+`rk scan suggestion` = 0, over **277 spawns**. A `Convention` is Furniture
+(permanent), so zero conventions means nothing had ever reached quorum. Not a
+broken mechanism: an undriven one. Three separate rats had each proposed a norm,
+asked the room to endorse it, and watched the ballot decay unanswered.
 
-So `rk inbox` surfaces every open ballot as an **`open-suggestion`** row
-(TKT-167) — the id, the proposer, the text, the live `n/quorum` tally and how
-long the window has left, with `rk endorse <sug-id>` as the resolving command.
-Rows sort closest-to-decaying first, and drop out the moment the proposal
-promotes (a `Convention` carries its id), decays, or if `quorum = 0` disables
-promotion entirely. This does not replace hop 1 — peers endorsing peers is still
-how a norm should pass — it adds the **one endorser who is always reachable**.
-`rk endorse` therefore does not require the spawn environment: run outside a rat
-(no `RK_AGENT`) it votes as the single distinct endorser `operator`.
+Two things drive it. First, `rk inbox` surfaces every open ballot as an
+**`open-suggestion`** row (TKT-167) — the id, the proposer, the text and the live
+`n/quorum` tally, with `rk endorse <sug-id>` as the resolving command. Rows drop
+out the moment the proposal promotes (a `Convention` carries its id) or if
+`quorum = 0` disables promotion entirely. This does not replace hop 1 — peers
+endorsing peers is still how a norm should pass — it adds the **one endorser who
+is always reachable**. `rk endorse` therefore does not require the spawn
+environment: run outside a rat (no `RK_AGENT`) it votes as the single distinct
+endorser `operator`.
+
+Second, ballots no longer expire (TKT-168). They used to carry a 24h voting
+window, which made quorum mean *three distinct rats inside one overlapping 24h
+window* — a wall-clock bound on a fleet whose activity is bursty and whose rats
+live minutes. Decay was the wrong instrument for three reasons a longer window
+would not have fixed: a vote **cannot be reinforced** (its author is dead minutes
+after casting it, so decay destroys information nobody can regenerate, unlike a
+`claim` its holder re-runs while still working); decay **buys no freshness**
+(promotion mints a permanent Furniture `Convention` regardless, so expiring the
+ballot only ever makes promotion harder); and an Ephemeral tuple **does not
+replicate** (rk-sync exports durable lifecycles only, so a windowed ballot was
+invisible to peer castles while the Convention it promotes to replicates —
+castles could never pool votes). A ballot is a ledger entry, not a pheromone.
+`rk suggest --ttl` / `rk endorse --ttl` still time-box one deliberately.
 
 The seam between hops 2 and 3 is a real contract: the convention must carry the
 suggestion's **non-blank** `text`, because the injection step drops a blank-text
