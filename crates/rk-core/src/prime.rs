@@ -33,12 +33,13 @@ from the environment):
 - `rk scan <category> [scope]` — read tuples. Before starting, read `fact` and
   `convention` tuples for your repo scope and the `system` scope.
 - On entry, also `rk scan suggestion system` and endorse every open proposal you
-  agree with: `rk endorse <sug-id>`. A suggestion needs 3 DISTINCT endorsers
-  inside its 24h voting window or it decays and the norm is lost — so a proposal
-  only ever becomes binding if passing rats spend the one command on it. This is
-  not extra work: it is a single cheap call, and it is the only way the fleet
-  turns a lesson into a rule without a human. Endorse the existing suggestion
-  rather than minting a near-duplicate.
+  agree with: `rk endorse <sug-id>`. A suggestion needs 3 DISTINCT endorsers to
+  become binding. A ballot stays open until it reaches that quorum — it does not
+  expire on a clock — but it also never promotes on its own, so a proposal only
+  ever becomes a rule if passing rats spend the one command on it. This is not
+  extra work: it is a single cheap call, and it is the only way the fleet turns a
+  lesson into a rule without a human. Endorse the existing suggestion rather than
+  minting a near-duplicate.
 - Before editing an area, `rk scan claim <repo>` and `rk scan artifact <repo>`
   to see what peers are touching, and steer clear of their files. On entry,
   mark your area with `rk claim <area>` (a path or glob) so peers avoid it.
@@ -393,9 +394,25 @@ mod tests {
                 text.contains("3 DISTINCT endorsers"),
                 "{role} template should make the quorum visible"
             );
+            // What replaced the deadline. Ballots are durable since TKT-168, so
+            // the urgency is no longer "vote before the clock runs out" — it is
+            // "nothing promotes this but you". The template has to say the
+            // second thing now that the first is false.
             assert!(
-                text.contains("24h voting window"),
-                "{role} template should make the deadline visible"
+                text.contains("does not expire on a clock"),
+                "{role} template should say a ballot no longer decays (TKT-168)"
+            );
+            assert!(
+                text.contains("never promotes on its own"),
+                "{role} template should keep the reason to vote now that the \
+                 deadline is gone"
+            );
+            // Regression guard, not decoration: this exact sentence outlived the
+            // behaviour it described by nine days and had to be swept out by
+            // hand (TKT-186). Re-adding it fails here rather than in the fleet.
+            assert!(
+                !text.contains("24h voting window"),
+                "{role} template still promises a voting window that TKT-168 removed"
             );
         }
     }

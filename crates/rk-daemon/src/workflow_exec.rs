@@ -136,10 +136,69 @@ pub struct Instance {
     pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+impl Instance {
+    /// This instance's [`work_key`] — the identity of the work it was launched
+    /// to perform, as opposed to the identity of the run that performed it.
+    pub fn work_key(&self) -> String {
+        work_key(&self.repo, &self.workflow, &self.params)
+    }
+}
+
+/// The identity of the WORK a run was launched to perform — its repo, workflow
+/// name, and the exact params it was given — as a stable digest.
+///
+/// Two instances share a `work_key` exactly when launching one would be a retry
+/// of the other. That is the whole basis of TKT-187: `rk inbox` retires a
+/// workflow failure once a later run of the SAME work has completed, without
+/// ever inspecting the failure's error text.
+///
+/// **Derived, not stored — deliberately.** It could have been a field written
+/// at launch, but the branch-shaped inbox rows already settled this argument
+/// (`inbox.rs`: the dropped-land row re-asks git rather than waiting for
+/// something to write a "resolved" record). A derived answer is correct against
+/// current data, needs no migration, and works on instances that were persisted
+/// before the feature existed; a written one needs a writer that fires at
+/// exactly the right moment and cannot be recomputed when it does not.
+///
+/// **`definition_digest` is deliberately EXCLUDED.** Editing the workflow file
+/// is the single most common repair for a workflow that failed, and folding the
+/// digest in would mean that repair prevents the retry from ever clearing the
+/// failure it fixed — exactly backwards.
+///
+/// Params are canonicalized through a `BTreeMap` before hashing so key order in
+/// the caller's `HashMap` cannot change the digest. serde_json's own `Map` is a
+/// `BTreeMap` unless the `preserve_order` feature is enabled (it is not here),
+/// so nested objects serialize in sorted key order for free.
+///
+/// Returns the empty string when the params cannot be serialized at all. Empty
+/// is the "matches nothing" key by contract — an instance whose work identity
+/// is unknowable must neither retire another failure nor be retired by one —
+/// which is why this fails closed instead of hashing a placeholder that every
+/// such instance would collide on.
+pub fn work_key(repo: &str, workflow: &str, params: &HashMap<String, Value>) -> String {
+    let canonical: std::collections::BTreeMap<&str, &Value> =
+        params.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let Ok(params_json) = serde_json::to_string(&canonical) else {
+        return String::new();
+    };
+    // Length-prefixed, not merely delimited: a separator alone would let a repo
+    // path containing the delimiter be re-cut into a different (repo, workflow)
+    // pair that hashes identically, and a false match here retires a real
+    // failure. Prefixing makes the encoding injective.
+    let material = format!(
+        "{}:{repo}|{}:{workflow}|{params_json}",
+        repo.len(),
+        workflow.len()
+    );
+    hex::encode(Sha256::digest(material.as_bytes()))
+}
+
 /// When a terminal instance settled: its `completed_at`, falling back to
 /// `started_at` for snapshots written before that field was populated. This is
-/// what an `rk prune --before` window is measured against.
-fn settled_at(instance: &Instance) -> DateTime<Utc> {
+/// what an `rk prune --before` window is measured against, and what orders the
+/// attempts within one [`work_key`] when `rk inbox` decides whether a failure
+/// has since been made good.
+pub(crate) fn settled_at(instance: &Instance) -> DateTime<Utc> {
     instance.completed_at.unwrap_or(instance.started_at)
 }
 
@@ -2737,6 +2796,107 @@ mod tests {
         assert!(parse_duration("   ").is_err());
         assert!(parse_duration("abc").is_err());
         assert!(parse_duration("m").is_err());
+    }
+
+    fn params(pairs: &[(&str, &str)]) -> HashMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), json!(v)))
+            .collect()
+    }
+
+    /// The whole TKT-187 auto-clear rests on this key meaning "the same work",
+    /// so the things that must and must not move it are pinned here rather than
+    /// left to the inbox tests that consume it.
+    #[test]
+    fn work_key_identifies_the_work_not_the_run() {
+        let base = work_key("/dev/repo", "steward", &params(&[("ticket", "TKT-1")]));
+
+        // A retry is a different RUN of the same WORK: nothing about the run —
+        // its id, its start time, its outcome — is an input here, so re-deriving
+        // from the same three fields must land on the same key.
+        assert_eq!(
+            base,
+            work_key("/dev/repo", "steward", &params(&[("ticket", "TKT-1")]))
+        );
+
+        // Param insertion order is a HashMap accident, not a difference in work.
+        let mut reordered = HashMap::new();
+        reordered.insert("b".to_string(), json!("2"));
+        reordered.insert("a".to_string(), json!("1"));
+        let mut forward = HashMap::new();
+        forward.insert("a".to_string(), json!("1"));
+        forward.insert("b".to_string(), json!("2"));
+        assert_eq!(
+            work_key("/dev/repo", "steward", &forward),
+            work_key("/dev/repo", "steward", &reordered)
+        );
+
+        // Each of the three inputs genuinely separates work.
+        assert_ne!(
+            base,
+            work_key("/dev/other", "steward", &params(&[("ticket", "TKT-1")]))
+        );
+        assert_ne!(
+            base,
+            work_key("/dev/repo", "reactor", &params(&[("ticket", "TKT-1")]))
+        );
+        assert_ne!(
+            base,
+            work_key("/dev/repo", "steward", &params(&[("ticket", "TKT-2")]))
+        );
+        assert_ne!(base, work_key("/dev/repo", "steward", &HashMap::new()));
+    }
+
+    /// The length prefixes are load-bearing, not cosmetic: without them a repo
+    /// path ending in the delimiter could be re-cut into a different
+    /// (repo, workflow) pair with identical material, and a false match here
+    /// retires a real failure from the operator's inbox.
+    #[test]
+    fn work_key_cannot_be_re_cut_across_its_fields() {
+        assert_ne!(
+            work_key("/dev/repo|x", "steward", &HashMap::new()),
+            work_key("/dev/repo", "x|steward", &HashMap::new())
+        );
+        assert_ne!(
+            work_key("a", "bc", &HashMap::new()),
+            work_key("ab", "c", &HashMap::new())
+        );
+    }
+
+    /// Editing the workflow file is the commonest repair for a workflow that
+    /// failed. If the definition digest were folded into the key, that repair
+    /// would guarantee the retry could never clear the failure it fixed — so the
+    /// exclusion is asserted, not merely commented.
+    #[test]
+    fn work_key_ignores_the_definition_digest() {
+        let mut before = Instance {
+            id: "wf-a".into(),
+            workflow: "steward".into(),
+            repo: "/dev/repo".into(),
+            status: InstanceStatus::Failed,
+            revision: 0,
+            current_step: 0,
+            total_steps: 1,
+            context: WorkflowContext::default(),
+            error: None,
+            awaiting: None,
+            instance_max_usd: None,
+            definition: "steward".into(),
+            definition_digest: "aaaa".into(),
+            params: params(&[("ticket", "TKT-1")]),
+            depth: 0,
+            started_at: Utc::now(),
+            completed_at: None,
+            archived_at: None,
+        };
+        let original = before.work_key();
+        before.definition_digest = "bbbb".into();
+        assert_eq!(original, before.work_key());
+        // Nor does the run's own identity or outcome move it.
+        before.id = "wf-b".into();
+        before.status = InstanceStatus::Completed;
+        assert_eq!(original, before.work_key());
     }
 
     #[test]

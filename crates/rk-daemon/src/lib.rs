@@ -338,15 +338,21 @@ mod tests {
 
     /// TKT-167: an open ballot reaches the operator over the wire, tallied
     /// against the reactor's own configured quorum. Without this the whole norms
-    /// program is invisible — a proposal decays on its voting window and the
-    /// only endorser who is always reachable never learns a vote was open.
+    /// program is invisible — the only endorser who is always reachable never
+    /// learns a vote was open, and nothing else in the fleet announces one.
+    ///
+    /// The ballot below is written Ephemeral (`ttl_secs`) on purpose even though
+    /// TKT-168 made that the non-default: it is the legacy shape still sitting in
+    /// live spaces, and the row has to keep rendering for it. The durable shape
+    /// is pinned separately by `a_ballot_written_without_a_window_is_durable`.
     #[tokio::test]
     async fn open_suggestion_surfaces_in_the_inbox_over_the_wire() {
         let (_dir, layout, _handle) = start_daemon().await;
         let mut client = connect(&layout).await;
 
-        // Exactly what `rk suggest` writes: a system-scope Suggestion authored by
-        // the proposing agent, with a voting window.
+        // A system-scope Suggestion authored by the proposing agent, carrying the
+        // voting window `rk suggest` used to apply by default (TKT-168 dropped
+        // it; `--ttl` and legacy tuples still produce this shape).
         client
             .call(
                 "space.out",
