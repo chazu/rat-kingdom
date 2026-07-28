@@ -77,23 +77,46 @@ ballot with no window.
 
 ## What this does not fix
 
-- **Nothing closes a losing ballot.** A proposal that never reaches quorum now
-  stays in the inbox forever. The right closing act is explicit (`rk withdraw
-  <sug-id>`, or an operator dismiss) rather than a silent clock, and the pile is
-  tiny — the fleet has minted about three suggestions in its life. Filed as a
-  ticket rather than bundled here.
+- **Nothing closes a losing ballot** (TKT-184). A proposal that never reaches
+  quorum now stays in the inbox forever. The right closing act is explicit
+  (`rk withdraw <sug-id>`, or an operator dismiss) rather than a silent clock,
+  and the pile is tiny — the fleet has minted about three suggestions in its
+  life.
 - **Legacy Ephemeral ballots.** The ones already in the live space keep their
   windows and will still decay; only new writes are durable.
-- **The null-text promotion hazard.** `promote_conventions` still mints a
-  permanent Convention citing `text: null` when quorum lands on a suggestion
-  whose text is gone (`reactor.rs`, defended by
+- **The null-text promotion hazard** (TKT-185). `promote_conventions` still
+  mints a permanent Convention citing `text: null` when quorum lands on a
+  suggestion whose text is gone (`reactor.rs`, defended by
   `quorum_promotes_even_after_suggestion_decays`). Durable ballots make this
-  nearly unreachable, but "nearly" plus "permanent and unretractable" is worth a
-  ticket. Deliberately not changed here: it is a defended decision of its own,
+  nearly unreachable, but "nearly" plus "permanent and unretractable" is worth
+  a ticket. Deliberately not changed here: it is a defended decision of its own,
   not fallout of the window.
 - **`inbox.rs` still says "a voting window (default 24h)"** in a doc comment
-  (~line 106). Left stale on purpose — `inbox.rs` is under another rat's claim.
-  Ticketed.
+  (~line 106) — TKT-186. Left stale on purpose: `inbox.rs` was under another
+  rat's claim while this was in flight.
+
+## A verification note worth more than this ticket
+
+`convention_quorum.rs` fails 0/2 for any rat that runs it, at this branch *and*
+at the merge-base, with `forbidden: agents may only write tuples for their own
+instance` — which reads exactly like a pre-existing breakage and is not one. The
+test process inherits `RK_AGENT` from the spawn env, so its daemon client
+authenticates as that rat, and `handle_out` then rejects every `space.out` naming
+a different instance — i.e. every wire test that simulates distinct agents. Run
+the suite with the spawn env stripped:
+
+```
+env -u RK_AGENT -u RK_TASK -u RK_REPO -u RK_ROLE -u RK_HOME -u RK_BRANCH \
+    -u RK_WORKTREE mise exec -- cargo test --workspace
+```
+
+Recorded as fact `rk-env-poisons-cargo-test` and proposed as a norm
+(`sug-1w6fswmzet`) — the first ballot minted under the new rules.
+
+One genuine load flake remains, unrelated to this change and of the known
+TKT-88 / TKT-126 family: `continuous_drain::partition_caps_hold_per_repo_and_
+allowlist_excludes_unlisted` failed once under full-workspace parallel load and
+passes in isolation and on repeat full runs. Filed as TKT-183, not fixed here.
 
 ## Changes
 
