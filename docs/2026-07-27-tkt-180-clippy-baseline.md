@@ -83,18 +83,32 @@ environment and sends it as the RPC `caller`. `Server::authorized`
 sets `RK_AGENT`, test processes inherit it, and so every test that drives a test
 daemon through one of those methods is rejected.
 
-Proven by isolation, not inference — same commit, no code change:
+Proven by isolation, not inference — same commit, no code change, the only
+variable is one environment variable:
 
-| Command | Result |
+| `cargo test --workspace --no-fail-fast` | Exit | Test binaries failed | Tests failed |
+| --- | --- | --- | --- |
+| as spawned (`RK_AGENT=Marbles-2`) | 101 | **39** | **79** |
+| under `env -u RK_AGENT` | 0 | 0 | 0 (418 passed) |
+
+All 79 failures have a single cause — every one panics on
+`Protocol("forbidden: ...")`, nothing else. By method:
+
+| Refused method | Failures |
 | --- | --- |
-| `cargo test -p rk-cli --test reviewer_drives_rework` | FAILED |
-| `env -u RK_AGENT cargo test -p rk-cli --test reviewer_drives_rework` | ok |
+| `workflow.run` | 36 |
+| `agent.spawn` | 24 |
+| `repo.add` | 6 |
+| `stop` | 2 |
+| `coordinator.watch` | 1 |
 
-The consequence is the same failure class this ticket is about, one level up:
-the completion protocol tells every rat to verify with `cargo test --workspace`,
-and that command **cannot go green inside a rat** — only in an operator shell.
-A rat that runs it sees failures it did not cause and cannot distinguish from a
-real regression.
+The consequence is the same failure class this ticket is about, one level up,
+and far larger than the five clippy warnings that prompted it: the completion
+protocol tells every rat to verify with `cargo test --workspace`, and that
+command **cannot go green inside a rat** — only in an operator shell. A rat
+running it sees 79 failures it did not cause, in 39 binaries, with no way to
+tell them from a real regression. Any rat that has ever reported "pre-existing
+failures, unrelated to my change" against this suite was looking at this.
 
 So the `test` and `verify` tasks wrap the suite in `env -u RK_AGENT`. That is a
 runner-level workaround, deliberately: the daemon's authorization is behaving
