@@ -706,10 +706,10 @@ async fn quorum_promotes_suggestion_to_convention_once() {
     assert_eq!(conventions(&space).len(), 1, "convention is the promote-once guard");
 }
 
-/// Quorum promotion still works with the suggestion tuple already decayed: the
-/// endorsements alone carry the vote, and the convention cites a null text.
+/// A quorum cannot promote a suggestion whose text has already decayed: a
+/// permanent Convention without content is junk and must not be minted.
 #[tokio::test]
-async fn quorum_promotes_even_after_suggestion_decays() {
+async fn quorum_does_not_promote_after_suggestion_decays() {
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
@@ -729,9 +729,7 @@ async fn quorum_promotes_even_after_suggestion_decays() {
     space.out(endorsement("sug-gone", "Nibbles")).unwrap();
     reactor.run_cycle().unwrap();
 
-    let convs = conventions(&space);
-    assert_eq!(convs.len(), 1);
-    assert_eq!(convs[0].payload["text"], serde_json::Value::Null);
+    assert!(conventions(&space).is_empty());
 }
 
 // --- Obstacle coalescence -------------------------------------------------

@@ -6,7 +6,7 @@ use crate::proto::{codes, Request, Response};
 use crate::coordinator::CoordinatorFilter;
 use chrono::{DateTime, Utc};
 use rk_core::paths::Layout;
-use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
+use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, SYSTEM_SCOPE};
 use rk_space::{CoordinatorEvent, Space};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -34,6 +34,31 @@ const MAX_SCAN_TUPLES: usize = 10_000;
 /// final response. Newest-first source scans preserve the current state of
 /// event reducers when old history is truncated.
 const MAX_INBOX_ITEMS: usize = 2_048;
+/// The caller id a human at a terminal authenticates as. `Client` sends this
+/// whenever `RK_AGENT` is unset, and an empty caller means the same thing.
+const OPERATOR_ACTOR: &str = "operator";
+
+/// Who may close a ballot: its proposer, or the operator (TKT-184).
+///
+/// Withdrawal is destructive-in-effect and unretractable in practice — it
+/// permanently suppresses a promotion — so it is gated to the two parties with
+/// standing. The proposer, because pulling your own proposal is the ordinary
+/// case and needs no ceremony. The operator, because they are the only party who
+/// is always reachable, and the ballot's author is usually a rat that has been
+/// dead for days by the time anyone decides the proposal is going nowhere;
+/// author-only would mean the common case has no one who can act.
+///
+/// A peer rat is deliberately NOT permitted. Endorsement is the fleet's
+/// mechanism for disagreeing with a proposal — you decline to endorse it — and
+/// letting any rat close any other's ballot would make a norm program where one
+/// dissenter beats three endorsers. Quorum is the vote; this is not a veto.
+///
+/// An empty caller is the operator: `Client` sends `operator` when `RK_AGENT` is
+/// unset, and pre-auth/local callers arrive blank, which the rest of the server
+/// already reads as the operator.
+fn may_withdraw(caller: &str, proposer: &str) -> bool {
+    caller.is_empty() || caller == OPERATOR_ACTOR || caller == proposer
+}
 
 pub struct Daemon {
     layout: Layout,
@@ -959,6 +984,7 @@ impl Daemon {
                 reply(resp)
             }
             "space.out" => reply(self.handle_out(req)),
+            "space.withdraw" => reply(self.handle_withdraw(req)),
             "space.scan" => reply(self.handle_scan(req)),
             "space.take" => reply(self.handle_blocking(req, true).await),
             "space.rd" => reply(self.handle_blocking(req, false).await),
@@ -1340,14 +1366,17 @@ impl Daemon {
         // had ever reached quorum over 277 spawns. Surfacing the ballot here
         // puts the always-reachable endorser — the operator — in front of it.
         // The three scans are read-side only; `build` does the counting.
+        // `Withdrawal` is the fourth: the other settled state, and the only one
+        // that retires a row now that a ballot no longer decays (TKT-184).
         let mut ballot_tuples = |category| scan(&Pattern::category(category));
-        let (suggestions, endorsements, conventions) = match (
+        let (suggestions, endorsements, conventions, withdrawals) = match (
             ballot_tuples(Category::Suggestion),
             ballot_tuples(Category::Endorsement),
             ballot_tuples(Category::Convention),
+            ballot_tuples(Category::Withdrawal),
         ) {
-            (Ok(s), Ok(e), Ok(c)) => (s, e, c),
-            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+            (Ok(s), Ok(e), Ok(c), Ok(w)) => (s, e, c, w),
+            (Err(e), _, _, _) | (_, Err(e), _, _) | (_, _, Err(e), _) | (_, _, _, Err(e)) => {
                 return Response::err(id, codes::INTERNAL, e.to_string())
             }
         };
@@ -1379,6 +1408,7 @@ impl Daemon {
                 suggestions: &suggestions,
                 endorsements: &endorsements,
                 conventions: &conventions,
+                withdrawals: &withdrawals,
                 // The reactor's own quorum, so the tally shown is the tally that
                 // promotes — and a configured 0 (promotion disabled) raises no
                 // rows rather than offering a vote that can never resolve.
@@ -1945,12 +1975,24 @@ impl Daemon {
                         | Category::Convention
                         | Category::Task
                         | Category::Available
+                        // `Withdrawal` is on this list for a different reason
+                        // than the rest: it is not that agents have no business
+                        // closing a ballot — the proposer is exactly who should
+                        // — but that a raw `out` carries no proof of WHOSE
+                        // ballot it is. `handle_out` only checks that a tuple's
+                        // `instance` is the caller, which a withdrawal keyed
+                        // `identity = <sug-id>` satisfies trivially, so leaving
+                        // it writable here would let any rat close any peer's
+                        // proposal. `space.withdraw` is the only route, and it
+                        // checks authorship against the Suggestion (TKT-184).
+                        | Category::Withdrawal
                 )
             {
                 return Response::err(
                     req.id,
                     codes::FORBIDDEN,
-                    "agents cannot write furniture, fact, convention, task, or available tuples",
+                    "agents cannot write furniture, fact, convention, task, or available tuples \
+                     (withdraw a ballot with `rk withdraw`, which checks authorship)",
                 );
             }
             if params
@@ -2036,6 +2078,129 @@ impl Daemon {
         };
         match written {
             Ok(t) => Response::ok(req.id, json!({"id": t.id, "written": true})),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    /// `space.withdraw` — close a losing ballot explicitly (TKT-184).
+    ///
+    /// This is its own RPC rather than a `space.out` of a `Withdrawal` because
+    /// the act needs an authorisation that `handle_out` structurally cannot
+    /// perform. `handle_out` authenticates a WRITER (a tuple's `instance` must
+    /// be the caller); withdrawal has to authorise against a SUBJECT — the
+    /// proposer recorded on a different tuple — and only a handler that reads
+    /// the `Suggestion` first can do that. See [`may_withdraw`].
+    ///
+    /// Ordered so the cheap terminal answers come before the authorisation
+    /// check, because they are answers the caller wants regardless of who they
+    /// are: a promoted ballot cannot be withdrawn by anyone (its Convention is
+    /// permanent and unretractable, so "withdrawn" would be a lie the space
+    /// cannot honour), and an already-withdrawn one is a no-op that must report
+    /// success — the resolving command on an inbox row has to be safe to run
+    /// twice, and the operator re-running it after a `rk sync` pulled a peer's
+    /// withdrawal should not read as a failure.
+    fn handle_withdraw(&self, req: Request) -> Response {
+        let params: WithdrawParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let sug_id = params.suggestion.trim().to_string();
+        if sug_id.is_empty() {
+            return Response::err(req.id, codes::BAD_PARAMS, "suggestion id must not be empty");
+        }
+        let ballot = |category| {
+            self.space.scan(
+                &Pattern::category(category)
+                    .scope(SYSTEM_SCOPE)
+                    .identity(sug_id.as_str()),
+            )
+        };
+
+        let suggestions = match ballot(Category::Suggestion) {
+            Ok(t) => t,
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        // The proposer is read off the Suggestion, never taken from the caller:
+        // that tuple is the only durable record of whose ballot this is.
+        let Some(suggestion) = suggestions.first() else {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                format!("no open suggestion {sug_id} on the system scope"),
+            );
+        };
+
+        match ballot(Category::Convention) {
+            Ok(c) if !c.is_empty() => {
+                return Response::err(
+                    req.id,
+                    codes::FORBIDDEN,
+                    format!(
+                        "{sug_id} already promoted to a convention — a promoted norm is \
+                         permanent and cannot be withdrawn"
+                    ),
+                )
+            }
+            Ok(_) => {}
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+
+        match ballot(Category::Withdrawal) {
+            Ok(w) if !w.is_empty() => {
+                return Response::ok(
+                    req.id,
+                    json!({"withdrawn": sug_id, "already": true, "written": false}),
+                )
+            }
+            Ok(_) => {}
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+
+        let caller = req.caller.clone();
+        if !may_withdraw(&caller, &suggestion.instance) {
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                format!(
+                    "only {proposer} (who proposed {sug_id}) or the operator may withdraw it",
+                    proposer = suggestion.instance
+                ),
+            );
+        }
+        // An operator's caller id is `operator` or empty; record the former
+        // either way so the ledger names an actor rather than a blank, and so
+        // the operator reads as ONE withdrawer however many shells they use —
+        // the same reason `rk endorse` votes as `operator`.
+        let by = if caller.is_empty() {
+            OPERATOR_ACTOR.to_string()
+        } else {
+            caller
+        };
+        let withdrawal = Tuple::new(
+            Category::Withdrawal,
+            SYSTEM_SCOPE,
+            sug_id.as_str(),
+            by.as_str(),
+            json!({
+                "suggestion": sug_id,
+                "withdrawn_by": by,
+                "proposer": suggestion.instance,
+                "text": suggestion.payload.get("text").cloned().unwrap_or(Value::Null),
+            }),
+        )
+        // Furniture for the same two reasons the Convention is: a closed ballot
+        // must stay closed (an evaporating withdrawal would silently reopen the
+        // row it retired, and re-arm the promotion it suppressed), and `in` must
+        // not be able to consume it — otherwise `rk in withdrawal system <id>`
+        // is an unauthorised reopen with no authorship check anywhere.
+        // Furniture also replicates, so a ballot withdrawn in one castle does
+        // not keep nagging — or promote — in another.
+        .with_lifecycle(Lifecycle::Furniture);
+        match self.space.out(withdrawal) {
+            Ok(()) => Response::ok(
+                req.id,
+                json!({"withdrawn": sug_id, "already": false, "written": true, "by": by}),
+            ),
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
     }
@@ -2192,6 +2357,15 @@ struct OutParams {
     lifecycle: Option<Lifecycle>,
     #[serde(default)]
     ttl_secs: Option<u64>,
+}
+
+/// `space.withdraw` params: the ballot to close. Everything else the record
+/// needs — proposer, text, withdrawer — is read from the space and the
+/// authenticated caller, never accepted from the wire, so a caller cannot
+/// misattribute the close.
+#[derive(Deserialize)]
+struct WithdrawParams {
+    suggestion: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -2447,6 +2621,44 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod withdraw_authorisation_tests {
+    //! TKT-184: who may close a ballot. Pinned as a pure predicate because the
+    //! wire tests cannot reach the interesting case — a test client with no
+    //! `RK_AGENT` authenticates as `operator`, which is authorised for every
+    //! ballot, so the peer-rat denial would never be exercised end to end.
+    use super::*;
+
+    #[test]
+    fn the_proposer_and_the_operator_may_withdraw() {
+        assert!(may_withdraw("Camembert-2", "Camembert-2"), "the proposer");
+        assert!(may_withdraw(OPERATOR_ACTOR, "Camembert-2"), "the operator");
+        // A local/pre-auth caller arrives blank and is the operator, exactly as
+        // `handle_out` and the ticket handlers already read it.
+        assert!(may_withdraw("", "Camembert-2"), "a blank caller");
+    }
+
+    #[test]
+    fn a_peer_rat_may_not_close_someone_elses_ballot() {
+        // The load-bearing denial. Declining to endorse is how a rat disagrees
+        // with a proposal; if any rat could withdraw any other's, one dissenter
+        // would outrank three endorsers and quorum would stop meaning anything.
+        assert!(!may_withdraw("Gruyere-2", "Camembert-2"));
+        // Name prefixes are distinct rats — a namesake generation must not
+        // inherit standing over its predecessor's ballot (the TKT-146 lesson).
+        assert!(!may_withdraw("Camembert-2", "Camembert"));
+        assert!(!may_withdraw("Camembert", "Camembert-2"));
+    }
+
+    /// A ballot proposed BY the operator stays withdrawable by the operator, and
+    /// is not thereby opened to every rat.
+    #[test]
+    fn an_operator_authored_ballot_is_still_operator_only() {
+        assert!(may_withdraw(OPERATOR_ACTOR, OPERATOR_ACTOR));
+        assert!(!may_withdraw("Gruyere-2", OPERATOR_ACTOR));
     }
 }
 

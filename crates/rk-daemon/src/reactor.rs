@@ -232,9 +232,17 @@ impl Reactor {
         // obstacle is ADDED, which moves the count; a burst of unrelated writes
         // leaves it unchanged, so the full scan is skipped. The first cycle
         // (`None`) always recomputes, catching up any pre-existing backlog.
-        let promote_pop = self
-            .space
-            .count_in_categories(&[Category::Endorsement, Category::Suggestion])?;
+        // `Withdrawal` joins the promotion population so the gate tracks every
+        // input to `promote_conventions`. It can only ever suppress a promotion,
+        // so omitting it would not be a correctness bug — a promotion still
+        // needs an endorsement, which moves the count on its own — but a gate
+        // that silently ignores one of its function's inputs is a trap for the
+        // next change to that function.
+        let promote_pop = self.space.count_in_categories(&[
+            Category::Endorsement,
+            Category::Suggestion,
+            Category::Withdrawal,
+        ])?;
         let coalesce_pop = self
             .space
             .count_in_categories(&[Category::Obstacle, Category::Need])?;
@@ -273,6 +281,35 @@ impl Reactor {
     /// that already has a `Convention` (matched by identity) is skipped, so the
     /// permanent Convention is itself the "already promoted" marker. Returns how
     /// many suggestions were promoted this call.
+    ///
+    /// Two things stop a quorum-reached ballot from minting a norm, and both
+    /// exist because the output is a `Furniture` Convention — **permanent and
+    /// unretractable**. There is no undo, so the bar to writing one is that it
+    /// will actually bind:
+    ///
+    /// - **Withdrawn** (TKT-184). Its proposer or the operator closed it. The
+    ///   endorsements stay in the space and stay countable, but they are inert:
+    ///   a late third vote on a withdrawn ballot promotes nothing. Checked
+    ///   before quorum, so no accumulation of votes ever reopens it.
+    /// - **No surviving text** (TKT-185). This used to mint a Convention citing
+    ///   `text: null`, which is worse than it looks in three separate ways: the
+    ///   norm cannot bind (`prime::render_conventions` drops a blank-text
+    ///   convention, so it never reaches a prompt), the reactor already refused
+    ///   to steer live rats with it, and — because the Convention is itself the
+    ///   promote-once guard — writing it *permanently forecloses* the real
+    ///   promotion of that id. So the reactor was minting an unretractable
+    ///   record of a norm that binds nobody and blocks the norm that would.
+    ///
+    ///   Skipping instead is the consistent completion of a rule the reactor
+    ///   already applied twice (the injection drop and the steer filter), and it
+    ///   is *deferral, not denial*: nothing is written, the endorsements keep
+    ///   their tally, and the same quorum promotes properly the moment the text
+    ///   is present. That matters because the reachable way to hit this is no
+    ///   longer decay — durable ballots (TKT-168) made that nearly impossible —
+    ///   but REPLICATION ORDER: rk-sync now carries ballots between castles, so
+    ///   a peer's endorsements can land here before the suggestion they are
+    ///   votes on. Under the old behaviour that race minted a permanent null
+    ///   norm; under this one the promotion simply waits a cycle.
     fn promote_conventions(&self, all: &[Tuple]) -> rk_core::Result<usize> {
         if self.config.quorum == 0 {
             return Ok(0);
@@ -283,6 +320,8 @@ impl Reactor {
         let mut endorsers: HashMap<&str, HashSet<&str>> = HashMap::new();
         // suggestion ids that already have a Convention (idempotency guard).
         let mut promoted_ids: HashSet<&str> = HashSet::new();
+        // suggestion ids their proposer or the operator has closed (TKT-184).
+        let mut withdrawn: HashSet<&str> = HashSet::new();
         // suggestion id -> the Suggestion tuple, for citing its text.
         let mut suggestions: HashMap<&str, &Tuple> = HashMap::new();
         for t in all {
@@ -298,6 +337,9 @@ impl Reactor {
                 }
                 Category::Convention => {
                     promoted_ids.insert(t.identity.as_str());
+                }
+                Category::Withdrawal => {
+                    withdrawn.insert(t.identity.as_str());
                 }
                 Category::Suggestion => {
                     suggestions.insert(t.identity.as_str(), t);
@@ -316,14 +358,40 @@ impl Reactor {
             if instances.len() < quorum || promoted_ids.contains(sug_id) {
                 continue;
             }
+            // Withdrawn ballots are closed for good: their votes remain on the
+            // record and remain countable, but they can no longer mint a norm.
+            // Ahead of the text check so a withdrawn ballot is reported as
+            // withdrawn rather than as waiting for a suggestion nobody will
+            // re-propose under that id.
+            if withdrawn.contains(sug_id) {
+                debug!(
+                    suggestion = %sug_id,
+                    count = instances.len(),
+                    "reactor skipped a withdrawn ballot at quorum"
+                );
+                continue;
+            }
+            // A norm with no text to bind is not promoted at all (TKT-185). The
+            // Convention is permanent AND is the promote-once guard, so minting
+            // a null-text one would foreclose the real promotion of this id
+            // forever. Skipping defers: the tally survives untouched and the
+            // next cycle promotes properly once the suggestion is here.
+            let Some(text) = suggestions
+                .get(sug_id)
+                .and_then(|s| s.payload.get("text"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            else {
+                debug!(
+                    suggestion = %sug_id,
+                    count = instances.len(),
+                    "reactor deferred promotion: quorum reached but the suggestion text is not here"
+                );
+                continue;
+            };
             // Sorted, deduped endorser list for a stable, replay-safe citation.
             let endorser_list: BTreeSet<&str> = instances.iter().copied().collect();
-            // The suggestion's own text may already have decayed; cite what we
-            // still have (the endorsements alone carry the quorum).
-            let text = suggestions
-                .get(sug_id)
-                .and_then(|s| s.payload.get("text").cloned())
-                .unwrap_or(Value::Null);
             let convention = Tuple::new(
                 Category::Convention,
                 SYSTEM_SCOPE,
@@ -343,11 +411,12 @@ impl Reactor {
             let scope = convention.scope.clone();
             self.space.out(convention)?;
             promoted += 1;
-            // Only steer on a materially-texted norm: a decayed (blank) suggestion
-            // carries no guidance to inject, matching TKT-18's blank-text drop.
-            if let Some(text) = text.as_str().map(str::trim).filter(|t| !t.is_empty()) {
-                steer_deltas.push((scope, text.to_string()));
-            }
+            // Every promoted norm is now materially texted by construction (the
+            // guard above), so every one is steerable — this used to filter for
+            // a non-blank text and silently promote-without-steering otherwise,
+            // matching TKT-18's blank-text injection drop. That branch is what
+            // TKT-185 turned into a refusal to promote at all.
+            steer_deltas.push((scope, text.to_string()));
             info!(
                 suggestion = %sug_id,
                 count = instances.len(),
