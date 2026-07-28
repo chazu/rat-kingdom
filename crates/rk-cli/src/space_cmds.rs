@@ -119,6 +119,12 @@ pub struct EndorseArgs {
     pub ttl: Option<String>,
 }
 
+#[derive(Args)]
+pub struct WithdrawArgs {
+    /// The suggestion id to withdraw (printed by `rk suggest`).
+    pub suggestion: String,
+}
+
 fn parse_duration(s: &str) -> Result<std::time::Duration> {
     let s = s.trim();
     let (num, unit) = s.split_at(s.len().saturating_sub(1));
@@ -499,6 +505,34 @@ pub async fn endorse(layout: &Layout, args: EndorseArgs, as_json: bool) -> Resul
     let ttl_secs = ballot_ttl_secs(args.ttl.as_deref())?;
     let mut client = Client::connect_or_spawn(layout).await?;
 
+    // A withdrawn ballot is closed: the reactor will never promote it however
+    // many votes it accumulates (TKT-184). Say so rather than writing a vote
+    // that is inert by construction — an endorsement that reports success and
+    // does nothing is exactly the silent failure the norms program already had
+    // too much of. Advisory only (the reactor is the enforcement), so a race
+    // against a concurrent withdraw costs a stray tuple, not a wrong promotion.
+    let withdrawn = client
+        .call(
+            "space.scan",
+            json!({
+                "category": "withdrawal",
+                "scope": rk_core::tuple::SYSTEM_SCOPE,
+                "identity": args.suggestion,
+            }),
+        )
+        .await?;
+    if withdrawn["tuples"]
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+    {
+        bail!(
+            "{} was withdrawn and can no longer promote — propose it again with \
+             `rk suggest` if you still want the norm",
+            args.suggestion
+        );
+    }
+
     // Idempotent: one endorsement per (suggestion, agent). A duplicate would not
     // inflate the reactor's distinct-instance tally anyway, but skipping it keeps
     // the space clean and the command honest about being a no-op.
@@ -545,6 +579,42 @@ pub async fn endorse(layout: &Layout, args: EndorseArgs, as_json: bool) -> Resul
         println!("{result}");
     } else {
         println!("endorsed {}", args.suggestion);
+    }
+    Ok(())
+}
+
+/// Close a losing ballot (TKT-184). The counterpart to quorum promotion on the
+/// other outcome, and the act that makes the `open-suggestion` inbox rank
+/// emptiable at all: ballots stopped expiring in TKT-168 — deliberately, because
+/// a vote is a ledger entry nobody survives to reinforce — which also removed
+/// the silent clock that used to clear a proposal nobody backed.
+///
+/// The decision is the daemon's, not this command's: `space.withdraw` reads the
+/// proposer off the `Suggestion` and refuses anyone who is neither them nor the
+/// operator. Doing it here instead would be advisory only — a rat can call the
+/// RPC directly — so this is a thin wrapper on purpose.
+///
+/// Withdrawing does NOT delete anything. The suggestion and every endorsement on
+/// it stay in the space and stay countable; `rk scan suggestion system` shows
+/// the whole history. What ends is that the ballot can promote and that the
+/// operator is nagged about it. There is no un-withdraw, and there does not need
+/// to be: re-proposing is one `rk suggest` away, and it mints a fresh id whose
+/// ballot starts from an honest zero rather than inheriting votes cast for an
+/// idea that was withdrawn.
+pub async fn withdraw(layout: &Layout, args: WithdrawArgs, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call("space.withdraw", json!({"suggestion": args.suggestion}))
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else if result["already"].as_bool() == Some(true) {
+        println!("{} was already withdrawn", args.suggestion);
+    } else {
+        println!(
+            "withdrew {} — its endorsements stay on the record but can no longer promote",
+            args.suggestion
+        );
     }
     Ok(())
 }

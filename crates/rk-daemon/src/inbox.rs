@@ -16,10 +16,14 @@
 //! anywhere would have named. Both are checked against local git on every read
 //! and clear themselves the moment the branch actually lands.
 //!
-//! One source is a BALLOT rather than a problem: an open `Suggestion` inside its
-//! voting window (`open-suggestion`). It is here because a proposal that nobody
-//! votes on is indistinguishable from one nobody made — it simply decays — and
-//! the operator is the one endorser who is always available.
+//! One source is a BALLOT rather than a problem: an open `Suggestion`
+//! (`open-suggestion`). It is here because a proposal nobody sees is
+//! indistinguishable from one nobody made, and the operator is the one endorser
+//! who is always available. It is also the only row here with no failure behind
+//! it, which is why it needs BOTH of its settled states wired up: since TKT-168
+//! a ballot no longer decays, so `rk withdraw` (TKT-184) is what retires a row
+//! nobody is going to back. Otherwise this rank only grows, and an inbox rank
+//! that can never be emptied trains the operator to skip the whole queue.
 
 use crate::agents::{AgentRecord, AgentState};
 use crate::workflow_exec::{Instance, InstanceStatus};
@@ -124,6 +128,13 @@ pub struct Ballots<'a> {
     /// settled and must never nag; the permanent Convention is the same
     /// already-promoted marker the reactor itself uses.
     pub conventions: &'a [Tuple],
+    /// `Withdrawal` tuples, keyed `identity = <sug-id>`: ballots their proposer
+    /// or the operator has closed (TKT-184). The other settled state, and the
+    /// one this row exists to make reachable — ballots stopped expiring in
+    /// TKT-168, so without an explicit close a proposal nobody backs sits in
+    /// this queue forever and the operator learns to scroll past the whole
+    /// `open-suggestion` rank. A queue that cannot be emptied stops being read.
+    pub withdrawals: &'a [Tuple],
     /// Distinct-endorser count at which the reactor promotes. Zero disables
     /// quorum promotion, and a ballot that can never resolve is not a ballot —
     /// no rows are raised.
@@ -139,6 +150,7 @@ impl Default for Ballots<'_> {
             suggestions: &[],
             endorsements: &[],
             conventions: &[],
+            withdrawals: &[],
             // Matches the reactor's "promotion disabled" reading. Safe as a
             // default because it can only suppress rows, never invent them.
             quorum: 0,
@@ -410,14 +422,21 @@ pub fn build(
 /// One row per open ballot: a system-scope `Suggestion` still inside its voting
 /// window that has neither promoted nor decayed (TKT-167).
 ///
-/// Three filters, each dropping a ballot the operator cannot usefully act on:
+/// Four filters, each dropping a ballot the operator cannot usefully act on:
 ///
 /// - **quorum 0** — promotion is disabled, so no endorsement can resolve it.
 /// - **already promoted** — a `Convention` carries the suggestion's id, so the
 ///   norm is permanent and the vote is over.
+/// - **withdrawn** — a `Withdrawal` carries the suggestion's id: its proposer or
+///   the operator closed it (TKT-184). The other settled state, and the only one
+///   that empties this rank now that ballots no longer decay (TKT-168). Note
+///   this drops the ROW, not the ballot: the suggestion and its endorsements
+///   stay in the space, so `rk scan suggestion system` still shows the full
+///   history to anyone who goes looking. What ends is the nagging.
 /// - **decayed** — `expires_at` has passed. Expiry is collected by the GC rather
 ///   than filtered on read, so a scan returns ballots whose window closed
-///   minutes ago; endorsing one is not what the operator meant.
+///   minutes ago; endorsing one is not what the operator meant. Only reachable
+///   for a `--ttl` ballot or a legacy one written before TKT-168.
 ///
 /// Scoped to `system`, matching the reactor: `promote_conventions` only ever
 /// considers system-scope tuples, so a suggestion written anywhere else could
@@ -436,17 +455,26 @@ fn open_suggestions(ballots: &Ballots<'_>) -> Vec<InboxItem> {
                 .insert(t.instance.as_str());
         }
     }
-    let promoted: HashSet<&str> = ballots
+    // Both settled states retire the row, and they are read the same way: a
+    // tuple on the suggestion's own id. Union them so the filter below asks one
+    // question — "is this ballot over?" — rather than tracking two outcomes.
+    let settled: HashSet<&str> = ballots
         .conventions
         .iter()
         .filter(|t| t.scope == SYSTEM_SCOPE && t.category == Category::Convention)
+        .chain(
+            ballots
+                .withdrawals
+                .iter()
+                .filter(|t| t.scope == SYSTEM_SCOPE && t.category == Category::Withdrawal),
+        )
         .map(|t| t.identity.as_str())
         .collect();
 
     let mut open: Vec<&Tuple> = ballots
         .suggestions
         .iter()
-        .filter(|t| t.scope == SYSTEM_SCOPE && !promoted.contains(t.identity.as_str()))
+        .filter(|t| t.scope == SYSTEM_SCOPE && !settled.contains(t.identity.as_str()))
         .filter(|t| t.expires_at.is_none_or(|e| e > ballots.now))
         .collect();
     // Closest to decaying first, so the ballot the operator is about to lose is
@@ -1192,6 +1220,101 @@ mod tests {
         );
         assert_eq!(*inbox.last().unwrap().kind, *"open-suggestion");
         assert!(inbox[0].urgency > inbox.last().unwrap().urgency);
+    }
+
+    fn withdrawal(sug_id: &str, by: &str) -> Tuple {
+        Tuple::new(
+            Category::Withdrawal,
+            SYSTEM_SCOPE,
+            sug_id,
+            by,
+            json!({ "suggestion": sug_id, "withdrawn_by": by }),
+        )
+    }
+
+    /// TKT-184 — the row that could not be retired. A ballot no longer decays
+    /// (TKT-168), so before `rk withdraw` existed a proposal nobody intended to
+    /// back sat in the inbox forever. Withdrawing it closes the row, and does so
+    /// per-ballot: a peer proposal is untouched.
+    #[test]
+    fn a_withdrawn_ballot_stops_nagging() {
+        let suggestions = vec![
+            suggestion("sug-pulled", "rat-1", "the author thought better of it", None),
+            suggestion("sug-live", "rat-2", "still worth backing", None),
+        ];
+        let withdrawals = vec![withdrawal("sug-pulled", "rat-1")];
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents::default(),
+            &Ballots {
+                suggestions: &suggestions,
+                withdrawals: &withdrawals,
+                quorum: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(inbox.len(), 1, "{inbox:?}");
+        assert_eq!(inbox[0].subject, "sug-live");
+    }
+
+    /// The withdrawal closes the BALLOT, not the votes. Endorsements on a
+    /// withdrawn proposal stay in the space and stay countable — dropping them
+    /// would recreate the orphaned-vote hazard TKT-168 was written to avoid —
+    /// so the row must be retired by the withdrawal alone, no matter how healthy
+    /// the tally underneath it looks.
+    #[test]
+    fn a_withdrawn_ballot_stays_closed_even_at_quorum() {
+        let suggestions = vec![suggestion("sug-pulled", "rat-1", "popular but pulled", None)];
+        let endorsements = vec![
+            endorsement("sug-pulled", "rat-7"),
+            endorsement("sug-pulled", "rat-8"),
+            endorsement("sug-pulled", "rat-9"),
+        ];
+        let withdrawals = vec![withdrawal("sug-pulled", "operator")];
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents::default(),
+            &Ballots {
+                suggestions: &suggestions,
+                endorsements: &endorsements,
+                withdrawals: &withdrawals,
+                quorum: 3,
+                ..Default::default()
+            },
+        );
+        assert!(inbox.is_empty(), "{inbox:?}");
+    }
+
+    /// A withdrawal is keyed on the suggestion id like every other ballot tuple,
+    /// and must not leak across ids or in from another scope — the same
+    /// discipline the endorsement tally is held to.
+    #[test]
+    fn a_withdrawal_only_closes_its_own_ballot() {
+        let suggestions = vec![suggestion("sug-a", "rat-1", "proposal a", None)];
+        let mut off_scope = withdrawal("sug-a", "rat-1");
+        off_scope.scope = "repo".into();
+        let withdrawals = vec![withdrawal("sug-other", "rat-2"), off_scope];
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &[],
+            &BranchEvents::default(),
+            &Ballots {
+                suggestions: &suggestions,
+                withdrawals: &withdrawals,
+                quorum: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(inbox.len(), 1, "{inbox:?}");
+        assert_eq!(inbox[0].subject, "sug-a");
     }
 
     #[test]

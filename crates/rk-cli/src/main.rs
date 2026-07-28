@@ -61,6 +61,8 @@ enum Command {
     Suggest(space_cmds::SuggestArgs),
     /// Endorse a suggestion by id (idempotent; sugar; env-autofilled).
     Endorse(space_cmds::EndorseArgs),
+    /// Close a losing ballot by id (proposer or operator only; votes stay on the record).
+    Withdraw(space_cmds::WithdrawArgs),
     /// Spawn a rat to work on a task in an isolated worktree.
     Spawn(agent_cmds::SpawnArgs),
     /// List agents (live fleet by default; --all/--archived include archived).
@@ -446,6 +448,7 @@ async fn main() -> Result<()> {
         Command::Claim(args) => space_cmds::claim(&layout, args, cli.json).await?,
         Command::Suggest(args) => space_cmds::suggest(&layout, args, cli.json).await?,
         Command::Endorse(args) => space_cmds::endorse(&layout, args, cli.json).await?,
+        Command::Withdraw(args) => space_cmds::withdraw(&layout, args, cli.json).await?,
         Command::Spawn(args) => agent_cmds::spawn(&layout, args, cli.json).await?,
         Command::List(args) => agent_cmds::list(&layout, args, cli.json).await?,
         Command::Prune(args) => agent_cmds::prune(&layout, args, cli.json).await?,

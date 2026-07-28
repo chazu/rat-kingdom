@@ -43,6 +43,24 @@ pub enum Category {
     Suggestion,
     /// A vote of support for a suggestion (one per agent, idempotent).
     Endorsement,
+    /// The explicit close of a losing ballot, keyed `identity = <sug-id>` —
+    /// the counterpart to [`Category::Convention`] on the other outcome.
+    ///
+    /// Ballots stopped expiring in TKT-168 (a vote is a ledger entry, not a
+    /// pheromone: nobody survives to reinforce it), which removed the silent
+    /// clock that used to clear a proposal nobody backed. Something still has to
+    /// close one, or `rk inbox` grows an `open-suggestion` row that never
+    /// retires. Withdrawal is that act, and it is deliberately explicit: only
+    /// the proposer or the operator may cast it, via `rk withdraw` (TKT-184).
+    ///
+    /// It does NOT delete the ballot. The `Suggestion` and every `Endorsement`
+    /// on it stay exactly where they are and stay countable — dropping the votes
+    /// would recreate the orphaned-endorsement hazard TKT-168 was written to
+    /// avoid, and would discard the record of who backed the idea before it was
+    /// pulled. The withdrawal is a separate tuple that renders those votes
+    /// *inert*: the reactor refuses to promote a withdrawn ballot however many
+    /// endorsers it later accumulates, and `rk inbox` stops raising its row.
+    Withdrawal,
 }
 
 impl Category {
@@ -61,10 +79,11 @@ impl Category {
             Category::Message => "message",
             Category::Suggestion => "suggestion",
             Category::Endorsement => "endorsement",
+            Category::Withdrawal => "withdrawal",
         }
     }
 
-    pub const ALL: [Category; 13] = [
+    pub const ALL: [Category; 14] = [
         Category::Fact,
         Category::Convention,
         Category::Task,
@@ -78,6 +97,10 @@ impl Category {
         Category::Message,
         Category::Suggestion,
         Category::Endorsement,
+        // Lowest weight, below the vote it closes: a withdrawal is bookkeeping
+        // on a ballot that is over. It must never outrank a live trail in a
+        // hot-scan — it is the one ballot tuple that steers nobody.
+        Category::Withdrawal,
     ];
 
     /// Pheromone trails: agent assertions that must be *refreshed* to stay
@@ -582,6 +605,23 @@ mod tests {
             prev = w;
         }
         assert!(Category::Fact.weight() > Category::Endorsement.weight());
+    }
+
+    /// TKT-184: a withdrawal is bookkeeping on a finished ballot. It must sit at
+    /// the bottom of the hot-scan ranking (never crowding out a live trail) and
+    /// must NOT evaporate — the whole point is that it closes the ballot for
+    /// good, so a decaying one would silently reopen it.
+    #[test]
+    fn withdrawal_is_the_weakest_trail_and_never_evaporates() {
+        assert!(!Category::Withdrawal.evaporates());
+        for c in Category::ALL {
+            if c != Category::Withdrawal {
+                assert!(
+                    c.weight() > Category::Withdrawal.weight(),
+                    "{c:?} must outrank a withdrawal"
+                );
+            }
+        }
     }
 
     #[test]
