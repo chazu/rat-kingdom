@@ -7,6 +7,12 @@
 //!   - every ready ticket is eventually dispatched and reaches `done` (refill);
 //!   - each ticket is dispatched exactly once (atomic claim, no double-grab);
 //!   - a system-scope ticket (no registered repo) is never dispatched.
+//!
+//! Both tests here drive a live daemon that spawns real worktrees, so they are
+//! scheduler-bound: waits are bounded by a wall-clock [`DRAIN_DEADLINE`] rather
+//! than an iteration count, concurrency caps are asserted as upper bounds on a
+//! sampled peak, and anything that must hold exactly is read once the backlog
+//! has settled. See [`SLOW_FAKE`] for why neither test unsets the fake harness.
 
 mod fixture;
 
@@ -56,6 +62,16 @@ async fn connect(layout: &Layout) -> Client {
 // A rat that works for ~0.4s before reporting a clean success — long enough that
 // its live window is reliably observable across 50ms polls, so a WIP cap that is
 // respected keeps the observed live count at or below the target.
+//
+// BOTH tests in this file set this SAME script into `RK_FAKE_HARNESS_CMD` and
+// NEITHER ever `remove_var`s it. The variable is process-global and cargo runs
+// these two tests concurrently in one process, so a `remove_var` on the exit
+// path of whichever test finishes first unsets the fake for the other test's
+// still-pending spawns: those rats run no script, never declare `rk_done`, and
+// their tickets never reach `done` — the peer then burns its whole wait budget
+// and fails. That is TKT-183, and it is the same race TKT-88 fixed in
+// fleet_budget.rs (supervisor_sweep.rs never removes it for the same reason).
+// Leaving one identical value set for the life of the process is harmless.
 const SLOW_FAKE: &str = r#"
 read -r _prompt
 sleep 0.4
@@ -63,6 +79,20 @@ echo '{"type":"system","subtype":"init","session_id":"drain-fake"}'
 rk_done "work done"   # a rat that never declares done fails (TKT-175)
 echo '{"type":"result","subtype":"success","is_error":false,"result":"drained","session_id":"drain-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
+
+/// Wall-clock ceiling for the refill loops below, and the gap between polls.
+///
+/// A loop *iteration count* is not a time budget: each pass also issues two or
+/// three RPCs against a daemon that is concurrently doing real `git worktree
+/// add`s and process launches, so the same 300 passes cover far less real time
+/// under parallel test load than in isolation — precisely when they need to
+/// cover more. A deadline means what it says and does not shrink under
+/// contention. Sized with the headroom TKT-88 established for these
+/// scheduler-bound daemon+agent polls, scaled to the several rats each test
+/// here waits on *sequentially*. Every loop breaks the instant its condition
+/// holds, so the happy path (~2s) is unchanged.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[tokio::test]
 async fn continuous_drain_refills_up_to_wip_and_never_exceeds_it() {
@@ -128,7 +158,8 @@ async fn continuous_drain_refills_up_to_wip_and_never_exceeds_it() {
     // Poll the fleet: track the peak live count and wait for all five to finish.
     let mut peak_live = 0usize;
     let mut all_done = false;
-    for _ in 0..200 {
+    let deadline = tokio::time::Instant::now() + DRAIN_DEADLINE;
+    while tokio::time::Instant::now() < deadline {
         let agents = client.call("agent.list", json!({})).await.unwrap();
         let live = agents["agents"]
             .as_array()
@@ -152,12 +183,16 @@ async fn continuous_drain_refills_up_to_wip_and_never_exceeds_it() {
             all_done = true;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 
     assert!(all_done, "all five ready tickets should be drained to done");
+    // The cap is the invariant, and it is an UPPER bound. A lower bound here
+    // would only assert that a 50ms sampler happened to catch one of the ~0.4s
+    // live windows, which is sampling luck, not behaviour — that rats really
+    // ran is settled below by `all_done` plus the exact agent count (TKT-183).
     assert!(
-        (1..=2).contains(&peak_live),
+        peak_live <= 2,
         "WIP cap of 2 must hold: peak live was {peak_live}"
     );
 
@@ -176,8 +211,7 @@ async fn continuous_drain_refills_up_to_wip_and_never_exceeds_it() {
         .await
         .unwrap();
     assert_eq!(orphan["tickets"][0]["payload"]["status"], "open");
-
-    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+    // NOTE: deliberately no `remove_var("RK_FAKE_HARNESS_CMD")` — see SLOW_FAKE.
 }
 
 /// Cross-repo WIP partitioning: the `repos` map is an allowlist whose per-repo
@@ -186,7 +220,8 @@ async fn continuous_drain_refills_up_to_wip_and_never_exceeds_it() {
 /// registered-but-unlisted repo is never drained. Asserts:
 ///   - neither allowlisted repo ever holds more than its cap of 1 rat live;
 ///   - both allowlisted repos' backlogs drain to `done` (fair progress);
-///   - the unlisted repo's tickets stay open (allowlist excludes it).
+///   - each repo ends with exactly one rat per ticket (no double-grab);
+///   - the unlisted repo's tickets stay open and it gets no rat at all.
 #[tokio::test]
 async fn partition_caps_hold_per_repo_and_allowlist_excludes_unlisted() {
     let home = tempfile::tempdir().unwrap();
@@ -273,7 +308,8 @@ async fn partition_caps_hold_per_repo_and_allowlist_excludes_unlisted() {
     let mut peak_alpha = 0usize;
     let mut peak_beta = 0usize;
     let mut both_done = false;
-    for _ in 0..300 {
+    let deadline = tokio::time::Instant::now() + DRAIN_DEADLINE;
+    while tokio::time::Instant::now() < deadline {
         let agents = client.call("agent.list", json!({})).await.unwrap();
         let mut live_alpha = 0usize;
         let mut live_beta = 0usize;
@@ -296,12 +332,45 @@ async fn partition_caps_hold_per_repo_and_allowlist_excludes_unlisted() {
             both_done = true;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 
     assert!(both_done, "both allowlisted repos should drain to done");
-    assert_eq!(peak_alpha, 1, "alpha cap of 1 must hold (peak {peak_alpha})");
-    assert_eq!(peak_beta, 1, "beta cap of 1 must hold (peak {peak_beta})");
+    // Each per-repo cap is an UPPER bound on concurrency, so that is what the
+    // sampled peak asserts. Requiring `== 1` also demanded that the 50ms poll
+    // caught one of the ~0.4s live windows; under parallel load this loop's own
+    // three RPCs per pass can stretch past a whole window, so that half of the
+    // assert tested the sampler, not the cap (TKT-183).
+    assert!(
+        peak_alpha <= 1,
+        "alpha's per-repo cap of 1 must hold, but peak live was {peak_alpha}"
+    );
+    assert!(
+        peak_beta <= 1,
+        "beta's per-repo cap of 1 must hold, but peak live was {peak_beta}"
+    );
+
+    // The settled per-repo agent tally — read after both backlogs drained, so
+    // it is a fact rather than a sample. This is what the sampled peak cannot
+    // prove: one rat per ticket in each allowlisted repo (no ticket
+    // double-grabbed), that `repo_name` really is the key the per-repo caps
+    // partition on, and that the excluded repo was never dispatched into at all
+    // — a stronger statement than gamma's tickets merely staying open.
+    assert_eq!(
+        agents_for_repo(&mut client, &alpha).await,
+        3,
+        "one rat per alpha ticket, dispatched once each"
+    );
+    assert_eq!(
+        agents_for_repo(&mut client, &beta).await,
+        3,
+        "one rat per beta ticket, dispatched once each"
+    );
+    assert_eq!(
+        agents_for_repo(&mut client, &gamma).await,
+        0,
+        "unlisted repo must never have a rat dispatched into it"
+    );
 
     // Gamma is registered but not in the allowlist → its backlog is untouched.
     let gamma_tickets = client
@@ -315,8 +384,21 @@ async fn partition_caps_hold_per_repo_and_allowlist_excludes_unlisted() {
         .filter(|t| t["payload"]["status"] == "open")
         .count();
     assert_eq!(gamma_open, 3, "unlisted repo must never be drained");
+    // NOTE: deliberately no `remove_var("RK_FAKE_HARNESS_CMD")` — see SLOW_FAKE.
+}
 
-    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+/// How many agent records the fleet holds for `scope`. Terminal records stay in
+/// the default `agent.list` view until an explicit `agent.archive` (TKT-136),
+/// and nothing archives on a timer, so after the drain settles this is a stable
+/// count rather than a race against completion.
+async fn agents_for_repo(client: &mut Client, scope: &str) -> usize {
+    let agents = client.call("agent.list", json!({})).await.unwrap();
+    agents["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["repo_name"].as_str() == Some(scope))
+        .count()
 }
 
 async fn ticket_done_count(client: &mut Client, scope: &str) -> usize {
