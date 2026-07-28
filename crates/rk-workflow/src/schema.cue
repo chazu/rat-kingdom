@@ -345,10 +345,44 @@ workflow: #Workflow
 	// following evaluate/when to route on. For a named check, overrides the
 	// check's own expectExit when set.
 	expectExit?: int
-	// Hard wall-clock bound; a suite still running when it elapses is killed
-	// and the step fails closed. A named check's own timeout applies unless the
-	// step overrides it.
+	// Hard wall-clock bound; a suite still running when it elapses is killed.
+	// A named check's own timeout applies unless the step overrides it. What the
+	// kill then does to the instance is `onTimeout`.
 	timeout: string | *"10m"
+
+	// What a blown `timeout` does to the instance.
+	//   "fail"     — (default, and the only behaviour before TKT-169) the
+	//                timeout is an ERROR: the step fails the instance on the
+	//                spot, so a suite that is merely too slow is indistinguishable
+	//                from a suite that is broken. Everything downstream — the
+	//                verdict read, the routing, the operator-facing `need` — is
+	//                skipped, and `rk inbox` gets a bare "timed out" failure.
+	//   "continue" — the timeout is a RESULT: the killed suite reports
+	//                {exit: 124, timed_out: true, verdict: "timeout"} into
+	//                ctx.previousResult and the workflow keeps running, so a
+	//                following `evaluate`/`when` decides what too-slow MEANS
+	//                here (escalate, retry, hold the branch).
+	// "continue" does NOT weaken the gate. Exit 124 is not 0, so an
+	// `evaluate {expect: {exit: 0}}` or an `expectExit: 0` still rejects a
+	// timed-out suite exactly like a red one — it only buys the workflow the
+	// chance to say so deliberately instead of dying mid-flight.
+	onTimeout: *"fail" | "continue"
+
+	// Lift one field of this step's result into ctx.var.<into>, so a following
+	// `when` can ROUTE on how the check went rather than only fail on it. The
+	// same (field, into) pair a `read` step carries; the whole result object is
+	// stored when `field` is unset. The result fields are:
+	//   exit       process exit code (124 on a killed timeout, by the timeout(1)
+	//              convention)
+	//   stdout     captured stdout (empty on a timeout — the readers are killed
+	//              with the child)
+	//   stderr     captured stderr, or the timeout explanation on a timeout
+	//   timed_out  true iff the wall-clock bound killed the command
+	//   verdict    "pass" (exit 0) | "timeout" | "fail" (any other exit)
+	// Route on `verdict`: it is the three-way distinction `exit` alone cannot
+	// make, since a suite may legitimately exit 124 on its own.
+	field?: string
+	into?:  string
 }
 
 // Merge a NAMED branch into a NAMED target directly — "land" the work. Where

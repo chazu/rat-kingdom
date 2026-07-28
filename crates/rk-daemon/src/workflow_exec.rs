@@ -76,6 +76,57 @@ struct ResolvedRun {
     cwd: Option<String>,
     expect_exit: Option<i64>,
     timeout: String,
+    on_timeout: OnTimeout,
+}
+
+/// What a blown `run` wall-clock bound does to the instance (TKT-169).
+///
+/// The command is killed either way — `kill_on_drop` owns that, and a hung suite
+/// never survives its budget. The choice here is only whether the kill is
+/// reported as an ERROR (which ends the run where it stands) or as a RESULT the
+/// following steps get to route on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnTimeout {
+    /// Fail the instance immediately. The default, and the only behaviour before
+    /// TKT-169.
+    Fail,
+    /// Report `{exit: 124, timed_out: true, verdict: "timeout"}` and keep going,
+    /// so the workflow decides what too-slow means. Not a weakening: 124 is not
+    /// 0, so every exit-based gate still rejects it.
+    Continue,
+}
+
+impl OnTimeout {
+    /// Parse the schema's `onTimeout` string. Fails closed on anything else: a
+    /// typo must not quietly resolve to the permissive-looking arm (nor to the
+    /// strict one, which would hide the typo until a timeout finally happened).
+    fn parse(raw: &str) -> rk_core::Result<Self> {
+        match raw {
+            "fail" => Ok(Self::Fail),
+            "continue" => Ok(Self::Continue),
+            other => Err(rk_core::Error::other(format!(
+                "run step: unknown onTimeout {other:?} (expected \"fail\" or \"continue\")"
+            ))),
+        }
+    }
+}
+
+/// Exit code reported for a command killed by its wall-clock bound — the
+/// `timeout(1)` convention, so shell-side readers already know it. A suite can
+/// exit 124 on its own, which is exactly why the result also carries the
+/// unambiguous `timed_out` / `verdict` fields for routing.
+const TIMEOUT_EXIT: i64 = 124;
+
+/// The outcome of running a `run` step's command to completion or to its bound.
+enum RunOutcome {
+    Completed {
+        status: std::process::ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    /// The wall-clock bound elapsed and the child was killed. Only ever returned
+    /// under [`OnTimeout::Continue`]; under `Fail` a timeout is an `Err`.
+    TimedOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -235,7 +286,8 @@ async fn collect_child_output(
     timeout: Duration,
     command: &str,
     timeout_text: &str,
-) -> rk_core::Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    on_timeout: OnTimeout,
+) -> rk_core::Result<RunOutcome> {
     let stdout = child
         .stdout
         .take()
@@ -337,6 +389,9 @@ async fn collect_child_output(
                 }
             }
             _ = &mut sleep => {
+                // The child dies here regardless of `on_timeout`: aborting the
+                // wait task drops the `kill_on_drop` child. The only choice is
+                // whether the caller learns about it as an error or a result.
                 if status.is_none() {
                     abort_task(&mut wait_task).await;
                 }
@@ -346,18 +401,21 @@ async fn collect_child_output(
                 if stderr.is_none() {
                     abort_task(&mut stderr_task).await;
                 }
-                return Err(rk_core::Error::other(format!(
-                    "run step: `{command}` timed out after {timeout_text}"
-                )));
+                return match on_timeout {
+                    OnTimeout::Fail => Err(rk_core::Error::other(format!(
+                        "run step: `{command}` timed out after {timeout_text}"
+                    ))),
+                    OnTimeout::Continue => Ok(RunOutcome::TimedOut),
+                };
             }
         }
     }
 
-    Ok((
-        status.expect("status completed with all child tasks"),
-        stdout.expect("stdout completed with all child tasks"),
-        stderr.expect("stderr completed with all child tasks"),
-    ))
+    Ok(RunOutcome::Completed {
+        status: status.expect("status completed with all child tasks"),
+        stdout: stdout.expect("stdout completed with all child tasks"),
+        stderr: stderr.expect("stderr completed with all child tasks"),
+    })
 }
 
 fn definition_inside_roots(
@@ -1151,9 +1209,26 @@ impl WorkflowEngine {
                 }
                 Step::Run(run) => {
                     let result = self.run_command(&ctx, run, repo).await?;
+                    // Optionally lift a field of the result into a ctx var so a
+                    // following `when` can ROUTE on how the check went, not just
+                    // fail on it (TKT-169). Same (field, into) semantics as a
+                    // `read` step, including "a field the result does not carry
+                    // lifts as null" — which `value_as_key` renders as the empty
+                    // string, so it falls to the `when`'s `default` arm rather
+                    // than silently matching a case.
+                    let lifted = run.into.as_ref().map(|into| {
+                        let value = match &run.field {
+                            Some(field) => result.get(field).cloned().unwrap_or(Value::Null),
+                            None => result.clone(),
+                        };
+                        (into.clone(), value)
+                    });
                     self.update(id, |i| {
                         i.context.previous_result = Some(result.clone());
                         i.context.awaited = Vec::new();
+                        if let Some((name, value)) = &lifted {
+                            i.context.vars.insert(name.clone(), value.clone());
+                        }
                     });
                 }
                 Step::Land(land) => {
@@ -1845,18 +1920,65 @@ impl WorkflowEngine {
                 rk_core::Error::other(format!("run step: failed to spawn `{command}`: {e}"))
             })?;
 
-        let (status, stdout, stderr) =
-            collect_child_output(child, timeout, &command, &resolved.timeout).await?;
-        let exit = status.code().unwrap_or(-1) as i64;
-        let stdout = String::from_utf8_lossy(&stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&stderr).into_owned();
-        info!(agent = %agent, exit, command = %command, "run step completed");
-        let result = json!({"exit": exit, "stdout": stdout, "stderr": stderr});
+        let outcome = collect_child_output(
+            child,
+            timeout,
+            &command,
+            &resolved.timeout,
+            resolved.on_timeout,
+        )
+        .await?;
+        // A `TimedOut` outcome only reaches here under `onTimeout: "continue"`;
+        // otherwise the timeout already returned an error above. The captured
+        // output is genuinely gone in that case (the reader tasks are aborted
+        // with the child), so stderr carries the explanation instead of a lie
+        // about what the suite printed.
+        let (exit, stdout, stderr, timed_out) = match outcome {
+            RunOutcome::Completed {
+                status,
+                stdout,
+                stderr,
+            } => (
+                status.code().unwrap_or(-1) as i64,
+                String::from_utf8_lossy(&stdout).into_owned(),
+                String::from_utf8_lossy(&stderr).into_owned(),
+                false,
+            ),
+            RunOutcome::TimedOut => (
+                TIMEOUT_EXIT,
+                String::new(),
+                format!(
+                    "run step: `{command}` timed out after {} and was killed",
+                    resolved.timeout
+                ),
+                true,
+            ),
+        };
+        // The routable three-way summary. `exit` alone cannot express it: a
+        // suite may exit 124 on its own, and "did not finish" calls for a
+        // different hand-off than "finished and said no".
+        let verdict = if timed_out {
+            "timeout"
+        } else if exit == 0 {
+            "pass"
+        } else {
+            "fail"
+        };
+        info!(agent = %agent, exit, timed_out, verdict, command = %command, "run step completed");
+        let result = json!({
+            "exit": exit,
+            "stdout": stdout,
+            "stderr": stderr,
+            "timed_out": timed_out,
+            "verdict": verdict,
+        });
 
         // Inline fail-closed gate: when the step (or named check) declares the
         // expected exit, enforce it here so `run` can gate on its own without a
         // trailing evaluate. When unset, the exit is left for a following
-        // evaluate/when.
+        // evaluate/when. A timed-out command reports 124, so this rejects it
+        // exactly as it rejects a red suite — `onTimeout: "continue"` never
+        // sneaks a too-slow check past a declared exit gate.
         if let Some(expected) = resolved.expect_exit {
             if exit != expected {
                 return Err(rk_core::Error::other(format!(
@@ -1891,6 +2013,15 @@ impl WorkflowEngine {
     /// `require_named_checks` policy is on, so a compromised workflow definition
     /// cannot run arbitrary shell — only the checks the repo registered.
     fn resolve_run(&self, run: &RunStep, repo: &str) -> rk_core::Result<ResolvedRun> {
+        // Parsed before either arm so an unknown value is rejected even for a
+        // step that would never have timed out — an authoring error should
+        // surface on the first run, not on the first slow day.
+        //
+        // `on_timeout` is deliberately step-only and never inherited from a
+        // named check: a check owns WHAT to run and how long to allow, but what
+        // a blown budget MEANS is the workflow's routing decision, and the
+        // routing (`into`/`when`) lives in the workflow too.
+        let on_timeout = OnTimeout::parse(&run.on_timeout)?;
         match (&run.command, &run.check) {
             (Some(_), Some(_)) => Err(rk_core::Error::other(
                 "run step: set exactly one of `command` or `check`, not both",
@@ -1910,6 +2041,7 @@ impl WorkflowEngine {
                     cwd: run.cwd.clone(),
                     expect_exit: run.expect_exit,
                     timeout: run.timeout.clone(),
+                    on_timeout,
                 })
             }
             (None, Some(name)) => {
@@ -1931,6 +2063,7 @@ impl WorkflowEngine {
                     cwd: run.cwd.clone().or(check.cwd),
                     expect_exit: run.expect_exit.or(check.expect_exit),
                     timeout,
+                    on_timeout,
                 })
             }
         }

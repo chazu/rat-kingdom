@@ -393,9 +393,18 @@ pub struct StopStep {
 /// Run a command in the active agent's worktree — the deterministic quality
 /// gate. Where `evaluate` only unifies against the harness's *self-reported*
 /// output, a `run` step executes the repo's real checks and captures the
-/// verdict the runner cannot forge. The `{exit, stdout, stderr}` result lands
-/// in `ctx.previousResult` so a following `evaluate {expect: {exit: 0}}` (or a
-/// `when`) can gate the merge; a red check fails the instance fail-closed.
+/// verdict the runner cannot forge. The `{exit, stdout, stderr, timed_out,
+/// verdict}` result lands in `ctx.previousResult` so a following
+/// `evaluate {expect: {exit: 0}}` (or a `when`) can gate the merge; a red check
+/// fails the instance fail-closed.
+///
+/// Two fields make a SLOW check routable rather than fatal (TKT-169): set
+/// `on_timeout: "continue"` and the blown wall-clock bound becomes a result
+/// (`verdict: "timeout"`) instead of an error, and `into`/`field` lift that
+/// verdict into a ctx var a following `when` can branch on. Together they let a
+/// workflow distinguish "the suite says no" from "the suite did not finish in
+/// the budget" — two conditions that both have to block a merge but call for
+/// very different operator hand-offs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunStep {
     /// Raw command line, executed verbatim via `sh -c` in the worktree. Only as
@@ -422,15 +431,45 @@ pub struct RunStep {
     /// this overrides the check's own `expectExit` when set.
     #[serde(default, rename = "expectExit")]
     pub expect_exit: Option<i64>,
-    /// Hard wall-clock bound; a suite still running when it elapses is killed
-    /// and the step fails closed. For a named check, the check's own timeout
-    /// applies unless the step sets one explicitly (a non-default value).
+    /// Hard wall-clock bound; a suite still running when it elapses is killed.
+    /// For a named check, the check's own timeout applies unless the step sets
+    /// one explicitly (a non-default value). What the kill does to the instance
+    /// is [`RunStep::on_timeout`].
     #[serde(default = "default_run_timeout")]
     pub timeout: String,
+    /// What a blown [`RunStep::timeout`] does to the instance: `"fail"` (the
+    /// default, and the only behaviour before TKT-169) makes it an error that
+    /// kills the run mid-flight; `"continue"` makes it a RESULT the workflow can
+    /// route on (`{exit: 124, timed_out: true, verdict: "timeout"}`).
+    ///
+    /// `"continue"` does not weaken a gate — 124 is not 0, so a following
+    /// `evaluate {expect: {exit: 0}}` (or an `expect_exit: 0`) still rejects a
+    /// timed-out suite exactly like a red one. It only lets the workflow say so
+    /// deliberately: escalate to a human, hold the branch, and finish, instead
+    /// of dying with a bare "timed out" and skipping every step that would have
+    /// explained it. Held as a string (like [`GateStep::gate_type`]) and parsed
+    /// fail-closed at execution: an unknown value is an error, never a silent
+    /// "fail".
+    #[serde(default = "default_on_timeout", rename = "onTimeout")]
+    pub on_timeout: String,
+    /// JSON field of this step's result to lift into `ctx.vars[into]`; the whole
+    /// result object when unset. Mirrors [`ReadStep::field`].
+    #[serde(default)]
+    pub field: Option<String>,
+    /// ctx variable name to store the lifted value under, so a following `when`
+    /// can route on it. `None` = lift nothing (every run step before TKT-169).
+    /// Mirrors [`ReadStep::into`], which is required there because a `read`
+    /// exists only to lift; a `run` lifts only when asked.
+    #[serde(default)]
+    pub into: Option<String>,
 }
 
 fn default_run_timeout() -> String {
     "10m".into()
+}
+
+fn default_on_timeout() -> String {
+    "fail".into()
 }
 
 /// A repo-registered named check: the per-repo allowlist entry a workflow `run`
