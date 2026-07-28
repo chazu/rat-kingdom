@@ -14,7 +14,8 @@
 //   spawn a cheap reviewer chained onto the completed branch
 //   -> POLICY GATE (#19): refuse to auto-merge diffs touching protected paths
 //   -> DIFF-SCOPE GATE (#20): refuse to auto-merge diffs over a size budget
-//   -> RUN GATE  (#6):    run the repo's real test/lint suite (real teeth)
+//   -> RUN GATE  (#6):    run the repo's real test/lint suite (real teeth),
+//                         routing green / red / too-slow separately (#169)
 //   -> read the reviewer's APPROVE/REWORK/STOP verdict artifact
 //   -> when verdict:
 //        APPROVE -> land the branch straight onto main (#23) — auto-merge
@@ -22,11 +23,18 @@
 //        STOP    -> escalate to the operator via a `need` tuple, hold the branch
 //        (other) -> escalate + fail loudly (an unknown verdict is a bug)
 //
-// Every gate fails CLOSED: a protected-path violation, an over-budget diff, or
-// a red suite fails the instance, so the branch is never merged and the failure
-// surfaces in `rk inbox`. Auto-merge is only ever reached through a clean policy
+// Every gate fails CLOSED: a protected-path violation, an over-budget diff, a
+// red suite, or a suite that never finished all hold the branch unmerged and
+// surface in `rk inbox`. Auto-merge is only ever reached through a clean policy
 // gate, a within-budget diff, a green suite, AND an explicit APPROVE — never on
 // a reviewer's word alone.
+//
+// This file is the SOURCE for every deployed copy. Install it with
+// `rk workflow install examples/workflows/steward.cue` rather than `cp`, and the
+// install manifest lets `rk workflow drift` tell you when a deployed steward has
+// been hand-edited away from this definition or left behind by it (TKT-176) —
+// which is how the live `steward-grmpl` kept a 30m gate and an unbound verdict
+// read that no repo source could fix.
 //
 // Copy to ~/.rat-kingdom/workflows/ (global) or <repo>/.rk/workflows/, and copy
 // the matching trigger into ~/.rat-kingdom/triggers/ (or <repo>/.rk/).
@@ -66,7 +74,20 @@ workflow: {
 		maxDiffFiles: {type: "int", required: false, default: 50}
 		maxDiffLines: {type: "int", required: false, default: 2000}
 		reviewTimeout: {type: "string", required: false, default: "15m"}
-		gateTimeout: {type: "string", required: false, default: "20m"}
+		// RUN-GATE BUDGET (TKT-169). The steward re-runs `check` in the
+		// reviewer's OWN worktree, which is a cold checkout: no warm build
+		// cache, and several stewards fired by the reactor competing for the
+		// same cores. So the honest budget is not the suite's warm wall-clock —
+		// it is that number with room for a full rebuild under contention.
+		// The live grmpl steward ran a 10-15m suite on a 30m bound and blew it,
+		// failing instances whose review had already passed; 60m is the same
+		// suite with the cold-cache headroom it actually needs.
+		//
+		// Tune this per repo rather than editing the step, and prefer SCOPING
+		// the gate over raising the bound forever: point `check` at a named
+		// entry in `<repo>/.rk/checks.cue` (which carries its own timeout) so
+		// the repo owns both the command and its budget.
+		gateTimeout: {type: "string", required: false, default: "60m"}
 	}
 
 	agents: {
@@ -130,9 +151,78 @@ workflow: {
 		{type: "evaluate", expect: {exit: 0}},
 
 		// 3. RUN GATE (#6). The repo's real suite, executed in the reviewer's
-		//    worktree — a verdict {exit,stdout,stderr} the harness cannot forge.
-		//    A red suite fails the instance closed: the branch is never merged.
-		{type: "run", command: _input.check, timeout: _input.gateTimeout},
+		//    worktree — a verdict the harness cannot forge. Nothing below this
+		//    reaches `land` unless the suite came back green.
+		//
+		//    Unlike the two gates above, this one routes on THREE outcomes
+		//    instead of two (TKT-169). `evaluate {exit: 0}` collapses "the suite
+		//    says no" and "the suite did not finish inside \(_input.gateTimeout)"
+		//    into one bare instance failure, and the second is the common one:
+		//    the steward's re-run is a cold worktree competing with its peers,
+		//    so a suite that is merely slow killed runs whose review had already
+		//    passed, with nothing in `rk inbox` to say why. `onTimeout:
+		//    "continue"` turns the blown budget into a result, and `verdict`
+		//    lifts the three-way answer for the `when` below.
+		//
+		//    Still fail-closed, in both directions: a timeout reports exit 124,
+		//    so it is no more mergeable than a red suite. It just gets a hand-off
+		//    that names the real problem.
+		{
+			type:      "run"
+			command:   _input.check
+			timeout:   _input.gateTimeout
+			onTimeout: "continue"
+			field:     "verdict"
+			into:      "gate"
+		},
+		{
+			type: "when"
+			var:  "gate"
+			cases: {
+				// GREEN. Fall through to the verdict read and the routing below
+				// — the only path that can reach `land`.
+				"pass": []
+
+				// TOO SLOW. An infrastructure condition, not a bad branch: the
+				// suite never got to say anything. Escalate with the budget in
+				// the text (so the operator can raise `gateTimeout` or scope
+				// `check` without digging), HOLD the branch, and END the run
+				// here — `break` at top level finishes the instance cleanly.
+				//
+				// The `break` is load-bearing. Without it the `when` falls
+				// through to the verdict read and the APPROVE arm would LAND a
+				// branch whose suite never completed.
+				//
+				// Clean completion, not `stop`: a timeout is a capacity signal
+				// the operator tunes, and failing the instance would add a
+				// second red mark in `rk inbox` for the one event the `need`
+				// already reports.
+				"timeout": [
+					{
+						type: "run"
+						command: "rk out need \(_input.repo) steward --payload '{\"agent\":\"steward\",\"task\":\"\(_input.taskId)\",\"text\":\"steward: run gate for \(_input.taskId) did not finish within \(_input.gateTimeout) on {{ctx.activeBranch}} — branch held unmerged; raise gateTimeout or point check at a scoped named check in .rk/checks.cue\"}'"
+						timeout: "2m"
+					},
+					{type: "dismiss", noMerge: true},
+					{type: "break"},
+				]
+			}
+			// RED (or a check that could not run at all). The branch is broken,
+			// which IS a failure — escalate, hold it, and fail loudly, the same
+			// shape as an unrecognized verdict below.
+			default: [
+				{
+					type: "run"
+					command: "rk out need \(_input.repo) steward --payload '{\"agent\":\"steward\",\"task\":\"\(_input.taskId)\",\"text\":\"steward: run gate FAILED for \(_input.taskId) on {{ctx.activeBranch}} — branch held unmerged; read the suite output with rk workflow status\"}'"
+					timeout: "2m"
+				},
+				{type: "dismiss", noMerge: true},
+				{type: "stop", reason: "run gate failed for " + _input.taskId},
+			]
+		},
+		// Keep the run gate's exit assertion explicit as a final fail-closed
+		// guard. The timeout and red branches terminate above; only the green
+		// branch reaches this assertion and then the review verdict.
 		{type: "evaluate", expect: {exit: 0}},
 
 		// 4. Lift the reviewer's verdict into ctx.var.verdict.

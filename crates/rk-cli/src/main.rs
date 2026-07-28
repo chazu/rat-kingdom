@@ -6,6 +6,7 @@ mod repo_cmds;
 mod space_cmds;
 mod ticket_cmds;
 mod top;
+mod workflow_cmds;
 
 use agent_cmds::print_pruned_instance;
 use anyhow::Result;
@@ -296,6 +297,21 @@ enum WorkflowCommand {
     Defs {
         #[arg(long, default_value = ".")]
         repo: String,
+    },
+    /// Install a .cue definition into the managed global or repo-local directory.
+    Install {
+        source: String,
+        /// Install into this repository's `.rk/workflows/`; omit for global install.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Compare deployed definitions with the repository's workflow sources.
+    Drift {
+        #[arg(long, default_value = ".")]
+        repo: String,
+        /// Override the source directory (defaults to `<repo>/examples/workflows`).
+        #[arg(long)]
+        source_dir: Option<String>,
     },
 }
 
@@ -651,6 +667,37 @@ async fn main() -> Result<()> {
                         {
                             println!("{}", d.as_str().unwrap_or("?"));
                         }
+                    }
+                }
+                WorkflowCommand::Install { source, repo } => {
+                    let target = workflow_cmds::install(&layout, &source, repo.as_deref())?;
+                    if cli.json {
+                        println!("{}", json!({"installed": target}));
+                    } else {
+                        println!("installed {}", target.display());
+                    }
+                }
+                WorkflowCommand::Drift { repo, source_dir } => {
+                    let report = workflow_cmds::drift(&layout, &repo, source_dir.as_deref())?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string(&report)?);
+                    } else if report.rows.is_empty() {
+                        println!("workflow drift: no deployed definitions found");
+                    } else {
+                        for row in &report.rows {
+                            println!("{:<10} {}", row.status, row.target);
+                        }
+                        if report.drifted == 0 {
+                            println!("workflow drift: clean");
+                        } else {
+                            println!(
+                                "workflow drift: {} definition(s) need attention",
+                                report.drifted
+                            );
+                        }
+                    }
+                    if report.drifted > 0 {
+                        anyhow::bail!("workflow definitions are not synchronized");
                     }
                 }
             }
