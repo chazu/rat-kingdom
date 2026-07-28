@@ -122,7 +122,7 @@ async fn suggestion_crossing_quorum_becomes_an_injectable_convention() {
     // --- The injection contract (TKT-18 consumes exactly this) ---------------
 
     // Permanent, never `in`-consumable, replicates across castles: an injected
-    // norm must outlive the voting-window-Ephemeral suggestion that spawned it.
+    // norm must outlive the ballot that spawned it.
     assert_eq!(
         c["lifecycle"],
         json!("furniture"),
@@ -187,4 +187,60 @@ async fn suggestion_crossing_quorum_becomes_an_injectable_convention() {
         count_for_sug, 1,
         "the convention is the promote-once guard; a later endorsement re-promotes nothing"
     );
+}
+
+/// TKT-168 — a ballot is a ledger entry, not a pheromone: written the way the
+/// CLI now writes it (no `ttl_secs`), a suggestion and its votes land `Session`
+/// durable, so the three endorsers reaching quorum no longer have to overlap
+/// inside one wall-clock window.
+///
+/// This asserts the two properties the old 24h default silently denied, both of
+/// which follow from `Lifecycle` and neither of which a *longer* window fixes:
+///
+/// - **survives the GC** — `gc_expired` collects on `expires_at`, so a ballot
+///   with no window is never collected, however quiet the fleet goes between
+///   the first vote and the third.
+/// - **replicates** — rk-sync exports durable lifecycles only, so an Ephemeral
+///   ballot was invisible to peer castles while the `Convention` it promotes to
+///   replicates. Durable is what lets two castles pool votes into one quorum.
+#[tokio::test]
+async fn a_ballot_written_without_a_window_is_durable() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let sug_id = "sug-durable";
+    client
+        .call("space.out", suggest(sug_id, "Whisker", "ballots are ledgers"))
+        .await
+        .unwrap();
+    client
+        .call("space.out", endorse(sug_id, "Nibbles"))
+        .await
+        .unwrap();
+
+    for category in ["suggestion", "endorsement"] {
+        let scan = client
+            .call("space.scan", json!({"category": category, "scope": "system"}))
+            .await
+            .unwrap();
+        let t = scan["tuples"]
+            .as_array()
+            .and_then(|a| a.iter().find(|t| t["identity"] == sug_id))
+            .unwrap_or_else(|| panic!("no {category} for {sug_id}"))
+            .clone();
+        assert_eq!(
+            t["lifecycle"],
+            json!("session"),
+            "a {category} written with no ttl must be durable, not Ephemeral"
+        );
+        assert!(
+            t.get("expires_at").is_none_or(Value::is_null),
+            "a durable {category} carries no expiry for the GC to collect: {t}"
+        );
+    }
 }
