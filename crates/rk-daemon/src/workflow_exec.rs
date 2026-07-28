@@ -58,6 +58,16 @@ const LIVENESS_POLL: Duration = Duration::from_secs(5);
 
 static PERSIST_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Where a live instance snapshot lives; every mutation rewrites its file here.
+const INSTANCE_DIR: &str = "workflow-instances";
+
+/// Where a pruned terminal instance is offloaded to. The same JSON in a
+/// different directory: archiving PRESERVES the run — `rk workflow status` and
+/// `rk workflow list --archived` still read it, `rk workflow unarchive` puts it
+/// back — it just stops the run counting as something awaiting a human
+/// (TKT-177).
+const INSTANCE_ARCHIVE_DIR: &str = "workflow-instances-archive";
+
 /// The effective parameters of a `run` step after named-check resolution and
 /// policy enforcement — a raw command or a repo-registered check collapse to the
 /// same shape here.
@@ -118,6 +128,32 @@ pub struct Instance {
     pub started_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When this instance was pruned out of the live store (`None` = live).
+    /// Set by [`WorkflowEngine::archive`] and cleared by
+    /// [`WorkflowEngine::unarchive`] — nothing else writes it, so it doubles as
+    /// the "is this row archived?" flag every view keys on.
+    #[serde(default)]
+    pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// When a terminal instance settled: its `completed_at`, falling back to
+/// `started_at` for snapshots written before that field was populated. This is
+/// what an `rk prune --before` window is measured against.
+fn settled_at(instance: &Instance) -> DateTime<Utc> {
+    instance.completed_at.unwrap_or(instance.started_at)
+}
+
+/// What one prune pass selects.
+///
+/// Both forms refuse a `Running` instance: an in-flight workflow is not
+/// settled, and hiding it would destroy the only signal that it is still going.
+#[derive(Debug, Clone)]
+pub enum Selection {
+    /// Every terminal instance that settled strictly before this cutoff — the
+    /// windowed sweep `rk prune` and `rk workflow prune --before` perform.
+    Before(DateTime<Utc>),
+    /// Exactly these ids — the targeted clear behind one `rk inbox` row.
+    Ids(Vec<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -426,6 +462,15 @@ pub struct WorkflowEngine {
     require_approval_for_landing: bool,
     allowed_target_branches: Vec<String>,
     instances: Mutex<HashMap<String, Instance>>,
+    /// Pruned terminal instances, kept for history. Held apart from `instances`
+    /// rather than flagged inside it so every existing reader — `list`, the
+    /// inbox sweep, the step machine — stays untouched and simply stops seeing
+    /// an archived run.
+    ///
+    /// LOCK ORDER: `instances` before `archived`, always. The two are taken
+    /// together only in [`archive`](WorkflowEngine::archive),
+    /// [`unarchive`](WorkflowEngine::unarchive), and their read-side helpers.
+    archived: Mutex<HashMap<String, Instance>>,
 }
 
 impl WorkflowEngine {
@@ -456,6 +501,7 @@ impl WorkflowEngine {
             require_approval_for_landing,
             allowed_target_branches,
             instances: Mutex::new(HashMap::new()),
+            archived: Mutex::new(HashMap::new()),
         }
     }
 
@@ -546,6 +592,7 @@ impl WorkflowEngine {
             depth: 0,
             started_at: chrono::Utc::now(),
             completed_at: None,
+            archived_at: None,
         };
         self.store(instance.clone());
         self.spawn_execution(instance.id.clone(), workflow, repo.to_string());
@@ -609,30 +656,8 @@ impl WorkflowEngine {
     /// `wait_all`). Idempotent: instances already in memory are overwritten by
     /// their on-disk snapshot, so calling it twice is harmless.
     pub fn rehydrate(self: &Arc<Self>) {
-        let dir = self.layout.home().join("workflow-instances");
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            // No instances persisted yet — a fresh home. Nothing to restore.
-            Err(_) => return,
-        };
         let mut resumable = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let instance: Instance = match std::fs::read(&path)
-                .ok()
-                .and_then(|data| serde_json::from_slice(&data).ok())
-            {
-                Some(i) => i,
-                None => {
-                    let error = format!("unreadable persisted workflow instance: {}", path.display());
-                    warn!(path = %path.display(), "{error}");
-                    self.record_persistence_failure(&path, error);
-                    continue;
-                }
-            };
+        for instance in self.read_instance_dir(&self.instances_dir()) {
             // Only top-level (depth 0) instances resume standalone. A nested
             // sub-workflow child (depth > 0) is re-driven by its parent's
             // resumed `sub_workflow` step (which re-runs the interrupted step and
@@ -644,6 +669,16 @@ impl WorkflowEngine {
                 resumable.push(instance);
             }
         }
+        // The pruned side of the store: terminal runs an operator cleared off
+        // the board. Loaded for history only, never resumed. An id present in
+        // BOTH stores is the archive/persist crash window — the live copy wins,
+        // so a crash mid-prune silently no-ops instead of losing a run.
+        for instance in self.read_instance_dir(&self.archive_dir()) {
+            if self.lock().contains_key(&instance.id) {
+                continue;
+            }
+            self.lock_archived().insert(instance.id.clone(), instance);
+        }
         if !resumable.is_empty() {
             info!(
                 count = resumable.len(),
@@ -653,6 +688,36 @@ impl WorkflowEngine {
         for instance in resumable {
             self.resume(instance);
         }
+    }
+
+    /// Read every `<id>.json` snapshot in one instance directory. A file that
+    /// no longer parses is reported as a `workflow_persistence_corrupt`
+    /// obstacle and skipped, so one bad snapshot cannot stop the rest of the
+    /// store loading. A directory that does not exist yet is simply empty.
+    fn read_instance_dir(&self, dir: &Path) -> Vec<Instance> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut loaded = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            match std::fs::read(&path)
+                .ok()
+                .and_then(|data| serde_json::from_slice::<Instance>(&data).ok())
+            {
+                Some(instance) => loaded.push(instance),
+                None => {
+                    let error =
+                        format!("unreadable persisted workflow instance: {}", path.display());
+                    warn!(path = %path.display(), "{error}");
+                    self.record_persistence_failure(&path, error);
+                }
+            }
+        }
+        loaded
     }
 
     /// Resume one rehydrated `Running` instance: reload its definition with the
@@ -1228,6 +1293,7 @@ impl WorkflowEngine {
             depth,
             started_at: chrono::Utc::now(),
             completed_at: None,
+            archived_at: None,
         };
         let child_id = child.id.clone();
         self.store(child);
@@ -1921,8 +1987,142 @@ impl WorkflowEngine {
         all
     }
 
+    /// Pruned instances only, oldest first.
+    pub fn list_archived(&self) -> Vec<Instance> {
+        let mut all: Vec<Instance> = self.lock_archived().values().cloned().collect();
+        all.sort_by_key(|i| i.started_at);
+        all
+    }
+
+    /// Live + archived, oldest first — the full run history. An id in both
+    /// stores (the crash window) yields the live copy only.
+    pub fn list_all(&self) -> Vec<Instance> {
+        let live = self.lock();
+        let mut all: Vec<Instance> = live.values().cloned().collect();
+        all.extend(
+            self.lock_archived()
+                .values()
+                .filter(|i| !live.contains_key(&i.id))
+                .cloned(),
+        );
+        drop(live);
+        all.sort_by_key(|i| i.started_at);
+        all
+    }
+
     pub fn status(&self, id: &str) -> Option<Instance> {
         self.lock().get(id).cloned()
+    }
+
+    /// Live snapshot for `id`, falling back to the archived one.
+    ///
+    /// Read-only callers (`rk workflow status`/`timeline`) use this so a pruned
+    /// run's history stays readable. Every mutation path deliberately keeps
+    /// using [`status`](WorkflowEngine::status), so an archived instance reads
+    /// as "no such instance" until it is explicitly unarchived.
+    pub fn status_any(&self, id: &str) -> Option<Instance> {
+        self.status(id)
+            .or_else(|| self.lock_archived().get(id).cloned())
+    }
+
+    /// Terminal instances this selection would archive, oldest first.
+    ///
+    /// [`Selection::Ids`] is strict: an unknown id, or one still `Running`, is
+    /// an error, so a targeted `rk workflow prune <id>` never silently
+    /// no-ops. [`Selection::Before`] is lenient by construction — it only ever
+    /// names rows it found.
+    pub fn archivable(&self, selection: &Selection) -> rk_core::Result<Vec<Instance>> {
+        let instances = self.lock();
+        let mut eligible: Vec<Instance> = match selection {
+            Selection::Before(cutoff) => instances
+                .values()
+                .filter(|i| i.status != InstanceStatus::Running && settled_at(i) < *cutoff)
+                .cloned()
+                .collect(),
+            Selection::Ids(ids) => {
+                let mut picked = Vec::new();
+                for id in ids {
+                    let Some(instance) = instances.get(id) else {
+                        // Lock order: `instances` is already held; `archived`
+                        // is only ever taken after it.
+                        let already = self.lock_archived().contains_key(id);
+                        return Err(rk_core::Error::other(if already {
+                            format!("workflow instance {id} is already archived")
+                        } else {
+                            format!("no such workflow instance: {id}")
+                        }));
+                    };
+                    if instance.status == InstanceStatus::Running {
+                        return Err(rk_core::Error::other(format!(
+                            "workflow instance {id} is still running (step {}/{}) — \
+                             let it settle, or reject its gate, before pruning it",
+                            instance.current_step, instance.total_steps
+                        )));
+                    }
+                    picked.push(instance.clone());
+                }
+                picked
+            }
+        };
+        drop(instances);
+        eligible.sort_by_key(|i| i.started_at);
+        eligible.dedup_by(|a, b| a.id == b.id);
+        Ok(eligible)
+    }
+
+    /// Move every [`archivable`](WorkflowEngine::archivable) instance into the
+    /// archive store, returning them as archived (with `archived_at` stamped).
+    ///
+    /// Every archive file is written BEFORE any live file is removed: a crash
+    /// part-way leaves those instances in both stores, which
+    /// [`rehydrate`](WorkflowEngine::rehydrate) resolves in favour of the live
+    /// copy — the pass no-ops rather than losing a run, and re-running it is
+    /// idempotent.
+    pub fn archive(&self, selection: &Selection) -> rk_core::Result<Vec<Instance>> {
+        let now = Utc::now();
+        let mut moved: Vec<Instance> = self.archivable(selection)?;
+        if moved.is_empty() {
+            return Ok(Vec::new());
+        }
+        let archive_dir = self.archive_dir();
+        for instance in &mut moved {
+            instance.archived_at = Some(now);
+            self.persist_to(&archive_dir, instance)?;
+        }
+        let live_dir = self.instances_dir();
+        for instance in &moved {
+            self.lock().remove(&instance.id);
+            self.lock_archived()
+                .insert(instance.id.clone(), instance.clone());
+            let _ = std::fs::remove_file(live_dir.join(format!("{}.json", instance.id)));
+        }
+        info!(count = moved.len(), "archived terminal workflow instances");
+        Ok(moved)
+    }
+
+    /// Restore one archived instance to the live store — the undo for
+    /// [`archive`](WorkflowEngine::archive). `Ok(None)` means no such archived
+    /// instance; an id a live instance already holds is a real collision, not a
+    /// no-op, and errors.
+    pub fn unarchive(&self, id: &str) -> rk_core::Result<Option<Instance>> {
+        if self.lock().contains_key(id) {
+            return Err(rk_core::Error::other(format!(
+                "cannot unarchive {id}: a live instance already holds that id"
+            )));
+        }
+        let Some(mut instance) = self.lock_archived().get(id).cloned() else {
+            return Ok(None);
+        };
+        instance.archived_at = None;
+        // Live file first: a crash before the archive file is removed leaves
+        // the instance in both stores, where the live copy wins — never in
+        // neither.
+        self.persist_to(&self.instances_dir(), &instance)?;
+        self.lock().insert(id.to_string(), instance.clone());
+        self.lock_archived().remove(id);
+        let _ = std::fs::remove_file(self.archive_dir().join(format!("{id}.json")));
+        info!(instance = id, "unarchived workflow instance");
+        Ok(Some(instance))
     }
 
     /// The instance plus its labelled step trace, for `rk workflow timeline`:
@@ -1931,7 +2131,7 @@ impl WorkflowEngine {
     /// `None` rows = the definition no longer loads (file moved or deleted
     /// since launch); the CLI then falls back to bare step numbers.
     pub fn timeline(&self, id: &str) -> Option<(Instance, Option<Vec<TimelineRow>>)> {
-        let instance = self.status(id)?;
+        let instance = self.status_any(id)?;
         let rows = self
             .find_definition(&instance.definition, &instance.repo)
             .ok()
@@ -2071,9 +2271,20 @@ impl WorkflowEngine {
         }
     }
 
+    fn instances_dir(&self) -> PathBuf {
+        self.layout.home().join(INSTANCE_DIR)
+    }
+
+    fn archive_dir(&self) -> PathBuf {
+        self.layout.home().join(INSTANCE_ARCHIVE_DIR)
+    }
+
     fn persist(&self, instance: &Instance) -> rk_core::Result<()> {
-        let dir = self.layout.home().join("workflow-instances");
-        std::fs::create_dir_all(&dir)?;
+        self.persist_to(&self.instances_dir(), instance)
+    }
+
+    fn persist_to(&self, dir: &Path, instance: &Instance) -> rk_core::Result<()> {
+        std::fs::create_dir_all(dir)?;
         let path = dir.join(format!("{}.json", instance.id));
         let data = serde_json::to_vec_pretty(instance)?;
         let sequence = PERSIST_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -2098,6 +2309,15 @@ impl WorkflowEngine {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Instance>> {
         match self.instances.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Guard on the archive store. Never taken before [`lock`](Self::lock) —
+    /// see the lock-order note on `WorkflowEngine::archived`.
+    fn lock_archived(&self) -> std::sync::MutexGuard<'_, HashMap<String, Instance>> {
+        match self.archived.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }

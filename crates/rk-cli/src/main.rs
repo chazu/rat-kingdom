@@ -7,6 +7,7 @@ mod space_cmds;
 mod ticket_cmds;
 mod top;
 
+use agent_cmds::print_pruned_instance;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rk_core::config::Config;
@@ -64,9 +65,10 @@ enum Command {
     Spawn(agent_cmds::SpawnArgs),
     /// List agents (live fleet by default; --all/--archived include archived).
     List(agent_cmds::ListArgs),
-    /// Archive settled terminal agent records (completed/failed/dismissed) out
-    /// of the default views. Nothing is deleted — cost/usage/lineage survive
-    /// and stay readable via `rk list --archived`.
+    /// Archive settled terminal agent records (completed/failed/dismissed) AND
+    /// settled workflow instances out of the default views. Nothing is deleted
+    /// — cost/usage/lineage survive and stay readable via `rk list --archived`
+    /// and `rk workflow list --archived`.
     Prune(agent_cmds::PruneArgs),
     /// Restore an archived agent record to the live registry.
     Unarchive(agent_cmds::NameArg),
@@ -245,7 +247,35 @@ enum WorkflowCommand {
         param_file: Option<String>,
     },
     /// List workflow instances.
-    List,
+    List {
+        /// Show pruned instances instead of live ones.
+        #[arg(long)]
+        archived: bool,
+        /// Show live and pruned instances together (the full run history).
+        #[arg(long)]
+        all: bool,
+    },
+    /// Archive settled instances out of `rk workflow list` and `rk inbox`.
+    /// Nothing is deleted: a pruned run still reads via `rk workflow status`
+    /// and `rk workflow list --archived`, and `rk workflow unarchive` puts it
+    /// back.
+    Prune {
+        /// Prune exactly these instance ids (from `rk inbox`). An unknown or
+        /// still-running id is an error, not a silent no-op.
+        ids: Vec<String>,
+        /// Without ids: prune instances that settled before this point — a
+        /// duration (30m, 24h, 7d, 2w) or a date (2026-07-24 / RFC3339).
+        #[arg(long, default_value = "7d")]
+        before: String,
+        /// Without ids: prune every settled instance, regardless of age.
+        #[arg(long)]
+        all: bool,
+        /// List what would be pruned without touching the store.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Restore one pruned instance to the live list.
+    Unarchive { id: String },
     /// Show one instance.
     Status { id: String },
     /// Render an instance's step trace: every step labelled and marked
@@ -502,21 +532,85 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
-                WorkflowCommand::List => {
-                    let result = client.call("workflow.list", json!({})).await?;
+                WorkflowCommand::List { archived, all } => {
+                    let result = client
+                        .call("workflow.list", json!({"archived": archived, "all": all}))
+                        .await?;
                     if cli.json {
                         println!("{}", result["instances"]);
                     } else {
-                        for i in result["instances"].as_array().cloned().unwrap_or_default() {
+                        let instances =
+                            result["instances"].as_array().cloned().unwrap_or_default();
+                        for i in &instances {
+                            // A pruned row is only reachable via --archived/--all,
+                            // so mark it rather than letting it read as live.
+                            let status = match i["archived_at"].as_str() {
+                                Some(_) => format!("{}*", i["status"].as_str().unwrap_or("?")),
+                                None => i["status"].as_str().unwrap_or("?").to_string(),
+                            };
                             println!(
                                 "{:14} {:12} {:10} step {}/{}",
                                 i["id"].as_str().unwrap_or("?"),
                                 i["workflow"].as_str().unwrap_or("?"),
-                                i["status"].as_str().unwrap_or("?"),
+                                status,
                                 i["current_step"],
                                 i["total_steps"],
                             );
                         }
+                        if instances.iter().any(|i| !i["archived_at"].is_null()) {
+                            println!("(* pruned — `rk workflow unarchive <id>` restores one)");
+                        }
+                    }
+                }
+                WorkflowCommand::Prune {
+                    ids,
+                    before,
+                    all,
+                    dry_run,
+                } => {
+                    let window = if !ids.is_empty() {
+                        format!("{} named", ids.len())
+                    } else if all {
+                        "all settled".to_string()
+                    } else {
+                        format!("settled before {before}")
+                    };
+                    let result = client
+                        .call(
+                            "workflow.archive",
+                            json!({
+                                "ids": ids,
+                                "before": before,
+                                "all": all,
+                                "dry_run": dry_run,
+                            }),
+                        )
+                        .await?;
+                    if cli.json {
+                        println!("{result}");
+                    } else {
+                        let instances =
+                            result["instances"].as_array().cloned().unwrap_or_default();
+                        if instances.is_empty() {
+                            println!("nothing to prune ({window})");
+                        } else {
+                            let verb = if dry_run { "would prune" } else { "pruned" };
+                            println!("{verb} {} instance(s) ({window}):", instances.len());
+                            for i in &instances {
+                                print_pruned_instance(i);
+                            }
+                            if dry_run {
+                                println!("(dry run — re-run without --dry-run to prune)");
+                            }
+                        }
+                    }
+                }
+                WorkflowCommand::Unarchive { id } => {
+                    let result = client.call("workflow.unarchive", json!({"name": id})).await?;
+                    if cli.json {
+                        println!("{}", result["instance"]);
+                    } else {
+                        println!("unarchived {id}");
                     }
                 }
                 WorkflowCommand::Status { id } => {

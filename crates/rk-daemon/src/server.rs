@@ -773,6 +773,8 @@ impl Daemon {
                     | "repo.remove"
                     | "workflow.run"
                     | "workflow.approve"
+                    | "workflow.archive"
+                    | "workflow.unarchive"
                     | "coordinator.snapshot"
                     | "coordinator.watch"
                     | "sync.now"
@@ -1107,13 +1109,41 @@ impl Daemon {
                 )
             }
             "workflow.run" => reply(self.handle_workflow_run(req).await),
-            "workflow.list" => reply(Response::ok(id, json!({"instances": self.engine().list()}))),
+            "workflow.list" => {
+                let params: WorkflowListParams = match parse_params(&req.params) {
+                    Ok(p) => p,
+                    Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
+                };
+                let engine = self.engine();
+                let instances = match (params.archived, params.all) {
+                    (true, _) => engine.list_archived(),
+                    (false, true) => engine.list_all(),
+                    (false, false) => engine.list(),
+                };
+                reply(Response::ok(id, json!({ "instances": instances })))
+            }
+            "workflow.archive" => reply(self.handle_workflow_archive(req).await),
+            "workflow.unarchive" => {
+                let params: NameParams = match parse_params(&req.params) {
+                    Ok(p) => p,
+                    Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
+                };
+                reply(match self.engine().unarchive(&params.name) {
+                    Ok(Some(instance)) => Response::ok(id, json!({ "instance": instance })),
+                    Ok(None) => Response::err(
+                        id,
+                        codes::INTERNAL,
+                        format!("no archived workflow instance: {}", params.name),
+                    ),
+                    Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
+                })
+            }
             "workflow.status" => {
                 let params: NameParams = match parse_params(&req.params) {
                     Ok(p) => p,
                     Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
                 };
-                reply(match self.engine().status(&params.name) {
+                reply(match self.engine().status_any(&params.name) {
                     Some(instance) => Response::ok(id, json!({"instance": instance})),
                     None => Response::err(
                         id,
@@ -1796,16 +1826,82 @@ impl Daemon {
             logs: params.reap_logs,
         };
         let supervisor = Arc::clone(&self.supervisor);
+        let engine = self.engine();
         let handle = tokio::runtime::Handle::current();
         let result = tokio::task::spawn_blocking(move || {
             let _entered = handle.enter();
-            supervisor.archive_agents(cutoff, params.dry_run, reap)
+            let mut value = supervisor.archive_agents(cutoff, params.dry_run, reap)?;
+            // The same sweep clears the workflow side of the board (TKT-177).
+            // An operator's "clear what's settled" is one gesture, and before
+            // this a failed instance had no `rk` path off `rk inbox` at all.
+            let selection = crate::workflow_exec::Selection::Before(cutoff);
+            let instances = if params.dry_run {
+                engine.archivable(&selection)?
+            } else {
+                engine.archive(&selection)?
+            };
+            value["instances"] = json!(instances);
+            Ok::<_, rk_core::Error>(value)
         })
         .await;
         match result {
             Ok(Ok(value)) => Response::ok(req.id, value),
             Ok(Err(e)) => Response::err(req.id, codes::INTERNAL, e.to_string()),
             Err(e) => Response::err(req.id, codes::INTERNAL, format!("archive task failed: {e}")),
+        }
+    }
+
+    /// `workflow.archive` — the targeted counterpart to the `agent.archive`
+    /// sweep: prune named terminal instances (the `rk inbox` row action) or
+    /// every one settled before a cutoff. The daemon owns the instance store
+    /// and rewrites it on every mutation, so this has to be an RPC — moving the
+    /// JSON aside by hand only works with the daemon stopped.
+    async fn handle_workflow_archive(&self, req: Request) -> Response {
+        let params: WorkflowArchiveParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let selection = if params.ids.is_empty() {
+            let now = chrono::Utc::now();
+            // `all` means "everything settled right now" — a cutoff of now,
+            // since eligibility is `settled_at < cutoff`.
+            let cutoff = if params.all {
+                now
+            } else {
+                match crate::agents::cutoff_from_spec(params.before.as_deref().unwrap_or("7d"), now)
+                {
+                    Ok(c) => c,
+                    Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+                }
+            };
+            crate::workflow_exec::Selection::Before(cutoff)
+        } else {
+            crate::workflow_exec::Selection::Ids(params.ids)
+        };
+        let engine = self.engine();
+        let result = tokio::task::spawn_blocking(move || {
+            if params.dry_run {
+                engine.archivable(&selection)
+            } else {
+                engine.archive(&selection)
+            }
+        })
+        .await;
+        match result {
+            Ok(Ok(instances)) => Response::ok(
+                req.id,
+                json!({
+                    "dry_run": params.dry_run,
+                    "count": instances.len(),
+                    "instances": instances,
+                }),
+            ),
+            Ok(Err(e)) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+            Err(e) => Response::err(
+                req.id,
+                codes::INTERNAL,
+                format!("workflow archive task failed: {e}"),
+            ),
         }
     }
 
@@ -2170,6 +2266,32 @@ struct AgentArchiveParams {
     reap_git: bool,
     /// Also delete each archived agent's transcript file. One-way.
     reap_logs: bool,
+}
+
+/// Which slice of the instance store `workflow.list` returns. Defaults (both
+/// false) to the live store, so every existing caller is unchanged.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct WorkflowListParams {
+    /// Pruned instances only.
+    archived: bool,
+    /// Live + pruned — the full run history. Ignored when `archived` is set.
+    all: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct WorkflowArchiveParams {
+    /// Prune exactly these instance ids. Non-empty ids override the window:
+    /// an unknown or still-running id is an error, never a silent no-op.
+    ids: Vec<String>,
+    /// Cutoff for the windowed form: a duration (`7d`, `24h`) or a date.
+    /// Defaults to `7d`.
+    before: Option<String>,
+    /// Prune every settled instance regardless of age (overrides `before`).
+    all: bool,
+    /// Report what would be pruned without touching the store.
+    dry_run: bool,
 }
 
 #[derive(Deserialize)]

@@ -298,6 +298,10 @@ pub async fn list(layout: &Layout, args: ListArgs, as_json: bool) -> Result<()> 
 /// into the archive store so `rk list` and `rk top` show only what's current.
 /// Nothing is deleted: archived records keep their cost/usage/lineage and stay
 /// readable via `rk list --archived` / `rk status`.
+///
+/// The same pass clears the workflow half of the board: settled instances are
+/// archived on the same window, so one gesture empties `rk inbox` instead of
+/// leaving failed instances with no `rk` path off it at all (TKT-177).
 pub async fn prune(layout: &Layout, args: PruneArgs, as_json: bool) -> Result<()> {
     let mut client = Client::connect_or_spawn(layout).await?;
     let result = client
@@ -317,12 +321,13 @@ pub async fn prune(layout: &Layout, args: PruneArgs, as_json: bool) -> Result<()
         return Ok(());
     }
     let agents = result["agents"].as_array().cloned().unwrap_or_default();
+    let instances = result["instances"].as_array().cloned().unwrap_or_default();
     let window = if args.all {
         "all eligible".to_string()
     } else {
         format!("older than {}", args.before)
     };
-    if agents.is_empty() {
+    if agents.is_empty() && instances.is_empty() {
         println!("nothing to archive ({window})");
         return Ok(());
     }
@@ -331,7 +336,9 @@ pub async fn prune(layout: &Layout, args: PruneArgs, as_json: bool) -> Result<()
     } else {
         "archived"
     };
-    println!("{verb} {} record(s) ({window}):", agents.len());
+    if !agents.is_empty() {
+        println!("{verb} {} record(s) ({window}):", agents.len());
+    }
     for a in &agents {
         println!(
             "  {:<12} {:<10} {:<14} ${:.4}",
@@ -340,6 +347,12 @@ pub async fn prune(layout: &Layout, args: PruneArgs, as_json: bool) -> Result<()
             a["task"].as_str().unwrap_or("-"),
             a["cost_usd"].as_f64().unwrap_or(0.0),
         );
+    }
+    if !instances.is_empty() {
+        println!("{verb} {} workflow instance(s) ({window}):", instances.len());
+        for i in &instances {
+            print_pruned_instance(i);
+        }
     }
     // Both reap passes report the same row shape, so print them the same way;
     // only the leading tag says which artifact a row is about.
@@ -361,6 +374,26 @@ pub async fn prune(layout: &Layout, args: PruneArgs, as_json: bool) -> Result<()
         println!("(dry run — re-run without --dry-run to archive)");
     }
     Ok(())
+}
+
+/// One archived workflow instance as a `rk prune` / `rk workflow prune` row.
+/// Shared so the sweeping and the targeted commands report identically; the
+/// failure text is what the operator was staring at in `rk inbox`, so it is
+/// echoed (truncated) rather than dropped.
+pub fn print_pruned_instance(instance: &Value) {
+    let detail = match instance["error"].as_str() {
+        Some(error) if !error.is_empty() => {
+            let line = error.lines().next().unwrap_or(error);
+            format!("  {}", line.chars().take(60).collect::<String>())
+        }
+        _ => String::new(),
+    };
+    println!(
+        "  {:<14} {:<12} {:<10}{detail}",
+        instance["id"].as_str().unwrap_or("?"),
+        instance["workflow"].as_str().unwrap_or("?"),
+        instance["status"].as_str().unwrap_or("?"),
+    );
 }
 
 /// `rk unarchive` — restore one archived record to the live registry.
