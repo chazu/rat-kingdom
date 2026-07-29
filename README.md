@@ -211,6 +211,12 @@ rk repo list                           # NAME → PATH
 rk repo show rat-kingdom               # details + its open tickets
 rk repo onboard inspect ~/dev/other    # deterministic read-only readiness report
 rk --json repo onboard inspect svc     # the same stable report shape as JSON
+rk repo onboard start svc              # durable headless assessment session
+rk repo onboard start svc --attach     # same session/report in a herdr pane
+rk repo onboard status onb-...         # stable state after disconnect or restart
+rk repo onboard report onb-...         # assessment plus terminal agent result
+rk repo onboard resume onb-...         # recover an orphaned/failed headless run
+rk repo onboard resume onb-... --attach
 ```
 
 A registered name works anywhere a repo is expected, e.g. `rk spawn --repo rat-kingdom`.
@@ -227,6 +233,22 @@ CUE, submodules, and Git LFS therefore fail closed.
 Inspection never registers the repository, launches an agent, runs a project
 check, or edits repository/castle state. It also does not auto-start the daemon;
 if the daemon is down, start it separately with `rk ping` and then inspect.
+
+`repo onboard start` journals one stable session per canonical repository and
+creates `onboarding/onb-...` in a Rat Kingdom-owned worktree. Repeating start
+reuses that session, branch, and worktree rather than touching the human
+checkout or launching a duplicate. Headless and `--attach` runs write the same
+`onboarding-sessions.json` record and expose the same status/report RPCs.
+Daemon restart marks an in-flight session orphaned; `resume` reuses the
+preserved worktree and, for attached runs, reattaches to a surviving herdr pane
+or recreates it.
+
+The spawned role is always `onboarder`; the RPC does not accept a role override.
+The daemon rejects unknown roles, forces onboarders into the harness's
+read-only/plan mode, and gives them only inspection reads, self progress, and
+their final `rk done` event. They cannot spawn agents, mutate tickets/repos,
+approve workflows, use ordinary rat tuple writes, or gain operator authority by
+clearing `RK_AGENT`/`RK_AUTH_TOKEN`.
 
 By default a finished rat's branch is merged directly into its base. A repo can
 instead be put in **PR mode** — `rk repo add <path> --merge-mode pr` — so the

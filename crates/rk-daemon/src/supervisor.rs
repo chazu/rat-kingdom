@@ -3410,6 +3410,26 @@ mod respawn_tests {
         )
     }
 
+    #[test]
+    fn roles_and_onboarder_sandbox_are_explicit() {
+        for role in ["rat", "reviewer", "foreman", "verifier", "onboarder"] {
+            validate_role(role).unwrap();
+        }
+        assert!(validate_role("onbaorder").is_err());
+        assert!(validate_role("").is_err());
+
+        assert_eq!(permission_mode("onboarder", "codex").unwrap(), "read-only");
+        assert_eq!(permission_mode("onboarder", "claude").unwrap(), "plan");
+        assert!(
+            permission_mode("onboarder", "axe").is_err(),
+            "a harness without an enforced read-only mode must fail closed"
+        );
+        assert_eq!(
+            permission_mode("rat", "codex").unwrap(),
+            "workspace-write"
+        );
+    }
+
     fn record(repo: &Path, branch: Option<&str>) -> AgentRecord {
         let now = Utc::now();
         AgentRecord {

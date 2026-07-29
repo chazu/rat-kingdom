@@ -141,7 +141,7 @@ enum Command {
     /// Print role instructions for the system. Defaults to the `operator` role
     /// unless RK_ROLE (set on spawned rats) indicates otherwise.
     Prime {
-        /// Role to render: operator | rat | reviewer | foreman. Overrides RK_ROLE.
+        /// Role to render: operator | rat | reviewer | foreman | verifier | onboarder. Overrides RK_ROLE.
         #[arg(long)]
         role: Option<String>,
     },
