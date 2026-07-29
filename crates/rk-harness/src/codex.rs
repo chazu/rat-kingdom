@@ -18,6 +18,17 @@ use tokio::sync::mpsc;
 
 pub struct CodexHarness;
 
+fn sandbox_mode(permission_mode: Option<&str>) -> &'static str {
+    match permission_mode {
+        Some("read-only") => "read-only",
+        Some("workspace-write") => "workspace-write",
+        // Claude's workflow vocabulary uses bypassPermissions; map it to the
+        // Codex equivalent instead of silently narrowing it to workspace-write.
+        Some("bypassPermissions") | Some("danger-full-access") => "danger-full-access",
+        _ => "workspace-write",
+    }
+}
+
 impl Harness for CodexHarness {
     fn kind(&self) -> &'static str {
         "codex"
@@ -41,11 +52,7 @@ impl Harness for CodexHarness {
         }
         // permission_mode maps to codex --sandbox. Default to the worktree
         // sandbox; operators can opt into a wider mode explicitly.
-        let sandbox = match spec.permission_mode.as_deref() {
-            Some("read-only") => "read-only",
-            Some("workspace-write") => "workspace-write",
-            _ => "workspace-write",
-        };
+        let sandbox = sandbox_mode(spec.permission_mode.as_deref());
         cmd.args(["--json", "--skip-git-repo-check", "--sandbox", sandbox]);
         if let Some(model) = &spec.model {
             cmd.args(["-m", model]);
@@ -195,6 +202,15 @@ pub(crate) fn parse_event_line(line: &str) -> Vec<HarnessEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_modes_map_to_codex_sandbox_modes() {
+        assert_eq!(sandbox_mode(Some("read-only")), "read-only");
+        assert_eq!(sandbox_mode(Some("workspace-write")), "workspace-write");
+        assert_eq!(sandbox_mode(Some("bypassPermissions")), "danger-full-access");
+        assert_eq!(sandbox_mode(Some("danger-full-access")), "danger-full-access");
+        assert_eq!(sandbox_mode(None), "workspace-write");
+    }
 
     #[test]
     fn thread_started_maps_to_started() {
