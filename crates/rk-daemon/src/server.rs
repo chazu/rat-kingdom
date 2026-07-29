@@ -864,6 +864,9 @@ impl Daemon {
                 | "repo.add"
                 | "repo.remove"
                 | "repo.onboard.start"
+                | "repo.onboard.propose"
+                | "repo.onboard.approve"
+                | "repo.onboard.decline"
                 | "repo.onboard.resume"
                 | "repo.onboard.status"
                 | "repo.onboard.report"
@@ -912,6 +915,7 @@ impl Daemon {
             | "repo.list"
             | "repo.get"
             | "repo.onboard.inspect"
+            | "repo.onboard.propose"
             | "agent.status"
             | "agent.log"
             | "agent.progress" => true,
@@ -1494,6 +1498,9 @@ impl Daemon {
             }),
             "repo.get" => reply(self.handle_repo_get(req)),
             "repo.onboard.start" => reply(self.handle_onboarding_start(req).await),
+            "repo.onboard.propose" => reply(self.handle_onboarding_propose(req)),
+            "repo.onboard.approve" => reply(self.handle_onboarding_approve(req)),
+            "repo.onboard.decline" => reply(self.handle_onboarding_decline(req)),
             "repo.onboard.resume" => reply(self.handle_onboarding_resume(req).await),
             "repo.onboard.status" => reply(self.handle_onboarding_status(req)),
             "repo.onboard.report" => reply(self.handle_onboarding_report(req)),
@@ -2104,6 +2111,149 @@ impl Daemon {
         }
     }
 
+    fn handle_onboarding_propose(&self, req: Request) -> Response {
+        let params: RepoOnboardingProposeParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let session = match self.onboarding_sessions.lock() {
+            Ok(sessions) => sessions.get(&params.session),
+            Err(_) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    "onboarding session registry lock poisoned",
+                );
+            }
+        };
+        let Some(session) = session else {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                format!("no such onboarding session: {}", params.session),
+            );
+        };
+        if req.caller != crate::client::OPERATOR
+            && session.agent.as_deref() != Some(req.caller.as_str())
+        {
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                format!(
+                    "{} does not own onboarding session {}",
+                    req.caller, params.session
+                ),
+            );
+        }
+        let tree_revision =
+            match crate::onboarding_proposals::onboarding_tree_revision(&session.worktree) {
+                Ok(revision) => revision,
+                Err(error) => {
+                    return Response::err(req.id, codes::BAD_PARAMS, error.to_string());
+                }
+            };
+        let result = self
+            .onboarding_sessions
+            .lock()
+            .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
+            .and_then(|mut sessions| {
+                sessions.propose(
+                    &params.session,
+                    params.proposal,
+                    req.caller.clone(),
+                    tree_revision,
+                )
+            });
+        match result {
+            Ok((proposal, created)) => {
+                Response::ok(req.id, json!({"proposal": proposal, "created": created}))
+            }
+            Err(error) => Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+        }
+    }
+
+    fn handle_onboarding_approve(&self, req: Request) -> Response {
+        let params: RepoOnboardingDecisionParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        self.handle_onboarding_decision(
+            req,
+            params,
+            crate::onboarding_proposals::OnboardingDecision::Approve,
+        )
+    }
+
+    fn handle_onboarding_decline(&self, req: Request) -> Response {
+        let params: RepoOnboardingDecisionParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        self.handle_onboarding_decision(
+            req,
+            params,
+            crate::onboarding_proposals::OnboardingDecision::Decline,
+        )
+    }
+
+    fn handle_onboarding_decision(
+        &self,
+        req: Request,
+        params: RepoOnboardingDecisionParams,
+        decision: crate::onboarding_proposals::OnboardingDecision,
+    ) -> Response {
+        let worktree = match self.onboarding_sessions.lock() {
+            Ok(sessions) => match sessions.get(&params.session) {
+                Some(session) => session.worktree,
+                None => {
+                    return Response::err(
+                        req.id,
+                        codes::BAD_PARAMS,
+                        format!("no such onboarding session: {}", params.session),
+                    );
+                }
+            },
+            Err(_) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    "onboarding session registry lock poisoned",
+                );
+            }
+        };
+        let tree_revision = match crate::onboarding_proposals::onboarding_tree_revision(&worktree) {
+            Ok(revision) => revision,
+            Err(error) => {
+                return Response::err(req.id, codes::BAD_PARAMS, error.to_string());
+            }
+        };
+        // The actor is derived only after RPC authentication. No request field
+        // can claim a human identity; the castle-qualified operator channel is
+        // the durable attribution available today.
+        let actor = format!("{}@{}", req.caller, self.castle);
+        let result = self
+            .onboarding_sessions
+            .lock()
+            .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
+            .and_then(|mut sessions| {
+                sessions.decide(
+                    &params.session,
+                    &params.proposal,
+                    &params.digest,
+                    &tree_revision,
+                    decision,
+                    actor,
+                    params.reason,
+                )
+            });
+        match result {
+            Ok((proposal, changed)) => {
+                Response::ok(req.id, json!({"proposal": proposal, "changed": changed}))
+            }
+            Err(error) => Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+        }
+    }
+
     fn handle_onboarding_status(&self, req: Request) -> Response {
         let params: RepoOnboardingSessionParams = match parse_params(&req.params) {
             Ok(params) => params,
@@ -2139,7 +2289,9 @@ impl Daemon {
                 prompt: Some(format!(
                     "Assess this repository read-only for onboarding session {}. \
                      The daemon's deterministic starting assessment follows. Confirm \
-                     evidence, report ambiguity, and finish with `rk done`; do not edit \
+                     evidence and report ambiguity. Journal concrete advice with \
+                     `rk repo onboard propose`; that records a proposal but grants no \
+                     approval or mutation authority. Finish with `rk done`; do not edit \
                      or commit anything.\n\n{}",
                     session.id, assessment
                 )),
@@ -3394,6 +3546,23 @@ struct RepoOnboardingStartParams {
     harness: Option<String>,
     #[serde(default)]
     attach: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoOnboardingProposeParams {
+    session: String,
+    proposal: crate::onboarding_proposals::OnboardingProposalDraft,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoOnboardingDecisionParams {
+    session: String,
+    proposal: String,
+    digest: String,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]

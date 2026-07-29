@@ -214,6 +214,11 @@ rk --json repo onboard inspect svc     # the same stable report shape as JSON
 rk repo onboard start svc              # durable headless assessment session
 rk repo onboard start svc --attach     # same session/report in a herdr pane
 rk repo onboard status onb-...         # stable state after disconnect or restart
+rk repo onboard propose onb-... --kind repo_file --title "Add verify" \
+  --evidence "README documents mise run verify" --target .rk/checks.cue \
+  --action write_repo_file --diff "$DIFF" --risk low --verification "mise run verify"
+rk repo onboard approve onb-... onb-prop-... --digest <sha256>
+rk repo onboard decline onb-... onb-prop-... --digest <sha256>
 rk repo onboard report onb-...         # assessment plus terminal agent result
 rk repo onboard resume onb-...         # recover an orphaned/failed headless run
 rk repo onboard resume onb-... --attach
@@ -246,9 +251,19 @@ or recreates it.
 The spawned role is always `onboarder`; the RPC does not accept a role override.
 The daemon rejects unknown roles, forces onboarders into the harness's
 read-only/plan mode, and gives them only inspection reads, self progress, and
-their final `rk done` event. They cannot spawn agents, mutate tickets/repos,
+proposal submission plus their final `rk done` event. Proposal submission only
+journals immutable advice: it does not edit the worktree or castle. Onboarders
+cannot approve or decline proposals, spawn agents, mutate tickets/repos,
 approve workflows, use ordinary rat tuple writes, or gain operator authority by
 clearing `RK_AGENT`/`RK_AUTH_TOKEN`.
+
+Each proposal records its evidence, exact diff, risk, target/action, verification
+plan, stable repository identity, and the onboarding Git tree revision. Its
+canonical SHA-256 digest covers all of that immutable content. Copy the digest
+shown by `status` or `report` into `approve`/`decline`; the daemon rejects a
+stale tree, edited persisted proposal, different digest, caller-supplied actor,
+or opposite second decision. Same-decision retries are idempotent, and the
+server records the authenticated castle-qualified operator plus decision time.
 
 By default a finished rat's branch is merged directly into its base. A repo can
 instead be put in **PR mode** — `rk repo add <path> --merge-mode pr` — so the

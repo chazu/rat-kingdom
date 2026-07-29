@@ -9,6 +9,7 @@ pub mod cron;
 pub mod drain;
 pub mod inbox;
 pub mod onboarding;
+pub mod onboarding_proposals;
 pub mod onboarding_sessions;
 pub mod proto;
 pub mod reactor;

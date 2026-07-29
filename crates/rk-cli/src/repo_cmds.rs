@@ -3,6 +3,7 @@
 use anyhow::{bail, Result};
 use rk_core::paths::Layout;
 use rk_daemon::onboarding::AssessmentReport;
+use rk_daemon::onboarding_proposals::OnboardingProposal;
 use rk_daemon::onboarding_sessions::{OnboardingReport, OnboardingSessionStatus};
 use rk_daemon::Client;
 use serde_json::json;
@@ -174,6 +175,100 @@ pub async fn onboard_start(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn onboard_propose(
+    layout: &Layout,
+    session: String,
+    kind: String,
+    title: String,
+    evidence: Vec<String>,
+    target_path: String,
+    action: String,
+    diff: String,
+    risk: String,
+    verification: Vec<String>,
+    as_json: bool,
+) -> Result<()> {
+    let mut client = Client::connect(layout).await?;
+    let result = client
+        .call(
+            "repo.onboard.propose",
+            json!({
+                "session": session,
+                "proposal": {
+                    "kind": kind,
+                    "title": title,
+                    "evidence": evidence,
+                    "target_path": target_path,
+                    "action": action,
+                    "diff": diff,
+                    "risk": risk,
+                    "verification": verification,
+                },
+            }),
+        )
+        .await?;
+    let proposal: OnboardingProposal = serde_json::from_value(result["proposal"].clone())?;
+    if as_json {
+        println!("{result}");
+    } else {
+        print_onboarding_proposal(&proposal);
+        println!(
+            "  journal   {}",
+            if result["created"].as_bool().unwrap_or(false) {
+                "created"
+            } else {
+                "already present"
+            }
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn onboard_decide(
+    layout: &Layout,
+    session: String,
+    proposal: String,
+    digest: String,
+    reason: Option<String>,
+    approve: bool,
+    as_json: bool,
+) -> Result<()> {
+    let method = if approve {
+        "repo.onboard.approve"
+    } else {
+        "repo.onboard.decline"
+    };
+    let mut client = Client::connect(layout).await?;
+    let result = client
+        .call(
+            method,
+            json!({
+                "session": session,
+                "proposal": proposal,
+                "digest": digest,
+                "reason": reason,
+            }),
+        )
+        .await?;
+    let proposal: OnboardingProposal = serde_json::from_value(result["proposal"].clone())?;
+    if as_json {
+        println!("{result}");
+    } else {
+        print_onboarding_proposal(&proposal);
+        println!(
+            "  decision  {}",
+            if result["changed"].as_bool().unwrap_or(false) {
+                "recorded"
+            } else {
+                "already recorded (idempotent)"
+            }
+        );
+    }
+    Ok(())
+}
+
 pub async fn onboard_resume(
     layout: &Layout,
     session: String,
@@ -256,6 +351,59 @@ fn print_onboarding_status(status: &OnboardingSessionStatus, reused: bool) {
     }
     if reused {
         println!("  resume    rk repo onboard resume {}", status.id);
+    }
+    if status.proposals.is_empty() {
+        println!("  proposals none");
+    } else {
+        println!("\nproposals:");
+        for proposal in &status.proposals {
+            print_onboarding_proposal(proposal);
+        }
+    }
+}
+
+fn print_onboarding_proposal(proposal: &OnboardingProposal) {
+    println!("  {} [{}] {}", proposal.id, proposal.status, proposal.title);
+    println!("    kind/action  {} / {}", proposal.kind, proposal.action);
+    println!("    target       {}", proposal.target_path);
+    println!("    risk         {}", proposal.risk);
+    println!("    repository   {}", proposal.repository_identity);
+    println!("    tree         {}", proposal.tree_revision);
+    println!("    digest       {}", proposal.digest);
+    println!(
+        "    proposed by  {} at {}",
+        proposal.proposer, proposal.proposed_at
+    );
+    println!("    evidence:");
+    for evidence in &proposal.evidence {
+        println!("      - {evidence}");
+    }
+    println!("    diff:");
+    for line in proposal.diff.lines() {
+        println!("      {line}");
+    }
+    println!("    verification:");
+    for verification in &proposal.verification {
+        println!("      - {verification}");
+    }
+    if let (Some(actor), Some(at)) = (&proposal.decision_actor, proposal.decision_at) {
+        println!("    decision     {actor} at {at}");
+    }
+    if let Some(reason) = &proposal.decision_reason {
+        println!("    reason       {reason}");
+    }
+    if let Some(failure) = &proposal.failure {
+        println!("    failure      {failure}");
+    }
+    if proposal.status == rk_daemon::onboarding_proposals::OnboardingProposalStatus::Proposed {
+        println!(
+            "    approve      rk repo onboard approve {} {} --digest {}",
+            proposal.session_id, proposal.id, proposal.digest
+        );
+        println!(
+            "    decline      rk repo onboard decline {} {} --digest {}",
+            proposal.session_id, proposal.id, proposal.digest
+        );
     }
 }
 
