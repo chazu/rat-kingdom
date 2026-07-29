@@ -46,6 +46,8 @@ pub struct VerificationCheck {
     pub cwd: Option<String>,
     pub expect_exit: Option<i64>,
     pub timeout: Option<String>,
+    pub environment_policy: Option<String>,
+    pub toolchain: Option<String>,
 }
 
 /// Maximum number of fact entries injected into one worker prompt.
@@ -372,6 +374,14 @@ fn render_verification_checks(checks: &[VerificationCheck]) -> Option<String> {
             let timeout = serde_json::to_string(timeout)
                 .unwrap_or_else(|_| "\"<unrenderable timeout>\"".to_string());
             let _ = writeln!(section, "  timeout: {timeout}");
+        }
+        if let Some(environment_policy) = &check.environment_policy {
+            let _ = writeln!(section, "  environment: {environment_policy}");
+        }
+        if let Some(toolchain) = &check.toolchain {
+            let toolchain = serde_json::to_string(toolchain)
+                .unwrap_or_else(|_| "\"<unrenderable toolchain>\"".to_string());
+            let _ = writeln!(section, "  toolchain: {toolchain}");
         }
     }
     Some(section)
@@ -729,6 +739,8 @@ mod tests {
             cwd: Some("crates/example".into()),
             expect_exit: Some(0),
             timeout: Some("15m".into()),
+            environment_policy: Some("strip_rk_spawn".into()),
+            toolchain: Some("mise rust@1.95.0".into()),
         }];
 
         let text = render("rat", &c);
@@ -738,6 +750,8 @@ mod tests {
         assert!(text.contains("cwd: \"crates/example\""));
         assert!(text.contains("expected exit: 0"));
         assert!(text.contains("timeout: \"15m\""));
+        assert!(text.contains("environment: strip_rk_spawn"));
+        assert!(text.contains("toolchain: \"mise rust@1.95.0\""));
 
         let checks_at = text
             .find("Repository verification checks")

@@ -98,6 +98,10 @@ pub struct Daemon {
     engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
     repos: std::sync::Mutex<crate::repos::RepoRegistry>,
     onboarding_sessions: std::sync::Mutex<crate::onboarding_sessions::OnboardingSessions>,
+    /// Serializes the Git apply/commit/verification recovery window. Session
+    /// persistence supplies restart safety; this lock prevents concurrent
+    /// operator retries in one daemon from racing the same worktree.
+    onboarding_apply_lock: tokio::sync::Mutex<()>,
     tickets: Arc<crate::tickets::Tickets>,
     coordinator_sessions: std::sync::Mutex<crate::coordinator::CoordinatorSessions>,
     /// Serializes read/append cycles for one agent's effective fact vote.
@@ -326,6 +330,7 @@ impl Daemon {
             engine: std::sync::OnceLock::new(),
             repos,
             onboarding_sessions,
+            onboarding_apply_lock: tokio::sync::Mutex::new(()),
             tickets,
             coordinator_sessions,
             fact_vote_lock: std::sync::Mutex::new(()),
@@ -867,6 +872,7 @@ impl Daemon {
                 | "repo.onboard.propose"
                 | "repo.onboard.approve"
                 | "repo.onboard.decline"
+                | "repo.onboard.apply"
                 | "repo.onboard.resume"
                 | "repo.onboard.status"
                 | "repo.onboard.report"
@@ -1501,6 +1507,7 @@ impl Daemon {
             "repo.onboard.propose" => reply(self.handle_onboarding_propose(req)),
             "repo.onboard.approve" => reply(self.handle_onboarding_approve(req)),
             "repo.onboard.decline" => reply(self.handle_onboarding_decline(req)),
+            "repo.onboard.apply" => reply(self.handle_onboarding_apply(req).await),
             "repo.onboard.resume" => reply(self.handle_onboarding_resume(req).await),
             "repo.onboard.status" => reply(self.handle_onboarding_status(req)),
             "repo.onboard.report" => reply(self.handle_onboarding_report(req)),
@@ -2193,6 +2200,207 @@ impl Daemon {
             req,
             params,
             crate::onboarding_proposals::OnboardingDecision::Decline,
+        )
+    }
+
+    async fn handle_onboarding_apply(&self, req: Request) -> Response {
+        let params: RepoOnboardingApplyParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let _apply_guard = self.onboarding_apply_lock.lock().await;
+        let actor = format!("{}@{}", req.caller, self.castle);
+        let (session, proposal) = match self.onboarding_sessions.lock() {
+            Ok(sessions) => {
+                let Some(session) = sessions.get(&params.session) else {
+                    return Response::err(
+                        req.id,
+                        codes::BAD_PARAMS,
+                        format!("no such onboarding session: {}", params.session),
+                    );
+                };
+                let Some(proposal) = session
+                    .proposals
+                    .iter()
+                    .find(|proposal| proposal.id == params.proposal)
+                    .cloned()
+                else {
+                    return Response::err(
+                        req.id,
+                        codes::BAD_PARAMS,
+                        format!(
+                            "no such onboarding proposal in {}: {}",
+                            params.session, params.proposal
+                        ),
+                    );
+                };
+                (session, proposal)
+            }
+            Err(_) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    "onboarding session registry lock poisoned",
+                );
+            }
+        };
+        if proposal.digest != params.digest {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                format!("stale proposal digest for {}", proposal.id),
+            );
+        }
+        if !matches!(
+            proposal.status,
+            crate::onboarding_proposals::OnboardingProposalStatus::Approved
+                | crate::onboarding_proposals::OnboardingProposalStatus::Applied
+                | crate::onboarding_proposals::OnboardingProposalStatus::Failed
+                | crate::onboarding_proposals::OnboardingProposalStatus::Verified
+        ) {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                format!(
+                    "proposal {} must be approved before apply; found {}",
+                    proposal.id, proposal.status
+                ),
+            );
+        }
+
+        let apply_session = session.clone();
+        let apply_proposal = proposal.clone();
+        let apply_actor = actor.clone();
+        let application = tokio::task::spawn_blocking(move || {
+            crate::onboarding_apply::ensure_application(
+                &apply_session,
+                &apply_proposal,
+                &apply_actor,
+            )
+        })
+        .await;
+        let application = match application {
+            Ok(Ok(application)) => application,
+            Ok(Err(error)) => {
+                let detail = error.to_string();
+                let _ = self
+                    .onboarding_sessions
+                    .lock()
+                    .map_err(|_| {
+                        rk_core::Error::other("onboarding session registry lock poisoned")
+                    })
+                    .and_then(|mut sessions| {
+                        sessions.record_application_failure(
+                            &params.session,
+                            &params.proposal,
+                            &params.digest,
+                            actor,
+                            detail.clone(),
+                        )
+                    });
+                return Response::err(req.id, codes::BAD_PARAMS, detail);
+            }
+            Err(error) => {
+                let detail = format!("onboarding application task failed: {error}");
+                let _ = self
+                    .onboarding_sessions
+                    .lock()
+                    .map_err(|_| {
+                        rk_core::Error::other("onboarding session registry lock poisoned")
+                    })
+                    .and_then(|mut sessions| {
+                        sessions.record_application_failure(
+                            &params.session,
+                            &params.proposal,
+                            &params.digest,
+                            actor,
+                            detail.clone(),
+                        )
+                    });
+                return Response::err(req.id, codes::INTERNAL, detail);
+            }
+        };
+        if proposal.status
+            == crate::onboarding_proposals::OnboardingProposalStatus::Verified
+        {
+            return Response::ok(
+                req.id,
+                json!({"proposal": proposal, "applied": false, "verified": false}),
+            );
+        }
+        let (applied_proposal, applied) = match self
+            .onboarding_sessions
+            .lock()
+            .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
+            .and_then(|mut sessions| {
+                sessions.record_application(
+                    &params.session,
+                    &params.proposal,
+                    &params.digest,
+                    application,
+                )
+            }) {
+            Ok(result) => result,
+            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+        };
+
+        let attempt = applied_proposal.verification_results.len() as u32 + 1;
+        let verification = match crate::onboarding_apply::verify(
+            &session,
+            &applied_proposal,
+            &actor,
+            attempt,
+        )
+        .await
+        {
+            Ok(verification) => verification,
+            Err(error) => {
+                let now = chrono::Utc::now();
+                let Some(contract) = applied_proposal.named_check.as_ref() else {
+                    return Response::err(req.id, codes::INTERNAL, error.to_string());
+                };
+                crate::onboarding_proposals::OnboardingVerification {
+                    attempt,
+                    actor: actor.clone(),
+                    started_at: now,
+                    finished_at: now,
+                    check_name: contract.name.clone(),
+                    command: contract.command.clone(),
+                    cwd: contract.cwd.clone(),
+                    expected_exit: contract.expect_exit,
+                    timeout: contract.timeout.clone(),
+                    environment_policy: contract.environment_policy,
+                    toolchain: contract.toolchain.clone(),
+                    exit_status: None,
+                    timed_out: false,
+                    passed: false,
+                    output_summary: format!("verification setup failed: {error}"),
+                    unresolved_risks: vec![
+                        "verification could not execute; onboarding branch is not ready to land"
+                            .into(),
+                    ],
+                }
+            }
+        };
+        let passed = verification.passed;
+        let proposal = match self
+            .onboarding_sessions
+            .lock()
+            .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
+            .and_then(|mut sessions| {
+                sessions.record_verification(
+                    &params.session,
+                    &params.proposal,
+                    &params.digest,
+                    verification,
+                )
+            }) {
+            Ok(proposal) => proposal,
+            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+        };
+        Response::ok(
+            req.id,
+            json!({"proposal": proposal, "applied": applied, "verified": passed}),
         )
     }
 
@@ -3563,6 +3771,14 @@ struct RepoOnboardingDecisionParams {
     digest: String,
     #[serde(default)]
     reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoOnboardingApplyParams {
+    session: String,
+    proposal: String,
+    digest: String,
 }
 
 #[derive(Deserialize)]

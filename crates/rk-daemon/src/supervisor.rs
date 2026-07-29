@@ -1324,6 +1324,8 @@ impl Supervisor {
                     cwd: check.cwd,
                     expect_exit: check.expect_exit,
                     timeout: check.timeout,
+                    environment_policy: Some(check.environment_policy.to_string()),
+                    toolchain: check.toolchain,
                 })
                 .collect(),
             Err(e) => {

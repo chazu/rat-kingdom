@@ -7,12 +7,13 @@
 //! [`crate::onboarding_sessions::OnboardingSessions`].
 
 use chrono::{DateTime, Utc};
+use rk_workflow::CheckEnvironmentPolicy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Component, Path};
 use std::process::Command;
 
-pub const PROPOSAL_SCHEMA_VERSION: u32 = 1;
+pub const PROPOSAL_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,6 +122,7 @@ impl OnboardingProposalStatus {
                 Self::Approved | Self::Declined | Self::Failed
             ) | (Self::Approved, Self::Applied | Self::Failed)
                 | (Self::Applied, Self::Verified | Self::Failed)
+                | (Self::Failed, Self::Applied)
         )
     }
 }
@@ -157,6 +159,11 @@ pub struct OnboardingProposalDraft {
     pub diff: String,
     pub risk: OnboardingProposalRisk,
     pub verification: Vec<String>,
+    /// Exact check metadata a human approves for `.rk/checks.cue`. The unified
+    /// diff is still the file-level change; this contract makes the executable
+    /// command and its environment independently visible and digest-bound.
+    #[serde(default)]
+    pub named_check: Option<OnboardingNamedCheck>,
 }
 
 impl OnboardingProposalDraft {
@@ -176,8 +183,92 @@ impl OnboardingProposalDraft {
         ) {
             self.target_path = canonical_repo_target(&self.target_path)?;
         }
+        match (
+            self.kind,
+            self.action,
+            self.target_path.as_str(),
+            self.named_check.take(),
+        ) {
+            (
+                OnboardingProposalKind::RepoFile,
+                OnboardingProposalAction::WriteRepoFile,
+                ".rk/checks.cue",
+                Some(check),
+            ) => self.named_check = Some(check.canonicalized()?),
+            (
+                OnboardingProposalKind::RepoFile,
+                OnboardingProposalAction::WriteRepoFile,
+                ".rk/checks.cue",
+                None,
+            ) => {
+                return Err(rk_core::Error::other(
+                    "a .rk/checks.cue proposal must bind an exact named_check contract",
+                ));
+            }
+            (_, _, _, Some(_)) => {
+                return Err(rk_core::Error::other(
+                    "named_check is only valid for a .rk/checks.cue repo-file proposal",
+                ));
+            }
+            _ => {}
+        }
         Ok(self)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnboardingNamedCheck {
+    pub name: String,
+    pub command: String,
+    pub cwd: String,
+    pub expect_exit: i64,
+    pub timeout: String,
+    pub environment_policy: CheckEnvironmentPolicy,
+    pub toolchain: String,
+}
+
+impl OnboardingNamedCheck {
+    fn canonicalized(mut self) -> rk_core::Result<Self> {
+        self.name = required_line("named_check.name", &self.name)?;
+        self.command = required_line("named_check.command", &self.command)?;
+        self.cwd = canonical_repo_cwd(&self.cwd)?;
+        self.timeout = required_line("named_check.timeout", &self.timeout)?;
+        validate_duration(&self.timeout)?;
+        self.toolchain = required_line("named_check.toolchain", &self.toolchain)?;
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingApplication {
+    pub actor: String,
+    pub at: DateTime<Utc>,
+    pub commit: String,
+    pub tree_revision: String,
+    pub target_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingVerification {
+    pub attempt: u32,
+    pub actor: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub check_name: String,
+    pub command: String,
+    pub cwd: String,
+    pub expected_exit: i64,
+    pub timeout: String,
+    pub environment_policy: CheckEnvironmentPolicy,
+    pub toolchain: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<i64>,
+    pub timed_out: bool,
+    pub passed: bool,
+    pub output_summary: String,
+    #[serde(default)]
+    pub unresolved_risks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +297,8 @@ pub struct OnboardingProposal {
     pub diff: String,
     pub risk: OnboardingProposalRisk,
     pub verification: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub named_check: Option<OnboardingNamedCheck>,
     pub digest: String,
     pub status: OnboardingProposalStatus,
     pub proposer: String,
@@ -218,6 +311,10 @@ pub struct OnboardingProposal {
     pub decision_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application: Option<OnboardingApplication>,
+    #[serde(default)]
+    pub verification_results: Vec<OnboardingVerification>,
     pub transitions: Vec<OnboardingProposalTransition>,
 }
 
@@ -250,6 +347,7 @@ impl OnboardingProposal {
             diff: draft.diff,
             risk: draft.risk,
             verification: draft.verification,
+            named_check: draft.named_check,
             digest,
             status: OnboardingProposalStatus::Proposed,
             proposer: proposer.clone(),
@@ -258,6 +356,8 @@ impl OnboardingProposal {
             decision_at: None,
             decision_reason: None,
             failure: None,
+            application: None,
+            verification_results: Vec::new(),
             transitions: vec![OnboardingProposalTransition {
                 from: None,
                 to: OnboardingProposalStatus::Proposed,
@@ -278,6 +378,7 @@ impl OnboardingProposal {
             diff: self.diff.clone(),
             risk: self.risk,
             verification: self.verification.clone(),
+            named_check: self.named_check.clone(),
         }
     }
 
@@ -353,6 +454,16 @@ fn proposal_digest(
     hash_field(&mut digest, &draft.diff);
     hash_field(&mut digest, draft.risk.as_str());
     hash_list(&mut digest, &draft.verification);
+    if let Some(check) = &draft.named_check {
+        hash_field(&mut digest, "named_check");
+        hash_field(&mut digest, &check.name);
+        hash_field(&mut digest, &check.command);
+        hash_field(&mut digest, &check.cwd);
+        hash_field(&mut digest, &check.expect_exit.to_string());
+        hash_field(&mut digest, &check.timeout);
+        hash_field(&mut digest, &check.environment_policy.to_string());
+        hash_field(&mut digest, &check.toolchain);
+    }
     hex::encode(digest.finalize())
 }
 
@@ -458,6 +569,32 @@ fn canonical_repo_target(target: &str) -> rk_core::Result<String> {
     Ok(normalized)
 }
 
+fn canonical_repo_cwd(cwd: &str) -> rk_core::Result<String> {
+    let cwd = cwd.trim();
+    if cwd.is_empty() || cwd == "." {
+        return Ok(".".into());
+    }
+    canonical_repo_target(cwd)
+}
+
+fn validate_duration(value: &str) -> rk_core::Result<()> {
+    let value = value.trim();
+    let (number, multiplier) = match value.chars().last() {
+        Some('s') => (&value[..value.len() - 1], 1_u64),
+        Some('m') => (&value[..value.len() - 1], 60),
+        Some('h') => (&value[..value.len() - 1], 3600),
+        _ => (value, 1),
+    };
+    let number = number
+        .parse::<u64>()
+        .map_err(|_| rk_core::Error::other(format!("invalid named_check.timeout: {value}")))?;
+    number
+        .checked_mul(multiplier)
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| rk_core::Error::other(format!("invalid named_check.timeout: {value}")))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +609,15 @@ mod tests {
             diff: "--- /dev/null\r\n+++ b/.rk/checks.cue\r\n".into(),
             risk: OnboardingProposalRisk::Low,
             verification: vec!["mise run verify".into()],
+            named_check: Some(OnboardingNamedCheck {
+                name: "verify".into(),
+                command: "mise run verify".into(),
+                cwd: ".".into(),
+                expect_exit: 0,
+                timeout: "20m".into(),
+                environment_policy: CheckEnvironmentPolicy::StripRkSpawn,
+                toolchain: "mise rust@1.95.0".into(),
+            }),
         }
     }
 
@@ -499,7 +645,7 @@ mod tests {
         assert!(!first.diff.contains('\r'));
 
         let mut changed = draft();
-        changed.diff.push_str("+changed: true\n");
+        changed.named_check.as_mut().unwrap().command = "mise run test".into();
         let changed = OnboardingProposal::new(
             "onb-one".into(),
             "repo-one".into(),
@@ -510,6 +656,56 @@ mod tests {
         .unwrap();
         assert_ne!(first.digest, changed.digest);
         assert_ne!(first.id, changed.id);
+    }
+
+    #[test]
+    fn checks_proposal_requires_exact_executable_contract() {
+        let mut missing = draft();
+        missing.named_check = None;
+        let error = OnboardingProposal::new(
+            "onb-one".into(),
+            "repo-one".into(),
+            "tree-one".into(),
+            missing,
+            "onboarder".into(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("must bind an exact named_check contract"));
+    }
+
+    #[test]
+    fn digest_binds_every_executable_contract_field() {
+        let base = OnboardingProposal::new(
+            "onb-one".into(),
+            "repo-one".into(),
+            "tree-one".into(),
+            draft(),
+            "onboarder".into(),
+        )
+        .unwrap();
+        let mutations: [fn(&mut OnboardingNamedCheck); 6] = [
+            |check| check.command = "mise run test".into(),
+            |check| check.cwd = "crates/rk-cli".into(),
+            |check| check.expect_exit = 2,
+            |check| check.timeout = "30m".into(),
+            |check| check.environment_policy = CheckEnvironmentPolicy::Inherit,
+            |check| check.toolchain = "system cargo".into(),
+        ];
+        let variants = mutations.map(|mutate| {
+            let mut changed = draft();
+            mutate(changed.named_check.as_mut().unwrap());
+            OnboardingProposal::new(
+                "onb-one".into(),
+                "repo-one".into(),
+                "tree-one".into(),
+                changed,
+                "onboarder".into(),
+            )
+            .unwrap()
+            .digest
+        });
+        assert!(variants.iter().all(|digest| digest != &base.digest));
     }
 
     #[test]
