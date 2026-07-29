@@ -209,6 +209,20 @@ enum RepoCommand {
         /// Registered repo name.
         name: String,
     },
+    /// Read-only repository onboarding assessment.
+    Onboard {
+        #[command(subcommand)]
+        command: RepoOnboardCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepoOnboardCommand {
+    /// Inspect a path or registered name without launching an agent or writing state.
+    Inspect {
+        /// Repository path or registered name.
+        target: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -826,6 +840,11 @@ async fn main() -> Result<()> {
             } => repo_cmds::add(&layout, path, name, merge_mode, remote, cli.json).await?,
             RepoCommand::List => repo_cmds::list(&layout, cli.json).await?,
             RepoCommand::Show { name } => repo_cmds::show(&layout, name, cli.json).await?,
+            RepoCommand::Onboard { command } => match command {
+                RepoOnboardCommand::Inspect { target } => {
+                    repo_cmds::onboard_inspect(&layout, target, cli.json).await?
+                }
+            },
         },
         Command::Ticket { command } => match command {
             TicketCommand::New(args) => ticket_cmds::new(&layout, args, cli.json).await?,
