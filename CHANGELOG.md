@@ -18,6 +18,13 @@ built_).
 
 ### System hardening and remediation (2026-07-26–27)
 
+- **Restart-safe guided onboarding** — repository assessment and content-bound
+  proposals now stage named checks and repo-local automation only in an isolated
+  onboarding branch. Workflow, trigger, and schedule validation stays inert
+  until a separate human activation advances the unchanged registered checkout
+  to the approved commit; durable intent, digest/tree checks, replay recovery,
+  refusal, outcome summaries, and terminal worktree cleanup make the boundary
+  at-least-once safe.
 - **Authenticated daemon IPC** — require per-layout tokens, restrict agent tuple
   writes and event identities to the authenticated agent, protect the socket
   with mode `0600`, and keep sync provenance separate from local authorization.

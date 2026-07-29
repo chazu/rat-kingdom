@@ -225,7 +225,7 @@ async fn onboarding_sessions_are_durable_resumable_and_capability_scoped() {
         &layout,
         &["--json", "repo", "onboard", "report", &completed_id],
     ));
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["session"]["id"], completed_id);
     assert_eq!(report["assessment"]["schema_version"], 1);
     assert_eq!(report["agent_result"], "assessment complete");

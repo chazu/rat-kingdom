@@ -7,9 +7,10 @@
 
 use crate::onboarding::AssessmentReport;
 use crate::onboarding_proposals::{
-    repository_identity, OnboardingApplication, OnboardingDecision, OnboardingProposal,
+    repository_identity, OnboardingActivation, OnboardingActivationStatus,
+    OnboardingActivationTransition, OnboardingApplication, OnboardingDecision, OnboardingProposal,
     OnboardingProposalDraft, OnboardingProposalStatus, OnboardingProposalTransition,
-    OnboardingVerification,
+    OnboardingValidation, OnboardingVerification,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const ONBOARDER_ROLE: &str = "onboarder";
-pub const SESSION_SCHEMA_VERSION: u32 = 1;
+pub const SESSION_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +53,8 @@ pub struct OnboardingSession {
     pub assessment: AssessmentReport,
     #[serde(default)]
     pub proposals: Vec<OnboardingProposal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<OnboardingCleanup>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -74,6 +77,8 @@ pub struct OnboardingSessionStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attach_target: Option<String>,
     pub proposals: Vec<OnboardingProposal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<OnboardingCleanup>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -84,8 +89,29 @@ pub struct OnboardingReport {
     pub session: OnboardingSessionStatus,
     pub assessment: AssessmentReport,
     pub proposals: Vec<OnboardingProposal>,
+    pub summary: OnboardingProposalSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<OnboardingCleanup>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_result: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingCleanup {
+    pub actor: String,
+    pub at: DateTime<Utc>,
+    pub worktree_removed: bool,
+    pub branch_retained: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingProposalSummary {
+    pub staged: Vec<String>,
+    pub verified: Vec<String>,
+    pub activated: Vec<String>,
+    pub declined: Vec<String>,
+    pub failed: Vec<String>,
+    pub unresolved: Vec<String>,
 }
 
 impl OnboardingSession {
@@ -119,6 +145,7 @@ impl OnboardingSession {
             agent_result: None,
             assessment,
             proposals: Vec::new(),
+            cleanup: None,
             created_at: now,
             updated_at: now,
         }
@@ -140,6 +167,7 @@ impl OnboardingSession {
             agent: self.agent.clone(),
             attach_target: self.attach_target.clone(),
             proposals: self.proposals.clone(),
+            cleanup: self.cleanup.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -151,6 +179,8 @@ impl OnboardingSession {
             session: self.status(),
             assessment: self.assessment.clone(),
             proposals: self.proposals.clone(),
+            summary: proposal_summary(&self.proposals),
+            cleanup: self.cleanup.clone(),
             agent_result: self.agent_result.clone(),
         }
     }
@@ -564,6 +594,353 @@ impl OnboardingSessions {
         Ok(updated)
     }
 
+    /// Append schema validation evidence for a staged workflow, trigger, or
+    /// schedule. Validation is deliberately separate from activation: this
+    /// transition changes only the onboarding journal and branch.
+    pub fn record_validation(
+        &mut self,
+        session_id: &str,
+        proposal_id: &str,
+        digest: &str,
+        validation: OnboardingValidation,
+    ) -> rk_core::Result<OnboardingProposal> {
+        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
+            rk_core::Error::other(format!("no such onboarding session: {session_id}"))
+        })?;
+        let proposal = proposal_mut(session, proposal_id, digest)?;
+        if proposal.status != OnboardingProposalStatus::Applied {
+            return Err(rk_core::Error::other(format!(
+                "proposal {proposal_id} cannot validate from {}",
+                proposal.status
+            )));
+        }
+        let next = if validation.passed {
+            OnboardingProposalStatus::Verified
+        } else {
+            OnboardingProposalStatus::Failed
+        };
+        let now = Utc::now();
+        proposal.status = next;
+        proposal.failure = (!validation.passed).then(|| validation.output_summary.clone());
+        proposal.validation_results.push(validation.clone());
+        proposal.transitions.push(OnboardingProposalTransition {
+            from: Some(OnboardingProposalStatus::Applied),
+            to: next,
+            actor: validation.actor,
+            at: now,
+            detail: Some(validation.output_summary),
+        });
+        let updated = proposal.clone();
+        session.updated_at = now;
+        self.persist()?;
+        Ok(updated)
+    }
+
+    /// Persist activation intent before the registered checkout is advanced.
+    /// An already-active or in-flight matching operation is replayed without
+    /// minting another intent. A failed matching operation starts one new
+    /// attempt while preserving its earlier transition evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_activation(
+        &mut self,
+        session_id: &str,
+        proposal_id: &str,
+        digest: &str,
+        operation_id: String,
+        actor: String,
+        expected_base_commit: String,
+        approved_commit: String,
+        approved_tree_revision: String,
+        target_digest: String,
+    ) -> rk_core::Result<(OnboardingProposal, bool)> {
+        let actor = required_actor(actor)?;
+        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
+            rk_core::Error::other(format!("no such onboarding session: {session_id}"))
+        })?;
+        let proposal = proposal_mut(session, proposal_id, digest)?;
+        if proposal.status != OnboardingProposalStatus::Verified {
+            return Err(rk_core::Error::other(format!(
+                "proposal {proposal_id} must be verified before activation; found {}",
+                proposal.status
+            )));
+        }
+        if proposal.automation_kind().is_none() {
+            return Err(rk_core::Error::other(format!(
+                "proposal {proposal_id} is not an automation activation proposal"
+            )));
+        }
+        let matches_contract = |activation: &OnboardingActivation| {
+            activation.operation_id == operation_id
+                && activation.expected_base_commit == expected_base_commit
+                && activation.approved_commit == approved_commit
+                && activation.approved_tree_revision == approved_tree_revision
+                && activation.target_digest == target_digest
+        };
+        if let Some(existing) = proposal.activation.as_ref() {
+            if !matches_contract(existing) {
+                return Err(rk_core::Error::other(format!(
+                    "proposal {proposal_id} activation contract drifted"
+                )));
+            }
+            match existing.status {
+                OnboardingActivationStatus::Activated | OnboardingActivationStatus::Activating => {
+                    return Ok((proposal.clone(), false));
+                }
+                OnboardingActivationStatus::Declined => {
+                    return Err(rk_core::Error::other(format!(
+                        "proposal {proposal_id} activation was declined"
+                    )));
+                }
+                OnboardingActivationStatus::Failed => {}
+            }
+        }
+
+        let now = Utc::now();
+        match proposal.activation.as_mut() {
+            Some(activation) => {
+                let previous = activation.status;
+                activation.status = OnboardingActivationStatus::Activating;
+                activation.actor = actor.clone();
+                activation.requested_at = now;
+                activation.completed_at = None;
+                activation.registered_commit = None;
+                activation.detail = None;
+                activation.attempts += 1;
+                activation.transitions.push(OnboardingActivationTransition {
+                    from: Some(previous),
+                    to: OnboardingActivationStatus::Activating,
+                    actor,
+                    at: now,
+                    detail: Some("retrying exact activation contract".into()),
+                });
+            }
+            None => {
+                proposal.activation = Some(OnboardingActivation {
+                    operation_id,
+                    status: OnboardingActivationStatus::Activating,
+                    actor: actor.clone(),
+                    requested_at: now,
+                    expected_base_commit,
+                    approved_commit,
+                    approved_tree_revision,
+                    target_digest,
+                    attempts: 1,
+                    completed_at: None,
+                    registered_commit: None,
+                    detail: None,
+                    transitions: vec![OnboardingActivationTransition {
+                        from: None,
+                        to: OnboardingActivationStatus::Activating,
+                        actor,
+                        at: now,
+                        detail: Some("activation intent persisted before landing".into()),
+                    }],
+                });
+            }
+        }
+        let updated = proposal.clone();
+        session.updated_at = now;
+        self.persist()?;
+        Ok((updated, true))
+    }
+
+    pub fn finish_activation(
+        &mut self,
+        session_id: &str,
+        proposal_id: &str,
+        digest: &str,
+        operation_id: &str,
+        registered_commit: String,
+        detail: String,
+    ) -> rk_core::Result<(OnboardingProposal, bool)> {
+        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
+            rk_core::Error::other(format!("no such onboarding session: {session_id}"))
+        })?;
+        let proposal = proposal_mut(session, proposal_id, digest)?;
+        let activation = proposal.activation.as_mut().ok_or_else(|| {
+            rk_core::Error::other(format!("proposal {proposal_id} has no activation intent"))
+        })?;
+        if activation.operation_id != operation_id {
+            return Err(rk_core::Error::other(format!(
+                "proposal {proposal_id} activation operation drifted"
+            )));
+        }
+        if activation.status == OnboardingActivationStatus::Activated {
+            return Ok((proposal.clone(), false));
+        }
+        if activation.status != OnboardingActivationStatus::Activating {
+            return Err(rk_core::Error::other(format!(
+                "proposal {proposal_id} cannot finish activation from {}",
+                activation.status
+            )));
+        }
+        let now = Utc::now();
+        activation.status = OnboardingActivationStatus::Activated;
+        activation.completed_at = Some(now);
+        activation.registered_commit = Some(registered_commit);
+        activation.detail = nonempty(detail);
+        activation.transitions.push(OnboardingActivationTransition {
+            from: Some(OnboardingActivationStatus::Activating),
+            to: OnboardingActivationStatus::Activated,
+            actor: activation.actor.clone(),
+            at: now,
+            detail: activation.detail.clone(),
+        });
+        let updated = proposal.clone();
+        session.updated_at = now;
+        self.persist()?;
+        Ok((updated, true))
+    }
+
+    pub fn fail_activation(
+        &mut self,
+        session_id: &str,
+        proposal_id: &str,
+        digest: &str,
+        operation_id: &str,
+        detail: String,
+    ) -> rk_core::Result<OnboardingProposal> {
+        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
+            rk_core::Error::other(format!("no such onboarding session: {session_id}"))
+        })?;
+        let proposal = proposal_mut(session, proposal_id, digest)?;
+        let activation = proposal.activation.as_mut().ok_or_else(|| {
+            rk_core::Error::other(format!("proposal {proposal_id} has no activation intent"))
+        })?;
+        if activation.operation_id != operation_id {
+            return Err(rk_core::Error::other(format!(
+                "proposal {proposal_id} activation operation drifted"
+            )));
+        }
+        if activation.status == OnboardingActivationStatus::Activated {
+            return Ok(proposal.clone());
+        }
+        let previous = activation.status;
+        let now = Utc::now();
+        activation.status = OnboardingActivationStatus::Failed;
+        activation.completed_at = Some(now);
+        activation.detail = Some(detail.clone());
+        activation.transitions.push(OnboardingActivationTransition {
+            from: Some(previous),
+            to: OnboardingActivationStatus::Failed,
+            actor: activation.actor.clone(),
+            at: now,
+            detail: Some(detail),
+        });
+        let updated = proposal.clone();
+        session.updated_at = now;
+        self.persist()?;
+        Ok(updated)
+    }
+
+    /// Refuse activation after staging/validation without discarding the
+    /// reviewed branch. The first activation decision wins.
+    pub fn decline_activation(
+        &mut self,
+        session_id: &str,
+        proposal_id: &str,
+        digest: &str,
+        actor: String,
+        reason: Option<String>,
+    ) -> rk_core::Result<(OnboardingProposal, bool)> {
+        let actor = required_actor(actor)?;
+        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
+            rk_core::Error::other(format!("no such onboarding session: {session_id}"))
+        })?;
+        let proposal = proposal_mut(session, proposal_id, digest)?;
+        if proposal.status != OnboardingProposalStatus::Verified
+            || proposal.automation_kind().is_none()
+        {
+            return Err(rk_core::Error::other(format!(
+                "proposal {proposal_id} must be verified automation before activation can be declined"
+            )));
+        }
+        if let Some(existing) = proposal.activation.as_ref() {
+            match existing.status {
+                OnboardingActivationStatus::Declined => {
+                    return Ok((proposal.clone(), false));
+                }
+                OnboardingActivationStatus::Activated | OnboardingActivationStatus::Activating => {
+                    return Err(rk_core::Error::other(format!(
+                        "proposal {proposal_id} activation is already {}",
+                        existing.status
+                    )));
+                }
+                OnboardingActivationStatus::Failed => {}
+            }
+        }
+        let now = Utc::now();
+        let detail = reason.and_then(nonempty);
+        let transition = OnboardingActivationTransition {
+            from: proposal
+                .activation
+                .as_ref()
+                .map(|activation| activation.status),
+            to: OnboardingActivationStatus::Declined,
+            actor: actor.clone(),
+            at: now,
+            detail: detail.clone(),
+        };
+        match proposal.activation.as_mut() {
+            Some(activation) => {
+                activation.status = OnboardingActivationStatus::Declined;
+                activation.actor = actor;
+                activation.completed_at = Some(now);
+                activation.detail = detail;
+                activation.transitions.push(transition);
+            }
+            None => {
+                let application = proposal.application.as_ref().ok_or_else(|| {
+                    rk_core::Error::other(format!(
+                        "proposal {proposal_id} has no staged application"
+                    ))
+                })?;
+                proposal.activation = Some(OnboardingActivation {
+                    operation_id: activation_operation_id(
+                        session_id,
+                        proposal_id,
+                        digest,
+                        &application.commit,
+                    ),
+                    status: OnboardingActivationStatus::Declined,
+                    actor,
+                    requested_at: now,
+                    expected_base_commit: String::new(),
+                    approved_commit: application.commit.clone(),
+                    approved_tree_revision: application.tree_revision.clone(),
+                    target_digest: application.target_digest.clone(),
+                    attempts: 0,
+                    completed_at: Some(now),
+                    registered_commit: None,
+                    detail,
+                    transitions: vec![transition],
+                });
+            }
+        }
+        let updated = proposal.clone();
+        session.updated_at = now;
+        self.persist()?;
+        Ok((updated, true))
+    }
+
+    pub fn record_cleanup(
+        &mut self,
+        session_id: &str,
+        cleanup: OnboardingCleanup,
+    ) -> rk_core::Result<(OnboardingSession, bool)> {
+        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
+            rk_core::Error::other(format!("no such onboarding session: {session_id}"))
+        })?;
+        if session.cleanup.is_some() {
+            return Ok((session.clone(), false));
+        }
+        session.cleanup = Some(cleanup);
+        session.updated_at = Utc::now();
+        let updated = session.clone();
+        self.persist()?;
+        Ok((updated, true))
+    }
+
     /// A daemon cannot know whether an in-flight launch crossed its last
     /// persistence boundary. Mark every nonterminal session orphaned on boot;
     /// reconciliation against the durable agent registry may immediately
@@ -625,6 +1002,48 @@ fn proposal_mut<'a>(
         )));
     }
     Ok(proposal)
+}
+
+pub fn activation_operation_id(
+    session_id: &str,
+    proposal_id: &str,
+    digest: &str,
+    approved_commit: &str,
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"rat-kingdom-onboarding-activation-v1\0");
+    for field in [session_id, proposal_id, digest, approved_commit] {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field.as_bytes());
+    }
+    format!("onb-act-{}", &hex::encode(hash.finalize())[..24])
+}
+
+pub fn proposal_summary(proposals: &[OnboardingProposal]) -> OnboardingProposalSummary {
+    let mut summary = OnboardingProposalSummary::default();
+    for proposal in proposals {
+        let destination = match proposal
+            .activation
+            .as_ref()
+            .map(|activation| activation.status)
+        {
+            Some(OnboardingActivationStatus::Activated) => &mut summary.activated,
+            Some(OnboardingActivationStatus::Declined) => &mut summary.declined,
+            Some(OnboardingActivationStatus::Failed) => &mut summary.failed,
+            Some(OnboardingActivationStatus::Activating) => &mut summary.unresolved,
+            None => match proposal.status {
+                OnboardingProposalStatus::Applied => &mut summary.staged,
+                OnboardingProposalStatus::Verified => &mut summary.verified,
+                OnboardingProposalStatus::Declined => &mut summary.declined,
+                OnboardingProposalStatus::Failed => &mut summary.failed,
+                OnboardingProposalStatus::Proposed | OnboardingProposalStatus::Approved => {
+                    &mut summary.unresolved
+                }
+            },
+        };
+        destination.push(proposal.id.clone());
+    }
+    summary
 }
 
 fn nonempty(value: String) -> Option<String> {

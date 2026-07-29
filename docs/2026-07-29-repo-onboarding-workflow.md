@@ -208,12 +208,21 @@ Every proposal has:
 }
 ```
 
-The lifecycle is:
+Repository-file staging and validation use:
 
 ```text
 proposed -> approved -> applied -> verified
          \-> declined
          \-> failed
+```
+
+For repo-local automation, `applied` means staged only. A second, independently
+journaled activation lifecycle begins after validation:
+
+```text
+verified -> activating -> activated
+         \-> declined
+         \-> failed -> activating (exact-contract retry)
 ```
 
 Approval must be durable and attributable to the human/operator. A proposal
@@ -231,14 +240,28 @@ persist the application result before reporting success. Recovery re-reads the
 proposal and working tree, then resumes or marks the proposal failed; it never
 blindly repeats a side effect.
 
+The activation key additionally binds the staged application commit. The
+daemon persists `activating` before advancing the registered checkout. It then
+requires the registered checkout to be clean, on the approved base branch, and
+still at the staged commit's exact parent; it also requires the onboarding
+branch tip, staged tree, and target file digest to match the proposal journal.
+Activation is a fast-forward to that exact commit. On replay, the exact commit
+already being in the base history is accepted only while the live target file
+still has its approved digest and schema. This makes a crash after Git advanced
+but before the result journaled recoverable without a second landing.
+
 The attached conversation can be the friendly interface, but each decision
 also needs a CLI/API representation so it survives disconnects:
 
 - `rk repo onboard status <session>`
 - `rk repo onboard approve <session> <proposal> --digest <sha256>`
 - `rk repo onboard decline <session> <proposal> --digest <sha256>`
+- `rk repo onboard apply <session> <proposal> --digest <sha256>`
+- `rk repo onboard activate <session> <proposal> --digest <sha256>`
+- `rk repo onboard decline-activation <session> <proposal> --digest <sha256>`
 - `rk repo onboard resume <session> [--attach]`
 - `rk repo onboard report <session> [--json]`
+- `rk repo onboard cleanup <session>`
 
 The exact subcommand spelling can follow the existing CLI's command tree, but
 the underlying RPC names and state transitions must be stable and idempotent.
@@ -251,6 +274,10 @@ the underlying RPC names and state transitions must be stable and idempotent.
 - Validating or staging a workflow is not activation. Because repo-local
   workflow, trigger, and schedule files are auto-discovered, landing them in
   the registered checkout is activation and requires its own final approval.
+- Workflow proposals target only `.rk/workflows/<name>.cue`; trigger and
+  schedule proposals are separate kinds targeting only `.rk/triggers.cue` and
+  `.rk/schedules.cue`. Their exact CUE schema is validated in the onboarding
+  worktree before activation, and schedule validation includes cron parsing.
 - A named check is repo-owner-controlled command data; it is not trusted merely
   because an onboarding rat suggested it. Human approval and CUE validation are
   required before it becomes part of the registry.
@@ -313,7 +340,11 @@ result. Add restart/replay tests for every persisted transition.
 
 Add fake repositories covering missing tools, ambiguous branches, malformed
 checks, dirty worktrees, existing instruction files, approval disconnects, and
-reruns. Document the operator flow and the non-destructive boundaries.
+reruns. Operational fixtures additionally cover concurrent onboarding sessions,
+base and onboarding branch movement after approval, explicit activation
+refusal, replay after landing but before result persistence, terminal worktree
+cleanup, and refusal to clean a long-lived attachment. Document the operator
+flow and the non-destructive boundaries.
 
 Each slice must include an end-to-end command/API path and focused regression
 coverage. The slices are ordered by dependency but each is demoable on its own:

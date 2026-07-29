@@ -1,15 +1,15 @@
-//! Application and verification of an approved `.rk/checks.cue` proposal.
+//! Staging and validation of approved repository onboarding proposals.
 //!
 //! All repository writes happen in the durable onboarding worktree. The exact
 //! approved patch becomes one commit carrying proposal trailers; those trailers
 //! are the restart seam when Git advanced but the JSON journal did not. The
-//! named check is then reloaded through rk-workflow's existing CUE schema and
-//! compared field-for-field with the digest-bound proposal contract before its
-//! repository-owned runner is executed.
+//! named check or automation definition is then reloaded through
+//! rk-workflow's existing CUE schemas. Automation remains inert here: only the
+//! separate activation transition may advance it into the registered checkout.
 
 use crate::onboarding_proposals::{
-    onboarding_tree_revision, OnboardingApplication, OnboardingNamedCheck, OnboardingProposal,
-    OnboardingVerification,
+    onboarding_tree_revision, OnboardingApplication, OnboardingAutomationKind,
+    OnboardingNamedCheck, OnboardingProposal, OnboardingValidation, OnboardingVerification,
 };
 use crate::onboarding_sessions::OnboardingSession;
 use chrono::Utc;
@@ -41,17 +41,10 @@ pub fn ensure_application(
     actor: &str,
 ) -> rk_core::Result<OnboardingApplication> {
     proposal.validate_integrity()?;
-    if proposal.target_path != CHECKS_TARGET {
-        return Err(rk_core::Error::other(format!(
-            "repo onboarding apply currently supports only {CHECKS_TARGET}, not {}",
-            proposal.target_path
-        )));
-    }
-    let contract = proposal.named_check.as_ref().ok_or_else(|| {
-        rk_core::Error::other("checks proposal has no digest-bound named_check contract")
-    })?;
+    validate_supported_target(proposal)?;
     let worktree = &session.worktree;
-    let target = worktree.join(CHECKS_TARGET);
+    let target_path = proposal.target_path.as_str();
+    let target = worktree.join(target_path);
 
     if let Some(application) = &proposal.application {
         require_clean(worktree)?;
@@ -65,11 +58,11 @@ pub fn ensure_application(
         let digest = file_digest(&target)?;
         if digest != application.target_digest {
             return Err(rk_core::Error::other(format!(
-                "{CHECKS_TARGET} drift after apply: recorded {}, current {digest}",
+                "{target_path} drift after apply: recorded {}, current {digest}",
                 application.target_digest
             )));
         }
-        validate_contract(&target, contract)?;
+        validate_target(&target, proposal)?;
         return Ok(application.clone());
     }
 
@@ -87,7 +80,7 @@ pub fn ensure_application(
                 proposal.tree_revision
             )));
         }
-        validate_contract(&target, contract)?;
+        validate_target(&target, proposal)?;
         return application_evidence(worktree, &target, actor);
     }
 
@@ -104,7 +97,7 @@ pub fn ensure_application(
         git_with_stdin(worktree, &["apply", "--check", "-"], &proposal.diff)?;
         git_with_stdin(worktree, &["apply", "-"], &proposal.diff)?;
     } else {
-        require_only_target(&dirty_paths, CHECKS_TARGET)?;
+        require_only_target(&dirty_paths, target_path)?;
         git_with_stdin(
             worktree,
             &["apply", "--reverse", "--check", "-"],
@@ -119,12 +112,17 @@ pub fn ensure_application(
     }
 
     let dirty_paths = status_paths(worktree)?;
-    require_only_target(&dirty_paths, CHECKS_TARGET)?;
-    validate_contract(&target, contract)?;
-    git_ok(worktree, &["add", "--", CHECKS_TARGET])?;
+    require_only_target(&dirty_paths, target_path)?;
+    validate_target(&target, proposal)?;
+    git_ok(worktree, &["add", "--", target_path])?;
+    let subject = proposal
+        .named_check
+        .as_ref()
+        .map(|check| check.name.as_str())
+        .unwrap_or(&proposal.target_path);
     let message = format!(
         "onboarding: apply {}\n\nOnboarding-Proposal: {}\nOnboarding-Digest: {}",
-        contract.name, proposal.id, proposal.digest
+        subject, proposal.id, proposal.digest
     );
     git_ok(
         worktree,
@@ -140,6 +138,49 @@ pub fn ensure_application(
     )?;
     require_clean(worktree)?;
     application_evidence(worktree, &target, actor)
+}
+
+/// Revalidate one staged workflow, trigger, or schedule without activating it.
+/// The resulting evidence is journaled independently of the later human
+/// activation decision.
+pub fn validate_automation(
+    session: &OnboardingSession,
+    proposal: &OnboardingProposal,
+    actor: &str,
+    attempt: u32,
+) -> rk_core::Result<OnboardingValidation> {
+    let kind = proposal.automation_kind().ok_or_else(|| {
+        rk_core::Error::other(format!(
+            "proposal {} is not an automation activation proposal",
+            proposal.id
+        ))
+    })?;
+    let target = session.worktree.join(&proposal.target_path);
+    let started_at = Utc::now();
+    let result = validate_automation_file(&target, kind);
+    let finished_at = Utc::now();
+    let target_digest = file_digest(&target)?;
+    let (passed, output_summary, unresolved_risks) = match result {
+        Ok(summary) => (true, summary, Vec::new()),
+        Err(error) => (
+            false,
+            error.to_string(),
+            vec!["automation definition is staged but invalid and cannot be activated".into()],
+        ),
+    };
+    Ok(OnboardingValidation {
+        attempt,
+        actor: actor.to_string(),
+        started_at,
+        finished_at,
+        automation_kind: kind,
+        target_path: proposal.target_path.clone(),
+        target_digest,
+        validator: automation_validator(kind).into(),
+        passed,
+        output_summary,
+        unresolved_risks,
+    })
 }
 
 /// Execute the exact check contract from the applied CUE registry. A red
@@ -244,6 +285,32 @@ fn application_evidence(
     })
 }
 
+fn validate_supported_target(proposal: &OnboardingProposal) -> rk_core::Result<()> {
+    if proposal.target_path == CHECKS_TARGET && proposal.named_check.is_some() {
+        return Ok(());
+    }
+    if proposal.automation_kind().is_some() {
+        return Ok(());
+    }
+    Err(rk_core::Error::other(format!(
+        "repo onboarding apply does not support {} / {}",
+        proposal.kind, proposal.target_path
+    )))
+}
+
+fn validate_target(path: &Path, proposal: &OnboardingProposal) -> rk_core::Result<()> {
+    if let Some(contract) = proposal.named_check.as_ref() {
+        return validate_contract(path, contract).map(|_| ());
+    }
+    let kind = proposal.automation_kind().ok_or_else(|| {
+        rk_core::Error::other(format!(
+            "proposal {} has no supported validation contract",
+            proposal.id
+        ))
+    })?;
+    validate_automation_file(path, kind).map(|_| ())
+}
+
 fn validate_contract(path: &Path, contract: &OnboardingNamedCheck) -> rk_core::Result<Check> {
     let matches = rk_workflow::load_checks(path)?
         .into_iter()
@@ -290,6 +357,68 @@ fn validate_contract(path: &Path, contract: &OnboardingNamedCheck) -> rk_core::R
         )));
     }
     Ok(check)
+}
+
+pub(crate) fn validate_automation_file(
+    path: &Path,
+    kind: OnboardingAutomationKind,
+) -> rk_core::Result<String> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|error| rk_core::Error::other(format!("read {}: {error}", path.display())))?;
+    crate::onboarding::reject_cue_imports(&source).map_err(rk_core::Error::other)?;
+    match kind {
+        OnboardingAutomationKind::Workflow => {
+            rk_workflow::validate_workflow_str(&source)?;
+            Ok(format!(
+                "workflow schema validation passed for {}",
+                path.display()
+            ))
+        }
+        OnboardingAutomationKind::Trigger => {
+            let triggers = rk_workflow::load_triggers_str(&source)?;
+            if triggers.is_empty() {
+                return Err(rk_core::Error::other(format!(
+                    "{} contains no triggers",
+                    path.display()
+                )));
+            }
+            Ok(format!(
+                "trigger schema validation passed for {} definition(s)",
+                triggers.len()
+            ))
+        }
+        OnboardingAutomationKind::Schedule => {
+            let schedules = rk_workflow::load_schedules_str(&source)?;
+            if schedules.is_empty() {
+                return Err(rk_core::Error::other(format!(
+                    "{} contains no schedules",
+                    path.display()
+                )));
+            }
+            for schedule in &schedules {
+                crate::cron::Cron::parse(&schedule.cron).map_err(|error| {
+                    rk_core::Error::other(format!(
+                        "schedule `{}` has invalid cron: {error}",
+                        schedule.name
+                    ))
+                })?;
+            }
+            Ok(format!(
+                "schedule schema and cron validation passed for {} definition(s)",
+                schedules.len()
+            ))
+        }
+    }
+}
+
+fn automation_validator(kind: OnboardingAutomationKind) -> &'static str {
+    match kind {
+        OnboardingAutomationKind::Workflow => "rk_workflow::validate_workflow_str",
+        OnboardingAutomationKind::Trigger => "rk_workflow::load_triggers_str",
+        OnboardingAutomationKind::Schedule => {
+            "rk_workflow::load_schedules_str + rk_daemon::cron::Cron::parse"
+        }
+    }
 }
 
 fn resolve_cwd(worktree: &Path, cwd: &str) -> rk_core::Result<PathBuf> {
