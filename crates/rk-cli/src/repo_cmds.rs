@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Result};
 use rk_core::paths::Layout;
+use rk_daemon::onboarding::AssessmentReport;
 use rk_daemon::Client;
 use serde_json::json;
 
@@ -108,6 +109,89 @@ pub async fn show(layout: &Layout, name: String, as_json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub async fn onboard_inspect(layout: &Layout, target: String, as_json: bool) -> Result<()> {
+    // Inspection is a strict read-only path: unlike ordinary convenience
+    // commands, it must not auto-start a daemon (which would write the castle
+    // socket, pid, logs, and identity files).
+    let mut client = Client::connect(layout).await?;
+    let result = client
+        .call("repo.onboard.inspect", json!({ "target": target }))
+        .await?;
+    let report: AssessmentReport = serde_json::from_value(result["report"].clone())?;
+
+    if as_json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        print_assessment(&report);
+    }
+    if !report.ready {
+        bail!("repository assessment failed closed; resolve the error findings above");
+    }
+    Ok(())
+}
+
+fn print_assessment(report: &AssessmentReport) {
+    let identity = report
+        .identity
+        .registered_name
+        .as_deref()
+        .unwrap_or(&report.identity.target);
+    let path = report
+        .identity
+        .canonical_path
+        .as_deref()
+        .unwrap_or("(unresolved)");
+    println!("repository assessment: {identity}");
+    println!("  path   {path}");
+    println!(
+        "  ready  {}",
+        if report.ready {
+            "yes"
+        } else {
+            "no (fail-closed)"
+        }
+    );
+    println!("  schema {}", report.schema_version);
+    println!("\nfindings:");
+    for finding in &report.findings {
+        println!(
+            "  {:<7} {:<28} {}",
+            finding.severity.to_string().to_uppercase(),
+            finding.kind,
+            finding.summary
+        );
+        for evidence in &finding.evidence {
+            if let Some(command) = &evidence.command {
+                println!(
+                    "           evidence [{}] {}: {} — `{}`",
+                    evidence.origin, evidence.source, evidence.detail, command
+                );
+            } else {
+                println!(
+                    "           evidence [{}] {}: {}",
+                    evidence.origin, evidence.source, evidence.detail
+                );
+            }
+        }
+        if let Some(ambiguity) = &finding.unresolved_ambiguity {
+            println!("           unresolved ambiguity: {ambiguity}");
+        }
+        if let Some(recommendation) = &finding.recommendation {
+            if let Some(command) = &recommendation.command {
+                println!(
+                    "           recommendation [{}]: {} — `{}`",
+                    recommendation.origin, recommendation.action, command
+                );
+            } else {
+                println!(
+                    "           recommendation [{}]: {}",
+                    recommendation.origin, recommendation.action
+                );
+            }
+        }
+    }
 }
 
 /// Resolve a repo argument that may be either a filesystem path or a registered

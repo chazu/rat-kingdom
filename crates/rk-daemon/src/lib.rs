@@ -8,6 +8,7 @@ pub mod coordinator;
 pub mod cron;
 pub mod drain;
 pub mod inbox;
+pub mod onboarding;
 pub mod proto;
 pub mod reactor;
 pub mod repos;

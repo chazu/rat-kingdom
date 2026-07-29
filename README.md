@@ -209,9 +209,24 @@ rk repo add ~/dev/rat-kingdom          # name defaults to the directory ("rat-ki
 rk repo add ~/dev/other --name svc     # or name it explicitly
 rk repo list                           # NAME → PATH
 rk repo show rat-kingdom               # details + its open tickets
+rk repo onboard inspect ~/dev/other    # deterministic read-only readiness report
+rk --json repo onboard inspect svc     # the same stable report shape as JSON
 ```
 
 A registered name works anywhere a repo is expected, e.g. `rk spawn --repo rat-kingdom`.
+
+`repo onboard inspect` resolves either a path or registered name, then reports
+canonical identity, git/remote/base state, repository instructions, documented
+toolchain entrypoints, named checks, repo-local workflows/triggers/schedules,
+and configured harness/`rk` readiness. Findings carry stable `kind`, `severity`,
+observed `evidence`, inferred `recommendation`, and
+`unresolved_ambiguity` fields. Error findings make the command exit non-zero:
+dirty or unborn repositories, ambiguous bases, missing remotes/tools, malformed
+CUE, submodules, and Git LFS therefore fail closed.
+
+Inspection never registers the repository, launches an agent, runs a project
+check, or edits repository/castle state. It also does not auto-start the daemon;
+if the daemon is down, start it separately with `rk ping` and then inspect.
 
 By default a finished rat's branch is merged directly into its base. A repo can
 instead be put in **PR mode** — `rk repo add <path> --merge-mode pr` — so the

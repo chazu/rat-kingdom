@@ -1403,6 +1403,40 @@ impl Daemon {
                 Err(_) => Response::err(id, codes::INTERNAL, "repo registry lock poisoned"),
             }),
             "repo.get" => reply(self.handle_repo_get(req)),
+            "repo.onboard.inspect" => {
+                let params: RepoInspectParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error))
+                    }
+                };
+                let registered = match self.repos.lock() {
+                    Ok(registry) => registry.list(),
+                    Err(_) => {
+                        return Outcome::Reply(Response::err(
+                            id,
+                            codes::INTERNAL,
+                            "repo registry lock poisoned",
+                        ))
+                    }
+                };
+                let context = crate::onboarding::InspectContext {
+                    default_harness: self.default_harness.clone(),
+                    require_named_checks: self.require_named_checks,
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::onboarding::inspect(&params.target, &registered, &context)
+                })
+                .await;
+                reply(match result {
+                    Ok(report) => Response::ok(id, json!({"report": report})),
+                    Err(error) => Response::err(
+                        id,
+                        codes::INTERNAL,
+                        format!("repository inspection task failed: {error}"),
+                    ),
+                })
+            }
             "ticket.new" => reply(self.handle_ticket_new(req).await),
             "ticket.list" => reply(self.handle_ticket_list(req)),
             "ticket.get" => reply(self.handle_ticket_get(req)),
@@ -2951,6 +2985,11 @@ struct RepoAddParams {
     /// Explicit remote name; when absent, `origin` is used at operation time.
     #[serde(default)]
     remote: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RepoInspectParams {
+    target: String,
 }
 
 #[derive(Deserialize)]
