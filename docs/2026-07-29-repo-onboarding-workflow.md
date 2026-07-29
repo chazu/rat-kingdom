@@ -198,6 +198,12 @@ Every proposal has:
   "changes": [".rk/checks.cue"],
   "risk": "low | medium | high",
   "verification": ["check:verify", "git diff --check"],
+  "repository_identity": "repo-...",
+  "tree_revision": "<git-tree-oid>",
+  "target_path": ".rk/checks.cue",
+  "action": "write_repo_file",
+  "diff": "<exact unified diff>",
+  "digest": "<canonical sha256>",
   "status": "proposed"
 }
 ```
@@ -229,8 +235,8 @@ The attached conversation can be the friendly interface, but each decision
 also needs a CLI/API representation so it survives disconnects:
 
 - `rk repo onboard status <session>`
-- `rk repo onboard approve <session> <proposal>`
-- `rk repo onboard decline <session> <proposal>`
+- `rk repo onboard approve <session> <proposal> --digest <sha256>`
+- `rk repo onboard decline <session> <proposal> --digest <sha256>`
 - `rk repo onboard resume <session> [--attach]`
 - `rk repo onboard report <session> [--json]`
 

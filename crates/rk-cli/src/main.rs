@@ -234,6 +234,61 @@ enum RepoOnboardCommand {
         /// Repository path or registered name.
         target: String,
     },
+    /// Journal one immutable, content-bound onboarding proposal.
+    Propose {
+        /// Stable onboarding session id.
+        session: String,
+        /// Proposal kind: repo_file, castle_config, registration, or workflow_activation.
+        #[arg(long)]
+        kind: String,
+        /// Human-readable proposal title.
+        #[arg(long)]
+        title: String,
+        /// Evidence supporting the proposal; repeat for multiple entries.
+        #[arg(long, required = true)]
+        evidence: Vec<String>,
+        /// Exact repository path or castle setting affected.
+        #[arg(long)]
+        target: String,
+        /// Action: write_repo_file, change_castle_config, register_repository, or activate_workflow.
+        #[arg(long)]
+        action: String,
+        /// Exact reviewable unified diff or configuration delta.
+        #[arg(long)]
+        diff: String,
+        /// Risk: low, medium, or high.
+        #[arg(long)]
+        risk: String,
+        /// Verification step; repeat for multiple entries.
+        #[arg(long, required = true)]
+        verification: Vec<String>,
+    },
+    /// Approve one exact proposal digest.
+    Approve {
+        /// Stable onboarding session id.
+        session: String,
+        /// Stable proposal id.
+        proposal: String,
+        /// Canonical digest shown by status/report.
+        #[arg(long)]
+        digest: String,
+        /// Optional durable decision rationale.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Decline one exact proposal digest.
+    Decline {
+        /// Stable onboarding session id.
+        session: String,
+        /// Stable proposal id.
+        proposal: String,
+        /// Canonical digest shown by status/report.
+        #[arg(long)]
+        digest: String,
+        /// Optional durable decision rationale.
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Resume an orphaned or failed onboarding session.
     Resume {
         /// Stable onboarding session id.
@@ -877,6 +932,54 @@ async fn main() -> Result<()> {
                 } => repo_cmds::onboard_start(&layout, target, harness, attach, cli.json).await?,
                 RepoOnboardCommand::Inspect { target } => {
                     repo_cmds::onboard_inspect(&layout, target, cli.json).await?
+                }
+                RepoOnboardCommand::Propose {
+                    session,
+                    kind,
+                    title,
+                    evidence,
+                    target,
+                    action,
+                    diff,
+                    risk,
+                    verification,
+                } => {
+                    repo_cmds::onboard_propose(
+                        &layout,
+                        session,
+                        kind,
+                        title,
+                        evidence,
+                        target,
+                        action,
+                        diff,
+                        risk,
+                        verification,
+                        cli.json,
+                    )
+                    .await?
+                }
+                RepoOnboardCommand::Approve {
+                    session,
+                    proposal,
+                    digest,
+                    reason,
+                } => {
+                    repo_cmds::onboard_decide(
+                        &layout, session, proposal, digest, reason, true, cli.json,
+                    )
+                    .await?
+                }
+                RepoOnboardCommand::Decline {
+                    session,
+                    proposal,
+                    digest,
+                    reason,
+                } => {
+                    repo_cmds::onboard_decide(
+                        &layout, session, proposal, digest, reason, false, cli.json,
+                    )
+                    .await?
                 }
                 RepoOnboardCommand::Resume { session, attach } => {
                     repo_cmds::onboard_resume(&layout, session, attach, cli.json).await?
