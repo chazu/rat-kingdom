@@ -3,6 +3,7 @@
 use anyhow::{bail, Result};
 use rk_core::paths::Layout;
 use rk_daemon::onboarding::AssessmentReport;
+use rk_daemon::onboarding_sessions::{OnboardingReport, OnboardingSessionStatus};
 use rk_daemon::Client;
 use serde_json::json;
 
@@ -22,7 +23,12 @@ pub async fn add(
             .file_name()
             .and_then(|s| s.to_str())
             .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("cannot infer a name from {}; pass --name", canonical.display()))?,
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot infer a name from {}; pass --name",
+                    canonical.display()
+                )
+            })?,
     };
     let mut params = json!({ "name": name, "path": canonical.to_string_lossy() });
     if let Some(mode) = merge_mode {
@@ -87,9 +93,18 @@ pub async fn show(layout: &Layout, name: String, as_json: bool) -> Result<()> {
     }
     println!("{}", repo["name"].as_str().unwrap_or("?"));
     println!("  path       {}", repo["path"].as_str().unwrap_or("?"));
-    println!("  registered {}", repo["created_at"].as_str().unwrap_or("?"));
-    println!("  merge      {}", repo["merge_mode"].as_str().unwrap_or("direct"));
-    println!("  remote     {}", repo["remote"].as_str().unwrap_or("origin"));
+    println!(
+        "  registered {}",
+        repo["created_at"].as_str().unwrap_or("?")
+    );
+    println!(
+        "  merge      {}",
+        repo["merge_mode"].as_str().unwrap_or("direct")
+    );
+    println!(
+        "  remote     {}",
+        repo["remote"].as_str().unwrap_or("origin")
+    );
     if let Some(host) = repo["host"].as_str() {
         println!("  host       {host}");
     }
@@ -130,6 +145,118 @@ pub async fn onboard_inspect(layout: &Layout, target: String, as_json: bool) -> 
         bail!("repository assessment failed closed; resolve the error findings above");
     }
     Ok(())
+}
+
+pub async fn onboard_start(
+    layout: &Layout,
+    target: String,
+    harness: Option<String>,
+    attach: bool,
+    as_json: bool,
+) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call(
+            "repo.onboard.start",
+            json!({
+                "target": target,
+                "harness": harness,
+                "attach": attach,
+            }),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        let status: OnboardingSessionStatus = serde_json::from_value(result["session"].clone())?;
+        print_onboarding_status(&status, result["reused"].as_bool().unwrap_or(false));
+    }
+    Ok(())
+}
+
+pub async fn onboard_resume(
+    layout: &Layout,
+    session: String,
+    attach: bool,
+    as_json: bool,
+) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call(
+            "repo.onboard.resume",
+            json!({"session": session, "attach": attach}),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        let status: OnboardingSessionStatus = serde_json::from_value(result["session"].clone())?;
+        print_onboarding_status(&status, result["reused"].as_bool().unwrap_or(false));
+    }
+    Ok(())
+}
+
+pub async fn onboard_status(layout: &Layout, session: String, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call("repo.onboard.status", json!({"session": session}))
+        .await?;
+    let status: OnboardingSessionStatus = serde_json::from_value(result["session"].clone())?;
+    if as_json {
+        println!("{}", serde_json::to_string(&status)?);
+    } else {
+        print_onboarding_status(&status, true);
+    }
+    Ok(())
+}
+
+pub async fn onboard_report(layout: &Layout, session: String, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call("repo.onboard.report", json!({"session": session}))
+        .await?;
+    let report: OnboardingReport = serde_json::from_value(result["report"].clone())?;
+    if as_json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        print_onboarding_status(&report.session, true);
+        println!();
+        print_assessment(&report.assessment);
+        if let Some(result) = report.agent_result {
+            println!("\nonboarder result:\n  {result}");
+        }
+    }
+    Ok(())
+}
+
+fn print_onboarding_status(status: &OnboardingSessionStatus, reused: bool) {
+    println!("onboarding session: {}", status.id);
+    println!("  state     {:?}", status.state);
+    println!(
+        "  repo      {} ({})",
+        status.repo_name,
+        status.repo_path.display()
+    );
+    println!("  branch    {}", status.branch);
+    println!("  worktree  {}", status.worktree.display());
+    println!("  harness   {}", status.harness);
+    println!(
+        "  mode      {}",
+        if status.attached {
+            "attached"
+        } else {
+            "headless"
+        }
+    );
+    if let Some(agent) = &status.agent {
+        println!("  agent     {agent}");
+    }
+    if let Some(target) = &status.attach_target {
+        println!("  attach    rk attach {target}");
+    }
+    if reused {
+        println!("  resume    rk repo onboard resume {}", status.id);
+    }
 }
 
 fn print_assessment(report: &AssessmentReport) {

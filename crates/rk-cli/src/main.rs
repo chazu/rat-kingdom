@@ -218,10 +218,39 @@ enum RepoCommand {
 
 #[derive(Subcommand)]
 enum RepoOnboardCommand {
+    /// Start or idempotently reuse a durable onboarding session.
+    Start {
+        /// Repository path or registered name.
+        target: String,
+        /// Harness kind; defaults to the daemon configuration.
+        #[arg(long)]
+        harness: Option<String>,
+        /// Launch in a human-attachable herdr pane.
+        #[arg(long)]
+        attach: bool,
+    },
     /// Inspect a path or registered name without launching an agent or writing state.
     Inspect {
         /// Repository path or registered name.
         target: String,
+    },
+    /// Resume an orphaned or failed onboarding session.
+    Resume {
+        /// Stable onboarding session id.
+        session: String,
+        /// Resume in a human-attachable herdr pane.
+        #[arg(long)]
+        attach: bool,
+    },
+    /// Show durable onboarding session state.
+    Status {
+        /// Stable onboarding session id.
+        session: String,
+    },
+    /// Show the durable onboarding assessment and terminal result.
+    Report {
+        /// Stable onboarding session id.
+        session: String,
     },
 }
 
@@ -610,7 +639,7 @@ async fn main() -> Result<()> {
                             _ => {
                                 return Err(anyhow::anyhow!(
                                     "--param-file {path} must contain a JSON object of key→value"
-                                ))
+                                ));
                             }
                         }
                     }
@@ -841,8 +870,22 @@ async fn main() -> Result<()> {
             RepoCommand::List => repo_cmds::list(&layout, cli.json).await?,
             RepoCommand::Show { name } => repo_cmds::show(&layout, name, cli.json).await?,
             RepoCommand::Onboard { command } => match command {
+                RepoOnboardCommand::Start {
+                    target,
+                    harness,
+                    attach,
+                } => repo_cmds::onboard_start(&layout, target, harness, attach, cli.json).await?,
                 RepoOnboardCommand::Inspect { target } => {
                     repo_cmds::onboard_inspect(&layout, target, cli.json).await?
+                }
+                RepoOnboardCommand::Resume { session, attach } => {
+                    repo_cmds::onboard_resume(&layout, session, attach, cli.json).await?
+                }
+                RepoOnboardCommand::Status { session } => {
+                    repo_cmds::onboard_status(&layout, session, cli.json).await?
+                }
+                RepoOnboardCommand::Report { session } => {
+                    repo_cmds::onboard_report(&layout, session, cli.json).await?
                 }
             },
         },
