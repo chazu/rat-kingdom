@@ -225,9 +225,19 @@ rk repo onboard propose onb-... --kind repo_file --title "Add verify" \
 rk repo onboard approve onb-... onb-prop-... --digest <sha256>
 rk repo onboard apply onb-... onb-prop-... --digest <sha256>
 rk repo onboard decline onb-... onb-prop-... --digest <sha256>
+rk repo onboard propose onb-... --kind workflow_activation \
+  --title "Add guarded maintenance workflow" --evidence "reviewed workflow design" \
+  --target .rk/workflows/maintenance.cue --action activate_workflow \
+  --diff "$DIFF" --risk high --verification "CUE workflow schema"
+rk repo onboard approve onb-... onb-prop-... --digest <sha256>
+rk repo onboard apply onb-... onb-prop-... --digest <sha256> # stage + validate only
+rk repo onboard activate onb-... onb-prop-... --digest <sha256>
+# or explicitly refuse the validated automation:
+rk repo onboard decline-activation onb-... onb-prop-... --digest <sha256>
 rk repo onboard report onb-...         # assessment plus terminal agent result
 rk repo onboard resume onb-...         # recover an orphaned/failed headless run
 rk repo onboard resume onb-... --attach
+rk repo onboard cleanup onb-...        # remove terminal clean worktree; retain branch/report
 ```
 
 A registered name works anywhere a repo is expected, e.g. `rk spawn --repo rat-kingdom`.
@@ -288,8 +298,32 @@ recommits nor reruns a verified check. After a failed check, retry reuses the
 recorded commit and executes a new attempt. An interrupted exact patch or
 trailer-bearing commit is recovered; unrelated dirt, an edited applied file,
 or branch movement is recorded as failure and never swept into the proposal.
-Landing the onboarding branch into the human checkout remains a separate
-operator action.
+
+Workflow, trigger, and schedule proposals use distinct activation kinds and
+actions: `workflow_activation`/`activate_workflow` targets exactly
+`.rk/workflows/<name>.cue`, `trigger_activation`/`activate_trigger` targets
+`.rk/triggers.cue`, and `schedule_activation`/`activate_schedule` targets
+`.rk/schedules.cue`. `apply` patches and commits only the onboarding worktree,
+then validates through the workflow/trigger/schedule CUE schema (including
+schedule cron parsing). This is inert: the daemon does not discover automation
+from onboarding worktrees.
+
+`activate` is the separate human decision that crosses the activation boundary.
+It journals an operation id before changing Git, then fast-forwards the clean,
+registered base checkout only when it is still the exact parent of the
+approved application commit. The onboarding branch head, committed tree,
+target-file digest, repository identity, and live target digest must all still
+match. A moved branch or changed file fails closed. Restart and duplicate
+delivery are safe: if the exact application commit is already present with the
+approved live digest, the daemon records recovery without landing it again.
+`decline-activation` permanently records refusal while retaining the staged
+branch.
+
+The report's summary has separate `staged`, `verified`, `activated`, `declined`,
+`failed`, and `unresolved` proposal lists. `cleanup` is allowed only for a
+terminal session without staged or unresolved proposals; it removes a clean
+onboarding worktree but retains both its Git branch and durable report.
+Running, orphaned, and long-lived attached sessions are never cleaned.
 
 By default a finished rat's branch is merged directly into its base. A repo can
 instead be put in **PR mode** — `rk repo add <path> --merge-mode pr` — so the

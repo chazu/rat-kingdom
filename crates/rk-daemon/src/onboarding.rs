@@ -1459,7 +1459,7 @@ fn read_bounded(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))
 }
 
-fn reject_cue_imports(source: &str) -> Result<(), String> {
+pub(crate) fn reject_cue_imports(source: &str) -> Result<(), String> {
     if source.lines().any(|line| {
         let line = line.trim_start();
         line == "import (" || line.starts_with("import ")

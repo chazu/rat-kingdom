@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Component, Path};
 use std::process::Command;
 
-pub const PROPOSAL_SCHEMA_VERSION: u32 = 2;
+pub const PROPOSAL_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,6 +22,8 @@ pub enum OnboardingProposalKind {
     CastleConfig,
     Registration,
     WorkflowActivation,
+    TriggerActivation,
+    ScheduleActivation,
 }
 
 impl OnboardingProposalKind {
@@ -31,6 +33,8 @@ impl OnboardingProposalKind {
             Self::CastleConfig => "castle_config",
             Self::Registration => "registration",
             Self::WorkflowActivation => "workflow_activation",
+            Self::TriggerActivation => "trigger_activation",
+            Self::ScheduleActivation => "schedule_activation",
         }
     }
 }
@@ -48,6 +52,8 @@ pub enum OnboardingProposalAction {
     ChangeCastleConfig,
     RegisterRepository,
     ActivateWorkflow,
+    ActivateTrigger,
+    ActivateSchedule,
 }
 
 impl OnboardingProposalAction {
@@ -57,6 +63,8 @@ impl OnboardingProposalAction {
             Self::ChangeCastleConfig => "change_castle_config",
             Self::RegisterRepository => "register_repository",
             Self::ActivateWorkflow => "activate_workflow",
+            Self::ActivateTrigger => "activate_trigger",
+            Self::ActivateSchedule => "activate_schedule",
         }
     }
 }
@@ -179,7 +187,10 @@ impl OnboardingProposalDraft {
         validate_kind_action(self.kind, self.action)?;
         if matches!(
             self.kind,
-            OnboardingProposalKind::RepoFile | OnboardingProposalKind::WorkflowActivation
+            OnboardingProposalKind::RepoFile
+                | OnboardingProposalKind::WorkflowActivation
+                | OnboardingProposalKind::TriggerActivation
+                | OnboardingProposalKind::ScheduleActivation
         ) {
             self.target_path = canonical_repo_target(&self.target_path)?;
         }
@@ -212,6 +223,7 @@ impl OnboardingProposalDraft {
             }
             _ => {}
         }
+        validate_automation_target(self.kind, self.action, &self.target_path)?;
         Ok(self)
     }
 }
@@ -271,6 +283,92 @@ pub struct OnboardingVerification {
     pub unresolved_risks: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnboardingAutomationKind {
+    Workflow,
+    Trigger,
+    Schedule,
+}
+
+impl std::fmt::Display for OnboardingAutomationKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Workflow => "workflow",
+            Self::Trigger => "trigger",
+            Self::Schedule => "schedule",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingValidation {
+    pub attempt: u32,
+    pub actor: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub automation_kind: OnboardingAutomationKind,
+    pub target_path: String,
+    pub target_digest: String,
+    pub validator: String,
+    pub passed: bool,
+    pub output_summary: String,
+    #[serde(default)]
+    pub unresolved_risks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnboardingActivationStatus {
+    Activating,
+    Activated,
+    Declined,
+    Failed,
+}
+
+impl std::fmt::Display for OnboardingActivationStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Activating => "activating",
+            Self::Activated => "activated",
+            Self::Declined => "declined",
+            Self::Failed => "failed",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingActivationTransition {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<OnboardingActivationStatus>,
+    pub to: OnboardingActivationStatus,
+    pub actor: String,
+    pub at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingActivation {
+    pub operation_id: String,
+    pub status: OnboardingActivationStatus,
+    pub actor: String,
+    pub requested_at: DateTime<Utc>,
+    pub expected_base_commit: String,
+    pub approved_commit: String,
+    pub approved_tree_revision: String,
+    pub target_digest: String,
+    pub attempts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registered_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub transitions: Vec<OnboardingActivationTransition>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnboardingProposalTransition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -315,6 +413,10 @@ pub struct OnboardingProposal {
     pub application: Option<OnboardingApplication>,
     #[serde(default)]
     pub verification_results: Vec<OnboardingVerification>,
+    #[serde(default)]
+    pub validation_results: Vec<OnboardingValidation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<OnboardingActivation>,
     pub transitions: Vec<OnboardingProposalTransition>,
 }
 
@@ -358,6 +460,8 @@ impl OnboardingProposal {
             failure: None,
             application: None,
             verification_results: Vec::new(),
+            validation_results: Vec::new(),
+            activation: None,
             transitions: vec![OnboardingProposalTransition {
                 from: None,
                 to: OnboardingProposalStatus::Proposed,
@@ -399,6 +503,17 @@ impl OnboardingProposal {
             )));
         }
         Ok(())
+    }
+
+    pub fn automation_kind(&self) -> Option<OnboardingAutomationKind> {
+        match self.kind {
+            OnboardingProposalKind::WorkflowActivation => Some(OnboardingAutomationKind::Workflow),
+            OnboardingProposalKind::TriggerActivation => Some(OnboardingAutomationKind::Trigger),
+            OnboardingProposalKind::ScheduleActivation => Some(OnboardingAutomationKind::Schedule),
+            OnboardingProposalKind::RepoFile
+            | OnboardingProposalKind::CastleConfig
+            | OnboardingProposalKind::Registration => None,
+        }
     }
 }
 
@@ -528,6 +643,12 @@ fn validate_kind_action(
         ) | (
             OnboardingProposalKind::WorkflowActivation,
             OnboardingProposalAction::ActivateWorkflow
+        ) | (
+            OnboardingProposalKind::TriggerActivation,
+            OnboardingProposalAction::ActivateTrigger
+        ) | (
+            OnboardingProposalKind::ScheduleActivation,
+            OnboardingProposalAction::ActivateSchedule
         )
     );
     if !valid {
@@ -536,6 +657,39 @@ fn validate_kind_action(
         )));
     }
     Ok(())
+}
+
+fn validate_automation_target(
+    kind: OnboardingProposalKind,
+    action: OnboardingProposalAction,
+    target: &str,
+) -> rk_core::Result<()> {
+    let valid = match (kind, action) {
+        (
+            OnboardingProposalKind::WorkflowActivation,
+            OnboardingProposalAction::ActivateWorkflow,
+        ) => {
+            let path = Path::new(target);
+            path.parent() == Some(Path::new(".rk/workflows"))
+                && path.extension().is_some_and(|extension| extension == "cue")
+                && path.file_stem().is_some_and(|stem| !stem.is_empty())
+        }
+        (OnboardingProposalKind::TriggerActivation, OnboardingProposalAction::ActivateTrigger) => {
+            target == ".rk/triggers.cue"
+        }
+        (
+            OnboardingProposalKind::ScheduleActivation,
+            OnboardingProposalAction::ActivateSchedule,
+        ) => target == ".rk/schedules.cue",
+        _ => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(rk_core::Error::other(format!(
+            "proposal kind {kind} requires its canonical repo-local automation target, not {target}"
+        )))
+    }
 }
 
 fn canonical_repo_target(target: &str) -> rk_core::Result<String> {

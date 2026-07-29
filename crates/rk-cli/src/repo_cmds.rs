@@ -310,6 +310,100 @@ pub async fn onboard_apply(
     Ok(())
 }
 
+pub async fn onboard_activate(
+    layout: &Layout,
+    session: String,
+    proposal: String,
+    digest: String,
+    as_json: bool,
+) -> Result<()> {
+    let mut client = Client::connect(layout).await?;
+    let result = client
+        .call(
+            "repo.onboard.activate",
+            json!({
+                "session": session,
+                "proposal": proposal,
+                "digest": digest,
+            }),
+        )
+        .await?;
+    let proposal: OnboardingProposal = serde_json::from_value(result["proposal"].clone())?;
+    if as_json {
+        println!("{result}");
+    } else {
+        print_onboarding_proposal(&proposal);
+        println!(
+            "  activation {}",
+            if result["changed"].as_bool().unwrap_or(false) {
+                "landed in registered checkout"
+            } else {
+                "already landed (idempotent replay)"
+            }
+        );
+    }
+    Ok(())
+}
+
+pub async fn onboard_decline_activation(
+    layout: &Layout,
+    session: String,
+    proposal: String,
+    digest: String,
+    reason: Option<String>,
+    as_json: bool,
+) -> Result<()> {
+    let mut client = Client::connect(layout).await?;
+    let result = client
+        .call(
+            "repo.onboard.decline_activation",
+            json!({
+                "session": session,
+                "proposal": proposal,
+                "digest": digest,
+                "reason": reason,
+            }),
+        )
+        .await?;
+    let proposal: OnboardingProposal = serde_json::from_value(result["proposal"].clone())?;
+    if as_json {
+        println!("{result}");
+    } else {
+        print_onboarding_proposal(&proposal);
+        println!(
+            "  activation {}",
+            if result["changed"].as_bool().unwrap_or(false) {
+                "declined"
+            } else {
+                "already declined (idempotent)"
+            }
+        );
+    }
+    Ok(())
+}
+
+pub async fn onboard_cleanup(layout: &Layout, session: String, as_json: bool) -> Result<()> {
+    let mut client = Client::connect(layout).await?;
+    let result = client
+        .call("repo.onboard.cleanup", json!({"session": session}))
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        let status: OnboardingSessionStatus = serde_json::from_value(result["session"].clone())?;
+        print_onboarding_status(&status, true);
+        println!(
+            "  cleanup   {}",
+            if result["cleaned"].as_bool().unwrap_or(false) {
+                "worktree removed; branch and report retained"
+            } else {
+                "already complete (idempotent)"
+            }
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn onboard_decide(
     layout: &Layout,
@@ -402,6 +496,19 @@ pub async fn onboard_report(layout: &Layout, session: String, as_json: bool) -> 
         print_onboarding_status(&report.session, true);
         println!();
         print_assessment(&report.assessment);
+        println!("\nproposal summary:");
+        println!("  staged     {}", report.summary.staged.join(", "));
+        println!("  verified   {}", report.summary.verified.join(", "));
+        println!("  activated  {}", report.summary.activated.join(", "));
+        println!("  declined   {}", report.summary.declined.join(", "));
+        println!("  failed     {}", report.summary.failed.join(", "));
+        println!("  unresolved {}", report.summary.unresolved.join(", "));
+        if let Some(cleanup) = report.cleanup {
+            println!(
+                "\ncleanup:\n  worktree removed at {} by {}; branch retained as {}",
+                cleanup.at, cleanup.actor, cleanup.branch_retained
+            );
+        }
         if let Some(result) = report.agent_result {
             println!("\nonboarder result:\n  {result}");
         }
@@ -517,6 +624,38 @@ fn print_onboarding_proposal(proposal: &OnboardingProposal) {
             println!("      unresolved   {risk}");
         }
     }
+    for validation in &proposal.validation_results {
+        println!(
+            "    validation {} attempt {}  {} ({})",
+            validation.automation_kind,
+            validation.attempt,
+            if validation.passed {
+                "passed"
+            } else {
+                "failed"
+            },
+            validation.validator
+        );
+        println!("      target digest {}", validation.target_digest);
+        println!("      output        {}", validation.output_summary);
+        for risk in &validation.unresolved_risks {
+            println!("      unresolved    {risk}");
+        }
+    }
+    if let Some(activation) = &proposal.activation {
+        println!(
+            "    activation    {} (operation {}, attempts {})",
+            activation.status, activation.operation_id, activation.attempts
+        );
+        println!("      approved      {}", activation.approved_commit);
+        println!("      expected base {}", activation.expected_base_commit);
+        if let Some(commit) = &activation.registered_commit {
+            println!("      registered    {commit}");
+        }
+        if let Some(detail) = &activation.detail {
+            println!("      detail        {detail}");
+        }
+    }
     if proposal.status == rk_daemon::onboarding_proposals::OnboardingProposalStatus::Proposed {
         println!(
             "    approve      rk repo onboard approve {} {} --digest {}",
@@ -532,6 +671,22 @@ fn print_onboarding_proposal(proposal: &OnboardingProposal) {
     {
         println!(
             "    apply        rk repo onboard apply {} {} --digest {}",
+            proposal.session_id, proposal.id, proposal.digest
+        );
+    }
+    if proposal.status == rk_daemon::onboarding_proposals::OnboardingProposalStatus::Verified
+        && proposal.automation_kind().is_some()
+        && proposal.activation.as_ref().is_none_or(|activation| {
+            activation.status
+                == rk_daemon::onboarding_proposals::OnboardingActivationStatus::Failed
+        })
+    {
+        println!(
+            "    activate     rk repo onboard activate {} {} --digest {}",
+            proposal.session_id, proposal.id, proposal.digest
+        );
+        println!(
+            "    decline      rk repo onboard decline-activation {} {} --digest {}",
             proposal.session_id, proposal.id, proposal.digest
         );
     }

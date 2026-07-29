@@ -263,7 +263,8 @@ enum RepoOnboardCommand {
     Propose {
         /// Stable onboarding session id.
         session: String,
-        /// Proposal kind: repo_file, castle_config, registration, or workflow_activation.
+        /// Proposal kind: repo_file, castle_config, registration,
+        /// workflow_activation, trigger_activation, or schedule_activation.
         #[arg(long)]
         kind: String,
         /// Human-readable proposal title.
@@ -275,7 +276,9 @@ enum RepoOnboardCommand {
         /// Exact repository path or castle setting affected.
         #[arg(long)]
         target: String,
-        /// Action: write_repo_file, change_castle_config, register_repository, or activate_workflow.
+        /// Action: write_repo_file, change_castle_config,
+        /// register_repository, activate_workflow, activate_trigger, or
+        /// activate_schedule.
         #[arg(long)]
         action: String,
         /// Exact reviewable unified diff or configuration delta.
@@ -325,6 +328,37 @@ enum RepoOnboardCommand {
         /// Canonical digest shown by status/report.
         #[arg(long)]
         digest: String,
+    },
+    /// Explicitly activate one validated workflow, trigger, or schedule by
+    /// landing its exact approved commit into the registered checkout.
+    Activate {
+        /// Stable onboarding session id.
+        session: String,
+        /// Stable proposal id.
+        proposal: String,
+        /// Canonical digest shown by status/report.
+        #[arg(long)]
+        digest: String,
+    },
+    /// Refuse activation while retaining the validated onboarding branch and
+    /// durable report.
+    DeclineActivation {
+        /// Stable onboarding session id.
+        session: String,
+        /// Stable proposal id.
+        proposal: String,
+        /// Canonical digest shown by status/report.
+        #[arg(long)]
+        digest: String,
+        /// Optional durable decision rationale.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Remove a terminal session's clean worktree while retaining its branch
+    /// and durable report.
+    Cleanup {
+        /// Stable onboarding session id.
+        session: String,
     },
     /// Resume an orphaned or failed onboarding session.
     Resume {
@@ -1040,6 +1074,28 @@ async fn main() -> Result<()> {
                     proposal,
                     digest,
                 } => repo_cmds::onboard_apply(&layout, session, proposal, digest, cli.json).await?,
+                RepoOnboardCommand::Activate {
+                    session,
+                    proposal,
+                    digest,
+                } => {
+                    repo_cmds::onboard_activate(&layout, session, proposal, digest, cli.json)
+                        .await?
+                }
+                RepoOnboardCommand::DeclineActivation {
+                    session,
+                    proposal,
+                    digest,
+                    reason,
+                } => {
+                    repo_cmds::onboard_decline_activation(
+                        &layout, session, proposal, digest, reason, cli.json,
+                    )
+                    .await?
+                }
+                RepoOnboardCommand::Cleanup { session } => {
+                    repo_cmds::onboard_cleanup(&layout, session, cli.json).await?
+                }
                 RepoOnboardCommand::Resume { session, attach } => {
                     repo_cmds::onboard_resume(&layout, session, attach, cli.json).await?
                 }

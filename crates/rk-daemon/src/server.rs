@@ -873,6 +873,9 @@ impl Daemon {
                 | "repo.onboard.approve"
                 | "repo.onboard.decline"
                 | "repo.onboard.apply"
+                | "repo.onboard.activate"
+                | "repo.onboard.decline_activation"
+                | "repo.onboard.cleanup"
                 | "repo.onboard.resume"
                 | "repo.onboard.status"
                 | "repo.onboard.report"
@@ -1215,8 +1218,8 @@ impl Daemon {
             "coordinator.snapshot" => match parse_params::<CoordinatorFilter>(&req.params) {
                 Ok(filter) if filter_is_valid(&filter) => {
                     match self.coordinator_snapshot(&filter) {
-                    Ok(snapshot) => reply(Response::ok(id, snapshot)),
-                    Err(e) => reply(Response::err(id, codes::INTERNAL, e.to_string())),
+                        Ok(snapshot) => reply(Response::ok(id, snapshot)),
+                        Err(e) => reply(Response::err(id, codes::INTERNAL, e.to_string())),
                     }
                 }
                 Ok(_) => reply(Response::err(
@@ -1232,7 +1235,7 @@ impl Daemon {
             "coordinator.watch" => match parse_params::<CoordinatorFilter>(&req.params) {
                 Ok(filter) if filter_is_valid(&filter) => {
                     match self.prepare_coordinator_watch(id, filter) {
-                    Ok(outcome) => outcome,
+                        Ok(outcome) => outcome,
                         Err(e) => reply(Response::err(req.id, codes::INTERNAL, e.to_string())),
                     }
                 }
@@ -1508,6 +1511,11 @@ impl Daemon {
             "repo.onboard.approve" => reply(self.handle_onboarding_approve(req)),
             "repo.onboard.decline" => reply(self.handle_onboarding_decline(req)),
             "repo.onboard.apply" => reply(self.handle_onboarding_apply(req).await),
+            "repo.onboard.activate" => reply(self.handle_onboarding_activate(req).await),
+            "repo.onboard.decline_activation" => {
+                reply(self.handle_onboarding_decline_activation(req).await)
+            }
+            "repo.onboard.cleanup" => reply(self.handle_onboarding_cleanup(req).await),
             "repo.onboard.resume" => reply(self.handle_onboarding_resume(req).await),
             "repo.onboard.status" => reply(self.handle_onboarding_status(req)),
             "repo.onboard.report" => reply(self.handle_onboarding_report(req)),
@@ -1591,9 +1599,9 @@ impl Daemon {
         // event, then the run completes — nothing else tracks the pushed branch.
         let pull_requests =
             match scan(&Pattern::category(Category::Event).identity("pull_request_opened")) {
-            Ok(t) => t,
-            Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
-        };
+                Ok(t) => t,
+                Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
+            };
         // `pull_request_closed` events are emitted by the fetch-driven review
         // sweep (TKT-70): a background pass fetched the forge and saw the branch
         // merged/deleted upstream even though the operator never pulled, so the
@@ -1602,9 +1610,9 @@ impl Daemon {
         // the hot path; the fetch that produces them does not.
         let pull_requests_closed =
             match scan(&Pattern::category(Category::Event).identity("pull_request_closed")) {
-            Ok(t) => t,
-            Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
-        };
+                Ok(t) => t,
+                Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
+            };
         // Every `land` step records its own outcome as a `branch_landed` event.
         // A land that neither merged nor opened a PR left the branch standing
         // outside the target, and reports that as a clean `{merged: false}`
@@ -2286,9 +2294,7 @@ impl Daemon {
                 let _ = self
                     .onboarding_sessions
                     .lock()
-                    .map_err(|_| {
-                        rk_core::Error::other("onboarding session registry lock poisoned")
-                    })
+                    .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
                     .and_then(|mut sessions| {
                         sessions.record_application_failure(
                             &params.session,
@@ -2305,9 +2311,7 @@ impl Daemon {
                 let _ = self
                     .onboarding_sessions
                     .lock()
-                    .map_err(|_| {
-                        rk_core::Error::other("onboarding session registry lock poisoned")
-                    })
+                    .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
                     .and_then(|mut sessions| {
                         sessions.record_application_failure(
                             &params.session,
@@ -2320,9 +2324,7 @@ impl Daemon {
                 return Response::err(req.id, codes::INTERNAL, detail);
             }
         };
-        if proposal.status
-            == crate::onboarding_proposals::OnboardingProposalStatus::Verified
-        {
+        if proposal.status == crate::onboarding_proposals::OnboardingProposalStatus::Verified {
             return Response::ok(
                 req.id,
                 json!({"proposal": proposal, "applied": false, "verified": false}),
@@ -2344,64 +2346,342 @@ impl Daemon {
             Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
         };
 
-        let attempt = applied_proposal.verification_results.len() as u32 + 1;
-        let verification = match crate::onboarding_apply::verify(
-            &session,
-            &applied_proposal,
-            &actor,
-            attempt,
-        )
-        .await
-        {
-            Ok(verification) => verification,
-            Err(error) => {
-                let now = chrono::Utc::now();
-                let Some(contract) = applied_proposal.named_check.as_ref() else {
-                    return Response::err(req.id, codes::INTERNAL, error.to_string());
+        let proposal = if let Some(contract) = applied_proposal.named_check.as_ref() {
+            let attempt = applied_proposal.verification_results.len() as u32 + 1;
+            let verification =
+                match crate::onboarding_apply::verify(&session, &applied_proposal, &actor, attempt)
+                    .await
+                {
+                    Ok(verification) => verification,
+                    Err(error) => {
+                        let now = chrono::Utc::now();
+                        crate::onboarding_proposals::OnboardingVerification {
+                            attempt,
+                            actor: actor.clone(),
+                            started_at: now,
+                            finished_at: now,
+                            check_name: contract.name.clone(),
+                            command: contract.command.clone(),
+                            cwd: contract.cwd.clone(),
+                            expected_exit: contract.expect_exit,
+                            timeout: contract.timeout.clone(),
+                            environment_policy: contract.environment_policy,
+                            toolchain: contract.toolchain.clone(),
+                            exit_status: None,
+                            timed_out: false,
+                            passed: false,
+                            output_summary: format!("verification setup failed: {error}"),
+                            unresolved_risks: vec![
+                            "verification could not execute; onboarding branch is not ready to land"
+                                .into(),
+                        ],
+                        }
+                    }
                 };
-                crate::onboarding_proposals::OnboardingVerification {
-                    attempt,
-                    actor: actor.clone(),
-                    started_at: now,
-                    finished_at: now,
-                    check_name: contract.name.clone(),
-                    command: contract.command.clone(),
-                    cwd: contract.cwd.clone(),
-                    expected_exit: contract.expect_exit,
-                    timeout: contract.timeout.clone(),
-                    environment_policy: contract.environment_policy,
-                    toolchain: contract.toolchain.clone(),
-                    exit_status: None,
-                    timed_out: false,
-                    passed: false,
-                    output_summary: format!("verification setup failed: {error}"),
-                    unresolved_risks: vec![
-                        "verification could not execute; onboarding branch is not ready to land"
-                            .into(),
-                    ],
+            match self
+                .onboarding_sessions
+                .lock()
+                .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
+                .and_then(|mut sessions| {
+                    sessions.record_verification(
+                        &params.session,
+                        &params.proposal,
+                        &params.digest,
+                        verification,
+                    )
+                }) {
+                Ok(proposal) => proposal,
+                Err(error) => {
+                    return Response::err(req.id, codes::INTERNAL, error.to_string());
+                }
+            }
+        } else {
+            let attempt = applied_proposal.validation_results.len() as u32 + 1;
+            let validation = match crate::onboarding_apply::validate_automation(
+                &session,
+                &applied_proposal,
+                &actor,
+                attempt,
+            ) {
+                Ok(validation) => validation,
+                Err(error) => {
+                    return Response::err(req.id, codes::INTERNAL, error.to_string());
+                }
+            };
+            match self
+                .onboarding_sessions
+                .lock()
+                .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
+                .and_then(|mut sessions| {
+                    sessions.record_validation(
+                        &params.session,
+                        &params.proposal,
+                        &params.digest,
+                        validation,
+                    )
+                }) {
+                Ok(proposal) => proposal,
+                Err(error) => {
+                    return Response::err(req.id, codes::INTERNAL, error.to_string());
                 }
             }
         };
-        let passed = verification.passed;
-        let proposal = match self
-            .onboarding_sessions
-            .lock()
-            .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
-            .and_then(|mut sessions| {
-                sessions.record_verification(
-                    &params.session,
-                    &params.proposal,
-                    &params.digest,
-                    verification,
-                )
-            }) {
-            Ok(proposal) => proposal,
-            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
-        };
+        let passed =
+            proposal.status == crate::onboarding_proposals::OnboardingProposalStatus::Verified;
         Response::ok(
             req.id,
             json!({"proposal": proposal, "applied": applied, "verified": passed}),
         )
+    }
+
+    async fn handle_onboarding_activate(&self, req: Request) -> Response {
+        let params: RepoOnboardingApplyParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let _apply_guard = self.onboarding_apply_lock.lock().await;
+        let actor = format!("{}@{}", req.caller, self.castle);
+        let (session, proposal) = match self.onboarding_sessions.lock() {
+            Ok(sessions) => {
+                let Some(session) = sessions.get(&params.session) else {
+                    return Response::err(
+                        req.id,
+                        codes::BAD_PARAMS,
+                        format!("no such onboarding session: {}", params.session),
+                    );
+                };
+                let Some(proposal) = session
+                    .proposals
+                    .iter()
+                    .find(|proposal| proposal.id == params.proposal)
+                    .cloned()
+                else {
+                    return Response::err(
+                        req.id,
+                        codes::BAD_PARAMS,
+                        format!(
+                            "no such onboarding proposal in {}: {}",
+                            params.session, params.proposal
+                        ),
+                    );
+                };
+                (session, proposal)
+            }
+            Err(_) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    "onboarding session registry lock poisoned",
+                );
+            }
+        };
+        if proposal.digest != params.digest {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                format!("stale proposal digest for {}", proposal.id),
+            );
+        }
+        let contract_session = session.clone();
+        let contract_proposal = proposal.clone();
+        let contract = match tokio::task::spawn_blocking(move || {
+            crate::onboarding_activation::contract(&contract_session, &contract_proposal)
+        })
+        .await
+        {
+            Ok(Ok(contract)) => contract,
+            Ok(Err(error)) => {
+                return Response::err(req.id, codes::BAD_PARAMS, error.to_string());
+            }
+            Err(error) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    format!("onboarding activation preflight task failed: {error}"),
+                );
+            }
+        };
+        let (intent, intent_created) = match self
+            .onboarding_sessions
+            .lock()
+            .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
+            .and_then(|mut sessions| {
+                sessions.begin_activation(
+                    &params.session,
+                    &params.proposal,
+                    &params.digest,
+                    contract.operation_id.clone(),
+                    actor,
+                    contract.expected_base_commit.clone(),
+                    contract.approved_commit.clone(),
+                    contract.approved_tree_revision.clone(),
+                    contract.target_digest.clone(),
+                )
+            }) {
+            Ok(result) => result,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+        };
+        if intent.activation.as_ref().is_some_and(|activation| {
+            activation.status == crate::onboarding_proposals::OnboardingActivationStatus::Activated
+        }) {
+            return Response::ok(
+                req.id,
+                json!({"proposal": intent, "activated": true, "changed": false}),
+            );
+        }
+
+        let activation_session = session;
+        let activation_proposal = intent;
+        let activation_contract = contract.clone();
+        let evidence = tokio::task::spawn_blocking(move || {
+            crate::onboarding_activation::ensure_activation(
+                &activation_session,
+                &activation_proposal,
+                &activation_contract,
+            )
+        })
+        .await;
+        let evidence = match evidence {
+            Ok(Ok(evidence)) => evidence,
+            Ok(Err(error)) => {
+                let detail = error.to_string();
+                let _ = self
+                    .onboarding_sessions
+                    .lock()
+                    .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
+                    .and_then(|mut sessions| {
+                        sessions.fail_activation(
+                            &params.session,
+                            &params.proposal,
+                            &params.digest,
+                            &contract.operation_id,
+                            detail.clone(),
+                        )
+                    });
+                return Response::err(req.id, codes::BAD_PARAMS, detail);
+            }
+            Err(error) => {
+                let detail = format!("onboarding activation task failed: {error}");
+                let _ = self
+                    .onboarding_sessions
+                    .lock()
+                    .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
+                    .and_then(|mut sessions| {
+                        sessions.fail_activation(
+                            &params.session,
+                            &params.proposal,
+                            &params.digest,
+                            &contract.operation_id,
+                            detail.clone(),
+                        )
+                    });
+                return Response::err(req.id, codes::INTERNAL, detail);
+            }
+        };
+        let (proposal, changed) = match self
+            .onboarding_sessions
+            .lock()
+            .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
+            .and_then(|mut sessions| {
+                sessions.finish_activation(
+                    &params.session,
+                    &params.proposal,
+                    &params.digest,
+                    &contract.operation_id,
+                    evidence.registered_commit,
+                    evidence.detail,
+                )
+            }) {
+            Ok(result) => result,
+            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+        };
+        Response::ok(
+            req.id,
+            json!({
+                "proposal": proposal,
+                "activated": true,
+                "changed": changed,
+                "intent_created": intent_created,
+            }),
+        )
+    }
+
+    async fn handle_onboarding_decline_activation(&self, req: Request) -> Response {
+        let params: RepoOnboardingDecisionParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let _apply_guard = self.onboarding_apply_lock.lock().await;
+        let actor = format!("{}@{}", req.caller, self.castle);
+        match self
+            .onboarding_sessions
+            .lock()
+            .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
+            .and_then(|mut sessions| {
+                sessions.decline_activation(
+                    &params.session,
+                    &params.proposal,
+                    &params.digest,
+                    actor,
+                    params.reason,
+                )
+            }) {
+            Ok((proposal, changed)) => Response::ok(
+                req.id,
+                json!({"proposal": proposal, "declined": true, "changed": changed}),
+            ),
+            Err(error) => Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+        }
+    }
+
+    async fn handle_onboarding_cleanup(&self, req: Request) -> Response {
+        let params: RepoOnboardingSessionParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let _apply_guard = self.onboarding_apply_lock.lock().await;
+        let session = match self.reconcile_onboarding_session(&params.session) {
+            Ok(session) => session,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+        };
+        if session.cleanup.is_some() {
+            return Response::ok(
+                req.id,
+                json!({"session": session.status(), "cleaned": false}),
+            );
+        }
+        let actor = format!("{}@{}", req.caller, self.castle);
+        let cleanup_session = session.clone();
+        let cleanup_actor = actor.clone();
+        let cleanup = match tokio::task::spawn_blocking(move || {
+            crate::onboarding_activation::ensure_cleanup(&cleanup_session, &cleanup_actor)
+        })
+        .await
+        {
+            Ok(Ok(cleanup)) => cleanup,
+            Ok(Err(error)) => {
+                return Response::err(req.id, codes::BAD_PARAMS, error.to_string());
+            }
+            Err(error) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    format!("onboarding cleanup task failed: {error}"),
+                );
+            }
+        };
+        match self
+            .onboarding_sessions
+            .lock()
+            .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
+            .and_then(|mut sessions| sessions.record_cleanup(&params.session, cleanup))
+        {
+            Ok((session, changed)) => Response::ok(
+                req.id,
+                json!({"session": session.status(), "cleaned": changed}),
+            ),
+            Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
+        }
     }
 
     fn handle_onboarding_decision(
@@ -3396,8 +3676,8 @@ impl Daemon {
                 .unwrap_or("clear")
                 .to_string();
             if latest.get(&key).is_none_or(|(current_at, current_id, _)| {
-                    vote.created_at > *current_at
-                        || (vote.created_at == *current_at && vote.id > *current_id)
+                vote.created_at > *current_at
+                    || (vote.created_at == *current_at && vote.id > *current_id)
             }) {
                 latest.insert(key, (vote.created_at, vote.id, state));
             }
