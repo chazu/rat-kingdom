@@ -71,6 +71,13 @@ second agent lifecycle:
 - Agent worktrees are the write boundary. The human's checkout is never edited
   directly by the onboarding agent.
 
+The adversarial review found one prerequisite outside onboarding itself:
+supervised processes must not be able to drop `RK_AGENT` and `RK_AUTH_TOKEN`
+and fall back to operator authority through the shared `RK_HOME`. Onboarding
+cannot safely apply or approve anything until that capability boundary is
+fixed. This is tracked as `TKT-01KYQR6X2XEDAWEJTSXCSQJE5M` and blocks the
+implementation batch.
+
 ## Domain model
 
 These terms are canonical for this feature:
@@ -90,6 +97,10 @@ These terms are canonical for this feature:
   workflow definitions, triggers, and the selected instruction file.
 - **Castle configuration** — machine-local registration, merge mode, remote,
   harness, and global policy. It must be kept distinct from repository files.
+- **Proposal digest** — a canonical hash over the proposal payload, target
+  repository identity, onboarding branch/tree revision, and requested action.
+  Approval and application are valid only for the exact digest the human
+  reviewed.
 - **Onboarding report** — the durable final record of findings, decisions,
   applied changes, verification results, and unresolved follow-ups.
 
@@ -104,8 +115,10 @@ These terms are canonical for this feature:
   the human confirms. Re-adding the same path is idempotent.
 - Create an onboarding session and an isolated branch/worktree.
 - Start the onboarding rat with a dedicated onboarding role. The role must be
-  distinct from `rat` and `reviewer` so ordinary completion instructions cannot
-  accidentally turn an advisory session into implementation work.
+  distinct from `rat` and `reviewer`, and the daemon must enforce its
+  capability set. An unknown role must not silently receive ordinary rat
+  permissions. This prevents a prompt-only `onboarder` label from becoming a
+  security boundary.
 - In attached mode, print the session id and attach target. In headless mode,
   emit machine-readable session state and continue producing report events.
 
@@ -151,8 +164,10 @@ worktree before proposing agent execution.
 
    Inspect available workflow definitions, triggers, schedules, approval gates,
    named-check references, and the castle's `require_named_checks` policy.
-   Present these as separate proposals. Enabling automation is never implied by
-   installing or validating a definition.
+   Present these as separate proposals. Repo-local workflow, trigger, and
+   schedule files are discovered and reloaded automatically by the daemon, so
+   landing an approved file into the registered checkout is the activation
+   boundary. Validation or staging in the onboarding branch is not activation.
 
 6. **Agent readiness proof**
 
@@ -196,9 +211,19 @@ proposed -> approved -> applied -> verified
 ```
 
 Approval must be durable and attributable to the human/operator. A proposal
+must be bound to its proposal digest and use compare-and-swap semantics: if the
+proposal, repository identity, onboarding branch revision, target path, or
+action changes, the old approval is stale and cannot be applied. A proposal
 that changes repository files is applied only in the onboarding branch. A
 castle-level proposal is applied through the existing operator RPC/config
 surface, never by writing a guessed config file from the agent worktree.
+
+The application key is `(session, proposal id, digest)`. Replaying an approval,
+retrying after a daemon restart, or resuming a disconnected session must be
+idempotent. The daemon must persist the decision before applying the change and
+persist the application result before reporting success. Recovery re-reads the
+proposal and working tree, then resumes or marks the proposal failed; it never
+blindly repeats a side effect.
 
 The attached conversation can be the friendly interface, but each decision
 also needs a CLI/API representation so it survives disconnects:
@@ -217,7 +242,9 @@ the underlying RPC names and state transitions must be stable and idempotent.
 - Discovery is read-only and may run repeatedly.
 - Proposal generation is not approval.
 - Applying a repository proposal is not landing the onboarding branch.
-- Installing a workflow is not enabling its trigger or schedule.
+- Validating or staging a workflow is not activation. Because repo-local
+  workflow, trigger, and schedule files are auto-discovered, landing them in
+  the registered checkout is activation and requires its own final approval.
 - A named check is repo-owner-controlled command data; it is not trusted merely
   because an onboarding rat suggested it. Human approval and CUE validation are
   required before it becomes part of the registry.
@@ -228,45 +255,65 @@ the underlying RPC names and state transitions must be stable and idempotent.
   visible follow-up; it never becomes a guessed default.
 - Onboarding must not enable continuous drain, triggers, schedules, or broad
   permission modes as a side effect.
+- The onboarding agent cannot approve its own proposals, invoke operator-only
+  RPCs, or gain operator authority by removing ambient identity variables.
 
 ## Implementation shape
 
-### Slice A — assessment
+### Slice 0 — prerequisite identity isolation
+
+Land `TKT-01KYQR6X2XEDAWEJTSXCSQJE5M` first. Supervised processes must retain a
+non-operator caller identity even when ambient `RK_*` variables are absent, and
+operator-only RPCs must remain unavailable to them. Add a regression proving
+the exact fallback attack fails. No onboarding ticket is ready to run until
+this slice is landed and deployed for the test harness.
+
+### Slice A — read-only assessment
 
 Add a reusable repository assessment service and `rk repo onboard inspect`.
 It returns stable JSON plus a concise human rendering for identity, tooling,
 instructions, checks, workflows/triggers, git state, and agent readiness. The
 assessment is deterministic, bounded, and does not write repository files.
 
-### Slice B — guided session
+The inspect command is independently demoable: it performs no onboarding-agent
+launch and no writes, and a fixture can compare its report against expected
+findings.
+
+### Slice B — guided session and enforced role
 
 Add the onboarding session record, dedicated role priming, attached/headless
 launch, resume/status/report RPCs, and the onboarding branch lifecycle. A
-session can complete its assessment without applying any proposal.
+session can complete its assessment without applying any proposal. The daemon
+must reject an unknown or downgraded onboarding role and persist orphaned/live
+session recovery state rather than relying on in-memory attach tracking.
 
-### Slice C — checkpoints and application
+### Slice C — content-bound checkpoints
 
-Add proposal persistence and operator approval/decline commands. Implement
-idempotent application for repo-owned changes, starting with `.rk/checks.cue`
-and the selected instruction file. Show the diff before approval and keep
-castle-level changes on their existing operator-owned surfaces.
+Add proposal persistence and operator approval/decline commands. Canonicalize
+and digest the proposal, bind it to the repo identity and onboarding tree
+revision, and reject stale or replayed decisions. Show the diff before approval
+and implement one complete named-check proposal path for `.rk/checks.cue`.
+Keep castle-level changes on their existing operator-owned surfaces.
 
-### Slice D — verification and workflow activation
+### Slice D — verification and explicit activation
 
 Validate and execute approved named checks, report environment/toolchain
 details, verify workflow references and trigger/schedule definitions, and make
-activation a separate approval. Produce the final onboarding report and a
-machine-readable readiness result.
+landing an approved workflow/trigger/schedule file the explicit activation
+step. Produce the final onboarding report and a machine-readable readiness
+result. Add restart/replay tests for every persisted transition.
 
-### Slice E — fixtures and documentation
+### Slice E — operational fixtures and documentation
 
 Add fake repositories covering missing tools, ambiguous branches, malformed
 checks, dirty worktrees, existing instruction files, approval disconnects, and
 reruns. Document the operator flow and the non-destructive boundaries.
 
-Each slice must include its end-to-end command/API path and focused regression
-coverage. No slice should require a human to manually edit JSON state or a
-worktree outside the Rat Kingdom lifecycle.
+Each slice must include an end-to-end command/API path and focused regression
+coverage. The slices are ordered by dependency but each is demoable on its own:
+read-only inspection, no-op guided session, one content-bound named-check
+proposal, and finally activation/recovery. No slice should require a human to
+manually edit JSON state or a worktree outside the Rat Kingdom lifecycle.
 
 ## Acceptance bar
 
@@ -285,6 +332,26 @@ The feature is ready when a fresh repository can be onboarded with this proof:
    and can use the documented verification path.
 7. Running onboarding a second time produces a drift report rather than
    duplicate files or duplicated durable conventions.
+
+## Adversarial review disposition
+
+Reviewer rat Cheesethief-2 completed an independent review on 2026-07-29.
+`mise run verify` passed completely in the review worktree. The review approved
+the document as a reviewable design but found that it was not implementation
+ready without the changes above:
+
+- supervised-agent/operator credential isolation is a blocker;
+- current workflow approval is instance-wide, caller-supplied, and not bound to
+  proposal content or revision;
+- repo-local workflow, trigger, and schedule discovery is automatic, making
+  landing the activation boundary;
+- onboarding needs an enforced capability/profile, durable replay semantics,
+  exact named-check digests, stable repository identity, and more vertical
+  slices.
+
+The detailed review is artifact `01KYQR881BZWS180Z0Q531G6GT`. The reviewer filed
+the identity prerequisite as `TKT-01KYQR6X2XEDAWEJTSXCSQJE5M` and the design
+hardening follow-up as `TKT-01KYQR6X34KCN7NDKXP0KNYZTV`.
 
 ## Open decisions for adversarial review
 
