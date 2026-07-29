@@ -105,6 +105,12 @@ pub struct Daemon {
     shutdown_tx: watch::Sender<bool>,
 }
 
+#[derive(Debug, Default)]
+struct PeerOrigin {
+    pid_observed: bool,
+    supervised_agents: std::collections::HashSet<String>,
+}
+
 impl Daemon {
     #[cfg(test)]
     pub(crate) fn space_handle(&self) -> Space {
@@ -649,9 +655,20 @@ impl Daemon {
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _)) => {
+                            let peer_pid = stream
+                                .peer_cred()
+                                .ok()
+                                .and_then(|credentials| credentials.pid())
+                                .and_then(|pid| u32::try_from(pid).ok());
+                            let origin = PeerOrigin {
+                                pid_observed: peer_pid.is_some(),
+                                supervised_agents: peer_pid
+                                    .map(|pid| daemon.supervisor.supervised_agents_for_peer(pid))
+                                    .unwrap_or_default(),
+                            };
                             let daemon = Arc::clone(&daemon);
                             tokio::spawn(async move {
-                                if let Err(e) = daemon.serve_conn(stream).await {
+                                if let Err(e) = daemon.serve_conn(stream, origin).await {
                                     debug!(error = %e, "connection ended with error");
                                 }
                             });
@@ -704,7 +721,11 @@ impl Daemon {
         }))
     }
 
-    async fn serve_conn(&self, stream: UnixStream) -> std::io::Result<()> {
+    async fn serve_conn(
+        &self,
+        stream: UnixStream,
+        origin: PeerOrigin,
+    ) -> std::io::Result<()> {
         let (read, mut write) = stream.into_split();
         let mut read = BufReader::new(read);
         let mut buf = Vec::new();
@@ -749,7 +770,7 @@ impl Daemon {
                     codes::UNAUTHORIZED,
                     "invalid daemon token",
                 )),
-                Ok(req) if !self.authorized(&req) => Outcome::Reply(Response::err(
+                Ok(req) if !self.authorized(&req, &origin) => Outcome::Reply(Response::err(
                     req.id,
                     codes::FORBIDDEN,
                     format!("{} is not authorized for {}", req.caller, req.method),
@@ -792,8 +813,23 @@ impl Daemon {
         }
     }
 
-    fn authorized(&self, req: &Request) -> bool {
-        if req.caller == "operator" || req.caller.is_empty() {
+    fn authorized(&self, req: &Request, origin: &PeerOrigin) -> bool {
+        let operator = req.caller == "operator" || req.caller.is_empty();
+        // The bearer root token alone is not operator authority. A local
+        // connection must have a kernel-observed pid, and a connection rooted
+        // in exactly one supervised agent may claim only that agent. This
+        // closes both `env -u RK_AGENT -u RK_AUTH_TOKEN rk ...` and
+        // cross-agent token derivation from the same-user root credential.
+        if !origin.pid_observed && operator {
+            return false;
+        }
+        if !origin.supervised_agents.is_empty()
+            && (origin.supervised_agents.len() != 1
+                || !origin.supervised_agents.contains(&req.caller))
+        {
+            return false;
+        }
+        if operator {
             return true;
         }
         if req.auth != rk_core::paths::derive_agent_token(&self.auth_token, &req.caller) {

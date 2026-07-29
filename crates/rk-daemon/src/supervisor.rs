@@ -16,7 +16,7 @@ use rk_ledger::{Budget, BudgetAction, BudgetScope, DispatchCheck, FleetBudget};
 use rk_space::Space;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
@@ -2554,6 +2554,64 @@ impl Supervisor {
         self.lock_registry().get_any(name).cloned()
     }
 
+    /// Resolve which non-dismissed supervised agent(s) own a local client
+    /// process.
+    ///
+    /// Agent-supplied environment is not authority: a harness can clear
+    /// `RK_AGENT` and `RK_AUTH_TOKEN`, and all harnesses run as the same Unix
+    /// user that owns `RK_HOME/auth.token`. The server therefore binds a
+    /// connection to kernel-observed process ancestry, process group, and
+    /// worktree cwd before it considers the request's claimed caller.
+    ///
+    /// The worktree check is also what covers attach-mode agents launched by
+    /// herdr, whose root pid is not owned by the daemon. Matching every observed
+    /// owner (rather than picking the first) makes an ambiguous cross-worktree
+    /// process fail closed at the server boundary.
+    pub(crate) fn supervised_agents_for_peer(&self, peer_pid: u32) -> HashSet<String> {
+        let agents: Vec<_> = self
+            .lock_registry()
+            .list()
+            .into_iter()
+            // A harness may keep running after it reports Completed, and an
+            // attach-mode pane deliberately does. Its worktree stays an agent
+            // authority domain until dismissal tears that session down.
+            .filter(|record| record.state != AgentState::Dismissed)
+            .map(|record| {
+                let worktree = record.worktree.as_ref().map(|worktree| {
+                    std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.clone())
+                });
+                (record.name.clone(), record.pid, worktree)
+            })
+            .collect();
+
+        let mut owners = HashSet::new();
+        let mut seen = HashSet::new();
+        let mut pid = Some(peer_pid);
+        // A normal harness tree is only a few processes deep. The cap keeps a
+        // corrupted platform response from turning authentication into a loop.
+        for _ in 0..64 {
+            let Some(current) = pid.filter(|current| *current > 1 && seen.insert(*current)) else {
+                break;
+            };
+            let Some(info) = process_info(current) else {
+                break;
+            };
+            for (name, root_pid, worktree) in &agents {
+                let root_matches = root_pid
+                    .is_some_and(|root| root == current || Some(root) == info.process_group);
+                let worktree_matches = worktree
+                    .as_ref()
+                    .zip(info.cwd.as_ref())
+                    .is_some_and(|(worktree, cwd)| cwd.starts_with(worktree));
+                if root_matches || worktree_matches {
+                    owners.insert(name.clone());
+                }
+            }
+            pid = info.parent;
+        }
+        owners
+    }
+
     /// Persist a bounded semantic checkpoint for the authenticated agent's
     /// current generation and publish a compact coordinator event.
     pub fn record_progress(
@@ -2999,6 +3057,90 @@ impl Supervisor {
             Err(p) => p.into_inner(),
         }
     }
+}
+
+struct ProcessInfo {
+    parent: Option<u32>,
+    process_group: Option<u32>,
+    cwd: Option<PathBuf>,
+}
+
+#[cfg(target_os = "macos")]
+fn process_info(pid: u32) -> Option<ProcessInfo> {
+    use std::ffi::CStr;
+    use std::mem::{size_of, zeroed};
+
+    // SAFETY: proc_pidinfo initializes exactly the requested libc structures.
+    // Both calls are read-only process metadata queries for a same-user peer.
+    unsafe {
+        let mut bsd: libc::proc_bsdinfo = zeroed();
+        let bsd_size = size_of::<libc::proc_bsdinfo>() as i32;
+        if libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut bsd as *mut _ as *mut libc::c_void,
+            bsd_size,
+        ) != bsd_size
+        {
+            return None;
+        }
+
+        let mut vnode: libc::proc_vnodepathinfo = zeroed();
+        let vnode_size = size_of::<libc::proc_vnodepathinfo>() as i32;
+        let cwd = if libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut vnode as *mut _ as *mut libc::c_void,
+            vnode_size,
+        ) == vnode_size
+        {
+            let path = vnode.pvi_cdir.vip_path.as_ptr() as *const libc::c_char;
+            CStr::from_ptr(path)
+                .to_str()
+                .ok()
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+        } else {
+            None
+        };
+
+        Some(ProcessInfo {
+            parent: (bsd.pbi_ppid > 0).then_some(bsd.pbi_ppid),
+            process_group: (bsd.pbi_pgid > 0).then_some(bsd.pbi_pgid),
+            cwd,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_info(pid: u32) -> Option<ProcessInfo> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The comm field is parenthesized and may contain spaces or `)`, so split
+    // after its final close paren. Remaining fields begin state, ppid, pgrp.
+    let fields: Vec<_> = stat.get(stat.rfind(')')? + 1..)?.split_whitespace().collect();
+    let parent = fields.get(1)?.parse::<u32>().ok().filter(|pid| *pid > 0);
+    let process_group = fields.get(2)?.parse::<u32>().ok().filter(|pid| *pid > 0);
+    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
+    Some(ProcessInfo {
+        parent,
+        process_group,
+        cwd,
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_info(pid: u32) -> Option<ProcessInfo> {
+    // Process-group ownership still covers headless harnesses on other Unix
+    // targets. Attach-mode ancestry/cwd support is implemented on macOS/Linux,
+    // the two deployment targets with a stable peer-pid API in this project.
+    let process_group = unsafe { libc::getpgid(pid as libc::pid_t) };
+    Some(ProcessInfo {
+        parent: None,
+        process_group: (process_group > 0).then_some(process_group as u32),
+        cwd: None,
+    })
 }
 
 #[cfg(test)]

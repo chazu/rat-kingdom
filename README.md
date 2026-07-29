@@ -369,6 +369,14 @@ Env: `RK_HOME` (state dir), `RK_LOG` (tracing filter), `RK_CONFIG_*`
 (`RK_AGENT`, `RK_TASK`, ...) are reserved for agent identity — set at spawn,
 never read as config.
 
+Local RPC authorization does not trust those environment variables or the
+bearer token alone. The daemon also binds each Unix-socket connection to its
+kernel-reported process origin. A process launched in a supervised agent tree
+or live agent worktree may claim only that agent, even if it clears
+`RK_AGENT`/`RK_AUTH_TOKEN` and can read the same-user `RK_HOME/auth.token`.
+Operator commands therefore fail closed when run from inside an agent
+worktree; run them from an operator checkout or another non-agent directory.
+
 ### `[drain]` — continuous-drain autoscaler
 
 Turning on `[drain]` hands the dispatch loop to the daemon: it keeps up to
