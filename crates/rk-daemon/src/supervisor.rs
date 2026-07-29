@@ -6,7 +6,7 @@ use crate::agents::{AgentProgress, AgentRecord, AgentState, Registry};
 use chrono::{DateTime, Utc};
 use rk_core::config::{MergeMode, SupervisorConfig};
 use rk_core::paths::Layout;
-use rk_core::prime::{render, PrimeContext, MAX_INJECTED_FACTS};
+use rk_core::prime::{render, PrimeContext, VerificationCheck, MAX_INJECTED_FACTS};
 use rk_core::tuple::{Category, Pattern, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
 use rk_git::{agent_branch, Repo};
 use rk_harness::{make_harness, HarnessEvent, LaunchSpec, SessionControl, TokenUsage};
@@ -523,6 +523,7 @@ impl Supervisor {
             parent: params.parent.clone(),
             facts: self.scan_facts(&repo_name),
             conventions: self.scan_conventions(&repo_name),
+            verification_checks: self.scan_verification_checks(&worktree),
         };
         let prompt = params
             .prompt
@@ -823,6 +824,7 @@ impl Supervisor {
             parent: record.parent.clone(),
             facts: self.scan_facts(&record.repo_name),
             conventions: self.scan_conventions(&record.repo_name),
+            verification_checks: self.scan_verification_checks(&worktree),
         };
         let spec = LaunchSpec {
             prompt: format!(
@@ -1128,6 +1130,33 @@ impl Supervisor {
             }
         }
         texts
+    }
+
+    /// Repo-owned named verification checks for a rat's worktree. A malformed
+    /// or absent registry must not make priming fail: the worker gets the
+    /// universal "do not guess" guidance and the workflow gate still fails
+    /// closed when it explicitly references a bad check.
+    fn scan_verification_checks(&self, worktree: &std::path::Path) -> Vec<VerificationCheck> {
+        let file = worktree.join(".rk").join("checks.cue");
+        if !file.exists() {
+            return Vec::new();
+        }
+        match rk_workflow::load_checks(&file) {
+            Ok(checks) => checks
+                .into_iter()
+                .map(|check| VerificationCheck {
+                    name: check.name,
+                    command: check.command,
+                    cwd: check.cwd,
+                    expect_exit: check.expect_exit,
+                    timeout: check.timeout,
+                })
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, path = %file.display(), "failed to load verification checks for priming");
+                Vec::new()
+            }
+        }
     }
 
     /// Recent facts for a rat spawned into repo: newest facts from the system

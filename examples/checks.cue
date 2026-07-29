@@ -7,6 +7,12 @@
 // or untrusted workflow definition can only ever run the checks listed HERE,
 // never arbitrary shell in an agent's worktree.
 //
+// A valid registry is also rendered into spawned and resumed worker prompts as
+// optional Repository verification checks guidance. The prompt shows the
+// declared metadata, while workflow run steps remain the authoritative gate.
+// A missing or invalid registry falls back to generic prompt guidance and does
+// not make priming fail.
+//
 // The command still runs via `sh -c` in the active rat's worktree, but the text
 // is fixed by this repo-owned file, which is the whole point of the allowlist.
 checks: [

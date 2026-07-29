@@ -168,6 +168,17 @@ from the outside (repos, tickets, spawn, watch, steer, dismiss). Spawned rats
 carry `RK_ROLE`, so `rk prime` inside a rat automatically renders that rat's
 own role instead.
 
+Worker prompts stay project-agnostic by default. When a repository contains a
+valid `.rk/checks.cue`, the daemon adds its named checks to the spawned and
+resumed worker's prompt as **Repository verification checks**. The section
+shows each check's name, command, working directory, expected exit, and timeout;
+the command is repository-owned guidance, not extra prompt instructions. A
+worker should prefer the `verify` check when present, otherwise choose the
+relevant declared check for its task. Workflow `run` steps remain the
+authoritative, fail-closed gate. Missing or malformed check registries do not
+prevent priming; the worker receives the generic instruction to report a
+missing gate instead of inventing a project-specific command.
+
 ## The tuplespace
 
 Coordination substrate and audit log in one. Tuples are
@@ -487,7 +498,8 @@ workflow: {
   compromised or untrusted workflow definition can invoke only the repo owner's
   registered checks — never arbitrary shell. A named check supplies its own
   command/cwd/`expectExit`/timeout; the step may override cwd/`expectExit`/timeout.
-  See `examples/workflows/named-check-merge.cue`.
+  The same registry is surfaced as optional guidance in spawned worker prompts;
+  it does not replace the workflow gate. See `examples/workflows/named-check-merge.cue`.
 
 ## Reactor (triggers)
 

@@ -162,3 +162,74 @@ async fn promoted_convention_reaches_spawned_rat_prompt() {
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
+
+#[tokio::test]
+async fn repo_named_checks_reach_spawned_rat_prompt() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+    std::fs::create_dir_all(repo_dir.path().join(".rk")).unwrap();
+    std::fs::write(
+        repo_dir.path().join(".rk/checks.cue"),
+        r#"checks: [
+    {name: "verify", command: "mise run verify", cwd: "crates/example", expectExit: 0, timeout: "15m"},
+]
+"#,
+    )
+    .unwrap();
+    git(repo_dir.path(), &["add", ".rk/checks.cue"]);
+    git(
+        repo_dir.path(),
+        &["commit", "-m", "declare verification check"],
+    );
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", CAPTURE_PRIME);
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let spawned = client
+        .call(
+            "agent.spawn",
+            json!({
+                "repo": repo_dir.path().to_string_lossy(),
+                "task": "prime-check",
+                "harness": "fake",
+            }),
+        )
+        .await
+        .unwrap();
+    let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+
+    let mut completed = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = client
+            .call("agent.status", json!({"name": name}))
+            .await
+            .unwrap();
+        if status["agent"]["state"] == "completed" {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "agent never completed");
+
+    client
+        .call("agent.dismiss", json!({"name": name}))
+        .await
+        .unwrap();
+    let primed = git_out(repo_dir.path(), &["show", "main:primed.txt"]);
+    assert!(
+        primed.contains("## Repository verification checks"),
+        "repo checks should add a verification section:\n{primed}"
+    );
+    assert!(primed.contains("- `verify`"));
+    assert!(primed.contains("command: \"mise run verify\""));
+    assert!(primed.contains("cwd: \"crates/example\""));
+    assert!(primed.contains("expected exit: 0"));
+    assert!(primed.contains("timeout: \"15m\""));
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}

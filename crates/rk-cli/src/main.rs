@@ -808,6 +808,7 @@ async fn main() -> Result<()> {
                 // `rk prime` inspects the template shape; live conventions are
                 // scanned and injected by the supervisor at spawn time.
                 conventions: Vec::new(),
+                verification_checks: Vec::new(),
             };
             let text = rk_core::prime::render(&role, &ctx);
             if cli.json {
