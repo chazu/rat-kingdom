@@ -2168,13 +2168,19 @@ impl Daemon {
             .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))?
             .get(id)
             .ok_or_else(|| rk_core::Error::other(format!("no such onboarding session: {id}")))?;
-        let Some(agent_name) = session.agent.as_deref() else {
+        let recovered = session
+            .agent
+            .as_deref()
+            .and_then(|name| self.supervisor.status(name))
+            .or_else(|| self.supervisor.onboarding_agent(id));
+        let Some(recovered) = recovered else {
             return Ok(session);
         };
+        let agent_name = recovered.name.clone();
         let agent = self
             .supervisor
-            .reconcile_attached(agent_name)?
-            .or_else(|| self.supervisor.status(agent_name))
+            .reconcile_attached(&agent_name)?
+            .or_else(|| self.supervisor.status(&agent_name))
             .ok_or_else(|| {
                 rk_core::Error::other(format!(
                     "onboarding session {id} references missing agent {agent_name}"

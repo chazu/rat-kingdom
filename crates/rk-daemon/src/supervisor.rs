@@ -2742,6 +2742,23 @@ impl Supervisor {
         self.lock_registry().get_any(name).cloned()
     }
 
+    /// Recover the supervisor side of a session whose session journal did not
+    /// yet persist its linked agent. Spawn journals the agent before worktree
+    /// creation, so matching the dedicated role + stable session task closes
+    /// the crash window without allocating a duplicate branch/worktree.
+    pub fn onboarding_agent(&self, session: &str) -> Option<AgentRecord> {
+        self.lock_registry()
+            .list()
+            .into_iter()
+            .filter(|record| {
+                record.role == ONBOARDER_ROLE
+                    && record.task.as_deref() == Some(session)
+                    && record.state != AgentState::Dismissed
+            })
+            .max_by_key(|record| record.created_at)
+            .cloned()
+    }
+
     /// Reconcile an attach-mode record against herdr. Losing the terminal that
     /// ran `rk attach` changes nothing; losing the pane itself turns the
     /// durable record into an orphan that `repo onboard resume` can recover.

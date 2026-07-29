@@ -375,6 +375,21 @@ async fn onboarding_sessions_are_durable_resumable_and_capability_scoped() {
         .unwrap()
         .unwrap();
 
+    // Simulate the narrow crash window after the supervisor journaled its
+    // agent but before the session journal linked that name. Recovery matches
+    // the dedicated role + stable session task instead of allocating a second
+    // owner for the same branch/worktree.
+    let sessions_path = home.path().join("onboarding-sessions.json");
+    let mut sessions: Value =
+        serde_json::from_slice(&std::fs::read(&sessions_path).unwrap()).unwrap();
+    sessions[headless_id.as_str()]["agent"] = Value::Null;
+    sessions[headless_id.as_str()]["state"] = json!("starting");
+    std::fs::write(
+        &sessions_path,
+        serde_json::to_vec_pretty(&sessions).unwrap(),
+    )
+    .unwrap();
+
     let daemon_b = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle_b = tokio::spawn(daemon_b.run());
     let mut operator = connect(&layout).await;
@@ -418,7 +433,7 @@ async fn onboarding_sessions_are_durable_resumable_and_capability_scoped() {
     assert_eq!(resumed_attached["session"]["state"], "running");
     assert_eq!(resumed_attached["session"]["attached"], true);
 
-    let persisted = std::fs::read_to_string(home.path().join("onboarding-sessions.json")).unwrap();
+    let persisted = std::fs::read_to_string(&sessions_path).unwrap();
     assert!(persisted.contains(&completed_id));
     assert!(persisted.contains(&headless_id));
     assert!(persisted.contains(&attached_id));
