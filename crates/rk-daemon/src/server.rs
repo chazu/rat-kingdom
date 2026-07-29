@@ -2,8 +2,8 @@
 //! them. Hosts the tuplespace; `space.watch` upgrades a connection to a
 //! server-push event stream.
 
-use crate::proto::{codes, Request, Response};
 use crate::coordinator::CoordinatorFilter;
+use crate::proto::{codes, Request, Response};
 use chrono::{DateTime, Utc};
 use rk_core::id::RecordId;
 use rk_core::paths::Layout;
@@ -97,6 +97,7 @@ pub struct Daemon {
     auth_token: String,
     engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
     repos: std::sync::Mutex<crate::repos::RepoRegistry>,
+    onboarding_sessions: std::sync::Mutex<crate::onboarding_sessions::OnboardingSessions>,
     tickets: Arc<crate::tickets::Tickets>,
     coordinator_sessions: std::sync::Mutex<crate::coordinator::CoordinatorSessions>,
     /// Serializes read/append cycles for one agent's effective fact vote.
@@ -289,11 +290,14 @@ impl Daemon {
         let repos = std::sync::Mutex::new(crate::repos::RepoRegistry::load(
             &layout.home().join("repos.json"),
         )?);
-        let coordinator_sessions = std::sync::Mutex::new(
-            crate::coordinator::CoordinatorSessions::load(
+        let onboarding_sessions =
+            std::sync::Mutex::new(crate::onboarding_sessions::OnboardingSessions::load(
+                &layout.home().join("onboarding-sessions.json"),
+            )?);
+        let coordinator_sessions =
+            std::sync::Mutex::new(crate::coordinator::CoordinatorSessions::load(
                 &layout.home().join("coordinator-sessions.json"),
-            )?,
-        );
+            )?);
         Ok(Self {
             layout,
             space,
@@ -321,6 +325,7 @@ impl Daemon {
             auth_token,
             engine: std::sync::OnceLock::new(),
             repos,
+            onboarding_sessions,
             tickets,
             coordinator_sessions,
             fact_vote_lock: std::sync::Mutex::new(()),
@@ -371,6 +376,14 @@ impl Daemon {
         info!(socket = %sock.display(), pid = std::process::id(), castle = %self.castle_display, "daemon listening");
         // Only now that the bind is won may shared state be touched.
         self.supervisor.on_daemon_started();
+        match self.onboarding_sessions.lock() {
+            Ok(mut sessions) => {
+                if let Err(error) = sessions.orphan_nonterminal() {
+                    warn!(%error, "failed to orphan onboarding sessions");
+                }
+            }
+            Err(_) => warn!("onboarding session registry lock poisoned"),
+        }
 
         let daemon = Arc::new(self);
         let mut shutdown_rx = daemon.shutdown_tx.subscribe();
@@ -721,11 +734,7 @@ impl Daemon {
         }))
     }
 
-    async fn serve_conn(
-        &self,
-        stream: UnixStream,
-        origin: PeerOrigin,
-    ) -> std::io::Result<()> {
+    async fn serve_conn(&self, stream: UnixStream, origin: PeerOrigin) -> std::io::Result<()> {
         let (read, mut write) = stream.into_split();
         let mut read = BufReader::new(read);
         let mut buf = Vec::new();
@@ -797,9 +806,7 @@ impl Daemon {
                     rx,
                 } => {
                     write_json_line(&mut write, &response).await?;
-                    return self
-                        .stream_coordinator(write, filter, boundary, rx)
-                        .await;
+                    return self.stream_coordinator(write, filter, boundary, rx).await;
                 }
                 Outcome::LogFollow {
                     response,
@@ -835,6 +842,14 @@ impl Daemon {
         if req.auth != rk_core::paths::derive_agent_token(&self.auth_token, &req.caller) {
             return false;
         }
+        if let Some(record) = self.supervisor.status(&req.caller) {
+            if record.role == crate::onboarding_sessions::ONBOARDER_ROLE {
+                return self.onboarder_authorized(req);
+            }
+            if crate::supervisor::validate_role(&record.role).is_err() {
+                return false;
+            }
+        }
         if !matches!(
             req.method.as_str(),
             "stop"
@@ -848,6 +863,10 @@ impl Daemon {
                 | "agent.revert"
                 | "repo.add"
                 | "repo.remove"
+                | "repo.onboard.start"
+                | "repo.onboard.resume"
+                | "repo.onboard.status"
+                | "repo.onboard.report"
                 | "workflow.run"
                 | "workflow.approve"
                 | "workflow.archive"
@@ -877,6 +896,42 @@ impl Daemon {
                     | "agent.interrupt"
                     | "agent.steer"
             )
+    }
+
+    /// Enforced capability profile for the onboarding role. This is
+    /// intentionally much smaller than the ordinary rat surface: inspection
+    /// reads, self progress, and the one completion event required by `rk
+    /// done`. It is evaluated after peer-origin and token binding, so clearing
+    /// ambient identity cannot select the operator arm above.
+    fn onboarder_authorized(&self, req: &Request) -> bool {
+        match req.method.as_str() {
+            "ping"
+            | "status"
+            | "space.scan"
+            | "space.rd"
+            | "repo.list"
+            | "repo.get"
+            | "repo.onboard.inspect"
+            | "agent.status"
+            | "agent.log"
+            | "agent.progress" => true,
+            "space.out" => {
+                req.params.get("category").and_then(Value::as_str) == Some("event")
+                    && req.params.get("identity").and_then(Value::as_str) == Some("task_done")
+                    && req
+                        .params
+                        .get("instance")
+                        .and_then(Value::as_str)
+                        .is_none_or(|instance| instance == req.caller)
+                    && req
+                        .params
+                        .get("payload")
+                        .and_then(|payload| payload.get("agent"))
+                        .and_then(Value::as_str)
+                        == Some(req.caller.as_str())
+            }
+            _ => false,
+        }
     }
 
     fn authenticated(&self, req: &Request) -> bool {
@@ -981,10 +1036,8 @@ impl Daemon {
         let rx = self.space.subscribe_coordinator();
         let baseline = self.latest_event_cursor();
         let scanned = if filter.after.is_some() {
-            self.space.coordinator_events_after(
-                filter.after,
-                crate::coordinator::MAX_REPLAY_EVENTS + 1,
-            )?
+            self.space
+                .coordinator_events_after(filter.after, crate::coordinator::MAX_REPLAY_EVENTS + 1)?
         } else {
             Vec::new()
         };
@@ -1056,7 +1109,9 @@ impl Daemon {
                 Ok(sessions) => sessions,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            sessions.cursor(&coordinator).unwrap_or(filter.after.unwrap_or(0))
+            sessions
+                .cursor(&coordinator)
+                .unwrap_or(filter.after.unwrap_or(0))
         };
         filter.after = Some(cursor);
         match self.coordinator_pending(&filter) {
@@ -1081,10 +1136,9 @@ impl Daemon {
     }
 
     fn coordinator_pending(&self, filter: &CoordinatorFilter) -> rk_core::Result<Value> {
-        let scanned = self.space.coordinator_events_after(
-            filter.after,
-            crate::coordinator::MAX_REPLAY_EVENTS + 1,
-        )?;
+        let scanned = self
+            .space
+            .coordinator_events_after(filter.after, crate::coordinator::MAX_REPLAY_EVENTS + 1)?;
         let replay = crate::coordinator::replay(scanned, filter);
         let snapshot = self.coordinator_snapshot(filter)?;
         Ok(json!({
@@ -1149,10 +1203,12 @@ impl Daemon {
                 Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
             },
             "coordinator.snapshot" => match parse_params::<CoordinatorFilter>(&req.params) {
-                Ok(filter) if filter_is_valid(&filter) => match self.coordinator_snapshot(&filter) {
+                Ok(filter) if filter_is_valid(&filter) => {
+                    match self.coordinator_snapshot(&filter) {
                     Ok(snapshot) => reply(Response::ok(id, snapshot)),
                     Err(e) => reply(Response::err(id, codes::INTERNAL, e.to_string())),
-                },
+                    }
+                }
                 Ok(_) => reply(Response::err(
                     id,
                     codes::BAD_PARAMS,
@@ -1164,14 +1220,12 @@ impl Daemon {
             "coordinator.pending" => reply(self.handle_coordinator_pending(req)),
             "coordinator.ack" => reply(self.handle_coordinator_ack(req)),
             "coordinator.watch" => match parse_params::<CoordinatorFilter>(&req.params) {
-                Ok(filter) if filter_is_valid(&filter) => match self.prepare_coordinator_watch(id, filter) {
+                Ok(filter) if filter_is_valid(&filter) => {
+                    match self.prepare_coordinator_watch(id, filter) {
                     Ok(outcome) => outcome,
-                    Err(e) => reply(Response::err(
-                        req.id,
-                        codes::INTERNAL,
-                        e.to_string(),
-                    )),
-                },
+                        Err(e) => reply(Response::err(req.id, codes::INTERNAL, e.to_string())),
+                    }
+                }
                 Ok(_) => reply(Response::err(
                     id,
                     codes::BAD_PARAMS,
@@ -1439,11 +1493,15 @@ impl Daemon {
                 Err(_) => Response::err(id, codes::INTERNAL, "repo registry lock poisoned"),
             }),
             "repo.get" => reply(self.handle_repo_get(req)),
+            "repo.onboard.start" => reply(self.handle_onboarding_start(req).await),
+            "repo.onboard.resume" => reply(self.handle_onboarding_resume(req).await),
+            "repo.onboard.status" => reply(self.handle_onboarding_status(req)),
+            "repo.onboard.report" => reply(self.handle_onboarding_report(req)),
             "repo.onboard.inspect" => {
                 let params: RepoInspectParams = match parse_params(&req.params) {
                     Ok(params) => params,
                     Err(error) => {
-                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error))
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
                     }
                 };
                 let registered = match self.repos.lock() {
@@ -1453,7 +1511,7 @@ impl Daemon {
                             id,
                             codes::INTERNAL,
                             "repo registry lock poisoned",
-                        ))
+                        ));
                     }
                 };
                 let context = crate::onboarding::InspectContext {
@@ -1517,9 +1575,8 @@ impl Daemon {
         };
         // Open PRs/MRs: a PR-mode dismiss/land emits a `pull_request_opened`
         // event, then the run completes — nothing else tracks the pushed branch.
-        let pull_requests = match scan(
-            &Pattern::category(Category::Event).identity("pull_request_opened"),
-        ) {
+        let pull_requests =
+            match scan(&Pattern::category(Category::Event).identity("pull_request_opened")) {
             Ok(t) => t,
             Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
         };
@@ -1529,9 +1586,8 @@ impl Daemon {
         // LOCAL detection below could not see it. `build` folds their branches
         // into the same suppression. Reading the events is cheap and stays on
         // the hot path; the fetch that produces them does not.
-        let pull_requests_closed = match scan(
-            &Pattern::category(Category::Event).identity("pull_request_closed"),
-        ) {
+        let pull_requests_closed =
+            match scan(&Pattern::category(Category::Event).identity("pull_request_closed")) {
             Ok(t) => t,
             Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
         };
@@ -1574,7 +1630,7 @@ impl Daemon {
         ) {
             (Ok(s), Ok(e), Ok(c), Ok(w)) => (s, e, c, w),
             (Err(e), _, _, _) | (_, Err(e), _, _) | (_, _, Err(e), _) | (_, _, _, Err(e)) => {
-                return Response::err(id, codes::INTERNAL, e.to_string())
+                return Response::err(id, codes::INTERNAL, e.to_string());
             }
         };
         // Both branch-shaped rows auto-clear once their branch is merged into
@@ -1850,7 +1906,7 @@ impl Daemon {
                     req.id,
                     codes::INTERNAL,
                     format!("repo inspection task failed: {e}"),
-                )
+                );
             }
         };
         let record = crate::repos::RepoRecord {
@@ -1884,6 +1940,314 @@ impl Daemon {
             Some(record) => Response::ok(req.id, json!({"repo": record})),
             None => Response::ok(req.id, json!({"repo": null})),
         }
+    }
+
+    async fn handle_onboarding_start(&self, req: Request) -> Response {
+        let params: RepoOnboardingStartParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let harness = params
+            .harness
+            .clone()
+            .unwrap_or_else(|| self.default_harness.clone());
+        let registered = match self.repos.lock() {
+            Ok(registry) => registry.list(),
+            Err(_) => return Response::err(req.id, codes::INTERNAL, "repo registry lock poisoned"),
+        };
+        let target = params.target.clone();
+        let context = crate::onboarding::InspectContext {
+            default_harness: harness.clone(),
+            require_named_checks: self.require_named_checks,
+        };
+        let assessment = match tokio::task::spawn_blocking(move || {
+            crate::onboarding::inspect(&target, &registered, &context)
+        })
+        .await
+        {
+            Ok(assessment) => assessment,
+            Err(error) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    format!("repository inspection task failed: {error}"),
+                );
+            }
+        };
+        let Some(repo_path) = assessment
+            .identity
+            .canonical_path
+            .as_deref()
+            .map(std::path::PathBuf::from)
+        else {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                "repository identity did not resolve; run `rk repo onboard inspect` for findings",
+            );
+        };
+        let path_for_git = repo_path.clone();
+        let (repo_name, base_branch) = match tokio::task::spawn_blocking(move || {
+            let repo = rk_git::Repo::discover(&path_for_git)?;
+            Ok::<_, rk_core::Error>((repo.name(), repo.current_branch()?))
+        })
+        .await
+        {
+            Ok(Ok(identity)) => identity,
+            Ok(Err(error)) => return Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+            Err(error) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    format!("repository identity task failed: {error}"),
+                );
+            }
+        };
+        let candidate = crate::onboarding_sessions::OnboardingSession::starting(
+            params.target,
+            repo_name,
+            repo_path,
+            base_branch,
+            harness,
+            params.attach,
+            assessment,
+            &self.layout.worktrees_dir(),
+        );
+        let (session, created) = {
+            let mut sessions = match self.onboarding_sessions.lock() {
+                Ok(sessions) => sessions,
+                Err(_) => {
+                    return Response::err(
+                        req.id,
+                        codes::INTERNAL,
+                        "onboarding session registry lock poisoned",
+                    );
+                }
+            };
+            match sessions.insert_if_absent(candidate) {
+                Ok(result) => result,
+                Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+            }
+        };
+        if !created {
+            return match self.reconcile_onboarding_session(&session.id) {
+                Ok(session) => Response::ok(req.id, onboarding_payload(&session, true)),
+                Err(error) => Response::err(req.id, codes::FORBIDDEN, error.to_string()),
+            };
+        }
+
+        match self.launch_onboarding_agent(&session, params.attach).await {
+            Ok(record) => {
+                let updated =
+                    match self.update_onboarding_from_agent(&session.id, &record, params.attach) {
+                        Ok(updated) => updated,
+                        Err(error) => {
+                            return Response::err(req.id, codes::INTERNAL, error.to_string());
+                        }
+                    };
+                Response::ok(req.id, onboarding_payload(&updated, false))
+            }
+            Err(error) => {
+                let _ = self.update_onboarding_failure(&session.id, error.to_string());
+                Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    format!(
+                        "onboarding session {} was journaled but launch failed: {error}",
+                        session.id
+                    ),
+                )
+            }
+        }
+    }
+
+    async fn handle_onboarding_resume(&self, req: Request) -> Response {
+        let params: RepoOnboardingResumeParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let session = match self.reconcile_onboarding_session(&params.session) {
+            Ok(session) => session,
+            Err(error) => return Response::err(req.id, codes::FORBIDDEN, error.to_string()),
+        };
+        if matches!(
+            session.state,
+            crate::onboarding_sessions::OnboardingSessionState::Running
+                | crate::onboarding_sessions::OnboardingSessionState::Starting
+                | crate::onboarding_sessions::OnboardingSessionState::Completed
+        ) {
+            return Response::ok(req.id, onboarding_payload(&session, true));
+        }
+
+        let resumed = if let Some(agent) = session.agent.as_deref() {
+            if session.worktree.exists() {
+                self.supervisor
+                    .respawn_onboarding_async(agent.to_string(), params.attach)
+                    .await
+            } else {
+                self.launch_onboarding_agent(&session, params.attach).await
+            }
+        } else {
+            self.launch_onboarding_agent(&session, params.attach).await
+        };
+        match resumed {
+            Ok(record) => {
+                match self.update_onboarding_from_agent(&session.id, &record, params.attach) {
+                    Ok(updated) => Response::ok(req.id, onboarding_payload(&updated, false)),
+                    Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
+                }
+            }
+            Err(error) => {
+                let _ = self.update_onboarding_failure(&session.id, error.to_string());
+                Response::err(req.id, codes::INTERNAL, error.to_string())
+            }
+        }
+    }
+
+    fn handle_onboarding_status(&self, req: Request) -> Response {
+        let params: RepoOnboardingSessionParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        match self.reconcile_onboarding_session(&params.session) {
+            Ok(session) => Response::ok(req.id, json!({"session": session.status()})),
+            Err(error) => Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+        }
+    }
+
+    fn handle_onboarding_report(&self, req: Request) -> Response {
+        let params: RepoOnboardingSessionParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        match self.reconcile_onboarding_session(&params.session) {
+            Ok(session) => Response::ok(req.id, json!({"report": session.report()})),
+            Err(error) => Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+        }
+    }
+
+    async fn launch_onboarding_agent(
+        &self,
+        session: &crate::onboarding_sessions::OnboardingSession,
+        attach: bool,
+    ) -> rk_core::Result<crate::agents::AgentRecord> {
+        let assessment = serde_json::to_string_pretty(&session.assessment)?;
+        self.supervisor
+            .spawn_async(crate::supervisor::SpawnParams {
+                repo: session.repo_path.to_string_lossy().into_owned(),
+                task: session.id.clone(),
+                prompt: Some(format!(
+                    "Assess this repository read-only for onboarding session {}. \
+                     The daemon's deterministic starting assessment follows. Confirm \
+                     evidence, report ambiguity, and finish with `rk done`; do not edit \
+                     or commit anything.\n\n{}",
+                    session.id, assessment
+                )),
+                role: crate::onboarding_sessions::ONBOARDER_ROLE.into(),
+                coordination: None,
+                harness: Some(session.harness.clone()),
+                parent: None,
+                base: Some(session.base_branch.clone()),
+                model: None,
+                permission_mode: None,
+                attach,
+                workflow_instance: None,
+                coordinator: None,
+                instance_max_usd: None,
+            })
+            .await
+    }
+
+    fn reconcile_onboarding_session(
+        &self,
+        id: &str,
+    ) -> rk_core::Result<crate::onboarding_sessions::OnboardingSession> {
+        let session = self
+            .onboarding_sessions
+            .lock()
+            .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))?
+            .get(id)
+            .ok_or_else(|| rk_core::Error::other(format!("no such onboarding session: {id}")))?;
+        let recovered = session
+            .agent
+            .as_deref()
+            .and_then(|name| self.supervisor.status(name))
+            .or_else(|| self.supervisor.onboarding_agent(id));
+        let Some(recovered) = recovered else {
+            return Ok(session);
+        };
+        let agent_name = recovered.name.clone();
+        let agent = self
+            .supervisor
+            .reconcile_attached(&agent_name)?
+            .or_else(|| self.supervisor.status(&agent_name))
+            .ok_or_else(|| {
+                rk_core::Error::other(format!(
+                    "onboarding session {id} references missing agent {agent_name}"
+                ))
+            })?;
+        if agent.role != crate::onboarding_sessions::ONBOARDER_ROLE {
+            return Err(rk_core::Error::other(format!(
+                "onboarding session {id} agent {} has downgraded role {:?}",
+                agent.name, agent.role
+            )));
+        }
+        self.update_onboarding_from_agent(id, &agent, session.attached)
+    }
+
+    fn update_onboarding_from_agent(
+        &self,
+        id: &str,
+        agent: &crate::agents::AgentRecord,
+        attached: bool,
+    ) -> rk_core::Result<crate::onboarding_sessions::OnboardingSession> {
+        let state = match agent.state {
+            crate::agents::AgentState::Spawning => {
+                crate::onboarding_sessions::OnboardingSessionState::Starting
+            }
+            crate::agents::AgentState::Running => {
+                crate::onboarding_sessions::OnboardingSessionState::Running
+            }
+            crate::agents::AgentState::Completed => {
+                crate::onboarding_sessions::OnboardingSessionState::Completed
+            }
+            crate::agents::AgentState::Failed | crate::agents::AgentState::Dismissed => {
+                crate::onboarding_sessions::OnboardingSessionState::Failed
+            }
+            crate::agents::AgentState::Orphaned => {
+                crate::onboarding_sessions::OnboardingSessionState::Orphaned
+            }
+        };
+        self.onboarding_sessions
+            .lock()
+            .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))?
+            .update(id, |session| {
+                session.agent = Some(agent.name.clone());
+                session.branch = agent
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| session.branch.clone());
+                session.worktree = agent
+                    .worktree
+                    .clone()
+                    .unwrap_or_else(|| session.worktree.clone());
+                session.attached = attached;
+                session.attach_target = agent.attach_target.clone();
+                session.agent_result = agent.result.clone();
+                session.state = state;
+            })?
+            .ok_or_else(|| rk_core::Error::other(format!("no such onboarding session: {id}")))
+    }
+
+    fn update_onboarding_failure(&self, id: &str, detail: String) -> rk_core::Result<()> {
+        self.onboarding_sessions
+            .lock()
+            .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))?
+            .update(id, |session| {
+                session.state = crate::onboarding_sessions::OnboardingSessionState::Failed;
+                session.agent_result = Some(detail);
+            })?;
+        Ok(())
     }
 
     async fn handle_ticket_new(&self, req: Request) -> Response {
@@ -1980,10 +2344,7 @@ impl Daemon {
         let mut params = if req.caller == "operator" || req.caller.is_empty() {
             params
         } else {
-            match self
-                .supervisor
-                .prepare_foreman_spawn(&req.caller, params)
-            {
+            match self.supervisor.prepare_foreman_spawn(&req.caller, params) {
                 Ok(p) => p,
                 Err(e) => return Response::err(req.id, codes::FORBIDDEN, e.to_string()),
             }
@@ -2062,7 +2423,12 @@ impl Daemon {
         let handle = tokio::runtime::Handle::current();
         let result = tokio::task::spawn_blocking(move || {
             let _entered = handle.enter();
-            engine.run_owned(&params.name, &params.repo, params.params, params.coordinator)
+            engine.run_owned(
+                &params.name,
+                &params.repo,
+                params.params,
+                params.coordinator,
+            )
         })
         .await;
         match result {
@@ -2348,11 +2714,7 @@ impl Daemon {
             Ok(t) => {
                 if let Some((category, scope, identity, payload)) = attention {
                     self.supervisor.publish_coordination_attention(
-                        &caller,
-                        &category,
-                        &scope,
-                        &identity,
-                        &payload,
+                        &caller, &category, &scope, &identity, &payload,
                     );
                 }
                 Response::ok(req.id, json!({"id": t.id, "written": true}))
@@ -2418,7 +2780,7 @@ impl Daemon {
                         "{sug_id} already promoted to a convention — a promoted norm is \
                          permanent and cannot be withdrawn"
                     ),
-                )
+                );
             }
             Ok(_) => {}
             Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
@@ -2429,7 +2791,7 @@ impl Daemon {
                 return Response::ok(
                     req.id,
                     json!({"withdrawn": sug_id, "already": true, "written": false}),
-                )
+                );
             }
             Ok(_) => {}
             Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
@@ -2499,13 +2861,13 @@ impl Daemon {
                     req.id,
                     codes::BAD_PARAMS,
                     format!("fact must be a tuple id: {e}"),
-                )
+                );
             }
         };
         let fact = match self.space.get(fact_id) {
             Ok(Some(tuple)) if tuple.category == Category::Fact => tuple,
             Ok(Some(_)) => {
-                return Response::err(req.id, codes::BAD_PARAMS, "target tuple is not a fact")
+                return Response::err(req.id, codes::BAD_PARAMS, "target tuple is not a fact");
             }
             Ok(None) => return Response::err(req.id, codes::BAD_PARAMS, "fact tuple not found"),
             Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
@@ -2587,7 +2949,9 @@ impl Daemon {
         // `--hot`, or any `--top N` cap, follows the strongest trail first;
         // otherwise the default oldest-first scan is unchanged.
         let requested_top = params.top;
-        let limit = requested_top.unwrap_or(MAX_SCAN_TUPLES).min(MAX_SCAN_TUPLES);
+        let limit = requested_top
+            .unwrap_or(MAX_SCAN_TUPLES)
+            .min(MAX_SCAN_TUPLES);
         let result = if params.hot || params.top.is_some() {
             self.space
                 .scan_hot(&params.pattern, Some(limit.saturating_add(1)))
@@ -2671,13 +3035,10 @@ impl Daemon {
                 .and_then(Value::as_str)
                 .unwrap_or("clear")
                 .to_string();
-            if latest
-                .get(&key)
-                .is_none_or(|(current_at, current_id, _)| {
+            if latest.get(&key).is_none_or(|(current_at, current_id, _)| {
                     vote.created_at > *current_at
                         || (vote.created_at == *current_at && vote.id > *current_id)
-                })
-            {
+            }) {
                 latest.insert(key, (vote.created_at, vote.id, state));
             }
         }
@@ -2746,10 +3107,7 @@ fn cleared_branches_for_paths(
     cleared
 }
 
-fn max_cursor(
-    left: Option<u64>,
-    right: Option<u64>,
-) -> Option<u64> {
+fn max_cursor(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.max(right)),
         (left, None) => left,
@@ -3029,6 +3387,41 @@ struct RepoInspectParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoOnboardingStartParams {
+    target: String,
+    #[serde(default)]
+    harness: Option<String>,
+    #[serde(default)]
+    attach: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoOnboardingResumeParams {
+    session: String,
+    #[serde(default)]
+    attach: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoOnboardingSessionParams {
+    session: String,
+}
+
+fn onboarding_payload(
+    session: &crate::onboarding_sessions::OnboardingSession,
+    reused: bool,
+) -> Value {
+    json!({
+        "session": session.status(),
+        "report": session.report(),
+        "reused": reused,
+    })
+}
+
+#[derive(Deserialize)]
 struct TicketListParams {
     #[serde(default)]
     scope: Option<String>,
@@ -3181,7 +3574,10 @@ mod agent_fact_authorisation_tests {
             }),
         });
 
-        assert!(response.error.is_none(), "agent fact was rejected: {response:?}");
+        assert!(
+            response.error.is_none(),
+            "agent fact was rejected: {response:?}"
+        );
         let facts = daemon
             .space
             .scan(&Pattern::category(Category::Fact).identity("observed-rate-limit"))
@@ -3209,7 +3605,10 @@ mod agent_fact_authorisation_tests {
             }),
         });
 
-        assert_eq!(response.error.as_ref().map(|error| error.code.as_str()), Some(codes::FORBIDDEN));
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some(codes::FORBIDDEN)
+        );
     }
 
     #[test]
@@ -3239,10 +3638,22 @@ mod agent_fact_authorisation_tests {
                 params: json!({"fact": fact_id, "vote": value}),
             })
         };
-        assert_eq!(vote("up-1", "Whisker", "up").result.unwrap()["written"], true);
-        assert_eq!(vote("up-2", "Whisker", "up").result.unwrap()["already"], true);
-        assert_eq!(vote("down-1", "Whisker", "down").result.unwrap()["written"], true);
-        assert_eq!(vote("up-3", "Nibbles", "up").result.unwrap()["written"], true);
+        assert_eq!(
+            vote("up-1", "Whisker", "up").result.unwrap()["written"],
+            true
+        );
+        assert_eq!(
+            vote("up-2", "Whisker", "up").result.unwrap()["already"],
+            true
+        );
+        assert_eq!(
+            vote("down-1", "Whisker", "down").result.unwrap()["written"],
+            true
+        );
+        assert_eq!(
+            vote("up-3", "Nibbles", "up").result.unwrap()["written"],
+            true
+        );
 
         let scan = daemon.handle_scan(Request {
             id: "scan-1".into(),
@@ -3251,12 +3662,27 @@ mod agent_fact_authorisation_tests {
             caller: "operator".into(),
             params: json!({"category": "fact"}),
         });
-        assert_eq!(scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["up"], 1);
-        assert_eq!(scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["down"], 1);
-        assert_eq!(scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["score"], 0);
+        assert_eq!(
+            scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["up"],
+            1
+        );
+        assert_eq!(
+            scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["down"],
+            1
+        );
+        assert_eq!(
+            scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["score"],
+            0
+        );
 
-        assert_eq!(vote("clear-1", "Whisker", "clear").result.unwrap()["written"], true);
-        assert_eq!(vote("clear-2", "Whisker", "clear").result.unwrap()["already"], true);
+        assert_eq!(
+            vote("clear-1", "Whisker", "clear").result.unwrap()["written"],
+            true
+        );
+        assert_eq!(
+            vote("clear-2", "Whisker", "clear").result.unwrap()["already"],
+            true
+        );
         let scan = daemon.handle_scan(Request {
             id: "scan-2".into(),
             method: "space.scan".into(),
@@ -3264,9 +3690,18 @@ mod agent_fact_authorisation_tests {
             caller: "operator".into(),
             params: json!({"category": "fact"}),
         });
-        assert_eq!(scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["up"], 1);
-        assert_eq!(scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["down"], 0);
-        assert_eq!(scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["score"], 1);
+        assert_eq!(
+            scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["up"],
+            1
+        );
+        assert_eq!(
+            scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["down"],
+            0
+        );
+        assert_eq!(
+            scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["score"],
+            1
+        );
 
         let raw = daemon.handle_out(Request {
             id: "forged-vote".into(),
@@ -3281,7 +3716,10 @@ mod agent_fact_authorisation_tests {
                 "payload": {"vote": "up"}
             }),
         });
-        assert_eq!(raw.error.as_ref().map(|error| error.code.as_str()), Some(codes::FORBIDDEN));
+        assert_eq!(
+            raw.error.as_ref().map(|error| error.code.as_str()),
+            Some(codes::FORBIDDEN)
+        );
     }
 }
 

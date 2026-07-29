@@ -3,6 +3,7 @@
 //! merge their work on dismissal.
 
 use crate::agents::{AgentProgress, AgentRecord, AgentState, Registry};
+use crate::onboarding_sessions::{onboarding_branch, onboarding_worktree, ONBOARDER_ROLE};
 use chrono::{DateTime, Utc};
 use rk_core::config::{MergeMode, SupervisorConfig};
 use rk_core::paths::Layout;
@@ -10,10 +11,10 @@ use rk_core::prime::{render, PrimeContext, VerificationCheck, MAX_INJECTED_FACTS
 use rk_core::tuple::{Category, Pattern, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
 use rk_git::{agent_branch, Repo};
 use rk_harness::{make_harness, HarnessEvent, LaunchSpec, SessionControl, TokenUsage};
-use rk_workflow::Coordination;
 use rk_ledger::pricing::PricingTable;
 use rk_ledger::{Budget, BudgetAction, BudgetScope, DispatchCheck, FleetBudget};
 use rk_space::Space;
+use rk_workflow::Coordination;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -28,6 +29,37 @@ fn default_permission_mode(harness: &str) -> &'static str {
         "claude" => "acceptEdits",
         "codex" => "workspace-write",
         _ => "workspace-write",
+    }
+}
+
+/// Roles are an authority input, not open-ended prompt decoration. Keep the
+/// accepted vocabulary explicit so a typo cannot silently receive the default
+/// worker prompt and capability set.
+pub fn validate_role(role: &str) -> rk_core::Result<()> {
+    if matches!(
+        role,
+        "rat" | "reviewer" | "foreman" | "verifier" | ONBOARDER_ROLE
+    ) {
+        Ok(())
+    } else {
+        Err(rk_core::Error::other(format!(
+            "unknown agent role {role:?}; expected rat, reviewer, foreman, verifier, or onboarder"
+        )))
+    }
+}
+
+/// Onboarders are assessment-only. Their filesystem boundary is enforced by
+/// the harness rather than by prompt prose, and callers cannot override it.
+fn permission_mode(role: &str, harness: &str) -> rk_core::Result<String> {
+    if role != ONBOARDER_ROLE {
+        return Ok(default_permission_mode(harness).into());
+    }
+    match harness {
+        "claude" => Ok("plan".into()),
+        "codex" | "fake" => Ok("read-only".into()),
+        other => Err(rk_core::Error::other(format!(
+            "harness {other:?} has no enforced read-only onboarding mode"
+        ))),
     }
 }
 
@@ -461,6 +493,7 @@ impl Supervisor {
     }
 
     pub fn spawn(self: &Arc<Self>, params: SpawnParams) -> rk_core::Result<AgentRecord> {
+        validate_role(&params.role)?;
         let repo = Repo::discover(std::path::Path::new(&params.repo))?;
         let repo_name = repo.name();
 
@@ -488,14 +521,42 @@ impl Supervisor {
             .clone()
             .unwrap_or_else(|| self.default_harness.clone());
         let harness = make_harness(&harness_kind)?;
+        let enforced_permission_mode = if params.role == ONBOARDER_ROLE {
+            permission_mode(&params.role, &harness_kind)?
+        } else {
+            params
+                .permission_mode
+                .clone()
+                .unwrap_or(permission_mode(&params.role, &harness_kind)?)
+        };
 
         // Reserve the name atomically: it stays claimed against concurrent
         // spawns until the journal row is inserted. Picking without reserving
         // let two near-simultaneous spawns grab the same name and collide on
         // the worktree path.
         let name = self.lock_registry().reserve_name();
-        let branch = agent_branch(&name, &params.task);
-        let worktree = self.layout.worktrees_dir().join(&repo_name).join(&name);
+        let (branch, worktree) = if params.role == ONBOARDER_ROLE {
+            if !params.task.starts_with("onb-")
+                || !params
+                    .task
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            {
+                self.lock_registry().release_name(&name);
+                return Err(rk_core::Error::other(
+                    "onboarder task must be a stable onb- session id",
+                ));
+            }
+            (
+                onboarding_branch(&params.task),
+                onboarding_worktree(&self.layout.worktrees_dir(), &repo_name, &params.task),
+            )
+        } else {
+            (
+                agent_branch(&name, &params.task),
+                self.layout.worktrees_dir().join(&repo_name).join(&name),
+            )
+        };
         let spawning = spawning_record(SpawnJournal {
             params: &params,
             repo: &repo,
@@ -550,12 +611,7 @@ impl Supervisor {
             env,
             // Keep the harness inside its worktree by default. Explicit
             // per-spawn modes remain available for operators that need them.
-            permission_mode: Some(
-                params
-                    .permission_mode
-                    .clone()
-                    .unwrap_or_else(|| default_permission_mode(&harness_kind).into()),
-            ),
+            permission_mode: Some(enforced_permission_mode),
             model: params.model.clone(),
             resume_session: None,
         };
@@ -738,17 +794,20 @@ impl Supervisor {
             });
         }
 
-        // Completion watcher: the rat's `rk done` tuple is the signal.
-        {
+        self.watch_attached_completion(&record);
+
+        Ok(record)
+    }
+
+    /// Reinstallable attach watcher. The pane can outlive the daemon, so
+    /// restart recovery must be able to wire this durable signal back up.
+    fn watch_attached_completion(self: &Arc<Self>, record: &AgentRecord) {
             let supervisor = Arc::clone(self);
-            let agent = name.clone();
+        let agent = record.name.clone();
             let space = self.space.clone();
             // Bound the read to this generation of the name. `task_done` events
             // are durable and outlive the rat they name, so an unbounded name
-            // search matches a PREDECESSOR's `rk done` and reports this rat
-            // complete the instant it starts — the attach-mode twin of the
-            // TKT-146 workflow-wait bug. `for_agent_since` is the one shared
-            // constructor for that predicate (TKT-159); it has no unbounded form.
+        // search matches a predecessor's completion.
             let since = record.created_at;
             tokio::spawn(async move {
                 let pattern = Pattern::for_agent_since(Category::Event, "task_done", &agent, since);
@@ -765,8 +824,6 @@ impl Supervisor {
                                 .or(Some("done".into()));
                         });
                         if let Ok(Some(record)) = updated {
-                            // Driven by the rat's own `task_done`, so this one is
-                            // declared by construction.
                             supervisor.route_completion(&record, false, true);
                             rk_mux::HerdrMux::notify(
                                 &format!("{agent} finished"),
@@ -774,19 +831,52 @@ impl Supervisor {
                             );
                         }
                     }
-                    Ok(None) => {
-                        warn!(agent = %agent, "attach-mode completion watch timed out");
-                    }
+                Ok(None) => warn!(agent = %agent, "attach-mode completion watch timed out"),
                     Err(e) => warn!(error = %e, "completion watch failed"),
                 }
             });
         }
 
-        Ok(record)
-    }
-
     /// Resume an orphaned/failed agent in its preserved worktree.
     pub fn respawn(self: &Arc<Self>, name: &str) -> rk_core::Result<AgentRecord> {
+        self.respawn_mode(name, false)
+    }
+
+    /// Resume an onboarding agent in either durable presentation mode. Unlike
+    /// ordinary `agent.respawn`, this may reattach to a herdr pane that
+    /// survived the daemon or recreate one in the preserved worktree.
+    pub fn respawn_onboarding(
+        self: &Arc<Self>,
+        name: &str,
+        attach: bool,
+    ) -> rk_core::Result<AgentRecord> {
+        let role = self
+            .status(name)
+            .map(|record| record.role)
+            .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
+        if role != ONBOARDER_ROLE {
+            return Err(rk_core::Error::other(format!(
+                "onboarding session agent {name} has downgraded role {role:?}"
+            )));
+        }
+        self.respawn_mode(name, attach)
+    }
+
+    pub async fn respawn_onboarding_async(
+        self: &Arc<Self>,
+        name: String,
+        attach: bool,
+    ) -> rk_core::Result<AgentRecord> {
+        let supervisor = Arc::clone(self);
+        let handle = tokio::runtime::Handle::current();
+        blocking_io("onboarding agent resume", move || {
+            let _entered = handle.enter();
+            supervisor.respawn_onboarding(&name, attach)
+        })
+        .await
+    }
+
+    fn respawn_mode(self: &Arc<Self>, name: &str, attach: bool) -> rk_core::Result<AgentRecord> {
         let record = self
             .lock_registry()
             .get(name)
@@ -795,6 +885,7 @@ impl Supervisor {
         if record.state.is_live() {
             return Err(rk_core::Error::other(format!("{name} is still running")));
         }
+        validate_role(&record.role)?;
         let (Some(worktree), Some(task)) = (record.worktree.clone(), record.task.clone()) else {
             return Err(rk_core::Error::other("record lacks worktree/task"));
         };
@@ -826,19 +917,31 @@ impl Supervisor {
             conventions: self.scan_conventions(&record.repo_name),
             verification_checks: self.scan_verification_checks(&worktree),
         };
-        let spec = LaunchSpec {
-            prompt: format!(
+        let resume_prompt = if record.role == ONBOARDER_ROLE {
+            format!(
+                "Resume onboarding session {task}. Reassess the repository read-only, \
+                 preserve the existing onboarding branch and session record, and finish \
+                 with `rk done` after reporting findings. Do not edit or commit files."
+            )
+        } else {
+            format!(
                 "You are resuming task {task} after an interruption. Check `git log` and \
                  `git status` in your worktree to see where you left off, then continue. \
                  Finish with `rk done` as usual."
-            ),
+            )
+        };
+        let spec = LaunchSpec {
+            prompt: resume_prompt,
             system_prompt: Some(render(&record.role, &prime_ctx)),
-            cwd: worktree,
+            cwd: worktree.clone(),
             env,
-            permission_mode: Some(default_permission_mode(&record.harness).into()),
+            permission_mode: Some(permission_mode(&record.role, &record.harness)?),
             model: None,
             resume_session: resume,
         };
+        if attach {
+            return self.respawn_attached(record, spec);
+        }
         let session = harness.launch(&spec)?;
 
         let updated = self
@@ -900,15 +1003,86 @@ impl Supervisor {
         Ok(updated)
     }
 
+    fn respawn_attached(
+        self: &Arc<Self>,
+        record: AgentRecord,
+        spec: LaunchSpec,
+    ) -> rk_core::Result<AgentRecord> {
+        if !rk_mux::HerdrMux::available() {
+            return Err(rk_core::Error::other(
+                "--attach needs a running herdr server (https://herdr.dev)",
+            ));
+        }
+        let existing = record
+            .attach_target
+            .as_deref()
+            .filter(|target| rk_mux::HerdrMux::agent_status(target).is_some())
+            .map(String::from);
+        let (target, created) = if let Some(target) = existing {
+            (target, false)
+        } else {
+            let argv = rk_mux::interactive_argv(
+                &record.harness,
+                spec.system_prompt.as_deref(),
+                spec.model.as_deref(),
+                spec.permission_mode.as_deref(),
+            )?;
+            (
+                rk_mux::HerdrMux::start_agent(&record.name, &spec.cwd, &spec.env, &argv)?,
+                true,
+            )
+        };
+        let updated = self
+            .lock_registry()
+            .update(&record.name, |current| {
+                current.state = AgentState::Running;
+                current.pid = None;
+                current.attach_target = Some(target.clone());
+                current.result = None;
+                current.crashed = false;
+            })?
+            .ok_or_else(|| rk_core::Error::other("record vanished"))?;
+
+        if created {
+            let target = target.clone();
+            let prompt = spec.prompt;
+            tokio::task::spawn_blocking(move || {
+                let _ = std::process::Command::new("herdr")
+                    .args([
+                        "agent",
+                        "wait",
+                        &target,
+                        "--status",
+                        "idle",
+                        "--timeout",
+                        "30000",
+                    ])
+                    .output();
+                if let Err(e) = rk_mux::HerdrMux::send(&target, &prompt) {
+                    warn!(error = %e, "failed to deliver resume prompt to herdr pane");
+                }
+            });
+        }
+
+        self.emit_event(
+            &updated.repo_name,
+            "agent_respawned",
+            json!({
+                "agent": updated.name,
+                "task": updated.task,
+                "attached": true,
+                "workflow_instance": updated.workflow_instance,
+            }),
+        );
+        self.forget_completion(&updated.name);
+        self.watch_attached_completion(&updated);
+        Ok(updated)
+    }
+
     /// `generation` is the agent record's `created_at`, captured once when the
     /// event loop is wired up: transcript writes are keyed on the generation, not
     /// the name, so a line can never land in a namesake's file.
-    fn handle_event(
-        self: &Arc<Self>,
-        name: &str,
-        generation: DateTime<Utc>,
-        event: HarnessEvent,
-    ) {
+    fn handle_event(self: &Arc<Self>, name: &str, generation: DateTime<Utc>, event: HarnessEvent) {
         match event {
             HarnessEvent::Started { session_id } => {
                 let _ = self.lock_registry().update(name, |r| {
@@ -1295,15 +1469,20 @@ impl Supervisor {
             (Some(_), Some(cap)) if cap > 0.0 => Some((instance_spent, cap)),
             _ => None,
         };
-        let check =
-            self.fleet_budget
+        let check = self
+            .fleet_budget
                 .check_dispatch_scoped(fleet_spent, repo_spent, instance_arg);
         match check.action {
             BudgetAction::Ok => Ok(()),
             BudgetAction::Warn => {
                 if let Some(scope) = check.scope {
                     if self.mark_fleet_warned(scope, repo, instance) {
-                        warn!(scope = scope.as_str(), spent = check.spent_usd, cap = check.cap_usd, "budget warning threshold crossed");
+                        warn!(
+                            scope = scope.as_str(),
+                            spent = check.spent_usd,
+                            cap = check.cap_usd,
+                            "budget warning threshold crossed"
+                        );
                         self.emit_dispatch_obstacle(repo, scope, "warning", &check, instance);
                     }
                 }
@@ -1311,7 +1490,12 @@ impl Supervisor {
             }
             BudgetAction::Stop => {
                 let scope = check.scope.unwrap_or(BudgetScope::Fleet);
-                warn!(scope = scope.as_str(), spent = check.spent_usd, cap = check.cap_usd, "budget cap hit — refusing dispatch");
+                warn!(
+                    scope = scope.as_str(),
+                    spent = check.spent_usd,
+                    cap = check.cap_usd,
+                    "budget cap hit — refusing dispatch"
+                );
                 self.emit_dispatch_obstacle(repo, scope, "exceeded", &check, instance);
                 Err(rk_core::Error::other(format!(
                     "{} budget cap hit: ${:.4} spent >= ${:.4} cap — dispatch refused",
@@ -1487,7 +1671,11 @@ impl Supervisor {
                 }
                 SweepAction::Hard { kind, detail } => {
                     warn!(agent = %record.name, kind, %detail, "supervisor sweep killing agent after grace");
-                    self.emit_sweep_obstacle(record, kind, &format!("{detail} — killed after grace"));
+                    self.emit_sweep_obstacle(
+                        record,
+                        kind,
+                        &format!("{detail} — killed after grace"),
+                    );
                     let control = self.lock_controls().remove(&record.name);
                     if let Some(control) = control {
                         tokio::spawn(async move {
@@ -1543,9 +1731,15 @@ impl Supervisor {
         // Stuck takes precedence in the message; both post an obstacle whose
         // `type` a reactor #Trigger can match ("stuck" / "runaway").
         let (kind, detail): (&'static str, String) = if stuck {
-            ("stuck", format!("no events for {idle_secs}s while still running"))
+            (
+                "stuck",
+                format!("no events for {idle_secs}s while still running"),
+            )
         } else {
-            ("runaway", format!("sustained burn ${burn:.2}/min with no completion"))
+            (
+                "runaway",
+                format!("sustained burn ${burn:.2}/min with no completion"),
+            )
         };
 
         match st.flagged_at {
@@ -2109,7 +2303,8 @@ impl Supervisor {
         }
 
         let repo_path = record.repo_root.clone();
-        let repo = blocking_io("dismiss repo discovery", move || Repo::discover(&repo_path)).await?;
+        let repo =
+            blocking_io("dismiss repo discovery", move || Repo::discover(&repo_path)).await?;
         let mut merged = false;
         let mut merge_commit: Option<String> = None;
         let mut pr_opened = false;
@@ -2455,14 +2650,7 @@ impl Supervisor {
                 }),
             );
         }
-        info!(
-            branch,
-            target,
-            merged,
-            pr_opened,
-            branch_deleted,
-            "land"
-        );
+        info!(branch, target, merged, pr_opened, branch_deleted, "land");
         Ok(result)
     }
 
@@ -2552,6 +2740,44 @@ impl Supervisor {
     /// rat's history stays inspectable with `rk status`.
     pub fn status(&self, name: &str) -> Option<AgentRecord> {
         self.lock_registry().get_any(name).cloned()
+    }
+
+    /// Recover the supervisor side of a session whose session journal did not
+    /// yet persist its linked agent. Spawn journals the agent before worktree
+    /// creation, so matching the dedicated role + stable session task closes
+    /// the crash window without allocating a duplicate branch/worktree.
+    pub fn onboarding_agent(&self, session: &str) -> Option<AgentRecord> {
+        self.lock_registry()
+            .list()
+            .into_iter()
+            .filter(|record| {
+                record.role == ONBOARDER_ROLE
+                    && record.task.as_deref() == Some(session)
+                    && record.state != AgentState::Dismissed
+            })
+            .max_by_key(|record| record.created_at)
+            .cloned()
+    }
+
+    /// Reconcile an attach-mode record against herdr. Losing the terminal that
+    /// ran `rk attach` changes nothing; losing the pane itself turns the
+    /// durable record into an orphan that `repo onboard resume` can recover.
+    pub fn reconcile_attached(&self, name: &str) -> rk_core::Result<Option<AgentRecord>> {
+        let Some(record) = self.lock_registry().get(name).cloned() else {
+            return Ok(None);
+        };
+        let missing = record.state == AgentState::Running
+            && record
+                .attach_target
+                .as_deref()
+                .is_some_and(|target| rk_mux::HerdrMux::agent_status(target).is_none());
+        if !missing {
+            return Ok(Some(record));
+        }
+        self.lock_registry().update(name, |current| {
+            current.state = AgentState::Orphaned;
+            current.pid = None;
+        })
     }
 
     /// Resolve which non-dismissed supervised agent(s) own a local client
@@ -2740,7 +2966,8 @@ impl Supervisor {
     }
 
     pub fn is_reporting_boundary(&self, name: &str) -> bool {
-        self.status(name).is_some_and(|record| is_reporting_boundary(&record))
+        self.status(name)
+            .is_some_and(|record| is_reporting_boundary(&record))
     }
 
     /// Validate the structural edge a foreman is attempting to manage.
@@ -2787,7 +3014,11 @@ impl Supervisor {
                 "foreman has no integration branch for a worker spawn",
             ));
         }
-        if params.parent.as_deref().is_some_and(|parent| parent != foreman) {
+        if params
+            .parent
+            .as_deref()
+            .is_some_and(|parent| parent != foreman)
+        {
             return Err(rk_core::Error::other(
                 "a foreman child spawn cannot name another parent",
             ));
@@ -3119,7 +3350,10 @@ fn process_info(pid: u32) -> Option<ProcessInfo> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The comm field is parenthesized and may contain spaces or `)`, so split
     // after its final close paren. Remaining fields begin state, ppid, pgrp.
-    let fields: Vec<_> = stat.get(stat.rfind(')')? + 1..)?.split_whitespace().collect();
+    let fields: Vec<_> = stat
+        .get(stat.rfind(')')? + 1..)?
+        .split_whitespace()
+        .collect();
     let parent = fields.get(1)?.parse::<u32>().ok().filter(|pid| *pid > 0);
     let process_group = fields.get(2)?.parse::<u32>().ok().filter(|pid| *pid > 0);
     let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
@@ -3191,6 +3425,26 @@ mod respawn_tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn roles_and_onboarder_sandbox_are_explicit() {
+        for role in ["rat", "reviewer", "foreman", "verifier", "onboarder"] {
+            validate_role(role).unwrap();
+        }
+        assert!(validate_role("onbaorder").is_err());
+        assert!(validate_role("").is_err());
+
+        assert_eq!(permission_mode("onboarder", "codex").unwrap(), "read-only");
+        assert_eq!(permission_mode("onboarder", "claude").unwrap(), "plan");
+        assert!(
+            permission_mode("onboarder", "axe").is_err(),
+            "a harness without an enforced read-only mode must fail closed"
+        );
+        assert_eq!(
+            permission_mode("rat", "codex").unwrap(),
+            "workspace-write"
+        );
     }
 
     fn record(repo: &Path, branch: Option<&str>) -> AgentRecord {
