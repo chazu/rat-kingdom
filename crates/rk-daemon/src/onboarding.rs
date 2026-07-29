@@ -921,14 +921,16 @@ fn inspect_cue(
                         EvidenceOrigin::Observed,
                         relative(root, &checks_file),
                         format!(
-                            "named check `{}` (cwd: {}, expected exit: {}, timeout: {})",
+                            "named check `{}` (cwd: {}, expected exit: {}, timeout: {}, environment: {}, toolchain: {})",
                             check.name,
                             check.cwd.as_deref().unwrap_or("."),
                             check
                                 .expect_exit
                                 .map(|exit| exit.to_string())
                                 .unwrap_or_else(|| "workflow step default".into()),
-                            check.timeout.as_deref().unwrap_or("workflow step default")
+                            check.timeout.as_deref().unwrap_or("workflow step default"),
+                            check.environment_policy,
+                            check.toolchain.as_deref().unwrap_or("not declared"),
                         ),
                         &check.command,
                     )

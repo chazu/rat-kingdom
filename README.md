@@ -171,8 +171,9 @@ own role instead.
 Worker prompts stay project-agnostic by default. When a repository contains a
 valid `.rk/checks.cue`, the daemon adds its named checks to the spawned and
 resumed worker's prompt as **Repository verification checks**. The section
-shows each check's name, command, working directory, expected exit, and timeout;
-the command is repository-owned guidance, not extra prompt instructions. A
+shows each check's name, command, working directory, expected exit, timeout,
+environment policy, and declared toolchain; the command is repository-owned
+guidance, not extra prompt instructions. A
 worker should prefer the `verify` check when present, otherwise choose the
 relevant declared check for its task. Workflow `run` steps remain the
 authoritative, fail-closed gate. Missing or malformed check registries do not
@@ -216,8 +217,13 @@ rk repo onboard start svc --attach     # same session/report in a herdr pane
 rk repo onboard status onb-...         # stable state after disconnect or restart
 rk repo onboard propose onb-... --kind repo_file --title "Add verify" \
   --evidence "README documents mise run verify" --target .rk/checks.cue \
-  --action write_repo_file --diff "$DIFF" --risk low --verification "mise run verify"
+  --action write_repo_file --diff "$DIFF" --risk low --verification "check:verify" \
+  --check-name verify --check-command "mise run verify" --check-cwd . \
+  --check-expect-exit 0 --check-timeout 20m \
+  --check-environment-policy strip_rk_spawn \
+  --check-toolchain "mise rust@1.95.0"
 rk repo onboard approve onb-... onb-prop-... --digest <sha256>
+rk repo onboard apply onb-... onb-prop-... --digest <sha256>
 rk repo onboard decline onb-... onb-prop-... --digest <sha256>
 rk repo onboard report onb-...         # assessment plus terminal agent result
 rk repo onboard resume onb-...         # recover an orphaned/failed headless run
@@ -264,6 +270,26 @@ shown by `status` or `report` into `approve`/`decline`; the daemon rejects a
 stale tree, edited persisted proposal, different digest, caller-supplied actor,
 or opposite second decision. Same-decision retries are idempotent, and the
 server records the authenticated castle-qualified operator plus decision time.
+
+A `.rk/checks.cue` proposal additionally binds the check name, exact command,
+cwd, expected exit, timeout, environment policy, and toolchain description into
+that digest. After approval, `repo onboard apply` applies the exact patch only
+inside the Rat Kingdom-owned onboarding worktree, validates the resulting file
+through the existing CUE checks schema, commits it on the onboarding branch,
+and executes that named check. The durable report records the application
+commit and tree plus every verification attempt's command, toolchain,
+environment policy, exit/timing result, bounded output summary, and unresolved
+risks. `strip_rk_spawn` removes `RK_AGENT`, `RK_TASK`, `RK_REPO`, `RK_ROLE`,
+`RK_HOME`, `RK_BRANCH`, `RK_WORKTREE`, and `RK_AUTH_TOKEN`; `inherit` preserves
+the daemon environment.
+
+Application retries are fail-closed and recoverable. A clean replay neither
+recommits nor reruns a verified check. After a failed check, retry reuses the
+recorded commit and executes a new attempt. An interrupted exact patch or
+trailer-bearing commit is recovered; unrelated dirt, an edited applied file,
+or branch movement is recorded as failure and never swept into the proposal.
+Landing the onboarding branch into the human checkout remains a separate
+operator action.
 
 By default a finished rat's branch is merged directly into its base. A repo can
 instead be put in **PR mode** — `rk repo add <path> --merge-mode pr` — so the
@@ -558,6 +584,10 @@ workflow: {
   compromised or untrusted workflow definition can invoke only the repo owner's
   registered checks — never arbitrary shell. A named check supplies its own
   command/cwd/`expectExit`/timeout; the step may override cwd/`expectExit`/timeout.
+  It may also declare `environmentPolicy: "inherit" | "strip_rk_spawn"`; the
+  latter removes ambient supervised-agent identity before execution. Optional
+  `toolchain` text records the repository-owned runner/toolchain for onboarding
+  evidence.
   The same registry is surfaced as optional guidance in spawned worker prompts;
   it does not replace the workflow gate. See `examples/workflows/named-check-merge.cue`.
 

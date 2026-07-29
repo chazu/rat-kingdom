@@ -216,6 +216,31 @@ enum RepoCommand {
     },
 }
 
+#[derive(Args)]
+struct NamedCheckProposalArgs {
+    /// Named check whose executable contract is carried by a `.rk/checks.cue` proposal.
+    #[arg(long)]
+    check_name: Option<String>,
+    /// Exact repository-owned runner command.
+    #[arg(long, requires = "check_name")]
+    check_command: Option<String>,
+    /// Exact working directory relative to the onboarding worktree.
+    #[arg(long, requires = "check_name")]
+    check_cwd: Option<String>,
+    /// Exact expected exit status.
+    #[arg(long, requires = "check_name")]
+    check_expect_exit: Option<i64>,
+    /// Exact wall-clock timeout.
+    #[arg(long, requires = "check_name")]
+    check_timeout: Option<String>,
+    /// Environment contract: inherit or strip_rk_spawn.
+    #[arg(long, requires = "check_name")]
+    check_environment_policy: Option<String>,
+    /// Repository-owned toolchain/runner description.
+    #[arg(long, requires = "check_name")]
+    check_toolchain: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum RepoOnboardCommand {
     /// Start or idempotently reuse a durable onboarding session.
@@ -262,6 +287,8 @@ enum RepoOnboardCommand {
         /// Verification step; repeat for multiple entries.
         #[arg(long, required = true)]
         verification: Vec<String>,
+        #[command(flatten)]
+        named_check: Box<NamedCheckProposalArgs>,
     },
     /// Approve one exact proposal digest.
     Approve {
@@ -288,6 +315,16 @@ enum RepoOnboardCommand {
         /// Optional durable decision rationale.
         #[arg(long)]
         reason: Option<String>,
+    },
+    /// Apply and execute one approved `.rk/checks.cue` proposal.
+    Apply {
+        /// Stable onboarding session id.
+        session: String,
+        /// Stable proposal id.
+        proposal: String,
+        /// Canonical digest shown by status/report.
+        #[arg(long)]
+        digest: String,
     },
     /// Resume an orphaned or failed onboarding session.
     Resume {
@@ -943,7 +980,17 @@ async fn main() -> Result<()> {
                     diff,
                     risk,
                     verification,
+                    named_check,
                 } => {
+                    let NamedCheckProposalArgs {
+                        check_name,
+                        check_command,
+                        check_cwd,
+                        check_expect_exit,
+                        check_timeout,
+                        check_environment_policy,
+                        check_toolchain,
+                    } = *named_check;
                     repo_cmds::onboard_propose(
                         &layout,
                         session,
@@ -955,6 +1002,13 @@ async fn main() -> Result<()> {
                         diff,
                         risk,
                         verification,
+                        check_name,
+                        check_command,
+                        check_cwd,
+                        check_expect_exit,
+                        check_timeout,
+                        check_environment_policy,
+                        check_toolchain,
                         cli.json,
                     )
                     .await?
@@ -981,6 +1035,11 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 }
+                RepoOnboardCommand::Apply {
+                    session,
+                    proposal,
+                    digest,
+                } => repo_cmds::onboard_apply(&layout, session, proposal, digest, cli.json).await?,
                 RepoOnboardCommand::Resume { session, attach } => {
                     repo_cmds::onboard_resume(&layout, session, attach, cli.json).await?
                 }

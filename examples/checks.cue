@@ -17,9 +17,11 @@
 // is fixed by this repo-owned file, which is the whole point of the allowlist.
 checks: [
 	{
-		name:    "test"
-		command: "cargo test --quiet"
-		timeout: "20m"
+		name:              "test"
+		command:           "cargo test --quiet"
+		timeout:           "20m"
+		environmentPolicy: "strip_rk_spawn"
+		toolchain:         "repository Rust toolchain"
 	},
 	{
 		name:       "clippy"

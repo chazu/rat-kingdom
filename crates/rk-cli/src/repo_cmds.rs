@@ -187,8 +187,44 @@ pub async fn onboard_propose(
     diff: String,
     risk: String,
     verification: Vec<String>,
+    check_name: Option<String>,
+    check_command: Option<String>,
+    check_cwd: Option<String>,
+    check_expect_exit: Option<i64>,
+    check_timeout: Option<String>,
+    check_environment_policy: Option<String>,
+    check_toolchain: Option<String>,
     as_json: bool,
 ) -> Result<()> {
+    let named_check = match check_name {
+        Some(name) => Some(json!({
+            "name": name,
+            "command": check_command
+                .ok_or_else(|| anyhow::anyhow!("--check-command is required with --check-name"))?,
+            "cwd": check_cwd
+                .ok_or_else(|| anyhow::anyhow!("--check-cwd is required with --check-name"))?,
+            "expect_exit": check_expect_exit
+                .ok_or_else(|| anyhow::anyhow!("--check-expect-exit is required with --check-name"))?,
+            "timeout": check_timeout
+                .ok_or_else(|| anyhow::anyhow!("--check-timeout is required with --check-name"))?,
+            "environment_policy": check_environment_policy
+                .ok_or_else(|| anyhow::anyhow!("--check-environment-policy is required with --check-name"))?,
+            "toolchain": check_toolchain
+                .ok_or_else(|| anyhow::anyhow!("--check-toolchain is required with --check-name"))?,
+        })),
+        None => {
+            if check_command.is_some()
+                || check_cwd.is_some()
+                || check_expect_exit.is_some()
+                || check_timeout.is_some()
+                || check_environment_policy.is_some()
+                || check_toolchain.is_some()
+            {
+                bail!("--check-name is required when supplying named-check fields");
+            }
+            None
+        }
+    };
     let mut client = Client::connect(layout).await?;
     let result = client
         .call(
@@ -204,6 +240,7 @@ pub async fn onboard_propose(
                     "diff": diff,
                     "risk": risk,
                     "verification": verification,
+                    "named_check": named_check,
                 },
             }),
         )
@@ -221,6 +258,54 @@ pub async fn onboard_propose(
                 "already present"
             }
         );
+    }
+    Ok(())
+}
+
+pub async fn onboard_apply(
+    layout: &Layout,
+    session: String,
+    proposal: String,
+    digest: String,
+    as_json: bool,
+) -> Result<()> {
+    let mut client = Client::connect(layout).await?;
+    let result = client
+        .call(
+            "repo.onboard.apply",
+            json!({
+                "session": session,
+                "proposal": proposal,
+                "digest": digest,
+            }),
+        )
+        .await?;
+    let proposal: OnboardingProposal = serde_json::from_value(result["proposal"].clone())?;
+    if as_json {
+        println!("{result}");
+    } else {
+        print_onboarding_proposal(&proposal);
+        println!(
+            "  apply     {}",
+            if result["applied"].as_bool().unwrap_or(false) {
+                "committed"
+            } else {
+                "already committed (idempotent)"
+            }
+        );
+        println!(
+            "  verify    {}",
+            if result["verified"].as_bool().unwrap_or(false) {
+                "passed"
+            } else {
+                "failed"
+            }
+        );
+    }
+    if !result["verified"].as_bool().unwrap_or(false)
+        && proposal.status != rk_daemon::onboarding_proposals::OnboardingProposalStatus::Verified
+    {
+        bail!("onboarding named check did not pass; see the durable report");
     }
     Ok(())
 }
@@ -386,6 +471,16 @@ fn print_onboarding_proposal(proposal: &OnboardingProposal) {
     for verification in &proposal.verification {
         println!("      - {verification}");
     }
+    if let Some(check) = &proposal.named_check {
+        println!("    named check:");
+        println!("      name         {}", check.name);
+        println!("      command      {}", check.command);
+        println!("      cwd          {}", check.cwd);
+        println!("      expect exit  {}", check.expect_exit);
+        println!("      timeout      {}", check.timeout);
+        println!("      environment  {}", check.environment_policy);
+        println!("      toolchain    {}", check.toolchain);
+    }
     if let (Some(actor), Some(at)) = (&proposal.decision_actor, proposal.decision_at) {
         println!("    decision     {actor} at {at}");
     }
@@ -395,6 +490,33 @@ fn print_onboarding_proposal(proposal: &OnboardingProposal) {
     if let Some(failure) = &proposal.failure {
         println!("    failure      {failure}");
     }
+    if let Some(application) = &proposal.application {
+        println!(
+            "    application  commit {} tree {}",
+            application.commit, application.tree_revision
+        );
+    }
+    for verification in &proposal.verification_results {
+        println!(
+            "    check attempt {}  {} (exit {}, environment {}, toolchain {})",
+            verification.attempt,
+            if verification.passed {
+                "passed"
+            } else {
+                "failed"
+            },
+            verification
+                .exit_status
+                .map(|exit| exit.to_string())
+                .unwrap_or_else(|| "none".into()),
+            verification.environment_policy,
+            verification.toolchain
+        );
+        println!("      output       {}", verification.output_summary);
+        for risk in &verification.unresolved_risks {
+            println!("      unresolved   {risk}");
+        }
+    }
     if proposal.status == rk_daemon::onboarding_proposals::OnboardingProposalStatus::Proposed {
         println!(
             "    approve      rk repo onboard approve {} {} --digest {}",
@@ -402,6 +524,14 @@ fn print_onboarding_proposal(proposal: &OnboardingProposal) {
         );
         println!(
             "    decline      rk repo onboard decline {} {} --digest {}",
+            proposal.session_id, proposal.id, proposal.digest
+        );
+    }
+    if proposal.status == rk_daemon::onboarding_proposals::OnboardingProposalStatus::Approved
+        || proposal.status == rk_daemon::onboarding_proposals::OnboardingProposalStatus::Failed
+    {
+        println!(
+            "    apply        rk repo onboard apply {} {} --digest {}",
             proposal.session_id, proposal.id, proposal.digest
         );
     }

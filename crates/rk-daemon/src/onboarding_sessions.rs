@@ -7,8 +7,9 @@
 
 use crate::onboarding::AssessmentReport;
 use crate::onboarding_proposals::{
-    repository_identity, OnboardingDecision, OnboardingProposal, OnboardingProposalDraft,
-    OnboardingProposalStatus, OnboardingProposalTransition,
+    repository_identity, OnboardingApplication, OnboardingDecision, OnboardingProposal,
+    OnboardingProposalDraft, OnboardingProposalStatus, OnboardingProposalTransition,
+    OnboardingVerification,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -417,6 +418,152 @@ impl OnboardingSessions {
         Ok((updated, true))
     }
 
+    /// Persist the exact commit produced by applying an approved repo-file
+    /// proposal. A matching replay is idempotent. A previously failed
+    /// verification may return to `applied` only when the immutable application
+    /// record still matches, allowing the named check to be retried without
+    /// writing the patch or commit twice.
+    pub fn record_application(
+        &mut self,
+        session_id: &str,
+        proposal_id: &str,
+        digest: &str,
+        application: OnboardingApplication,
+    ) -> rk_core::Result<(OnboardingProposal, bool)> {
+        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
+            rk_core::Error::other(format!("no such onboarding session: {session_id}"))
+        })?;
+        let proposal = proposal_mut(session, proposal_id, digest)?;
+        if let Some(existing) = &proposal.application {
+            if existing != &application {
+                return Err(rk_core::Error::other(format!(
+                    "proposal {proposal_id} application evidence drifted"
+                )));
+            }
+            if proposal.status != OnboardingProposalStatus::Failed {
+                return Ok((proposal.clone(), false));
+            }
+        } else if !matches!(
+            proposal.status,
+            OnboardingProposalStatus::Approved | OnboardingProposalStatus::Failed
+        ) {
+            return Err(rk_core::Error::other(format!(
+                "proposal {proposal_id} cannot record application from {}",
+                proposal.status
+            )));
+        }
+
+        let previous = proposal.status;
+        let now = Utc::now();
+        proposal.status = OnboardingProposalStatus::Applied;
+        proposal.failure = None;
+        proposal.application = Some(application.clone());
+        proposal.transitions.push(OnboardingProposalTransition {
+            from: Some(previous),
+            to: OnboardingProposalStatus::Applied,
+            actor: application.actor,
+            at: now,
+            detail: Some(format!("committed {}", application.commit)),
+        });
+        let updated = proposal.clone();
+        session.updated_at = now;
+        self.persist()?;
+        Ok((updated, true))
+    }
+
+    /// Preserve an application/preflight failure before returning it to the
+    /// caller. Failed proposals remain retryable; the immutable digest and any
+    /// successful application evidence still constrain every retry.
+    pub fn record_application_failure(
+        &mut self,
+        session_id: &str,
+        proposal_id: &str,
+        digest: &str,
+        actor: String,
+        detail: String,
+    ) -> rk_core::Result<OnboardingProposal> {
+        let actor = required_actor(actor)?;
+        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
+            rk_core::Error::other(format!("no such onboarding session: {session_id}"))
+        })?;
+        let proposal = proposal_mut(session, proposal_id, digest)?;
+        if !matches!(
+            proposal.status,
+            OnboardingProposalStatus::Approved
+                | OnboardingProposalStatus::Applied
+                | OnboardingProposalStatus::Failed
+                | OnboardingProposalStatus::Verified
+        ) {
+            return Err(rk_core::Error::other(format!(
+                "proposal {proposal_id} cannot fail application from {}",
+                proposal.status
+            )));
+        }
+        let previous = proposal.status;
+        let now = Utc::now();
+        proposal.status = OnboardingProposalStatus::Failed;
+        proposal.failure = Some(detail.clone());
+        proposal.transitions.push(OnboardingProposalTransition {
+            from: Some(previous),
+            to: OnboardingProposalStatus::Failed,
+            actor,
+            at: now,
+            detail: Some(detail),
+        });
+        let updated = proposal.clone();
+        session.updated_at = now;
+        self.persist()?;
+        Ok(updated)
+    }
+
+    /// Append one exact check execution result and advance the proposal to its
+    /// terminal result. The result contains the command, toolchain,
+    /// environment policy, exit/output summary, and unresolved risks shown in
+    /// the final onboarding report.
+    pub fn record_verification(
+        &mut self,
+        session_id: &str,
+        proposal_id: &str,
+        digest: &str,
+        verification: OnboardingVerification,
+    ) -> rk_core::Result<OnboardingProposal> {
+        let session = self.sessions.get_mut(session_id).ok_or_else(|| {
+            rk_core::Error::other(format!("no such onboarding session: {session_id}"))
+        })?;
+        let proposal = proposal_mut(session, proposal_id, digest)?;
+        if proposal.status != OnboardingProposalStatus::Applied {
+            return Err(rk_core::Error::other(format!(
+                "proposal {proposal_id} cannot verify from {}",
+                proposal.status
+            )));
+        }
+        let next = if verification.passed {
+            OnboardingProposalStatus::Verified
+        } else {
+            OnboardingProposalStatus::Failed
+        };
+        let now = Utc::now();
+        proposal.status = next;
+        proposal.failure = (!verification.passed).then(|| {
+            format!(
+                "check {} did not pass: {}",
+                verification.check_name, verification.output_summary
+            )
+        });
+        proposal.verification_results.push(verification.clone());
+        proposal.transitions.push(OnboardingProposalTransition {
+            from: Some(OnboardingProposalStatus::Applied),
+            to: next,
+            actor: verification.actor,
+            at: now,
+            detail: Some(verification.output_summary),
+        });
+        let updated = proposal.clone();
+        session.updated_at = now;
+        self.persist()?;
+        Ok(updated)
+    }
+
     /// A daemon cannot know whether an in-flight launch crossed its last
     /// persistence boundary. Mark every nonterminal session orphaned on boot;
     /// reconciliation against the durable agent registry may immediately
@@ -456,6 +603,30 @@ fn required_actor(actor: String) -> rk_core::Result<String> {
         .ok_or_else(|| rk_core::Error::other("proposal transition actor must not be empty"))
 }
 
+fn proposal_mut<'a>(
+    session: &'a mut OnboardingSession,
+    proposal_id: &str,
+    digest: &str,
+) -> rk_core::Result<&'a mut OnboardingProposal> {
+    let proposal = session
+        .proposals
+        .iter_mut()
+        .find(|proposal| proposal.id == proposal_id)
+        .ok_or_else(|| {
+            rk_core::Error::other(format!(
+                "no such onboarding proposal in {}: {proposal_id}",
+                session.id
+            ))
+        })?;
+    proposal.validate_integrity()?;
+    if proposal.digest != digest {
+        return Err(rk_core::Error::other(format!(
+            "stale proposal digest for {proposal_id}"
+        )));
+    }
+    Ok(proposal)
+}
+
 fn nonempty(value: String) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
@@ -466,8 +637,10 @@ mod tests {
     use super::*;
     use crate::onboarding::RepositoryIdentity;
     use crate::onboarding_proposals::{
-        OnboardingProposalAction, OnboardingProposalKind, OnboardingProposalRisk,
+        OnboardingNamedCheck, OnboardingProposalAction, OnboardingProposalKind,
+        OnboardingProposalRisk,
     };
+    use rk_workflow::CheckEnvironmentPolicy;
 
     fn assessment(path: &Path) -> AssessmentReport {
         AssessmentReport {
@@ -493,6 +666,15 @@ mod tests {
             diff: "--- /dev/null\n+++ b/.rk/checks.cue\n+verify: {}\n".into(),
             risk: OnboardingProposalRisk::Low,
             verification: vec!["mise run verify".into()],
+            named_check: Some(OnboardingNamedCheck {
+                name: "verify".into(),
+                command: "mise run verify".into(),
+                cwd: ".".into(),
+                expect_exit: 0,
+                timeout: "20m".into(),
+                environment_policy: CheckEnvironmentPolicy::StripRkSpawn,
+                toolchain: "mise rust@1.95.0".into(),
+            }),
         }
     }
 

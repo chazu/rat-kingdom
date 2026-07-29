@@ -58,6 +58,15 @@ fn draft(title: &str, suffix: &str) -> Value {
         ),
         "risk": "low",
         "verification": ["cargo test"],
+        "named_check": {
+            "name": suffix,
+            "command": "cargo test",
+            "cwd": ".",
+            "expect_exit": 0,
+            "timeout": "10m",
+            "environment_policy": "strip_rk_spawn",
+            "toolchain": "repository Rust toolchain",
+        },
     })
 }
 

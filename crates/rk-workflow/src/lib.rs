@@ -490,6 +490,23 @@ fn default_on_timeout() -> String {
     "fail".into()
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckEnvironmentPolicy {
+    #[default]
+    Inherit,
+    StripRkSpawn,
+}
+
+impl std::fmt::Display for CheckEnvironmentPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Inherit => "inherit",
+            Self::StripRkSpawn => "strip_rk_spawn",
+        })
+    }
+}
+
 /// A repo-registered named check: the per-repo allowlist entry a workflow `run`
 /// step invokes by name instead of carrying a raw shell command. The registry
 /// lives in `<repo>/.rk/checks.cue` and is owned by the repo, NOT by the (possibly
@@ -512,6 +529,16 @@ pub struct Check {
     /// Hard wall-clock bound; unset falls back to the run step's own timeout.
     #[serde(default)]
     pub timeout: Option<String>,
+    /// Environment inherited by the check process. Repositories whose test
+    /// clients read ambient rat identity can explicitly strip the spawn
+    /// contract rather than relying on an operator to remember shell hygiene.
+    #[serde(default, rename = "environmentPolicy")]
+    pub environment_policy: CheckEnvironmentPolicy,
+    /// Repository-owned description of the runner/toolchain used by this
+    /// command. Optional for legacy registries; required for onboarding-created
+    /// checks so the verification report can preserve it.
+    #[serde(default)]
+    pub toolchain: Option<String>,
 }
 
 /// Load and validate every `#Check` in one repo's `checks.cue` registry.
@@ -1654,7 +1681,12 @@ schedules: [
         let source = r#"
 checks: [
     {name: "test", command: "cargo test"},
-    {name: "clippy", command: "cargo clippy", cwd: "crates/x", expectExit: 0, timeout: "5m"},
+    {
+        name: "clippy", command: "cargo clippy", cwd: "crates/x",
+        expectExit: 0, timeout: "5m",
+        environmentPolicy: "strip_rk_spawn",
+        toolchain: "mise rust@1.95.0",
+    },
 ]
 "#;
         let checks = load_checks_str(source).unwrap();
@@ -1667,6 +1699,11 @@ checks: [
         assert_eq!(checks[1].cwd.as_deref(), Some("crates/x"));
         assert_eq!(checks[1].expect_exit, Some(0));
         assert_eq!(checks[1].timeout.as_deref(), Some("5m"));
+        assert_eq!(
+            checks[1].environment_policy,
+            CheckEnvironmentPolicy::StripRkSpawn
+        );
+        assert_eq!(checks[1].toolchain.as_deref(), Some("mise rust@1.95.0"));
     }
 
     #[test]
@@ -1681,5 +1718,13 @@ checks: [
         let bad = r#"checks: [{name: "x"}]"#;
         let err = load_checks_str(bad).unwrap_err();
         assert!(err.to_string().contains("cue export failed"), "{err}");
+    }
+
+    #[test]
+    fn check_unknown_environment_policy_is_a_cue_error() {
+        let bad =
+            r#"checks: [{name: "x", command: "true", environmentPolicy: "ambient_magic"}]"#;
+        let err = load_checks_str(bad).unwrap_err();
+        assert!(err.to_string().contains("environmentPolicy"), "{err}");
     }
 }
