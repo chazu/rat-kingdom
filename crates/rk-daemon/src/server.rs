@@ -5,6 +5,7 @@
 use crate::proto::{codes, Request, Response};
 use crate::coordinator::CoordinatorFilter;
 use chrono::{DateTime, Utc};
+use rk_core::id::RecordId;
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, SYSTEM_SCOPE};
 use rk_space::{CoordinatorEvent, Space};
@@ -37,6 +38,9 @@ const MAX_INBOX_ITEMS: usize = 2_048;
 /// The caller id a human at a terminal authenticates as. `Client` sends this
 /// whenever `RK_AGENT` is unset, and an empty caller means the same thing.
 const OPERATOR_ACTOR: &str = "operator";
+
+type FactVoteKey = (String, String, String);
+type FactVoteState = (DateTime<Utc>, RecordId, String);
 
 /// Who may close a ballot: its proposer, or the operator (TKT-184).
 ///
@@ -94,6 +98,9 @@ pub struct Daemon {
     engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
     repos: std::sync::Mutex<crate::repos::RepoRegistry>,
     tickets: Arc<crate::tickets::Tickets>,
+    coordinator_sessions: std::sync::Mutex<crate::coordinator::CoordinatorSessions>,
+    /// Serializes read/append cycles for one agent's effective fact vote.
+    fact_vote_lock: std::sync::Mutex<()>,
     started: Instant,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -276,6 +283,11 @@ impl Daemon {
         let repos = std::sync::Mutex::new(crate::repos::RepoRegistry::load(
             &layout.home().join("repos.json"),
         )?);
+        let coordinator_sessions = std::sync::Mutex::new(
+            crate::coordinator::CoordinatorSessions::load(
+                &layout.home().join("coordinator-sessions.json"),
+            )?,
+        );
         Ok(Self {
             layout,
             space,
@@ -304,6 +316,8 @@ impl Daemon {
             engine: std::sync::OnceLock::new(),
             repos,
             tickets,
+            coordinator_sessions,
+            fact_vote_lock: std::sync::Mutex::new(()),
             started: Instant::now(),
             shutdown_tx,
         })
@@ -782,30 +796,50 @@ impl Daemon {
         if req.caller == "operator" || req.caller.is_empty() {
             return true;
         }
-        req.auth == rk_core::paths::derive_agent_token(&self.auth_token, &req.caller)
-            && !matches!(
+        if req.auth != rk_core::paths::derive_agent_token(&self.auth_token, &req.caller) {
+            return false;
+        }
+        if !matches!(
+            req.method.as_str(),
+            "stop"
+                | "agent.spawn"
+                | "agent.respawn"
+                | "agent.dismiss"
+                | "agent.interrupt"
+                | "agent.steer"
+                | "agent.archive"
+                | "agent.unarchive"
+                | "agent.revert"
+                | "repo.add"
+                | "repo.remove"
+                | "workflow.run"
+                | "workflow.approve"
+                | "workflow.archive"
+                | "workflow.unarchive"
+                | "coordinator.snapshot"
+                | "coordinator.watch"
+                | "coordinator.register"
+                | "coordinator.pending"
+                | "coordinator.ack"
+                | "sync.now"
+                | "sync.peers"
+                | "ticket.update"
+                | "ticket.dep"
+        ) {
+            return true;
+        }
+
+        // A foreman gets only the child-management subset. Each target is
+        // checked again at dispatch time against the structural parent edge;
+        // this broad authorization is only the first gate.
+        self.supervisor.is_foreman(&req.caller)
+            && matches!(
                 req.method.as_str(),
-                "stop"
-                    | "agent.spawn"
+                "agent.spawn"
                     | "agent.respawn"
                     | "agent.dismiss"
                     | "agent.interrupt"
                     | "agent.steer"
-                    | "agent.archive"
-                    | "agent.unarchive"
-                    | "agent.revert"
-                    | "repo.add"
-                    | "repo.remove"
-                    | "workflow.run"
-                    | "workflow.approve"
-                    | "workflow.archive"
-                    | "workflow.unarchive"
-                    | "coordinator.snapshot"
-                    | "coordinator.watch"
-                    | "sync.now"
-                    | "sync.peers"
-                    | "ticket.update"
-                    | "ticket.dep"
             )
     }
 
@@ -882,16 +916,21 @@ impl Daemon {
         }
     }
 
-    fn coordinator_snapshot(&self, filter: &CoordinatorFilter) -> Value {
-        let snapshot = crate::coordinator::snapshot(
+    fn coordinator_snapshot(&self, filter: &CoordinatorFilter) -> rk_core::Result<Value> {
+        let events = self.space.coordinator_events_after(
+            None,
+            crate::coordinator::MAX_REPLAY_EVENTS.saturating_mul(4),
+        )?;
+        let snapshot = crate::coordinator::hierarchical_snapshot(
             &self.engine().list(),
             &self.supervisor.list(),
+            &events,
             filter,
         );
-        json!({
+        Ok(json!({
             "snapshot": snapshot,
             "cursor": self.latest_event_cursor(),
-        })
+        }))
     }
 
     fn prepare_coordinator_watch(
@@ -915,9 +954,14 @@ impl Daemon {
         };
         let replay = crate::coordinator::replay(scanned, &filter);
         let boundary = max_cursor(baseline, replay.boundary);
-        let snapshot = crate::coordinator::snapshot(
+        let events = self.space.coordinator_events_after(
+            None,
+            crate::coordinator::MAX_REPLAY_EVENTS.saturating_mul(4),
+        )?;
+        let snapshot = crate::coordinator::hierarchical_snapshot(
             &self.engine().list(),
             &self.supervisor.list(),
+            &events,
             &filter,
         );
         Ok(Outcome::CoordinatorWatch {
@@ -943,6 +987,78 @@ impl Daemon {
 
     fn latest_event_cursor(&self) -> Option<u64> {
         self.space.coordinator_latest_sequence().ok().flatten()
+    }
+
+    fn handle_coordinator_register(&self, req: Request) -> Response {
+        let params: CoordinatorRegisterParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        if params.coordinator.trim().is_empty() {
+            return Response::err(req.id, codes::BAD_PARAMS, "coordinator is required");
+        }
+        let mut sessions = match self.coordinator_sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match sessions.register(&params.coordinator, params.after) {
+            Ok(session) => Response::ok(req.id, json!({"session": session})),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    fn handle_coordinator_pending(&self, req: Request) -> Response {
+        let mut filter: CoordinatorFilter = match parse_params(&req.params) {
+            Ok(filter) => filter,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let Some(coordinator) = filter.coordinator.clone() else {
+            return Response::err(req.id, codes::BAD_PARAMS, "coordinator is required");
+        };
+        let cursor = {
+            let sessions = match self.coordinator_sessions.lock() {
+                Ok(sessions) => sessions,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            sessions.cursor(&coordinator).unwrap_or(filter.after.unwrap_or(0))
+        };
+        filter.after = Some(cursor);
+        match self.coordinator_pending(&filter) {
+            Ok(result) => Response::ok(req.id, result),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    fn handle_coordinator_ack(&self, req: Request) -> Response {
+        let params: CoordinatorAckParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let mut sessions = match self.coordinator_sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match sessions.acknowledge(&params.coordinator, params.cursor) {
+            Ok(session) => Response::ok(req.id, json!({"session": session})),
+            Err(e) => Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        }
+    }
+
+    fn coordinator_pending(&self, filter: &CoordinatorFilter) -> rk_core::Result<Value> {
+        let scanned = self.space.coordinator_events_after(
+            filter.after,
+            crate::coordinator::MAX_REPLAY_EVENTS + 1,
+        )?;
+        let replay = crate::coordinator::replay(scanned, filter);
+        let snapshot = self.coordinator_snapshot(filter)?;
+        Ok(json!({
+            "snapshot": snapshot["snapshot"],
+            "cursor": snapshot["cursor"],
+            "events": replay.events.iter().map(|event| json!({"cursor": event.cursor, "event": event.event})).collect::<Vec<_>>(),
+            "truncated": replay.truncated,
+            "resync_required": replay.truncated,
+            "ack_after": replay.boundary.or(snapshot["cursor"].as_u64()),
+        }))
     }
 
     /// Push `agent`'s new transcript entries as they land, until the client goes
@@ -985,6 +1101,7 @@ impl Daemon {
             }
             "space.out" => reply(self.handle_out(req)),
             "space.withdraw" => reply(self.handle_withdraw(req)),
+            "fact.vote" => reply(self.handle_fact_vote(req)),
             "space.scan" => reply(self.handle_scan(req)),
             "space.take" => reply(self.handle_blocking(req, true).await),
             "space.rd" => reply(self.handle_blocking(req, false).await),
@@ -996,19 +1113,22 @@ impl Daemon {
                 Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
             },
             "coordinator.snapshot" => match parse_params::<CoordinatorFilter>(&req.params) {
-                Ok(filter) if filter.instance.is_some() => reply(Response::ok(
-                    id,
-                    self.coordinator_snapshot(&filter),
-                )),
+                Ok(filter) if filter_is_valid(&filter) => match self.coordinator_snapshot(&filter) {
+                    Ok(snapshot) => reply(Response::ok(id, snapshot)),
+                    Err(e) => reply(Response::err(id, codes::INTERNAL, e.to_string())),
+                },
                 Ok(_) => reply(Response::err(
                     id,
                     codes::BAD_PARAMS,
-                    "coordinator.instance is required",
+                    "a coordinator scope is required (instance, coordinator, subtree, or repo)",
                 )),
                 Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
             },
+            "coordinator.register" => reply(self.handle_coordinator_register(req)),
+            "coordinator.pending" => reply(self.handle_coordinator_pending(req)),
+            "coordinator.ack" => reply(self.handle_coordinator_ack(req)),
             "coordinator.watch" => match parse_params::<CoordinatorFilter>(&req.params) {
-                Ok(filter) if filter.instance.is_some() => match self.prepare_coordinator_watch(id, filter) {
+                Ok(filter) if filter_is_valid(&filter) => match self.prepare_coordinator_watch(id, filter) {
                     Ok(outcome) => outcome,
                     Err(e) => reply(Response::err(
                         req.id,
@@ -1019,11 +1139,12 @@ impl Daemon {
                 Ok(_) => reply(Response::err(
                     id,
                     codes::BAD_PARAMS,
-                    "coordinator.instance is required",
+                    "a coordinator scope is required (instance, coordinator, subtree, or repo)",
                 )),
                 Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
             },
             "agent.spawn" => reply(self.handle_spawn(req).await),
+            "agent.progress" => reply(self.handle_progress(req)),
             "agent.respawn" => reply(self.handle_respawn(req).await),
             "agent.list" => reply(match parse_params::<AgentListParams>(&req.params) {
                 Ok(p) => {
@@ -1105,6 +1226,9 @@ impl Daemon {
                     Ok(p) => p,
                     Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
                 };
+                if let Err(e) = self.authorize_foreman_child(&req.caller, &params.name) {
+                    return reply(Response::err(id, codes::FORBIDDEN, e.to_string()));
+                }
                 reply(match self.supervisor.interrupt(&params.name).await {
                     Ok(()) => Response::ok(id, json!({"interrupted": true})),
                     Err(e) => Response::err(id, codes::INTERNAL, e.to_string()),
@@ -1115,6 +1239,9 @@ impl Daemon {
                     Ok(p) => p,
                     Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
                 };
+                if let Err(e) = self.authorize_foreman_child(&req.caller, &params.name) {
+                    return reply(Response::err(id, codes::FORBIDDEN, e.to_string()));
+                }
                 reply(
                     match self.supervisor.dismiss(&params.name, params.no_merge).await {
                         Ok(v) => Response::ok(id, v),
@@ -1780,9 +1907,54 @@ impl Daemon {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
+        let mut params = if req.caller == "operator" || req.caller.is_empty() {
+            params
+        } else {
+            match self
+                .supervisor
+                .prepare_foreman_spawn(&req.caller, params)
+            {
+                Ok(p) => p,
+                Err(e) => return Response::err(req.id, codes::FORBIDDEN, e.to_string()),
+            }
+        };
+        // Workflow-spawned foremen inherit the instance cap for children they
+        // dispatch. The workflow engine remains the source of that definition;
+        // the child spawn must not silently become an uncapped side door.
+        if params.instance_max_usd.is_none() {
+            if let Some(instance) = params.workflow_instance.as_deref() {
+                params.instance_max_usd = self.engine().instance_budget(instance);
+            }
+        }
         match self.supervisor.spawn_async(params).await {
             Ok(record) => Response::ok(req.id, json!({"agent": record})),
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    fn handle_progress(&self, req: Request) -> Response {
+        if req.caller.is_empty() || req.caller == "operator" {
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                "progress must be reported by an authenticated agent",
+            );
+        }
+        let params: ProgressParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        match self.supervisor.record_progress(
+            &req.caller,
+            params.summary,
+            params.next,
+            params.status,
+        ) {
+            Ok(agent) => Response::ok(
+                req.id,
+                json!({"agent": agent.name, "progress": agent.progress}),
+            ),
+            Err(e) => Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
         }
     }
 
@@ -1791,6 +1963,9 @@ impl Daemon {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
+        if let Err(e) = self.authorize_foreman_child(&req.caller, &params.name) {
+            return Response::err(req.id, codes::FORBIDDEN, e.to_string());
+        }
         let supervisor = Arc::clone(&self.supervisor);
         let name = params.name;
         let handle = tokio::runtime::Handle::current();
@@ -1817,7 +1992,7 @@ impl Daemon {
         let handle = tokio::runtime::Handle::current();
         let result = tokio::task::spawn_blocking(move || {
             let _entered = handle.enter();
-            engine.run(&params.name, &params.repo, params.params)
+            engine.run_owned(&params.name, &params.repo, params.params, params.coordinator)
         })
         .await;
         match result {
@@ -1935,6 +2110,13 @@ impl Daemon {
         }
     }
 
+    fn authorize_foreman_child(&self, caller: &str, child: &str) -> rk_core::Result<()> {
+        if caller == "operator" || caller.is_empty() {
+            return Ok(());
+        }
+        self.supervisor.authorize_child(caller, child)
+    }
+
     fn handle_named<F>(&self, req: Request, f: F) -> Response
     where
         F: FnOnce(&Arc<crate::supervisor::Supervisor>, String) -> rk_core::Result<Value>,
@@ -1954,6 +2136,9 @@ impl Daemon {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
+        if let Err(e) = self.authorize_foreman_child(&req.caller, &params.name) {
+            return Response::err(req.id, codes::FORBIDDEN, e.to_string());
+        }
         match self.supervisor.steer(&params.name, &params.message).await {
             Ok(()) => Response::ok(req.id, json!({"steered": true})),
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
@@ -1967,6 +2152,19 @@ impl Daemon {
         };
         let caller = req.caller.clone();
         let is_agent = caller != "operator" && !caller.is_empty();
+        let attention = if is_agent
+            && matches!(params.category, Category::Obstacle | Category::Need)
+            && self.supervisor.is_reporting_boundary(&caller)
+        {
+            Some((
+                params.category.as_str().to_string(),
+                params.scope.clone(),
+                params.identity.clone(),
+                params.payload.clone(),
+            ))
+        } else {
+            None
+        };
         if is_agent {
             if params.lifecycle == Some(Lifecycle::Furniture)
                 || matches!(
@@ -1985,6 +2183,7 @@ impl Daemon {
                         // proposal. `space.withdraw` is the only route, and it
                         // checks authorship against the Suggestion (TKT-184).
                         | Category::Withdrawal
+                        | Category::FactVote
                 )
             {
                 return Response::err(
@@ -2028,7 +2227,7 @@ impl Daemon {
             params.identity,
             params.instance.unwrap_or_else(|| {
                 if is_agent {
-                    caller
+                    caller.clone()
                 } else {
                     self.castle.clone()
                 }
@@ -2076,7 +2275,18 @@ impl Daemon {
             self.space.out(tuple.clone()).map(|()| tuple)
         };
         match written {
-            Ok(t) => Response::ok(req.id, json!({"id": t.id, "written": true})),
+            Ok(t) => {
+                if let Some((category, scope, identity, payload)) = attention {
+                    self.supervisor.publish_coordination_attention(
+                        &caller,
+                        &category,
+                        &scope,
+                        &identity,
+                        &payload,
+                    );
+                }
+                Response::ok(req.id, json!({"id": t.id, "written": true}))
+            }
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
     }
@@ -2204,6 +2414,101 @@ impl Daemon {
         }
     }
 
+    /// Cast, change, or retract the authenticated caller's vote on one Fact.
+    /// Votes are append-only ledger tuples: the latest entry for
+    /// `(fact, voter)` is effective, while the history preserves provenance.
+    fn handle_fact_vote(&self, req: Request) -> Response {
+        let params: FactVoteParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let fact_id = match params.fact.trim().parse::<RecordId>() {
+            Ok(id) => id,
+            Err(e) => {
+                return Response::err(
+                    req.id,
+                    codes::BAD_PARAMS,
+                    format!("fact must be a tuple id: {e}"),
+                )
+            }
+        };
+        let fact = match self.space.get(fact_id) {
+            Ok(Some(tuple)) if tuple.category == Category::Fact => tuple,
+            Ok(Some(_)) => {
+                return Response::err(req.id, codes::BAD_PARAMS, "target tuple is not a fact")
+            }
+            Ok(None) => return Response::err(req.id, codes::BAD_PARAMS, "fact tuple not found"),
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        let vote = params.vote.trim().to_ascii_lowercase();
+        if !matches!(vote.as_str(), "up" | "down" | "clear") {
+            return Response::err(req.id, codes::BAD_PARAMS, "vote must be up, down, or clear");
+        }
+        let voter = if req.caller.is_empty() {
+            OPERATOR_ACTOR.to_string()
+        } else {
+            req.caller.clone()
+        };
+        let _guard = match self.fact_vote_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let fact_key = fact_id.to_string();
+        let mut vote_pattern = Pattern::category(Category::FactVote)
+            .scope(fact.scope.clone())
+            .identity(fact_key.clone());
+        vote_pattern.instance = Some(voter.clone());
+        let existing = match self.space.scan(&vote_pattern) {
+            Ok(tuples) => tuples,
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        let current = existing
+            .iter()
+            .max_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            })
+            .and_then(|tuple| tuple.payload.get("vote"))
+            .and_then(Value::as_str);
+        let already = match vote.as_str() {
+            "clear" => current.is_none() || current == Some("clear"),
+            _ => current == Some(vote.as_str()),
+        };
+        if already {
+            return Response::ok(
+                req.id,
+                json!({
+                    "fact": fact_id,
+                    "vote": vote,
+                    "voter": voter,
+                    "already": true,
+                    "written": false,
+                }),
+            );
+        }
+        let tuple = Tuple::new(
+            Category::FactVote,
+            fact.scope,
+            fact_key.clone(),
+            voter.clone(),
+            json!({"fact": fact_key, "vote": vote, "voter": voter}),
+        );
+        match self.space.out(tuple) {
+            Ok(()) => Response::ok(
+                req.id,
+                json!({
+                    "fact": fact_id,
+                    "vote": vote,
+                    "voter": voter,
+                    "already": false,
+                    "written": true,
+                }),
+            ),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
     fn handle_scan(&self, req: Request) -> Response {
         let params: ScanParams = match parse_params(&req.params) {
             Ok(p) => p,
@@ -2225,7 +2530,19 @@ impl Daemon {
                 let truncated = tuples.len() > limit
                     || requested_top.is_some_and(|requested| requested > MAX_SCAN_TUPLES);
                 tuples.truncate(limit);
-                Response::ok(req.id, json!({"tuples": tuples, "truncated": truncated}))
+                let fact_votes = if params.pattern.category == Some(Category::Fact) {
+                    match self.fact_vote_counts(&tuples) {
+                        Ok(counts) => Some(counts),
+                        Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+                    }
+                } else {
+                    None
+                };
+                let mut result = json!({"tuples": tuples, "truncated": truncated});
+                if let Some(counts) = fact_votes {
+                    result["fact_votes"] = counts;
+                }
+                Response::ok(req.id, result)
             }
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
@@ -2247,10 +2564,75 @@ impl Daemon {
             self.space.rd(&params.pattern.pattern, timeout).await
         };
         match result {
-            Ok(Some(tuple)) => Response::ok(req.id, json!({"tuple": tuple})),
+            Ok(Some(tuple)) => {
+                let fact_votes = if tuple.category == Category::Fact {
+                    match self.fact_vote_counts(std::slice::from_ref(&tuple)) {
+                        Ok(counts) => Some(counts),
+                        Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+                    }
+                } else {
+                    None
+                };
+                let mut result = json!({"tuple": tuple});
+                if let Some(counts) = fact_votes {
+                    result["fact_votes"] = counts;
+                }
+                Response::ok(req.id, result)
+            }
             Ok(None) => Response::ok(req.id, json!({"tuple": null, "timed_out": true})),
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
+    }
+
+    /// Reduce the append-only vote ledger to the latest effective vote from
+    /// each voter, then return counts keyed by the fact id being read.
+    fn fact_vote_counts(&self, facts: &[Tuple]) -> rk_core::Result<Value> {
+        let targets: HashSet<(String, String)> = facts
+            .iter()
+            .map(|fact| (fact.scope.clone(), fact.id.to_string()))
+            .collect();
+        let votes = self.space.scan(&Pattern::category(Category::FactVote))?;
+        let mut latest: HashMap<FactVoteKey, FactVoteState> = HashMap::new();
+        for vote in votes {
+            let key = (vote.scope, vote.identity, vote.instance);
+            let state = vote
+                .payload
+                .get("vote")
+                .and_then(Value::as_str)
+                .unwrap_or("clear")
+                .to_string();
+            if latest
+                .get(&key)
+                .is_none_or(|(current_at, current_id, _)| {
+                    vote.created_at > *current_at
+                        || (vote.created_at == *current_at && vote.id > *current_id)
+                })
+            {
+                latest.insert(key, (vote.created_at, vote.id, state));
+            }
+        }
+        let mut counts: HashMap<(String, String), (u64, u64)> = HashMap::new();
+        for ((scope, fact_id, _voter), (_created_at, _id, state)) in latest {
+            if !targets.contains(&(scope.clone(), fact_id.clone())) {
+                continue;
+            }
+            let entry = counts.entry((scope, fact_id)).or_default();
+            match state.as_str() {
+                "up" => entry.0 += 1,
+                "down" => entry.1 += 1,
+                _ => {}
+            }
+        }
+        let mut result = serde_json::Map::new();
+        for fact in facts {
+            let key = (fact.scope.clone(), fact.id.to_string());
+            let (up, down) = counts.get(&key).copied().unwrap_or_default();
+            result.insert(
+                fact.id.to_string(),
+                json!({"up": up, "down": down, "score": up as i64 - down as i64}),
+            );
+        }
+        Ok(Value::Object(result))
     }
 
     fn status(&self) -> Value {
@@ -2303,6 +2685,13 @@ fn max_cursor(
         (left, None) => left,
         (None, right) => right,
     }
+}
+
+fn filter_is_valid(filter: &CoordinatorFilter) -> bool {
+    filter.instance.is_some()
+        || filter.coordinator.is_some()
+        || filter.subtree.is_some()
+        || filter.repo.is_some()
 }
 
 enum Outcome {
@@ -2367,6 +2756,12 @@ struct WithdrawParams {
     suggestion: String,
 }
 
+#[derive(Deserialize)]
+struct FactVoteParams {
+    fact: String,
+    vote: String,
+}
+
 #[derive(Deserialize, Default)]
 struct PatternParams {
     #[serde(flatten)]
@@ -2392,6 +2787,35 @@ struct WorkflowRunParams {
     repo: String,
     #[serde(default)]
     params: std::collections::HashMap<String, Value>,
+    /// Stable coordinator-session identity for owned-workflow monitoring.
+    #[serde(default)]
+    coordinator: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CoordinatorRegisterParams {
+    coordinator: String,
+    #[serde(default)]
+    after: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct CoordinatorAckParams {
+    coordinator: String,
+    cursor: u64,
+}
+
+#[derive(Deserialize)]
+struct ProgressParams {
+    summary: String,
+    #[serde(default)]
+    next: Option<String>,
+    #[serde(default = "default_progress_status")]
+    status: String,
+}
+
+fn default_progress_status() -> String {
+    "working".into()
 }
 
 #[derive(Deserialize)]
@@ -2711,6 +3135,78 @@ mod agent_fact_authorisation_tests {
         });
 
         assert_eq!(response.error.as_ref().map(|error| error.code.as_str()), Some(codes::FORBIDDEN));
+    }
+
+    #[test]
+    fn agents_can_vote_change_and_retract_facts_with_aggregate_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new_in_memory(Layout::at(dir.path()), "test-castle".into()).unwrap();
+        let fact = daemon.handle_out(Request {
+            id: "fact-vote-source".into(),
+            method: "space.out".into(),
+            auth: String::new(),
+            caller: "Whisker".into(),
+            params: json!({
+                "category": "fact",
+                "scope": "rat-kingdom",
+                "identity": "observed-rate-limit",
+                "payload": {"limit": 100}
+            }),
+        });
+        let fact_id = fact.result.unwrap()["id"].as_str().unwrap().to_string();
+
+        let vote = |id: &str, caller: &str, value: &str| {
+            daemon.handle_fact_vote(Request {
+                id: id.into(),
+                method: "fact.vote".into(),
+                auth: String::new(),
+                caller: caller.into(),
+                params: json!({"fact": fact_id, "vote": value}),
+            })
+        };
+        assert_eq!(vote("up-1", "Whisker", "up").result.unwrap()["written"], true);
+        assert_eq!(vote("up-2", "Whisker", "up").result.unwrap()["already"], true);
+        assert_eq!(vote("down-1", "Whisker", "down").result.unwrap()["written"], true);
+        assert_eq!(vote("up-3", "Nibbles", "up").result.unwrap()["written"], true);
+
+        let scan = daemon.handle_scan(Request {
+            id: "scan-1".into(),
+            method: "space.scan".into(),
+            auth: String::new(),
+            caller: "operator".into(),
+            params: json!({"category": "fact"}),
+        });
+        assert_eq!(scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["up"], 1);
+        assert_eq!(scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["down"], 1);
+        assert_eq!(scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["score"], 0);
+
+        assert_eq!(vote("clear-1", "Whisker", "clear").result.unwrap()["written"], true);
+        assert_eq!(vote("clear-2", "Whisker", "clear").result.unwrap()["already"], true);
+        let scan = daemon.handle_scan(Request {
+            id: "scan-2".into(),
+            method: "space.scan".into(),
+            auth: String::new(),
+            caller: "operator".into(),
+            params: json!({"category": "fact"}),
+        });
+        assert_eq!(scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["up"], 1);
+        assert_eq!(scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["down"], 0);
+        assert_eq!(scan.result.as_ref().unwrap()["fact_votes"][&fact_id]["score"], 1);
+
+        let raw = daemon.handle_out(Request {
+            id: "forged-vote".into(),
+            method: "space.out".into(),
+            auth: String::new(),
+            caller: "Whisker".into(),
+            params: json!({
+                "category": "fact_vote",
+                "scope": "rat-kingdom",
+                "identity": fact_id,
+                "instance": "Nibbles",
+                "payload": {"vote": "up"}
+            }),
+        });
+        assert_eq!(raw.error.as_ref().map(|error| error.code.as_str()), Some(codes::FORBIDDEN));
     }
 }
 

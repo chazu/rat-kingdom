@@ -15,6 +15,11 @@ pub struct PrimeContext {
     pub task: Option<String>,
     pub branch: Option<String>,
     pub parent: Option<String>,
+    /// Recent facts pre-scanned by the caller from the tuplespace for this
+    /// rat's repo scope + system. The renderer caps injected facts at
+    /// MAX_INJECTED_FACTS so durable history cannot grow a prompt without
+    /// bound. Empty means the section is omitted.
+    pub facts: Vec<String>,
     /// Active fleet conventions (promoted norms), pre-scanned by the caller from
     /// the tuplespace for this rat's repo scope + `system`. Composed verbatim
     /// into a "Standing conventions" section so a promoted norm changes an
@@ -23,12 +28,16 @@ pub struct PrimeContext {
     pub conventions: Vec<String>,
 }
 
+/// Maximum number of fact entries injected into one worker prompt.
+pub const MAX_INJECTED_FACTS: usize = 10;
+
 const FRAGMENT_SPACE: &str = "\
 ## Coordination: the tuplespace
 
-You coordinate with other agents stigmergically through a shared tuplespace,
-never by direct messages. Use these commands (they auto-fill your identity
-from the environment):
+You coordinate with other agents stigmergically through a shared tuplespace.
+Daemon-routed directed messages are reserved for structural parent completion
+notices; use tuples for all other coordination. Use these commands (they
+auto-fill your identity from the environment):
 
 - `rk scan <category> [scope]` — read tuples. Before starting, read `fact` and
   `convention` tuples for your repo scope and the `system` scope.
@@ -97,6 +106,14 @@ conversation.
   record appears, treat the refreshed snapshot as authoritative and continue
   from its cursor. `rk top` and raw `rk watch` are dashboards, not a reliable
   replacement for this workflow watch/replay path.
+- `rk monitor --coordinator <session-id> --once` — read bounded attention and
+  middle-rat rollups for all workflows owned by that coordinator session.
+  Add `--follow` for a live NDJSON stream, or `--subtree <middle-rat>` to
+  drill into one reporting boundary. Run the one-shot read before meaningful
+  decisions. Rat Kingdom cannot inject into an arbitrary Codex, Claude Code, or
+  other host session; a host wrapper may call this command at its turn boundary
+  if the host exposes such a hook. Monitoring is advisory: it never steers,
+  dismisses, merges, retries, or approves work.
 - `rk scan obstacle <repo>` / `rk scan need <repo>` — what rats have flagged.
 - `rk steer <name> \"...\"` — inject mid-session guidance · `rk interrupt <name>`.
 - `rk dismiss <name>` — stop the rat, merge its branch, clean up.
@@ -165,6 +182,47 @@ other work, even if you notice claimable tasks or open needs — post a `fact`
 or `need` tuple instead and let the orchestrator route it.
 ";
 
+const FRAGMENT_FOREMAN: &str = "\
+## Foreman role — coordinate, do not implement
+
+You are a foreman: a middle-rat responsible for turning one feature set into
+integrated work. Do not edit source code yourself. Your branch (`RK_BRANCH`) is
+the shared integration branch for your workers, and the workflow will merge it
+when you finish.
+
+Build a dispatch table from the parent ticket and its children. Keep at most
+the configured number of workers active. For every worker, use:
+
+`rk spawn --ticket <ticket> --parent \"$RK_AGENT\" --base \"$RK_BRANCH\"`
+
+The daemon authenticates the parent and forces those lineage fields, but keep
+them explicit in the command so the integration intent is visible. A worker's
+completion is delivered as a directed message:
+
+`rk rd message \"$RK_REPO\" \"$RK_AGENT\" --timeout 2m`
+
+On completion, inspect the worker's branch and result, then run `rk dismiss
+<worker>` to merge that worker into your integration branch. Do not dismiss a
+worker whose work is missing or failed; respawn, steer, or file an obstacle as
+appropriate. Run the configured check after each accepted merge when practical.
+
+Workers must commit, run their own verification, and finish with `rk done`; do
+not ask them to dismiss themselves. If a worker is blocked, record the issue
+and decide whether to steer, respawn, or re-dispatch it. Continue independent
+work while one item is blocked, but never claim the feature set is complete
+until every required item is integrated or explicitly escalated.
+
+Publish semantic checkpoints at meaningful milestones (not every tool call):
+
+`rk progress --summary \"4/7 child tickets complete\" --next \"reviewing the remaining three\"`
+
+If a child is blocked or needs coordinator input, report that in `--status
+blocked` and also use `rk obstacle` or `rk need` when durable detail is useful.
+
+Before finishing, run the final integration check on `RK_BRANCH`, summarize the
+completed and unresolved items, and run `rk done \"<summary>\"`. STOP after that.
+";
+
 const FRAGMENT_COMPLETION: &str = "\
 ## Completion protocol (mandatory, in order)
 
@@ -186,7 +244,12 @@ const FRAGMENT_COMPLETION: &str = "\
    commit: run `git status --porcelain` (must be empty) and
    `git log <base>..HEAD` (must be non-empty). If a verification command is
    still running, wait for it — do not report while it is in flight.
-5. `rk done \"<summary>\"` — this is how the orchestrator knows you finished.
+5. Before you finish, review the injected facts that were relevant to your task.
+   If a fact materially helped and appears correct, run `rk fact vote <fact-id> up`;
+   if it is incorrect or harmful, run `rk fact vote <fact-id> down`. Use `clear`
+   to retract an earlier vote. Vote only where you have a grounded view; this is
+   optional and never replaces filing a ticket for a problem. Then run
+   `rk done \"<summary>\"` — this is how the orchestrator knows you finished.
 ";
 
 /// Compose the active fleet conventions into a binding "Standing conventions"
@@ -214,10 +277,32 @@ fn render_conventions(conventions: &[String]) -> Option<String> {
     any.then_some(section)
 }
 
+/// Compose recent fact context into a bounded Known facts section, or None
+/// when there are no usable facts. Facts are observations, not binding
+/// conventions; the prompt says so explicitly to keep the two kinds distinct.
+fn render_facts(facts: &[String]) -> Option<String> {
+    let mut section = String::from(
+        "## Known facts\n\n\
+         These are observations from the fleet, not binding conventions. Use \
+         them as context and verify them when they matter to your task:\n\n",
+    );
+    let mut any = false;
+    for fact in facts.iter().take(MAX_INJECTED_FACTS) {
+        let fact = fact.trim();
+        if fact.is_empty() {
+            continue;
+        }
+        let _ = writeln!(section, "- {fact}");
+        any = true;
+    }
+    any.then_some(section)
+}
+
 /// Render role instructions. Roles: "operator" (the human's dispatcher — the
-/// default when no role is otherwise indicated), "rat" (directed worker), and
-/// "reviewer". The operator role addresses a session driving the fleet from the
-/// outside; the others address a spawned worker and are personalized from `ctx`.
+/// default when no role is otherwise indicated), "rat" (directed worker),
+/// "reviewer", and "foreman". The operator role addresses a session driving
+/// the fleet from the outside; the others address a spawned worker and are
+/// personalized from `ctx`.
 pub fn render(role: &str, ctx: &PrimeContext) -> String {
     if role == "operator" {
         return FRAGMENT_OPERATOR.to_string();
@@ -243,8 +328,23 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
         out.push_str(&section);
         out.push('\n');
     }
+    if let Some(section) = render_facts(&ctx.facts) {
+        out.push_str(&section);
+        out.push('\n');
+    }
 
     match role {
+        "foreman" => {
+            out.push_str(FRAGMENT_FOREMAN);
+            out.push('\n');
+            out.push_str(FRAGMENT_SPACE);
+            out.push('\n');
+            out.push_str(FRAGMENT_TICKETS);
+            out.push('\n');
+            out.push_str(FRAGMENT_GIT_SAFETY);
+            out.push('\n');
+            out.push_str(FRAGMENT_COMPLETION);
+        }
         "reviewer" => {
             out.push_str(
                 "Review the changes on your branch against the task requirements. \
@@ -307,6 +407,7 @@ mod tests {
             task: Some(".rk-1".into()),
             branch: Some("rat/whisker/rk-1".into()),
             parent: None,
+            facts: Vec::new(),
             conventions: Vec::new(),
         }
     }
@@ -335,6 +436,22 @@ mod tests {
         let text = render("reviewer", &ctx());
         assert!(text.contains("APPROVE"));
         assert!(!text.contains("only your task"));
+    }
+
+    #[test]
+    fn foreman_role_is_a_delegator_with_parent_merge_contract() {
+        let text = render("foreman", &ctx());
+        for needle in [
+            "You are a foreman",
+            "Do not edit source code yourself",
+            "--parent \"$RK_AGENT\" --base \"$RK_BRANCH\"",
+            "rk rd message",
+            "rk dismiss",
+            "run `rk done",
+        ] {
+            assert!(text.contains(needle), "foreman prompt missing {needle:?}");
+        }
+        assert!(!text.contains("You have exactly one task"));
     }
 
     #[test]
@@ -541,6 +658,20 @@ mod tests {
         assert_eq!(text.matches("- Prefer small commits.").count(), 1);
         // The blank never produces an empty bullet.
         assert!(!text.contains("- \n"));
+    }
+
+    #[test]
+    fn facts_are_injected_as_bounded_non_binding_context() {
+        let mut c = ctx();
+        c.facts = (0..12).map(|n| format!("fact-{n}")).collect();
+        let text = render("rat", &c);
+        assert_eq!(text.matches("- fact-").count(), MAX_INJECTED_FACTS);
+        assert!(text.contains("These are observations from the fleet, not binding conventions."));
+        assert!(text.contains("- fact-0"));
+        assert!(text.contains("- fact-9"));
+        assert!(!text.contains("- fact-10"));
+        assert!(text.contains("rk fact vote <fact-id> up"));
+        assert!(text.contains("rk fact vote <fact-id> down"));
     }
 
     #[test]

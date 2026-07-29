@@ -163,6 +163,8 @@ pub struct SpawnStep {
     #[serde(default = "default_role")]
     pub role: String,
     #[serde(default)]
+    pub coordination: Option<Coordination>,
+    #[serde(default)]
     pub agent: Option<String>,
     #[serde(default)]
     pub harness: Option<String>,
@@ -173,6 +175,21 @@ pub struct SpawnStep {
     pub task: TaskDef,
     #[serde(default)]
     pub branch: Option<String>,
+}
+
+/// Dispatch metadata identifying an agent as a reporting boundary. The
+/// supervision tree remains authoritative for safety; this metadata controls
+/// which summaries are visible in coordinator views.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Coordination {
+    #[serde(default)]
+    pub reports_to: Option<String>,
+    #[serde(default = "default_descendant_policy")]
+    pub descendant_policy: String,
+}
+
+fn default_descendant_policy() -> String {
+    "rollup".into()
 }
 
 fn default_role() -> String {
@@ -1439,6 +1456,7 @@ workflow: {
     fn aspects_apply_in_declaration_order_first_innermost() {
         let steps = vec![Step::Spawn(SpawnStep {
             role: "rat".into(),
+            coordination: None,
             agent: None,
             harness: None,
             model: None,

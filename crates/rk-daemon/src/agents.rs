@@ -5,6 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use rk_harness::TokenUsage;
+use rk_workflow::Coordination;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -45,6 +46,8 @@ impl AgentState {
 pub struct AgentRecord {
     pub name: String,
     pub role: String,
+    #[serde(default)]
+    pub coordination: Option<Coordination>,
     pub harness: String,
     /// Model requested at spawn (None = harness default; pricing then relies
     /// on harness-reported cost only).
@@ -64,6 +67,9 @@ pub struct AgentRecord {
     /// enforce a workflow's `budget:` cap at dispatch time.
     #[serde(default)]
     pub workflow_instance: Option<String>,
+    /// Coordinator session owning the workflow that dispatched this agent.
+    #[serde(default)]
+    pub coordinator: Option<String>,
     pub session_id: Option<String>,
     /// herdr target when running attached in a pane (attach-mode spawn).
     #[serde(default)]
@@ -85,6 +91,10 @@ pub struct AgentRecord {
     #[serde(default)]
     pub crashed: bool,
     pub result: Option<String>,
+    /// Latest semantic checkpoint for this generation, if the agent has
+    /// reported one. Stored with the registry so snapshots survive restart.
+    #[serde(default)]
+    pub progress: Option<AgentProgress>,
     pub usage: TokenUsage,
     pub cost_usd: f64,
     pub created_at: DateTime<Utc>,
@@ -95,6 +105,15 @@ pub struct AgentRecord {
     /// marker in every rendered view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentProgress {
+    pub summary: String,
+    pub next: Option<String>,
+    pub status: String,
+    pub revision: u64,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl AgentRecord {
@@ -521,6 +540,7 @@ mod tests {
         AgentRecord {
             name: name.into(),
             role: "rat".into(),
+            coordination: None,
             harness: "fake".into(),
             model: None,
             repo_root: "/tmp/repo".into(),
@@ -531,6 +551,7 @@ mod tests {
             target_branch: "main".into(),
             parent: None,
             workflow_instance: None,
+            coordinator: None,
             session_id: None,
             attach_target: None,
             pid: Some(1234),
@@ -538,6 +559,7 @@ mod tests {
             state,
             crashed: false,
             result: None,
+            progress: None,
             usage: TokenUsage::default(),
             cost_usd: 0.0,
             created_at: Utc::now(),

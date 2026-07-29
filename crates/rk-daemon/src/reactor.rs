@@ -1297,6 +1297,7 @@ mod tests {
         AgentRecord {
             name: name.into(),
             role: "rat".into(),
+            coordination: None,
             harness: "fake".into(),
             model: None,
             repo_root: std::path::PathBuf::from("/tmp"),
@@ -1307,6 +1308,7 @@ mod tests {
             target_branch: "main".into(),
             parent: None,
             workflow_instance: None,
+            coordinator: None,
             session_id: None,
             attach_target: None,
             pid: None,
@@ -1314,6 +1316,7 @@ mod tests {
             state,
             crashed: false,
             result: None,
+            progress: None,
             usage: Default::default(),
             cost_usd: 0.0,
             created_at: chrono::Utc::now(),

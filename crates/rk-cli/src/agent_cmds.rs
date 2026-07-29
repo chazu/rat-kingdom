@@ -21,7 +21,7 @@ pub struct SpawnArgs {
     /// Task description / initial prompt.
     #[arg(long)]
     pub prompt: Option<String>,
-    /// Agent role: rat | reviewer.
+    /// Agent role: rat | reviewer | foreman.
     #[arg(long, default_value = "rat")]
     pub role: String,
     /// Harness kind: claude | fake (default from config).
@@ -110,6 +110,19 @@ pub struct SteerArgs {
     pub name: String,
     /// Guidance to inject into the running session.
     pub message: String,
+}
+
+#[derive(Args)]
+pub struct ProgressArgs {
+    /// Bounded semantic checkpoint for the current agent generation.
+    #[arg(long)]
+    pub summary: String,
+    /// The next meaningful action.
+    #[arg(long)]
+    pub next: Option<String>,
+    /// working | blocked | complete.
+    #[arg(long, default_value = "working")]
+    pub status: String,
 }
 
 #[derive(Args)]
@@ -290,6 +303,30 @@ pub async fn list(layout: &Layout, args: ListArgs, as_json: bool) -> Result<()> 
     }
     if agents.iter().any(|a| !a["archived_at"].is_null()) {
         println!("(* archived — `rk unarchive <name>` restores one)");
+    }
+    Ok(())
+}
+
+pub async fn progress(layout: &Layout, args: ProgressArgs, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call(
+            "agent.progress",
+            json!({
+                "summary": args.summary,
+                "next": args.next,
+                "status": args.status,
+            }),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        println!(
+            "progress recorded for {} (revision {})",
+            result["agent"].as_str().unwrap_or("?"),
+            result["progress"]["revision"].as_u64().unwrap_or(0)
+        );
     }
     Ok(())
 }

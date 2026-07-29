@@ -111,11 +111,14 @@ workflow: #Workflow
 
 // Tuple categories a `read` step may match.
 #Category: "fact" | "convention" | "task" | "available" | "claim" | "obstacle" |
-	"need" | "artifact" | "resolution" | "event" | "message" | "suggestion" | "endorsement"
+	"need" | "artifact" | "resolution" | "event" | "message" | "suggestion" | "endorsement" | "fact_vote"
 
 #SpawnStep: {
 	type: "spawn"
 	role: string | *"rat"
+	// Optional reporting-boundary metadata. Workflow-owned foremen and
+	// stewards are also treated as boundaries by the daemon for compatibility.
+	coordination?: #Coordination
 	// Named agent profile from `agents` (or global config).
 	agent?: string
 	// Inline overrides (beat any profile).
@@ -128,6 +131,11 @@ workflow: #Workflow
 	}
 	// Base/merge-target branch override.
 	branch?: string
+}
+
+#Coordination: {
+	reports_to?: "coordinator" | string
+	descendant_policy?: "rollup" | "direct" | *"rollup"
 }
 
 // Wait for the most recently spawned agent to complete (task_done tuple or

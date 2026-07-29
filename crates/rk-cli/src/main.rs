@@ -10,7 +10,7 @@ mod workflow_cmds;
 
 use agent_cmds::print_pruned_instance;
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use rk_core::config::Config;
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
@@ -50,10 +50,14 @@ enum Command {
     Scan(space_cmds::HotScanArgs),
     /// Stream tuples live as they are written.
     Watch(space_cmds::ScanArgs),
+    /// Read or follow bounded coordinator attention and middle-rat rollups.
+    Monitor(MonitorArgs),
     /// Signal task completion (sugar; env-autofilled).
     Done(space_cmds::DoneArgs),
     /// Report something blocking progress (sugar; env-autofilled).
     Obstacle(space_cmds::TextArgs),
+    /// Publish a bounded semantic checkpoint for the current rat.
+    Progress(agent_cmds::ProgressArgs),
     /// Ask the room for help (sugar; env-autofilled).
     Need(space_cmds::TextArgs),
     /// Advisory claim marking an area you're editing (evaporates on a TTL; sugar; env-autofilled).
@@ -64,6 +68,11 @@ enum Command {
     Endorse(space_cmds::EndorseArgs),
     /// Close a losing ballot by id (proposer or operator only; votes stay on the record).
     Withdraw(space_cmds::WithdrawArgs),
+    /// Vote on the quality of an injected fact.
+    Fact {
+        #[command(subcommand)]
+        command: FactCommand,
+    },
     /// Spawn a rat to work on a task in an isolated worktree.
     Spawn(agent_cmds::SpawnArgs),
     /// List agents (live fleet by default; --all/--archived include archived).
@@ -132,7 +141,7 @@ enum Command {
     /// Print role instructions for the system. Defaults to the `operator` role
     /// unless RK_ROLE (set on spawned rats) indicates otherwise.
     Prime {
-        /// Role to render: operator | rat | reviewer. Overrides RK_ROLE.
+        /// Role to render: operator | rat | reviewer | foreman. Overrides RK_ROLE.
         #[arg(long)]
         role: Option<String>,
     },
@@ -155,6 +164,12 @@ enum Command {
     Approve(WorkflowDecisionArgs),
     /// Reject a workflow instance parked at an approval gate (holds it unmerged).
     Reject(WorkflowDecisionArgs),
+}
+
+#[derive(Subcommand)]
+enum FactCommand {
+    /// Upvote, downvote, or retract your vote on a fact tuple.
+    Vote(space_cmds::FactVoteArgs),
 }
 
 #[derive(clap::Args)]
@@ -248,6 +263,9 @@ enum WorkflowCommand {
         /// matching keys.
         #[arg(long = "param-file")]
         param_file: Option<String>,
+        /// Stable coordinator-session id that owns this workflow for monitoring.
+        #[arg(long)]
+        coordinator: Option<String>,
     },
     /// List workflow instances.
     List {
@@ -313,6 +331,31 @@ enum WorkflowCommand {
         #[arg(long)]
         source_dir: Option<String>,
     },
+}
+
+#[derive(Args)]
+struct MonitorArgs {
+    /// Stable coordinator-session owner to monitor.
+    #[arg(long)]
+    coordinator: Option<String>,
+    /// Explicit middle-rat subtree to drill into.
+    #[arg(long)]
+    subtree: Option<String>,
+    /// Repository diagnostic scope (not the coordinator default).
+    #[arg(long)]
+    repo: Option<String>,
+    /// Resume durable coordinator delivery after this cursor.
+    #[arg(long)]
+    after: Option<u64>,
+    /// Show all descendants instead of middle-rat rollups.
+    #[arg(long)]
+    all: bool,
+    /// Follow live events after the initial snapshot.
+    #[arg(long)]
+    follow: bool,
+    /// Perform one bounded read (the default; explicit for scripts).
+    #[arg(long)]
+    once: bool,
 }
 
 #[derive(Subcommand)]
@@ -458,13 +501,42 @@ async fn main() -> Result<()> {
         }
         Command::Scan(args) => space_cmds::scan(&layout, args, cli.json, &castle_display).await?,
         Command::Watch(args) => space_cmds::watch(&layout, args).await?,
+        Command::Monitor(args) => {
+            let mut params = serde_json::Map::new();
+            if let Some(coordinator) = args.coordinator {
+                params.insert("coordinator".into(), json!(coordinator));
+                params.insert("scope".into(), json!("owned"));
+            }
+            if let Some(subtree) = args.subtree {
+                params.insert("subtree".into(), json!(subtree));
+                params.insert("scope".into(), json!("subtree"));
+            }
+            if let Some(repo) = args.repo {
+                params.insert("repo".into(), json!(repo));
+                if !params.contains_key("scope") {
+                    params.insert("scope".into(), json!("repo"));
+                }
+            }
+            if let Some(after) = args.after {
+                params.insert("after".into(), json!(after));
+            }
+            params.insert(
+                "depth".into(),
+                json!(if args.all { "all" } else { "middle" }),
+            );
+            observe::monitor(&layout, json!(params), args.follow && !args.once, cli.json).await?;
+        }
         Command::Done(args) => space_cmds::done(&layout, args, cli.json).await?,
         Command::Obstacle(args) => space_cmds::report(&layout, args, "obstacle", cli.json).await?,
+        Command::Progress(args) => agent_cmds::progress(&layout, args, cli.json).await?,
         Command::Need(args) => space_cmds::report(&layout, args, "need", cli.json).await?,
         Command::Claim(args) => space_cmds::claim(&layout, args, cli.json).await?,
         Command::Suggest(args) => space_cmds::suggest(&layout, args, cli.json).await?,
         Command::Endorse(args) => space_cmds::endorse(&layout, args, cli.json).await?,
         Command::Withdraw(args) => space_cmds::withdraw(&layout, args, cli.json).await?,
+        Command::Fact {
+            command: FactCommand::Vote(args),
+        } => space_cmds::fact_vote(&layout, args, cli.json).await?,
         Command::Spawn(args) => agent_cmds::spawn(&layout, args, cli.json).await?,
         Command::List(args) => agent_cmds::list(&layout, args, cli.json).await?,
         Command::Prune(args) => agent_cmds::prune(&layout, args, cli.json).await?,
@@ -509,6 +581,7 @@ async fn main() -> Result<()> {
                     repo,
                     params,
                     param_file,
+                    coordinator,
                 } => {
                     let repo = std::fs::canonicalize(&repo)?;
                     let mut map = serde_json::Map::new();
@@ -538,7 +611,7 @@ async fn main() -> Result<()> {
                     let result = client
                         .call(
                             "workflow.run",
-                            json!({"name": name, "repo": repo.to_string_lossy(), "params": map}),
+                            json!({"name": name, "repo": repo.to_string_lossy(), "params": map, "coordinator": coordinator}),
                         )
                         .await?;
                     if cli.json {
@@ -731,6 +804,7 @@ async fn main() -> Result<()> {
                 task: std::env::var("RK_TASK").ok(),
                 branch: std::env::var("RK_BRANCH").ok(),
                 parent: std::env::var("RK_PARENT").ok(),
+                facts: Vec::new(),
                 // `rk prime` inspects the template shape; live conventions are
                 // scanned and injected by the supervisor at spawn time.
                 conventions: Vec::new(),

@@ -532,4 +532,59 @@ mod tests {
         assert_eq!(note["method"], "coordinator.event");
         assert_eq!(note["params"]["event"]["payload"]["revision"], 3);
     }
+
+    #[tokio::test]
+    async fn coordinator_pending_replays_until_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+        let space = daemon.space_handle();
+        let _handle = tokio::spawn(daemon.run());
+        let mut client = connect(&layout).await;
+        client
+            .call(
+                "coordinator.register",
+                json!({"coordinator": "session-1"}),
+            )
+            .await
+            .unwrap();
+        let cursor = space
+            .out_coordinator(rk_core::tuple::Tuple::new(
+                rk_core::tuple::Category::Event,
+                "myrepo",
+                "coordination_attention",
+                "daemon",
+                json!({
+                    "coordinator": "session-1",
+                    "workflow_instance": "wf-1",
+                    "route": "escalate",
+                    "summary": "middle-rat needs a decision"
+                }),
+            ))
+            .unwrap();
+        let pending = client
+            .call(
+                "coordinator.pending",
+                json!({"coordinator": "session-1", "scope": "owned"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending["events"].as_array().unwrap().len(), 1);
+        assert_eq!(pending["events"][0]["cursor"], cursor);
+        client
+            .call(
+                "coordinator.ack",
+                json!({"coordinator": "session-1", "cursor": cursor}),
+            )
+            .await
+            .unwrap();
+        let pending = client
+            .call(
+                "coordinator.pending",
+                json!({"coordinator": "session-1", "scope": "owned"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending["events"].as_array().unwrap().len(), 0);
+    }
 }

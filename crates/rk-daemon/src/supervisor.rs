@@ -2,14 +2,15 @@
 //! the registry and tuplespace, route completions up the spawn tree, and
 //! merge their work on dismissal.
 
-use crate::agents::{AgentRecord, AgentState, Registry};
+use crate::agents::{AgentProgress, AgentRecord, AgentState, Registry};
 use chrono::{DateTime, Utc};
 use rk_core::config::{MergeMode, SupervisorConfig};
 use rk_core::paths::Layout;
-use rk_core::prime::{render, PrimeContext};
+use rk_core::prime::{render, PrimeContext, MAX_INJECTED_FACTS};
 use rk_core::tuple::{Category, Pattern, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
 use rk_git::{agent_branch, Repo};
 use rk_harness::{make_harness, HarnessEvent, LaunchSpec, SessionControl, TokenUsage};
+use rk_workflow::Coordination;
 use rk_ledger::pricing::PricingTable;
 use rk_ledger::{Budget, BudgetAction, BudgetScope, DispatchCheck, FleetBudget};
 use rk_space::Space;
@@ -20,12 +21,24 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
+const MIN_PROGRESS_INTERVAL: chrono::Duration = chrono::Duration::seconds(5);
+
 fn default_permission_mode(harness: &str) -> &'static str {
     match harness {
         "claude" => "acceptEdits",
         "codex" => "workspace-write",
         _ => "workspace-write",
     }
+}
+
+fn is_reporting_boundary(record: &AgentRecord) -> bool {
+    record
+        .coordination
+        .as_ref()
+        .and_then(|coordination| coordination.reports_to.as_deref())
+        == Some("coordinator")
+        || (record.workflow_instance.is_some()
+            && matches!(record.role.as_str(), "foreman" | "steward"))
 }
 
 struct SpawnJournal<'a> {
@@ -44,6 +57,7 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
     AgentRecord {
         name: journal.name,
         role: journal.params.role.clone(),
+        coordination: journal.params.coordination.clone(),
         harness: journal.harness,
         model: journal.params.model.clone(),
         repo_root: journal.repo.root().to_path_buf(),
@@ -54,6 +68,7 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
         target_branch: journal.target_branch,
         parent: journal.params.parent.clone(),
         workflow_instance: journal.params.workflow_instance.clone(),
+        coordinator: journal.params.coordinator.clone(),
         session_id: None,
         attach_target: None,
         pid: None,
@@ -61,6 +76,7 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
         state: AgentState::Spawning,
         crashed: false,
         result: None,
+        progress: None,
         usage: TokenUsage::default(),
         cost_usd: 0.0,
         created_at: now,
@@ -90,6 +106,9 @@ pub struct SpawnParams {
     pub prompt: Option<String>,
     #[serde(default = "default_role")]
     pub role: String,
+    /// Optional explicit reporting-boundary metadata.
+    #[serde(default)]
+    pub coordination: Option<Coordination>,
     /// Harness kind; falls back to the daemon's configured default.
     #[serde(default)]
     pub harness: Option<String>,
@@ -111,6 +130,9 @@ pub struct SpawnParams {
     /// Recorded on the agent so its cost sums into the instance's rollup.
     #[serde(default)]
     pub workflow_instance: Option<String>,
+    /// Coordinator session inherited from the workflow owner, when any.
+    #[serde(default)]
+    pub coordinator: Option<String>,
     /// Per-instance USD cap for `workflow_instance`, from the workflow's
     /// `budget:` field. Enforced as a dispatch preflight: once this instance's
     /// summed cost reaches it, further spawns are refused. `None`/0 = unlimited.
@@ -499,6 +521,7 @@ impl Supervisor {
             task: Some(params.task.clone()),
             branch: Some(branch.clone()),
             parent: params.parent.clone(),
+            facts: self.scan_facts(&repo_name),
             conventions: self.scan_conventions(&repo_name),
         };
         let prompt = params
@@ -580,7 +603,20 @@ impl Supervisor {
                 "workflow_instance": params.workflow_instance,
             }),
         );
-
+        self.emit_coordinator_event(
+            &record,
+            "agent_lifecycle",
+            json!({
+                "route": "rollup",
+                "severity": "info",
+                "change": "started",
+                "summary": format!("{} started", record.name),
+                "coordinator": record.coordinator,
+                "workflow_instance": record.workflow_instance,
+                "agent": record.name,
+                "generation": record.created_at,
+            }),
+        );
         let supervisor = Arc::clone(self);
         let mut events = session.events;
         let generation = record.created_at;
@@ -661,6 +697,20 @@ impl Supervisor {
                 "role": params.role,
                 "attached": true,
                 "workflow_instance": params.workflow_instance,
+            }),
+        );
+        self.emit_coordinator_event(
+            &record,
+            "agent_lifecycle",
+            json!({
+                "route": "rollup",
+                "severity": "info",
+                "change": "started",
+                "summary": format!("{} started", record.name),
+                "coordinator": record.coordinator,
+                "workflow_instance": record.workflow_instance,
+                "agent": record.name,
+                "generation": record.created_at,
             }),
         );
 
@@ -771,6 +821,7 @@ impl Supervisor {
             task: record.task.clone(),
             branch: record.branch.clone(),
             parent: record.parent.clone(),
+            facts: self.scan_facts(&record.repo_name),
             conventions: self.scan_conventions(&record.repo_name),
         };
         let spec = LaunchSpec {
@@ -810,6 +861,20 @@ impl Supervisor {
                 "agent": name,
                 "task": updated.task,
                 "workflow_instance": updated.workflow_instance,
+            }),
+        );
+        self.emit_coordinator_event(
+            &updated,
+            "agent_lifecycle",
+            json!({
+                "route": "rollup",
+                "severity": "info",
+                "change": "respawned",
+                "summary": format!("{} respawned", updated.name),
+                "coordinator": updated.coordinator,
+                "workflow_instance": updated.workflow_instance,
+                "agent": updated.name,
+                "generation": updated.created_at,
             }),
         );
 
@@ -1063,6 +1128,56 @@ impl Supervisor {
             }
         }
         texts
+    }
+
+    /// Recent facts for a rat spawned into repo: newest facts from the system
+    /// and repo scopes, interleaved so one scope cannot crowd the other out,
+    /// then bounded to the prompt cap. Scan failures degrade to no facts —
+    /// priming must never fail on a knowledge read.
+    fn scan_facts(&self, repo: &str) -> Vec<String> {
+        let mut scoped = Vec::new();
+        for scope in [SYSTEM_SCOPE, repo] {
+            let pattern = Pattern::category(Category::Fact).scope(scope);
+            match self.space.scan_newest_limited(&pattern, MAX_INJECTED_FACTS) {
+                Ok(tuples) => scoped.push(
+                    tuples
+                        .into_iter()
+                        .map(|t| {
+                            let payload = serde_json::to_string(&t.payload)
+                                .unwrap_or_else(|_| "null".to_string());
+                            format!(
+                                "{} {} (reported by {}): {}",
+                                t.id, t.identity, t.instance, payload
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                Err(e) => {
+                    warn!(error = %e, scope, "failed to scan facts for priming");
+                    scoped.push(Vec::new());
+                }
+            }
+        }
+
+        let mut facts = Vec::new();
+        let mut offset = 0;
+        while facts.len() < MAX_INJECTED_FACTS {
+            let mut added = false;
+            for entries in &scoped {
+                if let Some(fact) = entries.get(offset) {
+                    facts.push(fact.clone());
+                    added = true;
+                    if facts.len() == MAX_INJECTED_FACTS {
+                        break;
+                    }
+                }
+            }
+            if !added {
+                break;
+            }
+            offset += 1;
+        }
+        facts
     }
 
     fn emit_obstacle_for_budget(&self, record: &AgentRecord, kind: &str) {
@@ -1832,6 +1947,22 @@ impl Supervisor {
                 "tokens": record.usage.total(),
             }),
         );
+        let boundary = is_reporting_boundary(record);
+        self.emit_coordinator_event(
+            record,
+            "agent_lifecycle",
+            json!({
+                "route": if boundary { "terminal" } else { "rollup" },
+                "severity": if is_error { "error" } else { "info" },
+                "change": if is_error { "failed" } else { "completed" },
+                "summary": record.result,
+                "coordinator": record.coordinator,
+                "workflow_instance": record.workflow_instance,
+                "agent": record.name,
+                "generation": record.created_at,
+                "declared_done": declared_done,
+            }),
+        );
         if let Some(parent) = &record.parent {
             let tuple = Tuple::new(
                 Category::Message,
@@ -2059,6 +2190,22 @@ impl Supervisor {
                 "parent": &record.parent,
             }),
         );
+        if is_reporting_boundary(&record) {
+            self.emit_coordinator_event(
+                &record,
+                "agent_lifecycle",
+                json!({
+                    "route": "terminal",
+                    "severity": "info",
+                    "change": "dismissed",
+                    "summary": format!("{} dismissed", record.name),
+                    "coordinator": record.coordinator,
+                    "workflow_instance": record.workflow_instance,
+                    "agent": record.name,
+                    "generation": record.created_at,
+                }),
+            );
+        }
         // A PR-mode dismiss hands the branch off for review rather than merging;
         // surface that as its own event so the inbox / steward can pick it up.
         if pr_opened {
@@ -2378,6 +2525,210 @@ impl Supervisor {
         self.lock_registry().get_any(name).cloned()
     }
 
+    /// Persist a bounded semantic checkpoint for the authenticated agent's
+    /// current generation and publish a compact coordinator event.
+    pub fn record_progress(
+        &self,
+        name: &str,
+        summary: String,
+        next: Option<String>,
+        status: String,
+    ) -> rk_core::Result<AgentRecord> {
+        let summary = summary.trim().chars().take(512).collect::<String>();
+        if summary.is_empty() {
+            return Err(rk_core::Error::other("progress summary cannot be empty"));
+        }
+        let next = next.map(|value| value.trim().chars().take(512).collect());
+        let status = status.trim().to_ascii_lowercase();
+        if !matches!(status.as_str(), "working" | "blocked" | "complete") {
+            return Err(rk_core::Error::other(
+                "progress status must be working, blocked, or complete",
+            ));
+        }
+        let now = Utc::now();
+        let current = self
+            .status(name)
+            .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
+        if !current.state.is_live() {
+            return Err(rk_core::Error::other(format!("agent {name} is not live")));
+        }
+        if let Some(progress) = &current.progress {
+            if now - progress.updated_at < MIN_PROGRESS_INTERVAL {
+                return Ok(current);
+            }
+        }
+        let mut registry = self.lock_registry();
+        let updated = registry
+            .update(name, |record| {
+                if !record.state.is_live() {
+                    return;
+                }
+                let revision = record
+                    .progress
+                    .as_ref()
+                    .map(|progress| progress.revision.saturating_add(1))
+                    .unwrap_or(1);
+                record.progress = Some(AgentProgress {
+                    summary: summary.clone(),
+                    next: next.clone(),
+                    status: status.clone(),
+                    revision,
+                    updated_at: now,
+                });
+            })?
+            .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
+        if !updated.state.is_live() {
+            return Err(rk_core::Error::other(format!("agent {name} is not live")));
+        }
+        drop(registry);
+        self.emit_coordinator_event(
+            &updated,
+            "middle_rat_progress",
+            json!({
+                "route": if status == "blocked" { "escalate" } else { "rollup" },
+                "severity": if status == "blocked" { "warning" } else { "info" },
+                "coordinator": updated.coordinator,
+                "workflow_instance": updated.workflow_instance,
+                "agent": updated.name,
+                "generation": updated.created_at,
+                "revision": updated.progress.as_ref().map(|p| p.revision),
+                "summary": summary,
+                "next": next,
+                "status": status,
+            }),
+        );
+        Ok(updated)
+    }
+
+    /// Promote an authenticated middle-rat's obstacle/need into the protected
+    /// coordinator journal. Leaf-rat detail remains in the tuplespace and is
+    /// owned by its reporting boundary.
+    pub fn publish_coordination_attention(
+        &self,
+        caller: &str,
+        category: &str,
+        scope: &str,
+        identity: &str,
+        payload: &serde_json::Value,
+    ) {
+        let Some(agent) = self.status(caller) else {
+            return;
+        };
+        if !is_reporting_boundary(&agent) {
+            return;
+        }
+        let summary = payload
+            .get("text")
+            .or_else(|| payload.get("summary"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(identity)
+            .chars()
+            .take(512)
+            .collect::<String>();
+        self.emit_coordinator_event(
+            &agent,
+            "coordination_attention",
+            json!({
+                "route": "escalate",
+                "severity": "warning",
+                "category": category,
+                "scope": scope,
+                "identity": identity,
+                "coordinator": agent.coordinator,
+                "workflow_instance": agent.workflow_instance,
+                "agent": agent.name,
+                "generation": agent.created_at,
+                "summary": summary,
+            }),
+        );
+    }
+
+    /// Whether an authenticated agent is a foreman allowed to manage a child
+    /// subtree. This is deliberately role-scoped: ordinary rats remain
+    /// workers, even though they have authenticated daemon access for their
+    /// own tuples.
+    pub fn is_foreman(&self, name: &str) -> bool {
+        self.status(name)
+            .is_some_and(|record| record.role == "foreman" && record.state.is_live())
+    }
+
+    pub fn is_reporting_boundary(&self, name: &str) -> bool {
+        self.status(name).is_some_and(|record| is_reporting_boundary(&record))
+    }
+
+    /// Validate the structural edge a foreman is attempting to manage.
+    /// Foremen may control only their direct children, never an arbitrary rat
+    /// selected by name. Workflow ownership and generation remain on the child
+    /// record, so respawn/dismiss preserve the same boundary.
+    pub fn authorize_child(&self, foreman: &str, child: &str) -> rk_core::Result<()> {
+        if !self.is_foreman(foreman) {
+            return Err(rk_core::Error::other(
+                "only a foreman may manage worker agents",
+            ));
+        }
+        let record = self
+            .status(child)
+            .ok_or_else(|| rk_core::Error::other(format!("no such agent: {child}")))?;
+        if record.parent.as_deref() != Some(foreman) {
+            return Err(rk_core::Error::other(format!(
+                "foreman {foreman} may manage only its direct children; {child} is owned by {}",
+                record.parent.as_deref().unwrap_or("the operator")
+            )));
+        }
+        Ok(())
+    }
+
+    /// Normalize a foreman's child spawn. The caller is the source of truth
+    /// for parentage, workflow ownership, and the shared integration branch;
+    /// accepting any of those fields from an agent would let it escape its
+    /// supervision subtree or merge directly into the repository target.
+    pub fn prepare_foreman_spawn(
+        &self,
+        foreman: &str,
+        mut params: SpawnParams,
+    ) -> rk_core::Result<SpawnParams> {
+        let record = self
+            .status(foreman)
+            .ok_or_else(|| rk_core::Error::other(format!("no such agent: {foreman}")))?;
+        if record.role != "foreman" {
+            return Err(rk_core::Error::other(
+                "only a foreman may spawn worker agents",
+            ));
+        }
+        if record.branch.is_none() {
+            return Err(rk_core::Error::other(
+                "foreman has no integration branch for a worker spawn",
+            ));
+        }
+        if params.parent.as_deref().is_some_and(|parent| parent != foreman) {
+            return Err(rk_core::Error::other(
+                "a foreman child spawn cannot name another parent",
+            ));
+        }
+        if params
+            .workflow_instance
+            .as_deref()
+            .is_some_and(|instance| Some(instance) != record.workflow_instance.as_deref())
+        {
+            return Err(rk_core::Error::other(
+                "a foreman child must remain in its parent's workflow instance",
+            ));
+        }
+        if params
+            .base
+            .as_deref()
+            .is_some_and(|base| Some(base) != record.branch.as_deref())
+        {
+            return Err(rk_core::Error::other(
+                "a foreman child must target the foreman's integration branch",
+            ));
+        }
+        params.parent = Some(foreman.to_string());
+        params.workflow_instance = record.workflow_instance.clone();
+        params.base = record.branch.clone();
+        Ok(params)
+    }
+
     /// Move settled terminal records (`Completed`/`Failed`/`Dismissed`) last
     /// touched before `cutoff` into the archive store, so they stop inflating
     /// the default views. Live and `Orphaned` records are never touched.
@@ -2567,6 +2918,24 @@ impl Supervisor {
         }
     }
 
+    fn emit_coordinator_event(
+        &self,
+        agent: &AgentRecord,
+        identity: &str,
+        payload: serde_json::Value,
+    ) {
+        let tuple = Tuple::new(
+            Category::Event,
+            agent.repo_name.clone(),
+            identity.to_string(),
+            self.castle.clone(),
+            payload,
+        );
+        if let Err(e) = self.space.out_coordinator(tuple) {
+            warn!(error = %e, identity, agent = %agent.name, "failed to emit coordinator event");
+        }
+    }
+
     fn lock_registry(&self) -> std::sync::MutexGuard<'_, Registry> {
         match self.registry.lock() {
             Ok(g) => g,
@@ -2658,6 +3027,7 @@ mod respawn_tests {
         AgentRecord {
             name: "Nibble".into(),
             role: "rat".into(),
+            coordination: None,
             harness: "fake".into(),
             model: None,
             repo_root: repo.to_path_buf(),
@@ -2668,6 +3038,7 @@ mod respawn_tests {
             target_branch: "main".into(),
             parent: None,
             workflow_instance: None,
+            coordinator: None,
             session_id: None,
             attach_target: None,
             pid: None,
@@ -2675,6 +3046,7 @@ mod respawn_tests {
             state: AgentState::Failed,
             crashed: false,
             result: None,
+            progress: None,
             usage: TokenUsage::default(),
             cost_usd: 0.0,
             created_at: now,

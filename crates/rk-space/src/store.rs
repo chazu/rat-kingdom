@@ -204,6 +204,18 @@ impl Store {
         Ok(n > 0)
     }
 
+    pub fn get(&self, id: RecordId) -> rk_core::Result<Option<Tuple>> {
+        self.conn
+            .query_row(
+                "SELECT id, category, scope, identity, instance, lifecycle, payload, created_at, expires_at, strength
+                 FROM tuples WHERE id = ?1",
+                [id.to_string()],
+                row_to_tuple,
+            )
+            .optional()
+            .map_err(sql_err)
+    }
+
     pub fn delete(&self, id: RecordId) -> rk_core::Result<bool> {
         let n = self
             .conn

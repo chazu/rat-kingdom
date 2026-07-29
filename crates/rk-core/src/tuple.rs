@@ -43,6 +43,8 @@ pub enum Category {
     Suggestion,
     /// A vote of support for a suggestion (one per agent, idempotent).
     Endorsement,
+    /// An agent's up/down/clear vote on a fact, keyed by the fact id.
+    FactVote,
     /// The explicit close of a losing ballot, keyed `identity = <sug-id>` —
     /// the counterpart to [`Category::Convention`] on the other outcome.
     ///
@@ -79,11 +81,12 @@ impl Category {
             Category::Message => "message",
             Category::Suggestion => "suggestion",
             Category::Endorsement => "endorsement",
+            Category::FactVote => "fact_vote",
             Category::Withdrawal => "withdrawal",
         }
     }
 
-    pub const ALL: [Category; 14] = [
+    pub const ALL: [Category; 15] = [
         Category::Fact,
         Category::Convention,
         Category::Task,
@@ -97,6 +100,7 @@ impl Category {
         Category::Message,
         Category::Suggestion,
         Category::Endorsement,
+        Category::FactVote,
         // Lowest weight, below the vote it closes: a withdrawal is bookkeeping
         // on a ballot that is over. It must never outrank a live trail in a
         // hot-scan — it is the one ballot tuple that steers nobody.

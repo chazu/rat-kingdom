@@ -105,6 +105,24 @@ Spawn options: `--harness claude|codex|axe|fake`, `--model`, `--role
 rat|reviewer`, `--base <branch>`, `--parent <agent>` (completion routing),
 `--no-merge` on dismiss, `--attach` (below).
 
+Workflow runs can opt into a stable coordinator ownership scope with
+`rk workflow run <name> --coordinator <session-id>`. The coordinator can then
+consume bounded attention and middle-rat rollups with:
+
+```bash
+rk monitor --coordinator <session-id> --once
+rk monitor --coordinator <session-id> --follow
+rk monitor --coordinator <session-id> --subtree <middle-rat> --once
+```
+
+`rk monitor --once` registers/reuses a durable cursor and acknowledges the
+rendered block after it is accepted. `--json` exposes the cursor, snapshot,
+attention records, and replay envelopes for a host session adapter. Rat
+Kingdom cannot universally inject this block into the next turn because the
+coordinator may be any external Codex, Claude Code, or other harness. Hosts
+with turn-boundary hooks can wrap this command; otherwise the coordinator
+should run it before meaningful decisions.
+
 ### How a rat signals
 
 Rats are primed with a composed role prompt and use sugar commands
@@ -114,6 +132,8 @@ Rats are primed with a composed role prompt and use sugar commands
 rk done "one-line summary"     # completion — mandatory final step
 rk obstacle "what's blocking"  # blocked but continuing/winding down
 rk need "what would help"      # ask the room
+rk progress --summary "4/7 child tickets complete" \
+  --next "reviewing the remaining three"   # middle-rat milestone
 rk out artifact $RK_REPO name --payload '{"...": "..."}'   # work products
 rk out artifact $RK_REPO fix --resolves <obstacle-id>      # backlink a solved wall
 ```
@@ -372,11 +392,14 @@ overnight.
 CUE-defined, validated by unification against the schema in
 `crates/rk-workflow/src/schema.cue`. Definitions go in
 `~/.rat-kingdom/workflows/` (global) or `<repo>/.rk/workflows/` (repo-local,
-wins). Two shipped examples in `examples/workflows/`:
+wins). Shipped examples in `examples/workflows/` include:
 
 - **solo-task** — spawn → wait → verify success → auto-merge.
 - **code-review** — rat implements on the strong model, a cheaper reviewer
   examines the branch and records an `artifact` verdict; a human merges.
+- **implement-featureset** — spawn a `foreman` middle-rat that delegates child
+  tickets to workers, reviews and merges them into its feature branch, then
+  lands the integrated branch.
 
 ```bash
 for workflow in examples/workflows/*.cue; do
@@ -386,6 +409,8 @@ rk workflow drift --repo .
 rk workflow defs
 rk workflow run solo-task --param taskId=fix-login \
   --param description="Fix the login redirect loop"
+rk workflow run implement-featureset --coordinator session-01 --param taskId=TKT-... \
+  --param taskDescription="Implement the feature set"
 rk workflow list
 rk workflow status wf-abc123
 ```

@@ -6,7 +6,7 @@
 //! a silently absent field (the predecessor's foreman-routing lesson).
 
 use anyhow::{bail, Context, Result};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use rk_core::identity::CastleDisplay;
 use rk_core::paths::Layout;
 use rk_daemon::Client;
@@ -125,6 +125,31 @@ pub struct WithdrawArgs {
     pub suggestion: String,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+pub enum FactVote {
+    Up,
+    Down,
+    Clear,
+}
+
+impl FactVote {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Clear => "clear",
+        }
+    }
+}
+
+#[derive(Args)]
+pub struct FactVoteArgs {
+    /// The fact tuple id shown by `rk scan fact ...` or in the priming prompt.
+    pub fact: String,
+    /// The vote to cast; `clear` retracts this agent's current vote.
+    pub vote: FactVote,
+}
+
 fn parse_duration(s: &str) -> Result<std::time::Duration> {
     let s = s.trim();
     let (num, unit) = s.split_at(s.len().saturating_sub(1));
@@ -203,7 +228,12 @@ fn env_required(name: &str) -> Result<String> {
     })
 }
 
-fn print_tuples(tuples: &Value, as_json: bool, display: &CastleDisplay) {
+fn print_tuples(
+    tuples: &Value,
+    as_json: bool,
+    display: &CastleDisplay,
+    fact_votes: Option<&Value>,
+) {
     // JSON output is the raw wire shape (author = actor id) so machine consumers
     // and `--json` piping never see a presentation alias in place of the id.
     if as_json {
@@ -219,22 +249,34 @@ fn print_tuples(tuples: &Value, as_json: bool, display: &CastleDisplay) {
         return;
     }
     for t in arr {
-        print_tuple_line(t, display);
+        print_tuple_line(t, display, fact_votes);
     }
 }
 
-fn print_tuple_line(t: &Value, display: &CastleDisplay) {
+fn print_tuple_line(t: &Value, display: &CastleDisplay, fact_votes: Option<&Value>) {
     let author = t["instance"].as_str().unwrap_or("?");
-    println!(
-        "{:10} {:12} {:24} [{}] {}",
+    let mut line = format!(
+        "{:10} {:12} {:24} {:26} [{}] {}",
         t["category"].as_str().unwrap_or("?"),
         t["scope"].as_str().unwrap_or("?"),
         t["identity"].as_str().unwrap_or("?"),
+        t["id"].as_str().unwrap_or("?"),
         // Author column: resolve THIS castle's own actor id to its friendly alias
         // for the human; every other author is shown verbatim.
         display.resolve(author),
         t["payload"]
     );
+    if t["category"].as_str() == Some("fact") {
+        if let Some(votes) = fact_votes.and_then(|all| all.get(t["id"].as_str().unwrap_or(""))) {
+            line.push_str(&format!(
+                " (votes +{}/-{}/{})",
+                votes["up"].as_u64().unwrap_or(0),
+                votes["down"].as_u64().unwrap_or(0),
+                votes["score"].as_i64().unwrap_or(0)
+            ));
+        }
+    }
+    println!("{line}");
 }
 
 /// Stamp the writing agent's name into an object payload that does not already
@@ -321,7 +363,7 @@ pub async fn blocking_read(
     if as_json {
         println!("{}", result["tuple"]);
     } else {
-        print_tuple_line(&result["tuple"], display);
+        print_tuple_line(&result["tuple"], display, result.get("fact_votes"));
     }
     Ok(())
 }
@@ -346,10 +388,44 @@ pub async fn scan(
     if as_json {
         println!("{result}");
     } else {
-        print_tuples(&result["tuples"], false, display);
+        print_tuples(&result["tuples"], false, display, result.get("fact_votes"));
         if result["truncated"].as_bool() == Some(true) {
             eprintln!("(scan truncated at 10,000 tuples; narrow the pattern or use --top)");
         }
+    }
+    Ok(())
+}
+
+pub async fn fact_vote(layout: &Layout, args: FactVoteArgs, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call(
+            "fact.vote",
+            json!({"fact": args.fact, "vote": args.vote.as_str()}),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else if result["already"].as_bool() == Some(true) {
+        println!(
+            "fact {} already {} by {}",
+            result["fact"].as_str().unwrap_or("?"),
+            result["vote"].as_str().unwrap_or("?"),
+            result["voter"].as_str().unwrap_or("?")
+        );
+    } else {
+        let action = match result["vote"].as_str() {
+            Some("up") => "upvoted",
+            Some("down") => "downvoted",
+            Some("clear") => "vote retracted",
+            _ => "updated",
+        };
+        println!(
+            "fact {} {} by {}",
+            result["fact"].as_str().unwrap_or("?"),
+            action,
+            result["voter"].as_str().unwrap_or("?")
+        );
     }
     Ok(())
 }
@@ -698,6 +774,26 @@ mod tests {
         let boxed = SuggestCli::parse_from(["rk", "hold through the migration", "--ttl", "2h"]);
         assert_eq!(ballot_ttl_secs(boxed.args.ttl.as_deref()).unwrap(), Some(7200));
         assert!(ballot_ttl_secs(Some("nope")).is_err());
+    }
+
+    #[test]
+    fn fact_vote_args_accept_up_down_and_clear() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct FactCli {
+            #[command(flatten)]
+            args: FactVoteArgs,
+        }
+
+        for (word, expected) in [
+            ("up", FactVote::Up),
+            ("down", FactVote::Down),
+            ("clear", FactVote::Clear),
+        ] {
+            let parsed = FactCli::parse_from(["rk", "01ARZ3NDEKTSV4RRFFQ69G5FAV", word]);
+            assert_eq!(parsed.args.vote.as_str(), expected.as_str());
+        }
     }
 
     /// The stamp is what makes a durable tuple attributable, so a workflow

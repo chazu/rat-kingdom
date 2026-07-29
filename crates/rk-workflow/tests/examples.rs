@@ -28,6 +28,10 @@ fn all_shipped_examples_load() {
         ("taskId".to_string(), json!("example-task")),
         ("description".to_string(), json!("example description")),
         (
+            "taskDescription".to_string(),
+            json!("example feature-set description"),
+        ),
+        (
             "question".to_string(),
             json!("How does the tuplespace work?"),
         ),
@@ -438,6 +442,10 @@ fn every_shipped_verdict_read_is_bound_to_its_reviewer() {
     let inputs = HashMap::from([
         ("taskId".to_string(), json!("example-task")),
         ("description".to_string(), json!("example description")),
+        (
+            "taskDescription".to_string(),
+            json!("example feature-set description"),
+        ),
         (
             "question".to_string(),
             json!("How does the tuplespace work?"),

@@ -479,6 +479,121 @@ pub async fn watch_workflow(
     }
 }
 
+/// Read or follow the bounded hierarchical coordinator view. The daemon owns
+/// cursor/replay semantics; this adapter only renders the compact snapshot and
+/// events so a host session can consume the same JSON contract.
+pub async fn monitor(
+    layout: &Layout,
+    params: Value,
+    follow: bool,
+    as_json: bool,
+) -> Result<()> {
+    if !follow {
+        let mut client = Client::connect_or_spawn(layout).await?;
+        if let Some(coordinator) = params["coordinator"].as_str().map(str::to_string) {
+            client
+                .call(
+                    "coordinator.register",
+                    json!({
+                        "coordinator": coordinator,
+                        "after": params["after"],
+                    }),
+                )
+                .await?;
+            let pending = client.call("coordinator.pending", params).await?;
+            render_monitor_snapshot(&pending, as_json);
+            if let Some(events) = pending["events"].as_array() {
+                for envelope in events {
+                    render_monitor_event(envelope, as_json);
+                }
+            }
+            if let Some(cursor) = pending["ack_after"].as_u64() {
+                client
+                    .call(
+                        "coordinator.ack",
+                        json!({"coordinator": coordinator, "cursor": cursor}),
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
+    }
+    let client = Client::connect_or_spawn(layout).await?;
+    let (initial, mut stream) = client.call_then_stream("coordinator.watch", params).await?;
+    render_monitor_snapshot(&initial, as_json);
+    if let Some(events) = initial["events"].as_array() {
+        for envelope in events {
+            render_monitor_event(envelope, as_json);
+        }
+    }
+    if !follow {
+        return Ok(());
+    }
+    while let Some(note) = stream.next().await? {
+        if note["method"].as_str() == Some("coordinator.event") {
+            render_monitor_event(&json!({
+                "cursor": note["params"]["cursor"],
+                "event": note["params"]["event"],
+            }), as_json);
+        } else if note["method"].as_str() == Some("lagged") {
+            if as_json {
+                println!("{}", json!({"kind": "resync", "data": note}));
+            } else {
+                eprintln!("coordinator history lagged; rerun with the latest cursor");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_monitor_snapshot(result: &Value, as_json: bool) {
+    if as_json {
+        println!("{}", json!({"kind": "snapshot", "data": result}));
+        return;
+    }
+    let snapshot = &result["snapshot"];
+    println!(
+        "coordinator cursor {} · {} workflow(s) · {} middle-rat(s)",
+        result["cursor"].as_u64().map(|cursor| cursor.to_string()).unwrap_or_else(|| "-".into()),
+        snapshot["workflows"].as_array().map(Vec::len).unwrap_or(0),
+        snapshot["middle_rats"].as_array().map(Vec::len).unwrap_or(0),
+    );
+    for attention in snapshot["attention"].as_array().into_iter().flatten() {
+        println!(
+            "ATTENTION {} {}",
+            attention["kind"].as_str().unwrap_or("event"),
+            attention["summary"].as_str().unwrap_or("-")
+        );
+    }
+    for middle in snapshot["middle_rats"].as_array().into_iter().flatten() {
+        let rollup = &middle["rollup"];
+        println!(
+            "{} {}: {}/{} complete, {} running, {} blocked{}",
+            middle["agent"].as_str().unwrap_or("?"),
+            middle["state"].as_str().unwrap_or("?"),
+            rollup["completed"],
+            rollup["total"],
+            rollup["running"],
+            rollup["blocked"],
+            middle["summary"].as_str().map(|summary| format!(" — {summary}")).unwrap_or_default(),
+        );
+    }
+}
+
+fn render_monitor_event(envelope: &Value, as_json: bool) {
+    if as_json {
+        println!("{}", json!({"kind": "event", "data": envelope}));
+        return;
+    }
+    let event = &envelope["event"];
+    println!(
+        "cursor={} {} {}",
+        envelope["cursor"].as_u64().map(|cursor| cursor.to_string()).unwrap_or_else(|| "?".into()),
+        event["payload"]["route"].as_str().unwrap_or("event"),
+        event["payload"]["summary"].as_str().unwrap_or_else(|| event["identity"].as_str().unwrap_or("coordination")),
+    );
+}
+
 enum WatchConnection {
     Done,
     Resync(String),

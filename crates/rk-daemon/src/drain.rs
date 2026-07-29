@@ -200,6 +200,7 @@ impl Drain {
                 task: ticket.identity.clone(),
                 prompt: Some(ticket_prompt(ticket)),
                 role: "rat".to_string(),
+                coordination: None,
                 harness: Some(resolved.harness),
                 parent: None,
                 base: None,
@@ -209,6 +210,7 @@ impl Drain {
                 // Drain dispatches standalone tickets, never a workflow instance,
                 // so there is no per-instance budget scope (TKT-32) to key on.
                 workflow_instance: None,
+                coordinator: None,
                 instance_max_usd: None,
             };
             match self.supervisor.spawn_async(params).await {

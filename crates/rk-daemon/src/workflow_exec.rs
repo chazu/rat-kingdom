@@ -135,6 +135,10 @@ pub struct Instance {
     pub id: String,
     pub workflow: String,
     pub repo: String,
+    /// Stable user-facing coordinator session that owns this workflow, when
+    /// explicitly supplied. Legacy and ad-hoc runs remain unowned.
+    #[serde(default)]
+    pub coordinator: Option<String>,
     pub status: InstanceStatus,
     /// Monotonic observable-state revision for coordinator consumers. Older
     /// snapshots deserialize as zero and enter the same sequence on their next
@@ -273,6 +277,12 @@ pub enum InstanceStatus {
     Running,
     Completed,
     Failed,
+}
+
+impl InstanceStatus {
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -688,6 +698,17 @@ impl WorkflowEngine {
         repo: &str,
         params: HashMap<String, Value>,
     ) -> rk_core::Result<Instance> {
+        self.run_owned(name, repo, params, None)
+    }
+
+    /// Launch a workflow with an explicit coordinator-session owner.
+    pub fn run_owned(
+        self: &Arc<Self>,
+        name: &str,
+        repo: &str,
+        params: HashMap<String, Value>,
+        coordinator: Option<String>,
+    ) -> rk_core::Result<Instance> {
         let file = self.find_definition(name, repo)?;
         let definition_digest = definition_digest(&file)?;
         let workflow = rk_workflow::load(&file, &params)?;
@@ -696,6 +717,7 @@ impl WorkflowEngine {
             id: prefixed_id("wf"),
             workflow: workflow.name.clone(),
             repo: repo.to_string(),
+            coordinator,
             status: InstanceStatus::Running,
             revision: 0,
             current_step: 0,
@@ -960,6 +982,7 @@ impl WorkflowEngine {
                         task: title,
                         prompt,
                         role: spawn.role.clone(),
+                        coordination: spawn.coordination.clone(),
                         harness: Some(resolved.harness),
                         parent: None,
                         base: spawn.branch.clone().or(ctx.active_branch.clone()),
@@ -967,6 +990,7 @@ impl WorkflowEngine {
                         permission_mode: resolved.permission_mode,
                         attach: false,
                         workflow_instance: Some(id.to_string()),
+                        coordinator: self.coordinator(id),
                         instance_max_usd: self.instance_budget(id),
                     })
                     .await?;
@@ -1414,6 +1438,7 @@ impl WorkflowEngine {
             id: prefixed_id("wf"),
             workflow: workflow_name.clone(),
             repo: child_repo.clone(),
+            coordinator: self.status(parent_id).and_then(|i| i.coordinator),
             status: InstanceStatus::Running,
             revision: 0,
             current_step: 0,
@@ -1540,7 +1565,9 @@ impl WorkflowEngine {
                 permission_mode: resolved.permission_mode,
                 attach: false,
                 workflow_instance: Some(id.to_string()),
-                instance_max_usd: instance_cap,
+                coordinator: self.coordinator(id),
+            instance_max_usd: instance_cap,
+            coordination: None,
             })
             .await?;
             fanned.push(FannedAgent {
@@ -2381,8 +2408,12 @@ impl WorkflowEngine {
 
     /// This instance's per-run budget cap (from the workflow's `budget:`), used
     /// as the dispatch preflight ceiling on every spawn it makes.
-    fn instance_budget(&self, id: &str) -> Option<f64> {
+    pub(crate) fn instance_budget(&self, id: &str) -> Option<f64> {
         self.lock().get(id).and_then(|i| i.instance_max_usd)
+    }
+
+    pub(crate) fn coordinator(&self, id: &str) -> Option<String> {
+        self.lock().get(id).and_then(|i| i.coordinator.clone())
     }
 
     fn store(&self, instance: Instance) {
@@ -2435,8 +2466,12 @@ impl WorkflowEngine {
             "instance": instance.id,
             "workflow": instance.workflow,
             "repo": repo_name_of(&instance.repo),
+            "coordinator": instance.coordinator,
             "revision": instance.revision,
             "reason": reason,
+            "route": if instance.status.is_terminal() { "terminal" } else { "rollup" },
+            "severity": if instance.status.is_terminal() { "info" } else { "debug" },
+            "summary": format!("workflow {:?} at step {}/{}", instance.status, instance.current_step, instance.total_steps),
             "status": instance.status,
             "current_step": instance.current_step,
             "total_steps": instance.total_steps,
@@ -3008,6 +3043,7 @@ mod tests {
             id: "wf-a".into(),
             workflow: "steward".into(),
             repo: "/dev/repo".into(),
+            coordinator: None,
             status: InstanceStatus::Failed,
             revision: 0,
             current_step: 0,

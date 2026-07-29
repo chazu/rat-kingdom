@@ -202,6 +202,11 @@ impl Space {
         self.lock().store.query_newest(pattern, false, Some(limit))
     }
 
+    /// Read one tuple by its durable id without consuming it.
+    pub fn get(&self, id: rk_core::id::RecordId) -> rk_core::Result<Option<Tuple>> {
+        self.lock().store.get(id)
+    }
+
     /// Delete one tuple by id (archive-on-resolution, targeted GC). Returns
     /// whether a row was removed. Unlike [`Space::take`], this consumes a
     /// *specific* tuple rather than the oldest pattern match — the reactor uses

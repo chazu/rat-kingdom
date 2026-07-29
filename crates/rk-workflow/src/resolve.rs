@@ -123,6 +123,7 @@ mod tests {
     fn step(agent: Option<&str>) -> SpawnStep {
         SpawnStep {
             role: "rat".into(),
+            coordination: None,
             agent: agent.map(String::from),
             harness: None,
             model: None,
