@@ -141,7 +141,7 @@ enum Command {
     /// Print role instructions for the system. Defaults to the `operator` role
     /// unless RK_ROLE (set on spawned rats) indicates otherwise.
     Prime {
-        /// Role to render: operator | rat | reviewer | foreman. Overrides RK_ROLE.
+        /// Role to render: operator | rat | reviewer | foreman | verifier | onboarder. Overrides RK_ROLE.
         #[arg(long)]
         role: Option<String>,
     },
@@ -208,6 +208,175 @@ enum RepoCommand {
     Show {
         /// Registered repo name.
         name: String,
+    },
+    /// Read-only repository onboarding assessment.
+    Onboard {
+        #[command(subcommand)]
+        command: RepoOnboardCommand,
+    },
+}
+
+#[derive(Args)]
+struct NamedCheckProposalArgs {
+    /// Named check whose executable contract is carried by a `.rk/checks.cue` proposal.
+    #[arg(long)]
+    check_name: Option<String>,
+    /// Exact repository-owned runner command.
+    #[arg(long, requires = "check_name")]
+    check_command: Option<String>,
+    /// Exact working directory relative to the onboarding worktree.
+    #[arg(long, requires = "check_name")]
+    check_cwd: Option<String>,
+    /// Exact expected exit status.
+    #[arg(long, requires = "check_name")]
+    check_expect_exit: Option<i64>,
+    /// Exact wall-clock timeout.
+    #[arg(long, requires = "check_name")]
+    check_timeout: Option<String>,
+    /// Environment contract: inherit or strip_rk_spawn.
+    #[arg(long, requires = "check_name")]
+    check_environment_policy: Option<String>,
+    /// Repository-owned toolchain/runner description.
+    #[arg(long, requires = "check_name")]
+    check_toolchain: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum RepoOnboardCommand {
+    /// Start or idempotently reuse a durable onboarding session.
+    Start {
+        /// Repository path or registered name.
+        target: String,
+        /// Harness kind; defaults to the daemon configuration.
+        #[arg(long)]
+        harness: Option<String>,
+        /// Launch in a human-attachable herdr pane.
+        #[arg(long)]
+        attach: bool,
+    },
+    /// Inspect a path or registered name without launching an agent or writing state.
+    Inspect {
+        /// Repository path or registered name.
+        target: String,
+    },
+    /// Journal one immutable, content-bound onboarding proposal.
+    Propose {
+        /// Stable onboarding session id.
+        session: String,
+        /// Proposal kind: repo_file, castle_config, registration,
+        /// workflow_activation, trigger_activation, or schedule_activation.
+        #[arg(long)]
+        kind: String,
+        /// Human-readable proposal title.
+        #[arg(long)]
+        title: String,
+        /// Evidence supporting the proposal; repeat for multiple entries.
+        #[arg(long, required = true)]
+        evidence: Vec<String>,
+        /// Exact repository path or castle setting affected.
+        #[arg(long)]
+        target: String,
+        /// Action: write_repo_file, change_castle_config,
+        /// register_repository, activate_workflow, activate_trigger, or
+        /// activate_schedule.
+        #[arg(long)]
+        action: String,
+        /// Exact reviewable unified diff or configuration delta.
+        #[arg(long)]
+        diff: String,
+        /// Risk: low, medium, or high.
+        #[arg(long)]
+        risk: String,
+        /// Verification step; repeat for multiple entries.
+        #[arg(long, required = true)]
+        verification: Vec<String>,
+        #[command(flatten)]
+        named_check: Box<NamedCheckProposalArgs>,
+    },
+    /// Approve one exact proposal digest.
+    Approve {
+        /// Stable onboarding session id.
+        session: String,
+        /// Stable proposal id.
+        proposal: String,
+        /// Canonical digest shown by status/report.
+        #[arg(long)]
+        digest: String,
+        /// Optional durable decision rationale.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Decline one exact proposal digest.
+    Decline {
+        /// Stable onboarding session id.
+        session: String,
+        /// Stable proposal id.
+        proposal: String,
+        /// Canonical digest shown by status/report.
+        #[arg(long)]
+        digest: String,
+        /// Optional durable decision rationale.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Apply and execute one approved `.rk/checks.cue` proposal.
+    Apply {
+        /// Stable onboarding session id.
+        session: String,
+        /// Stable proposal id.
+        proposal: String,
+        /// Canonical digest shown by status/report.
+        #[arg(long)]
+        digest: String,
+    },
+    /// Explicitly activate one validated workflow, trigger, or schedule by
+    /// landing its exact approved commit into the registered checkout.
+    Activate {
+        /// Stable onboarding session id.
+        session: String,
+        /// Stable proposal id.
+        proposal: String,
+        /// Canonical digest shown by status/report.
+        #[arg(long)]
+        digest: String,
+    },
+    /// Refuse activation while retaining the validated onboarding branch and
+    /// durable report.
+    DeclineActivation {
+        /// Stable onboarding session id.
+        session: String,
+        /// Stable proposal id.
+        proposal: String,
+        /// Canonical digest shown by status/report.
+        #[arg(long)]
+        digest: String,
+        /// Optional durable decision rationale.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Remove a terminal session's clean worktree while retaining its branch
+    /// and durable report.
+    Cleanup {
+        /// Stable onboarding session id.
+        session: String,
+    },
+    /// Resume an orphaned or failed onboarding session.
+    Resume {
+        /// Stable onboarding session id.
+        session: String,
+        /// Resume in a human-attachable herdr pane.
+        #[arg(long)]
+        attach: bool,
+    },
+    /// Show durable onboarding session state.
+    Status {
+        /// Stable onboarding session id.
+        session: String,
+    },
+    /// Show the durable onboarding assessment and terminal result.
+    Report {
+        /// Stable onboarding session id.
+        session: String,
     },
 }
 
@@ -596,7 +765,7 @@ async fn main() -> Result<()> {
                             _ => {
                                 return Err(anyhow::anyhow!(
                                     "--param-file {path} must contain a JSON object of key→value"
-                                ))
+                                ));
                             }
                         }
                     }
@@ -826,6 +995,117 @@ async fn main() -> Result<()> {
             } => repo_cmds::add(&layout, path, name, merge_mode, remote, cli.json).await?,
             RepoCommand::List => repo_cmds::list(&layout, cli.json).await?,
             RepoCommand::Show { name } => repo_cmds::show(&layout, name, cli.json).await?,
+            RepoCommand::Onboard { command } => match command {
+                RepoOnboardCommand::Start {
+                    target,
+                    harness,
+                    attach,
+                } => repo_cmds::onboard_start(&layout, target, harness, attach, cli.json).await?,
+                RepoOnboardCommand::Inspect { target } => {
+                    repo_cmds::onboard_inspect(&layout, target, cli.json).await?
+                }
+                RepoOnboardCommand::Propose {
+                    session,
+                    kind,
+                    title,
+                    evidence,
+                    target,
+                    action,
+                    diff,
+                    risk,
+                    verification,
+                    named_check,
+                } => {
+                    let NamedCheckProposalArgs {
+                        check_name,
+                        check_command,
+                        check_cwd,
+                        check_expect_exit,
+                        check_timeout,
+                        check_environment_policy,
+                        check_toolchain,
+                    } = *named_check;
+                    repo_cmds::onboard_propose(
+                        &layout,
+                        session,
+                        kind,
+                        title,
+                        evidence,
+                        target,
+                        action,
+                        diff,
+                        risk,
+                        verification,
+                        check_name,
+                        check_command,
+                        check_cwd,
+                        check_expect_exit,
+                        check_timeout,
+                        check_environment_policy,
+                        check_toolchain,
+                        cli.json,
+                    )
+                    .await?
+                }
+                RepoOnboardCommand::Approve {
+                    session,
+                    proposal,
+                    digest,
+                    reason,
+                } => {
+                    repo_cmds::onboard_decide(
+                        &layout, session, proposal, digest, reason, true, cli.json,
+                    )
+                    .await?
+                }
+                RepoOnboardCommand::Decline {
+                    session,
+                    proposal,
+                    digest,
+                    reason,
+                } => {
+                    repo_cmds::onboard_decide(
+                        &layout, session, proposal, digest, reason, false, cli.json,
+                    )
+                    .await?
+                }
+                RepoOnboardCommand::Apply {
+                    session,
+                    proposal,
+                    digest,
+                } => repo_cmds::onboard_apply(&layout, session, proposal, digest, cli.json).await?,
+                RepoOnboardCommand::Activate {
+                    session,
+                    proposal,
+                    digest,
+                } => {
+                    repo_cmds::onboard_activate(&layout, session, proposal, digest, cli.json)
+                        .await?
+                }
+                RepoOnboardCommand::DeclineActivation {
+                    session,
+                    proposal,
+                    digest,
+                    reason,
+                } => {
+                    repo_cmds::onboard_decline_activation(
+                        &layout, session, proposal, digest, reason, cli.json,
+                    )
+                    .await?
+                }
+                RepoOnboardCommand::Cleanup { session } => {
+                    repo_cmds::onboard_cleanup(&layout, session, cli.json).await?
+                }
+                RepoOnboardCommand::Resume { session, attach } => {
+                    repo_cmds::onboard_resume(&layout, session, attach, cli.json).await?
+                }
+                RepoOnboardCommand::Status { session } => {
+                    repo_cmds::onboard_status(&layout, session, cli.json).await?
+                }
+                RepoOnboardCommand::Report { session } => {
+                    repo_cmds::onboard_report(&layout, session, cli.json).await?
+                }
+            },
         },
         Command::Ticket { command } => match command {
             TicketCommand::New(args) => ticket_cmds::new(&layout, args, cli.json).await?,

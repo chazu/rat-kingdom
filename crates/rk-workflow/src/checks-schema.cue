@@ -32,4 +32,14 @@ checks: [...#Check]
 	// the step fails closed. Unset falls back to the referencing run step's own
 	// timeout (default 10m).
 	timeout?: string
+
+	// Exact environment contract for the command. "inherit" preserves the
+	// daemon environment. "strip_rk_spawn" removes the supervised-agent RK_*
+	// identity variables before execution, which is required by repositories
+	// whose test clients otherwise inherit the caller rat's authorization.
+	environmentPolicy?: "inherit" | "strip_rk_spawn"
+
+	// Human-readable repository-owned toolchain description captured in
+	// onboarding verification evidence (for example "mise rust@1.95.0").
+	toolchain?: string
 }

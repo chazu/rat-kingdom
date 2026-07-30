@@ -25,7 +25,9 @@ pub const OPERATOR: &str = "operator";
 ///
 /// `RK_AGENT` names the caller; `RK_AUTH_TOKEN` overrides the token the
 /// supervisor already handed the agent, which is why an agent session never
-/// has to read the operator token off disk.
+/// has to read the operator token off disk. This selects the wire identity but
+/// does not grant authority by itself: the server also binds the connection to
+/// its kernel-observed process origin.
 fn ambient_identity(
     layout: &Layout,
     var: impl Fn(&str) -> Option<String>,

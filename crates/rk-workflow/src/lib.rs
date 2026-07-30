@@ -7,8 +7,9 @@ pub mod resolve;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const SCHEMA: &str = include_str!("schema.cue");
 const TRIGGER_SCHEMA: &str = include_str!("triggers-schema.cue");
@@ -489,6 +490,23 @@ fn default_on_timeout() -> String {
     "fail".into()
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckEnvironmentPolicy {
+    #[default]
+    Inherit,
+    StripRkSpawn,
+}
+
+impl std::fmt::Display for CheckEnvironmentPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Inherit => "inherit",
+            Self::StripRkSpawn => "strip_rk_spawn",
+        })
+    }
+}
+
 /// A repo-registered named check: the per-repo allowlist entry a workflow `run`
 /// step invokes by name instead of carrying a raw shell command. The registry
 /// lives in `<repo>/.rk/checks.cue` and is owned by the repo, NOT by the (possibly
@@ -511,6 +529,16 @@ pub struct Check {
     /// Hard wall-clock bound; unset falls back to the run step's own timeout.
     #[serde(default)]
     pub timeout: Option<String>,
+    /// Environment inherited by the check process. Repositories whose test
+    /// clients read ambient rat identity can explicitly strip the spawn
+    /// contract rather than relying on an operator to remember shell hygiene.
+    #[serde(default, rename = "environmentPolicy")]
+    pub environment_policy: CheckEnvironmentPolicy,
+    /// Repository-owned description of the runner/toolchain used by this
+    /// command. Optional for legacy registries; required for onboarding-created
+    /// checks so the verification report can preserve it.
+    #[serde(default)]
+    pub toolchain: Option<String>,
 }
 
 /// Load and validate every `#Check` in one repo's `checks.cue` registry.
@@ -522,22 +550,11 @@ pub fn load_checks(file: &Path) -> rk_core::Result<Vec<Check>> {
 
 /// Load named checks from source text (see [`load_checks`]).
 pub fn load_checks_str(source: &str) -> rk_core::Result<Vec<Check>> {
-    let dir = tempfile_dir()?;
-    std::fs::write(dir.join("schema.cue"), CHECK_SCHEMA)?;
-    std::fs::write(dir.join("checks.cue"), ensure_checks_package(source))?;
-    let json = cue_export(&dir, "checks")?;
+    let source = schema_with_source(CHECK_SCHEMA, source);
+    let json = cue_export_stdin(&source, "checks")?;
     let checks: Vec<Check> = serde_json::from_str(&json)
         .map_err(|e| rk_core::Error::other(format!("checks JSON did not match schema: {e}")))?;
-    std::fs::remove_dir_all(&dir).ok();
     Ok(checks)
-}
-
-fn ensure_checks_package(source: &str) -> String {
-    if source.trim_start().starts_with("package ") || source.contains("\npackage ") {
-        source.to_string()
-    } else {
-        format!("package checks\n\n{source}")
-    }
 }
 
 /// Merge a NAMED branch into a NAMED target — the explicit `{branch, target}`
@@ -754,22 +771,11 @@ pub fn load_triggers(file: &Path) -> rk_core::Result<Vec<Trigger>> {
 
 /// Load triggers from source text (see [`load_triggers`]).
 pub fn load_triggers_str(source: &str) -> rk_core::Result<Vec<Trigger>> {
-    let dir = tempfile_dir()?;
-    std::fs::write(dir.join("schema.cue"), TRIGGER_SCHEMA)?;
-    std::fs::write(dir.join("triggers.cue"), ensure_triggers_package(source))?;
-    let json = cue_export(&dir, "triggers")?;
+    let source = schema_with_source(TRIGGER_SCHEMA, source);
+    let json = cue_export_stdin(&source, "triggers")?;
     let triggers: Vec<Trigger> = serde_json::from_str(&json)
         .map_err(|e| rk_core::Error::other(format!("triggers JSON did not match schema: {e}")))?;
-    std::fs::remove_dir_all(&dir).ok();
     Ok(triggers)
-}
-
-fn ensure_triggers_package(source: &str) -> String {
-    if source.trim_start().starts_with("package ") || source.contains("\npackage ") {
-        source.to_string()
-    } else {
-        format!("package triggers\n\n{source}")
-    }
 }
 
 /// A scheduled workflow: a cron cadence plus the workflow to launch on it. The
@@ -802,22 +808,47 @@ pub fn load_schedules(file: &Path) -> rk_core::Result<Vec<Schedule>> {
 
 /// Load schedules from source text (see [`load_schedules`]).
 pub fn load_schedules_str(source: &str) -> rk_core::Result<Vec<Schedule>> {
-    let dir = tempfile_dir()?;
-    std::fs::write(dir.join("schema.cue"), SCHEDULE_SCHEMA)?;
-    std::fs::write(dir.join("schedules.cue"), ensure_schedules_package(source))?;
-    let json = cue_export(&dir, "schedules")?;
+    let source = schema_with_source(SCHEDULE_SCHEMA, source);
+    let json = cue_export_stdin(&source, "schedules")?;
     let schedules: Vec<Schedule> = serde_json::from_str(&json)
         .map_err(|e| rk_core::Error::other(format!("schedules JSON did not match schema: {e}")))?;
-    std::fs::remove_dir_all(&dir).ok();
     Ok(schedules)
 }
 
-fn ensure_schedules_package(source: &str) -> String {
-    if source.trim_start().starts_with("package ") || source.contains("\npackage ") {
-        source.to_string()
-    } else {
-        format!("package schedules\n\n{source}")
+/// Validate a workflow's syntax and schema without resolving its runtime
+/// parameters. The definition and embedded schema are sent to `cue` on stdin,
+/// so inspection does not create a temporary package or write beside the
+/// repository being assessed.
+pub fn validate_workflow_str(source: &str) -> rk_core::Result<()> {
+    let base = schema_with_source(SCHEMA, source);
+    let params_source = format!("{base}\n_input: [string]: _\n");
+    let params_json = cue_export_stdin(&params_source, "workflow.params")?;
+    let params: HashMap<String, Param> = serde_json::from_str(&params_json)
+        .map_err(|e| rk_core::Error::other(format!("workflow params malformed: {e}")))?;
+
+    let mut keys = params.keys().collect::<Vec<_>>();
+    keys.sort();
+    let mut input = String::from("\n_input: {\n");
+    for key in keys {
+        let param = &params[key];
+        let value = param
+            .default
+            .clone()
+            .unwrap_or_else(|| match param.param_type.as_str() {
+                "string" => Value::String(String::new()),
+                "int" => Value::Number(1.into()),
+                "number" => Value::Number(1.into()),
+                "bool" => Value::Bool(false),
+                "list" => Value::Array(Vec::new()),
+                _ => Value::Null,
+            });
+        input.push_str(&format!("\t{key}: {value}\n"));
     }
+    input.push_str("}\n");
+    let json = cue_export_stdin(&(base + &input), "workflow")?;
+    serde_json::from_str::<Workflow>(&json)
+        .map_err(|e| rk_core::Error::other(format!("workflow JSON did not match schema: {e}")))?;
+    Ok(())
 }
 
 /// List workflow definitions in a directory (files named `<name>.cue`).
@@ -941,6 +972,49 @@ fn cue_export(dir: &Path, expr: &str) -> rk_core::Result<String> {
         .current_dir(dir)
         .output()
         .map_err(|e| rk_core::Error::other(format!("cue CLI not runnable: {e}")))?;
+    if !out.status.success() {
+        return Err(rk_core::Error::other(format!(
+            "cue export failed:\n{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Merge a user definition into one embedded-schema package. A repository file
+/// may declare the expected package itself; remove that declaration because the
+/// embedded schema already carries it.
+fn schema_with_source(schema: &str, source: &str) -> String {
+    let mut removed_package = false;
+    let source = source
+        .lines()
+        .filter(|line| {
+            if !removed_package && line.trim_start().starts_with("package ") {
+                removed_package = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{schema}\n\n// repository definition\n{source}\n")
+}
+
+fn cue_export_stdin(source: &str, expr: &str) -> rk_core::Result<String> {
+    let mut child = Command::new("cue")
+        .args(["export", "-", "-e", expr, "--out", "json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| rk_core::Error::other(format!("cue CLI not runnable: {e}")))?;
+    child
+        .stdin
+        .take()
+        .expect("cue stdin is piped")
+        .write_all(source.as_bytes())?;
+    let out = child.wait_with_output()?;
     if !out.status.success() {
         return Err(rk_core::Error::other(format!(
             "cue export failed:\n{}",
@@ -1607,7 +1681,12 @@ schedules: [
         let source = r#"
 checks: [
     {name: "test", command: "cargo test"},
-    {name: "clippy", command: "cargo clippy", cwd: "crates/x", expectExit: 0, timeout: "5m"},
+    {
+        name: "clippy", command: "cargo clippy", cwd: "crates/x",
+        expectExit: 0, timeout: "5m",
+        environmentPolicy: "strip_rk_spawn",
+        toolchain: "mise rust@1.95.0",
+    },
 ]
 "#;
         let checks = load_checks_str(source).unwrap();
@@ -1620,6 +1699,11 @@ checks: [
         assert_eq!(checks[1].cwd.as_deref(), Some("crates/x"));
         assert_eq!(checks[1].expect_exit, Some(0));
         assert_eq!(checks[1].timeout.as_deref(), Some("5m"));
+        assert_eq!(
+            checks[1].environment_policy,
+            CheckEnvironmentPolicy::StripRkSpawn
+        );
+        assert_eq!(checks[1].toolchain.as_deref(), Some("mise rust@1.95.0"));
     }
 
     #[test]
@@ -1634,5 +1718,13 @@ checks: [
         let bad = r#"checks: [{name: "x"}]"#;
         let err = load_checks_str(bad).unwrap_err();
         assert!(err.to_string().contains("cue export failed"), "{err}");
+    }
+
+    #[test]
+    fn check_unknown_environment_policy_is_a_cue_error() {
+        let bad =
+            r#"checks: [{name: "x", command: "true", environmentPolicy: "ambient_magic"}]"#;
+        let err = load_checks_str(bad).unwrap_err();
+        assert!(err.to_string().contains("environmentPolicy"), "{err}");
     }
 }

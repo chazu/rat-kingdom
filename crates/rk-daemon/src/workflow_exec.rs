@@ -77,6 +77,7 @@ struct ResolvedRun {
     expect_exit: Option<i64>,
     timeout: String,
     on_timeout: OnTimeout,
+    environment_policy: rk_workflow::CheckEnvironmentPolicy,
 }
 
 /// What a blown `run` wall-clock bound does to the instance (TKT-169).
@@ -1992,7 +1993,8 @@ impl WorkflowEngine {
         let command = interpolate(&resolved.command, ctx);
         let timeout = parse_duration(&resolved.timeout)?;
 
-        let child = tokio::process::Command::new("sh")
+        let mut child_command = tokio::process::Command::new("sh");
+        child_command
             .arg("-c")
             .arg(&command)
             .current_dir(&dir)
@@ -2001,7 +2003,22 @@ impl WorkflowEngine {
             .stderr(std::process::Stdio::piped())
             // Kill the suite if the timeout below drops the wait future, so a
             // hung check leaves no orphan behind.
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        if resolved.environment_policy == rk_workflow::CheckEnvironmentPolicy::StripRkSpawn {
+            for name in [
+                "RK_AGENT",
+                "RK_TASK",
+                "RK_REPO",
+                "RK_ROLE",
+                "RK_HOME",
+                "RK_BRANCH",
+                "RK_WORKTREE",
+                "RK_AUTH_TOKEN",
+            ] {
+                child_command.env_remove(name);
+            }
+        }
+        let child = child_command
             .spawn()
             .map_err(|e| {
                 rk_core::Error::other(format!("run step: failed to spawn `{command}`: {e}"))
@@ -2129,6 +2146,7 @@ impl WorkflowEngine {
                     expect_exit: run.expect_exit,
                     timeout: run.timeout.clone(),
                     on_timeout,
+                    environment_policy: rk_workflow::CheckEnvironmentPolicy::Inherit,
                 })
             }
             (None, Some(name)) => {
@@ -2151,6 +2169,7 @@ impl WorkflowEngine {
                     expect_exit: run.expect_exit.or(check.expect_exit),
                     timeout,
                     on_timeout,
+                    environment_policy: check.environment_policy,
                 })
             }
         }

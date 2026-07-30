@@ -176,8 +176,9 @@ own role instead.
 Worker prompts stay project-agnostic by default. When a repository contains a
 valid `.rk/checks.cue`, the daemon adds its named checks to the spawned and
 resumed worker's prompt as **Repository verification checks**. The section
-shows each check's name, command, working directory, expected exit, and timeout;
-the command is repository-owned guidance, not extra prompt instructions. A
+shows each check's name, command, working directory, expected exit, timeout,
+environment policy, and declared toolchain; the command is repository-owned
+guidance, not extra prompt instructions. A
 worker should prefer the `verify` check when present, otherwise choose the
 relevant declared check for its task. Workflow `run` steps remain the
 authoritative, fail-closed gate. Missing or malformed check registries do not
@@ -214,9 +215,120 @@ rk repo add ~/dev/rat-kingdom          # name defaults to the directory ("rat-ki
 rk repo add ~/dev/other --name svc     # or name it explicitly
 rk repo list                           # NAME → PATH
 rk repo show rat-kingdom               # details + its open tickets
+rk repo onboard inspect ~/dev/other    # deterministic read-only readiness report
+rk --json repo onboard inspect svc     # the same stable report shape as JSON
+rk repo onboard start svc              # durable headless assessment session
+rk repo onboard start svc --attach     # same session/report in a herdr pane
+rk repo onboard status onb-...         # stable state after disconnect or restart
+rk repo onboard propose onb-... --kind repo_file --title "Add verify" \
+  --evidence "README documents mise run verify" --target .rk/checks.cue \
+  --action write_repo_file --diff "$DIFF" --risk low --verification "check:verify" \
+  --check-name verify --check-command "mise run verify" --check-cwd . \
+  --check-expect-exit 0 --check-timeout 20m \
+  --check-environment-policy strip_rk_spawn \
+  --check-toolchain "mise rust@1.95.0"
+rk repo onboard approve onb-... onb-prop-... --digest <sha256>
+rk repo onboard apply onb-... onb-prop-... --digest <sha256>
+rk repo onboard decline onb-... onb-prop-... --digest <sha256>
+rk repo onboard propose onb-... --kind workflow_activation \
+  --title "Add guarded maintenance workflow" --evidence "reviewed workflow design" \
+  --target .rk/workflows/maintenance.cue --action activate_workflow \
+  --diff "$DIFF" --risk high --verification "CUE workflow schema"
+rk repo onboard approve onb-... onb-prop-... --digest <sha256>
+rk repo onboard apply onb-... onb-prop-... --digest <sha256> # stage + validate only
+rk repo onboard activate onb-... onb-prop-... --digest <sha256>
+# or explicitly refuse the validated automation:
+rk repo onboard decline-activation onb-... onb-prop-... --digest <sha256>
+rk repo onboard report onb-...         # assessment plus terminal agent result
+rk repo onboard resume onb-...         # recover an orphaned/failed headless run
+rk repo onboard resume onb-... --attach
+rk repo onboard cleanup onb-...        # remove terminal clean worktree; retain branch/report
 ```
 
 A registered name works anywhere a repo is expected, e.g. `rk spawn --repo rat-kingdom`.
+
+`repo onboard inspect` resolves either a path or registered name, then reports
+canonical identity, git/remote/base state, repository instructions, documented
+toolchain entrypoints, named checks, repo-local workflows/triggers/schedules,
+and configured harness/`rk` readiness. Findings carry stable `kind`, `severity`,
+observed `evidence`, inferred `recommendation`, and
+`unresolved_ambiguity` fields. Error findings make the command exit non-zero:
+dirty or unborn repositories, ambiguous bases, missing remotes/tools, malformed
+CUE, submodules, and Git LFS therefore fail closed.
+
+Inspection never registers the repository, launches an agent, runs a project
+check, or edits repository/castle state. It also does not auto-start the daemon;
+if the daemon is down, start it separately with `rk ping` and then inspect.
+
+`repo onboard start` journals one stable session per canonical repository and
+creates `onboarding/onb-...` in a Rat Kingdom-owned worktree. Repeating start
+reuses that session, branch, and worktree rather than touching the human
+checkout or launching a duplicate. Headless and `--attach` runs write the same
+`onboarding-sessions.json` record and expose the same status/report RPCs.
+Daemon restart marks an in-flight session orphaned; `resume` reuses the
+preserved worktree and, for attached runs, reattaches to a surviving herdr pane
+or recreates it.
+
+The spawned role is always `onboarder`; the RPC does not accept a role override.
+The daemon rejects unknown roles, forces onboarders into the harness's
+read-only/plan mode, and gives them only inspection reads, self progress, and
+proposal submission plus their final `rk done` event. Proposal submission only
+journals immutable advice: it does not edit the worktree or castle. Onboarders
+cannot approve or decline proposals, spawn agents, mutate tickets/repos,
+approve workflows, use ordinary rat tuple writes, or gain operator authority by
+clearing `RK_AGENT`/`RK_AUTH_TOKEN`.
+
+Each proposal records its evidence, exact diff, risk, target/action, verification
+plan, stable repository identity, and the onboarding Git tree revision. Its
+canonical SHA-256 digest covers all of that immutable content. Copy the digest
+shown by `status` or `report` into `approve`/`decline`; the daemon rejects a
+stale tree, edited persisted proposal, different digest, caller-supplied actor,
+or opposite second decision. Same-decision retries are idempotent, and the
+server records the authenticated castle-qualified operator plus decision time.
+
+A `.rk/checks.cue` proposal additionally binds the check name, exact command,
+cwd, expected exit, timeout, environment policy, and toolchain description into
+that digest. After approval, `repo onboard apply` applies the exact patch only
+inside the Rat Kingdom-owned onboarding worktree, validates the resulting file
+through the existing CUE checks schema, commits it on the onboarding branch,
+and executes that named check. The durable report records the application
+commit and tree plus every verification attempt's command, toolchain,
+environment policy, exit/timing result, bounded output summary, and unresolved
+risks. `strip_rk_spawn` removes `RK_AGENT`, `RK_TASK`, `RK_REPO`, `RK_ROLE`,
+`RK_HOME`, `RK_BRANCH`, `RK_WORKTREE`, and `RK_AUTH_TOKEN`; `inherit` preserves
+the daemon environment.
+
+Application retries are fail-closed and recoverable. A clean replay neither
+recommits nor reruns a verified check. After a failed check, retry reuses the
+recorded commit and executes a new attempt. An interrupted exact patch or
+trailer-bearing commit is recovered; unrelated dirt, an edited applied file,
+or branch movement is recorded as failure and never swept into the proposal.
+
+Workflow, trigger, and schedule proposals use distinct activation kinds and
+actions: `workflow_activation`/`activate_workflow` targets exactly
+`.rk/workflows/<name>.cue`, `trigger_activation`/`activate_trigger` targets
+`.rk/triggers.cue`, and `schedule_activation`/`activate_schedule` targets
+`.rk/schedules.cue`. `apply` patches and commits only the onboarding worktree,
+then validates through the workflow/trigger/schedule CUE schema (including
+schedule cron parsing). This is inert: the daemon does not discover automation
+from onboarding worktrees.
+
+`activate` is the separate human decision that crosses the activation boundary.
+It journals an operation id before changing Git, then fast-forwards the clean,
+registered base checkout only when it is still the exact parent of the
+approved application commit. The onboarding branch head, committed tree,
+target-file digest, repository identity, and live target digest must all still
+match. A moved branch or changed file fails closed. Restart and duplicate
+delivery are safe: if the exact application commit is already present with the
+approved live digest, the daemon records recovery without landing it again.
+`decline-activation` permanently records refusal while retaining the staged
+branch.
+
+The report's summary has separate `staged`, `verified`, `activated`, `declined`,
+`failed`, and `unresolved` proposal lists. `cleanup` is allowed only for a
+terminal session without staged or unresolved proposals; it removes a clean
+onboarding worktree but retains both its Git branch and durable report.
+Running, orphaned, and long-lived attached sessions are never cleaned.
 
 By default a finished rat's branch is merged directly into its base. A repo can
 instead be put in **PR mode** — `rk repo add <path> --merge-mode pr` — so the
@@ -374,6 +486,14 @@ Env: `RK_HOME` (state dir), `RK_LOG` (tracing filter), `RK_CONFIG_*`
 (`RK_AGENT`, `RK_TASK`, ...) are reserved for agent identity — set at spawn,
 never read as config.
 
+Local RPC authorization does not trust those environment variables or the
+bearer token alone. The daemon also binds each Unix-socket connection to its
+kernel-reported process origin. A process launched in a supervised agent tree
+or live agent worktree may claim only that agent, even if it clears
+`RK_AGENT`/`RK_AUTH_TOKEN` and can read the same-user `RK_HOME/auth.token`.
+Operator commands therefore fail closed when run from inside an agent
+worktree; run them from an operator checkout or another non-agent directory.
+
 ### `[drain]` — continuous-drain autoscaler
 
 Turning on `[drain]` hands the dispatch loop to the daemon: it keeps up to
@@ -503,6 +623,10 @@ workflow: {
   compromised or untrusted workflow definition can invoke only the repo owner's
   registered checks — never arbitrary shell. A named check supplies its own
   command/cwd/`expectExit`/timeout; the step may override cwd/`expectExit`/timeout.
+  It may also declare `environmentPolicy: "inherit" | "strip_rk_spawn"`; the
+  latter removes ambient supervised-agent identity before execution. Optional
+  `toolchain` text records the repository-owned runner/toolchain for onboarding
+  evidence.
   The same registry is surfaced as optional guidance in spawned worker prompts;
   it does not replace the workflow gate. See `examples/workflows/named-check-merge.cue`.
 
