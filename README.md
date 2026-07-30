@@ -247,6 +247,8 @@ rk repo onboard cleanup onb-...        # remove terminal clean worktree; retain 
 
 A registered name works anywhere a repo is expected, e.g. `rk spawn --repo rat-kingdom`.
 
+For the operator walkthrough, see [Repository onboarding](docs/repo-onboarding.md).
+
 `repo onboard inspect` resolves either a path or registered name, then reports
 canonical identity, git/remote/base state, repository instructions, documented
 toolchain entrypoints, named checks, repo-local workflows/triggers/schedules,
