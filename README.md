@@ -103,7 +103,12 @@ them (`--reap-git --reap-logs`) when you want everything reclaimed.
 
 Spawn options: `--harness claude|codex|axe|fake`, `--model`, `--role
 rat|reviewer`, `--base <branch>`, `--parent <agent>` (completion routing),
-`--no-merge` on dismiss, `--attach` (below).
+`--permission-mode`, `--no-merge` on dismiss, `--attach` (below).
+
+Codex rats default to `danger-full-access` because the Rat Kingdom coordination
+socket lives under `RK_HOME`, outside the agent worktree. Codex
+`read-only`/`workspace-write` overrides are rejected before launch because
+they cannot run `rk done` or other coordination commands.
 
 Workflow runs can opt into a stable coordinator ownership scope with
 `rk workflow run <name> --coordinator <session-id>`. The coordinator can then

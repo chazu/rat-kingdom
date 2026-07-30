@@ -25,7 +25,11 @@ fn sandbox_mode(permission_mode: Option<&str>) -> &'static str {
         // Claude's workflow vocabulary uses bypassPermissions; map it to the
         // Codex equivalent instead of silently narrowing it to workspace-write.
         Some("bypassPermissions") | Some("danger-full-access") => "danger-full-access",
-        _ => "workspace-write",
+        // Rat Kingdom agents must reach the daemon's Unix socket at RK_HOME;
+        // that path is outside their worktree and is blocked by Codex's
+        // workspace-write sandbox. The supervisor rejects restricted explicit
+        // modes, and this adapter default keeps direct LaunchSpec callers safe.
+        _ => "danger-full-access",
     }
 }
 
@@ -50,8 +54,8 @@ impl Harness for CodexHarness {
         if let Some(session) = &spec.resume_session {
             cmd.args(["resume", session]);
         }
-        // permission_mode maps to codex --sandbox. Default to the worktree
-        // sandbox; operators can opt into a wider mode explicitly.
+        // permission_mode maps to codex --sandbox. Rat Kingdom's default must
+        // include access to the daemon socket outside the worktree.
         let sandbox = sandbox_mode(spec.permission_mode.as_deref());
         cmd.args(["--json", "--skip-git-repo-check", "--sandbox", sandbox]);
         if let Some(model) = &spec.model {
@@ -207,9 +211,15 @@ mod tests {
     fn permission_modes_map_to_codex_sandbox_modes() {
         assert_eq!(sandbox_mode(Some("read-only")), "read-only");
         assert_eq!(sandbox_mode(Some("workspace-write")), "workspace-write");
-        assert_eq!(sandbox_mode(Some("bypassPermissions")), "danger-full-access");
-        assert_eq!(sandbox_mode(Some("danger-full-access")), "danger-full-access");
-        assert_eq!(sandbox_mode(None), "workspace-write");
+        assert_eq!(
+            sandbox_mode(Some("bypassPermissions")),
+            "danger-full-access"
+        );
+        assert_eq!(
+            sandbox_mode(Some("danger-full-access")),
+            "danger-full-access"
+        );
+        assert_eq!(sandbox_mode(None), "danger-full-access");
     }
 
     #[test]

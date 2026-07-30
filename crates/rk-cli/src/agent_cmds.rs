@@ -24,7 +24,7 @@ pub struct SpawnArgs {
     /// Agent role: rat | reviewer | foreman.
     #[arg(long, default_value = "rat")]
     pub role: String,
-    /// Harness kind: claude | fake (default from config).
+    /// Harness kind: claude | codex | axe | fake (default from config).
     #[arg(long)]
     pub harness: Option<String>,
     /// Spawning agent name (structural parent for completion routing).
@@ -36,7 +36,7 @@ pub struct SpawnArgs {
     /// Model override.
     #[arg(long)]
     pub model: Option<String>,
-    /// Harness permission mode (e.g. acceptEdits, bypassPermissions).
+    /// Harness permission mode (e.g. acceptEdits, bypassPermissions, danger-full-access).
     #[arg(long)]
     pub permission_mode: Option<String>,
     /// Run interactively in a herdr pane (human-attachable).

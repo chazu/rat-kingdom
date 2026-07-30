@@ -26,8 +26,28 @@ const MIN_PROGRESS_INTERVAL: chrono::Duration = chrono::Duration::seconds(5);
 fn default_permission_mode(harness: &str) -> &'static str {
     match harness {
         "claude" => "acceptEdits",
-        "codex" => "workspace-write",
+        // A rat's coordination contract includes `rk done`, tuple writes, and
+        // ticket operations. Codex's workspace-write sandbox blocks the Unix
+        // socket outside the worktree, so it cannot satisfy that contract.
+        "codex" => "danger-full-access",
         _ => "workspace-write",
+    }
+}
+
+fn validate_permission_mode(harness: &str, permission_mode: &str) -> rk_core::Result<()> {
+    if harness != "codex" {
+        return Ok(());
+    }
+
+    match permission_mode {
+        "danger-full-access" | "bypassPermissions" => Ok(()),
+        "read-only" | "workspace-write" => Err(rk_core::Error::other(
+            "codex agents need danger-full-access to reach the rk daemon socket; \
+             use --permission-mode danger-full-access (or omit the override)",
+        )),
+        other => Err(rk_core::Error::other(format!(
+            "unsupported codex permission mode '{other}': use danger-full-access"
+        ))),
     }
 }
 
@@ -488,6 +508,11 @@ impl Supervisor {
             .clone()
             .unwrap_or_else(|| self.default_harness.clone());
         let harness = make_harness(&harness_kind)?;
+        let permission_mode = params
+            .permission_mode
+            .clone()
+            .unwrap_or_else(|| default_permission_mode(&harness_kind).into());
+        validate_permission_mode(&harness_kind, &permission_mode)?;
 
         // Reserve the name atomically: it stays claimed against concurrent
         // spawns until the journal row is inserted. Picking without reserving
@@ -548,14 +573,9 @@ impl Supervisor {
             system_prompt: Some(render(&params.role, &prime_ctx)),
             cwd: worktree.clone(),
             env,
-            // Keep the harness inside its worktree by default. Explicit
-            // per-spawn modes remain available for operators that need them.
-            permission_mode: Some(
-                params
-                    .permission_mode
-                    .clone()
-                    .unwrap_or_else(|| default_permission_mode(&harness_kind).into()),
-            ),
+            // Use the harness-specific default unless an operator supplied an
+            // explicit mode. Codex's default is intentionally socket-capable.
+            permission_mode: Some(permission_mode),
             model: params.model.clone(),
             resume_session: None,
         };
@@ -3049,6 +3069,24 @@ mod respawn_tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn codex_defaults_to_socket_capable_permission_mode() {
+        assert_eq!(default_permission_mode("codex"), "danger-full-access");
+        assert_eq!(default_permission_mode("claude"), "acceptEdits");
+    }
+
+    #[test]
+    fn codex_rejects_permission_modes_that_block_rk_socket() {
+        assert!(validate_permission_mode("codex", "danger-full-access").is_ok());
+        assert!(validate_permission_mode("codex", "bypassPermissions").is_ok());
+        for mode in ["read-only", "workspace-write"] {
+            let error = validate_permission_mode("codex", mode)
+                .expect_err("a restricted Codex sandbox must fail before spawn");
+            assert!(error.to_string().contains("rk daemon socket"));
+        }
+        assert!(validate_permission_mode("fake", "workspace-write").is_ok());
     }
 
     fn record(repo: &Path, branch: Option<&str>) -> AgentRecord {
