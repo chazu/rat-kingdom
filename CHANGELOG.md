@@ -28,9 +28,11 @@ built_).
 - **Authenticated daemon IPC** — require per-layout tokens, restrict agent tuple
   writes and event identities to the authenticated agent, protect the socket
   with mode `0600`, and keep sync provenance separate from local authorization.
-- **Least-privilege execution** — harnesses default to workspace-scoped
-  permissions; workflow approval, named-check, target-allowlist, and definition
-  digest policies are enforced fail-closed.
+- **Role-appropriate execution** — unattended workers receive explicit
+  non-interactive Claude/Codex permissions so Git and Rat Kingdom coordination
+  cannot stall on an approval nobody can answer; onboarding remains forcibly
+  read-only/plan-mode. Workflow approval, named-check, target-allowlist, and
+  definition digest policies remain enforced fail-closed.
 - **Durable recovery** — workflow snapshots are atomic and corruption becomes a
   visible recovery failure; agent allocation is journaled before side effects;
   changed workflow definitions cannot be resumed silently.
@@ -58,6 +60,12 @@ built_).
 - **Reactor performance** — trigger defs cached; per-cycle scan cost bounded.
 
 ### Autonomy — the fleet drives itself
+
+- **Autonomous worker permissions** — global `[agents.default]` harness, model,
+  and permission settings now apply consistently to direct, nested, workflow,
+  and drain spawns. Effective permissions persist across respawn and appear in
+  `rk status`; Claude bypasses permission prompts and Codex bypasses both
+  approvals and the sandbox for ordinary unattended workers.
 
 - **Steward** — on every rat completion the reactor fires a workflow that spawns
   a cheap reviewer on the branch, runs a protected-path **policy gate** and the

@@ -5,6 +5,7 @@ use clap::Args;
 use rk_core::paths::Layout;
 use rk_daemon::Client;
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 
 #[derive(Args)]
 pub struct SpawnArgs {
@@ -36,7 +37,7 @@ pub struct SpawnArgs {
     /// Model override.
     #[arg(long)]
     pub model: Option<String>,
-    /// Harness permission mode (e.g. acceptEdits, bypassPermissions, danger-full-access).
+    /// Harness permission mode (autonomous: bypassPermissions or danger-full-access).
     #[arg(long)]
     pub permission_mode: Option<String>,
     /// Run interactively in a herdr pane (human-attachable).
@@ -493,25 +494,56 @@ pub async fn status(layout: &Layout, args: NameArg, as_json: bool) -> Result<()>
     if as_json {
         println!("{}", result["agent"]);
     } else {
-        let a = &result["agent"];
-        println!(
-            "{}: {}",
-            a["name"].as_str().unwrap_or("?"),
-            a["state"].as_str().unwrap_or("?")
-        );
-        println!("  role     {}", a["role"].as_str().unwrap_or("?"));
-        println!("  harness  {}", a["harness"].as_str().unwrap_or("?"));
-        println!("  repo     {}", a["repo_root"].as_str().unwrap_or("?"));
-        println!("  task     {}", a["task"].as_str().unwrap_or("-"));
-        println!("  branch   {}", a["branch"].as_str().unwrap_or("-"));
-        println!("  session  {}", a["session_id"].as_str().unwrap_or("-"));
-        println!("  tokens   {}", total_tokens(&a["usage"]));
-        println!("  cost     ${:.4}", a["cost_usd"].as_f64().unwrap_or(0.0));
-        if let Some(result_text) = a["result"].as_str() {
-            println!("  result   {result_text}");
-        }
+        print!("{}", format_status(&result["agent"]));
     }
     Ok(())
+}
+
+fn format_status(a: &Value) -> String {
+    let mut text = String::new();
+    writeln!(
+        text,
+        "{}: {}",
+        a["name"].as_str().unwrap_or("?"),
+        a["state"].as_str().unwrap_or("?"),
+    )
+    .unwrap();
+    for (label, value) in [
+        ("role", a["role"].as_str().unwrap_or("?").to_string()),
+        (
+            "harness",
+            a["harness"].as_str().unwrap_or("?").to_string(),
+        ),
+        ("model", a["model"].as_str().unwrap_or("-").to_string()),
+        (
+            "permissions",
+            a["permission_mode"].as_str().unwrap_or("-").to_string(),
+        ),
+        (
+            "repo",
+            a["repo_root"].as_str().unwrap_or("?").to_string(),
+        ),
+        ("task", a["task"].as_str().unwrap_or("-").to_string()),
+        (
+            "branch",
+            a["branch"].as_str().unwrap_or("-").to_string(),
+        ),
+        (
+            "session",
+            a["session_id"].as_str().unwrap_or("-").to_string(),
+        ),
+        ("tokens", total_tokens(&a["usage"]).to_string()),
+        (
+            "cost",
+            format!("${:.4}", a["cost_usd"].as_f64().unwrap_or(0.0)),
+        ),
+    ] {
+        writeln!(text, "  {label:<11} {value}").unwrap();
+    }
+    if let Some(result_text) = a["result"].as_str() {
+        writeln!(text, "  {:<11} {result_text}", "result").unwrap();
+    }
+    text
 }
 
 /// Print an agent's transcript (assistant text, tool calls, retries). With
@@ -869,5 +901,28 @@ mod tests {
     #[test]
     fn json_output_carries_no_prose() {
         assert_eq!(generation_note(&reply(2, 2), "Gouda", true), None);
+    }
+
+    #[test]
+    fn status_shows_effective_model_and_permission_mode() {
+        let rendered = format_status(&json!({
+            "name": "Rizzo",
+            "state": "running",
+            "role": "rat",
+            "harness": "claude",
+            "permission_mode": "bypassPermissions",
+            "model": "sonnet",
+            "repo_root": "/tmp/repo",
+            "task": "research",
+            "branch": "rat/rizzo/research",
+            "session_id": "session",
+            "usage": {},
+            "cost_usd": 0.0,
+        }));
+        assert!(rendered.contains("model       sonnet"), "{rendered}");
+        assert!(
+            rendered.contains("permissions bypassPermissions"),
+            "{rendered}"
+        );
     }
 }

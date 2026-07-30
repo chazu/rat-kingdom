@@ -227,6 +227,7 @@ fn terminal_record(name: &str, created_at: DateTime<Utc>) -> AgentRecord {
         role: "rat".into(),
         coordination: None,
         harness: "fake".into(),
+        permission_mode: None,
         model: None,
         repo_root: "/tmp/repo".into(),
         repo_name: "repo".into(),

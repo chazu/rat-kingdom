@@ -27,7 +27,9 @@ pub struct Config {
     pub evaporation: EvaporationConfig,
     pub policy: PolicyConfig,
     /// Named agent profiles: [agents.<name>] harness/model/permission_mode.
-    /// The "default" profile applies to all spawns that name no profile.
+    /// The "default" profile applies centrally to every ordinary spawn that
+    /// does not override a field, including direct, nested, workflow, and drain
+    /// dispatch. Onboarders keep their daemon-enforced restricted policy.
     pub agents: std::collections::HashMap<String, AgentProfileConfig>,
     /// Cost-tier routing: map ticket labels/priority to an agent-profile name.
     /// Drives fan-out spawns onto cheap or premium tiers so a fixed budget runs

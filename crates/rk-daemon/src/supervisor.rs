@@ -14,7 +14,7 @@ use rk_harness::{make_harness, HarnessEvent, LaunchSpec, SessionControl, TokenUs
 use rk_ledger::pricing::PricingTable;
 use rk_ledger::{Budget, BudgetAction, BudgetScope, DispatchCheck, FleetBudget};
 use rk_space::Space;
-use rk_workflow::Coordination;
+use rk_workflow::{AgentProfile, Coordination};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -26,13 +26,83 @@ const MIN_PROGRESS_INTERVAL: chrono::Duration = chrono::Duration::seconds(5);
 
 fn default_permission_mode(harness: &str) -> &'static str {
     match harness {
-        "claude" => "acceptEdits",
+        // Workers are unattended. A mode that still asks about Bash commands
+        // strands git/rk operations because no human is attached to approve.
+        "claude" => "bypassPermissions",
         // A rat's coordination contract includes `rk done`, tuple writes, and
         // ticket operations. Codex's workspace-write sandbox blocks the Unix
         // socket outside the worktree, so it cannot satisfy that contract.
         "codex" => "danger-full-access",
         _ => "workspace-write",
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct EffectiveAgentConfig {
+    harness: String,
+    model: Option<String>,
+    permission_mode: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AgentDefaults {
+    harness: String,
+    profile: AgentProfile,
+}
+
+impl AgentDefaults {
+    pub(crate) fn new(harness: String, profile: AgentProfile) -> Self {
+        Self { harness, profile }
+    }
+}
+
+fn effective_agent_config(
+    default_harness: &str,
+    default_agent: &AgentProfile,
+    params: &SpawnParams,
+) -> rk_core::Result<EffectiveAgentConfig> {
+    // Onboarding is an assessment boundary: global worker defaults must never
+    // widen it. Explicit harness/model selection remains available, while the
+    // permission mode is forced by role.
+    if params.role == ONBOARDER_ROLE {
+        let harness = params
+            .harness
+            .clone()
+            .unwrap_or_else(|| default_harness.to_string());
+        return Ok(EffectiveAgentConfig {
+            permission_mode: permission_mode(&params.role, &harness)?,
+            harness,
+            model: params.model.clone(),
+        });
+    }
+
+    let harness = params
+        .harness
+        .clone()
+        .or_else(|| default_agent.harness.clone())
+        .unwrap_or_else(|| default_harness.to_string());
+    let mode = params
+        .permission_mode
+        .clone()
+        .or_else(|| default_agent.permission_mode.clone())
+        .unwrap_or_else(|| default_permission_mode(&harness).into());
+    validate_permission_mode(&harness, &mode)?;
+    Ok(EffectiveAgentConfig {
+        harness,
+        model: params
+            .model
+            .clone()
+            .or_else(|| default_agent.model.clone()),
+        permission_mode: mode,
+    })
+}
+
+fn respawn_permission_mode(record: &AgentRecord) -> rk_core::Result<String> {
+    record
+        .permission_mode
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| permission_mode(&record.role, &record.harness))
 }
 
 fn validate_permission_mode(harness: &str, permission_mode: &str) -> rk_core::Result<()> {
@@ -102,6 +172,8 @@ struct SpawnJournal<'a> {
     worktree: PathBuf,
     target_branch: String,
     harness: String,
+    model: Option<String>,
+    permission_mode: String,
 }
 
 fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
@@ -111,7 +183,8 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
         role: journal.params.role.clone(),
         coordination: journal.params.coordination.clone(),
         harness: journal.harness,
-        model: journal.params.model.clone(),
+        permission_mode: Some(journal.permission_mode),
+        model: journal.model,
         repo_root: journal.repo.root().to_path_buf(),
         repo_name: journal.repo_name.to_string(),
         task: Some(journal.params.task.clone()),
@@ -226,6 +299,7 @@ pub struct Supervisor {
     layout: Layout,
     castle: String,
     default_harness: String,
+    default_agent: AgentProfile,
     registry: Mutex<Registry>,
     /// Live control handles (not persisted; gone after restart).
     controls: Mutex<HashMap<String, SessionControl>>,
@@ -418,6 +492,26 @@ impl Supervisor {
         space: Space,
         tickets: Arc<crate::tickets::Tickets>,
     ) -> rk_core::Result<Self> {
+        Self::new_with_agent_defaults(
+            layout,
+            castle,
+            AgentDefaults::new(default_harness, AgentProfile::default()),
+            budget,
+            fleet_budget,
+            space,
+            tickets,
+        )
+    }
+
+    pub(crate) fn new_with_agent_defaults(
+        layout: Layout,
+        castle: String,
+        defaults: AgentDefaults,
+        budget: Budget,
+        fleet_budget: FleetBudget,
+        space: Space,
+        tickets: Arc<crate::tickets::Tickets>,
+    ) -> rk_core::Result<Self> {
         let registry = Registry::load(&layout.home().join("agents.json"))?;
         let mut pricing = PricingTable::vendored();
         // User/runtime overrides, LiteLLM-shaped.
@@ -432,7 +526,8 @@ impl Supervisor {
         Ok(Self {
             layout,
             castle,
-            default_harness,
+            default_harness: defaults.harness,
+            default_agent: defaults.profile,
             registry: Mutex::new(registry),
             controls: Mutex::new(HashMap::new()),
             space,
@@ -536,21 +631,9 @@ impl Supervisor {
         // Resolve the harness before journaling so an unknown adapter never
         // leaves a durable failed row. After this point every side effect has a
         // registry record to explain it, including a worktree or launch failure.
-        let harness_kind = params
-            .harness
-            .clone()
-            .unwrap_or_else(|| self.default_harness.clone());
-        let harness = make_harness(&harness_kind)?;
-        let enforced_permission_mode = if params.role == ONBOARDER_ROLE {
-            permission_mode(&params.role, &harness_kind)?
-        } else {
-            let mode = params
-                .permission_mode
-                .clone()
-                .unwrap_or(permission_mode(&params.role, &harness_kind)?);
-            validate_permission_mode(&harness_kind, &mode)?;
-            mode
-        };
+        let effective =
+            effective_agent_config(&self.default_harness, &self.default_agent, &params)?;
+        let harness = make_harness(&effective.harness)?;
 
         // Reserve the name atomically: it stays claimed against concurrent
         // spawns until the journal row is inserted. Picking without reserving
@@ -587,7 +670,9 @@ impl Supervisor {
             branch: branch.clone(),
             worktree: worktree.clone(),
             target_branch: target_branch.clone(),
-            harness: harness_kind.clone(),
+            harness: effective.harness.clone(),
+            model: effective.model.clone(),
+            permission_mode: effective.permission_mode.clone(),
         });
         if let Err(e) = self.lock_registry().insert(spawning) {
             self.lock_registry().release_name(&name);
@@ -631,11 +716,11 @@ impl Supervisor {
             system_prompt: Some(render(&params.role, &prime_ctx)),
             cwd: worktree.clone(),
             env,
-            // Keep the harness inside its worktree by default. Explicit
-            // per-spawn modes remain available for operators that need them;
-            // Codex defaults to the socket-capable mode.
-            permission_mode: Some(enforced_permission_mode),
-            model: params.model.clone(),
+            // Ordinary workers must run unattended; onboarding's restricted
+            // mode was enforced during effective config resolution above.
+            // Persist this exact value so respawn cannot silently narrow it.
+            permission_mode: Some(effective.permission_mode),
+            model: effective.model,
             resume_session: None,
         };
 
@@ -648,6 +733,7 @@ impl Supervisor {
                 branch,
                 worktree,
                 target_branch,
+                effective.harness,
                 spec,
             );
         }
@@ -722,6 +808,7 @@ impl Supervisor {
         branch: String,
         worktree: std::path::PathBuf,
         target_branch: String,
+        harness_kind: String,
         spec: LaunchSpec,
     ) -> rk_core::Result<AgentRecord> {
         if !rk_mux::HerdrMux::available() {
@@ -734,10 +821,6 @@ impl Supervisor {
             self.mark_spawn_failed(&name, &error);
             return Err(error);
         }
-        let harness_kind = params
-            .harness
-            .clone()
-            .unwrap_or_else(|| self.default_harness.clone());
         let argv = match rk_mux::interactive_argv(
             &harness_kind,
             spec.system_prompt.as_deref(),
@@ -958,8 +1041,8 @@ impl Supervisor {
             system_prompt: Some(render(&record.role, &prime_ctx)),
             cwd: worktree.clone(),
             env,
-            permission_mode: Some(permission_mode(&record.role, &record.harness)?),
-            model: None,
+            permission_mode: Some(respawn_permission_mode(&record)?),
+            model: record.model.clone(),
             resume_session: resume,
         };
         if attach {
@@ -3455,7 +3538,68 @@ mod respawn_tests {
     #[test]
     fn codex_defaults_to_socket_capable_permission_mode() {
         assert_eq!(default_permission_mode("codex"), "danger-full-access");
-        assert_eq!(default_permission_mode("claude"), "acceptEdits");
+        assert_eq!(default_permission_mode("claude"), "bypassPermissions");
+    }
+
+    #[test]
+    fn global_default_profile_applies_to_direct_workers_but_not_onboarders() {
+        let profile = AgentProfile {
+            harness: Some("codex".into()),
+            model: Some("gpt-test".into()),
+            permission_mode: Some("danger-full-access".into()),
+        };
+        let mut params = SpawnParams {
+            repo: "/tmp/repo".into(),
+            task: "task".into(),
+            prompt: None,
+            role: "rat".into(),
+            coordination: None,
+            harness: None,
+            parent: None,
+            base: None,
+            model: None,
+            permission_mode: None,
+            attach: false,
+            workflow_instance: None,
+            coordinator: None,
+            instance_max_usd: None,
+        };
+
+        let worker = effective_agent_config("claude", &profile, &params).unwrap();
+        assert_eq!(worker.harness, "codex");
+        assert_eq!(worker.model.as_deref(), Some("gpt-test"));
+        assert_eq!(worker.permission_mode, "danger-full-access");
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let repo = Repo::discover(repo_dir.path()).unwrap();
+        let record = spawning_record(SpawnJournal {
+            params: &params,
+            repo: &repo,
+            repo_name: "repo",
+            name: "Nibble".into(),
+            branch: "rat/nibble/task".into(),
+            worktree: repo_dir.path().join("worktree"),
+            target_branch: "main".into(),
+            harness: worker.harness,
+            model: worker.model,
+            permission_mode: worker.permission_mode,
+        });
+        assert_eq!(record.model.as_deref(), Some("gpt-test"));
+        assert_eq!(
+            record.permission_mode.as_deref(),
+            Some("danger-full-access")
+        );
+        assert_eq!(
+            respawn_permission_mode(&record).unwrap(),
+            "danger-full-access"
+        );
+
+        params.role = ONBOARDER_ROLE.into();
+        let onboarder = effective_agent_config("claude", &profile, &params).unwrap();
+        assert_eq!(onboarder.harness, "claude");
+        assert_eq!(onboarder.model, None);
+        assert_eq!(onboarder.permission_mode, "plan");
     }
 
     #[test]
@@ -3497,6 +3641,7 @@ mod respawn_tests {
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),
+            permission_mode: None,
             model: None,
             repo_root: repo.to_path_buf(),
             repo_name: "repo".into(),

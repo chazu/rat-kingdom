@@ -166,9 +166,15 @@ pub fn interactive_argv(
                 argv.push("--model".into());
                 argv.push(model.into());
             }
-            if let Some(mode) = permission_mode {
-                argv.push("--permission-mode".into());
-                argv.push(mode.into());
+            match permission_mode {
+                Some("bypassPermissions") | Some("danger-full-access") => {
+                    argv.push("--dangerously-skip-permissions".into());
+                }
+                Some(mode) => {
+                    argv.push("--permission-mode".into());
+                    argv.push(mode.into());
+                }
+                None => {}
             }
         }
         "codex" => {
@@ -176,14 +182,17 @@ pub fn interactive_argv(
                 argv.push("-m".into());
                 argv.push(model.into());
             }
-            let sandbox = match permission_mode {
-                Some("read-only") => "read-only",
-                Some("workspace-write") => "workspace-write",
-                Some("bypassPermissions") | Some("danger-full-access") => "danger-full-access",
-                _ => "danger-full-access",
-            };
-            argv.push("--sandbox".into());
-            argv.push(sandbox.into());
+            match permission_mode {
+                Some("read-only") => {
+                    argv.push("--sandbox".into());
+                    argv.push("read-only".into());
+                }
+                Some("workspace-write") => {
+                    argv.push("--sandbox".into());
+                    argv.push("workspace-write".into());
+                }
+                _ => argv.push("--dangerously-bypass-approvals-and-sandbox".into()),
+            }
         }
         _ => unreachable!(),
     }
@@ -206,7 +215,17 @@ mod tests {
 
         let codex = interactive_argv("codex", None, Some("gpt-5.5-codex"), None).unwrap();
         assert_eq!(codex[0], "codex");
-        assert!(codex.contains(&"danger-full-access".to_string()));
+        assert!(codex.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+
+        let claude = interactive_argv(
+            "claude",
+            None,
+            None,
+            Some("bypassPermissions"),
+        )
+        .unwrap();
+        assert!(claude.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(!claude.contains(&"--permission-mode".to_string()));
 
         assert!(interactive_argv("axe", None, None, None).is_err());
     }

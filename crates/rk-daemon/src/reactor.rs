@@ -1299,6 +1299,7 @@ mod tests {
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),
+            permission_mode: None,
             model: None,
             repo_root: std::path::PathBuf::from("/tmp"),
             repo_name: repo.into(),

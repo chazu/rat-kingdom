@@ -670,6 +670,7 @@ mod tests {
                 descendant_policy: "rollup".into(),
             }),
             harness: "fake".into(),
+            permission_mode: None,
             model: None,
             repo_root: PathBuf::from("/tmp/repo"),
             repo_name: "repo".into(),

@@ -125,6 +125,21 @@ impl Daemon {
     pub fn new(layout: Layout, config: &rk_core::config::Config) -> rk_core::Result<Self> {
         layout.ensure()?;
         let space = Space::open(&layout.db_path())?;
+        let global_agents: HashMap<String, rk_workflow::AgentProfile> = config
+            .agents
+            .iter()
+            .map(|(name, p)| {
+                (
+                    name.clone(),
+                    rk_workflow::AgentProfile {
+                        harness: p.harness.clone(),
+                        model: p.model.clone(),
+                        permission_mode: p.permission_mode.clone(),
+                    },
+                )
+            })
+            .collect();
+        let default_agent = global_agents.get("default").cloned().unwrap_or_default();
         let budget = rk_ledger::Budget {
             max_usd: config.budget.max_usd,
             max_tokens: config.budget.max_tokens,
@@ -146,29 +161,17 @@ impl Daemon {
         let display =
             rk_core::identity::CastleDisplay::new(actor.clone(), config.castle_name.clone());
         let castle_display = display.own().to_string();
-        let mut daemon = Self::with_space(
+        let mut daemon = Self::with_space_and_default_agent(
             layout,
             actor,
             config.harness.default.clone(),
+            default_agent,
             budget,
             fleet_budget,
             space,
         )?;
         daemon.castle_display = castle_display;
-        daemon.global_agents = config
-            .agents
-            .iter()
-            .map(|(name, p)| {
-                (
-                    name.clone(),
-                    rk_workflow::AgentProfile {
-                        harness: p.harness.clone(),
-                        model: p.model.clone(),
-                        permission_mode: p.permission_mode.clone(),
-                    },
-                )
-            })
-            .collect();
+        daemon.global_agents = global_agents;
         daemon.tier_routing = rk_workflow::TierRouting {
             rules: config
                 .tiers
@@ -276,15 +279,35 @@ impl Daemon {
         fleet_budget: rk_ledger::FleetBudget,
         space: Space,
     ) -> rk_core::Result<Self> {
+        Self::with_space_and_default_agent(
+            layout,
+            castle,
+            default_harness,
+            rk_workflow::AgentProfile::default(),
+            budget,
+            fleet_budget,
+            space,
+        )
+    }
+
+    fn with_space_and_default_agent(
+        layout: Layout,
+        castle: String,
+        default_harness: String,
+        default_agent: rk_workflow::AgentProfile,
+        budget: rk_ledger::Budget,
+        fleet_budget: rk_ledger::FleetBudget,
+        space: Space,
+    ) -> rk_core::Result<Self> {
         layout.ensure()?;
         let auth_token = layout.auth_token()?;
         // One Tickets instance, shared by the RPC handlers and the supervisor,
         // so ticket-lifecycle writes serialize on a single lock.
         let tickets = Arc::new(crate::tickets::Tickets::new(space.clone(), castle.clone()));
-        let supervisor = Arc::new(crate::supervisor::Supervisor::new(
+        let supervisor = Arc::new(crate::supervisor::Supervisor::new_with_agent_defaults(
             layout.clone(),
             castle.clone(),
-            default_harness.clone(),
+            crate::supervisor::AgentDefaults::new(default_harness.clone(), default_agent),
             budget,
             fleet_budget,
             space.clone(),
@@ -4385,6 +4408,76 @@ mod agent_fact_authorisation_tests {
             raw.error.as_ref().map(|error| error.code.as_str()),
             Some(codes::FORBIDDEN)
         );
+    }
+}
+
+#[cfg(test)]
+mod default_agent_profile_tests {
+    use super::*;
+    use rk_core::config::AgentProfileConfig;
+    use std::process::Command;
+
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn config_default_profile_reaches_a_direct_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "rat@example.com"]);
+        git(&repo, &["config", "user.name", "Rat"]);
+        std::fs::write(repo.join("README.md"), "test\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "initial"]);
+
+        let mut config = rk_core::config::Config::default();
+        config.harness.default = "claude".into();
+        config.agents.insert(
+            "default".into(),
+            AgentProfileConfig {
+                harness: Some("fake".into()),
+                model: Some("profile-model".into()),
+                permission_mode: Some("workspace-write".into()),
+            },
+        );
+        let daemon = Daemon::new(Layout::at(dir.path().join("rk-home")), &config).unwrap();
+        let record = daemon
+            .supervisor
+            .spawn_async(crate::supervisor::SpawnParams {
+                repo: repo.display().to_string(),
+                task: "direct-defaults".into(),
+                prompt: Some("finish".into()),
+                role: "rat".into(),
+                coordination: None,
+                harness: None,
+                parent: None,
+                base: None,
+                model: None,
+                permission_mode: None,
+                attach: false,
+                workflow_instance: None,
+                coordinator: None,
+                instance_max_usd: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(record.harness, "fake");
+        assert_eq!(record.model.as_deref(), Some("profile-model"));
+        assert_eq!(record.permission_mode.as_deref(), Some("workspace-write"));
     }
 }
 

@@ -18,18 +18,20 @@ use tokio::sync::mpsc;
 
 pub struct CodexHarness;
 
-fn sandbox_mode(permission_mode: Option<&str>) -> &'static str {
+fn permission_args(permission_mode: Option<&str>) -> Vec<String> {
     match permission_mode {
-        Some("read-only") => "read-only",
-        Some("workspace-write") => "workspace-write",
-        // Claude's workflow vocabulary uses bypassPermissions; map it to the
-        // Codex equivalent instead of silently narrowing it to workspace-write.
-        Some("bypassPermissions") | Some("danger-full-access") => "danger-full-access",
-        // Rat Kingdom agents must reach the daemon's Unix socket at RK_HOME;
-        // that path is outside their worktree and is blocked by Codex's
-        // workspace-write sandbox. The supervisor rejects restricted explicit
-        // modes, and this adapter default keeps direct LaunchSpec callers safe.
-        _ => "danger-full-access",
+        Some("read-only") => vec!["--sandbox".into(), "read-only".into()],
+        Some("workspace-write") => vec!["--sandbox".into(), "workspace-write".into()],
+        // The worker contract is non-interactive: a command that needs human
+        // approval cannot complete, and the daemon socket sits outside the
+        // worktree sandbox. Keep approval and sandbox bypass explicit rather
+        // than relying on `codex exec` defaults or user configuration.
+        Some("bypassPermissions") | Some("danger-full-access") | None => {
+            vec!["--dangerously-bypass-approvals-and-sandbox".into()]
+        }
+        // The supervisor rejects unsupported modes. Direct LaunchSpec callers
+        // retain the old full-access fallback instead of silently narrowing.
+        Some(_) => vec!["--dangerously-bypass-approvals-and-sandbox".into()],
     }
 }
 
@@ -54,10 +56,8 @@ impl Harness for CodexHarness {
         if let Some(session) = &spec.resume_session {
             cmd.args(["resume", session]);
         }
-        // permission_mode maps to codex --sandbox. Rat Kingdom's default must
-        // include access to the daemon socket outside the worktree.
-        let sandbox = sandbox_mode(spec.permission_mode.as_deref());
-        cmd.args(["--json", "--skip-git-repo-check", "--sandbox", sandbox]);
+        cmd.args(["--json", "--skip-git-repo-check"]);
+        cmd.args(permission_args(spec.permission_mode.as_deref()));
         if let Some(model) = &spec.model {
             cmd.args(["-m", model]);
         }
@@ -208,18 +208,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn permission_modes_map_to_codex_sandbox_modes() {
-        assert_eq!(sandbox_mode(Some("read-only")), "read-only");
-        assert_eq!(sandbox_mode(Some("workspace-write")), "workspace-write");
+    fn autonomous_modes_bypass_codex_approvals_and_sandbox() {
+        for mode in [None, Some("bypassPermissions"), Some("danger-full-access")] {
+            assert_eq!(
+                permission_args(mode),
+                vec!["--dangerously-bypass-approvals-and-sandbox"]
+            );
+        }
         assert_eq!(
-            sandbox_mode(Some("bypassPermissions")),
-            "danger-full-access"
+            permission_args(Some("read-only")),
+            vec!["--sandbox", "read-only"]
         );
-        assert_eq!(
-            sandbox_mode(Some("danger-full-access")),
-            "danger-full-access"
-        );
-        assert_eq!(sandbox_mode(None), "danger-full-access");
     }
 
     #[test]

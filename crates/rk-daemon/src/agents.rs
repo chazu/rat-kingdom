@@ -49,6 +49,10 @@ pub struct AgentRecord {
     #[serde(default)]
     pub coordination: Option<Coordination>,
     pub harness: String,
+    /// Effective permission mode used for this generation. Older records omit
+    /// it and respawn falls back to the harness-specific worker default.
+    #[serde(default)]
+    pub permission_mode: Option<String>,
     /// Model requested at spawn (None = harness default; pricing then relies
     /// on harness-reported cost only).
     #[serde(default)]
@@ -542,6 +546,7 @@ mod tests {
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),
+            permission_mode: None,
             model: None,
             repo_root: "/tmp/repo".into(),
             repo_name: "repo".into(),

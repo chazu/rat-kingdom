@@ -103,12 +103,19 @@ them (`--reap-git --reap-logs`) when you want everything reclaimed.
 
 Spawn options: `--harness claude|codex|axe|fake`, `--model`, `--role
 rat|reviewer`, `--base <branch>`, `--parent <agent>` (completion routing),
-`--permission-mode`, `--no-merge` on dismiss, `--attach` (below).
+`--permission-mode`, `--no-merge` on dismiss, `--attach` (below). `rk status`
+shows the effective harness, model, and permission mode recorded for the
+generation.
 
-Codex rats default to `danger-full-access` because the Rat Kingdom coordination
-socket lives under `RK_HOME`, outside the agent worktree. Codex
-`read-only`/`workspace-write` overrides are rejected before launch because
-they cannot run `rk done` or other coordination commands.
+Ordinary workers are unattended, so Claude defaults to `bypassPermissions` and
+Codex defaults to `danger-full-access`. The adapters make those modes explicit:
+Claude receives `--dangerously-skip-permissions`; Codex receives
+`--dangerously-bypass-approvals-and-sandbox`. A command that waits for human
+approval cannot complete in a headless worker, and Codex also needs access to
+the Rat Kingdom socket under `RK_HOME`, outside the agent worktree. Codex
+`read-only`/`workspace-write` worker overrides are therefore rejected before
+launch. Onboarders are the exception: the daemon always forces Claude `plan` or
+Codex `read-only`, regardless of worker defaults.
 
 Workflow runs can opt into a stable coordinator ownership scope with
 `rk workflow run <name> --coordinator <session-id>`. The coordinator can then
@@ -404,6 +411,8 @@ default = "claude"               # harness when nothing else specifies
 [agents.default]                 # global default agent profile
 harness = "claude"
 model = "sonnet"
+permission_mode = "bypassPermissions" # optional; applies to every ordinary
+                                      # direct/workflow/nested/drain spawn
 
 [agents.cheap]                   # named profiles, referenced by spawns/workflows
 harness = "codex"
@@ -482,6 +491,10 @@ default_merge_mode = "direct"    # fleet-wide fallback for repos registered
                                  # request for review (see docs/pr-merge-mode.md).
                                  # A repo's own --merge-mode always overrides this.
 ```
+
+Configuration is loaded when the daemon starts. After editing
+`~/.rat-kingdom/config.toml`, restart the daemon (or run `mise run deploy` when
+installing new source) before expecting new spawns to use it.
 
 Env: `RK_HOME` (state dir), `RK_LOG` (tracing filter), `RK_CONFIG_*`
 (config overrides, e.g. `RK_CONFIG_BUDGET_MAX_USD=2`). Plain `RK_*` names
@@ -586,7 +599,10 @@ workflow: {
   overrides → the tier a routing rule picked from the ticket's labels/priority
   (`[tiers]` / workflow `tiers:`) → step's named profile (workflow `agents`, then
   global `[agents.<name>]`) → workflow `agents.default` → global `[agents.default]`
-  → `[harness] default`. Unknown profile/tier names are errors.
+  → `[harness] default`. The global default profile is also resolved centrally
+  for direct and nested `rk spawn` calls and continuous-drain dispatches, so
+  those paths cannot silently fall back to different permissions. Unknown
+  profile/tier names are errors.
 - Spawn steps inside a workflow base their worktrees on the previous agent's
   branch (`ctx.activeBranch`), which is how a reviewer sees the rat's work.
 - **Per-instance budget**: add `budget: {max_usd: 2.5}` to a workflow to cap the

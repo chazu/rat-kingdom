@@ -11,6 +11,16 @@ use tokio::process::Command;
 
 pub struct ClaudeHarness;
 
+fn permission_args(permission_mode: Option<&str>) -> Vec<String> {
+    match permission_mode {
+        Some("bypassPermissions") | Some("danger-full-access") => {
+            vec!["--dangerously-skip-permissions".into()]
+        }
+        Some(mode) => vec!["--permission-mode".into(), mode.into()],
+        None => Vec::new(),
+    }
+}
+
 impl Harness for ClaudeHarness {
     fn kind(&self) -> &'static str {
         "claude"
@@ -39,9 +49,7 @@ impl Harness for ClaudeHarness {
         if let Some(system) = &spec.system_prompt {
             cmd.args(["--append-system-prompt", system]);
         }
-        if let Some(mode) = &spec.permission_mode {
-            cmd.args(["--permission-mode", mode]);
-        }
+        cmd.args(permission_args(spec.permission_mode.as_deref()));
         if let Some(model) = &spec.model {
             cmd.args(["--model", model]);
         }
@@ -219,5 +227,19 @@ mod tests {
             "please also run the tests"
         );
         assert!(!line.contains('\n'), "must be a single line");
+    }
+
+    #[test]
+    fn autonomous_modes_bypass_all_claude_permission_checks() {
+        for mode in ["bypassPermissions", "danger-full-access"] {
+            assert_eq!(
+                permission_args(Some(mode)),
+                vec!["--dangerously-skip-permissions"]
+            );
+        }
+        assert_eq!(
+            permission_args(Some("acceptEdits")),
+            vec!["--permission-mode", "acceptEdits"]
+        );
     }
 }

@@ -787,6 +787,7 @@ mod tests {
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),
+            permission_mode: None,
             model: None,
             repo_root: "/tmp/repo".into(),
             repo_name: "repo".into(),
