@@ -141,10 +141,15 @@ enum Command {
     /// Print role instructions for the system. Defaults to the `operator` role
     /// unless RK_ROLE (set on spawned rats) indicates otherwise.
     Prime {
-        /// Role to render: operator | rat | reviewer | foreman | verifier | onboarder. Overrides RK_ROLE.
+        /// Role to render: operator | onboarding | rat | reviewer | foreman | verifier | onboarder. Overrides RK_ROLE.
         #[arg(long)]
         role: Option<String>,
     },
+    /// Prime this operator session to guide repository onboarding with the user.
+    ///
+    /// Exact sugar for `rk prime --role onboarding`; prints context only and
+    /// does not launch an agent or mutate repository state.
+    Onboard,
     /// Register and inspect repositories the system knows about.
     Repo {
         #[command(subcommand)]
@@ -578,6 +583,44 @@ async fn decide(
     Ok(())
 }
 
+const PRIME_ROLES: [&str; 7] = [
+    "operator",
+    "onboarding",
+    "rat",
+    "reviewer",
+    "foreman",
+    "verifier",
+    "onboarder",
+];
+
+fn print_prime(role: String, json_output: bool) -> Result<()> {
+    if !PRIME_ROLES.contains(&role.as_str()) {
+        anyhow::bail!(
+            "unknown role '{role}' (expected: {})",
+            PRIME_ROLES.join(", ")
+        );
+    }
+    let ctx = rk_core::prime::PrimeContext {
+        agent: std::env::var("RK_AGENT").unwrap_or_default(),
+        repo: std::env::var("RK_REPO").unwrap_or_default(),
+        task: std::env::var("RK_TASK").ok(),
+        branch: std::env::var("RK_BRANCH").ok(),
+        parent: std::env::var("RK_PARENT").ok(),
+        facts: Vec::new(),
+        // `rk prime` inspects the template shape; live conventions are scanned
+        // and injected by the supervisor at spawn time.
+        conventions: Vec::new(),
+        verification_checks: Vec::new(),
+    };
+    let text = rk_core::prime::render(&role, &ctx);
+    if json_output {
+        println!("{}", json!({ "role": role, "prime": text }));
+    } else {
+        print!("{text}");
+    }
+    Ok(())
+}
+
 fn init_tracing(config: &Config) {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_env("RK_LOG")
@@ -963,29 +1006,9 @@ async fn main() -> Result<()> {
             let role = role
                 .or_else(|| std::env::var("RK_ROLE").ok())
                 .unwrap_or_else(|| "operator".to_string());
-            const ROLES: [&str; 3] = ["operator", "rat", "reviewer"];
-            if !ROLES.contains(&role.as_str()) {
-                anyhow::bail!("unknown role '{role}' (expected: {})", ROLES.join(", "));
-            }
-            let ctx = rk_core::prime::PrimeContext {
-                agent: std::env::var("RK_AGENT").unwrap_or_default(),
-                repo: std::env::var("RK_REPO").unwrap_or_default(),
-                task: std::env::var("RK_TASK").ok(),
-                branch: std::env::var("RK_BRANCH").ok(),
-                parent: std::env::var("RK_PARENT").ok(),
-                facts: Vec::new(),
-                // `rk prime` inspects the template shape; live conventions are
-                // scanned and injected by the supervisor at spawn time.
-                conventions: Vec::new(),
-                verification_checks: Vec::new(),
-            };
-            let text = rk_core::prime::render(&role, &ctx);
-            if cli.json {
-                println!("{}", json!({ "role": role, "prime": text }));
-            } else {
-                print!("{text}");
-            }
+            print_prime(role, cli.json)?;
         }
+        Command::Onboard => print_prime("onboarding".into(), cli.json)?,
         Command::Repo { command } => match command {
             RepoCommand::Add {
                 path,

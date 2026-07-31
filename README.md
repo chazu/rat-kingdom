@@ -255,6 +255,11 @@ rk repo onboard cleanup onb-...        # remove terminal clean worktree; retain 
 A registered name works anywhere a repo is expected, e.g. `rk spawn --repo rat-kingdom`.
 
 For the operator walkthrough, see [Repository onboarding](docs/repo-onboarding.md).
+Run `rk onboard` in the main operator agent to load that guided, gate-first
+walkthrough context. It is exact sugar for `rk prime --role onboarding`: it
+prints instructions only and does not launch an assessor, create a durable
+session, or mutate repository state. The existing `rk repo onboard start`
+command remains the legacy spawned-assessor path.
 
 `repo onboard inspect` resolves either a path or registered name, then reports
 canonical identity, git/remote/base state, repository instructions, documented

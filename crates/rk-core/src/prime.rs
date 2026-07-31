@@ -160,6 +160,96 @@ conversation.
 Inspect what a worker is told with `rk prime --role rat` or `--role reviewer`.
 ";
 
+const FRAGMENT_ONBOARDING: &str = "\
+# Guided repository onboarding
+
+This is a guided repository onboarding led by the main Rat Kingdom operator
+session together with the user. It is not an ordinary worker task and does not
+create a special onboarding agent. Establish evidence before recommendations,
+walk through decisions one at a time, and never treat a proposal as approval.
+
+## 1. Establish the repository and user intent
+
+- Ask which repository should be onboarded and what successful use of Rat
+  Kingdom should enable there.
+- Run `rk repo onboard inspect <path-or-name>` before proposing changes. Treat
+  its observed evidence as authoritative; call out inferred commands and
+  unresolved ambiguity.
+- Inspect the repository's own instructions, task runner, CI configuration,
+  toolchain pins, Git/base/remote conventions, and existing `.rk` files.
+- Preserve the user's checkout and unrelated changes. Do not mutate repository
+  or castle state until the user explicitly approves the exact change.
+
+## 2. Verification contract — the first onboarding priority
+
+Before proposing agents, workflows, triggers, schedules, or continuous drain,
+establish how the repository proves work is safe to land. Answer explicitly:
+
+1. What is the canonical full verification gate?
+2. What faster checks should an implementer run while working?
+3. What exact runner and pinned toolchain execute each check?
+4. What working directory, expected exit status, timeout, environment, network,
+   services, secrets, and generated files does each check require?
+5. How can an operator make sure the gate is passing on the exact revision to
+   be landed?
+6. Where should a new feature add or extend its validation gate?
+
+The executable implementation belongs in the repository's normal runner
+(`mise.toml`, Makefile, justfile, package scripts, or equivalent). The trusted
+RK registry belongs in `<repo>/.rk/checks.cue`. Workflow `run` steps reference
+checks by name; do not copy raw project commands into workflow definitions.
+
+Prefer one complete named check called `verify` as the canonical aggregate
+gate. It must declare an exact command, working directory, expected exit,
+timeout, environment policy (`inherit` or `strip_rk_spawn`), and toolchain.
+Feature work should normally extend the repository's aggregate `verify` task.
+Add a separate named check only when it has meaningfully different scope,
+cost, prerequisites, or workflow routing.
+
+Show the user the proposed check contract and how it was derived. Validate its
+CUE schema and run the exact approved command in an isolated onboarding
+worktree. A timeout, spawn failure, mismatched exit, unavailable dependency, or
+unverified inference is a red gate, not a warning to waive. Record exact
+results and remaining risks.
+
+Offer `[policy] require_named_checks = true` separately. It makes workflows
+fail closed when they carry raw commands instead of repository-owned named
+checks. Enabling castle policy is a distinct approval from adding a repository
+check.
+
+## 3. Automation and agent readiness
+
+Only after the verification contract is understood and green:
+
+- Explain which workflows consume each named check and where the check sits
+  before landing or opening a pull request.
+- Inspect proposed workflow, trigger, schedule, harness, permission, Git, and
+  merge-mode settings. Present independent changes as independent decisions.
+- Prove that a normal agent receives the named checks in its priming, can use
+  the repository's pinned runner, and can reach Rat Kingdom coordination.
+- Keep staging, verification, landing, and activation separate. A validated
+  file in an onboarding worktree is not active automation.
+
+## 4. Human checkpoints and completion
+
+Before each mutation, show the evidence, exact diff or config value, operational
+risk, verification plan, and rollback. Wait for explicit approval. Never
+approve a proposal, activate automation, or broaden permissions merely because
+the change seems conventional.
+
+Finish with a concise verification playbook containing:
+
+- canonical `verify` command and complete contract;
+- component/feature checks and when to use them;
+- workflows that enforce each check;
+- how to run and diagnose a red gate;
+- the exact recipe for adding validation for a new feature;
+- accepted, declined, failed, and unresolved onboarding decisions.
+
+The repository is not automation-ready while its canonical gate is absent,
+ambiguous, invalid, red, or unused by its landing workflow.
+";
+
 const FRAGMENT_TICKETS: &str = "\
 ## Tickets: durable work items
 
@@ -389,13 +479,20 @@ fn render_verification_checks(checks: &[VerificationCheck]) -> Option<String> {
 
 /// Render role instructions. Roles: "operator" (the human's dispatcher — the
 /// default when no role is otherwise indicated), "rat" (directed worker),
-/// "reviewer", "foreman", "verifier", and "onboarder". The operator role
-/// addresses a session driving the fleet from the outside; the others address
-/// a spawned worker and are personalized from `ctx`. Spawn rejects roles
-/// outside this vocabulary before rendering.
+/// "reviewer", "foreman", "verifier", and "onboarder", plus the operator-side
+/// "onboarding" specialization. Operator/onboarding address a session driving
+/// the fleet from the outside; the others address a spawned worker and are
+/// personalized from `ctx`. Spawn rejects roles outside its worker vocabulary
+/// before rendering.
 pub fn render(role: &str, ctx: &PrimeContext) -> String {
     if role == "operator" {
         return FRAGMENT_OPERATOR.to_string();
+    }
+    if role == "onboarding" {
+        let mut out = FRAGMENT_OPERATOR.to_string();
+        out.push('\n');
+        out.push_str(FRAGMENT_ONBOARDING);
+        return out;
     }
     let mut out = String::new();
     let _ = writeln!(
@@ -865,5 +962,32 @@ mod tests {
         assert!(!text.contains("MANDATORY final step"));
         // The operator ignores its ctx (no personalized worker header).
         assert!(!text.contains("You are Whisker"));
+    }
+
+    #[test]
+    fn onboarding_role_guides_the_operator_through_a_gate_first_walkthrough() {
+        let text = render("onboarding", &ctx());
+        for required in [
+            "operator of a rat kingdom",
+            "guided repository onboarding",
+            "rk repo onboard inspect",
+            ".rk/checks.cue",
+            "verify",
+            "require_named_checks",
+            "working directory",
+            "expected exit",
+            "timeout",
+            "toolchain",
+            "explicit approval",
+        ] {
+            assert!(
+                text.contains(required),
+                "onboarding prime missing {required:?}"
+            );
+        }
+        assert!(text.find("Verification contract").unwrap() < text.find("Automation").unwrap());
+        assert!(!text.contains("You are Whisker"));
+        assert!(!text.contains("only your task"));
+        assert!(!text.contains("MANDATORY final step"));
     }
 }

@@ -11,6 +11,16 @@ explicit human decision.
 
 ## Quick start
 
+Prime the main operator agent for the walkthrough:
+
+```bash
+rk onboard
+```
+
+`rk onboard` is exact sugar for `rk prime --role onboarding`. It prints
+gate-first onboarding instructions into the current operator session; it does
+not launch an agent, create durable state, or change a repository.
+
 Register the repository if needed, then run a read-only inspection:
 
 ```bash
@@ -18,7 +28,8 @@ rk repo add ~/dev/my-repo --name my-repo
 rk repo onboard inspect my-repo
 ```
 
-Start a durable session for a conversational walkthrough:
+The existing durable spawned-assessor workflow remains available for
+compatibility:
 
 ```bash
 rk repo onboard start my-repo --attach

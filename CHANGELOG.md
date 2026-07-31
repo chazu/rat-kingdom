@@ -18,6 +18,12 @@ built_).
 
 ### System hardening and remediation (2026-07-26–27)
 
+- **Operator-led onboarding prime** — `rk onboard` is exact sugar for
+  `rk prime --role onboarding`, giving the main operator agent a guided,
+  gate-first walkthrough without launching a special assessor or mutating
+  repository state. The prime makes the repository-owned `verify` contract,
+  `.rk/checks.cue`, workflow consumers, and explicit human decisions the
+  onboarding priority.
 - **Restart-safe guided onboarding** — repository assessment and content-bound
   proposals now stage named checks and repo-local automation only in an isolated
   onboarding branch. Workflow, trigger, and schedule validation stays inert
