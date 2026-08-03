@@ -323,6 +323,10 @@ fn steward_loads_and_routes() {
         panic!("steward must start by spawning the reviewer");
     };
     assert_eq!(spawn.role, "reviewer");
+    let resolved =
+        rk_workflow::resolve::resolve(spawn, &workflow.agents, &HashMap::new(), "fake").unwrap();
+    assert_eq!(resolved.harness, "codex");
+    assert_eq!(resolved.model.as_deref(), Some("gpt-5.6-luna"));
     assert!(
         spawn.branch.is_some(),
         "reviewer must chain onto the branch param"

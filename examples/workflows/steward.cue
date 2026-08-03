@@ -92,10 +92,10 @@ workflow: {
 	}
 
 	agents: {
-		// Review runs on the cheap model: the steward's whole point is that the
-		// common (clean) case costs almost nothing.
-		default:  {harness: "claude", model: "haiku"}
-		reviewer: {harness: "claude", model: "haiku"}
+		// Steward reviews follow the fleet's configured Codex/Luna execution
+		// policy instead of silently routing this one workflow through Claude.
+		default:  {harness: "codex", model: "gpt-5.6-luna"}
+		reviewer: {harness: "codex", model: "gpt-5.6-luna"}
 	}
 
 	steps: [
