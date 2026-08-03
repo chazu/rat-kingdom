@@ -143,7 +143,8 @@ async fn an_ungated_land_fails_closed_before_git_side_effects() {
         "an ungated land must fail closed: {status}"
     );
     assert_eq!(
-        status["instance"]["error"], "land step requires a prior approved human gate",
+        status["instance"]["error"],
+        "land step requires a prior approved human gate or a trusted automated workflow",
         "the failure should explain the required operator action: {status}"
     );
     let branch = status["instance"]["context"]["active_branch"]

@@ -559,6 +559,9 @@ require_named_checks = false     # true => a workflow `run` step may ONLY invoke
                                  # raw inline `command` is refused fail-closed, so
                                  # a compromised/untrusted workflow def cannot run
                                  # arbitrary shell in a rat's worktree.
+require_approval_for_landing = true # land/open_pr normally needs a human gate
+automated_landing_workflows = ["steward"] # land-only exception for managed global
+                                          # definitions; local shadows stay untrusted
 default_merge_mode = "direct"    # fleet-wide fallback for repos registered
                                  # without --merge-mode: "direct" merges the
                                  # branch, "pr" pushes it and opens a pull/merge

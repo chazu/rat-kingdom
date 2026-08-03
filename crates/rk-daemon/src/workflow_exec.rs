@@ -171,6 +171,11 @@ pub struct Instance {
     /// workflow refuses to execute a changed definition after restart.
     #[serde(default)]
     pub definition_digest: String,
+    /// Operator-granted capability for this exact workflow run. Set only when
+    /// the configured workflow name resolved directly from the managed global
+    /// workflow directory; repo-local name shadowing cannot set it.
+    #[serde(default)]
+    pub automated_landing_authorized: bool,
     /// The original `_input` params this instance launched with, replayed at
     /// reload so a resumed workflow validates and interpolates identically to
     /// its first run (TKT-52).
@@ -589,6 +594,7 @@ pub struct WorkflowEngine {
     /// the `wait` fails immediately (TKT-147).
     respawn_enabled: bool,
     require_approval_for_landing: bool,
+    automated_landing_workflows: Vec<String>,
     allowed_target_branches: Vec<String>,
     instances: Mutex<HashMap<String, Instance>>,
     /// Pruned terminal instances, kept for history. Held apart from `instances`
@@ -615,6 +621,7 @@ impl WorkflowEngine {
         require_named_checks: bool,
         respawn_enabled: bool,
         require_approval_for_landing: bool,
+        automated_landing_workflows: Vec<String>,
         allowed_target_branches: Vec<String>,
     ) -> Self {
         Self {
@@ -628,6 +635,7 @@ impl WorkflowEngine {
             require_named_checks,
             respawn_enabled,
             require_approval_for_landing,
+            automated_landing_workflows,
             allowed_target_branches,
             instances: Mutex::new(HashMap::new()),
             archived: Mutex::new(HashMap::new()),
@@ -678,6 +686,28 @@ impl WorkflowEngine {
         )))
     }
 
+    /// Whether this exact definition carries the operator's configured
+    /// unattended-landing authority. Name membership alone is insufficient:
+    /// repo-local definitions shadow global ones during normal resolution, so
+    /// trusting only the name would let a repository replace `steward.cue` and
+    /// inherit a capability intended for an operator-managed definition.
+    fn is_automated_landing_definition(&self, file: &Path, workflow: &str) -> bool {
+        if !self
+            .automated_landing_workflows
+            .iter()
+            .any(|trusted| trusted == workflow)
+        {
+            return false;
+        }
+        let Ok(managed_dir) = std::fs::canonicalize(self.layout.workflows_dir()) else {
+            return false;
+        };
+        let Ok(definition) = std::fs::canonicalize(file) else {
+            return false;
+        };
+        definition.parent() == Some(managed_dir.as_path())
+    }
+
     pub fn definitions(&self, repo: &str) -> Vec<String> {
         let mut names: Vec<String> = rk_workflow::definitions(&self.layout.workflows_dir())
             .into_iter()
@@ -713,6 +743,8 @@ impl WorkflowEngine {
         let file = self.find_definition(name, repo)?;
         let definition_digest = definition_digest(&file)?;
         let workflow = rk_workflow::load(&file, &params)?;
+        let automated_landing_authorized =
+            self.is_automated_landing_definition(&file, &workflow.name);
 
         let instance = Instance {
             id: prefixed_id("wf"),
@@ -729,6 +761,7 @@ impl WorkflowEngine {
             instance_max_usd: workflow.budget.map(|b| b.max_usd),
             definition: name.to_string(),
             definition_digest,
+            automated_landing_authorized,
             params,
             depth: 0,
             started_at: chrono::Utc::now(),
@@ -1317,9 +1350,12 @@ impl WorkflowEngine {
                     });
                 }
                 Step::Land(land) => {
-                    if self.require_approval_for_landing && !ctx.approval_granted {
+                    let automated = self
+                        .status(id)
+                        .is_some_and(|instance| instance.automated_landing_authorized);
+                    if self.require_approval_for_landing && !ctx.approval_granted && !automated {
                         return Err(rk_core::Error::other(
-                            "land step requires a prior approved human gate",
+                            "land step requires a prior approved human gate or a trusted automated workflow",
                         ));
                     }
                     let branch = interpolate(&land.branch, &ctx);
@@ -1435,6 +1471,8 @@ impl WorkflowEngine {
         let definition_digest = definition_digest(&file)?;
         let workflow = rk_workflow::load(&file, &params)?;
         let workflow_name = workflow.name.clone();
+        let automated_landing_authorized =
+            self.is_automated_landing_definition(&file, &workflow_name);
         let child = Instance {
             id: prefixed_id("wf"),
             workflow: workflow_name.clone(),
@@ -1450,6 +1488,7 @@ impl WorkflowEngine {
             instance_max_usd: workflow.budget.map(|b| b.max_usd),
             definition: sub.workflow.clone(),
             definition_digest,
+            automated_landing_authorized,
             params,
             depth,
             started_at: chrono::Utc::now(),
@@ -3110,6 +3149,7 @@ mod tests {
             instance_max_usd: None,
             definition: "steward".into(),
             definition_digest: "aaaa".into(),
+            automated_landing_authorized: false,
             params: params(&[("ticket", "TKT-1")]),
             depth: 0,
             started_at: Utc::now(),

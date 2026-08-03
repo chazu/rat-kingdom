@@ -14,6 +14,31 @@ fn examples_dir() -> PathBuf {
 }
 
 #[test]
+fn repository_verify_check_trusts_only_its_current_worktree() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join(".rk")
+        .join("checks.cue");
+    let checks = rk_workflow::load_checks(&file)
+        .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
+    let verify = checks
+        .iter()
+        .find(|check| check.name == "verify")
+        .expect("repository must declare a verify check");
+
+    assert_eq!(
+        verify.command,
+        "MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" mise run verify",
+        "the named check runs in transient agent worktrees, so trust must be process-local"
+    );
+    assert_eq!(
+        verify.environment_policy,
+        rk_workflow::CheckEnvironmentPolicy::StripRkSpawn
+    );
+}
+
+#[test]
 fn all_shipped_examples_load() {
     let dir = examples_dir();
     let defs = rk_workflow::definitions(&dir);

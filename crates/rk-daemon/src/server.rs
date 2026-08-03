@@ -90,6 +90,7 @@ pub struct Daemon {
     /// checks; raw inline commands are refused (TKT-30, `[policy]`).
     require_named_checks: bool,
     require_approval_for_landing: bool,
+    automated_landing_workflows: Vec<String>,
     /// Fleet-wide default merge mode a repo is registered with when `rk repo
     /// add` names no explicit `--merge-mode` (`[policy] default_merge_mode`).
     default_merge_mode: rk_core::config::MergeMode,
@@ -192,6 +193,7 @@ impl Daemon {
         daemon.evaporation_decay = config.evaporation.decay;
         daemon.require_named_checks = config.policy.require_named_checks;
         daemon.require_approval_for_landing = config.policy.require_approval_for_landing;
+        daemon.automated_landing_workflows = config.policy.automated_landing_workflows.clone();
         daemon.default_merge_mode = config.policy.default_merge_mode;
         daemon.allowed_target_branches = config.policy.allowed_target_branches.clone();
         if config.sync.enabled {
@@ -346,6 +348,8 @@ impl Daemon {
             default_harness,
             require_named_checks: false,
             require_approval_for_landing: true,
+            automated_landing_workflows: rk_core::config::PolicyConfig::default()
+                .automated_landing_workflows,
             default_merge_mode: rk_core::config::MergeMode::default(),
             allowed_target_branches: rk_core::config::PolicyConfig::default()
                 .allowed_target_branches,
@@ -757,6 +761,7 @@ impl Daemon {
                 // a `wait` only gives up on one when it cannot be (TKT-147).
                 self.sweep_config.respawn_enabled && self.sweep_config.respawn_max_attempts > 0,
                 self.require_approval_for_landing,
+                self.automated_landing_workflows.clone(),
                 self.allowed_target_branches.clone(),
             ))
         }))

@@ -7,7 +7,7 @@ package checks
 checks: [
 	{
 		name:              "verify"
-		command:           "mise run verify"
+		command:           "MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" mise run verify"
 		timeout:           "60m"
 		environmentPolicy: "strip_rk_spawn"
 		toolchain:         "mise rust@1.95.0"
