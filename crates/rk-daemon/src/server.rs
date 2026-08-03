@@ -2054,6 +2054,7 @@ impl Daemon {
             repo_path,
             base_branch,
             harness,
+            params.model,
             params.attach,
             assessment,
             &self.layout.worktrees_dir(),
@@ -2793,6 +2794,20 @@ impl Daemon {
         attach: bool,
     ) -> rk_core::Result<crate::agents::AgentRecord> {
         let assessment = serde_json::to_string_pretty(&session.assessment)?;
+        let (proposal_instruction, completion_instruction) = if session.harness == "jcode" {
+            (
+                "Include concrete proposed changes in the final assessment for the operator to \
+                 review and journal; your restricted tool surface cannot call RK mutation APIs.",
+                "Return the final assessment summary and stop; the one-shot jcode terminal event \
+                 completes the session, so do not try to run `rk done`.",
+            )
+        } else {
+            (
+                "Journal concrete advice with `rk repo onboard propose`; that records a proposal \
+                 but grants no approval or mutation authority.",
+                "Finish with `rk done`; do not edit or commit anything.",
+            )
+        };
         self.supervisor
             .spawn_async(crate::supervisor::SpawnParams {
                 repo: session.repo_path.to_string_lossy().into_owned(),
@@ -2800,18 +2815,16 @@ impl Daemon {
                 prompt: Some(format!(
                     "Assess this repository read-only for onboarding session {}. \
                      The daemon's deterministic starting assessment follows. Confirm \
-                     evidence and report ambiguity. Journal concrete advice with \
-                     `rk repo onboard propose`; that records a proposal but grants no \
-                     approval or mutation authority. Finish with `rk done`; do not edit \
-                     or commit anything.\n\n{}",
-                    session.id, assessment
+                     evidence and report ambiguity. {proposal_instruction} \
+                     {completion_instruction}\n\n{}",
+                    session.id, assessment,
                 )),
                 role: crate::onboarding_sessions::ONBOARDER_ROLE.into(),
                 coordination: None,
                 harness: Some(session.harness.clone()),
                 parent: None,
                 base: Some(session.base_branch.clone()),
-                model: None,
+                model: session.model.clone(),
                 permission_mode: None,
                 attach,
                 workflow_instance: None,
@@ -4055,6 +4068,8 @@ struct RepoOnboardingStartParams {
     target: String,
     #[serde(default)]
     harness: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     attach: bool,
 }

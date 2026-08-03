@@ -255,6 +255,9 @@ enum RepoOnboardCommand {
         /// Harness kind; defaults to the daemon configuration.
         #[arg(long)]
         harness: Option<String>,
+        /// Harness-native model identifier.
+        #[arg(long)]
+        model: Option<String>,
         /// Launch in a human-attachable herdr pane.
         #[arg(long)]
         attach: bool,
@@ -611,6 +614,7 @@ fn print_prime(role: String, json_output: bool) -> Result<()> {
         // and injected by the supervisor at spawn time.
         conventions: Vec::new(),
         verification_checks: Vec::new(),
+        harness_terminal_completion: false,
     };
     let text = rk_core::prime::render(&role, &ctx);
     if json_output {
@@ -1022,8 +1026,12 @@ async fn main() -> Result<()> {
                 RepoOnboardCommand::Start {
                     target,
                     harness,
+                    model,
                     attach,
-                } => repo_cmds::onboard_start(&layout, target, harness, attach, cli.json).await?,
+                } => {
+                    repo_cmds::onboard_start(&layout, target, harness, model, attach, cli.json)
+                        .await?
+                }
                 RepoOnboardCommand::Inspect { target } => {
                     repo_cmds::onboard_inspect(&layout, target, cli.json).await?
                 }

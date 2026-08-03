@@ -31,6 +31,10 @@ pub struct PrimeContext {
     /// workflow execution remains the authoritative gate. Empty means the
     /// repository has not declared named checks and the section is omitted.
     pub verification_checks: Vec<VerificationCheck>,
+    /// The harness's one-shot terminal event is the completion signal. Used by
+    /// restricted harnesses that cannot safely receive a general-purpose shell
+    /// solely to run `rk done`.
+    pub harness_terminal_completion: bool,
 }
 
 /// A repo-owned named verification check rendered into a worker's prompt.
@@ -296,8 +300,7 @@ const FRAGMENT_ONBOARDER: &str = "\
 
 You are the repository's onboarding assessor. Your capability is deliberately
 narrower than an ordinary rat's: the harness is forced into a read-only mode
-and the daemon permits only assessment reads, your own progress, and your final
-`rk done` signal.
+and the daemon rejects onboarding mutations.
 
 - Inspect the repository, its instructions, git state, declared toolchain,
   checks, workflows, triggers, schedules, and harness readiness.
@@ -308,7 +311,6 @@ and the daemon permits only assessment reads, your own progress, and your final
 - The durable onboarding session already owns the assessment report, branch,
   and worktree. A disconnect or daemon restart is not permission to recreate
   them; resume through the existing session.
-- Finish by running `rk done \"<one-line assessment summary>\"`, then stop.
 ";
 
 const FRAGMENT_FOREMAN: &str = "\
@@ -535,6 +537,16 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
     match role {
         "onboarder" => {
             out.push_str(FRAGMENT_ONBOARDER);
+            if ctx.harness_terminal_completion {
+                out.push_str(
+                    "- Finish by returning the final assessment summary, then stop. The harness's \
+                     terminal result completes this assessment; do not try to run `rk done`.\n",
+                );
+            } else {
+                out.push_str(
+                    "- Finish by running `rk done \"<one-line assessment summary>\"`, then stop.\n",
+                );
+            }
         }
         "foreman" => {
             out.push_str(FRAGMENT_FOREMAN);
@@ -617,6 +629,7 @@ mod tests {
             facts: Vec::new(),
             conventions: Vec::new(),
             verification_checks: Vec::new(),
+            harness_terminal_completion: false,
         }
     }
 
@@ -685,6 +698,16 @@ mod tests {
                 "onboarder silently inherited ordinary rat instruction {inherited:?}"
             );
         }
+    }
+
+    #[test]
+    fn onboarder_can_use_harness_terminal_completion_without_shell_access() {
+        let mut context = ctx();
+        context.harness_terminal_completion = true;
+        let text = render("onboarder", &context);
+        assert!(text.contains("terminal result completes this assessment"));
+        assert!(text.contains("do not try to run `rk done`"));
+        assert!(!text.contains("Finish by running `rk done"));
     }
 
     #[test]

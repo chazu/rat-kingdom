@@ -149,11 +149,15 @@ fn permission_mode(role: &str, harness: &str) -> rk_core::Result<String> {
     }
     match harness {
         "claude" => Ok("plan".into()),
-        "codex" | "fake" => Ok("read-only".into()),
+        "codex" | "fake" | "jcode" => Ok("read-only".into()),
         other => Err(rk_core::Error::other(format!(
             "harness {other:?} has no enforced read-only onboarding mode"
         ))),
     }
+}
+
+fn uses_harness_terminal_completion(role: &str, harness: &str) -> bool {
+    role == ONBOARDER_ROLE && harness == "jcode"
 }
 
 fn is_reporting_boundary(record: &AgentRecord) -> bool {
@@ -366,9 +370,10 @@ struct CompletionState {
 struct TurnClaim {
     /// Publish this turn as the generation's `harness_result`.
     publish: bool,
-    /// This generation wrote its `rk done` — see [`Supervisor::declared_done`].
-    /// Carried onto the published event so a reader can tell a rat that
-    /// declared itself finished from one that merely stopped producing turns.
+    /// This generation positively declared completion, normally through
+    /// `rk done`; restricted one-shot jcode onboarding uses its native terminal
+    /// event instead. Carried onto the published event so a reader can tell an
+    /// agent that finished from one that merely stopped producing turns.
     declared_done: bool,
 }
 
@@ -637,6 +642,13 @@ impl Supervisor {
         let effective =
             effective_agent_config(&self.default_harness, &self.default_agent, &params)?;
         let harness = make_harness(&effective.harness)?;
+        if params.attach && uses_harness_terminal_completion(&params.role, &effective.harness) {
+            return Err(rk_core::Error::other(
+                "jcode onboarding is headless-only: its restricted tool surface cannot run \
+                 `rk done`, so Rat Kingdom completes the assessment from jcode's one-shot \
+                 terminal event",
+            ));
+        }
 
         // Reserve the name atomically: it stays claimed against concurrent
         // spawns until the journal row is inserted. Picking without reserving
@@ -695,6 +707,10 @@ impl Supervisor {
             facts: self.scan_facts(&repo_name),
             conventions: self.scan_conventions(&repo_name),
             verification_checks: self.scan_verification_checks(&worktree),
+            harness_terminal_completion: uses_harness_terminal_completion(
+                &params.role,
+                &effective.harness,
+            ),
         };
         let prompt = params
             .prompt
@@ -1007,6 +1023,11 @@ impl Supervisor {
             return Err(rk_core::Error::other(format!("{name} is still running")));
         }
         validate_role(&record.role)?;
+        if attach && uses_harness_terminal_completion(&record.role, &record.harness) {
+            return Err(rk_core::Error::other(
+                "jcode onboarding is headless-only: resume without `--attach`",
+            ));
+        }
         let (Some(worktree), Some(task)) = (record.worktree.clone(), record.task.clone()) else {
             return Err(rk_core::Error::other("record lacks worktree/task"));
         };
@@ -1037,8 +1058,19 @@ impl Supervisor {
             facts: self.scan_facts(&record.repo_name),
             conventions: self.scan_conventions(&record.repo_name),
             verification_checks: self.scan_verification_checks(&worktree),
+            harness_terminal_completion: uses_harness_terminal_completion(
+                &record.role,
+                &record.harness,
+            ),
         };
-        let resume_prompt = if record.role == ONBOARDER_ROLE {
+        let resume_prompt = if uses_harness_terminal_completion(&record.role, &record.harness) {
+            format!(
+                "Resume onboarding session {task}. Reassess the repository read-only, \
+                 preserve the existing onboarding branch and session record, then return \
+                 the final findings and stop. Do not edit or commit files and do not try \
+                 to run `rk done`; the terminal response completes this assessment."
+            )
+        } else if record.role == ONBOARDER_ROLE {
             format!(
                 "Resume onboarding session {task}. Reassess the repository read-only, \
                  preserve the existing onboarding branch and session record, and finish \
@@ -1262,7 +1294,12 @@ impl Supervisor {
                     }
                 });
                 if let Ok(Some(record)) = updated {
-                    let claim = self.claim_completion(name, generation, is_error);
+                    let claim = self.claim_completion(
+                        name,
+                        generation,
+                        is_error,
+                        uses_harness_terminal_completion(&record.role, &record.harness),
+                    );
                     if claim.publish {
                         info!(agent = name, is_error, "agent completed");
                         self.route_completion(&record, is_error, claim.declared_done);
@@ -2159,25 +2196,37 @@ impl Supervisor {
     /// `evaluate` behind it judges that text, and a steward reviewer whose
     /// APPROVE lands in a later turn is read as having no verdict at all.
     ///
-    /// Two things prove a turn is the last one, and this is where the first is
-    /// applied:
+    /// Three things prove a turn is the last one, and this is where the first
+    /// two are applied:
     ///
     /// 1. **The agent said so.** `rk done` writes exactly one `task_done` per
     ///    generation — the one signal in the system that a harness cannot
     ///    duplicate, because the rat writes it rather than the harness. Every
     ///    spawned role is primed with `rk done` as its mandatory final step.
-    /// 2. **The process is gone.** Handled at `Exited`; see
+    /// 2. **A restricted one-shot harness ended its request.** Jcode onboarding
+    ///    has no Bash tool and its headless `done` event is terminal by native
+    ///    contract.
+    /// 3. **The process is gone.** Handled at `Exited`; see
     ///    [`Self::flush_withheld_completion`].
     ///
     /// A failed turn is terminal on its own: the session ended in an error, so
     /// there is no later turn to prefer, and holding it back would only turn a
     /// fast, legible failure into a `wait` timeout.
-    fn claim_completion(&self, name: &str, generation: DateTime<Utc>, is_error: bool) -> TurnClaim {
+    fn claim_completion(
+        &self,
+        name: &str,
+        generation: DateTime<Utc>,
+        is_error: bool,
+        harness_terminal: bool,
+    ) -> TurnClaim {
         // Asked unconditionally rather than short-circuited behind `is_error`,
         // because the answer is published as `declared_done` and a failed turn
         // has one too: a rat can run `rk done` and then have a later turn error
         // out. Costs one indexed scan on a path that runs once per turn.
-        let declared_done = self.declared_done(name, generation);
+        // Jcode onboarding runs one headless request with no Bash tool. Its
+        // native `done` event is therefore the only safe positive completion
+        // signal and, unlike an interactive turn boundary, ends the process.
+        let declared_done = harness_terminal || self.declared_done(name, generation);
         let terminal = is_error || declared_done;
         let mut completions = self.lock_completions();
         let state = completions
@@ -3654,18 +3703,38 @@ mod respawn_tests {
 
         assert_eq!(permission_mode("onboarder", "codex").unwrap(), "read-only");
         assert_eq!(permission_mode("onboarder", "claude").unwrap(), "plan");
+        assert_eq!(permission_mode("onboarder", "jcode").unwrap(), "read-only");
         assert!(
             permission_mode("onboarder", "axe").is_err(),
             "a harness without an enforced read-only mode must fail closed"
-        );
-        assert!(
-            permission_mode("onboarder", "jcode").is_err(),
-            "jcode has no enforced read-only mode"
         );
         assert_eq!(
             permission_mode("rat", "codex").unwrap(),
             "danger-full-access"
         );
+    }
+
+    #[test]
+    fn only_jcode_onboarders_use_native_terminal_completion() {
+        assert!(uses_harness_terminal_completion("onboarder", "jcode"));
+        assert!(!uses_harness_terminal_completion("rat", "jcode"));
+        assert!(!uses_harness_terminal_completion("onboarder", "codex"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = supervisor(dir.path());
+        let generation = Utc::now();
+        let claim = supervisor.claim_completion("Jade", generation, false, true);
+        assert!(claim.publish);
+        assert!(claim.declared_done);
+        assert!(
+            !supervisor
+                .claim_completion("Jade", generation, false, true)
+                .publish
+        );
+
+        let ordinary = supervisor.claim_completion("Whisker", generation, false, false);
+        assert!(!ordinary.publish);
+        assert!(!ordinary.declared_done);
     }
 
     fn record(repo: &Path, branch: Option<&str>) -> AgentRecord {

@@ -119,12 +119,16 @@ launch. jcode also runs with full host access: its adapter consumes
 `run --ndjson`, disables jcode-native swarm/auto-poke ownership, and rejects
 permission modes it cannot enforce. Configure its provider with `jcode login`
 before spawning. Onboarders are the exception: the daemon always forces Claude
-`plan` or Codex `read-only`, regardless of worker defaults; jcode cannot enforce
-that boundary and is rejected for onboarding.
+`plan` or Codex/jcode `read-only`, regardless of worker defaults. Jcode v0.65+
+onboarders are headless-only and receive an explicit `read,ls,agentgrep` tool
+allow-list; Bash and every mutating tool remain unavailable. Their one-shot
+native `done` event completes the assessment, so no shell is exposed solely to
+run `rk done`.
 
 ```bash
 jcode auth-test --all-configured
 rk spawn --harness jcode --task fix-login --prompt "Fix the login bug, verify, commit, and run rk done"
+rk repo onboard start . --harness jcode --model gpt-5.6-luna
 ```
 
 Workflow runs can opt into a stable coordinator ownership scope with

@@ -273,6 +273,105 @@ async fn onboarding_sessions_are_durable_resumable_and_capability_scoped() {
     assert!(prime.contains("forced into a read-only mode"));
     assert!(!prime.contains("Commit BEFORE you verify"));
 
+    // Jcode v0.65+ onboarding gets a strict read/search allow-list, carries an
+    // explicit model through the durable session, and treats the one-shot
+    // native done event as its positive completion signal. No Bash tool is
+    // exposed solely to let the model call `rk done`.
+    let fake_jcode = home.path().join("fake-jcode");
+    let jcode_args = home.path().join("jcode-args");
+    std::fs::write(
+        &fake_jcode,
+        r#"#!/bin/bash
+set -eu
+test "$JCODE_SWARM_ENABLED" = 0
+test "$JCODE_RUN_AUTO_POKE" = 0
+printf '%s\036' "$@" > "$RK_TEST_JCODE_ARGS"
+echo '{"type":"start","session_id":"jcode-onboarding"}'
+echo '{"type":"done","session_id":"jcode-onboarding","text":"jcode assessment complete"}'
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_jcode, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::env::set_var("RK_JCODE_BIN", &fake_jcode);
+    std::env::set_var("RK_TEST_JCODE_ARGS", &jcode_args);
+    let jcode_repo = repository("jcode-onboarding");
+    let jcode_start = successful_json(run_rk(
+        &layout,
+        &[
+            "--json",
+            "repo",
+            "onboard",
+            "start",
+            jcode_repo.path().to_str().unwrap(),
+            "--harness",
+            "jcode",
+            "--model",
+            "gpt-5.6-luna",
+        ],
+    ));
+    let jcode_session = jcode_start["session"]["id"].as_str().unwrap();
+    let jcode_agent = jcode_start["session"]["agent"].as_str().unwrap();
+    let jcode_repo_name = jcode_start["session"]["repo_name"].as_str().unwrap();
+    let jcode_completed = wait_for_session(&layout, jcode_session, "completed").await;
+    assert_eq!(jcode_completed["model"], "gpt-5.6-luna");
+    let jcode_report = successful_json(run_rk(
+        &layout,
+        &["--json", "repo", "onboard", "report", jcode_session],
+    ));
+    assert_eq!(jcode_report["agent_result"], "jcode assessment complete");
+
+    let args = std::fs::read(&jcode_args).unwrap();
+    let args: Vec<_> = args
+        .split(|byte| *byte == 0x1e)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8(arg.to_vec()).unwrap())
+        .collect();
+    assert!(args
+        .windows(2)
+        .any(|pair| pair == ["--model", "gpt-5.6-luna"]));
+    assert!(args.iter().any(|arg| arg == "--disable-base-tools"));
+    assert!(args
+        .windows(2)
+        .any(|pair| { pair == ["--tools", rk_core::JCODE_READ_ONLY_TOOLS] }));
+
+    let results = operator
+        .call(
+            "space.scan",
+            json!({
+                "category": "event",
+                "scope": jcode_repo_name,
+                "identity": "harness_result",
+                "payload_search": format!("\"agent\":\"{jcode_agent}\"")
+            }),
+        )
+        .await
+        .unwrap();
+    let result = &results["tuples"][0]["payload"];
+    assert_eq!(result["is_error"], false);
+    assert_eq!(result["declared_done"], true);
+
+    let attached_jcode_repo = repository("attached-jcode-onboarding");
+    let attached_jcode = run_rk(
+        &layout,
+        &[
+            "repo",
+            "onboard",
+            "start",
+            attached_jcode_repo.path().to_str().unwrap(),
+            "--harness",
+            "jcode",
+            "--attach",
+        ],
+    );
+    assert!(!attached_jcode.status.success());
+    assert!(String::from_utf8_lossy(&attached_jcode.stderr).contains("headless-only"));
+    std::env::remove_var("RK_JCODE_BIN");
+    std::env::remove_var("RK_TEST_JCODE_ARGS");
+
     // Role typos and attempts to smuggle a downgraded role into the onboarding
     // RPC are rejected before a branch or agent can be created.
     assert!(operator

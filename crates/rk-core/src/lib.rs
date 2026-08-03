@@ -10,3 +10,6 @@ pub mod prime;
 pub mod tuple;
 
 pub use error::{Error, Result};
+
+/// Jcode tools allowed for assessment-only repository onboarding.
+pub const JCODE_READ_ONLY_TOOLS: &str = "read,ls,agentgrep";

@@ -463,36 +463,26 @@ fn add_harness_readiness(report: &mut AssessmentReport, harness: &str) {
             )
             .evidence([observed("daemon configuration", "default harness: fake")]),
         );
-    } else if harness == "jcode" {
-        report.findings.push(
-            Finding::new(
-                FindingKind::HarnessMissing,
-                Severity::Error,
-                format!(
-                    "configured harness `{harness}` cannot enforce read-only onboarding"
-                ),
-            )
-            .evidence([observed(
-                "daemon configuration",
-                format!("default harness: {harness}"),
-            )])
-            .recommend(
-                "Select Claude or Codex for the assessment session.",
-                None,
-            ),
-        );
     } else if command_exists(harness, Path::new(".")) {
-        report.findings.push(
-            Finding::new(
-                FindingKind::HarnessReady,
-                Severity::Info,
-                format!("configured harness `{harness}` is available"),
-            )
-            .evidence([observed(
-                "PATH",
-                command_path(harness).unwrap_or_else(|| harness.into()),
-            )]),
-        );
+        let mut finding = Finding::new(
+            FindingKind::HarnessReady,
+            Severity::Info,
+            format!("configured harness `{harness}` is available"),
+        )
+        .evidence([observed(
+            "PATH",
+            command_path(harness).unwrap_or_else(|| harness.into()),
+        )]);
+        if harness == "jcode" {
+            finding = finding.evidence([observed(
+                "onboarding launch policy",
+                format!(
+                    "--disable-base-tools --tools {}",
+                    rk_core::JCODE_READ_ONLY_TOOLS
+                ),
+            )]);
+        }
+        report.findings.push(finding);
     } else {
         report.findings.push(
             Finding::new(
@@ -1676,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn jcode_is_not_reported_ready_for_read_only_onboarding() {
+    fn jcode_readiness_uses_the_standard_executable_check() {
         let dir = fixture();
         let registered = vec![record("fixture", dir.path())];
         let report = inspect(
@@ -1687,11 +1677,20 @@ mod tests {
                 require_named_checks: false,
             },
         );
-        assert!(!report.ready);
-        assert!(report.findings.iter().any(|finding| {
-            finding.kind == FindingKind::HarnessMissing
-                && finding.summary.contains("read-only onboarding")
+        assert!(!report.findings.iter().any(|finding| {
+            finding
+                .summary
+                .contains("cannot enforce read-only onboarding")
         }));
+        let expected_kind = if command_exists("jcode", Path::new(".")) {
+            FindingKind::HarnessReady
+        } else {
+            FindingKind::HarnessMissing
+        };
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.kind == expected_kind && finding.summary.contains("jcode")));
     }
 
     #[test]

@@ -152,6 +152,7 @@ pub async fn onboard_start(
     layout: &Layout,
     target: String,
     harness: Option<String>,
+    model: Option<String>,
     attach: bool,
     as_json: bool,
 ) -> Result<()> {
@@ -162,6 +163,7 @@ pub async fn onboard_start(
             json!({
                 "target": target,
                 "harness": harness,
+                "model": model,
                 "attach": attach,
             }),
         )
@@ -527,6 +529,9 @@ fn print_onboarding_status(status: &OnboardingSessionStatus, reused: bool) {
     println!("  branch    {}", status.branch);
     println!("  worktree  {}", status.worktree.display());
     println!("  harness   {}", status.harness);
+    if let Some(model) = &status.model {
+        println!("  model     {model}");
+    }
     println!(
         "  mode      {}",
         if status.attached {

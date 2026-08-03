@@ -43,6 +43,13 @@ impl Harness for JcodeHarness {
         if let Some(session) = &spec.resume_session {
             cmd.args(["--resume", session]);
         }
+        if spec.permission_mode.as_deref() == Some("read-only") {
+            cmd.args([
+                "--disable-base-tools",
+                "--tools",
+                rk_core::JCODE_READ_ONLY_TOOLS,
+            ]);
+        }
         cmd.args(["run", "--ndjson"]);
 
         let full_prompt = match &spec.system_prompt {
@@ -406,6 +413,69 @@ echo '{"type":"done","session_id":"jcode-session-1","text":"working done","usage
                 "be a rat\n\n---\n\ndo the task",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn read_only_launch_exposes_only_assessment_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_jcode = dir.path().join("fake-jcode");
+        let args_file = dir.path().join("args");
+        std::fs::write(
+            &fake_jcode,
+            r#"#!/bin/bash
+printf '%s\036' "$@" > "$RK_JCODE_ARGS_FILE"
+echo '{"type":"done","text":"assessed"}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_jcode, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut env = HashMap::new();
+        env.insert(
+            "RK_JCODE_BIN".into(),
+            fake_jcode.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "RK_JCODE_ARGS_FILE".into(),
+            args_file.to_string_lossy().into_owned(),
+        );
+        let mut session = JcodeHarness
+            .launch(&LaunchSpec {
+                prompt: "assess".into(),
+                cwd: dir.path().to_path_buf(),
+                env,
+                permission_mode: Some("read-only".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        while session.events.recv().await.is_some() {}
+
+        let bytes = std::fs::read(args_file).unwrap();
+        let args: Vec<_> = bytes
+            .split(|byte| *byte == 0x1e)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8(arg.to_vec()).unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--no-update",
+                "--quiet",
+                "-C",
+                dir.path().to_str().unwrap(),
+                "--disable-base-tools",
+                "--tools",
+                rk_core::JCODE_READ_ONLY_TOOLS,
+                "run",
+                "--ndjson",
+                "assess",
+            ]
+        );
+        for forbidden in ["bash", "write", "edit", "apply_patch"] {
+            assert!(!rk_core::JCODE_READ_ONLY_TOOLS
+                .split(',')
+                .any(|tool| tool == forbidden));
+        }
     }
 
     #[tokio::test]
