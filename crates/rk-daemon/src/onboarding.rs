@@ -463,6 +463,24 @@ fn add_harness_readiness(report: &mut AssessmentReport, harness: &str) {
             )
             .evidence([observed("daemon configuration", "default harness: fake")]),
         );
+    } else if harness == "jcode" {
+        report.findings.push(
+            Finding::new(
+                FindingKind::HarnessMissing,
+                Severity::Error,
+                format!(
+                    "configured harness `{harness}` cannot enforce read-only onboarding"
+                ),
+            )
+            .evidence([observed(
+                "daemon configuration",
+                format!("default harness: {harness}"),
+            )])
+            .recommend(
+                "Select Claude or Codex for the assessment session.",
+                None,
+            ),
+        );
     } else if command_exists(harness, Path::new(".")) {
         report.findings.push(
             Finding::new(
@@ -1655,6 +1673,25 @@ mod tests {
             .iter()
             .any(|evidence| evidence.origin == EvidenceOrigin::Observed
                 && evidence.command.as_deref() == Some("mise run verify")));
+    }
+
+    #[test]
+    fn jcode_is_not_reported_ready_for_read_only_onboarding() {
+        let dir = fixture();
+        let registered = vec![record("fixture", dir.path())];
+        let report = inspect(
+            "fixture",
+            &registered,
+            &InspectContext {
+                default_harness: "jcode".into(),
+                require_named_checks: false,
+            },
+        );
+        assert!(!report.ready);
+        assert!(report.findings.iter().any(|finding| {
+            finding.kind == FindingKind::HarnessMissing
+                && finding.summary.contains("read-only onboarding")
+        }));
     }
 
     #[test]

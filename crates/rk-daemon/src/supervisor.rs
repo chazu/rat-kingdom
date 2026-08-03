@@ -31,8 +31,9 @@ fn default_permission_mode(harness: &str) -> &'static str {
         "claude" => "bypassPermissions",
         // A rat's coordination contract includes `rk done`, tuple writes, and
         // ticket operations. Codex's workspace-write sandbox blocks the Unix
-        // socket outside the worktree, so it cannot satisfy that contract.
-        "codex" => "danger-full-access",
+        // socket outside the worktree, while jcode exposes no narrower enforced
+        // sandbox. Record the full authority both harnesses actually need.
+        "codex" | "jcode" => "danger-full-access",
         _ => "workspace-write",
     }
 }
@@ -106,18 +107,20 @@ fn respawn_permission_mode(record: &AgentRecord) -> rk_core::Result<String> {
 }
 
 fn validate_permission_mode(harness: &str, permission_mode: &str) -> rk_core::Result<()> {
-    if harness != "codex" {
+    if !matches!(harness, "codex" | "jcode") {
         return Ok(());
     }
 
     match permission_mode {
         "danger-full-access" | "bypassPermissions" => Ok(()),
         "read-only" | "workspace-write" => Err(rk_core::Error::other(
-            "codex agents need danger-full-access to reach the rk daemon socket; \
+            format!(
+                "{harness} agents need danger-full-access to reach the rk daemon socket; \
              use --permission-mode danger-full-access (or omit the override)",
+            ),
         )),
         other => Err(rk_core::Error::other(format!(
-            "unsupported codex permission mode '{other}': use danger-full-access"
+            "unsupported {harness} permission mode '{other}': use danger-full-access"
         ))),
     }
 }
@@ -833,7 +836,12 @@ impl Supervisor {
                 return Err(e);
             }
         };
-        let target = match rk_mux::HerdrMux::start_agent(&name, &worktree, &spec.env, &argv) {
+        let mut attach_env = spec.env.clone();
+        if harness_kind == "jcode" {
+            attach_env.insert("JCODE_SWARM_ENABLED".into(), "0".into());
+            attach_env.insert("JCODE_AUTO_POKE".into(), "0".into());
+        }
+        let target = match rk_mux::HerdrMux::start_agent(&name, &worktree, &attach_env, &argv) {
             Ok(t) => t,
             Err(e) => {
                 let _ = repo.remove_worktree(&worktree);
@@ -881,7 +889,14 @@ impl Supervisor {
         // integration hook, not a sleep); fall back to sending anyway.
         {
             let target = target.clone();
-            let prompt = spec.prompt.clone();
+            let prompt = if harness_kind == "jcode" {
+                match &spec.system_prompt {
+                    Some(system) => format!("{system}\n\n---\n\n{}", spec.prompt),
+                    None => spec.prompt.clone(),
+                }
+            } else {
+                spec.prompt.clone()
+            };
             tokio::task::spawn_blocking(move || {
                 let _ = std::process::Command::new("herdr")
                     .args([
@@ -1133,8 +1148,13 @@ impl Supervisor {
                 spec.model.as_deref(),
                 spec.permission_mode.as_deref(),
             )?;
+            let mut attach_env = spec.env.clone();
+            if record.harness == "jcode" {
+                attach_env.insert("JCODE_SWARM_ENABLED".into(), "0".into());
+                attach_env.insert("JCODE_AUTO_POKE".into(), "0".into());
+            }
             (
-                rk_mux::HerdrMux::start_agent(&record.name, &spec.cwd, &spec.env, &argv)?,
+                rk_mux::HerdrMux::start_agent(&record.name, &spec.cwd, &attach_env, &argv)?,
                 true,
             )
         };
@@ -1151,7 +1171,14 @@ impl Supervisor {
 
         if created {
             let target = target.clone();
-            let prompt = spec.prompt;
+            let prompt = if record.harness == "jcode" {
+                match spec.system_prompt {
+                    Some(system) => format!("{system}\n\n---\n\n{}", spec.prompt),
+                    None => spec.prompt,
+                }
+            } else {
+                spec.prompt
+            };
             tokio::task::spawn_blocking(move || {
                 let _ = std::process::Command::new("herdr")
                     .args([
@@ -3536,8 +3563,9 @@ mod respawn_tests {
     }
 
     #[test]
-    fn codex_defaults_to_socket_capable_permission_mode() {
+    fn autonomous_harnesses_default_to_socket_capable_permission_modes() {
         assert_eq!(default_permission_mode("codex"), "danger-full-access");
+        assert_eq!(default_permission_mode("jcode"), "danger-full-access");
         assert_eq!(default_permission_mode("claude"), "bypassPermissions");
     }
 
@@ -3603,13 +3631,15 @@ mod respawn_tests {
     }
 
     #[test]
-    fn codex_rejects_permission_modes_that_block_rk_socket() {
-        assert!(validate_permission_mode("codex", "danger-full-access").is_ok());
-        assert!(validate_permission_mode("codex", "bypassPermissions").is_ok());
-        for mode in ["read-only", "workspace-write"] {
-            let error = validate_permission_mode("codex", mode)
-                .expect_err("a restricted Codex sandbox must fail before spawn");
-            assert!(error.to_string().contains("rk daemon socket"));
+    fn full_access_harnesses_reject_modes_that_block_or_misstate_rk_socket_access() {
+        for harness in ["codex", "jcode"] {
+            assert!(validate_permission_mode(harness, "danger-full-access").is_ok());
+            assert!(validate_permission_mode(harness, "bypassPermissions").is_ok());
+            for mode in ["read-only", "workspace-write"] {
+                let error = validate_permission_mode(harness, mode)
+                    .expect_err("a restricted or unenforceable mode must fail before spawn");
+                assert!(error.to_string().contains("rk daemon socket"));
+            }
         }
         assert!(validate_permission_mode("fake", "workspace-write").is_ok());
     }
@@ -3627,6 +3657,10 @@ mod respawn_tests {
         assert!(
             permission_mode("onboarder", "axe").is_err(),
             "a harness without an enforced read-only mode must fail closed"
+        );
+        assert!(
+            permission_mode("onboarder", "jcode").is_err(),
+            "jcode has no enforced read-only mode"
         );
         assert_eq!(
             permission_mode("rat", "codex").unwrap(),

@@ -55,7 +55,7 @@ workflow: {
 		budgetUsd: {type: "int", required: false, default: 30}
 	}
 
-	agents: {default: {harness: "claude"}}
+	agents: {default: {harness: "codex"}}
 
 	// Wallet kill-switch scoped to this one overnight instance.
 	budget: {max_usd: _input.budgetUsd}

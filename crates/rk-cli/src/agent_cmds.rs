@@ -25,7 +25,7 @@ pub struct SpawnArgs {
     /// Agent role: rat | reviewer | foreman.
     #[arg(long, default_value = "rat")]
     pub role: String,
-    /// Harness kind: claude | codex | axe | fake (default from config).
+    /// Harness kind: claude | codex | axe | jcode | fake (default from config).
     #[arg(long)]
     pub harness: Option<String>,
     /// Spawning agent name (structural parent for completion routing).

@@ -67,7 +67,7 @@ workflow: #Workflow
 // Which harness/model runs an agent. All fields optional; resolution is
 // field-wise: step > workflow profile > global profile > global defaults.
 #AgentProfile: {
-	harness?:         "claude" | "codex" | "axe" | "fake"
+	harness?:         "claude" | "codex" | "axe" | "jcode" | "fake"
 	model?:           string
 	permission_mode?: string
 }

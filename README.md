@@ -14,6 +14,7 @@ no terminal scraping, no keystroke injection, no sleeps.
 | `claude` (Claude Code) | default harness | at least one harness |
 | `codex` (Codex CLI) | second harness | optional |
 | `axe` | budget-capped one-shot harness | optional |
+| [`jcode`](https://jcode.sh/docs) | multi-provider NDJSON harness | optional |
 | [`herdr`](https://herdr.dev) | attachable interactive rats | optional |
 
 ## Install
@@ -101,21 +102,30 @@ because they answer different questions — a branch may hold the only copy of a
 rat's work, a transcript only narrates work that lives elsewhere — so combine
 them (`--reap-git --reap-logs`) when you want everything reclaimed.
 
-Spawn options: `--harness claude|codex|axe|fake`, `--model`, `--role
+Spawn options: `--harness claude|codex|axe|jcode|fake`, `--model`, `--role
 rat|reviewer`, `--base <branch>`, `--parent <agent>` (completion routing),
 `--permission-mode`, `--no-merge` on dismiss, `--attach` (below). `rk status`
 shows the effective harness, model, and permission mode recorded for the
 generation.
 
 Ordinary workers are unattended, so Claude defaults to `bypassPermissions` and
-Codex defaults to `danger-full-access`. The adapters make those modes explicit:
-Claude receives `--dangerously-skip-permissions`; Codex receives
-`--dangerously-bypass-approvals-and-sandbox`. A command that waits for human
-approval cannot complete in a headless worker, and Codex also needs access to
-the Rat Kingdom socket under `RK_HOME`, outside the agent worktree. Codex
+Codex/jcode default to `danger-full-access`. The adapters make the Claude and
+Codex modes explicit: Claude receives `--dangerously-skip-permissions`; Codex
+receives `--dangerously-bypass-approvals-and-sandbox`. A command that waits for
+human approval cannot complete in a headless worker, and Codex also needs access
+to the Rat Kingdom socket under `RK_HOME`, outside the agent worktree. Codex
 `read-only`/`workspace-write` worker overrides are therefore rejected before
-launch. Onboarders are the exception: the daemon always forces Claude `plan` or
-Codex `read-only`, regardless of worker defaults.
+launch. jcode also runs with full host access: its adapter consumes
+`run --ndjson`, disables jcode-native swarm/auto-poke ownership, and rejects
+permission modes it cannot enforce. Configure its provider with `jcode login`
+before spawning. Onboarders are the exception: the daemon always forces Claude
+`plan` or Codex `read-only`, regardless of worker defaults; jcode cannot enforce
+that boundary and is rejected for onboarding.
+
+```bash
+jcode auth-test --all-configured
+rk spawn --harness jcode --task fix-login --prompt "Fix the login bug, verify, commit, and run rk done"
+```
 
 Workflow runs can opt into a stable coordinator ownership scope with
 `rk workflow run <name> --coordinator <session-id>`. The coordinator can then
@@ -768,6 +778,7 @@ in panes you can watch and take over:
 ```bash
 herdr integration install claude   # once — lets herdr report TUI readiness
 rk spawn --task tricky-1 --attach --prompt "..."
+rk spawn --harness jcode --task tricky-2 --attach --prompt "..."
 rk attach Whisker                  # drop into the live session
 rk steer Whisker "try the other approach"   # works from outside too
 ```
@@ -830,7 +841,7 @@ baseline. A toolchain bump may add lints over code that was clean when written
 unrelated change.
 
 Crate map: `rk-core` (tuple model, config, priming), `rk-space` (tuplespace),
-`rk-git` (worktrees/merges), `rk-harness` (claude/codex/axe/fake adapters),
+`rk-git` (worktrees/merges), `rk-harness` (claude/codex/axe/jcode/fake adapters),
 `rk-ledger` (pricing/budgets), `rk-workflow` (CUE definitions), `rk-sync`
 (git-notes replication), `rk-mux` (herdr), `rk-daemon` (supervisor, executor,
 server), `rk-cli` (`rk`).

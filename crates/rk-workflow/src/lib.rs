@@ -1233,6 +1233,22 @@ workflow: {
     }
 
     #[test]
+    fn jcode_is_an_allowed_agent_profile_harness() {
+        let source = r#"
+workflow: {
+    name: "jcode-worker"
+    agents: {default: {harness: "jcode", model: "gpt-test"}}
+    steps: [{type: "spawn", task: {title: "work"}}]
+}
+"#;
+        let workflow = load_str(source, &HashMap::new()).unwrap();
+        assert_eq!(
+            workflow.agents["default"].harness.as_deref(),
+            Some("jcode")
+        );
+    }
+
+    #[test]
     fn missing_required_param_is_rejected() {
         let err = load_str(SAMPLE, &HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("taskId"), "{err}");

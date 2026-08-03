@@ -150,9 +150,10 @@ pub fn interactive_argv(
     let mut argv: Vec<String> = match harness {
         "claude" => vec!["claude".into()],
         "codex" => vec!["codex".into()],
+        "jcode" => vec!["jcode".into(), "--no-update".into()],
         other => {
             return Err(rk_core::Error::other(format!(
-                "harness '{other}' has no interactive mode (attach supports claude, codex)"
+                "harness '{other}' has no interactive mode (attach supports claude, codex, jcode)"
             )))
         }
     };
@@ -194,6 +195,12 @@ pub fn interactive_argv(
                 _ => argv.push("--dangerously-bypass-approvals-and-sandbox".into()),
             }
         }
+        "jcode" => {
+            if let Some(model) = model {
+                argv.push("--model".into());
+                argv.push(model.into());
+            }
+        }
         _ => unreachable!(),
     }
     Ok(argv)
@@ -216,6 +223,18 @@ mod tests {
         let codex = interactive_argv("codex", None, Some("gpt-5.5-codex"), None).unwrap();
         assert_eq!(codex[0], "codex");
         assert!(codex.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+
+        let jcode = interactive_argv(
+            "jcode",
+            Some("delivered with the first prompt"),
+            Some("gpt-5.5"),
+            Some("danger-full-access"),
+        )
+        .unwrap();
+        assert_eq!(
+            jcode,
+            ["jcode", "--no-update", "--model", "gpt-5.5"]
+        );
 
         let claude = interactive_argv(
             "claude",

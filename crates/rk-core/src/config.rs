@@ -498,7 +498,7 @@ impl Default for LogConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct HarnessConfig {
-    /// Default harness kind for spawned rats: "claude" | "codex" | "axe".
+    /// Default harness kind for spawned rats: "claude" | "codex" | "axe" | "jcode".
     pub default: String,
 }
 

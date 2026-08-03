@@ -6,6 +6,7 @@ pub mod axe;
 pub mod claude;
 pub mod codex;
 pub mod fake;
+pub mod jcode;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -193,8 +194,9 @@ pub fn make_harness(kind: &str) -> rk_core::Result<Box<dyn Harness>> {
         "codex" => Ok(Box::new(codex::CodexHarness)),
         "axe" => Ok(Box::new(axe::AxeHarness)),
         "fake" => Ok(Box::new(fake::FakeHarness)),
+        "jcode" => Ok(Box::new(jcode::JcodeHarness)),
         other => Err(rk_core::Error::other(format!(
-            "unknown harness kind: {other} (available: claude, codex, axe, fake)"
+            "unknown harness kind: {other} (available: claude, codex, axe, jcode, fake)"
         ))),
     }
 }
