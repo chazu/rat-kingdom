@@ -131,6 +131,61 @@ rk spawn --harness jcode --task fix-login --prompt "Fix the login bug, verify, c
 rk repo onboard start . --harness jcode --model gpt-5.6-luna
 ```
 
+### Jcode configuration and precedence
+
+Use a global default when most workers should use jcode, and named profiles for
+workflow-specific choices:
+
+```toml
+# ~/.rat-kingdom/config.toml
+[agents.default]
+harness = "jcode"
+model = "gpt-5.6-luna"
+permission_mode = "danger-full-access"
+
+[agents.nightly]
+harness = "jcode"
+model = "gpt-5.6-luna"
+permission_mode = "danger-full-access"
+```
+
+A workflow can select and refine the same named profile. Inline fields are the
+last override:
+
+```cue
+workflow: {
+    name: "jcode-example"
+    agents: {
+        nightly: {model: "gpt-5.6-luna"}
+    }
+    steps: [{
+        type: "spawn"
+        role: "rat"
+        agent: "nightly"
+        model: "gpt-5.6-luna" // optional inline override
+        task: {title: "example"}
+    }]
+}
+```
+
+Resolution is field-by-field, from most to least specific: direct/inline spawn
+override; routed tier; workflow named profile; global profile with the same
+name; workflow default; global default; `[harness].default`. A direct
+`rk spawn --harness jcode --model ... --permission-mode ...` therefore wins
+over global defaults. `rk respawn` deliberately reuses the model and permission
+mode recorded for that generation; editing config does not silently change a
+failed worker. Inspect the effective values with `rk status <agent>` (or
+`rk --json status <agent>`).
+
+Ordinary jcode workers accept `danger-full-access`; `bypassPermissions` is a
+compatibility spelling with the same full-access contract. Restricted ordinary
+worker values are rejected because they cannot support the daemon coordination
+socket. Onboarding ignores worker permissions and forces the adapter's
+`read-only` tool allow-list. The repeatable invocation proof lives in
+[`crates/rk-harness/src/jcode.rs`](crates/rk-harness/src/jcode.rs), while profile,
+direct-spawn, respawn, and status coverage lives in the workflow, daemon, and
+CLI test suites.
+
 Workflow runs can opt into a stable coordinator ownership scope with
 `rk workflow run <name> --coordinator <session-id>`. The coordinator can then
 consume bounded attention and middle-rat rollups with:

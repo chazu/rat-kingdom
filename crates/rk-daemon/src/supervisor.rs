@@ -3718,9 +3718,9 @@ mod respawn_tests {
     }
 
     #[test]
-    fn global_default_profile_applies_to_direct_workers_but_not_onboarders() {
+    fn jcode_global_defaults_apply_to_direct_spawn_and_survive_respawn() {
         let profile = AgentProfile {
-            harness: Some("codex".into()),
+            harness: Some("jcode".into()),
             model: Some("gpt-test".into()),
             permission_mode: Some("danger-full-access".into()),
         };
@@ -3742,7 +3742,7 @@ mod respawn_tests {
         };
 
         let worker = effective_agent_config("claude", &profile, &params).unwrap();
-        assert_eq!(worker.harness, "codex");
+        assert_eq!(worker.harness, "jcode");
         assert_eq!(worker.model.as_deref(), Some("gpt-test"));
         assert_eq!(worker.permission_mode, "danger-full-access");
 
@@ -3771,7 +3771,16 @@ mod respawn_tests {
             "danger-full-access"
         );
 
+        params.model = Some("gpt-direct".into());
+        params.permission_mode = Some("bypassPermissions".into());
+        let direct_override = effective_agent_config("claude", &profile, &params).unwrap();
+        assert_eq!(direct_override.harness, "jcode");
+        assert_eq!(direct_override.model.as_deref(), Some("gpt-direct"));
+        assert_eq!(direct_override.permission_mode, "bypassPermissions");
+
         params.role = ONBOARDER_ROLE.into();
+        params.model = None;
+        params.permission_mode = None;
         let onboarder = effective_agent_config("claude", &profile, &params).unwrap();
         assert_eq!(onboarder.harness, "claude");
         assert_eq!(onboarder.model, None);

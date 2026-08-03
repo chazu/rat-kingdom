@@ -199,6 +199,59 @@ mod tests {
     }
 
     #[test]
+    fn jcode_settings_follow_profile_and_inline_precedence_per_field() {
+        let global = HashMap::from([
+            (
+                "default".into(),
+                AgentProfile {
+                    harness: Some("jcode".into()),
+                    model: Some("gpt-global".into()),
+                    permission_mode: Some("danger-full-access".into()),
+                },
+            ),
+            (
+                "nightly".into(),
+                AgentProfile {
+                    harness: None,
+                    model: Some("gpt-profile".into()),
+                    permission_mode: Some("bypassPermissions".into()),
+                },
+            ),
+        ]);
+        let workflow = HashMap::from([(
+            "nightly".into(),
+            AgentProfile {
+                harness: None,
+                model: Some("gpt-workflow".into()),
+                permission_mode: None,
+            },
+        )]);
+
+        let inherited = step(None)
+            .pipe_resolve(&HashMap::new(), &global, "claude")
+            .unwrap();
+        assert_eq!(inherited.harness, "jcode");
+        assert_eq!(inherited.model.as_deref(), Some("gpt-global"));
+        assert_eq!(
+            inherited.permission_mode.as_deref(),
+            Some("danger-full-access")
+        );
+
+        let mut overridden = step(Some("nightly"));
+        overridden.model = Some("gpt-inline".into());
+        overridden.permission_mode = Some("danger-full-access".into());
+        let resolved = overridden
+            .pipe_resolve(&workflow, &global, "claude")
+            .unwrap();
+        assert_eq!(resolved.harness, "jcode", "global default supplies harness");
+        assert_eq!(resolved.model.as_deref(), Some("gpt-inline"));
+        assert_eq!(
+            resolved.permission_mode.as_deref(),
+            Some("danger-full-access")
+        );
+    }
+
+    #[test]
     fn tier_layer_beats_named_profile_but_loses_to_inline() {
         let global = HashMap::from([
             ("default".into(), profile(Some("claude"), Some("opus"))),
