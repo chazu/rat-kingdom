@@ -33,7 +33,9 @@ workflow: {
 					"""
 			}
 		},
-		{type: "wait", timeout: "25m"},
+		// Mining the full event feed and writing proposals has exceeded 25m in
+		// production. Give this single self-improvement task the fan-out budget.
+		{type: "wait", timeout: "45m"},
 		{type: "evaluate", expect: {is_error: false}},
 		{type: "dismiss"},
 	]

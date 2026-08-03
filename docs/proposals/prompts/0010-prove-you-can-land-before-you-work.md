@@ -4,7 +4,7 @@
 **Target prompt:** `crates/rk-core/src/prime.rs` → `FRAGMENT_COMPLETION` (a new
 first step, ahead of "Commit BEFORE you verify")
 **Companion convention:** `prove-your-tools-on-entry`
-**Status:** proposed (do NOT apply live — an operator/steward lands this)
+**Status:** landed
 
 ## The recurring pain
 

@@ -635,6 +635,7 @@ impl Supervisor {
             Some(b) => b.clone(),
             None => repo.current_branch()?,
         };
+        let instruction_base = self.instruction_base(&params.role, &target_branch, &repo);
 
         // Resolve the harness before journaling so an unknown adapter never
         // leaves a durable failed row. After this point every side effect has a
@@ -703,7 +704,7 @@ impl Supervisor {
             repo: repo_name.clone(),
             task: Some(params.task.clone()),
             branch: Some(branch.clone()),
-            base: Some(target_branch.clone()),
+            base: Some(instruction_base.clone()),
             parent: params.parent.clone(),
             facts: self.scan_facts(&repo_name),
             conventions: self.scan_conventions(&repo_name),
@@ -724,7 +725,7 @@ impl Supervisor {
             &repo_name,
             &params.task,
             Some(&branch),
-            &target_branch,
+            &instruction_base,
             &worktree,
             params.workflow_instance.as_deref(),
         );
@@ -1040,6 +1041,9 @@ impl Supervisor {
         } else {
             None
         };
+        let repo = Repo::discover(&record.repo_root)?;
+        let instruction_base =
+            self.instruction_base(&record.role, &record.target_branch, &repo);
 
         let env = self.agent_env(
             &record.name,
@@ -1047,7 +1051,7 @@ impl Supervisor {
             &record.repo_name,
             &task,
             record.branch.as_deref(),
-            &record.target_branch,
+            &instruction_base,
             &worktree,
             record.workflow_instance.as_deref(),
         );
@@ -1057,7 +1061,7 @@ impl Supervisor {
             repo: record.repo_name.clone(),
             task: record.task.clone(),
             branch: record.branch.clone(),
-            base: Some(record.target_branch.clone()),
+            base: Some(instruction_base),
             parent: record.parent.clone(),
             facts: self.scan_facts(&record.repo_name),
             conventions: self.scan_conventions(&record.repo_name),
@@ -3451,6 +3455,29 @@ impl Supervisor {
         }
     }
 
+    /// The branch a worker must compare against in its instructions is not
+    /// always the branch its worktree was cut from. Reviewers are deliberately
+    /// chained onto the completed work, so their worktree base is that rat
+    /// branch while their comparison base is the predecessor's merge target.
+    fn instruction_base(&self, role: &str, worktree_base: &str, repo: &Repo) -> String {
+        if role != "reviewer" {
+            return worktree_base.to_string();
+        }
+        let predecessor_target = {
+            let registry = self.lock_registry();
+            registry
+                .list_all()
+                .into_iter()
+                .rev()
+                .find(|record| record.branch.as_deref() == Some(worktree_base))
+                .map(|record| record.target_branch.clone())
+        };
+        predecessor_target.unwrap_or_else(|| {
+            repo.current_branch()
+                .unwrap_or_else(|_| worktree_base.to_string())
+        })
+    }
+
     fn lock_controls(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionControl>> {
         match self.controls.lock() {
             Ok(g) => g,
@@ -3640,6 +3667,54 @@ mod respawn_tests {
         );
 
         assert_eq!(env.get("RK_BASE").map(String::as_str), Some("integration"));
+    }
+
+    #[test]
+    fn reviewer_instructions_compare_with_the_predecessors_merge_target() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        git(repo_dir.path(), &["branch", "integration"]);
+        let repo = Repo::discover(repo_dir.path()).unwrap();
+        let sup = supervisor(home.path());
+        let params = SpawnParams {
+            repo: repo_dir.path().display().to_string(),
+            task: "task".into(),
+            prompt: None,
+            role: "rat".into(),
+            coordination: None,
+            harness: Some("fake".into()),
+            parent: None,
+            base: Some("integration".into()),
+            model: None,
+            permission_mode: None,
+            attach: false,
+            workflow_instance: None,
+            coordinator: None,
+            instance_max_usd: None,
+        };
+        let record = spawning_record(SpawnJournal {
+            params: &params,
+            repo: &repo,
+            repo_name: "repo",
+            name: "Nibble".into(),
+            branch: "rat/nibble/task".into(),
+            worktree: repo_dir.path().join("worktree"),
+            target_branch: "integration".into(),
+            harness: "fake".into(),
+            model: None,
+            permission_mode: "workspace-write".into(),
+        });
+        sup.lock_registry().insert(record).unwrap();
+
+        assert_eq!(
+            sup.instruction_base("reviewer", "rat/nibble/task", &repo),
+            "integration"
+        );
+        assert_eq!(
+            sup.instruction_base("rat", "rat/nibble/task", &repo),
+            "rat/nibble/task"
+        );
     }
 
     #[test]

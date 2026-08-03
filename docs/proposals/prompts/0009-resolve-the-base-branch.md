@@ -7,7 +7,7 @@ and the `"reviewer"` arm of `render()`
 **Reconstructs:** Parmesan-2's lost 0009 (see 0010), re-derived independently and
 re-checked against `supervisor.rs` / `workflow_exec.rs` / `steward.cue`
 **Requires a test change** (unlike 0008) — see the safety section
-**Status:** proposed (do NOT apply live — an operator/steward lands this)
+**Status:** landed
 
 ## The gap
 

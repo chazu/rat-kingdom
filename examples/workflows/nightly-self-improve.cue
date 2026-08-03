@@ -142,7 +142,9 @@ workflow: {
 					"""
 			}
 		},
-		{type: "wait", timeout: "25m"},
+		// The refine phase mines the full event feed and writes proposals; its
+		// observed cost exceeds the old 25m budget, so match the fan-out join.
+		{type: "wait", timeout: "45m"},
 		{type: "evaluate", expect: {is_error: false}},
 		{type: "dismiss"},
 	]

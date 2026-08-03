@@ -360,13 +360,23 @@ completed and unresolved items, and run `rk done \"<summary>\"`. STOP after that
 const FRAGMENT_COMPLETION: &str = "\
 ## Completion protocol (mandatory, in order)
 
-1. Commit BEFORE you verify, not after. Your branch is read by other agents
+1. Prove you can LAND before you produce anything. On entry, once, run
+   `rk scan fact system` and `git status` in your worktree. If `rk` or a git
+   write (`git add`/`git commit`) is denied, missing, or errors out, STOP
+   IMMEDIATELY and say so as your only output — do not start the task, do not
+   look for a workaround. You cannot commit, so your worktree is deleted on
+   dismissal and everything you write is lost; you cannot reach the
+   tuplespace, so you cannot even report what you found. A denied tool at
+   minute 1 costs nothing. The same denial discovered at minute 25 has cost a
+   full lifetime and two finished proposals. Do not assume a denial is
+   transient because your workflow declares broad permissions.
+2. Commit BEFORE you verify, not after. Your branch is read by other agents
    while you are still working — a reviewer chains off it the moment your
    task is reported done, and an empty branch reads as a lost delivery. Never
    start a long verification run, and never end a turn, with the work sitting
    uncommitted in your worktree. Amend or add commits as verification forces
    changes.
-2. Verify with the project's documented verification entrypoint. Before choosing
+3. Verify with the project's documented verification entrypoint. Before choosing
    commands, inspect the repository's own instructions and configuration (for
    example its README, agent guidance, task runner, or named check). If the task
    or workflow provides a repository-owned verification check, use its documented
@@ -374,23 +384,24 @@ const FRAGMENT_COMPLETION: &str = "\
    relevant build, test, lint, or equivalent validation for this task and must
    actually run. A partial check is NOT verification. If no documented
    entrypoint exists, report that gap as an obstacle or need instead of guessing.
-3. Never `rk done` on a build you broke. If you hit a pre-existing failure that
+4. Never `rk done` on a build you broke. If you hit a pre-existing failure that
    is unrelated to your change, do NOT fix it inline (peers on other branches
    will race you) — file a ticket and post a `fact` tuple describing it, then
    finish your own task.
-4. Prove the branch carries the work before you signal. `rk done` is NOT a
+5. Prove the branch carries the work before you signal. `rk done` is NOT a
    commit: run `git status --porcelain` (must be empty) and
    `git log <base>..HEAD` (must be non-empty). Resolve `<base>` — do not assume
-   `main`. Your worktree is NOT always cut from the integration branch: a
+   an integration branch name. Your worktree is NOT always cut from the
+   integration branch: a
    workflow chains each step's rat onto the previous step's branch, so
-   `git log main..HEAD` can be non-empty because of a PREDECESSOR's commits
+   `git log <base>..HEAD` can be non-empty because of a PREDECESSOR's commits
    while you have committed nothing. Get your own fork point with
-   `git merge-base HEAD main` and count from there:
-   `git log $(git merge-base HEAD main)..HEAD` — and confirm at least one of
+   `git merge-base HEAD <base>` and count from there:
+   `git log $(git merge-base HEAD <base>)..HEAD` — and confirm at least one of
    those commits is yours (`git log --format='%an %s' $(git merge-base HEAD \
-   main)..HEAD`). If a verification command is still running, wait for it — do
+   <base>)..HEAD`). If a verification command is still running, wait for it — do
    not report while it is in flight.
-5. Before you finish, review the injected facts that were relevant to your task.
+6. Before you finish, review the injected facts that were relevant to your task.
    If a fact materially helped and appears correct, run `rk fact vote <fact-id> up`;
    if it is incorrect or harmful, run `rk fact vote <fact-id> down`. Use `clear`
    to retract an earlier vote. Vote only where you have a grounded view; this is
@@ -566,7 +577,7 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
             out.push_str(
                 "Review the changes on your branch against the task requirements. \
                  FIRST establish there are changes: run `git log <base>..HEAD`, where \
-                 `<base>` is the repo's INTEGRATION branch (`main`) — NOT your own \
+                 `<base>` is the repo's INTEGRATION branch — NOT your own \
                  fork point. You are chained onto the branch you are reviewing, so \
                  your fork point is the tip of that work and `git log` from it is \
                  empty on every healthy review. Counting from your fork point would \
@@ -574,7 +585,7 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
                  EMPTY branch is not a verdict — it has two causes needing OPPOSITE \
                  verdicts, so disambiguate before you judge. Find the implementer's \
                  commit (`rk scan artifact <repo>` records the sha) and run \
-                 `git merge-base --is-ancestor <sha> main`:\n\
+                 `git merge-base --is-ancestor <sha> <base>`:\n\
                  - NOT an ancestor ⇒ the work was never committed (check the \
                  implementer's branch and worktree — it may still be live with the \
                  work staged). APPROVE would merge a no-op and lose the work: \
@@ -726,7 +737,7 @@ mod tests {
         // 283 lines — so the mechanical check is pinned here rather than left
         // to each reviewer to re-derive from a repo-scoped fact.
         let text = render("reviewer", &ctx());
-        assert!(text.contains("git merge-base --is-ancestor <sha> main"));
+        assert!(text.contains("git merge-base --is-ancestor <sha> <base>"));
         assert!(
             text.contains("NOT an ancestor ⇒ the work was never committed"),
             "reviewer should be told the uncommitted case is a REWORK"
@@ -759,7 +770,8 @@ mod tests {
         let text = render("reviewer", &context);
 
         assert!(text.contains("git log rat/integration/review..HEAD"));
-        assert!(!text.contains("git log <base>..HEAD"));
+        assert!(text.contains("git merge-base HEAD rat/integration/review"));
+        assert!(!text.contains("<base>"));
     }
 
     #[test]
@@ -854,12 +866,31 @@ mod tests {
             );
             assert!(text.contains("git status --porcelain"));
             assert!(text.contains("git log <base>..HEAD"));
-            // <base> is not resolvable from a rat's env (supervisor.rs agent_env
-            // exports no base), and a workflow-chained rat is cut from its
-            // predecessor's branch, not main — so the placeholder has to come
-            // with the resolution.
-            assert!(text.contains("git merge-base HEAD main"));
+            // Operator-side rendering has no spawn context, so the placeholder
+            // keeps its mechanical fallback. Spawned workers receive the
+            // resolved value through both PrimeContext and RK_BASE.
+            assert!(text.contains("git merge-base HEAD <base>"));
             assert!(text.contains("do not assume"));
+        }
+    }
+
+    #[test]
+    fn completion_protocol_checks_landability_before_work() {
+        // A prompt-refine rat spent a full lifetime producing proposals under a
+        // sandbox that denied both rk and git writes. The entry check is the
+        // cheap boundary that prevents work which cannot be reported or kept.
+        for role in ["rat", "reviewer"] {
+            let text = render(role, &ctx());
+            let tools_at = text.find("Prove you can LAND").expect("entry tool check");
+            let commit_at = text
+                .find("Commit BEFORE you verify")
+                .expect("commit-first step");
+            assert!(
+                tools_at < commit_at,
+                "{role}: check tool access before producing work"
+            );
+            assert!(text.contains("STOP\n   IMMEDIATELY"), "{role}");
+            assert!(text.contains("rk scan fact system"), "{role}");
         }
     }
 
