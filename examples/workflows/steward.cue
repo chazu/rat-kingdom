@@ -56,9 +56,10 @@ workflow: {
 		// Where an approved branch lands. The reviewer's own base is the work
 		// branch, so only an explicit `land` can put it on main.
 		target: {type: "string", required: false, default: "main"}
-		// The repo's real check command — the run gate's teeth (#6). Run
-		// verbatim in the reviewer's worktree (checked out on the branch).
-		check: {type: "string", required: false, default: "cargo test --quiet"}
+		// The repo's real NAMED check — the run gate's teeth (#6). The command
+		// lives in `.rk/checks.cue`, not in this workflow definition, so the
+		// steward remains compatible with `require_named_checks = true`.
+		check: {type: "string", required: false, default: "verify"}
 		// POLICY GUARDRAIL (#19): an ERE matched against the names of files the
 		// branch changes vs `target`. A hit means the diff touches a protected
 		// path, so the steward refuses to auto-merge and escalates to a human.
@@ -131,7 +132,11 @@ workflow: {
 		//    diffs go to the operator, never to auto-merge.
 		{
 			type: "run"
-			command: "! git diff --name-only \(_input.target)...HEAD | grep -qE '\(_input.protectedPaths)'"
+			check: "steward-protected-paths"
+			env: {
+				RK_CHECK_TARGET:          _input.target
+				RK_CHECK_PROTECTED_PATHS: _input.protectedPaths
+			}
 			timeout: "2m"
 		},
 		{type: "evaluate", expect: {exit: 0}},
@@ -145,7 +150,12 @@ workflow: {
 		//     its verdict.
 		{
 			type: "run"
-			command: "files=$(git diff --name-only \(_input.target)...HEAD | wc -l | tr -d ' '); lines=$(git diff --numstat \(_input.target)...HEAD | awk '{a=$1;b=$2;if(a==\"-\")a=0;if(b==\"-\")b=0;s+=a+b} END{print s+0}'); echo \"diff-scope: $files files / $lines lines vs \(_input.target) (budget \(_input.maxDiffFiles)f/\(_input.maxDiffLines)l, 0=off)\"; { [ \(_input.maxDiffFiles) -eq 0 ] || [ $files -le \(_input.maxDiffFiles) ]; } && { [ \(_input.maxDiffLines) -eq 0 ] || [ $lines -le \(_input.maxDiffLines) ]; }"
+			check: "steward-diff-scope"
+			env: {
+				RK_CHECK_TARGET:         _input.target
+				RK_CHECK_MAX_DIFF_FILES: "\(_input.maxDiffFiles)"
+				RK_CHECK_MAX_DIFF_LINES: "\(_input.maxDiffLines)"
+			}
 			timeout: "2m"
 		},
 		{type: "evaluate", expect: {exit: 0}},
@@ -169,7 +179,7 @@ workflow: {
 		//    that names the real problem.
 		{
 			type:      "run"
-			command:   _input.check
+			check:     _input.check
 			timeout:   _input.gateTimeout
 			onTimeout: "continue"
 			field:     "verdict"
@@ -200,7 +210,13 @@ workflow: {
 				"timeout": [
 					{
 						type: "run"
-						command: "rk out need \(_input.repo) steward --payload '{\"agent\":\"steward\",\"task\":\"\(_input.taskId)\",\"text\":\"steward: run gate for \(_input.taskId) did not finish within \(_input.gateTimeout) on {{ctx.activeBranch}} — branch held unmerged; raise gateTimeout or point check at a scoped named check in .rk/checks.cue\"}'"
+						check: "steward-report-timeout"
+						env: {
+							RK_CHECK_REPO:         _input.repo
+							RK_CHECK_TASK_ID:      _input.taskId
+							RK_CHECK_GATE_TIMEOUT: _input.gateTimeout
+							RK_CHECK_BRANCH:       "{{ctx.activeBranch}}"
+						}
 						timeout: "2m"
 					},
 					{type: "dismiss", noMerge: true},
@@ -213,7 +229,12 @@ workflow: {
 			default: [
 				{
 					type: "run"
-					command: "rk out need \(_input.repo) steward --payload '{\"agent\":\"steward\",\"task\":\"\(_input.taskId)\",\"text\":\"steward: run gate FAILED for \(_input.taskId) on {{ctx.activeBranch}} — branch held unmerged; read the suite output with rk workflow status\"}'"
+					check: "steward-report-gate-failure"
+					env: {
+						RK_CHECK_REPO:    _input.repo
+						RK_CHECK_TASK_ID: _input.taskId
+						RK_CHECK_BRANCH:  "{{ctx.activeBranch}}"
+					}
 					timeout: "2m"
 				},
 				{type: "dismiss", noMerge: true},
@@ -277,7 +298,12 @@ workflow: {
 				"REWORK": [
 					{
 						type: "run"
-						command: "rk ticket new 'rework: \(_input.taskId)' --repo \(_input.repo) --body 'Steward routed REWORK on branch {{ctx.activeBranch}}. Read the reviewer notes: rk scan artifact \(_input.repo)'"
+						check: "steward-file-rework-ticket"
+						env: {
+							RK_CHECK_REPO:    _input.repo
+							RK_CHECK_TASK_ID: _input.taskId
+							RK_CHECK_BRANCH:  "{{ctx.activeBranch}}"
+						}
 						timeout: "2m"
 					},
 					{type: "dismiss", noMerge: true},
@@ -289,7 +315,12 @@ workflow: {
 				"STOP": [
 					{
 						type: "run"
-						command: "rk out need \(_input.repo) steward --payload '{\"agent\":\"steward\",\"task\":\"\(_input.taskId)\",\"text\":\"steward: reviewer returned STOP for \(_input.taskId) on {{ctx.activeBranch}} — needs a human merge decision; branch held unmerged\"}'"
+						check: "steward-report-stop"
+						env: {
+							RK_CHECK_REPO:    _input.repo
+							RK_CHECK_TASK_ID: _input.taskId
+							RK_CHECK_BRANCH:  "{{ctx.activeBranch}}"
+						}
 						timeout: "2m"
 					},
 					{type: "dismiss", noMerge: true},
@@ -300,7 +331,12 @@ workflow: {
 			default: [
 				{
 					type: "run"
-					command: "rk out need \(_input.repo) steward --payload '{\"agent\":\"steward\",\"task\":\"\(_input.taskId)\",\"text\":\"steward: unrecognized review verdict for \(_input.taskId) on {{ctx.activeBranch}} — branch held unmerged, needs a human\"}'"
+					check: "steward-report-unknown-verdict"
+					env: {
+						RK_CHECK_REPO:    _input.repo
+						RK_CHECK_TASK_ID: _input.taskId
+						RK_CHECK_BRANCH:  "{{ctx.activeBranch}}"
+					}
 					timeout: "2m"
 				},
 				{type: "dismiss", noMerge: true},

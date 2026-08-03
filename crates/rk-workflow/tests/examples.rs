@@ -292,21 +292,28 @@ fn steward_loads_and_routes() {
         })
         .collect();
     assert!(
-        runs.iter().any(|r| r
-            .command
-            .as_deref()
-            .is_some_and(|c| c.contains("git diff --name-only"))),
-        "a protected-path policy gate must run before merge"
+        runs.iter().any(|r| {
+            r.check.as_deref() == Some("steward-protected-paths")
+                && r.env.contains_key("RK_CHECK_TARGET")
+                && r.env.contains_key("RK_CHECK_PROTECTED_PATHS")
+        }),
+        "a repository-authorized protected-path policy gate must run before merge"
     );
     // A diff-scope gate bounds the SIZE of the branch's diff (#20): count files
     // and added+removed lines vs the target and exit non-zero when over budget.
     // The budget params interpolate to bare integers, so match the numstat probe.
     assert!(
-        runs.iter().any(|r| r
-            .command
-            .as_deref()
-            .is_some_and(|c| c.contains("git diff --numstat"))),
-        "a diff-scope guardrail must run before merge"
+        runs.iter().any(|r| {
+            r.check.as_deref() == Some("steward-diff-scope")
+                && r.env.contains_key("RK_CHECK_MAX_DIFF_FILES")
+                && r.env.contains_key("RK_CHECK_MAX_DIFF_LINES")
+        }),
+        "a repository-authorized diff-scope guardrail must run before merge"
+    );
+    assert!(
+        runs.iter()
+            .all(|r| r.command.is_none() && r.check.is_some()),
+        "steward top-level run gates must use repo-owned named checks"
     );
     let gate_evaluates = workflow
         .steps
@@ -377,14 +384,14 @@ fn steward_loads_and_routes() {
     assert!(
         when.cases["REWORK"]
             .iter()
-            .any(|s| matches!(s, Step::Run(r) if r.command.as_deref().is_some_and(|c| c.contains("rk ticket new")))),
+            .any(|s| matches!(s, Step::Run(r) if r.check.as_deref() == Some("steward-file-rework-ticket"))),
         "REWORK must file a follow-up ticket"
     );
     // STOP escalates to the operator via a need tuple and holds the branch.
     assert!(
-        when.cases["STOP"]
-            .iter()
-            .any(|s| matches!(s, Step::Run(r) if r.command.as_deref().is_some_and(|c| c.contains("rk out need")))),
+        when.cases["STOP"].iter().any(
+            |s| matches!(s, Step::Run(r) if r.check.as_deref() == Some("steward-report-stop"))
+        ),
         "STOP must escalate via a need tuple"
     );
     // Unknown verdict: escalate and fail loudly.

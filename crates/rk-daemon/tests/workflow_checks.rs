@@ -48,6 +48,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"did the wo
 const CHECKS: &str = r#"
 checks: [
     {name: "worktree-has-work", command: "test -f work-{{ctx.activeAgent}}.txt", expectExit: 0, timeout: "30s"},
+    {name: "check-inputs-arrive", command: "test \"$RK_CHECK_TASK\" = env-1 && test -n \"$RK_CHECK_AGENT\"", expectExit: 0, timeout: "30s"},
 ]
 "#;
 
@@ -77,6 +78,27 @@ workflow: {
         {type: "spawn", role: "rat", task: {title: _input.taskId, description: "do " + _input.taskId}},
         {type: "wait", timeout: "30s"},
         {type: "run", command: "echo pwned", expectExit: 0, timeout: "30s"},
+        {type: "dismiss"},
+    ]
+}
+"#;
+
+const CHECK_ENV_WORKFLOW: &str = r#"
+workflow: {
+    name: "named-check-env"
+    params: {taskId: {type: "string", required: true}}
+    agents: {default: {harness: "fake", model: "sonnet"}}
+    steps: [
+        {type: "spawn", role: "rat", task: {title: _input.taskId, description: "do " + _input.taskId}},
+        {type: "wait", timeout: "30s"},
+        {
+            type: "run"
+            check: "check-inputs-arrive"
+            env: {
+                RK_CHECK_TASK:  _input.taskId
+                RK_CHECK_AGENT: "{{ctx.activeAgent}}"
+            }
+        },
         {type: "dismiss"},
     ]
 }
@@ -174,6 +196,43 @@ async fn named_check_resolves_and_merges_under_policy() {
         listing.contains("work-"),
         "named-check green work must merge: {listing}"
     );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+/// Workflow data may parameterize a fixed repository-owned command only via
+/// the RK_CHECK_* namespace. Values are interpolated at execution time while
+/// the command remains the exact text declared by the repository.
+#[tokio::test]
+async fn named_check_receives_namespaced_data_inputs_under_policy() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    write_def(repo_dir.path(), "named-check-env", CHECK_ENV_WORKFLOW);
+    write_checks(repo_dir.path(), CHECKS);
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    let layout = Layout::at(home.path());
+    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    daemon.set_require_named_checks(true);
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let started = client
+        .call(
+            "workflow.run",
+            json!({
+                "name": "named-check-env",
+                "repo": repo_dir.path().to_string_lossy(),
+                "params": {"taskId": "env-1"},
+            }),
+        )
+        .await
+        .unwrap();
+    let id = started["instance"]["id"].as_str().unwrap().to_string();
+
+    await_status(&mut client, &id, "completed").await;
+    assert!(main_listing(repo_dir.path()).contains("work-"));
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }

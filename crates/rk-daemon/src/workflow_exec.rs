@@ -2018,6 +2018,14 @@ impl WorkflowEngine {
                 child_command.env_remove(name);
             }
         }
+        for (name, value) in &run.env {
+            if !valid_check_env_name(name) {
+                return Err(rk_core::Error::other(format!(
+                    "run step: environment name '{name}' is not allowed; use RK_CHECK_*"
+                )));
+            }
+            child_command.env(name, interpolate(value, ctx));
+        }
         let child = child_command
             .spawn()
             .map_err(|e| {
@@ -2611,6 +2619,18 @@ fn interpolate_item(text: &str, item: &TicketItem, ctx: &WorkflowContext) -> Str
         .replace("{{item.body}}", &item.body)
 }
 
+/// Keep named-check inputs in a data-only namespace. In particular, a workflow
+/// must not be able to replace PATH/BASH_ENV/loader hooks or forge RK_AGENT.
+fn valid_check_env_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix("RK_CHECK_") else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 /// Replace `{{ctx.*}}` placeholders in workflow strings at execution time.
 fn interpolate(text: &str, ctx: &WorkflowContext) -> String {
     let previous = ctx
@@ -2854,6 +2874,23 @@ mod tests {
             interpolate(text, &ctx),
             "Review rat/whisker/t1 by Whisker: looks good"
         );
+    }
+
+    #[test]
+    fn named_check_inputs_cannot_replace_process_authority() {
+        for allowed in ["RK_CHECK_TASK", "RK_CHECK_DIFF_LIMIT_2"] {
+            assert!(valid_check_env_name(allowed), "{allowed}");
+        }
+        for rejected in [
+            "PATH",
+            "BASH_ENV",
+            "RK_AGENT",
+            "RK_CHECK_",
+            "RK_CHECK_lower",
+            "RK_CHECK_BAD-NAME",
+        ] {
+            assert!(!valid_check_env_name(rejected), "{rejected}");
+        }
     }
 
     #[test]

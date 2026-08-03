@@ -348,6 +348,12 @@ workflow: #Workflow
 	// Working directory relative to the worktree root; the root if unset. For a
 	// named check, overrides the check's own cwd when set.
 	cwd?: string
+	// Data inputs for a repo-owned named check. The executor accepts only names
+	// in the RK_CHECK_* namespace, preventing a workflow from replacing PATH,
+	// loader hooks, or the supervised agent identity. Values may use ctx
+	// interpolation and are passed as environment variables, never as command
+	// text.
+	env?: [string]: string
 	// If set, the step fails the instance inline when the actual exit code
 	// differs (fail-closed). If unset, the exit is only captured for a
 	// following evaluate/when to route on. For a named check, overrides the

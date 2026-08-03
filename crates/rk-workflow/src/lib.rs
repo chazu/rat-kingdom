@@ -443,6 +443,13 @@ pub struct RunStep {
     /// named check, this overrides the check's own `cwd` when set.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Workflow-supplied data passed to a repository-owned named check without
+    /// changing the check's executable command. Names are restricted at
+    /// execution time to the `RK_CHECK_*` namespace so an untrusted workflow
+    /// cannot replace `PATH`, loader hooks, or the supervised agent identity.
+    /// Values support the same runtime context interpolation as commands.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
     /// If set, the step itself fails the instance when the actual exit code
     /// differs — a fail-closed inline gate. If unset, the exit is only
     /// captured for a following `evaluate`/`when` to route on. For a named check,

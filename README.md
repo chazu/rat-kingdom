@@ -663,7 +663,12 @@ workflow: {
   It may also declare `environmentPolicy: "inherit" | "strip_rk_spawn"`; the
   latter removes ambient supervised-agent identity before execution. Optional
   `toolchain` text records the repository-owned runner/toolchain for onboarding
-  evidence.
+  evidence. A workflow may pass data to that fixed command through an `env`
+  map, but only with `RK_CHECK_*` names; attempts to replace `PATH`, loader
+  hooks, or `RK_AGENT` fail closed. The shipped steward uses this mechanism for
+  its repo-owned diff guards and escalation actions, so repositories enabling
+  it must register the matching `steward-*` checks shown in
+  `examples/checks.cue` as well as their `verify` check.
   The same registry is surfaced as optional guidance in spawned worker prompts;
   it does not replace the workflow gate. See `examples/workflows/named-check-merge.cue`.
 

@@ -1,49 +1,17 @@
-// Per-repo named-check registry (TKT-30). Copy to <repo>/.rk/checks.cue.
-//
-// Each entry is a named command the repo owner trusts. A workflow `run` step
-// invokes one by NAME (`{type: "run", check: "test"}`) instead of carrying a raw
-// shell command. With `[policy] require_named_checks = true` in the daemon
-// config, a raw `command` on a run step is refused fail-closed — so a compromised
-// or untrusted workflow definition can only ever run the checks listed HERE,
-// never arbitrary shell in an agent's worktree.
-//
-// A valid registry is also rendered into spawned and resumed worker prompts as
-// optional Repository verification checks guidance. The prompt shows the
-// declared metadata, while workflow run steps remain the authoritative gate.
-// A missing or invalid registry falls back to generic prompt guidance and does
-// not make priming fail.
-//
-// The command still runs via `sh -c` in the active rat's worktree, but the text
-// is fixed by this repo-owned file, which is the whole point of the allowlist.
+package checks
+
+// Repository-owned executable contract. Workflows may select these entries by
+// name, but they cannot replace their command text. This keeps unattended
+// automation compatible with the castle's fail-closed require_named_checks
+// policy.
 checks: [
 	{
 		name:              "verify"
-		command:           "cargo build --workspace && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings"
+		command:           "mise run verify"
 		timeout:           "60m"
 		environmentPolicy: "strip_rk_spawn"
-		toolchain:         "repository Rust toolchain"
+		toolchain:         "mise rust@1.95.0"
 	},
-	{
-		name:              "test"
-		command:           "cargo test --quiet"
-		timeout:           "20m"
-		environmentPolicy: "strip_rk_spawn"
-		toolchain:         "repository Rust toolchain"
-	},
-	{
-		name:       "clippy"
-		command:    "cargo clippy --all-targets -- -D warnings"
-		expectExit: 0
-		timeout:    "10m"
-	},
-	{
-		name:    "fmt"
-		command: "cargo fmt --check"
-		timeout: "2m"
-	},
-	// The steward workflow uses these repository-authorized gates and actions.
-	// Dynamic workflow data arrives only through RK_CHECK_* variables; command
-	// text remains owned by this registry.
 	{
 		name: "steward-protected-paths"
 		command: "target=$RK_CHECK_TARGET; ! git diff --name-only \"$target\"...HEAD | grep -qE \"$RK_CHECK_PROTECTED_PATHS\""
