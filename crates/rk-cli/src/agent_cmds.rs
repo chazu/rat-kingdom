@@ -529,6 +529,10 @@ fn format_status(a: &Value) -> String {
             a["branch"].as_str().unwrap_or("-").to_string(),
         ),
         (
+            "base",
+            a["target_branch"].as_str().unwrap_or("-").to_string(),
+        ),
+        (
             "session",
             a["session_id"].as_str().unwrap_or("-").to_string(),
         ),
@@ -915,6 +919,7 @@ mod tests {
             "repo_root": "/tmp/repo",
             "task": "research",
             "branch": "rat/rizzo/research",
+            "target_branch": "integration",
             "session_id": "session",
             "usage": {},
             "cost_usd": 0.0,
@@ -924,5 +929,6 @@ mod tests {
             rendered.contains("permissions bypassPermissions"),
             "{rendered}"
         );
+        assert!(rendered.contains("base        integration"), "{rendered}");
     }
 }

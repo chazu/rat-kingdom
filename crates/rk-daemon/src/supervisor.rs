@@ -703,6 +703,7 @@ impl Supervisor {
             repo: repo_name.clone(),
             task: Some(params.task.clone()),
             branch: Some(branch.clone()),
+            base: Some(target_branch.clone()),
             parent: params.parent.clone(),
             facts: self.scan_facts(&repo_name),
             conventions: self.scan_conventions(&repo_name),
@@ -723,6 +724,7 @@ impl Supervisor {
             &repo_name,
             &params.task,
             Some(&branch),
+            &target_branch,
             &worktree,
             params.workflow_instance.as_deref(),
         );
@@ -1045,6 +1047,7 @@ impl Supervisor {
             &record.repo_name,
             &task,
             record.branch.as_deref(),
+            &record.target_branch,
             &worktree,
             record.workflow_instance.as_deref(),
         );
@@ -1054,6 +1057,7 @@ impl Supervisor {
             repo: record.repo_name.clone(),
             task: record.task.clone(),
             branch: record.branch.clone(),
+            base: Some(record.target_branch.clone()),
             parent: record.parent.clone(),
             facts: self.scan_facts(&record.repo_name),
             conventions: self.scan_conventions(&record.repo_name),
@@ -3378,6 +3382,7 @@ impl Supervisor {
         repo_name: &str,
         task: &str,
         branch: Option<&str>,
+        base: &str,
         worktree: &std::path::Path,
         workflow_instance: Option<&str>,
     ) -> HashMap<String, String> {
@@ -3394,6 +3399,7 @@ impl Supervisor {
         if let Some(branch) = branch {
             env.insert("RK_BRANCH".into(), branch.to_string());
         }
+        env.insert("RK_BASE".into(), base.to_string());
         env.insert("RK_WORKTREE".into(), worktree.display().to_string());
         if let Some(instance) = workflow_instance {
             env.insert("RK_WORKFLOW_INSTANCE".into(), instance.to_string());
@@ -3616,6 +3622,24 @@ mod respawn_tests {
         assert_eq!(default_permission_mode("codex"), "danger-full-access");
         assert_eq!(default_permission_mode("jcode"), "danger-full-access");
         assert_eq!(default_permission_mode("claude"), "bypassPermissions");
+    }
+
+    #[test]
+    fn agent_env_exports_resolved_base() {
+        let home = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let env = sup.agent_env(
+            "Nibble",
+            "reviewer",
+            "repo",
+            "review",
+            Some("rat/nibble/review"),
+            "integration",
+            Path::new("/tmp/review-worktree"),
+            None,
+        );
+
+        assert_eq!(env.get("RK_BASE").map(String::as_str), Some("integration"));
     }
 
     #[test]

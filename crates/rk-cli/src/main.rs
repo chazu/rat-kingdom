@@ -608,6 +608,7 @@ fn print_prime(role: String, json_output: bool) -> Result<()> {
         repo: std::env::var("RK_REPO").unwrap_or_default(),
         task: std::env::var("RK_TASK").ok(),
         branch: std::env::var("RK_BRANCH").ok(),
+        base: std::env::var("RK_BASE").ok(),
         parent: std::env::var("RK_PARENT").ok(),
         facts: Vec::new(),
         // `rk prime` inspects the template shape; live conventions are scanned

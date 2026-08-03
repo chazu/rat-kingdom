@@ -14,6 +14,9 @@ pub struct PrimeContext {
     pub repo: String,
     pub task: Option<String>,
     pub branch: Option<String>,
+    /// Resolved merge/base branch used when spawning this worker. The renderer
+    /// substitutes it into instructions that mention `<base>`.
+    pub base: Option<String>,
     pub parent: Option<String>,
     /// Recent facts pre-scanned by the caller from the tuplespace for this
     /// rat's repo scope + system. The renderer caps injected facts at
@@ -612,7 +615,9 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
             out.push_str(FRAGMENT_COMPLETION);
         }
     }
-    out
+    // Preserve the placeholder for operator-side/template rendering when no
+    // resolved base was supplied; spawned workers receive the concrete value.
+    out.replace("<base>", ctx.base.as_deref().unwrap_or("<base>"))
 }
 
 #[cfg(test)]
@@ -625,6 +630,7 @@ mod tests {
             repo: "myrepo".into(),
             task: Some(".rk-1".into()),
             branch: Some("rat/whisker/rk-1".into()),
+            base: None,
             parent: None,
             facts: Vec::new(),
             conventions: Vec::new(),
@@ -744,6 +750,16 @@ mod tests {
         );
         // Confined to the reviewer arm — a directed rat renders no verdicts.
         assert!(!render("rat", &ctx()).contains("git merge-base --is-ancestor"));
+    }
+
+    #[test]
+    fn resolved_base_replaces_reviewer_placeholder() {
+        let mut context = ctx();
+        context.base = Some("rat/integration/review".into());
+        let text = render("reviewer", &context);
+
+        assert!(text.contains("git log rat/integration/review..HEAD"));
+        assert!(!text.contains("git log <base>..HEAD"));
     }
 
     #[test]
