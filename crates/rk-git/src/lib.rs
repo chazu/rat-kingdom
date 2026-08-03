@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -15,6 +16,19 @@ use tracing::debug;
 /// `worktree add` would fail. Merges to the *same* target are additionally
 /// serialized upstream by the daemon's merge queue.
 static MERGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Git's worktree administration mutates shared `.git/worktrees` metadata and
+/// is not safe under concurrent `add`/`remove`/`prune` processes, even when the
+/// worktree paths and target refs are distinct. Keep that short metadata
+/// boundary process-serialized; the actual work performed inside each
+/// worktree remains concurrent.
+static WORKTREE_METADATA: Mutex<()> = Mutex::new(());
+
+fn worktree_metadata_guard() -> MutexGuard<'static, ()> {
+    WORKTREE_METADATA
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 pub const PROTECTED_BRANCHES: [&str; 4] = ["main", "master", "develop", "HEAD"];
 
@@ -206,6 +220,7 @@ impl Repo {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let _metadata = worktree_metadata_guard();
         // Cute rat names are drawn from a finite pool and reused, so a prior rat
         // of the same name can leave a worktree directory behind (a crash or a
         // failed cleanup) at exactly this path; `git worktree add` then fails
@@ -249,11 +264,13 @@ impl Repo {
     /// Remove a worktree (force: uncommitted changes in it are discarded —
     /// dismiss-with-merge commits first via the agent's own protocol).
     pub fn remove_worktree(&self, path: &Path) -> rk_core::Result<()> {
+        let _metadata = worktree_metadata_guard();
         self.git(&["worktree", "remove", "--force", &path.to_string_lossy()])?;
         Ok(())
     }
 
     pub fn prune_worktrees(&self) -> rk_core::Result<()> {
+        let _metadata = worktree_metadata_guard();
         self.git(&["worktree", "prune"])?;
         Ok(())
     }
@@ -340,13 +357,16 @@ impl Repo {
             .join(".git")
             .join(format!("rk-merge-{}-{}", std::process::id(), seq));
         // Detached checkout of target — never conflicts with existing checkouts.
-        self.git(&[
-            "worktree",
-            "add",
-            "--detach",
-            &tmp.to_string_lossy(),
-            target,
-        ])?;
+        {
+            let _metadata = worktree_metadata_guard();
+            self.git(&[
+                "worktree",
+                "add",
+                "--detach",
+                &tmp.to_string_lossy(),
+                target,
+            ])?;
+        }
         let result = (|| -> rk_core::Result<MergeOutcome> {
             let target_before = self.git(&["rev-parse", &format!("refs/heads/{target}")])?;
             match op(&tmp) {
@@ -375,7 +395,10 @@ impl Repo {
             }
         })();
         // Always clean up the temp worktree.
-        let _ = self.git(&["worktree", "remove", "--force", &tmp.to_string_lossy()]);
+        {
+            let _metadata = worktree_metadata_guard();
+            let _ = self.git(&["worktree", "remove", "--force", &tmp.to_string_lossy()]);
+        }
         result
     }
 
