@@ -193,6 +193,28 @@ fn shipped_example_schedules_load() {
 }
 
 #[test]
+fn repository_activates_the_daily_nightly_schedule() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join(".rk")
+        .join("schedules.cue");
+    let schedules = rk_workflow::load_schedules(&file)
+        .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
+    assert_eq!(schedules.len(), 1, "one self-improvement cadence");
+    let nightly = &schedules[0];
+    assert_eq!(nightly.name, "nightly-self-improve");
+    assert_eq!(nightly.cron, "0 3 * * *");
+    assert_eq!(nightly.run, "nightly-self-improve");
+    assert_eq!(nightly.repo, None, "repo-local discovery supplies the repo");
+    assert_eq!(nightly.params.get("limit").map(String::as_str), Some("5"));
+    assert_eq!(
+        nightly.params.get("budgetUsd").map(String::as_str),
+        Some("30")
+    );
+}
+
+#[test]
 fn shipped_example_checks_load() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
