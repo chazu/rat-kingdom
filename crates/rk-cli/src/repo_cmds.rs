@@ -7,6 +7,7 @@ use rk_daemon::onboarding_proposals::OnboardingProposal;
 use rk_daemon::onboarding_sessions::{OnboardingReport, OnboardingSessionStatus};
 use rk_daemon::Client;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 pub async fn add(
     layout: &Layout,
@@ -44,12 +45,25 @@ pub async fn add(
     if as_json {
         println!("{repo}");
     } else {
-        println!(
-            "registered {} → {} ({} mode)",
-            repo["name"].as_str().unwrap_or("?"),
-            repo["path"].as_str().unwrap_or("?"),
-            repo["merge_mode"].as_str().unwrap_or("direct")
-        );
+        let policy = &repo["activated_policy"];
+        if policy.is_object() {
+            println!(
+                "registered {} → {} ({} delivery; policy {})",
+                repo["name"].as_str().unwrap_or("?"),
+                repo["path"].as_str().unwrap_or("?"),
+                policy["policy"]["delivery"]["mode"]
+                    .as_str()
+                    .unwrap_or("merge"),
+                short_digest(policy["digest"].as_str().unwrap_or("?"))
+            );
+        } else {
+            println!(
+                "registered {} → {} (legacy {} mode)",
+                repo["name"].as_str().unwrap_or("?"),
+                repo["path"].as_str().unwrap_or("?"),
+                repo["merge_mode"].as_str().unwrap_or("direct")
+            );
+        }
     }
     Ok(())
 }
@@ -106,6 +120,54 @@ pub async fn show(layout: &Layout, name: String, as_json: bool) -> Result<()> {
         "  remote     {}",
         repo["remote"].as_str().unwrap_or("origin")
     );
+    if let Some(activated) = repo["activated_policy"].as_object() {
+        let policy = &activated["policy"];
+        let work = &policy["work"];
+        let delivery = &policy["delivery"];
+        let digest = activated["digest"].as_str().unwrap_or("?");
+        println!("  policy     {} (activated)", short_digest(digest));
+        println!(
+            "  branch     {}",
+            work["branch"].as_str().unwrap_or("rat/{{agent}}/{{task}}")
+        );
+        println!(
+            "  worktree   {}",
+            work["worktree"].as_str().unwrap_or("{{repo}}/{{agent}}")
+        );
+        println!(
+            "  delivery   {} → {}",
+            delivery["mode"].as_str().unwrap_or("merge"),
+            delivery["target"].as_str().unwrap_or("agent-base")
+        );
+        println!(
+            "  publish    {}/{}",
+            delivery["remote"].as_str().unwrap_or("origin"),
+            delivery["remoteBranch"].as_str().unwrap_or("{{branch}}")
+        );
+        println!(
+            "  cleanup    delete source branch: {}",
+            delivery["deleteSource"].as_bool().unwrap_or(true)
+        );
+        let policy_path = std::path::Path::new(repo["path"].as_str().unwrap_or(""))
+            .join(".rk")
+            .join("repo.cue");
+        match std::fs::read(&policy_path) {
+            Ok(bytes) => {
+                let live = hex::encode(Sha256::digest(bytes));
+                if live == digest {
+                    println!("  drift      clean");
+                } else {
+                    println!(
+                        "  drift      VERSIONED FILE DIFFERS ({}; run onboarding to activate)",
+                        short_digest(&live)
+                    );
+                }
+            }
+            Err(error) => println!("  drift      unreadable: {error}"),
+        }
+    } else {
+        println!("  policy     legacy registry fields (no activated .rk/repo.cue)");
+    }
     if let Some(host) = repo["host"].as_str() {
         println!("  host       {host}");
     }
@@ -125,6 +187,10 @@ pub async fn show(layout: &Layout, name: String, as_json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn short_digest(digest: &str) -> &str {
+    digest.get(..12).unwrap_or(digest)
 }
 
 pub async fn onboard_inspect(layout: &Layout, target: String, as_json: bool) -> Result<()> {

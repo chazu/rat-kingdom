@@ -6,6 +6,7 @@ pub mod resolve;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,185 @@ const SCHEMA: &str = include_str!("schema.cue");
 const TRIGGER_SCHEMA: &str = include_str!("triggers-schema.cue");
 const SCHEDULE_SCHEMA: &str = include_str!("schedules-schema.cue");
 const CHECK_SCHEMA: &str = include_str!("checks-schema.cue");
+const REPOSITORY_POLICY_SCHEMA: &str = include_str!("repository-policy-schema.cue");
+
+/// How a completed branch is delivered for one registered repository.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeliveryMode {
+    /// Merge the source into its target locally.
+    #[default]
+    Merge,
+    /// Merge locally, then push the resulting target branch.
+    MergePush,
+    /// Push the source branch without merging it.
+    PushBranch,
+    /// Push the source branch and open a pull/merge request.
+    Pr,
+}
+
+/// Per-repository branch and worktree naming templates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkPolicy {
+    #[serde(default = "default_branch_template")]
+    pub branch: String,
+    #[serde(default = "default_worktree_template")]
+    pub worktree: String,
+}
+
+impl Default for WorkPolicy {
+    fn default() -> Self {
+        Self {
+            branch: default_branch_template(),
+            worktree: default_worktree_template(),
+        }
+    }
+}
+
+/// Per-repository destination and remote-delivery behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryPolicy {
+    #[serde(default = "default_delivery_target")]
+    pub target: String,
+    #[serde(default)]
+    pub mode: DeliveryMode,
+    #[serde(default = "default_remote")]
+    pub remote: String,
+    #[serde(default = "default_remote_branch", rename = "remoteBranch")]
+    pub remote_branch: String,
+    #[serde(default = "default_true", rename = "deleteSource")]
+    pub delete_source: bool,
+}
+
+impl Default for DeliveryPolicy {
+    fn default() -> Self {
+        Self {
+            target: default_delivery_target(),
+            mode: DeliveryMode::default(),
+            remote: default_remote(),
+            remote_branch: default_remote_branch(),
+            delete_source: true,
+        }
+    }
+}
+
+/// Versioned repository behavior activated into the daemon's repo registry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryPolicy {
+    #[serde(default)]
+    pub work: WorkPolicy,
+    #[serde(default)]
+    pub delivery: DeliveryPolicy,
+}
+
+impl RepositoryPolicy {
+    /// Render the local agent branch using git-ref-safe placeholder values.
+    pub fn branch_name(&self, agent: &str, task: &str, repo: &str, role: &str) -> String {
+        render_work_template(
+            &self.work.branch,
+            &slug(agent),
+            &slug(task),
+            &slug(repo),
+            &slug(role),
+        )
+    }
+
+    /// Render the path relative to Rat Kingdom's worktree root. The policy
+    /// loader has already rejected absolute and parent-traversing templates.
+    pub fn worktree_path(&self, agent: &str, task: &str, repo: &str, role: &str) -> PathBuf {
+        PathBuf::from(render_work_template(
+            &self.work.worktree,
+            &safe_path_segment(agent),
+            &safe_path_segment(task),
+            &safe_path_segment(repo),
+            &safe_path_segment(role),
+        ))
+    }
+
+    /// Resolve `agent-base` to the branch the completed worker was actually
+    /// based on; a fixed policy target ignores that runtime base.
+    pub fn delivery_target(&self, agent_base: &str) -> String {
+        if self.delivery.target == "agent-base" {
+            agent_base.to_string()
+        } else {
+            self.delivery.target.clone()
+        }
+    }
+
+    /// Render the configured remote branch. `branch` and `target` are already
+    /// validated git refs and intentionally retain their slash hierarchy.
+    pub fn remote_branch(&self, branch: &str, target: &str, repo: &str) -> String {
+        self.delivery
+            .remote_branch
+            .replace("{{branch}}", branch)
+            .replace("{{target}}", target)
+            .replace("{{repo}}", &slug(repo))
+    }
+}
+
+fn render_work_template(
+    template: &str,
+    agent: &str,
+    task: &str,
+    repo: &str,
+    role: &str,
+) -> String {
+    template
+        .replace("{{agent}}", agent)
+        .replace("{{task}}", task)
+        .replace("{{repo}}", repo)
+        .replace("{{role}}", role)
+}
+
+fn slug(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn safe_path_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('.')
+        .to_string()
+}
+
+fn default_branch_template() -> String {
+    "rat/{{agent}}/{{task}}".into()
+}
+
+fn default_worktree_template() -> String {
+    "{{repo}}/{{agent}}".into()
+}
+
+fn default_delivery_target() -> String {
+    "agent-base".into()
+}
+
+fn default_remote() -> String {
+    "origin".into()
+}
+
+fn default_remote_branch() -> String {
+    "{{branch}}".into()
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Workflow {
@@ -562,6 +742,170 @@ pub fn load_checks_str(source: &str) -> rk_core::Result<Vec<Check>> {
     let checks: Vec<Check> = serde_json::from_str(&json)
         .map_err(|e| rk_core::Error::other(format!("checks JSON did not match schema: {e}")))?;
     Ok(checks)
+}
+
+/// Load and validate a versioned `.rk/repo.cue` policy.
+pub fn load_repository_policy(file: &Path) -> rk_core::Result<RepositoryPolicy> {
+    load_repository_policy_with_digest(file).map(|(policy, _)| policy)
+}
+
+/// Load and digest the same immutable byte snapshot, avoiding a policy/digest
+/// mismatch if the file changes while registration or activation is reading it.
+pub fn load_repository_policy_with_digest(
+    file: &Path,
+) -> rk_core::Result<(RepositoryPolicy, String)> {
+    let source = std::fs::read_to_string(file)
+        .map_err(|e| rk_core::Error::other(format!("read {}: {e}", file.display())))?;
+    let digest = hex::encode(Sha256::digest(source.as_bytes()));
+    Ok((load_repository_policy_str(&source)?, digest))
+}
+
+/// SHA-256 digest of the exact policy bytes used as the activation identity.
+pub fn repository_policy_digest(file: &Path) -> rk_core::Result<String> {
+    let bytes = std::fs::read(file)
+        .map_err(|e| rk_core::Error::other(format!("read {}: {e}", file.display())))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+/// Load a repository policy from CUE source and enforce template safety rules
+/// that are clearer to express once the schema has produced concrete strings.
+pub fn load_repository_policy_str(source: &str) -> rk_core::Result<RepositoryPolicy> {
+    let source = schema_with_source(REPOSITORY_POLICY_SCHEMA, source);
+    let json = cue_export_stdin(&source, "repo")?;
+    let policy: RepositoryPolicy = serde_json::from_str(&json).map_err(|e| {
+        rk_core::Error::other(format!("repository policy JSON did not match schema: {e}"))
+    })?;
+    validate_repository_policy(&policy)?;
+    Ok(policy)
+}
+
+fn validate_repository_policy(policy: &RepositoryPolicy) -> rk_core::Result<()> {
+    validate_template(
+        "repo.work.branch",
+        &policy.work.branch,
+        &["agent", "task", "repo", "role"],
+    )?;
+    validate_template(
+        "repo.work.worktree",
+        &policy.work.worktree,
+        &["agent", "task", "repo", "role"],
+    )?;
+    if !policy.work.branch.contains("{{agent}}") {
+        return Err(rk_core::Error::other(
+            "repo.work.branch must contain {{agent}} so concurrent workers are unique",
+        ));
+    }
+    if !policy.work.worktree.contains("{{agent}}") {
+        return Err(rk_core::Error::other(
+            "repo.work.worktree must contain {{agent}} so concurrent workers are unique",
+        ));
+    }
+    validate_branch_value(
+        "repo.work.branch",
+        &policy.branch_name("sample-agent", "sample-task", "sample-repo", "rat"),
+    )?;
+    let worktree = Path::new(&policy.work.worktree);
+    if worktree.is_absolute()
+        || worktree.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(rk_core::Error::other(
+            "repo.work.worktree must stay below Rat Kingdom's worktrees directory",
+        ));
+    }
+    validate_template(
+        "repo.delivery.remoteBranch",
+        &policy.delivery.remote_branch,
+        &["branch", "target", "repo"],
+    )?;
+    if policy.delivery.target != "agent-base" {
+        validate_branch_value("repo.delivery.target", &policy.delivery.target)?;
+    }
+    validate_branch_value(
+        "repo.delivery.remoteBranch",
+        &policy.remote_branch("rat/sample-agent/sample-task", "main", "sample-repo"),
+    )?;
+    if matches!(
+        policy.delivery.mode,
+        DeliveryMode::PushBranch | DeliveryMode::Pr
+    ) && !policy.delivery.remote_branch.contains("{{branch}}")
+    {
+        return Err(rk_core::Error::other(
+            "repo.delivery.remoteBranch must contain {{branch}} for push-branch or pr mode",
+        ));
+    }
+    for (name, value) in [
+        ("repo.delivery.target", policy.delivery.target.as_str()),
+        ("repo.delivery.remote", policy.delivery.remote.as_str()),
+        (
+            "repo.delivery.remoteBranch",
+            policy.delivery.remote_branch.as_str(),
+        ),
+    ] {
+        if value.trim().is_empty() || value.contains('\0') || value.contains(char::is_whitespace) {
+            return Err(rk_core::Error::other(format!(
+                "{name} must be a non-empty whitespace-free value"
+            )));
+        }
+    }
+    if policy.delivery.remote.starts_with('-') {
+        return Err(rk_core::Error::other(
+            "repo.delivery.remote must not begin with '-'",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_branch_value(name: &str, value: &str) -> rk_core::Result<()> {
+    let output = Command::new("git")
+        .args(["check-ref-format", "--branch", value])
+        .output()
+        .map_err(|error| {
+            rk_core::Error::other(format!("git is required to validate {name}: {error}"))
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(rk_core::Error::other(format!(
+        "{name} renders an invalid git branch {value:?}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+fn validate_template(name: &str, template: &str, allowed: &[&str]) -> rk_core::Result<()> {
+    if template.trim().is_empty() || template.contains('\0') {
+        return Err(rk_core::Error::other(format!(
+            "{name} must be a non-empty template"
+        )));
+    }
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            return Err(rk_core::Error::other(format!(
+                "{name} contains an unclosed placeholder"
+            )));
+        };
+        let placeholder = &after[..end];
+        if !allowed.contains(&placeholder) {
+            return Err(rk_core::Error::other(format!(
+                "{name} contains unsupported placeholder {{{{{placeholder}}}}}"
+            )));
+        }
+        rest = &after[end + 2..];
+    }
+    if rest.contains("}}") {
+        return Err(rk_core::Error::other(format!(
+            "{name} contains an unmatched placeholder terminator"
+        )));
+    }
+    Ok(())
 }
 
 /// Merge a NAMED branch into a NAMED target — the explicit `{branch, target}`
@@ -1727,6 +2071,56 @@ checks: [
             CheckEnvironmentPolicy::StripRkSpawn
         );
         assert_eq!(checks[1].toolchain.as_deref(), Some("mise rust@1.95.0"));
+    }
+
+    #[test]
+    fn repository_policy_loads_versioned_work_and_delivery_behavior() {
+        let policy = load_repository_policy_str(
+            r#"
+            repo: {
+                work: {
+                    branch: "agents/{{task}}/{{agent}}"
+                    worktree: "{{repo}}/{{task}}/{{agent}}"
+                }
+                delivery: {
+                    target: "agent-base"
+                    mode: "merge-push"
+                    remote: "upstream"
+                    remoteBranch: "review/{{branch}}"
+                    deleteSource: false
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(policy.work.branch, "agents/{{task}}/{{agent}}");
+        assert_eq!(policy.work.worktree, "{{repo}}/{{task}}/{{agent}}");
+        assert_eq!(policy.delivery.target, "agent-base");
+        assert_eq!(policy.delivery.mode, DeliveryMode::MergePush);
+        assert_eq!(policy.delivery.remote, "upstream");
+        assert_eq!(policy.delivery.remote_branch, "review/{{branch}}");
+        assert!(!policy.delivery.delete_source);
+    }
+
+    #[test]
+    fn repository_policy_defaults_preserve_existing_behavior() {
+        let policy = load_repository_policy_str("repo: {}").unwrap();
+        assert_eq!(policy, RepositoryPolicy::default());
+    }
+
+    #[test]
+    fn repository_policy_rejects_unsafe_or_non_unique_worktree_templates() {
+        for source in [
+            r#"repo: {work: {worktree: "../outside/{{agent}}"}}"#,
+            r#"repo: {work: {worktree: "shared"}}"#,
+            r#"repo: {work: {branch: "rat/{{unknown}}/{{agent}}"}}"#,
+            r#"repo: {work: {branch: "rat//{{agent}}"}}"#,
+            r#"repo: {delivery: {target: "bad..target"}}"#,
+            r#"repo: {delivery: {remote: "--upload-pack=oops"}}"#,
+        ] {
+            assert!(load_repository_policy_str(source).is_err(), "{source}");
+        }
     }
 
     #[test]

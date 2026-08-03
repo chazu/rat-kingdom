@@ -280,14 +280,11 @@ workflow: {
 				"APPROVE": [
 					{type: "dismiss", noMerge: true},
 					{type: "land", branch: "{{ctx.activeBranch}}", target: _input.target},
-					// GATE THE LAND RESULT. `land` routes on the repo's merge mode:
-					// a Direct-merge repo reports {merged: true}; a PR-mode repo
-					// pushes the branch and opens a PR, reporting {pr_opened: true}
-					// (never merged) — surfaced to the operator as an awaiting-review
-					// row in rk inbox. BOTH are a clean hand-off, so accept either.
-					// Only a conflict / moved target / push failure (merged:false AND
-					// pr_opened:false) fails closed, holding the branch for rk inbox.
-					{type: "evaluate", expect: {merged: true}, anyOf: [{pr_opened: true}]},
+					// GATE THE POLICY RESULT. Every repository delivery mode reports
+					// the same `delivered` truth: local merge, merge+push, branch push,
+					// or PR/MR hand-off. A conflict or push failure stays false and
+					// holds the branch for rk inbox.
+					{type: "evaluate", expect: {delivered: true}},
 				]
 				// REWORK: hand the fixable work back durably as a ticket rather
 				// than looping a rework rat here — the steward stays fast and

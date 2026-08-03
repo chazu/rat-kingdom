@@ -367,6 +367,13 @@ pub(crate) fn validate_automation_file(
         .map_err(|error| rk_core::Error::other(format!("read {}: {error}", path.display())))?;
     crate::onboarding::reject_cue_imports(&source).map_err(rk_core::Error::other)?;
     match kind {
+        OnboardingAutomationKind::RepositoryPolicy => {
+            rk_workflow::load_repository_policy_str(&source)?;
+            Ok(format!(
+                "repository policy schema and safety validation passed for {}",
+                path.display()
+            ))
+        }
         OnboardingAutomationKind::Workflow => {
             rk_workflow::validate_workflow_str(&source)?;
             Ok(format!(
@@ -413,6 +420,9 @@ pub(crate) fn validate_automation_file(
 
 fn automation_validator(kind: OnboardingAutomationKind) -> &'static str {
     match kind {
+        OnboardingAutomationKind::RepositoryPolicy => {
+            "rk_workflow::load_repository_policy_str"
+        }
         OnboardingAutomationKind::Workflow => "rk_workflow::validate_workflow_str",
         OnboardingAutomationKind::Trigger => "rk_workflow::load_triggers_str",
         OnboardingAutomationKind::Schedule => {

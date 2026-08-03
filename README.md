@@ -33,7 +33,7 @@ tuplespace db, worktrees, logs, workflow definitions, sync state.
 ```bash
 cd ~/some-git-repo
 
-# Spawn a rat on a task (isolated worktree, branch rat/<name>/<task>)
+# Spawn a rat on a task (isolated worktree; names come from `.rk/repo.cue`)
 rk spawn --task fix-readme --prompt "Fix the typos in README.md, commit, then run: rk done"
 
 rk list                      # fleet at a glance (state, tokens, cost)
@@ -284,7 +284,8 @@ Lifecycle classes: `furniture` (daemon-owned, unconsumable), `session`
 
 So the system knows where your repositories live, register them by name. The
 registry is machine-local (paths differ per castle) and is what lets you refer
-to a repo by name instead of a path elsewhere.
+to a repo by name instead of a path elsewhere. If `.rk/repo.cue` exists,
+registration validates it and activates its exact digest.
 
 ```bash
 rk repo add ~/dev/rat-kingdom          # name defaults to the directory ("rat-kingdom")
@@ -322,6 +323,13 @@ rk repo onboard cleanup onb-...        # remove terminal clean worktree; retain 
 ```
 
 A registered name works anywhere a repo is expected, e.g. `rk spawn --repo rat-kingdom`.
+
+Version per-repository work and delivery behavior in `.rk/repo.cue`: branch
+and worktree templates, dynamic or fixed target branch, local merge, merge and
+push, branch push, or PR/MR delivery, remote mapping, and source-branch cleanup.
+The checked-in file is inert until its exact digest is registered or activated,
+and `rk repo show` reports drift. See [Repository work and delivery
+policy](docs/repository-policy.md) for the schema and trust boundary.
 
 For the operator walkthrough, see [Repository onboarding](docs/repo-onboarding.md).
 Run `rk onboard` in the main operator agent to load that guided, gate-first
@@ -387,8 +395,10 @@ recorded commit and executes a new attempt. An interrupted exact patch or
 trailer-bearing commit is recovered; unrelated dirt, an edited applied file,
 or branch movement is recorded as failure and never swept into the proposal.
 
-Workflow, trigger, and schedule proposals use distinct activation kinds and
-actions: `workflow_activation`/`activate_workflow` targets exactly
+Repository policy, workflow, trigger, and schedule proposals use distinct
+activation kinds and actions. A policy is a `repo_file` proposal targeting
+exactly `.rk/repo.cue`; `apply` validates its schema but does not change live
+execution. `workflow_activation`/`activate_workflow` targets exactly
 `.rk/workflows/<name>.cue`, `trigger_activation`/`activate_trigger` targets
 `.rk/triggers.cue`, and `schedule_activation`/`activate_schedule` targets
 `.rk/schedules.cue`. `apply` patches and commits only the onboarding worktree,
@@ -413,11 +423,11 @@ terminal session without staged or unresolved proposals; it removes a clean
 onboarding worktree but retains both its Git branch and durable report.
 Running, orphaned, and long-lived attached sessions are never cleaned.
 
-By default a finished rat's branch is merged directly into its base. A repo can
-instead be put in **PR mode** — `rk repo add <path> --merge-mode pr` — so the
-daemon pushes the branch and opens a pull/merge request for human/CI review
-instead of merging. See [docs/pr-merge-mode.md](docs/pr-merge-mode.md) for the
-credential prerequisites and the GitHub/GitLab flows.
+By default a finished rat's branch is merged directly into its base. Set
+`repo.delivery.mode` in `.rk/repo.cue` to `merge-push`, `push-branch`, or `pr`
+when that repository needs a remote handoff. See
+[docs/repository-policy.md](docs/repository-policy.md) for configuration and
+[docs/pr-merge-mode.md](docs/pr-merge-mode.md) for forge credential details.
 
 ## Tickets
 
@@ -563,10 +573,10 @@ require_approval_for_landing = true # land/open_pr normally needs a human gate
 automated_landing_workflows = ["steward"] # land-only exception for managed global
                                           # definitions; local shadows stay untrusted
 default_merge_mode = "direct"    # fleet-wide fallback for repos registered
-                                 # without --merge-mode: "direct" merges the
+                                 # without an activated `.rk/repo.cue`: "direct" merges the
                                  # branch, "pr" pushes it and opens a pull/merge
                                  # request for review (see docs/pr-merge-mode.md).
-                                 # A repo's own --merge-mode always overrides this.
+                                 # Versioned repository policy takes precedence.
 ```
 
 Configuration is loaded when the daemon starts. After editing

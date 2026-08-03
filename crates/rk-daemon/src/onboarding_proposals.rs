@@ -286,6 +286,7 @@ pub struct OnboardingVerification {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnboardingAutomationKind {
+    RepositoryPolicy,
     Workflow,
     Trigger,
     Schedule,
@@ -294,6 +295,7 @@ pub enum OnboardingAutomationKind {
 impl std::fmt::Display for OnboardingAutomationKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::RepositoryPolicy => "repository_policy",
             Self::Workflow => "workflow",
             Self::Trigger => "trigger",
             Self::Schedule => "schedule",
@@ -506,13 +508,25 @@ impl OnboardingProposal {
     }
 
     pub fn automation_kind(&self) -> Option<OnboardingAutomationKind> {
-        match self.kind {
-            OnboardingProposalKind::WorkflowActivation => Some(OnboardingAutomationKind::Workflow),
-            OnboardingProposalKind::TriggerActivation => Some(OnboardingAutomationKind::Trigger),
-            OnboardingProposalKind::ScheduleActivation => Some(OnboardingAutomationKind::Schedule),
-            OnboardingProposalKind::RepoFile
-            | OnboardingProposalKind::CastleConfig
-            | OnboardingProposalKind::Registration => None,
+        match (self.kind, self.target_path.as_str()) {
+            (OnboardingProposalKind::RepoFile, ".rk/repo.cue") => {
+                Some(OnboardingAutomationKind::RepositoryPolicy)
+            }
+            (OnboardingProposalKind::WorkflowActivation, _) => {
+                Some(OnboardingAutomationKind::Workflow)
+            }
+            (OnboardingProposalKind::TriggerActivation, _) => {
+                Some(OnboardingAutomationKind::Trigger)
+            }
+            (OnboardingProposalKind::ScheduleActivation, _) => {
+                Some(OnboardingAutomationKind::Schedule)
+            }
+            (
+                OnboardingProposalKind::RepoFile
+                | OnboardingProposalKind::CastleConfig
+                | OnboardingProposalKind::Registration,
+                _,
+            ) => None,
         }
     }
 }

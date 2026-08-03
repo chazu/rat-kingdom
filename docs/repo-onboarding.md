@@ -42,9 +42,10 @@ Rat-Kingdom-owned worktree. The human checkout is not used for edits.
 ## The workflow
 
 1. **Inspect.** Onboarding reports Git state, remotes and base branch,
-   repository instructions, toolchain entrypoints, named checks, workflows,
-   triggers, schedules, and `rk` readiness. Inspection is read-only and does
-   not start an agent or change repository state.
+   repository instructions, toolchain entrypoints, named checks, repository
+   work/delivery policy, workflows, triggers, schedules, and `rk` readiness.
+   It compares `.rk/repo.cue` with the exact activated digest. Inspection is
+   read-only and does not start an agent or change repository state.
 
 2. **Discuss and propose.** The onboarder explains findings and submits a
    proposal for each meaningful change. A proposal contains the evidence,
@@ -74,8 +75,9 @@ Rat-Kingdom-owned worktree. The human checkout is not used for edits.
    policy, exit status, timing, and bounded output.
 
 5. **Activate.** Applying stages and verifies the change; activation is the
-   separate decision that lands it in the registered base checkout. Automation
-   proposals for workflows, triggers, and schedules always require this step:
+   separate decision that lands it in the registered base checkout. Repository
+   policy and automation proposals for workflows, triggers, and schedules
+   always require this step:
 
    ```bash
    rk repo onboard activate onb-... onb-prop-... --digest <sha256>
@@ -84,6 +86,22 @@ Rat-Kingdom-owned worktree. The human checkout is not used for edits.
    Activation fails closed if the base checkout, onboarding branch, target file,
    or approved digest has drifted. Use `decline-activation` to refuse a
    validated change while retaining its branch and report.
+
+### Repository policy decisions
+
+Onboarding should make `.rk/repo.cue` explicit before enabling autonomous
+delivery. Review these as repository-owned choices:
+
+- agent branch and worktree naming templates;
+- whether completed work targets its actual agent base or a fixed branch;
+- whether delivery locally merges, merges and pushes, only pushes a branch, or
+  requests a PR/MR;
+- remote/remote-branch mapping and source-branch cleanup.
+
+Applying the proposal validates only the staged file. Activation lands the
+approved commit and copies that exact file digest into the operator-owned repo
+registry. Later direct edits are reported as drift and remain inert. The full
+schema is in [Repository work and delivery policy](repository-policy.md).
 
 ## Recovery and cleanup
 

@@ -77,6 +77,7 @@ fn register_repo(layout: &Layout, name: &str, path: &Path) {
         merge_mode: Default::default(),
         remote: None,
         host: None,
+        activated_policy: None,
     })
     .unwrap();
 }

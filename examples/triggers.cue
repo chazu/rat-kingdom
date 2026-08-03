@@ -73,6 +73,8 @@ triggers: [
 			taskId: "{{tuple.payload.task}}"
 			// Raw pass-through: the exact branch the reviewer must chain onto.
 			branch: "{{tuple.payload.branch}}"
+			// Daemon-authored base branch; preserves feature-branch routing.
+			target: "{{tuple.payload.target}}"
 			// The repo the completion is scoped to.
 			repo: "{{tuple.scope}}"
 		}

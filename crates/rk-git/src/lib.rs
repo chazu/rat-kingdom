@@ -407,13 +407,28 @@ impl Repo {
     /// URL) are printed on stderr, so both streams are captured. Uses the
     /// repo's already-configured credentials; no separate auth surface.
     pub fn push_branch(&self, branch: &str, remote: &str) -> rk_core::Result<String> {
-        if branch.trim().is_empty() || remote.trim().is_empty() {
+        self.push_branch_as(branch, branch, remote)
+    }
+
+    /// Push a local branch to a separately named remote branch.
+    pub fn push_branch_as(
+        &self,
+        branch: &str,
+        remote_branch: &str,
+        remote: &str,
+    ) -> rk_core::Result<String> {
+        if branch.trim().is_empty()
+            || remote_branch.trim().is_empty()
+            || remote.trim().is_empty()
+        {
             return Err(rk_core::Error::other(
-                "push_branch requires a branch and a remote",
+                "push_branch_as requires local branch, remote branch, and remote",
             ));
         }
         self.validate_local_branch(branch, "branch to push")?;
-        git_output(&self.root, &["push", "-u", remote, branch])
+        self.validate_branch_name(remote_branch, "remote branch")?;
+        let refspec = format!("{branch}:{remote_branch}");
+        git_output(&self.root, &["push", "-u", remote, &refspec])
     }
 
     /// The [`Host`] kind of `remote`, inferred from its configured URL.
@@ -439,15 +454,31 @@ impl Repo {
     ///
     /// [`merge_branch`]: Repo::merge_branch
     pub fn open_pull_request(&self, branch: &str, target: &str, remote: &str) -> PrOutcome {
-        if branch.trim().is_empty() || target.trim().is_empty() || remote.trim().is_empty() {
+        self.open_pull_request_as(branch, branch, target, remote)
+    }
+
+    /// Push `branch` as `remote_branch` and open a PR/MR against `target`.
+    pub fn open_pull_request_as(
+        &self,
+        branch: &str,
+        remote_branch: &str,
+        target: &str,
+        remote: &str,
+    ) -> PrOutcome {
+        if branch.trim().is_empty()
+            || remote_branch.trim().is_empty()
+            || target.trim().is_empty()
+            || remote.trim().is_empty()
+        {
             return PrOutcome {
                 opened: false,
                 url: None,
-                detail: "open_pull_request requires a branch, target, and remote".into(),
+                detail: "open_pull_request_as requires local branch, remote branch, target, and remote".into(),
             };
         }
         if let Err(e) = self
             .validate_local_branch(branch, "pull request source")
+            .and_then(|_| self.validate_branch_name(remote_branch, "pull request remote source"))
             .and_then(|_| self.validate_local_branch(target, "pull request target"))
         {
             return PrOutcome {
@@ -458,6 +489,7 @@ impl Repo {
         }
         let host = self.remote_host(remote);
         let target_opt = format!("merge_request.target={target}");
+        let refspec = format!("{branch}:{remote_branch}");
         let args: Vec<&str> = match host {
             Host::GitLab => vec![
                 "push",
@@ -466,10 +498,10 @@ impl Repo {
                 "-o",
                 &target_opt,
                 remote,
-                branch,
+                &refspec,
             ],
             // GitHub has no create-PR-via-push; push and surface the compare URL.
-            Host::GitHub | Host::Unknown => vec!["push", "-u", remote, branch],
+            Host::GitHub | Host::Unknown => vec!["push", "-u", remote, &refspec],
         };
         match git_output(&self.root, &args) {
             Ok(out) => {
@@ -490,7 +522,9 @@ impl Repo {
             Err(e) => PrOutcome {
                 opened: false,
                 url: None,
-                detail: format!("push failed for {branch} -> {remote}: {e}"),
+                detail: format!(
+                    "push failed for {branch} -> {remote}/{remote_branch}: {e}"
+                ),
             },
         }
     }
@@ -833,6 +867,19 @@ mod tests {
         // The branch now exists on the remote.
         let refs = git_in(&bare, &["rev-parse", &format!("refs/heads/{branch}")]);
         assert!(refs.is_ok(), "branch should exist on remote: {refs:?}");
+    }
+
+    #[test]
+    fn push_branch_as_uses_the_configured_remote_name() {
+        let (dir, repo) = scratch_repo();
+        let bare = bare_remote(dir.path(), "plain-remote", &repo, false);
+        let branch = commit_on_branch(dir.path(), &repo, "pip", "task-remote-name");
+
+        repo.push_branch_as(&branch, "review/task-remote-name", "origin")
+            .unwrap();
+
+        assert!(git_in(&bare, &["rev-parse", "refs/heads/review/task-remote-name"]).is_ok());
+        assert!(git_in(&bare, &["rev-parse", &format!("refs/heads/{branch}")]).is_err());
     }
 
     #[test]

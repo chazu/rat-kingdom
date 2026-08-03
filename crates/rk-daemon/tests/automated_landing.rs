@@ -10,6 +10,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+static HARNESS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const WORKING_FAKE: &str = r#"
 read -r _prompt
 echo "trusted workflow landed" > steward.txt
@@ -32,6 +34,27 @@ workflow: {
         {type: "land", branch: "{{ctx.activeBranch}}", target: "main"},
         {type: "evaluate", expect: {merged: true}},
     ]
+}
+"#;
+
+const FEATURE_STEWARD: &str = r#"
+workflow: {
+    name: "steward"
+    agents: {default: {harness: "fake"}}
+    steps: [
+        {type: "spawn", role: "reviewer", task: {title: "reviewed-feature-work"}},
+        {type: "wait", timeout: "60s"},
+        {type: "evaluate", expect: {is_error: false}},
+        {type: "dismiss", noMerge: true},
+        {type: "land", branch: "{{ctx.activeBranch}}", target: "feature/integration"},
+        {type: "evaluate", expect: {delivered: true}},
+    ]
+}
+"#;
+
+const AGENT_BASE_POLICY: &str = r#"
+repo: {
+    delivery: {target: "agent-base", mode: "merge", remote: "origin", remoteBranch: "{{branch}}", deleteSource: true}
 }
 "#;
 
@@ -93,6 +116,7 @@ async fn run_and_wait(client: &mut Client, repo: &Path) -> serde_json::Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_the_managed_global_steward_may_land_without_a_human_gate() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
 
     // The managed global definition is explicitly trusted by policy.
@@ -136,5 +160,69 @@ async fn only_the_managed_global_steward_may_land_without_a_human_gate() {
     );
     local_handle.abort();
 
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activated_agent_base_policy_authorizes_unattended_feature_branch_landing() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    std::fs::create_dir_all(repo.path().join(".rk")).unwrap();
+    std::fs::write(repo.path().join(".rk/repo.cue"), AGENT_BASE_POLICY).unwrap();
+    git(repo.path(), &["add", ".rk/repo.cue"]);
+    git(repo.path(), &["commit", "-m", "policy"]);
+    git(repo.path(), &["branch", "feature/integration"]);
+
+    let layout = Layout::at(home.path());
+    std::fs::create_dir_all(layout.workflows_dir()).unwrap();
+    std::fs::write(layout.workflows_dir().join("steward.cue"), FEATURE_STEWARD).unwrap();
+    let daemon = Daemon::new_in_memory(layout.clone(), "feature-policy".into()).unwrap();
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+    let repo_name = repo
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    client
+        .call(
+            "repo.add",
+            json!({"name": repo_name, "path": repo.path()}),
+        )
+        .await
+        .unwrap();
+
+    let result = run_and_wait(&mut client, repo.path()).await;
+    assert_eq!(result["instance"]["status"], "completed", "{result}");
+    assert_eq!(result["instance"]["context"]["approval_granted"], false);
+    assert_eq!(
+        result["instance"]["context"]["previous_result"]["target"],
+        "feature/integration"
+    );
+    assert_eq!(
+        result["instance"]["context"]["previous_result"]["delivered"],
+        true
+    );
+    assert!(
+        git(repo.path(), &["show", "feature/integration:steward.txt"])
+            .contains("trusted workflow landed")
+    );
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["show", "main:steward.txt"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "main must remain untouched"
+    );
+
+    handle.abort();
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }

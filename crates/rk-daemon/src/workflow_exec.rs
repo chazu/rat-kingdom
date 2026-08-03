@@ -1369,7 +1369,7 @@ impl WorkflowEngine {
                     if target.is_empty() {
                         return Err(rk_core::Error::other("land step: target resolved to empty"));
                     }
-                    self.require_allowed_target(&target)?;
+                    self.require_allowed_target(&target, repo, automated)?;
                     let result = self
                         .supervisor
                         .land(std::path::Path::new(repo), &branch, &target, land.keep_branch)
@@ -1398,7 +1398,7 @@ impl WorkflowEngine {
                             "open_pr step: target resolved to empty",
                         ));
                     }
-                    self.require_allowed_target(&target)?;
+                    self.require_allowed_target(&target, repo, false)?;
                     let result = self
                         .supervisor
                         .open_pr(std::path::Path::new(repo), &branch, &target)
@@ -2140,7 +2140,31 @@ impl WorkflowEngine {
         Ok(result)
     }
 
-    fn require_allowed_target(&self, target: &str) -> rk_core::Result<()> {
+    fn require_allowed_target(
+        &self,
+        target: &str,
+        repo: &str,
+        automated: bool,
+    ) -> rk_core::Result<()> {
+        if automated {
+            if let Ok(git_repo) = rk_git::Repo::discover(Path::new(repo)) {
+                let registry_path = self.layout.home().join("repos.json");
+                if let Ok(registry) = crate::repos::RepoRegistry::load(&registry_path) {
+                    if let Some(approved) = registry
+                        .get_by_path(git_repo.root())
+                        .and_then(|record| record.activated_policy.as_ref())
+                    {
+                        let policy_target = approved.policy.delivery.target.as_str();
+                        if policy_target == "agent-base" || policy_target == target {
+                            return Ok(());
+                        }
+                        return Err(rk_core::Error::other(format!(
+                            "workflow target '{target}' does not match activated repository policy target '{policy_target}'"
+                        )));
+                    }
+                }
+            }
+        }
         if self
             .allowed_target_branches
             .iter()
@@ -2149,7 +2173,7 @@ impl WorkflowEngine {
             return Ok(());
         }
         Err(rk_core::Error::other(format!(
-            "workflow target '{target}' is not in policy.allowed_target_branches"
+            "workflow target '{target}' is not authorized by the activated repository policy or policy.allowed_target_branches"
         )))
     }
 

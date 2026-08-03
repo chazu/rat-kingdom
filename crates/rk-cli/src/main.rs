@@ -191,25 +191,25 @@ struct WorkflowDecisionArgs {
 
 #[derive(Subcommand)]
 enum RepoCommand {
-    /// Register a repository (path is canonicalized; name defaults to its directory).
+    /// Register a repository and activate its current `.rk/repo.cue`, if present.
     Add {
         /// Path to the repository.
         path: String,
         /// Name to register it under (defaults to the directory name).
         #[arg(long)]
         name: Option<String>,
-        /// How agent branches reach their base: `direct` (git merge, the
-        /// default) or `pr` (open a pull/merge request for review). Omit to use
-        /// the daemon's `[policy] default_merge_mode`.
+        /// Legacy fallback for repositories without `.rk/repo.cue`: `direct`
+        /// or `pr`. Cannot be combined with a versioned repository policy.
         #[arg(long, value_parser = ["direct", "pr"])]
         merge_mode: Option<String>,
-        /// Remote to push / open PRs against (defaults to origin).
+        /// Legacy fallback remote for repositories without `.rk/repo.cue`.
+        /// Cannot be combined with a versioned repository policy.
         #[arg(long)]
         remote: Option<String>,
     },
     /// List registered repositories.
     List,
-    /// Show one repository and its open tickets.
+    /// Show one repository, its active delivery policy, and its open tickets.
     Show {
         /// Registered repo name.
         name: String,
@@ -271,8 +271,9 @@ enum RepoOnboardCommand {
     Propose {
         /// Stable onboarding session id.
         session: String,
-        /// Proposal kind: repo_file, castle_config, registration,
-        /// workflow_activation, trigger_activation, or schedule_activation.
+        /// Proposal kind: repo_file (including `.rk/repo.cue`), castle_config,
+        /// registration, workflow_activation, trigger_activation, or
+        /// schedule_activation.
         #[arg(long)]
         kind: String,
         /// Human-readable proposal title.
@@ -327,7 +328,8 @@ enum RepoOnboardCommand {
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Apply and execute one approved `.rk/checks.cue` proposal.
+    /// Apply and validate one approved repository-file or automation proposal;
+    /// execute its named check when the proposal carries one.
     Apply {
         /// Stable onboarding session id.
         session: String,
@@ -337,8 +339,9 @@ enum RepoOnboardCommand {
         #[arg(long)]
         digest: String,
     },
-    /// Explicitly activate one validated workflow, trigger, or schedule by
-    /// landing its exact approved commit into the registered checkout.
+    /// Explicitly activate one validated repository policy, workflow, trigger,
+    /// or schedule by landing its exact approved commit into the registered
+    /// checkout.
     Activate {
         /// Stable onboarding session id.
         session: String,

@@ -133,6 +133,9 @@ pub enum FindingKind {
     ToolMissing,
     NamedChecksPresent,
     NamedChecksMissing,
+    RepositoryPolicyPresent,
+    RepositoryPolicyMissing,
+    RepositoryPolicyDrift,
     WorkflowDefinition,
     TriggerDefinition,
     ScheduleDefinition,
@@ -169,6 +172,9 @@ impl FindingKind {
             Self::ToolMissing => "tool_missing",
             Self::NamedChecksPresent => "named_checks_present",
             Self::NamedChecksMissing => "named_checks_missing",
+            Self::RepositoryPolicyPresent => "repository_policy_present",
+            Self::RepositoryPolicyMissing => "repository_policy_missing",
+            Self::RepositoryPolicyDrift => "repository_policy_drift",
             Self::WorkflowDefinition => "workflow_definition",
             Self::TriggerDefinition => "trigger_definition",
             Self::ScheduleDefinition => "schedule_definition",
@@ -411,10 +417,134 @@ pub fn inspect(
     inspect_git(&top_level, &mut report);
     let instructions = inspect_instructions(&top_level, &mut report);
     let cue_available = command_exists("cue", &top_level);
+    inspect_repository_policy(
+        &top_level,
+        cue_available,
+        registered,
+        &mut report,
+    );
     let checks = inspect_cue(&top_level, cue_available, context, &mut report);
     inspect_toolchain(&top_level, &instructions, &checks, &mut report);
 
     finish(report)
+}
+
+fn inspect_repository_policy(
+    root: &Path,
+    cue_available: bool,
+    registered: &[RepoRecord],
+    report: &mut AssessmentReport,
+) {
+    let file = root.join(".rk").join("repo.cue");
+    if !file.is_file() {
+        report.findings.push(
+            Finding::new(
+                FindingKind::RepositoryPolicyMissing,
+                Severity::Warning,
+                "repository has no versioned `.rk/repo.cue` work/delivery policy",
+            )
+            .evidence([observed(".rk/repo.cue", "file absent")])
+            .recommend(
+                "Review branch/worktree naming, target, remote, and delivery mode during onboarding, then activate the exact policy digest.",
+                None,
+            ),
+        );
+        return;
+    }
+    if !cue_available {
+        return;
+    }
+    let loaded = read_cue(&file).and_then(|source| {
+        reject_cue_imports(&source)?;
+        rk_workflow::load_repository_policy_str(&source).map_err(|error| error.to_string())
+    });
+    let policy = match loaded {
+        Ok(policy) => policy,
+        Err(error) => {
+            push_cue_error(root, &file, error, report);
+            return;
+        }
+    };
+    let digest = match rk_workflow::repository_policy_digest(&file) {
+        Ok(digest) => digest,
+        Err(error) => {
+            push_cue_error(root, &file, error.to_string(), report);
+            return;
+        }
+    };
+    let matching = registered.iter().filter(|record| {
+        std::fs::canonicalize(&record.path)
+            .ok()
+            .is_some_and(|path| path == root)
+    });
+    let mut registered_count = 0usize;
+    let mut drifted = Vec::new();
+    for record in matching {
+        registered_count += 1;
+        match &record.activated_policy {
+            Some(approved) if approved.digest == digest => {}
+            Some(approved) => drifted.push(format!(
+                "{} activated {}, checkout {}",
+                record.name, approved.digest, digest
+            )),
+            None => drifted.push(format!("{} has no activated policy digest", record.name)),
+        }
+    }
+    if drifted.is_empty() {
+        let summary = if registered_count == 0 {
+            "repository work/delivery policy is valid but the repository is not registered"
+        } else {
+            "repository work/delivery policy is valid and content-bound"
+        };
+        let finding = Finding::new(
+                FindingKind::RepositoryPolicyPresent,
+                Severity::Info,
+                summary,
+            )
+            .evidence([
+                observed(relative(root, &file), format!("sha256 {digest}")),
+                observed(
+                    relative(root, &file),
+                    format!(
+                        "branch {}, worktree {}, target {}, mode {:?}, remote {}",
+                        policy.work.branch,
+                        policy.work.worktree,
+                        policy.delivery.target,
+                        policy.delivery.mode,
+                        policy.delivery.remote
+                    ),
+                ),
+            ]);
+        report.findings.push(if registered_count == 0 {
+            finding.recommend(
+                "Register the repository to activate this exact policy digest.",
+                Some(format!("rk repo add {}", root.display())),
+            )
+        } else {
+            finding
+        });
+    } else {
+        report.findings.push(
+            Finding::new(
+                FindingKind::RepositoryPolicyDrift,
+                Severity::Error,
+                "checked-in repository policy is not the policy activated in the daemon registry",
+            )
+            .evidence(
+                drifted
+                    .into_iter()
+                    .map(|detail| observed("castle registry", detail)),
+            )
+            .ambiguity(format!(
+                "the checkout policy is valid but {} registered alias(es) do not carry its digest",
+                registered_count
+            ))
+            .recommend(
+                "Activate the exact `.rk/repo.cue` digest through onboarding, or explicitly re-register the repository after review.",
+                None,
+            ),
+        );
+    }
 }
 
 fn finish(mut report: AssessmentReport) -> AssessmentReport {
@@ -869,17 +999,25 @@ fn inspect_cue(
     report: &mut AssessmentReport,
 ) -> Vec<rk_workflow::Check> {
     let rk_dir = root.join(".rk");
+    let policy_file = rk_dir.join("repo.cue");
     let checks_file = rk_dir.join("checks.cue");
     let workflows = rk_workflow::definitions(&rk_dir.join("workflows"));
     let triggers_file = rk_dir.join("triggers.cue");
     let schedules_file = rk_dir.join("schedules.cue");
-    let any_cue = checks_file.is_file()
+    let any_cue = policy_file.is_file()
+        || checks_file.is_file()
         || !workflows.is_empty()
         || triggers_file.is_file()
         || schedules_file.is_file();
 
     if any_cue && !cue_available {
         let mut evidence = Vec::new();
+        if policy_file.is_file() {
+            evidence.push(observed(
+                relative(root, &policy_file),
+                "requires CUE validation",
+            ));
+        }
         if checks_file.is_file() {
             evidence.push(observed(
                 relative(root, &checks_file),
@@ -1745,6 +1883,7 @@ mod tests {
             merge_mode: MergeMode::Direct,
             remote: None,
             host: None,
+            activated_policy: None,
         }
     }
 

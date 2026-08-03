@@ -17,13 +17,13 @@ GitHub vs GitLab flows look like, and the end-to-end review path.
 
 ## 1. How it works (one paragraph)
 
-Every merge in the system funnels through one seam: `Supervisor::dismiss` (a
-rat's branch → its own base) and `Supervisor::land` (an explicit
-`{branch, target}`). PR mode branches that seam on the repo's **`merge_mode`**:
-`direct` runs the historical local `git merge`; `pr` runs
+Every completed branch funnels through one delivery seam: `Supervisor::dismiss`
+(a rat's branch → its own base) and `Supervisor::land` (an explicit
+`{branch, target}`). PR mode selects the `pr` value in the repository's
+activated `.rk/repo.cue`: it runs
 `git push` + open-PR-**via-git-only** (no `gh`/`glab` dependency — an operator
 decision), then **does not merge and does not delete the branch**. The result
-carries `{merged: false, pr_opened: true, pr_url}` and the daemon emits a
+carries `{delivered: true, merged: false, pr_opened: true, pr_url}` and the daemon emits a
 `pull_request_opened` event alongside the usual `agent_dismissed`/`branch_landed`.
 
 There is **no separate auth surface**: the push uses the repo checkout's own
@@ -77,48 +77,59 @@ credentials first.
 
 ### Per-repo (recommended)
 
-Set the mode when you register the repo, or re-register to change it:
+Add or update `.rk/repo.cue`:
 
-```bash
-rk repo add ~/dev/svc --merge-mode pr                 # open a PR instead of merging
-rk repo add ~/dev/svc --merge-mode pr --remote upstream # push/PR against a non-origin remote
-rk repo add ~/dev/svc --merge-mode direct             # the default; explicit here
+```cue
+repo: {
+	delivery: {
+		target:       "agent-base"
+		mode:         "pr"
+		remote:       "origin"
+		remoteBranch: "review/{{branch}}"
+		deleteSource: true // PR mode keeps it regardless
+	}
+}
 ```
 
-- `--merge-mode` accepts `direct` or `pr`. **Omit it** to inherit the
-  fleet-wide default (see below).
-- `--remote` chooses which remote to push / open the PR against (defaults to
-  `origin`).
+- `target` may preserve the agent's actual base or name a fixed target.
+- `remote` chooses which remote to push / open the PR against.
+- `remoteBranch` maps the local worker branch to a forge branch and must retain
+  `{{branch}}`.
 - The **host** (`github.com`, `gitlab.com`, …) is inferred from that remote's
   URL at registration and stored on the repo record — it decides GitHub vs
   GitLab behavior (§4).
+
+For a new registration, `rk repo add ~/dev/svc` validates and activates the
+current file. For an existing registration, use the repository onboarding
+proposal/approval/apply/activate flow. Editing the file directly does not
+change live delivery behavior.
 
 Inspect what got recorded:
 
 ```bash
 rk repo show svc
-#   merge      pr
+#   delivery   pr → agent-base
 #   remote     origin
 #   host       github.com
 ```
 
-`rk repo list` also shows each repo's mode.
+See [Repository work and delivery policy](repository-policy.md) for the full
+schema and other modes.
 
 ### Fleet-wide default
 
-A repo registered **without** `--merge-mode` falls back to the daemon's
+A legacy repo registered **without** an activated `.rk/repo.cue` falls back to the daemon's
 `[policy] default_merge_mode` in `~/.rat-kingdom/config.toml`:
 
 ```toml
 [policy]
 default_merge_mode = "direct"    # or "pr" — fleet-wide fallback for repos
-                                 # registered without an explicit --merge-mode.
-                                 # A repo's own --merge-mode always overrides this.
+                                 # registered without a versioned policy.
 ```
 
-Default is `direct`, so the feature is fully opt-in and backward compatible: a
-registry file written before PR mode existed, and any repo added without the
-flag, behaves exactly as before.
+Default is `direct`, so old registry files behave exactly as before. The legacy
+`rk repo add --merge-mode/--remote` flags remain available only when the repo
+has no `.rk/repo.cue`.
 
 ---
 
@@ -196,13 +207,9 @@ Key differences to expect in PR mode:
   PR merges is the host's job (e.g. delete-branch-on-merge), not the daemon's.
 - **The base is untouched** until a human/CI merges the PR — that is the whole
   point.
-- **`merged` is `false`.** The result shape is
-  `{merged: false, pr_opened: true, pr_url: "…"}`. A workflow that asserts
-  `evaluate {expect: {merged: true}}` after a `dismiss`/`land` will **not** see
-  `merged: true` in PR mode — that gate-outcome adaptation (asserting
-  `pr_opened` instead) and an "awaiting-review" inbox source are tracked
-  separately (TKT-66/67); until they land, drive PR-mode repos with plain
-  `rk dismiss` / gates that don't hard-assert `merged`.
+- **`merged` is `false`; `delivered` is `true`.** Workflows that support all
+  repository modes should assert `evaluate {expect: {delivered: true}}` rather
+  than branching on `merged`/`pr_opened` themselves.
 - **The ticket is not auto-closed** on dismiss, because nothing merged — it
   closes when the branch actually lands via the PR.
 

@@ -184,6 +184,8 @@ walk through decisions one at a time, and never treat a proposal as approval.
   unresolved ambiguity.
 - Inspect the repository's own instructions, task runner, CI configuration,
   toolchain pins, Git/base/remote conventions, and existing `.rk` files.
+- Inspect `.rk/repo.cue` and compare it with the activated digest reported by
+  `rk repo show`. Treat a checked-in edit as requested policy, not live policy.
 - Preserve the user's checkout and unrelated changes. Do not mutate repository
   or castle state until the user explicitly approves the exact change.
 
@@ -231,11 +233,16 @@ Only after the verification contract is understood and green:
 - Explain which workflows consume each named check and where the check sits
   before landing or opening a pull request.
 - Inspect proposed workflow, trigger, schedule, harness, permission, Git, and
-  merge-mode settings. Present independent changes as independent decisions.
+  repository-policy settings. Explicitly review branch/worktree templates,
+  `agent-base` versus a fixed target, delivery mode, remote branch mapping, and
+  source-branch cleanup. Present independent changes as independent decisions.
 - Prove that a normal agent receives the named checks in its priming, can use
   the repository's pinned runner, and can reach Rat Kingdom coordination.
 - Keep staging, verification, landing, and activation separate. A validated
   file in an onboarding worktree is not active automation.
+- Apply `.rk/repo.cue` only in the isolated onboarding worktree, then use the
+  explicit activation step to land and activate its exact digest. Never imply
+  that editing the versioned file changed running behavior.
 
 ## 4. Human checkpoints and completion
 
@@ -249,6 +256,7 @@ Finish with a concise verification playbook containing:
 - canonical `verify` command and complete contract;
 - component/feature checks and when to use them;
 - workflows that enforce each check;
+- activated repository policy digest and its naming/target/delivery behavior;
 - how to run and diagnose a red gate;
 - the exact recipe for adding validation for a new feature;
 - accepted, declined, failed, and unresolved onboarding decisions.
@@ -1079,6 +1087,8 @@ mod tests {
             "guided repository onboarding",
             "rk repo onboard inspect",
             ".rk/checks.cue",
+            ".rk/repo.cue",
+            "activated digest",
             "verify",
             "require_named_checks",
             "working directory",

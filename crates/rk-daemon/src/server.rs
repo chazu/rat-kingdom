@@ -1932,15 +1932,55 @@ impl Daemon {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
-        let path = std::path::PathBuf::from(&params.path);
-        if !path.exists() {
-            return Response::err(
-                req.id,
-                codes::BAD_PARAMS,
-                format!("path does not exist: {}", params.path),
-            );
-        }
-        let remote = params.remote;
+        let path = match std::fs::canonicalize(&params.path) {
+            Ok(path) => path,
+            Err(error) => {
+                return Response::err(
+                    req.id,
+                    codes::BAD_PARAMS,
+                    format!("cannot resolve repository path {}: {error}", params.path),
+                );
+            }
+        };
+        let policy_file = path.join(".rk").join("repo.cue");
+        let activated_policy = if policy_file.is_file() {
+            if params.merge_mode.is_some() || params.remote.is_some() {
+                return Response::err(
+                    req.id,
+                    codes::BAD_PARAMS,
+                    "a repository with .rk/repo.cue cannot also use --merge-mode or --remote; edit and activate the versioned policy instead",
+                );
+            }
+            let policy_file_for_load = policy_file.clone();
+            match tokio::task::spawn_blocking(move || {
+                let (policy, digest) =
+                    rk_workflow::load_repository_policy_with_digest(&policy_file_for_load)?;
+                Ok::<_, rk_core::Error>(crate::repos::ActivatedRepositoryPolicy {
+                    digest,
+                    policy,
+                })
+            })
+            .await
+            {
+                Ok(Ok(activated)) => Some(activated),
+                Ok(Err(error)) => {
+                    return Response::err(req.id, codes::BAD_PARAMS, error.to_string());
+                }
+                Err(error) => {
+                    return Response::err(
+                        req.id,
+                        codes::INTERNAL,
+                        format!("repo policy inspection task failed: {error}"),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        let remote = activated_policy
+            .as_ref()
+            .map(|approved| approved.policy.delivery.remote.clone())
+            .or(params.remote);
         let remote_name = remote.as_deref().unwrap_or("origin");
         let path_for_remote = path.clone();
         let remote_name = remote_name.to_string();
@@ -1963,9 +2003,21 @@ impl Daemon {
             name: params.name,
             path,
             created_at: chrono::Utc::now(),
-            merge_mode: params.merge_mode.unwrap_or(self.default_merge_mode),
+            merge_mode: activated_policy
+                .as_ref()
+                .map(|approved| match approved.policy.delivery.mode {
+                    rk_workflow::DeliveryMode::Pr => rk_core::config::MergeMode::Pr,
+                    rk_workflow::DeliveryMode::Merge
+                    | rk_workflow::DeliveryMode::MergePush
+                    | rk_workflow::DeliveryMode::PushBranch => {
+                        rk_core::config::MergeMode::Direct
+                    }
+                })
+                .or(params.merge_mode)
+                .unwrap_or(self.default_merge_mode),
             remote,
             host,
+            activated_policy,
         };
         let mut reg = match self.repos.lock() {
             Ok(r) => r,
@@ -2559,6 +2611,9 @@ impl Daemon {
             );
         }
 
+        let activates_repository_policy = proposal.automation_kind()
+            == Some(crate::onboarding_proposals::OnboardingAutomationKind::RepositoryPolicy);
+        let activation_repo_path = session.repo_path.clone();
         let activation_session = session;
         let activation_proposal = intent;
         let activation_contract = contract.clone();
@@ -2607,6 +2662,64 @@ impl Daemon {
                 return Response::err(req.id, codes::INTERNAL, detail);
             }
         };
+        if activates_repository_policy {
+            let policy_file = activation_repo_path.join(".rk").join("repo.cue");
+            let policy_file_for_load = policy_file.clone();
+            let activated = tokio::task::spawn_blocking(move || {
+                let (policy, digest) =
+                    rk_workflow::load_repository_policy_with_digest(&policy_file_for_load)?;
+                Ok::<_, rk_core::Error>(crate::repos::ActivatedRepositoryPolicy {
+                    digest,
+                    policy,
+                })
+            })
+            .await;
+            let activated = match activated {
+                Ok(Ok(activated)) if activated.digest == contract.target_digest => activated,
+                Ok(Ok(activated)) => {
+                    let detail = format!(
+                        "activated repository policy digest drifted: expected {}, found {}",
+                        contract.target_digest, activated.digest
+                    );
+                    let _ = self.onboarding_sessions.lock().ok().and_then(|mut sessions| {
+                        sessions
+                            .fail_activation(
+                                &params.session,
+                                &params.proposal,
+                                &params.digest,
+                                &contract.operation_id,
+                                detail.clone(),
+                            )
+                            .ok()
+                    });
+                    return Response::err(req.id, codes::BAD_PARAMS, detail);
+                }
+                Ok(Err(error)) => {
+                    return Response::err(req.id, codes::BAD_PARAMS, error.to_string());
+                }
+                Err(error) => {
+                    return Response::err(
+                        req.id,
+                        codes::INTERNAL,
+                        format!("repository policy activation task failed: {error}"),
+                    );
+                }
+            };
+            let mut repos = match self.repos.lock() {
+                Ok(repos) => repos,
+                Err(_) => {
+                    return Response::err(
+                        req.id,
+                        codes::INTERNAL,
+                        "repo registry lock poisoned during policy activation",
+                    );
+                }
+            };
+            if let Err(error) = repos.activate_policy_by_path(&activation_repo_path, activated) {
+                return Response::err(req.id, codes::BAD_PARAMS, error.to_string());
+            }
+            drop(repos);
+        }
         let (proposal, changed) = match self
             .onboarding_sessions
             .lock()

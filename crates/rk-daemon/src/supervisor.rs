@@ -5,16 +5,16 @@
 use crate::agents::{AgentProgress, AgentRecord, AgentState, Registry};
 use crate::onboarding_sessions::{onboarding_branch, onboarding_worktree, ONBOARDER_ROLE};
 use chrono::{DateTime, Utc};
-use rk_core::config::{MergeMode, SupervisorConfig};
+use rk_core::config::SupervisorConfig;
 use rk_core::paths::Layout;
 use rk_core::prime::{render, PrimeContext, VerificationCheck, MAX_INJECTED_FACTS};
 use rk_core::tuple::{Category, Pattern, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
-use rk_git::{agent_branch, Repo};
+use rk_git::Repo;
 use rk_harness::{make_harness, HarnessEvent, LaunchSpec, SessionControl, TokenUsage};
 use rk_ledger::pricing::PricingTable;
 use rk_ledger::{Budget, BudgetAction, BudgetScope, DispatchCheck, FleetBudget};
 use rk_space::Space;
-use rk_workflow::{AgentProfile, Coordination};
+use rk_workflow::{AgentProfile, Coordination, DeliveryMode};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -23,6 +23,21 @@ use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 const MIN_PROGRESS_INTERVAL: chrono::Duration = chrono::Duration::seconds(5);
+
+#[derive(Debug, Default)]
+struct BranchDelivery {
+    target: String,
+    remote: String,
+    remote_branch: Option<String>,
+    delivered: bool,
+    merged: bool,
+    merge_commit: Option<String>,
+    pushed: bool,
+    pr_opened: bool,
+    pr_url: Option<String>,
+    branch_deleted: bool,
+    detail: String,
+}
 
 fn default_permission_mode(harness: &str) -> &'static str {
     match harness {
@@ -619,6 +634,7 @@ impl Supervisor {
         validate_role(&params.role)?;
         let repo = Repo::discover(std::path::Path::new(&params.repo))?;
         let repo_name = repo.name();
+        let repo_policy = self.repository_policy(&repo);
 
         // Hierarchical fleet/repo budget guard: the wallet kill-switch. Once the
         // fleet-wide (or per-repo) cost sum reaches its cap we refuse the spawn
@@ -633,7 +649,7 @@ impl Supervisor {
         )?;
         let target_branch = match &params.base {
             Some(b) => b.clone(),
-            None => repo.current_branch()?,
+            None => repo_policy.delivery_target(&repo.current_branch()?),
         };
         let instruction_base = self.instruction_base(&params.role, &target_branch, &repo);
 
@@ -674,8 +690,13 @@ impl Supervisor {
             )
         } else {
             (
-                agent_branch(&name, &params.task),
-                self.layout.worktrees_dir().join(&repo_name).join(&name),
+                repo_policy.branch_name(&name, &params.task, &repo_name, &params.role),
+                self.layout.worktrees_dir().join(repo_policy.worktree_path(
+                    &name,
+                    &params.task,
+                    &repo_name,
+                    &params.role,
+                )),
             )
         };
         let spawning = spawning_record(SpawnJournal {
@@ -2345,6 +2366,10 @@ impl Supervisor {
                 "role": record.role,
                 "task": record.task,
                 "branch": record.branch,
+                // The actual base this agent was forked from. Steward carries
+                // this daemon-authored value through as its delivery target so
+                // feature-branch work does not silently reroute to `main`.
+                "target": record.target_branch,
                 "parent": record.parent,
                 "is_error": is_error,
                 // Whether the agent itself declared the task finished (`rk done`)
@@ -2447,26 +2472,162 @@ impl Supervisor {
         control.interrupt().await
     }
 
-    /// Resolve a repo's merge policy — how a landed branch reaches its base.
-    /// Reads the on-disk repo registry (`repos.json`), which the daemon
-    /// persists synchronously on every `repo add`, so this sees the current
-    /// policy without sharing mutable state with the server. Returns the
-    /// repo's `(merge_mode, remote, host)`; an unregistered repo (or an
-    /// unreadable registry) resolves to the pre-PR-mode default — a direct
-    /// merge into `origin`.
-    fn merge_policy(&self, repo_name: &str) -> (MergeMode, String, Option<String>) {
+    /// Resolve the activated repository policy, translating legacy registry
+    /// fields into the same defaults. The registry is operator-owned and
+    /// content-bound; live `.rk/repo.cue` edits do not take effect until the
+    /// repository is re-added or an onboarding activation updates the record.
+    fn repository_policy(&self, repo: &Repo) -> rk_workflow::RepositoryPolicy {
         let path = self.layout.home().join("repos.json");
-        match crate::repos::RepoRegistry::load(&path) {
-            Ok(reg) => match reg.get(repo_name) {
-                Some(rec) => (
-                    rec.merge_mode,
-                    rec.remote_or_default().to_string(),
-                    rec.host.clone(),
-                ),
-                None => (MergeMode::Direct, "origin".to_string(), None),
-            },
-            Err(_) => (MergeMode::Direct, "origin".to_string(), None),
+        crate::repos::RepoRegistry::load(&path)
+            .ok()
+            .and_then(|registry| {
+                registry
+                    .get_by_path(repo.root())
+                    .map(|record| record.effective_policy())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Execute one repository policy against a source branch. Every delivery
+    /// mode returns the same `delivered` truth so workflows do not accidentally
+    /// treat a local merge with a failed push as complete.
+    async fn deliver_branch(
+        &self,
+        repo: &Repo,
+        repo_name: &str,
+        branch: &str,
+        agent_base: &str,
+        keep_branch: bool,
+    ) -> rk_core::Result<BranchDelivery> {
+        let policy = self.repository_policy(repo);
+        let target = policy.delivery_target(agent_base);
+        let remote = policy.delivery.remote.clone();
+        let remote_branch = policy.remote_branch(branch, &target, repo_name);
+        let mut delivery = BranchDelivery {
+            target: target.clone(),
+            remote: remote.clone(),
+            ..BranchDelivery::default()
+        };
+
+        match policy.delivery.mode {
+            DeliveryMode::Merge | DeliveryMode::MergePush => {
+                let outcome = {
+                    let _merge_guard = self.merge_queue.acquire(repo.root(), &target).await;
+                    let repo = repo.clone();
+                    let branch = branch.to_string();
+                    let target = target.clone();
+                    blocking_io("repository policy merge", move || {
+                        repo.merge_branch(&branch, &target)
+                    })
+                    .await?
+                };
+                delivery.merged = outcome.merged;
+                delivery.merge_commit = outcome.commit;
+                delivery.detail = outcome.detail;
+                if delivery.merged && policy.delivery.mode == DeliveryMode::MergePush {
+                    let repo = repo.clone();
+                    let target_to_push = target.clone();
+                    let remote_to_push = remote.clone();
+                    match blocking_io("repository policy target push", move || {
+                        repo.push_branch_as(&target_to_push, &target_to_push, &remote_to_push)
+                    })
+                    .await
+                    {
+                        Ok(output) => {
+                            delivery.pushed = true;
+                            delivery.detail = format!(
+                                "{}; pushed {target} to {remote}: {}",
+                                delivery.detail,
+                                output.trim()
+                            );
+                        }
+                        Err(error) => {
+                            delivery.detail = format!(
+                                "{}; local merge succeeded but push to {remote}/{target} failed: {error}",
+                                delivery.detail
+                            );
+                        }
+                    }
+                }
+                delivery.delivered = delivery.merged
+                    && (policy.delivery.mode == DeliveryMode::Merge || delivery.pushed);
+            }
+            DeliveryMode::PushBranch => {
+                let repo = repo.clone();
+                let branch_to_push = branch.to_string();
+                let remote_branch_to_push = remote_branch.clone();
+                let remote_to_push = remote.clone();
+                match blocking_io("repository policy branch push", move || {
+                    repo.push_branch_as(
+                        &branch_to_push,
+                        &remote_branch_to_push,
+                        &remote_to_push,
+                    )
+                })
+                .await
+                {
+                    Ok(output) => {
+                        delivery.pushed = true;
+                        delivery.delivered = true;
+                        delivery.remote_branch = Some(remote_branch.clone());
+                        delivery.detail = format!(
+                            "pushed {branch} to {remote}/{remote_branch}: {}",
+                            output.trim()
+                        );
+                    }
+                    Err(error) => {
+                        delivery.remote_branch = Some(remote_branch.clone());
+                        delivery.detail = format!(
+                            "push failed for {branch} -> {remote}/{remote_branch}: {error}"
+                        );
+                    }
+                }
+            }
+            DeliveryMode::Pr => {
+                let repo = repo.clone();
+                let branch_for_pr = branch.to_string();
+                let remote_branch_for_pr = remote_branch.clone();
+                let target_for_pr = target.clone();
+                let remote_for_pr = remote.clone();
+                let outcome = blocking_io("repository policy pull request", move || {
+                    Ok(repo.open_pull_request_as(
+                        &branch_for_pr,
+                        &remote_branch_for_pr,
+                        &target_for_pr,
+                        &remote_for_pr,
+                    ))
+                })
+                .await?;
+                delivery.remote_branch = Some(remote_branch);
+                delivery.pushed = outcome.opened;
+                delivery.pr_opened = outcome.opened;
+                delivery.pr_url = outcome.url;
+                delivery.delivered = outcome.opened;
+                delivery.detail = outcome.detail;
+            }
         }
+
+        let delete_source = delivery.delivered
+            && policy.delivery.delete_source
+            && !keep_branch
+            && policy.delivery.mode != DeliveryMode::Pr;
+        if delete_source {
+            let repo = repo.clone();
+            let source = branch.to_string();
+            match blocking_io("repository policy branch deletion", move || {
+                repo.delete_branch(&source)
+            })
+            .await
+            {
+                Ok(()) => delivery.branch_deleted = true,
+                Err(error) => warn!(
+                    branch,
+                    error = %error,
+                    "delivery succeeded but source branch could not be deleted"
+                ),
+            }
+        }
+        Ok(delivery)
     }
 
     /// Dismiss: stop the session if live, then reconcile the branch with its
@@ -2497,12 +2658,13 @@ impl Supervisor {
         let repo_path = record.repo_root.clone();
         let repo =
             blocking_io("dismiss repo discovery", move || Repo::discover(&repo_path)).await?;
-        let mut merged = false;
-        let mut merge_commit: Option<String> = None;
-        let mut pr_opened = false;
-        let mut pr_url: Option<String> = None;
-        let mut detail = String::from("no merge requested");
-        let (merge_mode, remote, _host) = self.merge_policy(&record.repo_name);
+        let policy = self.repository_policy(&repo);
+        let mut delivery = BranchDelivery {
+            target: record.target_branch.clone(),
+            remote: policy.delivery.remote,
+            detail: "no delivery requested".into(),
+            ..BranchDelivery::default()
+        };
 
         if let Some(worktree) = &record.worktree {
             if worktree.exists() {
@@ -2516,60 +2678,17 @@ impl Supervisor {
         }
         if let Some(branch) = &record.branch {
             if no_merge {
-                detail = format!("branch {branch} preserved (--no-merge)");
+                delivery.detail = format!("branch {branch} preserved (--no-merge)");
             } else {
-                match merge_mode {
-                    MergeMode::Direct => {
-                        // Take our turn in the per-target merge queue: only one
-                        // land or dismiss into this target runs at a time, so
-                        // this merge sees a target no concurrent auto-merge is
-                        // moving underneath it. Held only across the merge
-                        // itself — the kill/worktree cleanup above and the
-                        // branch delete below stay parallel across a fan-out.
-                        let outcome = {
-                            let _merge_guard = self
-                                .merge_queue
-                                .acquire(repo.root(), &record.target_branch)
-                                .await;
-                            let repo = repo.clone();
-                            let branch = branch.clone();
-                            let target = record.target_branch.clone();
-                            blocking_io("dismiss merge", move || {
-                                repo.merge_branch(&branch, &target)
-                            })
-                            .await?
-                        };
-                        merged = outcome.merged;
-                        merge_commit = outcome.commit;
-                        detail = outcome.detail;
-                        if merged {
-                            let repo = repo.clone();
-                            let branch = branch.clone();
-                            blocking_io("dismiss branch deletion", move || {
-                                repo.delete_branch(&branch)
-                            })
-                            .await?;
-                        }
-                    }
-                    MergeMode::Pr => {
-                        // PR mode never merges or deletes the branch: it pushes
-                        // and opens a pull/merge request, leaving the branch
-                        // standing for a human to review and merge. A push/auth
-                        // failure is a clean `pr_opened: false` (never an error),
-                        // mirroring the merge path's `merged: false`.
-                        let repo = repo.clone();
-                        let branch = branch.clone();
-                        let target = record.target_branch.clone();
-                        let remote = remote.clone();
-                        let outcome = blocking_io("dismiss pull request", move || {
-                            Ok(repo.open_pull_request(&branch, &target, &remote))
-                        })
-                        .await?;
-                        pr_opened = outcome.opened;
-                        pr_url = outcome.url;
-                        detail = outcome.detail;
-                    }
-                }
+                delivery = self
+                    .deliver_branch(
+                        &repo,
+                        &record.repo_name,
+                        branch,
+                        &record.target_branch,
+                        false,
+                    )
+                    .await?;
             }
         }
 
@@ -2578,12 +2697,12 @@ impl Supervisor {
             r.pid = None;
             // Record the landed merge commit as the `rk revert` anchor; a
             // no-merge or PR-mode dismiss leaves any prior record untouched.
-            if merge_commit.is_some() {
-                r.merge_commit = merge_commit.clone();
+            if delivery.merge_commit.is_some() {
+                r.merge_commit = delivery.merge_commit.clone();
             }
         })?;
         // A merged ticket-rat closes its ticket for good.
-        if merged {
+        if delivery.merged {
             if let Some(task) = &record.task {
                 if task.starts_with(crate::tickets::ID_PREFIX) {
                     if let Err(e) = self.tickets.set_status(task, "closed").await {
@@ -2598,11 +2717,17 @@ impl Supervisor {
             json!({
                 "agent": name,
                 "workflow_instance": record.workflow_instance,
-                "merged": merged,
-                "merge_commit": &merge_commit,
-                "pr_opened": pr_opened,
-                "pr_url": &pr_url,
-                "detail": &detail,
+                "delivered": delivery.delivered,
+                "target": &delivery.target,
+                "remote": &delivery.remote,
+                "remote_branch": &delivery.remote_branch,
+                "merged": delivery.merged,
+                "merge_commit": &delivery.merge_commit,
+                "pushed": delivery.pushed,
+                "pr_opened": delivery.pr_opened,
+                "pr_url": &delivery.pr_url,
+                "branch_deleted": delivery.branch_deleted,
+                "detail": &delivery.detail,
                 "parent": &record.parent,
             }),
         );
@@ -2624,27 +2749,35 @@ impl Supervisor {
         }
         // A PR-mode dismiss hands the branch off for review rather than merging;
         // surface that as its own event so the inbox / steward can pick it up.
-        if pr_opened {
+        if delivery.pr_opened {
             self.emit_event(
                 &record.repo_name,
                 "pull_request_opened",
                 json!({
                     "agent": name,
                     "branch": &record.branch,
-                    "target": &record.target_branch,
-                    "url": &pr_url,
-                    "detail": &detail,
+                    "target": &delivery.target,
+                    "remote": &delivery.remote,
+                    "remote_branch": &delivery.remote_branch,
+                    "url": &delivery.pr_url,
+                    "detail": &delivery.detail,
                     "parent": &record.parent,
                 }),
             );
         }
         Ok(json!({
             "agent": name,
-            "merged": merged,
-            "merge_commit": merge_commit,
-            "pr_opened": pr_opened,
-            "pr_url": pr_url,
-            "detail": detail,
+            "delivered": delivery.delivered,
+            "target": delivery.target,
+            "remote": delivery.remote,
+            "remote_branch": delivery.remote_branch,
+            "merged": delivery.merged,
+            "merge_commit": delivery.merge_commit,
+            "pushed": delivery.pushed,
+            "pr_opened": delivery.pr_opened,
+            "pr_url": delivery.pr_url,
+            "branch_deleted": delivery.branch_deleted,
+            "detail": delivery.detail,
         }))
     }
 
@@ -2765,84 +2898,50 @@ impl Supervisor {
     ) -> rk_core::Result<serde_json::Value> {
         let repo_path = repo_root.to_path_buf();
         let repo = blocking_io("land repo discovery", move || Repo::discover(&repo_path)).await?;
-        let (merge_mode, remote, _host) = self.merge_policy(&repo.name());
-        let mut merged = false;
-        let mut branch_deleted = false;
-        let mut pr_opened = false;
-        let mut pr_url: Option<String> = None;
-        let detail;
-        match merge_mode {
-            MergeMode::Direct => {
-                // Same land / merge queue the agent-dismiss path uses: serialize
-                // with any concurrent land/dismiss into this target so the merge
-                // runs on the freshly-updated target rather than racing another
-                // auto-merge (TKT-51).
-                let outcome = {
-                    let _merge_guard = self.merge_queue.acquire(repo.root(), target).await;
-                    let repo = repo.clone();
-                    let branch = branch.to_string();
-                    let target = target.to_string();
-                    blocking_io("land merge", move || repo.merge_branch(&branch, &target)).await?
-                };
-                merged = outcome.merged;
-                detail = outcome.detail;
-                if merged && !keep_branch {
-                    let repo_for_delete = repo.clone();
-                    let branch_to_delete = branch.to_string();
-                    match blocking_io("land branch deletion", move || {
-                        repo_for_delete.delete_branch(&branch_to_delete)
-                    })
-                    .await
-                    {
-                        Ok(()) => branch_deleted = true,
-                        Err(e) => warn!(
-                            branch,
-                            error = %e,
-                            "land: merged but could not delete source branch"
-                        ),
-                    }
-                }
-            }
-            MergeMode::Pr => {
-                // PR mode never merges or deletes the branch: push and open the
-                // pull/merge request, leaving it for review.
-                let repo_for_pr = repo.clone();
-                let branch = branch.to_string();
-                let target = target.to_string();
-                let remote = remote.clone();
-                let outcome = blocking_io("land pull request", move || {
-                    Ok(repo_for_pr.open_pull_request(&branch, &target, &remote))
-                })
-                .await?;
-                pr_opened = outcome.opened;
-                pr_url = outcome.url;
-                detail = outcome.detail;
-            }
-        }
+        let repo_name = repo.name();
+        let delivery = self
+            .deliver_branch(&repo, &repo_name, branch, target, keep_branch)
+            .await?;
         let result = json!({
             "branch": branch,
-            "target": target,
-            "merged": merged,
-            "pr_opened": pr_opened,
-            "pr_url": pr_url,
-            "detail": detail,
-            "branch_deleted": branch_deleted,
+            "target": delivery.target,
+            "remote": delivery.remote,
+            "remote_branch": delivery.remote_branch,
+            "delivered": delivery.delivered,
+            "merged": delivery.merged,
+            "merge_commit": delivery.merge_commit,
+            "pushed": delivery.pushed,
+            "pr_opened": delivery.pr_opened,
+            "pr_url": delivery.pr_url,
+            "detail": delivery.detail,
+            "branch_deleted": delivery.branch_deleted,
         });
-        self.emit_event(&repo.name(), "branch_landed", result.clone());
+        self.emit_event(&repo_name, "branch_landed", result.clone());
         // Surface an opened PR as its own event, mirroring dismiss.
-        if pr_opened {
+        if delivery.pr_opened {
             self.emit_event(
-                &repo.name(),
+                &repo_name,
                 "pull_request_opened",
                 json!({
                     "branch": branch,
-                    "target": target,
+                    "target": result.get("target"),
+                    "remote": result.get("remote"),
+                    "remote_branch": result.get("remote_branch"),
                     "url": result.get("pr_url"),
                     "detail": result.get("detail"),
                 }),
             );
         }
-        info!(branch, target, merged, pr_opened, branch_deleted, "land");
+        info!(
+            branch,
+            target = %delivery.target,
+            delivered = delivery.delivered,
+            merged = delivery.merged,
+            pushed = delivery.pushed,
+            pr_opened = delivery.pr_opened,
+            branch_deleted = delivery.branch_deleted,
+            "land"
+        );
         Ok(result)
     }
 
@@ -2869,18 +2968,31 @@ impl Supervisor {
             Repo::discover(&repo_path)
         })
         .await?;
-        let (_merge_mode, remote, _host) = self.merge_policy(&repo.name());
+        let repo_name = repo.name();
+        let policy = self.repository_policy(&repo);
+        let remote = policy.delivery.remote.clone();
+        let remote_branch = policy.remote_branch(branch, target, &repo_name);
         let repo_for_pr = repo.clone();
         let branch_name = branch.to_string();
+        let remote_branch_name = remote_branch.clone();
         let target_name = target.to_string();
         let outcome = blocking_io("pull request", move || {
-            Ok(repo_for_pr.open_pull_request(&branch_name, &target_name, &remote))
+            Ok(repo_for_pr.open_pull_request_as(
+                &branch_name,
+                &remote_branch_name,
+                &target_name,
+                &remote,
+            ))
         })
         .await?;
         let result = json!({
             "branch": branch,
             "target": target,
+            "remote": policy.delivery.remote,
+            "remote_branch": remote_branch,
+            "delivered": outcome.opened,
             "merged": false,
+            "pushed": outcome.opened,
             "pr_opened": outcome.opened,
             "pr_url": outcome.url,
             "detail": outcome.detail,
@@ -2889,11 +3001,13 @@ impl Supervisor {
         // so the inbox / steward can pick up the hand-off.
         if outcome.opened {
             self.emit_event(
-                &repo.name(),
+                &repo_name,
                 "pull_request_opened",
                 json!({
                     "branch": branch,
                     "target": target,
+                    "remote": result.get("remote"),
+                    "remote_branch": result.get("remote_branch"),
                     "url": result.get("pr_url"),
                     "detail": result.get("detail"),
                 }),

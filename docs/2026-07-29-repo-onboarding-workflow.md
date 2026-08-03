@@ -1,6 +1,11 @@
 # Guided repository onboarding workflow
 
-Status: implementation design
+Status: implemented; updated 2026-08-03 for repository policy activation
+
+The shipped implementation adds one important refinement to the original
+design: repository-owned lifecycle intent lives in `.rk/repo.cue`, while the
+daemon executes an operator-activated copy bound to the file's exact digest.
+See [`repository-policy.md`](repository-policy.md) for the current schema.
 
 ## Intent
 
@@ -39,7 +44,8 @@ repeat discovery.
 
 ## Non-goals
 
-- Automatically enabling fleet-wide drain, schedules, triggers, or merge policy.
+- Automatically enabling fleet-wide drain, schedules, triggers, or repository
+  delivery policy without explicit activation.
 - Replacing the repository's CI system or inventing a new project build tool.
 - Treating an agent's observation as permission to change the human's checkout.
 - Installing git hooks, changing remotes, changing authentication, or changing
@@ -52,8 +58,10 @@ The implementation should compose existing surfaces rather than introduce a
 second agent lifecycle:
 
 - `rk repo add` persists a machine-local `RepoRecord` containing the path,
-  remote, host, and merge mode. Onboarding may idempotently register a path,
-  but registration must be shown as a separate decision from repository edits.
+  remote/host compatibility fields, and the exact activated `.rk/repo.cue`
+  policy plus digest when present. Onboarding may idempotently register a path,
+  but registration must be shown as a separate decision from later repository
+  edits.
 - `.rk/checks.cue` is already the repository-owned named-check registry. Its
   commands are the allowlisted inputs to workflow `run` steps when
   `require_named_checks` is enabled.
@@ -94,9 +102,11 @@ These terms are canonical for this feature:
 - **Onboarding branch** — the isolated branch where approved repository-file
   changes are applied.
 - **Repository configuration** — repo-owned files such as `.rk/checks.cue`,
-  workflow definitions, triggers, and the selected instruction file.
-- **Castle configuration** — machine-local registration, merge mode, remote,
-  harness, and global policy. It must be kept distinct from repository files.
+  `.rk/repo.cue`, workflow definitions, triggers, and the selected instruction
+  file. These are versioned requests until activated where required.
+- **Castle configuration** — machine-local registration, the activated
+  repository-policy digest/copy, harness, and global policy. It must be kept
+  distinct from repository files.
 - **Proposal digest** — a canonical hash over the proposal payload, target
   repository identity, onboarding branch/tree revision, and requested action.
   Approval and application are valid only for the exact digest the human
@@ -133,7 +143,8 @@ worktree before proposing agent execution.
 1. **Identity and access**
 
    Confirm repository path, registered name, remote/host, current branch,
-   default/base branch, worktree cleanliness, and the selected merge mode.
+   default/base branch, worktree cleanliness, and the activated repository
+   policy/digest. Report direct `.rk/repo.cue` edits as inert drift.
    Report missing remotes or ambiguous base branches; do not repair them
    automatically.
 
@@ -152,13 +163,15 @@ worktree before proposing agent execution.
    environment, and whether each command mutates state. Propose additions or
    repairs to `.rk/checks.cue`; validate CUE before applying them.
 
-4. **Git discipline proposal**
+4. **Git and delivery discipline proposal**
 
    Check clean-worktree expectations, commit-before-verify order, branch/base
-   resolution, branch naming, remote/merge mode, and whether repository
-   instructions explain how a rat proves delivery. Prefer a focused update to
-   the repository's existing instruction file; do not create a competing
-   instruction hierarchy without approval.
+   resolution, branch/worktree naming, `agent-base` versus a fixed target,
+   delivery mode, remote-branch mapping, cleanup, and whether repository
+   instructions explain how a rat proves delivery. Record those lifecycle
+   choices in `.rk/repo.cue`. Prefer a focused update to the repository's
+   existing instruction file; do not create a competing instruction hierarchy
+   without approval.
 
 5. **Workflow and policy proposal**
 
@@ -166,8 +179,10 @@ worktree before proposing agent execution.
    named-check references, and the castle's `require_named_checks` policy.
    Present these as separate proposals. Repo-local workflow, trigger, and
    schedule files are discovered and reloaded automatically by the daemon, so
-   landing an approved file into the registered checkout is the activation
-   boundary. Validation or staging in the onboarding branch is not activation.
+   landing an approved file into the registered checkout is their activation
+   boundary. Repository policy additionally requires copying the landed exact
+   digest into the operator-owned registry. Validation or staging in the
+   onboarding branch is not activation.
 
 6. **Agent readiness proof**
 
@@ -271,6 +286,9 @@ the underlying RPC names and state transitions must be stable and idempotent.
 - Discovery is read-only and may run repeatedly.
 - Proposal generation is not approval.
 - Applying a repository proposal is not landing the onboarding branch.
+- Applying `.rk/repo.cue` validates only the staged request. Activation lands
+  the exact approved commit and records that exact digest/policy in every local
+  alias for the registered checkout. Later edits remain inert drift.
 - Validating or staging a workflow is not activation. Because repo-local
   workflow, trigger, and schedule files are auto-discovered, landing them in
   the registered checkout is activation and requires its own final approval.

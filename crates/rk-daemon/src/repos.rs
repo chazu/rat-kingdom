@@ -7,6 +7,7 @@
 
 use chrono::{DateTime, Utc};
 use rk_core::config::MergeMode;
+use rk_workflow::{DeliveryMode, RepositoryPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,13 +30,44 @@ pub struct RepoRecord {
     /// URL at registration time. `None` if the repo had no such remote.
     #[serde(default)]
     pub host: Option<String>,
+    /// Exact `.rk/repo.cue` policy approved by an operator, plus the digest of
+    /// the activated file. `None` preserves the legacy CLI/config behavior for
+    /// registries written before repository policies existed.
+    #[serde(default)]
+    pub activated_policy: Option<ActivatedRepositoryPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivatedRepositoryPolicy {
+    pub digest: String,
+    pub policy: RepositoryPolicy,
 }
 
 impl RepoRecord {
     /// The remote to use for push / PR operations, defaulting to `origin` when
     /// none was configured.
     pub fn remote_or_default(&self) -> &str {
-        self.remote.as_deref().unwrap_or("origin")
+        self.activated_policy
+            .as_ref()
+            .map(|approved| approved.policy.delivery.remote.as_str())
+            .or(self.remote.as_deref())
+            .unwrap_or("origin")
+    }
+
+    /// Active behavior with legacy fields translated into the same model.
+    pub fn effective_policy(&self) -> RepositoryPolicy {
+        self.activated_policy
+            .as_ref()
+            .map(|approved| approved.policy.clone())
+            .unwrap_or_else(|| {
+                let mut policy = RepositoryPolicy::default();
+                policy.delivery.mode = match self.merge_mode {
+                    MergeMode::Direct => DeliveryMode::Merge,
+                    MergeMode::Pr => DeliveryMode::Pr,
+                };
+                policy.delivery.remote = self.remote_or_default().to_string();
+                policy
+            })
     }
 }
 
@@ -103,10 +135,54 @@ impl RepoRegistry {
         self.repos.get(name)
     }
 
+    /// Resolve the deterministic first alias registered for a canonical path.
+    pub fn get_by_path(&self, path: &Path) -> Option<&RepoRecord> {
+        let mut matches = self
+            .repos
+            .values()
+            .filter(|record| record.path == path)
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| left.name.cmp(&right.name));
+        matches.into_iter().next()
+    }
+
     pub fn list(&self) -> Vec<RepoRecord> {
         let mut all: Vec<_> = self.repos.values().cloned().collect();
         all.sort_by(|a, b| a.name.cmp(&b.name));
         all
+    }
+
+    /// Activate one content-bound policy for every alias of a canonical repo.
+    /// The checkout path is machine-local; aliases must not acquire divergent
+    /// delivery authority merely because the same path has multiple names.
+    pub fn activate_policy_by_path(
+        &mut self,
+        repo_path: &Path,
+        activated: ActivatedRepositoryPolicy,
+    ) -> rk_core::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for record in self.repos.values_mut() {
+            if record.path == repo_path {
+                record.merge_mode = match activated.policy.delivery.mode {
+                    DeliveryMode::Pr => MergeMode::Pr,
+                    DeliveryMode::Merge
+                    | DeliveryMode::MergePush
+                    | DeliveryMode::PushBranch => MergeMode::Direct,
+                };
+                record.remote = Some(activated.policy.delivery.remote.clone());
+                record.activated_policy = Some(activated.clone());
+                names.push(record.name.clone());
+            }
+        }
+        if names.is_empty() {
+            return Err(rk_core::Error::other(format!(
+                "repository is not registered: {}",
+                repo_path.display()
+            )));
+        }
+        names.sort();
+        self.persist()?;
+        Ok(names)
     }
 
     fn persist(&self) -> rk_core::Result<()> {
@@ -132,6 +208,7 @@ mod tests {
             merge_mode: MergeMode::default(),
             remote: None,
             host: None,
+            activated_policy: None,
         }
     }
 
