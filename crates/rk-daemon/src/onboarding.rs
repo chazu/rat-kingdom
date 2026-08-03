@@ -1407,25 +1407,138 @@ fn verification_name(name: &str) -> bool {
 }
 
 fn command_tool(command: &str) -> Option<String> {
-    let mut words = command.split_whitespace().peekable();
-    let mut word = words.next()?.trim_matches(['\'', '"']).to_string();
-    while word.contains('=') && !word.starts_with("./") && !word.starts_with('/') {
-        word = words.next()?.trim_matches(['\'', '"']).to_string();
-    }
-    if word == "env" {
-        loop {
-            word = words.next()?.trim_matches(['\'', '"']).to_string();
-            if word == "-u" || word == "--unset" {
-                words.next()?;
-                continue;
-            }
-            if word.starts_with("--unset=") || word.contains('=') {
-                continue;
-            }
-            break;
+    for statement in shell_statements(command) {
+        let words = shell_words(&statement);
+        if words.is_empty() || words.iter().all(|word| shell_assignment(word)) {
+            continue;
         }
+        let mut words = words.into_iter();
+        let mut word = words.next()?;
+        while matches!(word.as_str(), "!" | "{" | "(" | "command")
+            || shell_assignment(&word)
+        {
+            word = words.next()?;
+        }
+        if word == "env" {
+            loop {
+                word = words.next()?;
+                if word == "-u" || word == "--unset" {
+                    words.next()?;
+                    continue;
+                }
+                if word.starts_with("--unset=") || shell_assignment(&word) {
+                    continue;
+                }
+                break;
+            }
+        }
+        return Some(word.trim_matches(['\'', '"']).to_string());
     }
-    Some(word)
+    None
+}
+
+/// Split a shell fragment at top-level list separators. Quoted prose and
+/// command substitutions are opaque: onboarding only needs the first actual
+/// command, and treating their interior words as executables creates bogus
+/// `tool_missing` findings.
+fn shell_statements(command: &str) -> Vec<String> {
+    shell_tokens(command, true)
+}
+
+/// Tokenize either statements or words while respecting the shell constructs
+/// that occur in repository-owned checks. This deliberately does not execute or
+/// fully parse shell; it only preserves quoted strings and `$()` as one token.
+fn shell_tokens(command: &str, split_statements: bool) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut substitution_depth = 0usize;
+    let chars = command.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            current.push(ch);
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if let Some(active) = quote {
+            current.push(ch);
+            if ch == active {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+            current.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '$' && chars.get(index + 1) == Some(&'(') {
+            substitution_depth += 1;
+            current.push(ch);
+            current.push('(');
+            index += 2;
+            continue;
+        }
+        if substitution_depth > 0 {
+            current.push(ch);
+            if ch == '(' {
+                substitution_depth += 1;
+            } else if ch == ')' {
+                substitution_depth -= 1;
+            }
+            index += 1;
+            continue;
+        }
+
+        let list_separator = split_statements
+            && (matches!(ch, ';' | '\n')
+                || (ch == '&' && chars.get(index + 1) == Some(&'&'))
+                || (ch == '|' && chars.get(index + 1) == Some(&'|')));
+        let word_separator = !split_statements && ch.is_whitespace();
+        if list_separator || word_separator {
+            if !current.trim().is_empty() {
+                tokens.push(current.trim().to_string());
+            }
+            current.clear();
+            if split_statements && matches!(ch, '&' | '|') {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        current.push(ch);
+        index += 1;
+    }
+    if !current.trim().is_empty() {
+        tokens.push(current.trim().to_string());
+    }
+    tokens
+}
+
+fn shell_words(statement: &str) -> Vec<String> {
+    shell_tokens(statement, false)
+}
+
+fn shell_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    matches!(chars.next(), Some('_' | 'a'..='z' | 'A'..='Z'))
+        && chars.all(|ch| matches!(ch, '_' | 'a'..='z' | 'A'..='Z' | '0'..='9'))
 }
 
 fn command_exists(command: &str, root: &Path) -> bool {
@@ -1691,6 +1804,61 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.kind == expected_kind && finding.summary.contains("jcode")));
+    }
+
+    #[test]
+    fn shell_check_tool_detection_ignores_assignments_operators_and_quoted_prose() {
+        assert_eq!(
+            command_tool(
+                "target=$RK_CHECK_TARGET; ! git diff --name-only \"$target\"...HEAD | grep x"
+            )
+            .as_deref(),
+            Some("git")
+        );
+        assert_eq!(
+            command_tool(
+                r#"text="steward: reviewer returned STOP"; payload=$(jq -nc --arg text "$text" '{text:$text}'); rk out need repo steward --payload "$payload""#
+            )
+            .as_deref(),
+            Some("rk")
+        );
+        assert_eq!(
+            command_tool("MODE=test env -u RK_AGENT cargo test --workspace").as_deref(),
+            Some("cargo")
+        );
+    }
+
+    #[test]
+    fn repository_named_checks_do_not_invent_missing_tools_from_shell_prose() {
+        let dir = fixture();
+        fs::create_dir_all(dir.path().join(".rk")).unwrap();
+        fs::write(
+            dir.path().join(".rk/checks.cue"),
+            r#"checks: [
+    {name: "guard", command: "target=$RK_CHECK_TARGET; ! git diff --name-only \"$target\"...HEAD | grep x"},
+    {name: "report", command: "text=\"reviewer returned STOP\"; payload=$(jq -nc --arg text \"$text\" '{text:$text}'); rk out need repo steward --payload \"$payload\""},
+]"#,
+        )
+        .unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-m", "add shell checks"]);
+
+        let report = inspect(
+            dir.path().to_str().unwrap(),
+            &[],
+            &InspectContext {
+                default_harness: "fake".into(),
+                require_named_checks: true,
+            },
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == FindingKind::ToolMissing),
+            "{:#?}",
+            report.findings
+        );
     }
 
     #[test]
