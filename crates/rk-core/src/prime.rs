@@ -375,8 +375,16 @@ const FRAGMENT_COMPLETION: &str = "\
    finish your own task.
 4. Prove the branch carries the work before you signal. `rk done` is NOT a
    commit: run `git status --porcelain` (must be empty) and
-   `git log <base>..HEAD` (must be non-empty). If a verification command is
-   still running, wait for it — do not report while it is in flight.
+   `git log <base>..HEAD` (must be non-empty). Resolve `<base>` — do not assume
+   `main`. Your worktree is NOT always cut from the integration branch: a
+   workflow chains each step's rat onto the previous step's branch, so
+   `git log main..HEAD` can be non-empty because of a PREDECESSOR's commits
+   while you have committed nothing. Get your own fork point with
+   `git merge-base HEAD main` and count from there:
+   `git log $(git merge-base HEAD main)..HEAD` — and confirm at least one of
+   those commits is yours (`git log --format='%an %s' $(git merge-base HEAD \
+   main)..HEAD`). If a verification command is still running, wait for it — do
+   not report while it is in flight.
 5. Before you finish, review the injected facts that were relevant to your task.
    If a fact materially helped and appears correct, run `rk fact vote <fact-id> up`;
    if it is incorrect or harmful, run `rk fact vote <fact-id> down`. Use `clear`
@@ -542,7 +550,12 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
         "reviewer" => {
             out.push_str(
                 "Review the changes on your branch against the task requirements. \
-                 FIRST establish there are changes: run `git log <base>..HEAD`. An \
+                 FIRST establish there are changes: run `git log <base>..HEAD`, where \
+                 `<base>` is the repo's INTEGRATION branch (`main`) — NOT your own \
+                 fork point. You are chained onto the branch you are reviewing, so \
+                 your fork point is the tip of that work and `git log` from it is \
+                 empty on every healthy review. Counting from your fork point would \
+                 make you REWORK finished work. An \
                  EMPTY branch is not a verdict — it has two causes needing OPPOSITE \
                  verdicts, so disambiguate before you judge. Find the implementer's \
                  commit (`rk scan artifact <repo>` records the sha) and run \
@@ -802,7 +815,31 @@ mod tests {
             );
             assert!(text.contains("git status --porcelain"));
             assert!(text.contains("git log <base>..HEAD"));
+            // <base> is not resolvable from a rat's env (supervisor.rs agent_env
+            // exports no base), and a workflow-chained rat is cut from its
+            // predecessor's branch, not main — so the placeholder has to come
+            // with the resolution.
+            assert!(text.contains("git merge-base HEAD main"));
+            assert!(text.contains("do not assume"));
         }
+    }
+
+    #[test]
+    fn reviewer_counts_from_the_integration_branch_not_its_fork_point() {
+        // steward.cue spawns the reviewer with `branch: _input.branch`, so the
+        // reviewer's fork point IS the work under review and `git log <fork>..HEAD`
+        // is empty on every healthy review. Resolving <base> "correctly" therefore
+        // routes finished work to REWORK.
+        let text = render("reviewer", &ctx());
+        assert!(text.contains("NOT your own"));
+        assert!(text.contains("chained onto the branch you are reviewing"));
+        // The rat's opposite instruction must not leak into the reviewer arm.
+        let reviewer_arm = text
+            .split("Review the changes on your branch against the task requirements. ")
+            .nth(1)
+            .and_then(|arm| arm.split("## Coordination: the tuplespace").next())
+            .expect("reviewer arm");
+        assert!(!reviewer_arm.contains("do not assume"));
     }
 
     #[test]
