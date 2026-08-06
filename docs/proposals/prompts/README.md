@@ -26,6 +26,7 @@ a unified diff, a safety argument against the `prime.rs` tests, and any companio
 | 0010 | Prove you can land before you spend a lifetime | `FRAGMENT_COMPLETION` (new step 1) | landed |
 | 0011 | The prompt orders a `fact` write the daemon forbids | `FRAGMENT_SINGLE_TASK` + `FRAGMENT_COMPLETION` step 4 | implemented (daemon authorization) |
 | 0012 | Make parallel-drain file ownership a stop condition | `FRAGMENT_SPACE` + `FRAGMENT_GIT_SAFETY` | proposed |
+| 0013 | Classify failure boundaries before proposing prompt edits | `prompt-refine` task descriptions | proposed |
 
 Proposals 0004 and 0005 are the two halves of one failure (empty branches at the
 implementer/reviewer seam) and were landed together.
