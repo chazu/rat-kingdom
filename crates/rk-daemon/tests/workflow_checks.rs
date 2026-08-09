@@ -10,6 +10,12 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+// These tests configure the fake harness through a process-global environment
+// variable. Keep the variable stable until the daemon and its child harness
+// have finished; otherwise a sibling test can remove it between workflow.run
+// and the spawn step, silently selecting the default no-op fake.
+static HARNESS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .arg("-C")
@@ -163,6 +169,7 @@ fn main_listing(repo: &Path) -> String {
 /// lets the branch merge. This is the sanctioned path.
 #[tokio::test]
 async fn named_check_resolves_and_merges_under_policy() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     init_repo(repo_dir.path());
@@ -205,6 +212,7 @@ async fn named_check_resolves_and_merges_under_policy() {
 /// the command remains the exact text declared by the repository.
 #[tokio::test]
 async fn named_check_receives_namespaced_data_inputs_under_policy() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     init_repo(repo_dir.path());
@@ -243,6 +251,7 @@ async fn named_check_receives_namespaced_data_inputs_under_policy() {
 /// arbitrary shell.
 #[tokio::test]
 async fn raw_command_refused_under_policy_fails_closed() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     init_repo(repo_dir.path());
@@ -288,6 +297,7 @@ async fn raw_command_refused_under_policy_fails_closed() {
 /// the policy is opt-in and backward compatible.
 #[tokio::test]
 async fn raw_command_runs_when_policy_off() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     init_repo(repo_dir.path());
@@ -327,6 +337,7 @@ async fn raw_command_runs_when_policy_off() {
 /// closed — a typo or a stale reference never silently runs nothing.
 #[tokio::test]
 async fn unknown_check_fails_closed() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     init_repo(repo_dir.path());
