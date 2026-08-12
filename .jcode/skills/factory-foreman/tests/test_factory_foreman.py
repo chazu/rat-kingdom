@@ -1,6 +1,7 @@
 import copy
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -285,6 +286,138 @@ class FactoryForemanClassificationTests(unittest.TestCase):
         report = self.classify(snapshot)
 
         self.assertEqual(report.findings, [])
+
+
+class ExplodingRunner:
+    def run(self, argv):
+        raise AssertionError(f"runner must not execute: {argv!r}")
+
+
+class FactoryForemanCliTests(unittest.TestCase):
+    def default_runner(self):
+        return FakeRunner(FactoryForemanSnapshotTests().default_results())
+
+    def run_cli(self, args, runner=None):
+        return factory_foreman.main(args, runner=runner or self.default_runner())
+
+    def test_triage_markdown_contains_health_and_findings_sections(self):
+        result = self.run_cli(["triage", "--repo", REPO, "--format", "markdown"])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("# Factory Triage", result.stdout)
+        self.assertIn("## Snapshot Health", result.stdout)
+        self.assertIn("## Findings", result.stdout)
+
+    def test_partial_snapshot_warning_is_visible(self):
+        results = FactoryForemanSnapshotTests().default_results()
+        results[SNAPSHOT_ARGVS[1]] = CommandResult(1, "", "inbox failed")
+
+        result = self.run_cli(
+            ["snapshot", "--repo", REPO, "--format", "markdown"],
+            runner=FakeRunner(results),
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("DEGRADED", result.stdout)
+        self.assertIn("inbox", result.stdout)
+
+    def test_propose_workflow_renders_but_does_not_execute(self):
+        result = self.run_cli(
+            ["propose-workflow", "repair", "--repo", REPO],
+            runner=ExplodingRunner(),
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("proposal_id", payload)
+        self.assertIn("argv", payload)
+        self.assertIn("command", payload)
+
+    def test_validate_proposal_returns_exact_argv_on_matching_id(self):
+        proposal = json.loads(
+            self.run_cli(
+                [
+                    "propose-workflow",
+                    "repair",
+                    "--repo",
+                    REPO,
+                    "--param",
+                    "ticket=123",
+                    "--coordinator",
+                    "coord-1",
+                ],
+                runner=ExplodingRunner(),
+            ).stdout
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "proposal.json"
+            path.write_text(json.dumps(proposal), encoding="utf-8")
+            result = self.run_cli(
+                [
+                    "validate-proposal",
+                    "--proposal-file",
+                    str(path),
+                    "--approved-id",
+                    proposal["proposal_id"],
+                ],
+                runner=ExplodingRunner(),
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout)["argv"], proposal["argv"])
+
+    def test_validate_proposal_rejects_exact_command_mismatch(self):
+        proposal = json.loads(
+            self.run_cli(
+                ["propose-workflow", "repair", "--repo", REPO, "--coordinator", "coord-1"],
+                runner=ExplodingRunner(),
+            ).stdout
+        )
+        proposal["argv"][-1] = "coord-2"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "proposal.json"
+            path.write_text(json.dumps(proposal), encoding="utf-8")
+            result = self.run_cli(
+                [
+                    "validate-proposal",
+                    "--proposal-file",
+                    str(path),
+                    "--approved-id",
+                    proposal["proposal_id"],
+                ],
+                runner=ExplodingRunner(),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("argv", result.stdout)
+
+    def test_propose_workflow_rejects_invalid_param_without_equals(self):
+        result = self.run_cli(
+            ["propose-workflow", "repair", "--repo", REPO, "--param", "broken"],
+            runner=ExplodingRunner(),
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("KEY=VALUE", result.stderr)
+
+    def test_propose_workflow_quotes_shell_display_without_changing_argv(self):
+        result = self.run_cli(
+            [
+                "propose-workflow",
+                "repair",
+                "--repo",
+                REPO,
+                "--param",
+                "summary=hello world",
+            ],
+            runner=ExplodingRunner(),
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertIn("summary=hello world", payload["argv"])
+        self.assertIn("'summary=hello world'", payload["command"])
 
 
 if __name__ == "__main__":

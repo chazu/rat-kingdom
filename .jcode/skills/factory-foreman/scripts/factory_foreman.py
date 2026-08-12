@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
+import shlex
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 
@@ -49,6 +53,11 @@ class SubprocessRunner:
         except subprocess.TimeoutExpired as error:
             return CommandResult(124, error.stdout or "", "timeout")
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise ValueError(message)
 
 
 @dataclass(frozen=True)
@@ -508,3 +517,140 @@ def _observe(command: str, argv: tuple[str, ...], runner: Runner) -> Observation
         return Observation(False, command, error=f"invalid JSON: {error.msg}")
 
     return Observation(True, command, data=data)
+
+
+def main(argv: list[str] | None = None, runner: Runner | None = None) -> CommandResult:
+    runner = runner or SubprocessRunner()
+    parser = _build_parser()
+    try:
+        args = parser.parse_args(argv)
+        if args.command == "snapshot":
+            snapshot = collect_snapshot(args.repo, runner)
+            stdout = _render_snapshot(snapshot, args.format)
+            return CommandResult(_snapshot_exit_code(snapshot), stdout, "")
+        if args.command == "triage":
+            snapshot = collect_snapshot(args.repo, runner)
+            triage = classify_snapshot(snapshot)
+            stdout = _render_triage(snapshot, triage, args.format)
+            return CommandResult(_snapshot_exit_code(snapshot), stdout, "")
+        if args.command == "propose-workflow":
+            proposal = _proposal(args.workflow, args.repo, args.param or [], args.coordinator)
+            return CommandResult(0, json.dumps(proposal, sort_keys=True) + "\n", "")
+        if args.command == "validate-proposal":
+            proposal = json.loads(Path(args.proposal_file).read_text(encoding="utf-8"))
+            argv_value = proposal.get("argv")
+            if not isinstance(argv_value, list) or not all(isinstance(part, str) for part in argv_value):
+                return CommandResult(1, "", "invalid proposal argv\n")
+            actual_id = proposal_id(argv_value)
+            if actual_id != args.approved_id:
+                return CommandResult(1, "", "proposal id mismatch\n")
+            return CommandResult(0, json.dumps({"argv": argv_value}, sort_keys=True) + "\n", "")
+        raise ValueError("missing command")
+    except ValueError as error:
+        return CommandResult(2, "", f"error: {error}\n")
+    except (OSError, json.JSONDecodeError) as error:
+        return CommandResult(1, "", f"error: {error}\n")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = _ArgumentParser(prog="factory-foreman")
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    for name in ("snapshot", "triage"):
+        command = subcommands.add_parser(name)
+        command.add_argument("--repo", required=True)
+        command.add_argument("--format", choices=("json", "markdown"), required=True)
+
+    propose = subcommands.add_parser("propose-workflow")
+    propose.add_argument("workflow")
+    propose.add_argument("--repo", required=True)
+    propose.add_argument("--param", action="append", type=_param)
+    propose.add_argument("--coordinator")
+
+    validate = subcommands.add_parser("validate-proposal")
+    validate.add_argument("--proposal-file", required=True)
+    validate.add_argument("--approved-id", required=True)
+    return parser
+
+
+def _param(value: str) -> str:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("--param must use KEY=VALUE")
+    return value
+
+
+def _snapshot_exit_code(snapshot: FactorySnapshot) -> int:
+    if not snapshot.observations:
+        return 1
+    if (
+        snapshot.observations.get(
+            PREFLIGHT_COMMAND, Observation(False, "", error="")
+        ).ok
+        is False
+        and len(snapshot.observations) == 1
+    ):
+        return 1
+    if all(not observation.ok for observation in snapshot.observations.values()):
+        return 1
+    return 0
+
+
+def _render_snapshot(snapshot: FactorySnapshot, output_format: str) -> str:
+    if output_format == "json":
+        return json.dumps(snapshot.to_dict(), sort_keys=True) + "\n"
+    health = "HEALTHY" if snapshot.healthy else "DEGRADED"
+    lines = [
+        "# Factory Snapshot",
+        "",
+        f"Repository: {snapshot.repo}",
+        f"Status: {health}",
+        "",
+        "## Observations",
+    ]
+    for name, observation in snapshot.observations.items():
+        status = "ok" if observation.ok else f"DEGRADED: {observation.error}"
+        lines.append(f"- {name}: {status}")
+    return "\n".join(lines) + "\n"
+
+
+def _render_triage(snapshot: FactorySnapshot, triage: TriageReport, output_format: str) -> str:
+    if output_format == "json":
+        return (
+            json.dumps(
+                {"snapshot": snapshot.to_dict(), "triage": triage.to_dict()},
+                sort_keys=True,
+            )
+            + "\n"
+        )
+    health = "HEALTHY" if snapshot.healthy else "DEGRADED"
+    lines = ["# Factory Triage", "", "## Snapshot Health", "", f"Status: {health}"]
+    for error in snapshot.errors:
+        lines.append(f"- DEGRADED: {error}")
+    lines.extend(["", "## Findings"])
+    if not triage.findings:
+        lines.append("- No findings.")
+    else:
+        for finding in triage.findings:
+            lines.append(f"- {finding.severity.upper()} {finding.category}: {finding.summary}")
+    return "\n".join(lines) + "\n"
+
+
+def _proposal(workflow: str, repo: str, params: list[str], coordinator: str | None) -> dict[str, Any]:
+    argv = ["rk", "--json", "workflow", "run", workflow, "--repo", repo]
+    for value in params:
+        argv.extend(["--param", value])
+    if coordinator is not None:
+        argv.extend(["--coordinator", coordinator])
+    return {"proposal_id": proposal_id(argv), "argv": argv, "command": shlex.join(argv)}
+
+
+def proposal_id(argv: list[str]) -> str:
+    canonical = json.dumps(argv, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+if __name__ == "__main__":
+    result = main()
+    print(result.stdout, end="")
+    print(result.stderr, end="")
+    raise SystemExit(result.returncode)
