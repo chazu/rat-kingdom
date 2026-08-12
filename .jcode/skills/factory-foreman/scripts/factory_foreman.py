@@ -276,6 +276,22 @@ def _classify_row(source: str, row: dict[str, Any]) -> list[Finding]:
         )
         return findings
 
+    check = _failed_named_check(row)
+    if check is not None:
+        findings.append(
+            _finding(
+                "named-check-failure",
+                "medium",
+                check,
+                f"Repository check failed: {check}.",
+                detail,
+                "Open the named check output and fix the first failing assertion or command.",
+                workflow_instance,
+                agent,
+            )
+        )
+        return findings
+
     text_category = _classify_text(lower)
     if text_category is not None:
         category, severity, summary, next_step = text_category
@@ -287,22 +303,6 @@ def _classify_row(source: str, row: dict[str, Any]) -> list[Finding]:
                 summary,
                 detail,
                 next_step,
-                workflow_instance,
-                agent,
-            )
-        )
-        return findings
-
-    check = _failed_named_check(row)
-    if check is not None:
-        findings.append(
-            _finding(
-                "named-check-failure",
-                "medium",
-                check,
-                f"Repository check failed: {check}.",
-                detail,
-                "Open the named check output and fix the first failing assertion or command.",
                 workflow_instance,
                 agent,
             )
@@ -334,7 +334,13 @@ def _budget_pressure(
     source: str,
 ) -> Finding | None:
     spend = _first_number(row, "spend_usd", "cost_usd", "usage_usd", "current_spend_usd")
-    maximum = _first_number(row, "instance_max_usd", "max_usd", "budget_usd")
+    maximum = _first_number(
+        row,
+        "instance_max_usd",
+        "workflow_instance_max_usd",
+        "instance_budget_usd",
+        "workflow_instance_budget_usd",
+    )
     if spend is None or maximum is None or maximum <= 0:
         return None
     if spend / maximum < BUDGET_PRESSURE_RATIO:
@@ -370,14 +376,14 @@ def _classify_text(lower: str) -> tuple[str, str, str, str] | None:
 
 
 def _is_timeout(row: dict[str, Any], lower: str) -> bool:
-    if row.get("timed_out") is True or row.get("timeout") is True:
+    if row.get("timed_out") is True:
         return True
     if _exit_code(row) == 124:
         return True
     for step in _steps(row):
         if step.get("timed_out") is True or _exit_code(step) == 124:
             return True
-    return "timed out" in lower or "timeout" in lower
+    return "timed out" in lower
 
 
 def _is_empty_harness_result(row: dict[str, Any]) -> bool:

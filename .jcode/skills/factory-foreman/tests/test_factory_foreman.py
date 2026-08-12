@@ -74,6 +74,26 @@ def classified_snapshot(*, workflows=None, inbox=None, errors=None):
     )
 
 
+def classification_case(case):
+    payload = fixture_json("classification_cases_snapshot")
+    for observation_name, observation in payload["observations"].items():
+        data = observation.get("data") or {}
+        for key in ("workflows", "messages"):
+            for row in data.get(key, []):
+                if row.get("case") == case:
+                    return observation_name, row
+    raise AssertionError(f"missing classification fixture case: {case}")
+
+
+def classified_case_snapshot(case):
+    observation_name, row = classification_case(case)
+    if observation_name == "workflows":
+        return classified_snapshot(workflows=[copy.deepcopy(row)])
+    if observation_name == "inbox":
+        return classified_snapshot(inbox=[copy.deepcopy(row)])
+    raise AssertionError(f"unsupported classification source: {observation_name}")
+
+
 class FakeRunner:
     def __init__(self, results=None):
         self.calls = []
@@ -161,41 +181,17 @@ class FactoryForemanClassificationTests(unittest.TestCase):
         return report.findings[0]
 
     def test_classifies_empty_undeclared_harness_result(self):
-        snapshot = classified_snapshot(
-            workflows=[
-                {
-                    "kind": "workflow-failed",
-                    "id": "wf-1",
-                    "workflow_instance": "inst-empty",
-                    "agent": "agent-1",
-                    "harness_result": {
-                        "declared_done": False,
-                        "result": "",
-                        "usage": {"input_tokens": 0, "output_tokens": 0},
-                    },
-                    "detail": "",
-                }
-            ]
-        )
+        snapshot = classified_case_snapshot("empty-undeclared-harness-result")
 
         finding = self.assert_single_category(
             self.classify(snapshot), "empty-harness-result"
         )
 
         self.assertEqual(finding.workflow_instance, "inst-empty")
-        self.assertEqual(finding.agent, "agent-1")
+        self.assertEqual(finding.agent, "agent-empty")
 
     def test_classifies_missing_rk_command(self):
-        snapshot = classified_snapshot(
-            inbox=[
-                {
-                    "kind": "workflow-failed",
-                    "workflow_instance": "inst-rk",
-                    "agent": "agent-2",
-                    "detail": "shell: rk: command not found",
-                }
-            ]
-        )
+        snapshot = classified_case_snapshot("missing-rk-command")
 
         finding = self.assert_single_category(
             self.classify(snapshot), "missing-rk-executable"
@@ -204,18 +200,7 @@ class FactoryForemanClassificationTests(unittest.TestCase):
         self.assertIn("rk: command not found", finding.evidence)
 
     def test_classifies_named_check_failure(self):
-        snapshot = classified_snapshot(
-            workflows=[
-                {
-                    "kind": "workflow-failed",
-                    "workflow_instance": "inst-check",
-                    "agent": "agent-3",
-                    "run_steps": [
-                        {"name": "cargo test", "exit_code": 101, "detail": "failed"}
-                    ],
-                }
-            ]
-        )
+        snapshot = classified_case_snapshot("named-check-failure")
 
         finding = self.assert_single_category(
             self.classify(snapshot), "named-check-failure"
@@ -225,49 +210,19 @@ class FactoryForemanClassificationTests(unittest.TestCase):
         self.assertIn("exit_code", finding.evidence)
 
     def test_classifies_timeout_separately_from_red_check(self):
-        snapshot = classified_snapshot(
-            workflows=[
-                {
-                    "kind": "workflow-failed",
-                    "workflow_instance": "inst-timeout",
-                    "agent": "agent-4",
-                    "timed_out": True,
-                    "run_steps": [{"name": "cargo test", "exit_code": 124}],
-                    "detail": "cargo test timed out with exit 124",
-                }
-            ]
-        )
+        snapshot = classified_case_snapshot("timeout")
 
         self.assert_single_category(self.classify(snapshot), "workflow-timeout")
 
     def test_classifies_orphaned_agent(self):
-        snapshot = classified_snapshot(
-            inbox=[
-                {
-                    "kind": "agent-orphaned",
-                    "workflow_instance": "inst-orphan",
-                    "agent": "agent-5",
-                    "detail": "agent lost its workflow lease",
-                }
-            ]
-        )
+        snapshot = classified_case_snapshot("orphaned-agent")
 
         finding = self.assert_single_category(self.classify(snapshot), "orphaned-agent")
 
-        self.assertEqual(finding.subject, "agent-5")
+        self.assertEqual(finding.subject, "agent-orphan")
 
     def test_reports_high_cost_instance_as_budget_pressure(self):
-        snapshot = classified_snapshot(
-            workflows=[
-                {
-                    "kind": "workflow-running",
-                    "workflow_instance": "inst-budget",
-                    "agent": "agent-6",
-                    "spend_usd": 8.0,
-                    "instance_max_usd": 10.0,
-                }
-            ]
-        )
+        snapshot = classified_case_snapshot("budget-pressure")
 
         finding = self.assert_single_category(self.classify(snapshot), "budget-pressure")
 
@@ -275,28 +230,14 @@ class FactoryForemanClassificationTests(unittest.TestCase):
         self.assertIn("10", finding.evidence)
 
     def test_unknown_failure_is_preserved_not_dropped(self):
-        snapshot = classified_snapshot(
-            inbox=[
-                {
-                    "kind": "workflow-failed",
-                    "workflow_instance": "inst-unknown",
-                    "agent": "agent-7",
-                    "detail": "frobnicator returned a new opaque status",
-                }
-            ]
-        )
+        snapshot = classified_case_snapshot("unknown-failure")
 
         finding = self.assert_single_category(self.classify(snapshot), "unknown")
 
         self.assertIn("frobnicator returned a new opaque status", finding.evidence)
 
     def test_findings_are_deduplicated_and_severity_sorted(self):
-        duplicate = {
-            "kind": "workflow-failed",
-            "workflow_instance": "inst-dupe",
-            "agent": "agent-8",
-            "detail": "rk: command not found",
-        }
+        _, duplicate = classification_case("missing-rk-command")
         snapshot = classified_snapshot(
             inbox=[copy.deepcopy(duplicate), copy.deepcopy(duplicate)],
             workflows=[
@@ -319,6 +260,31 @@ class FactoryForemanClassificationTests(unittest.TestCase):
         self.assertEqual(
             [finding.severity for finding in report.findings], ["critical", "medium"]
         )
+
+    def test_named_check_beats_generic_permission_or_stale_text(self):
+        snapshot = classified_case_snapshot("named-check-with-permission-text")
+
+        finding = self.assert_single_category(
+            self.classify(snapshot), "named-check-failure"
+        )
+
+        self.assertEqual(finding.subject, "cargo clippy")
+
+    def test_timeout_token_in_check_name_is_not_workflow_timeout(self):
+        snapshot = classified_case_snapshot("timeout-token-not-timeout")
+
+        finding = self.assert_single_category(
+            self.classify(snapshot), "named-check-failure"
+        )
+
+        self.assertEqual(finding.subject, "timeout_tests")
+
+    def test_budget_pressure_ignores_fleet_budget_aliases(self):
+        snapshot = classified_case_snapshot("fleet-budget-alias-not-instance")
+
+        report = self.classify(snapshot)
+
+        self.assertEqual(report.findings, [])
 
 
 if __name__ == "__main__":
