@@ -1,0 +1,13 @@
+{
+  "schema": "factory-foreman.snapshot.v1",
+  "generated_at": "1970-01-01T00:00:00Z",
+  "repo": "demo",
+  "healthy": false,
+  "observations": {
+    "agents": {"ok": true, "command": "agents", "data": {"agents": [{"name": "agent-1"}]}},
+    "inbox": {"ok": true, "command": "inbox", "data": {"messages": []}},
+    "workflows": {"ok": true, "command": "workflows", "data": {"workflows": []}},
+    "cost": {"ok": true, "command": "cost", "data": {"total_usd": 0}} 
+  },
+  "errors": []
+}
