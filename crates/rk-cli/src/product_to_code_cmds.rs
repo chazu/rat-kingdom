@@ -123,17 +123,8 @@ async fn run_graph(layout: &Layout, command: GraphCommand, json_output: bool) ->
                 }
                 return Ok(1);
             }
-            let mutations = graph_mutations(&graph, &args.repo, &report.topological_order);
-            let creates: Vec<_> = mutations
-                .iter()
-                .filter(|m| m["operation"] == "ticket.create")
-                .cloned()
-                .collect();
-            let dependencies: Vec<_> = mutations
-                .iter()
-                .filter(|m| m["operation"] == "ticket.dep.add")
-                .cloned()
-                .collect();
+            let apply_plan = graph.apply_plan(&args.repo, &criterion_ids)?;
+            let mutations = apply_plan.mutations();
             let output = json!({
                 "schema": "product_to_code.ticket_graph.dry_run.v1",
                 "pure": true,
@@ -141,11 +132,12 @@ async fn run_graph(layout: &Layout, command: GraphCommand, json_output: bool) ->
                 "authority": "local dry-run only; daemon owns ticket mutation",
                 "graph_id": graph.id,
                 "initiative_id": initiative.id,
-                "creates": creates,
-                "updates": [],
-                "dependencies": dependencies,
-                "dispatches": [],
-                "blocked": [],
+                "topological_order": apply_plan.topological_order,
+                "creates": apply_plan.creates,
+                "updates": apply_plan.updates,
+                "dependencies": apply_plan.dependencies,
+                "dispatches": apply_plan.dispatches,
+                "blocked": apply_plan.blocked,
                 "mutations": mutations,
             });
             if json_output {
@@ -172,8 +164,6 @@ async fn run_graph(layout: &Layout, command: GraphCommand, json_output: bool) ->
                 "repo": args.repo,
                 "graph": graph,
                 "initiative": initiative,
-                "topological_order": report.topological_order,
-                "mutations": graph_mutations(&graph, &args.repo, &report.topological_order),
             });
             let mut client = Client::connect_or_spawn(layout).await?;
             let result = client
@@ -227,34 +217,6 @@ fn criterion_ids(initiative: &InitiativeContract) -> Vec<String> {
         .collect()
 }
 
-fn graph_mutations(
-    graph: &TicketGraph,
-    repo: &str,
-    topological_order: &[String],
-) -> Vec<serde_json::Value> {
-    let mut mutations = Vec::new();
-    for id in topological_order {
-        if let Some(node) = graph.nodes.iter().find(|node| &node.id == id) {
-            mutations.push(json!({
-                "operation": "ticket.create",
-                "stable_graph_node_id": node.id,
-                "repo": repo,
-                "title": node.title,
-                "description": node.description,
-                "acceptance_criterion_ids": node.acceptance_criterion_ids,
-            }));
-        }
-    }
-    for edge in &graph.edges {
-        mutations.push(json!({
-            "operation": "ticket.dep.add",
-            "blocked_graph_node_id": edge.to,
-            "dependency_graph_node_id": edge.from,
-            "relationship": edge.relationship,
-        }));
-    }
-    mutations
-}
 
 fn run_research(command: ResearchCommand, json_output: bool) -> Result<i32> {
     match command {
