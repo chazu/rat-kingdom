@@ -1,7 +1,7 @@
 use rk_core::factory::{
     recommendations::{
-        evaluate_recommendation_report, evaluate_recommendations, RecommendationId,
-        RecommendationThresholds,
+        evaluate_recommendation_report, evaluate_recommendations, RecommendationRule,
+        RecommendationSeverity, SuppressionReason,
     },
     scorecards::{
         FactoryScorecard, MetricAvailability, ScorecardGroupKey, ScorecardMetrics,
@@ -11,13 +11,13 @@ use rk_core::factory::{
 };
 use std::collections::BTreeMap;
 
-fn row(task_class: &str, workflow: &str) -> FactoryScorecard {
+fn row(task_class: &str, workflow: &str, harness: &str, model: &str) -> FactoryScorecard {
     FactoryScorecard {
         group_key: ScorecardGroupKey {
             task_class: task_class.into(),
             workflow: workflow.into(),
-            harness: "harness-a".into(),
-            model: "model-a".into(),
+            harness: harness.into(),
+            model: model.into(),
         },
         projection: ScorecardProjection::Composite,
         projected: false,
@@ -81,192 +81,247 @@ fn runs(mut row: FactoryScorecard, runs: u32, accepted: u32) -> FactoryScorecard
     available(row, OutcomeEvidenceKind::AgentRecord, runs, runs)
 }
 
-fn ids(rows: &[FactoryScorecard]) -> Vec<RecommendationId> {
-    evaluate_recommendations(rows)
-        .into_iter()
-        .map(|r| r.id)
-        .collect()
+fn observed(mut row: FactoryScorecard) -> FactoryScorecard {
+    for family in [
+        OutcomeEvidenceKind::Phase3VerifiedDelivery,
+        OutcomeEvidenceKind::StructuredReviewerRework,
+        OutcomeEvidenceKind::Phase4CiSignal,
+        OutcomeEvidenceKind::StructuredRevert,
+        OutcomeEvidenceKind::PricingSnapshot,
+        OutcomeEvidenceKind::AgentRecord,
+        OutcomeEvidenceKind::HumanGateDecision,
+        OutcomeEvidenceKind::RecurrenceKey,
+    ] {
+        row = available(row, family, 10, 10);
+    }
+    row
 }
 
 #[test]
-fn emits_all_rule_families_in_deterministic_order_with_thresholds_evidence_and_counts() {
-    let mut target = runs(row("bugfix", "wf-a"), 20, 10);
-    target.metrics.reworked = 7;
-    target.metrics.ci_failed = 7;
-    target.metrics.ci_recovered = 1;
-    target.metrics.reverted = 3;
-    target.metrics.average_cost_micro_usd = Some(2_500_000);
-    target.metrics.cost_sample_size = 6;
-    target.metrics.median_lead_time_ms = Some(8 * 60 * 60 * 1000);
-    target.metrics.p95_lead_time_ms = Some(20 * 60 * 60 * 1000);
-    target.metrics.lead_time_sample_size = 6;
-    target.metrics.human_interventions = 8;
-    target.metrics.intervention_sample_size = 8;
-    target.metrics.recurrence_count = 5;
-    target.metrics.distinct_recurrence_keys = 5;
-    target.metrics.recurrence_sample_size = 10;
-    target = available(target, OutcomeEvidenceKind::Phase3VerifiedDelivery, 20, 20);
-    target = available(target, OutcomeEvidenceKind::StructuredReviewerRework, 7, 7);
-    target = available(target, OutcomeEvidenceKind::Phase4CiSignal, 7, 8);
-    target = available(target, OutcomeEvidenceKind::StructuredRevert, 3, 3);
-    target = available(target, OutcomeEvidenceKind::PricingSnapshot, 6, 6);
-    target = available(target, OutcomeEvidenceKind::HumanGateDecision, 8, 8);
-    target = available(target, OutcomeEvidenceKind::RecurrenceKey, 5, 10);
+fn plan_contract_exposes_advisory_recommendation_metadata_without_mutation_fields_or_language() {
+    let mut target = runs(row("bugfix", "wf-a", "harness-a", "model-a"), 10, 5);
+    target = available(target, OutcomeEvidenceKind::Phase3VerifiedDelivery, 2, 10);
+    let mut peer = runs(row("bugfix", "wf-a", "harness-b", "model-b"), 10, 8);
+    peer = available(peer, OutcomeEvidenceKind::Phase3VerifiedDelivery, 3, 10);
 
-    let mut peer = runs(row("bugfix", "wf-a"), 20, 18);
-    peer = available(peer, OutcomeEvidenceKind::Phase3VerifiedDelivery, 20, 20);
+    let recommendations = evaluate_recommendations(&[target.clone(), peer]);
 
-    let recommendations = evaluate_recommendations(&[target, peer]);
-
+    let rec = recommendations
+        .iter()
+        .find(|rec| rec.rule == RecommendationRule::LowAcceptance)
+        .expect("low acceptance recommendation");
+    assert_eq!(rec.severity, RecommendationSeverity::Critical);
+    assert_eq!(rec.subject_group_key, target.group_key);
+    assert!(rec.summary.contains("acceptance"));
+    assert!(rec.advice.as_ref().unwrap().contains("Review"));
+    assert_eq!(rec.thresholds.min_sample_size, 10);
+    assert_eq!(rec.thresholds.acceptance_below_ratio, Some((60, 100)));
     assert_eq!(
-        recommendations.iter().map(|r| r.id).collect::<Vec<_>>(),
-        vec![
-            RecommendationId::LowAcceptance,
-            RecommendationId::HighRework,
-            RecommendationId::CiInstability,
-            RecommendationId::Reverts,
-            RecommendationId::HighCost,
-            RecommendationId::SlowLeadTime,
-            RecommendationId::HumanIntervention,
-            RecommendationId::Recurrence,
-        ]
+        rec.thresholds.peer_acceptance_at_least_ratio,
+        Some((80, 100))
     );
-    let first = &recommendations[0];
     assert_eq!(
-        first.thresholds.min_runs,
-        RecommendationThresholds::default().min_runs
+        rec.metric_availability.source_family,
+        OutcomeEvidenceKind::Phase3VerifiedDelivery
     );
-    assert_eq!(first.evidence.numerator, 10);
-    assert_eq!(first.evidence.denominator, 20);
-    assert_eq!(first.source_counts.active_source_count, 20);
-}
+    assert!(rec.metric_availability.available);
+    assert_eq!(
+        rec.comparison_evidence.as_ref().unwrap().comparable_median,
+        None
+    );
+    assert_eq!(rec.evidence.numerator, Some(5));
+    assert_eq!(rec.evidence.denominator, Some(10));
+    assert_eq!(rec.source_counts.active_source_count, 2);
+    assert_eq!(rec.sample_size, 10);
+    assert!(!rec.suppressed);
+    assert_eq!(rec.suppression_reason, None);
 
-#[test]
-fn payload_is_advisory_and_excludes_mutation_language_and_fields() {
-    let mut target = runs(row("bugfix", "wf-a"), 20, 10);
-    target = available(target, OutcomeEvidenceKind::Phase3VerifiedDelivery, 20, 20);
-    let mut peer = runs(row("bugfix", "wf-a"), 20, 19);
-    peer = available(peer, OutcomeEvidenceKind::Phase3VerifiedDelivery, 20, 20);
-
-    let payload = serde_json::to_string(&evaluate_recommendations(&[target, peer])).unwrap();
-
-    assert!(payload.contains("advisory"));
+    let payload = serde_json::to_string(&recommendations)
+        .unwrap()
+        .to_lowercase();
     for forbidden in [
-        "command", "patch", "routing", "policy", "config", "workflow", "ticket", "approval",
-        "dispatch", "must", "apply", "execute",
+        "command", "patch", "routing", "policy", "config", "ticket", "approval", "dispatch",
+        "must", "apply", "execute",
     ] {
         assert!(
-            !payload.to_lowercase().contains(forbidden),
+            !payload.contains(forbidden),
             "forbidden token {forbidden} in {payload}"
         );
     }
 }
 
 #[test]
-fn low_acceptance_compares_only_same_task_class_and_workflow_peers_with_required_samples() {
-    let mut target = runs(row("bugfix", "wf-a"), 20, 12);
-    target = available(target, OutcomeEvidenceKind::Phase3VerifiedDelivery, 20, 20);
-    let mut same = runs(row("bugfix", "wf-a"), 20, 19);
-    same = available(same, OutcomeEvidenceKind::Phase3VerifiedDelivery, 20, 20);
-    let other_workflow = runs(row("bugfix", "wf-b"), 20, 20);
-    let other_class = runs(row("feature", "wf-a"), 20, 20);
-    let low_sample_same = runs(row("bugfix", "wf-a"), 3, 3);
+fn exact_plan_rules_emit_advice_only_when_thresholds_and_comparable_groups_match() {
+    let mut target = observed(runs(row("bugfix", "wf-a", "harness-a", "model-a"), 10, 5));
+    target.metrics.reworked = 3;
+    target.metrics.ci_failed = 8;
+    target.metrics.ci_recovered = 6;
+    target.metrics.reverted = 1;
+    target.metrics.average_cost_micro_usd = Some(150);
+    target.metrics.cost_sample_size = 8;
+    target.metrics.p95_lead_time_ms = Some(150);
+    target.metrics.lead_time_sample_size = 8;
+    target.metrics.human_interventions = 3;
+    target.metrics.intervention_sample_size = 8;
+    target.metrics.recurrence_count = 3;
+    target.metrics.recurrence_sample_size = 5;
 
-    assert_eq!(
-        ids(&[target, same, other_workflow, other_class, low_sample_same]),
-        vec![RecommendationId::LowAcceptance]
-    );
+    let mut peer_a = observed(runs(row("bugfix", "wf-a", "harness-b", "model-b"), 10, 8));
+    peer_a.metrics.ci_failed = 8;
+    peer_a.metrics.ci_recovered = 8;
+    peer_a.metrics.average_cost_micro_usd = Some(100);
+    peer_a.metrics.cost_sample_size = 8;
+    peer_a.metrics.p95_lead_time_ms = Some(100);
+    peer_a.metrics.lead_time_sample_size = 8;
+
+    let mut peer_b = observed(runs(row("bugfix", "wf-a", "harness-c", "model-c"), 10, 9));
+    peer_b.metrics.ci_failed = 8;
+    peer_b.metrics.ci_recovered = 8;
+    peer_b.metrics.average_cost_micro_usd = Some(80);
+    peer_b.metrics.cost_sample_size = 8;
+    peer_b.metrics.p95_lead_time_ms = Some(80);
+    peer_b.metrics.lead_time_sample_size = 8;
+
+    let rules: Vec<_> = evaluate_recommendations(&[target, peer_a, peer_b])
+        .into_iter()
+        .filter(|rec| !rec.suppressed)
+        .map(|rec| rec.rule)
+        .collect();
+
+    for rule in [
+        RecommendationRule::LowAcceptance,
+        RecommendationRule::HighRework,
+        RecommendationRule::CiInstability,
+        RecommendationRule::Reverts,
+        RecommendationRule::HighCost,
+        RecommendationRule::SlowLeadTime,
+        RecommendationRule::HumanIntervention,
+        RecommendationRule::Recurrence,
+    ] {
+        assert!(rules.contains(&rule), "missing {rule:?} in {rules:?}");
+    }
+    assert_eq!(rules.len(), 8);
 }
 
 #[test]
-fn low_acceptance_without_peer_produces_no_recommendation() {
-    let mut target = runs(row("bugfix", "wf-a"), 20, 1);
-    target = available(target, OutcomeEvidenceKind::Phase3VerifiedDelivery, 20, 20);
+fn observed_below_threshold_samples_emit_suppressed_rows_with_reasons() {
+    let mut target = observed(runs(row("bugfix", "wf-a", "harness-a", "model-a"), 10, 10));
+    target.metrics.ci_failed = 1;
+    target.metrics.ci_recovered = 0;
+    target.metrics.average_cost_micro_usd = Some(999);
+    target.metrics.cost_sample_size = 7;
+    target.metrics.p95_lead_time_ms = Some(999);
+    target.metrics.lead_time_sample_size = 7;
+    target.metrics.human_interventions = 2;
+    target.metrics.intervention_sample_size = 7;
+    target.metrics.recurrence_count = 2;
+    target.metrics.recurrence_sample_size = 4;
 
-    assert!(evaluate_recommendations(&[target]).is_empty());
+    let report = evaluate_recommendation_report(&[target]);
+
+    assert!(report.recommendations.iter().all(|rec| rec.suppressed));
+    let suppressed: Vec<_> = report
+        .recommendations
+        .iter()
+        .map(|rec| (rec.rule, rec.suppression_reason))
+        .collect();
+    assert!(suppressed.contains(&(
+        RecommendationRule::CiInstability,
+        Some(SuppressionReason::LowSample)
+    )));
+    assert!(suppressed.contains(&(
+        RecommendationRule::HighCost,
+        Some(SuppressionReason::LowSample)
+    )));
+    assert!(suppressed.contains(&(
+        RecommendationRule::SlowLeadTime,
+        Some(SuppressionReason::LowSample)
+    )));
+    assert!(suppressed.contains(&(
+        RecommendationRule::HumanIntervention,
+        Some(SuppressionReason::LowSample)
+    )));
+    assert!(suppressed.contains(&(
+        RecommendationRule::Recurrence,
+        Some(SuppressionReason::LowSample)
+    )));
 }
 
 #[test]
 fn unavailable_metrics_warn_and_suppress_without_advice() {
-    let mut target = runs(row("bugfix", "wf-a"), 20, 20);
+    let mut target = runs(row("bugfix", "wf-a", "harness-a", "model-a"), 10, 10);
     target.metrics.average_cost_micro_usd = Some(9_000_000);
     target.metrics.cost_sample_size = 10;
     target = unavailable(target, OutcomeEvidenceKind::PricingSnapshot);
 
     let report = evaluate_recommendation_report(&[target]);
 
-    assert!(report.recommendations.is_empty());
-    assert_eq!(report.suppressions[0].id, RecommendationId::HighCost);
-    assert_eq!(report.suppressions[0].reason, "metric_unavailable");
-    assert_eq!(report.warnings[0], "metric_unavailable: high_cost");
+    assert!(report
+        .recommendations
+        .iter()
+        .all(|rec| rec.advice.is_none()));
+    assert!(report
+        .recommendations
+        .iter()
+        .any(|rec| rec.rule == RecommendationRule::HighCost
+            && rec.suppressed
+            && rec.suppression_reason == Some(SuppressionReason::MetricUnavailable)));
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("high_cost")));
 }
 
 #[test]
-fn observed_but_low_sample_metrics_are_suppressed() {
-    let mut target = runs(row("bugfix", "wf-a"), 20, 20);
-    target.metrics.average_cost_micro_usd = Some(9_000_000);
-    target.metrics.cost_sample_size = 2;
-    target = available(target, OutcomeEvidenceKind::PricingSnapshot, 2, 2);
+fn cross_group_rows_are_not_comparable_evidence_for_peer_rules() {
+    let mut target = observed(runs(row("bugfix", "wf-a", "harness-a", "model-a"), 10, 5));
+    target.metrics.average_cost_micro_usd = Some(150);
+    target.metrics.cost_sample_size = 8;
+    target.metrics.p95_lead_time_ms = Some(150);
+    target.metrics.lead_time_sample_size = 8;
 
-    let report = evaluate_recommendation_report(&[target]);
+    let mut other_workflow = observed(runs(row("bugfix", "wf-b", "harness-b", "model-b"), 10, 10));
+    other_workflow.metrics.average_cost_micro_usd = Some(50);
+    other_workflow.metrics.cost_sample_size = 8;
+    other_workflow.metrics.p95_lead_time_ms = Some(50);
+    other_workflow.metrics.lead_time_sample_size = 8;
 
-    assert!(report.recommendations.is_empty());
-    assert_eq!(report.suppressions[0].reason, "low_sample");
+    let mut other_class = observed(runs(row("feature", "wf-a", "harness-c", "model-c"), 10, 10));
+    other_class.metrics.average_cost_micro_usd = Some(50);
+    other_class.metrics.cost_sample_size = 8;
+    other_class.metrics.p95_lead_time_ms = Some(50);
+    other_class.metrics.lead_time_sample_size = 8;
+
+    let recommendations = evaluate_recommendations(&[target, other_workflow, other_class]);
+
+    assert!(!recommendations
+        .iter()
+        .any(|rec| rec.rule == RecommendationRule::LowAcceptance && !rec.suppressed));
+    assert!(!recommendations
+        .iter()
+        .any(|rec| rec.rule == RecommendationRule::HighCost && !rec.suppressed));
+    assert!(!recommendations
+        .iter()
+        .any(|rec| rec.rule == RecommendationRule::SlowLeadTime && !rec.suppressed));
 }
 
 #[test]
-fn exact_denominators_are_used_for_rate_rules() {
-    let mut target = runs(row("bugfix", "wf-a"), 20, 20);
-    target.metrics.reworked = 5;
-    target.metrics.ci_failed = 4;
-    target.metrics.ci_recovered = 1;
-    target.metrics.reverted = 1;
-    target.metrics.human_interventions = 4;
-    target.metrics.intervention_sample_size = 10;
-    target.metrics.recurrence_count = 4;
-    target.metrics.recurrence_sample_size = 10;
-    target = available(target, OutcomeEvidenceKind::StructuredReviewerRework, 5, 5);
-    target = available(target, OutcomeEvidenceKind::Phase4CiSignal, 4, 5);
-    target = available(target, OutcomeEvidenceKind::StructuredRevert, 1, 1);
-    target = available(target, OutcomeEvidenceKind::HumanGateDecision, 4, 10);
-    target = available(target, OutcomeEvidenceKind::RecurrenceKey, 4, 10);
+fn stable_order_is_severity_rule_task_class_workflow_harness_model_id() {
+    let mut z = observed(runs(row("zeta", "wf-b", "harness-b", "model-b"), 10, 10));
+    z.metrics.reworked = 3;
+    let mut a = observed(runs(row("alpha", "wf-a", "harness-a", "model-a"), 10, 10));
+    a.metrics.reworked = 3;
 
-    let recommendations = evaluate_recommendations(&[target]);
+    let recs = evaluate_recommendations(&[z, a]);
+    let unsuppressed: Vec<_> = recs.into_iter().filter(|rec| !rec.suppressed).collect();
 
-    assert!(recommendations
-        .iter()
-        .any(|r| r.id == RecommendationId::HighRework && r.evidence.denominator == 20));
-    assert!(recommendations
-        .iter()
-        .any(|r| r.id == RecommendationId::CiInstability && r.evidence.denominator == 4));
-    assert!(recommendations
-        .iter()
-        .any(|r| r.id == RecommendationId::Reverts && r.evidence.denominator == 20));
-    assert!(recommendations
-        .iter()
-        .any(|r| r.id == RecommendationId::HumanIntervention && r.evidence.denominator == 10));
-    assert!(recommendations
-        .iter()
-        .any(|r| r.id == RecommendationId::Recurrence && r.evidence.denominator == 10));
-}
-
-#[test]
-fn threshold_comparisons_do_not_overflow() {
-    let mut target = runs(row("bugfix", "wf-a"), u32::MAX, u32::MAX);
-    target.metrics.reworked = u32::MAX;
-    target = available(
-        target,
-        OutcomeEvidenceKind::StructuredReviewerRework,
-        u32::MAX,
-        u32::MAX,
-    );
-
-    assert_eq!(ids(&[target]), vec![RecommendationId::HighRework]);
+    assert_eq!(unsuppressed[0].subject_group_key.task_class, "alpha");
+    assert_eq!(unsuppressed[1].subject_group_key.task_class, "zeta");
 }
 
 #[test]
 fn projected_rows_are_ignored_so_evaluation_is_over_scorecard_observations_only() {
-    let mut projected = runs(row("bugfix", "wf-a"), 20, 20);
+    let mut projected = runs(row("bugfix", "wf-a", "harness-a", "model-a"), 20, 20);
     projected.projected = true;
     projected.projection = ScorecardProjection::TaskClass;
     projected.metrics.reworked = 20;
@@ -278,4 +333,62 @@ fn projected_rows_are_ignored_so_evaluation_is_over_scorecard_observations_only(
     );
 
     assert!(evaluate_recommendations(&[projected]).is_empty());
+}
+
+#[test]
+fn unknown_task_class_or_workflow_suppresses_peer_comparison_rules() {
+    let mut target = observed(runs(row("unknown", "wf-a", "harness-a", "model-a"), 10, 5));
+    target.metrics.ci_failed = 8;
+    target.metrics.ci_recovered = 0;
+    target.metrics.average_cost_micro_usd = Some(150);
+    target.metrics.cost_sample_size = 8;
+    target.metrics.p95_lead_time_ms = Some(150);
+    target.metrics.lead_time_sample_size = 8;
+
+    let mut peer = observed(runs(row("unknown", "wf-a", "harness-b", "model-b"), 10, 10));
+    peer.metrics.ci_failed = 8;
+    peer.metrics.ci_recovered = 8;
+    peer.metrics.average_cost_micro_usd = Some(1);
+    peer.metrics.cost_sample_size = 8;
+    peer.metrics.p95_lead_time_ms = Some(1);
+    peer.metrics.lead_time_sample_size = 8;
+
+    let recs = evaluate_recommendations(&[target, peer]);
+
+    for rule in [
+        RecommendationRule::LowAcceptance,
+        RecommendationRule::CiInstability,
+        RecommendationRule::HighCost,
+        RecommendationRule::SlowLeadTime,
+    ] {
+        let rec = recs
+            .iter()
+            .find(|rec| rec.rule == rule)
+            .expect("suppressed peer rule");
+        assert!(rec.suppressed, "{rule:?} should be suppressed");
+        assert_eq!(rec.advice, None);
+        assert_eq!(
+            rec.suppression_reason,
+            Some(SuppressionReason::NoComparablePeer)
+        );
+        assert_eq!(rec.subject_group_key.task_class, "unknown");
+    }
+}
+
+#[test]
+fn full_composite_key_separates_subjects_with_same_task_class_and_workflow() {
+    let mut harness_a = observed(runs(row("bugfix", "wf-a", "harness-a", "model-a"), 10, 10));
+    harness_a.metrics.reworked = 3;
+    let mut harness_b = observed(runs(row("bugfix", "wf-a", "harness-b", "model-a"), 10, 10));
+    harness_b.metrics.reworked = 3;
+
+    let active: Vec<_> = evaluate_recommendations(&[harness_b.clone(), harness_a.clone()])
+        .into_iter()
+        .filter(|rec| rec.rule == RecommendationRule::HighRework && !rec.suppressed)
+        .collect();
+
+    assert_eq!(active.len(), 2);
+    assert_eq!(active[0].subject_group_key, harness_a.group_key);
+    assert_eq!(active[1].subject_group_key, harness_b.group_key);
+    assert_ne!(active[0].id, active[1].id);
 }
