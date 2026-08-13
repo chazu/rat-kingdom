@@ -3,6 +3,7 @@
 mod agent_cmds;
 mod factory_cmds;
 mod observe;
+mod product_to_code_cmds;
 mod repo_cmds;
 mod space_cmds;
 mod ticket_cmds;
@@ -165,6 +166,11 @@ enum Command {
     Factory {
         #[command(subcommand)]
         command: factory_cmds::FactoryCommand,
+    },
+    /// Validate and render local product-to-code artifacts.
+    ProductToCode {
+        #[command(subcommand)]
+        command: product_to_code_cmds::ProductToCodeCommand,
     },
     /// Run and inspect CUE-defined workflows.
     Workflow {
@@ -800,6 +806,12 @@ async fn main() -> Result<()> {
             }
         },
         Command::Factory { command } => factory_cmds::run(&layout, command, cli.json).await?,
+        Command::ProductToCode { command } => {
+            let code = product_to_code_cmds::run(command, cli.json)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Command::Workflow { command } => {
             let mut client = Client::connect_or_spawn(&layout).await?;
             match command {

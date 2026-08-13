@@ -61,19 +61,7 @@ pub struct ArchitectureResearchArtifact {
 
 impl ArchitectureResearchArtifact {
     pub fn validate(&self) -> Result<()> {
-        let mut errors = Vec::new();
-        push_empty(&mut errors, "id", &self.id);
-        push_empty(&mut errors, "initiative_id", &self.initiative_id);
-        if self.researched_files.is_empty() {
-            errors.push("researched_files must contain at least one file".to_string());
-        }
-        if self.architecture_decisions.is_empty() {
-            errors.push("architecture_decisions must contain at least one decision".to_string());
-        }
-        if self.open_questions.is_empty() && !self.open_questions_exhausted {
-            errors.push("open_questions must contain at least one question unless open_questions_exhausted is true".to_string());
-        }
-        finish(errors)
+        finish(crate::product_to_code::research::research_validation_errors(self))
     }
 }
 
