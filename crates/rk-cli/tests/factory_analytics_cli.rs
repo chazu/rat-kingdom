@@ -91,6 +91,22 @@ mod factory_analytics_cli {
         assert!(text.contains("## Source Counts"));
         assert!(text.contains("## Recommendations"));
         assert!(text.contains("## Suppressed"));
+        let active = text
+            .split("## Recommendations")
+            .nth(1)
+            .unwrap()
+            .split("## Suppressed")
+            .next()
+            .unwrap();
+        let suppressed = text.split("## Suppressed").nth(1).unwrap();
+        assert!(
+            active.contains("(no advisory recommendations)"),
+            "suppressed/empty-advice records must not render active recommendations:\n{text}"
+        );
+        assert!(
+            suppressed.contains("(none)"),
+            "daemon wire schema with no suppressions must render no suppressed records:\n{text}"
+        );
         // Advisory language, no mutation controls.
         for banned in ["--apply", "dispatch", "rewrite-policy", "update-workflow"] {
             assert!(!text.contains(banned), "markdown must not contain {banned}");

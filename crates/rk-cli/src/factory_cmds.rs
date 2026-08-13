@@ -539,13 +539,22 @@ fn render_recommend_markdown(result: &Value) -> String {
     out.push_str("## Recommendations\n\n");
     match result["recommendations"].as_array() {
         Some(recs) if !recs.is_empty() => {
+            let mut rendered = 0;
             for rec in recs {
+                let advice = rec["advice"].as_str().unwrap_or("");
+                if rec["suppressed"].as_bool().unwrap_or(false) || advice.trim().is_empty() {
+                    continue;
+                }
                 out.push_str(&format!(
                     "- [{}] {}: {} (advisory)\n",
                     rec["severity"].as_str().unwrap_or("info"),
                     rec["rule"].as_str().unwrap_or("?"),
-                    rec["advice"].as_str().unwrap_or(""),
+                    advice,
                 ));
+                rendered += 1;
+            }
+            if rendered == 0 {
+                out.push_str("(no advisory recommendations)\n");
             }
         }
         _ => out.push_str("(no advisory recommendations)\n"),
@@ -556,10 +565,13 @@ fn render_recommend_markdown(result: &Value) -> String {
     match result["suppressions"].as_array() {
         Some(sup) if !sup.is_empty() => {
             for entry in sup {
+                let source_counts = &entry["source_counts"];
                 out.push_str(&format!(
-                    "- {}: {} (low-sample or unavailable metric)\n",
+                    "- {}: {} (source={} available=false sample={})\n",
                     entry["rule"].as_str().unwrap_or("?"),
                     entry["reason"].as_str().unwrap_or("?"),
+                    entry["source_family"].as_str().unwrap_or("?"),
+                    source_counts["event_count"].as_u64().unwrap_or(0),
                 ));
             }
         }
@@ -580,5 +592,88 @@ fn parse_digest(digest: &str) -> Result<String, String> {
         Ok(digest.to_string())
     } else {
         Err("digest must be exactly 64 hexadecimal characters".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_recommend_markdown;
+    use serde_json::json;
+
+    #[test]
+    fn recommend_markdown_filters_suppressed_and_empty_advice_from_active_section() {
+        let result = json!({
+            "schema_version": 1,
+            "repo": "rat-kingdom",
+            "generated_at": "2026-08-13T00:00:00Z",
+            "group_by": "agent",
+            "include_archived": false,
+            "nature": "advisory",
+            "source_counts": [],
+            "availability": [],
+            "scorecards": [],
+            "recommendations": [
+                {
+                    "id": "active",
+                    "severity": "warning",
+                    "rule": "HighRework",
+                    "summary": "rework is elevated",
+                    "advice": "Review rework evidence for repeated reviewer findings.",
+                    "suppressed": false,
+                    "sample_size": 12,
+                    "source_count": 12,
+                    "source_counts": {"active_source_count": 12, "archived_source_count": 0, "event_count": 12},
+                    "metric_availability": {"source_family": "StructuredReviewerRework", "available": true}
+                },
+                {
+                    "id": "suppressed",
+                    "severity": "warning",
+                    "rule": "CiInstability",
+                    "summary": "ci instability",
+                    "advice": null,
+                    "suppressed": true,
+                    "suppression_reason": "MetricUnavailable",
+                    "sample_size": 12,
+                    "source_count": 0,
+                    "source_counts": {"active_source_count": 0, "archived_source_count": 0, "event_count": 0},
+                    "metric_availability": {"source_family": "Phase4CiSignal", "available": false}
+                },
+                {
+                    "id": "empty-advice",
+                    "severity": "info",
+                    "rule": "Recurrence",
+                    "summary": "recurrence",
+                    "advice": "",
+                    "suppressed": false,
+                    "sample_size": 9,
+                    "source_count": 9,
+                    "source_counts": {"active_source_count": 9, "archived_source_count": 0, "event_count": 9},
+                    "metric_availability": {"source_family": "RecurrenceKey", "available": true}
+                }
+            ],
+            "suppressions": [
+                {
+                    "rule": "CiInstability",
+                    "reason": "MetricUnavailable",
+                    "subject_group_key": {"task_class": "unknown", "workflow": "unknown", "harness": "unknown", "model": "unknown"},
+                    "source_family": "Phase4CiSignal",
+                    "source_counts": {"active_source_count": 0, "archived_source_count": 0, "event_count": 0}
+                }
+            ],
+            "warnings": []
+        });
+
+        let markdown = render_recommend_markdown(&result);
+        let active = markdown.split("## Recommendations").nth(1).unwrap().split("## Suppressed").next().unwrap();
+        let suppressed = markdown.split("## Suppressed").nth(1).unwrap();
+
+        assert!(active.contains("HighRework"), "active section: {active}");
+        assert!(!active.contains("CiInstability"), "active section must omit suppressed records: {active}");
+        assert!(!active.contains("Recurrence"), "active section must omit empty advice: {active}");
+        assert!(suppressed.contains("CiInstability"), "suppressed section: {suppressed}");
+        assert!(suppressed.contains("MetricUnavailable"), "suppressed section: {suppressed}");
+        assert!(suppressed.contains("Phase4CiSignal"), "suppressed section: {suppressed}");
+        assert!(suppressed.contains("available=false"), "suppressed section: {suppressed}");
+        assert!(suppressed.contains("sample=0"), "suppressed section: {suppressed}");
     }
 }
