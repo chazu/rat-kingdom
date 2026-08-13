@@ -45,6 +45,14 @@ fn facts(inputs: Vec<StructuredOutcomeInput>) -> Vec<rk_core::factory::outcome_f
     .build()
 }
 
+fn facts_active_only(
+    inputs: Vec<StructuredOutcomeInput>,
+) -> Vec<rk_core::factory::outcome_facts::OutcomeFact> {
+    OutcomeFactBuilder::from_structured_inputs(inputs, std::iter::empty::<OutcomeFactSource>())
+        .include_archived(false)
+        .build()
+}
+
 #[test]
 fn groups_metrics_by_composite_task_class_workflow_harness_model() {
     let mut other = base(
@@ -340,6 +348,86 @@ fn projected_recurrence_does_not_merge_same_key_across_distinct_composites() {
     assert_eq!(projected.metrics.recurrence_count, 0);
     assert_eq!(projected.metrics.distinct_recurrence_keys, 0);
     assert_eq!(projected.metrics.recurrence_sample_size, 2);
+}
+
+#[test]
+fn archived_only_metadata_preserves_source_counts_when_archived_excluded() {
+    let mut archived = base(
+        OutcomeEvidenceKind::AgentRecord,
+        "archived-only-source",
+        FactoryMetricPayload::Run { count: 1 },
+    );
+    archived.archived = true;
+
+    let built = facts_active_only(vec![archived]);
+    let rows = aggregate_scorecards(
+        &built,
+        ScorecardQuery {
+            include_archived: false,
+            projections: vec![],
+        },
+    );
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].metrics.runs, 0);
+    assert_eq!(rows[0].metrics.archived_runs, 0);
+    assert_eq!(rows[0].metrics.unobserved, 1);
+    let counts = rows[0]
+        .source_counts
+        .by_family
+        .get(&OutcomeEvidenceKind::AgentRecord)
+        .unwrap();
+    assert_eq!(counts.active_source_count, 0);
+    assert_eq!(counts.archived_source_count, 1);
+    assert_eq!(counts.event_count, 1);
+}
+
+#[test]
+fn source_counts_do_not_collapse_same_source_id_across_repos_or_projections() {
+    let first = base(
+        OutcomeEvidenceKind::AgentRecord,
+        "same-source-id",
+        FactoryMetricPayload::Run { count: 1 },
+    );
+    let mut second = base(
+        OutcomeEvidenceKind::AgentRecord,
+        "same-source-id",
+        FactoryMetricPayload::Run { count: 1 },
+    );
+    second.repo = "repo-b".into();
+    second.harness = Some("harness-b".into());
+
+    let rows = aggregate_scorecards(
+        &facts(vec![first, second]),
+        ScorecardQuery {
+            include_archived: false,
+            projections: vec![ScorecardProjection::All, ScorecardProjection::TaskClassWorkflow],
+        },
+    );
+
+    let all = rows
+        .iter()
+        .find(|row| row.projection == ScorecardProjection::All)
+        .unwrap();
+    let all_counts = all
+        .source_counts
+        .by_family
+        .get(&OutcomeEvidenceKind::AgentRecord)
+        .unwrap();
+    assert_eq!(all_counts.active_source_count, 2);
+    assert_eq!(all_counts.event_count, 2);
+
+    let projected = rows
+        .iter()
+        .find(|row| row.projection == ScorecardProjection::TaskClassWorkflow)
+        .unwrap();
+    let projected_counts = projected
+        .source_counts
+        .by_family
+        .get(&OutcomeEvidenceKind::AgentRecord)
+        .unwrap();
+    assert_eq!(projected_counts.active_source_count, 2);
+    assert_eq!(projected_counts.event_count, 2);
 }
 
 #[test]

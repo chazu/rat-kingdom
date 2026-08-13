@@ -92,9 +92,12 @@ struct Accumulator {
     costs: Vec<u64>,
     lead_times: Vec<u64>,
     recurrence_keys: Vec<(ScorecardGroupKey, String)>,
-    active_sources: BTreeMap<OutcomeEvidenceKind, BTreeSet<String>>,
-    archived_sources: BTreeMap<OutcomeEvidenceKind, BTreeSet<String>>,
+    active_sources: BTreeMap<OutcomeEvidenceKind, BTreeSet<SourceDedupeKey>>,
+    archived_sources: BTreeMap<OutcomeEvidenceKind, BTreeSet<SourceDedupeKey>>,
+    metadata_source_counts: BTreeMap<OutcomeEvidenceKind, SourceCounts>,
 }
+
+type SourceDedupeKey = (OutcomeEvidenceKind, String, String);
 
 impl Default for FactoryScorecard {
     fn default() -> Self {
@@ -171,17 +174,36 @@ fn add_fact(acc: &mut Accumulator, fact: &OutcomeFact, include_archived: bool) {
         .entry(fact.evidence_kind)
         .or_default();
     counts.event_count = counts.event_count.saturating_add(1);
+    if !fact.availability.available {
+        let metadata_counts = acc
+            .metadata_source_counts
+            .entry(fact.evidence_kind)
+            .or_default();
+        metadata_counts.active_source_count = metadata_counts
+            .active_source_count
+            .saturating_add(fact.source_counts.active_source_count);
+        metadata_counts.archived_source_count = metadata_counts
+            .archived_source_count
+            .saturating_add(fact.source_counts.archived_source_count);
+        metadata_counts.event_count = metadata_counts
+            .event_count
+            .saturating_add(fact.source_counts.event_count);
+        counts.event_count = counts
+            .event_count
+            .saturating_add(fact.source_counts.event_count.saturating_sub(1));
+    }
     if fact.availability.available {
+        let source_key = source_dedupe_key(fact);
         if fact.archived {
             acc.archived_sources
                 .entry(fact.evidence_kind)
                 .or_default()
-                .insert(fact.source.source_id.clone());
+                .insert(source_key);
         } else {
             acc.active_sources
                 .entry(fact.evidence_kind)
                 .or_default()
-                .insert(fact.source.source_id.clone());
+                .insert(source_key);
         }
     }
 
@@ -238,6 +260,18 @@ fn add_fact(acc: &mut Accumulator, fact: &OutcomeFact, include_archived: bool) {
     }
 }
 
+fn source_dedupe_key(fact: &OutcomeFact) -> SourceDedupeKey {
+    (
+        fact.evidence_kind,
+        fact.source
+            .repo
+            .as_deref()
+            .unwrap_or(fact.repo.as_str())
+            .to_string(),
+        fact.source.source_id.clone(),
+    )
+}
+
 fn is_explicit_run_fact(fact: &OutcomeFact) -> bool {
     fact.evidence_kind == OutcomeEvidenceKind::AgentRecord
         && fact.metric_kind == OutcomeMetricKind::Run
@@ -261,20 +295,41 @@ fn finalize(mut acc: Accumulator) -> FactoryScorecard {
     acc.lead_times.sort_unstable();
     acc.recurrence_keys.sort();
     for (kind, sources) in acc.active_sources {
-        acc.row
+        let counts = acc
+            .row
             .source_counts
             .by_family
             .entry(kind)
-            .or_default()
-            .active_source_count = sources.len().try_into().unwrap_or(u32::MAX);
+            .or_default();
+        counts.active_source_count = counts
+            .active_source_count
+            .max(sources.len().try_into().unwrap_or(u32::MAX));
     }
     for (kind, sources) in acc.archived_sources {
-        acc.row
+        let counts = acc
+            .row
             .source_counts
             .by_family
             .entry(kind)
-            .or_default()
-            .archived_source_count = sources.len().try_into().unwrap_or(u32::MAX);
+            .or_default();
+        counts.archived_source_count = counts
+            .archived_source_count
+            .max(sources.len().try_into().unwrap_or(u32::MAX));
+    }
+    for (kind, metadata_counts) in acc.metadata_source_counts {
+        let counts = acc
+            .row
+            .source_counts
+            .by_family
+            .entry(kind)
+            .or_default();
+        counts.active_source_count = counts
+            .active_source_count
+            .max(metadata_counts.active_source_count);
+        counts.archived_source_count = counts
+            .archived_source_count
+            .max(metadata_counts.archived_source_count);
+        counts.event_count = counts.event_count.max(metadata_counts.event_count);
     }
     let total_cost: u128 = acc.costs.iter().map(|cost| u128::from(*cost)).sum();
     acc.row.metrics.total_cost_micro_usd = total_cost.min(u128::from(u64::MAX)) as u64;
