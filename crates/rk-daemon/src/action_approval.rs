@@ -101,7 +101,7 @@ impl ActionApprovalStore {
                 return Err(rk_core::Error::other("approval binding mismatch"));
             }
             return match existing.status {
-                ApprovalStatus::Approved => Ok(existing.clone()),
+                ApprovalStatus::Approved => Err(rk_core::Error::other("approval already approved")),
                 ApprovalStatus::Executing => {
                     Err(rk_core::Error::other("approval already executing"))
                 }
@@ -406,6 +406,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("already consumed"), "{err}");
+
+        let failed_proposal = store.propose("caller-a", action, None).unwrap();
+        store
+            .approve(&failed_proposal.id, &failed_proposal.digest, "operator")
+            .unwrap();
+        store.finish_failed(&failed_proposal.id, "boom").unwrap();
+        let err = store
+            .approve(&failed_proposal.id, &failed_proposal.digest, "operator")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already failed"), "{err}");
     }
 
     #[test]
