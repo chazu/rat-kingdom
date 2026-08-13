@@ -514,18 +514,36 @@ fn require_matching(
 
 fn reject_secret_like(kind: &'static str, key: &str) -> Result<(), SignalValidationError> {
     let lower = key.to_ascii_lowercase();
-    if contains_secret_word(&lower) || contains_url_userinfo_credentials(&lower) {
-        return Err(SignalValidationError::SecretLikeField(kind, key.into()));
+    if is_url_like(&lower) {
+        if url_contains_secret_like_parts(key) {
+            return Err(SignalValidationError::SecretLikeField(
+                kind,
+                "<redacted>".into(),
+            ));
+        }
+        return Ok(());
     }
 
-    let normalized = percent_decode_ascii_bounded(key);
-    if normalized != lower
-        && (contains_secret_word(&normalized) || contains_url_userinfo_credentials(&normalized))
-    {
-        return Err(SignalValidationError::SecretLikeField(kind, key.into()));
+    if contains_secret_word(&lower) {
+        return Err(SignalValidationError::SecretLikeField(
+            kind,
+            "<redacted>".into(),
+        ));
+    }
+
+    let normalized = percent_decode_ascii_fixed_point(key);
+    if normalized != lower && contains_secret_word(&normalized) {
+        return Err(SignalValidationError::SecretLikeField(
+            kind,
+            "<redacted>".into(),
+        ));
     }
 
     Ok(())
+}
+
+fn is_url_like(value: &str) -> bool {
+    value.contains("://") || value.starts_with("//")
 }
 
 fn contains_secret_word(value: &str) -> bool {
@@ -553,22 +571,76 @@ fn contains_secret_word(value: &str) -> bool {
     secret_words.iter().any(|word| value.contains(word))
 }
 
-fn contains_url_userinfo_credentials(value: &str) -> bool {
-    let Some(authority_start) = value.find("://").map(|index| index + 3) else {
-        return false;
-    };
-    let authority = value[authority_start..]
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    let Some(userinfo) = authority.rsplit_once('@').map(|(userinfo, _)| userinfo) else {
-        return false;
-    };
-
-    userinfo.contains(':')
+fn url_contains_secret_like_parts(value: &str) -> bool {
+    let normalized = percent_decode_ascii_fixed_point(value);
+    url_contains_userinfo(value)
+        || url_contains_userinfo(&normalized)
+        || url_contains_sensitive_query_name(value)
+        || url_contains_sensitive_query_name(&normalized)
 }
 
-fn percent_decode_ascii_bounded(value: &str) -> String {
+fn url_contains_userinfo(value: &str) -> bool {
+    let Some(authority_start) = authority_start(value) else {
+        return false;
+    };
+    value[authority_start..]
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .contains('@')
+}
+
+fn url_contains_sensitive_query_name(value: &str) -> bool {
+    let Some(query) = value.split_once('?').map(|(_, query)| query) else {
+        return false;
+    };
+    let query = query.split('#').next().unwrap_or_default();
+    query.split('&').any(|part| {
+        let name = part.split(['=', ';']).next().unwrap_or_default();
+        let name = percent_decode_ascii_fixed_point(name);
+        let name = name.split(['=', ';']).next().unwrap_or_default();
+        is_sensitive_parameter_name(name)
+    })
+}
+
+fn authority_start(value: &str) -> Option<usize> {
+    if value.starts_with("//") {
+        Some(2)
+    } else {
+        value.find("://").map(|index| index + 3)
+    }
+}
+
+fn is_sensitive_parameter_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "secret"
+            | "token"
+            | "access_token"
+            | "refresh_token"
+            | "api_key"
+            | "apikey"
+            | "password"
+            | "authorization"
+            | "cookie"
+            | "credential"
+    )
+}
+
+fn percent_decode_ascii_fixed_point(value: &str) -> String {
+    const MAX_PASSES: usize = 8;
+    let mut current = value.to_ascii_lowercase();
+    for _ in 0..MAX_PASSES {
+        let next = percent_decode_ascii_once_bounded(&current);
+        if next == current {
+            return next;
+        }
+        current = next;
+    }
+    current
+}
+
+fn percent_decode_ascii_once_bounded(value: &str) -> String {
     const MAX_NORMALIZED_BYTES: usize = 4096;
 
     let bytes = value.as_bytes();

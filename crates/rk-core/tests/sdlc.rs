@@ -147,6 +147,73 @@ fn test_url_refs_allow_benign_percent_encoding_without_raw_telemetry() {
 }
 
 #[test]
+fn test_url_refs_reject_repeatedly_encoded_sensitive_query_keys() {
+    for url in [
+        "https://example.invalid/build?%2574%256f%256b%2565%256e=redacted",
+        "https://example.invalid/build?%25252561%25252570%25252569%2525255f%2525256b%25252565%25252579=redacted",
+    ] {
+        let mut envelope = base_envelope(SignalKind::CiFailed);
+        envelope.refs = vec![SignalRef {
+            label: "build".into(),
+            url: url.into(),
+        }];
+
+        assert_invalid(&envelope);
+    }
+}
+
+#[test]
+fn test_url_ref_errors_do_not_echo_secret_bearing_urls_or_values() {
+    let secret_url = "https://example.invalid/build?token=super-secret-value";
+    let mut envelope = base_envelope(SignalKind::CiFailed);
+    envelope.refs = vec![SignalRef {
+        label: "build".into(),
+        url: secret_url.into(),
+    }];
+
+    let err = envelope.validate(&SignalLimits::default()).unwrap_err();
+    let rendered = err.to_string();
+    assert!(!rendered.contains(secret_url));
+    assert!(!rendered.contains("super-secret-value"));
+    assert!(rendered.contains("ref"));
+}
+
+#[test]
+fn test_url_refs_reject_scheme_relative_and_username_only_userinfo() {
+    for url in [
+        "//user:secret@example.invalid/build",
+        "//user@example.invalid/build",
+        "https://user@example.invalid/build",
+    ] {
+        let mut envelope = base_envelope(SignalKind::CiFailed);
+        envelope.refs = vec![SignalRef {
+            label: "build".into(),
+            url: url.into(),
+        }];
+
+        assert_invalid(&envelope);
+    }
+}
+
+#[test]
+fn test_url_refs_allow_sensitive_substrings_outside_parameter_name_boundaries() {
+    for url in [
+        "https://example.invalid/build?deployment_tokenizer=ok",
+        "https://example.invalid/build?myapi_keychain=ok",
+        "https://example.invalid/build?note=token-api_key-text",
+        "https://example.invalid/api/token/status?job=ci",
+    ] {
+        let mut envelope = base_envelope(SignalKind::CiFailed);
+        envelope.refs = vec![SignalRef {
+            label: "build".into(),
+            url: url.into(),
+        }];
+
+        envelope.validate(&SignalLimits::default()).unwrap();
+    }
+}
+
+#[test]
 fn test_signal_limits_reject_raw_telemetry_shape() {
     let mut envelope = base_envelope(SignalKind::CiFailed);
     envelope
