@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use clap::{Args, Subcommand, ValueEnum};
 use rk_core::paths::Layout;
 use rk_daemon::Client;
 use serde_json::{json, Map, Value};
+use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
 pub enum FactoryCommand {
@@ -17,6 +18,8 @@ pub enum FactoryCommand {
     ProposeWorkflow(FactoryProposeWorkflowArgs),
     /// Approve an exact factory action digest.
     Approve(FactoryApproveArgs),
+    /// Execute an exact approved factory action from a saved proposal envelope.
+    ExecuteAction(FactoryExecuteActionArgs),
     /// Execute an approved typed workflow.run action.
     ExecuteWorkflow(FactoryExecuteWorkflowArgs),
     /// Read-only self-optimization scorecards grouped by task class, workflow,
@@ -97,10 +100,30 @@ pub struct FactoryProposeWorkflowArgs {
 #[derive(Args)]
 pub struct FactoryApproveArgs {
     /// Proposal id returned by propose-workflow.
-    pub proposal_id: String,
+    #[arg(
+        required_unless_present = "proposal_file",
+        requires = "digest",
+        conflicts_with = "proposal_file"
+    )]
+    pub proposal_id: Option<String>,
     /// Exact 64-character lowercase hex digest returned by the daemon.
-    #[arg(value_parser = parse_digest)]
-    pub digest: String,
+    #[arg(
+        required_unless_present = "proposal_file",
+        requires = "proposal_id",
+        conflicts_with = "proposal_file",
+        value_parser = parse_digest
+    )]
+    pub digest: Option<String>,
+    /// Saved JSON output from a typed factory proposal command.
+    #[arg(long, value_name = "PATH")]
+    pub proposal_file: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct FactoryExecuteActionArgs {
+    /// Saved JSON output from a typed factory proposal command.
+    #[arg(long, value_name = "PATH")]
+    pub proposal_file: PathBuf,
 }
 
 #[derive(Args)]
@@ -239,6 +262,7 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
         FactoryCommand::ProposeWorkflow(args) => {
             let mut client = Client::connect_or_spawn(layout).await?;
             let action = workflow_action(args.workflow, args.repo, args.params, args.coordinator);
+            let execution_action = action.clone();
             let result = client
                 .call(
                     "factory.propose_action",
@@ -251,10 +275,13 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
                     "{}",
                     json!({
                         "schema": "factory.proposal.v1",
+                        "proposal_id": proposal["id"],
+                        "kind": "workflow.run",
                         "proposal": proposal,
                         "digest": result["digest"],
                         "risk": proposal["risk"],
                         "action": proposal["action"],
+                        "execution_action": execution_action,
                     })
                 );
             } else {
@@ -266,11 +293,12 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
             }
         }
         FactoryCommand::Approve(args) => {
+            let (proposal_id, digest) = approval_input(args)?;
             let mut client = Client::connect_or_spawn(layout).await?;
             let result = client
                 .call(
                     "factory.approve_action",
-                    json!({"proposal_id": args.proposal_id, "digest": args.digest}),
+                    json!({"proposal_id": proposal_id, "digest": digest}),
                 )
                 .await?;
             if json_output {
@@ -280,6 +308,26 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
                     "approved {}",
                     result["approval"]["proposal_id"].as_str().unwrap_or("?")
                 );
+            }
+        }
+        FactoryCommand::ExecuteAction(args) => {
+            let envelope = proposal_execution_envelope(&args.proposal_file)?;
+            let mut client = Client::connect_or_spawn(layout).await?;
+            let result = client
+                .call(
+                    "factory.execute_action",
+                    json!({
+                        "proposal_id": envelope.proposal_id,
+                        "digest": envelope.digest,
+                        "kind": envelope.kind,
+                        "action": envelope.execution_action,
+                    }),
+                )
+                .await?;
+            if json_output {
+                println!("{result}");
+            } else {
+                println!("executed {}", envelope.kind);
             }
         }
         FactoryCommand::ExecuteWorkflow(args) => {
@@ -321,6 +369,87 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
             } else {
                 print!("{}", render_recommend_markdown(&result));
             }
+        }
+    }
+    Ok(())
+}
+
+struct ProposalExecutionEnvelope {
+    proposal_id: String,
+    digest: String,
+    kind: String,
+    execution_action: Value,
+}
+
+fn approval_input(args: FactoryApproveArgs) -> Result<(String, String)> {
+    if let Some(path) = args.proposal_file {
+        let envelope = proposal_execution_envelope(&path)?;
+        return Ok((envelope.proposal_id, envelope.digest));
+    }
+    Ok((
+        args.proposal_id
+            .ok_or_else(|| anyhow!("proposal id is required"))?,
+        args.digest.ok_or_else(|| anyhow!("digest is required"))?,
+    ))
+}
+
+fn proposal_execution_envelope(path: &Path) -> Result<ProposalExecutionEnvelope> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read proposal file {}", path.display()))?;
+    let value: Value = serde_json::from_str(&text)
+        .with_context(|| format!("parse proposal file {}", path.display()))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("proposal file must contain a JSON object"))?;
+    let proposal_id = required_string(object, "proposal_id")?;
+    let digest = parse_digest(&required_string(object, "digest")?).map_err(anyhow::Error::msg)?;
+    let kind = required_string(object, "kind")?;
+    if !matches!(
+        kind.as_str(),
+        "workflow.run" | "ticket_graph.apply" | "product_to_code.dispatch"
+    ) {
+        return Err(anyhow!("unsupported proposal action kind: {kind}"));
+    }
+    let execution_action = object
+        .get("execution_action")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or_else(|| anyhow!("proposal file is missing object field execution_action"))?;
+
+    if let Some(proposal) = object.get("proposal").and_then(Value::as_object) {
+        require_matching_string(proposal, "id", &proposal_id, "proposal_id")?;
+        require_matching_string(proposal, "digest", &digest, "digest")?;
+        require_matching_string(proposal, "kind", &kind, "kind")?;
+    }
+
+    Ok(ProposalExecutionEnvelope {
+        proposal_id,
+        digest,
+        kind,
+        execution_action,
+    })
+}
+
+fn required_string(object: &Map<String, Value>, field: &str) -> Result<String> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("proposal file is missing string field {field}"))
+}
+
+fn require_matching_string(
+    object: &Map<String, Value>,
+    nested_field: &str,
+    expected: &str,
+    top_level_field: &str,
+) -> Result<()> {
+    if let Some(actual) = object.get(nested_field).and_then(Value::as_str) {
+        if actual != expected {
+            return Err(anyhow!(
+                "proposal file has conflicting {top_level_field}: top-level={expected} proposal.{nested_field}={actual}"
+            ));
         }
     }
     Ok(())

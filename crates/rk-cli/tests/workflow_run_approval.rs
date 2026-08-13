@@ -375,10 +375,68 @@ async fn test_factory_propose_workflow_sends_typed_action_not_shell_command() {
     assert_eq!(value["action"]["repo"], "fixture");
     assert_eq!(value["action"]["params"]["taskId"], "hello");
     assert_eq!(value["action"]["coordinator"], "coord-1");
+    assert_eq!(value["proposal_id"], value["proposal"]["id"]);
+    assert_eq!(value["kind"], "workflow.run");
+    assert_eq!(value["execution_action"]["name"], "noop");
+    assert_eq!(value["execution_action"]["repo"], "fixture");
+    assert_eq!(value["execution_action"]["params"]["taskId"], "hello");
+    assert_eq!(value["execution_action"]["coordinator"], "coord-1");
     assert!(
         value.get("argv").is_none(),
         "factory proposal must not expose shell argv authority"
     );
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_factory_proposal_file_can_be_approved_and_executed_exactly() {
+    let (home, _repo, handle) = fixture().await;
+    let layout = Layout::at(home.path());
+    let proposal = successful_json(run_rk(
+        &layout,
+        &[
+            "--json",
+            "factory",
+            "propose-workflow",
+            "noop",
+            "--repo",
+            "fixture",
+            "--param",
+            "taskId=value with spaces",
+            "--coordinator",
+            "coord-file",
+        ],
+    ));
+    let proposal_file = home.path().join("workflow-proposal.json");
+    std::fs::write(&proposal_file, serde_json::to_vec_pretty(&proposal).unwrap()).unwrap();
+
+    let approved = successful_json(run_rk(
+        &layout,
+        &[
+            "--json",
+            "factory",
+            "approve",
+            "--proposal-file",
+            proposal_file.to_str().unwrap(),
+        ],
+    ));
+    assert_eq!(approved["approval"]["proposal_id"], proposal["proposal_id"]);
+
+    let executed = successful_json(run_rk(
+        &layout,
+        &[
+            "--json",
+            "factory",
+            "execute-action",
+            "--proposal-file",
+            proposal_file.to_str().unwrap(),
+        ],
+    ));
+    assert_eq!(executed["instance"]["workflow"], "noop");
+    assert_eq!(executed["instance"]["params"]["taskId"], "value with spaces");
+    assert_eq!(executed["instance"]["coordinator"], "coord-file");
+    assert_eq!(executed["approval"]["status"], "consumed");
+
     handle.abort();
 }
 
