@@ -1,0 +1,15 @@
+{
+  "id": "   ",
+  "initiative_id": "   ",
+  "nodes": [
+    {
+      "id": "   ",
+      "title": "   ",
+      "description": "   ",
+      "acceptance_criterion_ids": ["   "]
+    }
+  ],
+  "edges": [
+    { "from": "   ", "to": "   ", "relationship": "   " }
+  ]
+}

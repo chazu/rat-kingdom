@@ -43,6 +43,48 @@ fn test_architecture_research_artifact_requires_decisions_and_open_questions() {
 }
 
 #[test]
+fn test_architecture_research_artifact_rejects_whitespace_required_and_optional_lists() {
+    let mut artifact: ArchitectureResearchArtifact = serde_json::from_str(&fixture(
+        "architecture_research_invalid_empty_decisions.json",
+    ))
+    .unwrap();
+    artifact.researched_files = vec!["   ".to_string()];
+    artifact.domain_terms = vec!["   ".to_string()];
+    artifact.architecture_decisions = vec!["   ".to_string()];
+    artifact.constraints = vec!["   ".to_string()];
+    artifact.risks = vec!["   ".to_string()];
+    artifact.open_questions = vec!["   ".to_string()];
+    artifact.open_questions_exhausted = false;
+    artifact.evidence_ids = vec!["   ".to_string()];
+
+    let err = artifact.validate().unwrap_err().to_string();
+
+    assert!(err.contains("researched_files"));
+    assert!(err.contains("domain_terms"));
+    assert!(err.contains("architecture_decisions"));
+    assert!(err.contains("constraints"));
+    assert!(err.contains("risks"));
+    assert!(err.contains("open_questions"));
+    assert!(err.contains("evidence_ids"));
+}
+
+#[test]
+fn test_architecture_research_artifact_rejects_whitespace_recommended_ticket_graph_path() {
+    let mut artifact: ArchitectureResearchArtifact = serde_json::from_str(&fixture(
+        "architecture_research_invalid_empty_decisions.json",
+    ))
+    .unwrap();
+    artifact.researched_files = vec!["crates/rk-core/src/product_to_code/contracts.rs".to_string()];
+    artifact.architecture_decisions = vec!["Keep contracts offline".to_string()];
+    artifact.open_questions = vec!["Should graph ordering be exported?".to_string()];
+    artifact.recommended_ticket_graph_path = Some("   ".to_string());
+
+    let err = artifact.validate().unwrap_err().to_string();
+
+    assert!(err.contains("recommended_ticket_graph_path"));
+}
+
+#[test]
 fn test_generic_evidence_accepts_tool_agnostic_impact_payload() {
     let evidence: GenericEvidence = serde_json::from_str(&fixture("evidence_impact.json")).unwrap();
     evidence.validate().unwrap();
@@ -195,6 +237,31 @@ fn test_ticket_graph_rejects_duplicate_missing_and_unknown_criterion_mappings() 
 }
 
 #[test]
+fn test_ticket_graph_rejects_whitespace_required_strings_and_list_ids() {
+    let mut graph: TicketGraph = serde_json::from_str(&fixture("ticket_graph_valid.json")).unwrap();
+    graph.id = "   ".to_string();
+    graph.initiative_id = "   ".to_string();
+    graph.nodes[0].id = "   ".to_string();
+    graph.nodes[0].title = "   ".to_string();
+    graph.nodes[0].description = "   ".to_string();
+    graph.nodes[0].acceptance_criterion_ids = vec!["   ".to_string()];
+    graph.edges[0].relationship = "   ".to_string();
+
+    let err = graph
+        .validate(&["AC-1".to_string()])
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("id"));
+    assert!(err.contains("initiative_id"));
+    assert!(err.contains("nodes.id"));
+    assert!(err.contains("nodes.title"));
+    assert!(err.contains("nodes.description"));
+    assert!(err.contains("nodes.acceptance_criterion_ids"));
+    assert!(err.contains("edges.relationship"));
+}
+
+#[test]
 fn test_verification_report_rejects_duplicate_missing_and_unknown_evidence_references() {
     let mut report: VerificationReport =
         serde_json::from_str(&fixture("verification_report_valid.json")).unwrap();
@@ -213,6 +280,53 @@ fn test_verification_report_rejects_duplicate_missing_and_unknown_evidence_refer
     assert!(err.contains("missing acceptance criterion verification AC-1"));
     assert!(err.contains("missing acceptance criterion verification AC-3"));
     assert!(err.contains("unknown evidence id EVID-missing"));
+}
+
+#[test]
+fn test_verification_report_rejects_whitespace_required_strings_and_list_ids() {
+    let mut report: VerificationReport =
+        serde_json::from_str(&fixture("verification_report_valid.json")).unwrap();
+    report.id = "   ".to_string();
+    report.initiative_id = "   ".to_string();
+    report.entries[0].acceptance_criterion_id = "   ".to_string();
+    report.entries[0].status = "   ".to_string();
+    report.entries[0].evidence_ids = vec!["   ".to_string()];
+
+    let err = report.validate().unwrap_err().to_string();
+
+    assert!(err.contains("id"));
+    assert!(err.contains("initiative_id"));
+    assert!(err.contains("entries.acceptance_criterion_id"));
+    assert!(err.contains("entries.status"));
+    assert!(err.contains("entries.evidence_ids"));
+}
+
+#[test]
+fn test_architecture_research_rejects_whitespace_required_and_optional_strings() {
+    let artifact = ArchitectureResearchArtifact {
+        id: "ARCH-whitespace".to_string(),
+        initiative_id: "INIT-product-to-code".to_string(),
+        researched_files: vec!["   ".to_string()],
+        domain_terms: vec!["   ".to_string()],
+        architecture_decisions: vec!["   ".to_string()],
+        constraints: vec!["   ".to_string()],
+        risks: vec!["   ".to_string()],
+        open_questions: vec!["   ".to_string()],
+        open_questions_exhausted: false,
+        recommended_ticket_graph_path: Some("   ".to_string()),
+        evidence_ids: vec!["   ".to_string()],
+    };
+
+    let err = artifact.validate().unwrap_err().to_string();
+
+    assert!(err.contains("researched_files"));
+    assert!(err.contains("domain_terms"));
+    assert!(err.contains("architecture_decisions"));
+    assert!(err.contains("constraints"));
+    assert!(err.contains("risks"));
+    assert!(err.contains("open_questions"));
+    assert!(err.contains("recommended_ticket_graph_path"));
+    assert!(err.contains("evidence_ids"));
 }
 
 #[test]

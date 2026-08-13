@@ -94,6 +94,9 @@ pub fn research_validation_errors(artifact: &ArchitectureResearchArtifact) -> Ve
         );
     }
     push_non_empty_items(&mut errors, "open_questions", &artifact.open_questions);
+    if let Some(path) = &artifact.recommended_ticket_graph_path {
+        push_empty(&mut errors, "recommended_ticket_graph_path", path);
+    }
     push_non_empty_items(&mut errors, "evidence_ids", &artifact.evidence_ids);
     errors
 }

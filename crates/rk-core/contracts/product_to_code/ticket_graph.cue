@@ -1,21 +1,23 @@
 package product_to_code
 
+#NonBlankString: string & =~"\\S"
+
 #TicketGraphNode: {
-	id:          string & !=""
-	title:       string & !=""
-	description: string & !=""
-	acceptance_criterion_ids?: [...string & !=""]
+	id:          #NonBlankString
+	title:       #NonBlankString
+	description: #NonBlankString
+	acceptance_criterion_ids?: [...#NonBlankString]
 }
 
 #TicketGraphEdge: {
-	from:         string & !=""
-	to:           string & !=""
-	relationship: string & !=""
+	from:         #NonBlankString
+	to:           #NonBlankString
+	relationship: #NonBlankString
 }
 
 #TicketGraph: {
-	id:            string & !=""
-	initiative_id: string & !=""
-	nodes:         [#TicketGraphNode, ...#TicketGraphNode]
-	edges?:        [...#TicketGraphEdge]
+	id:            #NonBlankString
+	initiative_id: #NonBlankString
+	nodes: [#TicketGraphNode, ...#TicketGraphNode]
+	edges?: [...#TicketGraphEdge]
 }
