@@ -1,8 +1,8 @@
 use anyhow::Result;
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use rk_core::paths::Layout;
 use rk_daemon::Client;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 #[derive(Subcommand)]
 pub enum FactoryCommand {
@@ -19,6 +19,14 @@ pub enum FactoryCommand {
     Approve(FactoryApproveArgs),
     /// Execute an approved typed workflow.run action.
     ExecuteWorkflow(FactoryExecuteWorkflowArgs),
+    /// Read-only self-optimization scorecards grouped by task class, workflow,
+    /// harness, and model. Advisory only; never mutates routing, policy,
+    /// workflows, tickets, approvals, or dispatch.
+    Scorecards(FactoryAnalyticsArgs),
+    /// Read-only advisory recommendations derived from scorecards. Advisory
+    /// only; never mutates routing, policy, workflows, tickets, approvals, or
+    /// dispatch.
+    Recommend(FactoryAnalyticsArgs),
 }
 
 #[derive(Subcommand)]
@@ -114,6 +122,55 @@ pub struct FactoryExecuteWorkflowArgs {
     /// Stable coordinator-session id that owns this workflow for monitoring.
     #[arg(long)]
     pub coordinator: Option<String>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum FactoryGroupBy {
+    Composite,
+    TaskClass,
+    Workflow,
+    Harness,
+    Model,
+    TaskClassWorkflow,
+    All,
+}
+
+impl FactoryGroupBy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Composite => "composite",
+            Self::TaskClass => "task_class",
+            Self::Workflow => "workflow",
+            Self::Harness => "harness",
+            Self::Model => "model",
+            Self::TaskClassWorkflow => "task_class_workflow",
+            Self::All => "all",
+        }
+    }
+}
+
+#[derive(Args)]
+pub struct FactoryAnalyticsArgs {
+    /// Registered repository name or path scope.
+    #[arg(long)]
+    pub repo: String,
+    /// Projection: composite (default), task_class, workflow, harness, model,
+    /// task_class_workflow, or all.
+    #[arg(long = "group-by")]
+    pub group_by: Option<FactoryGroupBy>,
+    /// Include archived history in metrics and split active/archived counts.
+    #[arg(long)]
+    pub include_archived: bool,
+    /// Only count events observed at or after this epoch-ms bound.
+    #[arg(long)]
+    pub since: Option<i64>,
+    /// Only count events observed at or before this epoch-ms bound.
+    #[arg(long)]
+    pub until: Option<i64>,
+    /// Minimum sample size hint forwarded to the daemon.
+    #[arg(long)]
+    pub min_sample: Option<u32>,
 }
 
 pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) -> Result<()> {
@@ -243,6 +300,28 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
                 );
             }
         }
+        FactoryCommand::Scorecards(args) => {
+            let mut client = Client::connect(layout).await?;
+            let result = client
+                .call("factory.scorecards", analytics_params(args))
+                .await?;
+            if json_output {
+                println!("{result}");
+            } else {
+                print!("{}", render_scorecards_markdown(&result));
+            }
+        }
+        FactoryCommand::Recommend(args) => {
+            let mut client = Client::connect(layout).await?;
+            let result = client
+                .call("factory.recommend", analytics_params(args))
+                .await?;
+            if json_output {
+                println!("{result}");
+            } else {
+                print!("{}", render_recommend_markdown(&result));
+            }
+        }
     }
     Ok(())
 }
@@ -353,6 +432,143 @@ fn parse_param(pair: &str) -> Result<(String, String), String> {
         return Err("--param key cannot be empty".into());
     }
     Ok((key.to_string(), value.to_string()))
+}
+
+fn analytics_params(args: FactoryAnalyticsArgs) -> Value {
+    let mut map = Map::new();
+    map.insert("repo".into(), Value::String(args.repo));
+    if let Some(group_by) = args.group_by {
+        map.insert(
+            "group_by".into(),
+            Value::String(group_by.as_str().to_string()),
+        );
+    }
+    if args.include_archived {
+        map.insert("include_archived".into(), Value::Bool(true));
+    }
+    if let Some(since) = args.since {
+        map.insert("since".into(), json!(since));
+    }
+    if let Some(until) = args.until {
+        map.insert("until".into(), json!(until));
+    }
+    if let Some(min_sample) = args.min_sample {
+        map.insert("min_sample".into(), json!(min_sample));
+    }
+    Value::Object(map)
+}
+
+fn render_source_counts(out: &mut String, result: &Value) {
+    out.push_str("## Source Counts\n\n");
+    if let Some(counts) = result["source_counts"].as_array() {
+        for entry in counts {
+            out.push_str(&format!(
+                "- {}: active={} archived={} events={} available={}\n",
+                entry["source_family"].as_str().unwrap_or("?"),
+                entry["active_source_count"].as_u64().unwrap_or(0),
+                entry["archived_source_count"].as_u64().unwrap_or(0),
+                entry["event_count"].as_u64().unwrap_or(0),
+                availability_of(result, entry["source_family"].as_str().unwrap_or("")),
+            ));
+        }
+    }
+    out.push('\n');
+}
+
+fn availability_of(result: &Value, family: &str) -> bool {
+    result["availability"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|a| a["source_family"].as_str() == Some(family))
+        .and_then(|a| a["available"].as_bool())
+        .unwrap_or(false)
+}
+
+fn render_scorecard_rows(out: &mut String, result: &Value) {
+    out.push_str("## Scorecards\n\n");
+    match result["scorecards"].as_array() {
+        Some(rows) if !rows.is_empty() => {
+            for row in rows {
+                let key = &row["group_key"];
+                out.push_str(&format!(
+                    "- ({} / {} / {} / {}) runs={} accepted={} reworked={} ci_failed={} reverted={} cost_micro_usd={}\n",
+                    key["task_class"].as_str().unwrap_or("unknown"),
+                    key["workflow"].as_str().unwrap_or("unknown"),
+                    key["harness"].as_str().unwrap_or("unknown"),
+                    key["model"].as_str().unwrap_or("unknown"),
+                    row["metrics"]["runs"].as_u64().unwrap_or(0),
+                    row["metrics"]["accepted"].as_u64().unwrap_or(0),
+                    row["metrics"]["reworked"].as_u64().unwrap_or(0),
+                    row["metrics"]["ci_failed"].as_u64().unwrap_or(0),
+                    row["metrics"]["reverted"].as_u64().unwrap_or(0),
+                    row["metrics"]["total_cost_micro_usd"].as_u64().unwrap_or(0),
+                ));
+            }
+        }
+        _ => out.push_str("(no observed scorecard rows)\n"),
+    }
+    out.push('\n');
+}
+
+fn render_warnings(out: &mut String, result: &Value) {
+    if let Some(warnings) = result["warnings"].as_array() {
+        if !warnings.is_empty() {
+            out.push_str("## Warnings\n\n");
+            for warning in warnings {
+                out.push_str(&format!("- {}\n", warning.as_str().unwrap_or("")));
+            }
+            out.push('\n');
+        }
+    }
+}
+
+fn render_scorecards_markdown(result: &Value) -> String {
+    let mut out = String::from("# Factory Scorecards\n\n");
+    render_source_counts(&mut out, result);
+    render_scorecard_rows(&mut out, result);
+    render_warnings(&mut out, result);
+    out
+}
+
+fn render_recommend_markdown(result: &Value) -> String {
+    let mut out = String::from("# Factory Scorecards\n\n");
+    render_source_counts(&mut out, result);
+    render_scorecard_rows(&mut out, result);
+
+    out.push_str("## Recommendations\n\n");
+    match result["recommendations"].as_array() {
+        Some(recs) if !recs.is_empty() => {
+            for rec in recs {
+                out.push_str(&format!(
+                    "- [{}] {}: {} (advisory)\n",
+                    rec["severity"].as_str().unwrap_or("info"),
+                    rec["rule"].as_str().unwrap_or("?"),
+                    rec["advice"].as_str().unwrap_or(""),
+                ));
+            }
+        }
+        _ => out.push_str("(no advisory recommendations)\n"),
+    }
+    out.push('\n');
+
+    out.push_str("## Suppressed\n\n");
+    match result["suppressions"].as_array() {
+        Some(sup) if !sup.is_empty() => {
+            for entry in sup {
+                out.push_str(&format!(
+                    "- {}: {} (low-sample or unavailable metric)\n",
+                    entry["rule"].as_str().unwrap_or("?"),
+                    entry["reason"].as_str().unwrap_or("?"),
+                ));
+            }
+        }
+        _ => out.push_str("(none)\n"),
+    }
+    out.push('\n');
+
+    render_warnings(&mut out, result);
+    out
 }
 
 fn parse_digest(digest: &str) -> Result<String, String> {
