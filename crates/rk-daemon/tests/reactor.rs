@@ -5,6 +5,7 @@
 //! and pin down idempotency, re-entrancy, and the per-trigger rate cap.
 
 use rk_core::config::ReactorConfig;
+use rk_core::id::RecordId;
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Pattern, Tuple, FULL_STRENGTH};
 use rk_daemon::reactor::{Reactor, REACTOR_INSTANCE};
@@ -247,6 +248,88 @@ async fn dispatch_is_idempotent_under_feed_loss_and_cursor_reset() {
 
     // Exactly one workflow instance was ever created.
     assert_eq!(reactor.engine_instance_count(), 1);
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+#[tokio::test]
+async fn delayed_lower_record_id_is_processed_after_cursor_advance() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    write_trigger(&layout);
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+    let now = chrono::Utc::now();
+    let mut delayed = ping();
+    delayed.id = RecordId::floor_at(now);
+    let mut boundary = Tuple::new(
+        Category::Event,
+        "myrepo",
+        "boundary",
+        "Whisker",
+        json!({}),
+    );
+    boundary.id = RecordId::floor_at(now + chrono::Duration::days(1));
+
+    space.out(boundary).unwrap();
+    assert_eq!(reactor.run_cycle().unwrap(), 0);
+    space.out(delayed).unwrap();
+
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        1,
+        "persistence order must replay a delayed tuple below the prior ULID cursor"
+    );
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+#[tokio::test]
+async fn restart_after_future_record_id_processes_normal_write() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    write_trigger(&layout);
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+
+    let now = chrono::Utc::now();
+    {
+        let space = rk_space::Space::open(&layout.db_path()).unwrap();
+        let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+        let mut future = Tuple::new(
+            Category::Event,
+            "myrepo",
+            "future-boundary",
+            "Whisker",
+            json!({}),
+        );
+        future.id = RecordId::floor_at(now + chrono::Duration::days(1));
+        space.out(future).unwrap();
+        reactor.initialize_cursor().unwrap();
+    }
+
+    let reopened = rk_space::Space::open(&layout.db_path()).unwrap();
+    let restarted = build_reactor_with_space(
+        &layout,
+        ReactorConfig::default(),
+        reopened.clone(),
+    );
+    let mut normal = ping();
+    normal.id = RecordId::floor_at(now);
+    reopened.out(normal).unwrap();
+
+    assert_eq!(
+        restarted.run_cycle().unwrap(),
+        1,
+        "a persisted sequence must survive restart and wall-clock rollback"
+    );
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
@@ -1097,11 +1180,6 @@ async fn fresh_obstacle_on_resolved_topic_steers_and_reinforces() {
     space.gc_expired(0.5).unwrap();
     let decayed = resolutions(&space).pop().expect("trail survives one decay");
     assert!(decayed.strength.unwrap() < FULL_STRENGTH, "trail decayed");
-
-    // This test exercises resolution steering, not ULID cursor ordering. Cross
-    // the persisted cursor's millisecond boundary so the fresh wall is in the
-    // next deterministic delta instead of depending on random ULID suffix order.
-    std::thread::sleep(Duration::from_millis(2));
 
     // Another rat hits the same wall (different phrasing, same topic).
     let wall2 = obstacle("myrepo", "Nibbles", "Flaky SYNC test!!");

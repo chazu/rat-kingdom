@@ -7,10 +7,10 @@
 //!
 //! The live feed ([`Space::subscribe`]) is a lossy broadcast: it drops events
 //! for laggy consumers. A trigger must never miss an event, so the feed is used
-//! only as a *wake signal*. The source of truth is a durable cursor over the
-//! store: each cycle scans tuples with `id` greater than the last processed id
-//! (ULIDs sort by creation time), fires matching triggers, then advances the
-//! cursor. This is the same cursor discipline the multiplayer sync loop uses.
+//! only as a *wake signal*. The source of truth is a durable SQLite persistence
+//! sequence: each cycle reads tuples committed after the saved boundary, fires
+//! matching triggers, then advances only after the batch succeeds. This is the
+//! same cursor discipline the multiplayer sync loop uses.
 //!
 //! # Idempotency and re-entrancy
 //!
@@ -159,20 +159,19 @@ impl Reactor {
         if self.cursor_file.exists() {
             return Ok(());
         }
-        let all = self.space.scan(&Pattern::default())?;
-        if let Some(max) = all.iter().map(|t| t.id).max() {
-            self.save_cursor(max)?;
+        let boundary = self.space.latest_persistence_sequence()?;
+        if boundary > 0 {
+            self.save_cursor(boundary)?;
         }
         Ok(())
     }
 
-    /// Process every tuple newer than the cursor: match it against all loaded
-    /// triggers and fire the workflows. Returns how many workflows were fired.
+    /// Process every tuple persisted after the durable SQLite cursor: match it
+    /// against all loaded triggers and fire the workflows. Returns how many
+    /// workflows were fired.
     pub fn run_cycle(&self) -> rk_core::Result<usize> {
-        let cursor = self.load_cursor();
-        // Bounded delta: only tuples newer than the cursor, resolved from the id
-        // PRIMARY KEY index — no full-table scan + Rust-side `id <= cursor` skip.
-        let delta = self.space.scan(&Pattern::default().after(cursor))?;
+        let cursor = self.load_cursor()?.unwrap_or(0);
+        let delta = self.space.persistence_delta(Some(cursor))?;
         // Load the registry, then the triggers (cache-gated, so a `cue` shell-out
         // runs only when a trigger file changed), AFTER the delta scan. Loading
         // them no earlier than the scan closes the window where a repo / trigger
@@ -182,15 +181,8 @@ impl Reactor {
         let triggers = self.cached_triggers(&registry);
 
         let mut fired = 0usize;
-        let mut max_id = cursor;
         let mut retryable_failure = false;
-        for tuple in &delta {
-            // Advance the cursor past every delta tuple, including the reactor's
-            // own markers, so they are seen once and never re-scanned.
-            max_id = Some(match max_id {
-                Some(m) => m.max(tuple.id),
-                None => tuple.id,
-            });
+        for tuple in &delta.tuples {
             if tuple.instance == REACTOR_INSTANCE {
                 continue;
             }
@@ -240,12 +232,8 @@ impl Reactor {
                 warn!(tuple = %tuple.id, error = %e, "reactor resolution-backlink failed");
             }
         }
-        if !retryable_failure {
-            if let Some(m) = max_id {
-                if cursor.map(|c| m > c).unwrap_or(true) {
-                    self.save_cursor(m)?;
-                }
-            }
+        if !retryable_failure && delta.boundary > cursor {
+            self.save_cursor(delta.boundary)?;
         }
 
         fired += self.react_to_sdlc_ci_transition_backlog()?;
@@ -259,8 +247,7 @@ impl Reactor {
         // store on EVERY wake is the cost TKT-29 targets. Gate WHETHER to
         // recompute on whether the relevant category population *changed* since
         // last cycle — an exact SQL COUNT (no row materialisation, and immune to
-        // the same-millisecond ULID ordering that makes a cursor delta an
-        // unreliable change signal, unlike the firing loop which tolerates it).
+        // independent of the persistence cursor, whose SQLite sequence is exact).
         // A promotion / coalescence can only newly qualify when an endorsement /
         // obstacle is ADDED, which moves the count; a burst of unrelated writes
         // leaves it unchanged, so the full scan is skipped. The first cycle
@@ -1584,16 +1571,22 @@ impl Reactor {
         self.engine.list().len()
     }
 
-    fn load_cursor(&self) -> Option<RecordId> {
-        std::fs::read_to_string(&self.cursor_file)
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
+    fn load_cursor(&self) -> rk_core::Result<Option<u64>> {
+        let Ok(raw) = std::fs::read_to_string(&self.cursor_file) else {
+            return Ok(None);
+        };
+        let raw = raw.trim();
+        if let Ok(sequence) = raw.parse::<u64>() {
+            return Ok(Some(sequence));
+        }
+        let Ok(legacy) = raw.parse::<RecordId>() else {
+            return Ok(None);
+        };
+        self.space.legacy_persistence_sequence(legacy)
     }
 
-    fn save_cursor(&self, id: RecordId) -> rk_core::Result<()> {
-        std::fs::write(&self.cursor_file, id.to_string())?;
+    fn save_cursor(&self, sequence: u64) -> rk_core::Result<()> {
+        std::fs::write(&self.cursor_file, sequence.to_string())?;
         Ok(())
     }
 }
