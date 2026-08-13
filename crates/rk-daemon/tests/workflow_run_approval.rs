@@ -192,6 +192,73 @@ async fn test_execute_workflow_run_with_matching_approval_starts_instance() {
 }
 
 #[tokio::test]
+async fn test_second_approve_action_fails_without_lifecycle_reset_or_second_dispatch() {
+    let (_home, _repo_dir, _layout, handle, mut client) = setup().await;
+    let proposed = client
+        .call(
+            "factory.propose_action",
+            json!({
+                "kind":"workflow.run",
+                "action":{"name":"factory-test","repo":"repo-a", "params":{"taskId":"one"}}
+            }),
+        )
+        .await
+        .unwrap();
+    let proposal_id = proposed["proposal"]["id"].as_str().unwrap().to_string();
+    let digest = proposed["proposal"]["digest"].as_str().unwrap().to_string();
+    let approved = client
+        .call(
+            "factory.approve_action",
+            json!({"proposal_id": proposal_id, "digest": digest}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approved["grant"]["status"], "approved");
+
+    let err = client
+        .call(
+            "factory.approve_action",
+            json!({"proposal_id": proposal_id, "digest": digest}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already approved"), "{err}");
+
+    let executed = client
+        .call(
+            "factory.execute_action",
+            json!({
+                "proposal_id": proposal_id,
+                "digest": digest,
+                "action":{"name":"factory-test","repo":"repo-a", "params":{"taskId":"one"}}
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(executed["approval"]["status"], "consumed");
+
+    let err = client
+        .call(
+            "factory.approve_action",
+            json!({"proposal_id": proposal_id, "digest": digest}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already consumed"), "{err}");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let listed = client.call("workflow.list", json!({})).await.unwrap();
+    let instances = listed["instances"].as_array().unwrap();
+    assert_eq!(instances.len(), 1, "{listed}");
+    assert_eq!(instances[0]["id"], executed["instance"]["id"]);
+
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn test_concurrent_execute_approval_dispatches_once() {
     let (_home, _repo_dir, layout, handle, mut client) = setup().await;
     let proposed = client

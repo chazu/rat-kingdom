@@ -230,6 +230,16 @@ impl ActionApprovalStore {
         Ok(out)
     }
 
+    pub fn list(&self) -> rk_core::Result<Vec<ActionProposal>> {
+        let data = self.lock()?;
+        Ok(data.proposals.values().cloned().collect())
+    }
+
+    pub fn list_grants(&self) -> rk_core::Result<Vec<ApprovalGrant>> {
+        let data = self.lock()?;
+        Ok(data.grants.values().cloned().collect())
+    }
+
     fn lock(&self) -> rk_core::Result<std::sync::MutexGuard<'_, StoreData>> {
         self.data
             .lock()
@@ -360,6 +370,42 @@ mod tests {
             .unwrap();
         assert_eq!(grant.status, ApprovalStatus::Consumed);
         assert_eq!(grant.instance_id.as_deref(), Some(instance_id.as_str()));
+    }
+
+    #[test]
+    fn approve_rejects_every_existing_grant_state() {
+        let (_dir, store) = store();
+        let action = action("repo-a", "/repo/a");
+        let proposal = store.propose("caller-a", action.clone(), None).unwrap();
+        let first = store
+            .approve(&proposal.id, &proposal.digest, "operator")
+            .unwrap();
+        assert_eq!(first.status, ApprovalStatus::Approved);
+
+        let err = store
+            .approve(&proposal.id, &proposal.digest, "operator")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already approved"), "{err}");
+
+        let executing = store
+            .begin_execute(&proposal.id, &proposal.digest, "caller-a", &action)
+            .unwrap();
+        assert_eq!(executing.status, ApprovalStatus::Executing);
+        let err = store
+            .approve(&proposal.id, &proposal.digest, "operator")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already executing"), "{err}");
+
+        store
+            .finish_success(&proposal.id, executing.instance_id.as_deref().unwrap())
+            .unwrap();
+        let err = store
+            .approve(&proposal.id, &proposal.digest, "operator")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already consumed"), "{err}");
     }
 
     #[test]
