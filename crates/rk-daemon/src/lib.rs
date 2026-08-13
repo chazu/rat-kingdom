@@ -10,6 +10,7 @@ pub mod cron;
 pub mod drain;
 pub mod factory_events;
 pub mod inbox;
+pub mod ingest_auth;
 pub mod onboarding;
 pub mod onboarding_activation;
 pub mod onboarding_apply;
@@ -50,6 +51,36 @@ mod tests {
         (dir, layout, handle)
     }
 
+    async fn start_daemon_with_config(
+        config: rk_core::config::Config,
+    ) -> (
+        tempfile::TempDir,
+        Layout,
+        tokio::task::JoinHandle<rk_core::Result<()>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        let daemon = Daemon::new(layout.clone(), &config).unwrap();
+        let handle = tokio::spawn(daemon.run());
+        (dir, layout, handle)
+    }
+
+    async fn raw_request(layout: &Layout, req: Request) -> Response {
+        let stream = loop {
+            match UnixStream::connect(layout.socket_path()).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        let mut stream = BufReader::new(stream);
+        let mut line = serde_json::to_vec(&req).unwrap();
+        line.push(b'\n');
+        stream.get_mut().write_all(&line).await.unwrap();
+        let mut response = String::new();
+        stream.read_line(&mut response).await.unwrap();
+        serde_json::from_str(&response).unwrap()
+    }
+
     /// Always an explicit operator connection: an ambient `RK_AGENT` (every
     /// test run inside a supervised rat has one) would otherwise make these
     /// tests speak as that rat and be refused the operator-only methods.
@@ -61,6 +92,173 @@ mod tests {
             }
         }
         panic!("daemon did not come up");
+    }
+
+    mod sdlc_ingest_auth {
+        use super::*;
+
+        fn source(name: &str) -> rk_core::config::IngestSourceConfig {
+            rk_core::config::IngestSourceConfig {
+                name: name.into(),
+                allowed_kinds: vec!["status".into()],
+                ..Default::default()
+            }
+        }
+
+        fn config_with_source(
+            source: rk_core::config::IngestSourceConfig,
+        ) -> rk_core::config::Config {
+            let mut config = rk_core::config::Config::default();
+            config.ingest.sources = vec![source];
+            config
+        }
+
+        #[test]
+        fn test_default_config_has_no_public_ingest_listener() {
+            let config = rk_core::config::Config::default();
+            assert!(config.ingest.sources.is_empty());
+            assert_eq!(config.ingest.max_state_limit, 1_000);
+        }
+
+        #[test]
+        fn test_ingest_source_must_be_enabled_to_resolve() {
+            let mut src = source("probe");
+            src.enabled = false;
+            let config = config_with_source(src);
+            let root = "root";
+            assert!(crate::ingest_auth::SourcePrincipal::from_request(
+                &config.ingest,
+                root,
+                &crate::ingest_auth::source_caller("probe"),
+                &crate::ingest_auth::derive_source_token(root, "probe"),
+            )
+            .is_none());
+        }
+
+        #[test]
+        fn test_requested_source_name_resolves_to_configured_source_principal() {
+            let config = config_with_source(source("probe"));
+            let root = "root";
+            let principal = crate::ingest_auth::SourcePrincipal::from_request(
+                &config.ingest,
+                root,
+                &crate::ingest_auth::source_caller("probe"),
+                &crate::ingest_auth::derive_source_token(root, "probe"),
+            )
+            .unwrap();
+            assert_eq!(principal.name, "probe");
+        }
+
+        #[test]
+        fn test_source_token_required_for_non_operator_source_mode() {
+            let config = config_with_source(source("probe"));
+            assert!(crate::ingest_auth::SourcePrincipal::from_request(
+                &config.ingest,
+                "root",
+                &crate::ingest_auth::source_caller("probe"),
+                "root",
+            )
+            .is_none());
+        }
+
+        #[test]
+        fn test_inline_principal_is_rejected() {
+            let config = config_with_source(source("probe"));
+            let root = "root";
+            let principal = crate::ingest_auth::SourcePrincipal::from_request(
+                &config.ingest,
+                root,
+                &crate::ingest_auth::source_caller("probe"),
+                &crate::ingest_auth::derive_source_token(root, "probe"),
+            )
+            .unwrap();
+            let params = serde_json::from_value(json!({"kind":"status", "principal":"operator", "source":"other", "instance":"castle"})).unwrap();
+            assert!(crate::ingest_auth::event_payload(&principal, params).is_err());
+        }
+
+        #[tokio::test]
+        async fn test_server_allowlist_accepts_only_ingest_methods_for_source_tokens() {
+            let (_dir, layout, handle) =
+                start_daemon_with_config(config_with_source(source("probe"))).await;
+            let token =
+                crate::ingest_auth::derive_source_token(&layout.auth_token().unwrap(), "probe");
+            let caller = crate::ingest_auth::source_caller("probe");
+            let ok = raw_request(
+                &layout,
+                Request {
+                    id: "ok".into(),
+                    method: "ingest.event".into(),
+                    auth: token.clone(),
+                    caller: caller.clone(),
+                    params: json!({"kind":"status", "scope":"ignored"}),
+                },
+            )
+            .await;
+            assert!(ok.error.is_none(), "source ingest should pass: {ok:?}");
+            assert_eq!(
+                ok.result.as_ref().unwrap()["tuple"]["scope"],
+                rk_core::tuple::SYSTEM_SCOPE
+            );
+            let denied = raw_request(
+                &layout,
+                Request {
+                    id: "deny".into(),
+                    method: "space.out".into(),
+                    auth: token,
+                    caller,
+                    params: json!({"category":"event", "identity":"bad"}),
+                },
+            )
+            .await;
+            assert_eq!(denied.error.unwrap().code, crate::proto::codes::FORBIDDEN);
+            let mut operator = connect(&layout).await;
+            operator.call("stop", json!({})).await.unwrap();
+            handle.await.unwrap().unwrap();
+        }
+
+        #[test]
+        fn test_allowed_kinds_are_enforced_by_source() {
+            let config = config_with_source(source("probe"));
+            let root = "root";
+            let principal = crate::ingest_auth::SourcePrincipal::from_request(
+                &config.ingest,
+                root,
+                &crate::ingest_auth::source_caller("probe"),
+                &crate::ingest_auth::derive_source_token(root, "probe"),
+            )
+            .unwrap();
+            let params = serde_json::from_value(json!({"kind":"workflow"})).unwrap();
+            assert!(crate::ingest_auth::event_payload(&principal, params).is_err());
+        }
+
+        #[test]
+        fn test_source_limits_cannot_exceed_daemon_maximums() {
+            let mut config = config_with_source(rk_core::config::IngestSourceConfig {
+                name: "probe".into(),
+                allowed_kinds: vec!["status".into()],
+                max_state_limit: 99,
+                max_summary_len: 999,
+                max_refs: 999,
+                max_attributes: 999,
+                ..Default::default()
+            });
+            config.ingest.max_state_limit = 5;
+            config.ingest.max_summary_len = 7;
+            config.ingest.max_refs = 3;
+            config.ingest.max_attributes = 2;
+            let root = "root";
+            let principal = crate::ingest_auth::SourcePrincipal::from_request(
+                &config.ingest,
+                root,
+                &crate::ingest_auth::source_caller("probe"),
+                &crate::ingest_auth::derive_source_token(root, "probe"),
+            )
+            .unwrap();
+            assert_eq!(principal.max_state_limit(), 5);
+            assert_eq!(principal.limits().max_summary_len, 7);
+            assert_eq!(principal.limits().max_refs, 3);
+            assert_eq!(principal.limits().max_attributes, 2);
+        }
     }
 
     #[tokio::test]
@@ -241,6 +439,162 @@ mod tests {
         // connection, so the refusal above is about authority, not a broken
         // token.
         assert_eq!(agent.call("ping", json!({})).await.unwrap(), json!("pong"));
+    }
+
+    #[tokio::test]
+    async fn configured_source_auth_and_ingest_allowlist() {
+        let mut config = rk_core::config::Config::default();
+        config.ingest.max_state_limit = 5;
+        config.ingest.sources = vec![
+            rk_core::config::IngestSourceConfig {
+                name: "probe".into(),
+                enabled: true,
+                allowed_kinds: vec!["status".into()],
+                max_state_limit: 99,
+                ..Default::default()
+            },
+            rk_core::config::IngestSourceConfig {
+                name: "disabled".into(),
+                enabled: false,
+                allowed_kinds: vec!["status".into()],
+                max_state_limit: 5,
+                ..Default::default()
+            },
+        ];
+        let (_dir, layout, handle) = start_daemon_with_config(config).await;
+        let token = crate::ingest_auth::derive_source_token(&layout.auth_token().unwrap(), "probe");
+        let caller = crate::ingest_auth::source_caller("probe");
+
+        let ok = raw_request(
+            &layout,
+            Request {
+                id: "ingest-ok".into(),
+                method: "ingest.event".into(),
+                auth: token.clone(),
+                caller: caller.clone(),
+                params: json!({"kind": "status", "scope": "repo", "payload": {"ok": true}}),
+            },
+        )
+        .await;
+        assert!(ok.error.is_none(), "ingest.event should succeed: {ok:?}");
+        let tuple = ok.result.unwrap()["tuple"].clone();
+        assert_eq!(tuple["instance"], "source:probe");
+        assert_eq!(tuple["identity"], "ingest.status");
+        assert_eq!(tuple["payload"]["source"], "probe");
+
+        let state = raw_request(
+            &layout,
+            Request {
+                id: "state".into(),
+                method: "ingest.state".into(),
+                auth: token.clone(),
+                caller: caller.clone(),
+                params: json!({"kind": "status", "limit": 5}),
+            },
+        )
+        .await;
+        assert!(
+            state.error.is_none(),
+            "ingest.state should succeed: {state:?}"
+        );
+        assert_eq!(state.result.unwrap()["tuples"].as_array().unwrap().len(), 1);
+
+        let cases = [
+            (
+                "spoofed-token",
+                "ingest.event",
+                caller.clone(),
+                layout.auth_token().unwrap(),
+                json!({"kind": "status"}),
+                crate::proto::codes::UNAUTHORIZED,
+            ),
+            (
+                "inline-principal",
+                "ingest.event",
+                caller.clone(),
+                token.clone(),
+                json!({"kind": "status", "principal": "operator"}),
+                crate::proto::codes::FORBIDDEN,
+            ),
+            (
+                "disabled-source",
+                "ingest.event",
+                crate::ingest_auth::source_caller("disabled"),
+                crate::ingest_auth::derive_source_token(&layout.auth_token().unwrap(), "disabled"),
+                json!({"kind": "status"}),
+                crate::proto::codes::UNAUTHORIZED,
+            ),
+            (
+                "unknown-source",
+                "ingest.event",
+                crate::ingest_auth::source_caller("unknown"),
+                crate::ingest_auth::derive_source_token(&layout.auth_token().unwrap(), "unknown"),
+                json!({"kind": "status"}),
+                crate::proto::codes::UNAUTHORIZED,
+            ),
+            (
+                "disallowed-kind",
+                "ingest.event",
+                caller.clone(),
+                token.clone(),
+                json!({"kind": "workflow"}),
+                crate::proto::codes::FORBIDDEN,
+            ),
+            (
+                "excessive-limit",
+                "ingest.state",
+                caller.clone(),
+                token.clone(),
+                json!({"kind": "status", "limit": 6}),
+                crate::proto::codes::BAD_PARAMS,
+            ),
+            (
+                "source-mutates-workflow",
+                "workflow.run",
+                caller.clone(),
+                token.clone(),
+                json!({}),
+                crate::proto::codes::FORBIDDEN,
+            ),
+            (
+                "source-mutates-space",
+                "space.out",
+                caller.clone(),
+                token.clone(),
+                json!({"category":"event", "identity":"bad"}),
+                crate::proto::codes::FORBIDDEN,
+            ),
+            (
+                "normal-rat-no-source",
+                "ingest.event",
+                "Whisker".into(),
+                layout.agent_auth_token("Whisker").unwrap(),
+                json!({"kind": "status"}),
+                crate::proto::codes::FORBIDDEN,
+            ),
+        ];
+        for (id, method, caller, auth, params, code) in cases {
+            let response = raw_request(
+                &layout,
+                Request {
+                    id: id.into(),
+                    method: method.into(),
+                    auth,
+                    caller,
+                    params,
+                },
+            )
+            .await;
+            assert_eq!(response.error.unwrap().code, code, "case {id}");
+        }
+
+        let mut operator = connect(&layout).await;
+        assert_eq!(
+            operator.call("ping", json!({})).await.unwrap(),
+            json!("pong")
+        );
+        operator.call("stop", json!({})).await.unwrap();
+        handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]

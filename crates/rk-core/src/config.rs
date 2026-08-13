@@ -25,6 +25,7 @@ pub struct Config {
     pub review_sweep: ReviewSweepConfig,
     pub drain: DrainConfig,
     pub evaporation: EvaporationConfig,
+    pub ingest: IngestConfig,
     pub policy: PolicyConfig,
     /// Named agent profiles: [agents.<name>] harness/model/permission_mode.
     /// The "default" profile applies centrally to every ordinary spawn that
@@ -35,6 +36,61 @@ pub struct Config {
     /// Drives fan-out spawns onto cheap or premium tiers so a fixed budget runs
     /// a wider fleet. See [`TierRoutingConfig`].
     pub tiers: TierRoutingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct IngestConfig {
+    /// No default sources: every local ingest source must be operator-configured.
+    pub sources: Vec<IngestSourceConfig>,
+    /// Daemon-wide read cap for ingest.state.
+    pub max_state_limit: usize,
+    /// Daemon-wide ceiling for accepted SDLC signal summaries.
+    pub max_summary_len: usize,
+    /// Daemon-wide ceiling for accepted SDLC signal refs.
+    pub max_refs: usize,
+    /// Daemon-wide ceiling for accepted SDLC signal attributes.
+    pub max_attributes: usize,
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            max_state_limit: 1_000,
+            max_summary_len: crate::sdlc::SignalLimits::default().max_summary_len,
+            max_refs: crate::sdlc::SignalLimits::default().max_refs,
+            max_attributes: crate::sdlc::SignalLimits::default().max_attributes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct IngestSourceConfig {
+    pub name: String,
+    pub enabled: bool,
+    pub allowed_kinds: Vec<String>,
+    pub token_derivation: String,
+    pub max_state_limit: usize,
+    pub max_summary_len: usize,
+    pub max_refs: usize,
+    pub max_attributes: usize,
+}
+
+impl Default for IngestSourceConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            enabled: true,
+            allowed_kinds: Vec::new(),
+            token_derivation: "source".into(),
+            max_state_limit: 100,
+            max_summary_len: crate::sdlc::SignalLimits::default().max_summary_len,
+            max_refs: crate::sdlc::SignalLimits::default().max_refs,
+            max_attributes: crate::sdlc::SignalLimits::default().max_attributes,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

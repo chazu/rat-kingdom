@@ -4,6 +4,7 @@
 
 use crate::coordinator::CoordinatorFilter;
 use crate::factory_events::FactoryEventFilter;
+use crate::ingest_auth::{IngestEventParams, IngestStateParams, SourcePrincipal};
 use crate::proto::{codes, Request, Response};
 use chrono::{DateTime, Utc};
 use rk_core::action::{ApprovalStatus, FactoryAction, TicketGraphApplyAction, WorkflowRunAction};
@@ -85,6 +86,7 @@ pub struct Daemon {
     review_sweep_config: rk_core::config::ReviewSweepConfig,
     drain_config: rk_core::config::DrainConfig,
     evaporation_decay: f64,
+    ingest_config: rk_core::config::IngestConfig,
     global_agents: std::collections::HashMap<String, rk_workflow::AgentProfile>,
     tier_routing: rk_workflow::TierRouting,
     default_harness: String,
@@ -194,6 +196,7 @@ impl Daemon {
         daemon.review_sweep_config = config.review_sweep.clone();
         daemon.drain_config = config.drain.clone();
         daemon.evaporation_decay = config.evaporation.decay;
+        daemon.ingest_config = config.ingest.clone();
         daemon.require_named_checks = config.policy.require_named_checks;
         daemon.require_approval_for_landing = config.policy.require_approval_for_landing;
         daemon.automated_landing_workflows = config.policy.automated_landing_workflows.clone();
@@ -349,6 +352,7 @@ impl Daemon {
             review_sweep_config: rk_core::config::ReviewSweepConfig::default(),
             drain_config: rk_core::config::DrainConfig::default(),
             evaporation_decay: rk_core::config::EvaporationConfig::default().decay,
+            ingest_config: rk_core::config::IngestConfig::default(),
             global_agents: Default::default(),
             tier_routing: Default::default(),
             default_harness,
@@ -872,6 +876,13 @@ impl Daemon {
     }
 
     fn authorized(&self, req: &Request, origin: &PeerOrigin) -> bool {
+        if req
+            .caller
+            .starts_with(crate::ingest_auth::SOURCE_CALLER_PREFIX)
+        {
+            return self.ingest_principal(req).is_some()
+                && matches!(req.method.as_str(), "ingest.event" | "ingest.state");
+        }
         let operator = req.caller == "operator" || req.caller.is_empty();
         // The bearer root token alone is not operator authority. A local
         // connection must have a kernel-observed pid, and a connection rooted
@@ -1000,11 +1011,26 @@ impl Daemon {
     }
 
     fn authenticated(&self, req: &Request) -> bool {
+        if req
+            .caller
+            .starts_with(crate::ingest_auth::SOURCE_CALLER_PREFIX)
+        {
+            return self.ingest_principal(req).is_some();
+        }
         if req.caller == "operator" || req.caller.is_empty() {
             req.auth == self.auth_token
         } else {
             req.auth == rk_core::paths::derive_agent_token(&self.auth_token, &req.caller)
         }
+    }
+
+    fn ingest_principal(&self, req: &Request) -> Option<SourcePrincipal> {
+        SourcePrincipal::from_request(
+            &self.ingest_config,
+            &self.auth_token,
+            &req.caller,
+            &req.auth,
+        )
     }
 
     /// Push matching tuples as notification lines until the client goes away.
@@ -1363,6 +1389,8 @@ impl Daemon {
                 reply(resp)
             }
             "space.out" => reply(self.handle_out(req)),
+            "ingest.event" => reply(self.handle_ingest_event(req)),
+            "ingest.state" => reply(self.handle_ingest_state(req)),
             "space.withdraw" => reply(self.handle_withdraw(req)),
             "fact.vote" => reply(self.handle_fact_vote(req)),
             "space.scan" => reply(self.handle_scan(req)),
@@ -4163,6 +4191,85 @@ impl Daemon {
             }
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
+    }
+
+    fn handle_ingest_event(&self, req: Request) -> Response {
+        let Some(principal) = self.ingest_principal(&req) else {
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                "unknown or disabled ingest source",
+            );
+        };
+        let params: IngestEventParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let kind = params.kind.clone();
+        let payload = match crate::ingest_auth::event_payload(&principal, params) {
+            Ok(payload) => payload,
+            Err(error) => return Response::err(req.id, codes::FORBIDDEN, error),
+        };
+        let tuple = Tuple::new(
+            Category::Event,
+            rk_core::tuple::SYSTEM_SCOPE,
+            format!("ingest.{kind}"),
+            format!("source:{}", principal.name),
+            payload,
+        );
+        match self.space.out(tuple.clone()) {
+            Ok(()) => Response::ok(req.id, json!({"tuple": tuple})),
+            Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
+        }
+    }
+
+    fn handle_ingest_state(&self, req: Request) -> Response {
+        let Some(principal) = self.ingest_principal(&req) else {
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                "unknown or disabled ingest source",
+            );
+        };
+        let params: IngestStateParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let requested = params.limit.unwrap_or(principal.max_state_limit());
+        if requested > principal.max_state_limit() {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                format!("limit exceeds source cap {}", principal.max_state_limit()),
+            );
+        }
+        if let Some(kind) = params.kind.as_deref() {
+            if !principal.allows_kind(kind) {
+                return Response::err(
+                    req.id,
+                    codes::FORBIDDEN,
+                    format!("source may not read kind {kind}"),
+                );
+            }
+        }
+        let pattern = Pattern::category(Category::Event);
+        let rows = match self
+            .space
+            .scan_newest_limited(&pattern, requested.saturating_add(1))
+        {
+            Ok(rows) => rows,
+            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+        };
+        let identity = params.kind.map(|kind| format!("ingest.{kind}"));
+        let mut tuples: Vec<_> = rows
+            .into_iter()
+            .filter(|tuple| tuple.instance == format!("source:{}", principal.name))
+            .filter(|tuple| identity.as_ref().is_none_or(|id| &tuple.identity == id))
+            .take(requested)
+            .collect();
+        let truncated = tuples.len() == requested;
+        tuples.truncate(requested);
+        Response::ok(req.id, json!({"tuples": tuples, "truncated": truncated}))
     }
 
     async fn handle_blocking(&self, req: Request, destructive: bool) -> Response {
