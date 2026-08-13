@@ -1,6 +1,7 @@
 use crate::product_to_code::contracts::{ArchitectureResearchArtifact, InitiativeContract};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::path::{Component, Path};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResearchValidationReport {
@@ -16,6 +17,9 @@ impl ArchitectureResearchArtifact {
         initiative: &InitiativeContract,
     ) -> ResearchValidationReport {
         let mut errors = research_validation_errors(self);
+        if let Err(err) = initiative.validate() {
+            errors.push(format!("initiative contract is invalid: {err}"));
+        }
         if self.initiative_id != initiative.id {
             errors.push(format!(
                 "artifact initiative_id {} does not match initiative id {}",
@@ -64,7 +68,7 @@ pub fn research_validation_errors(artifact: &ArchitectureResearchArtifact) -> Ve
         &artifact.researched_files,
     );
     for file in &artifact.researched_files {
-        if file.starts_with('/') {
+        if !is_safe_repo_relative_path(file) {
             errors.push(format!(
                 "researched_files must be repo-relative paths, got {file}"
             ));
@@ -96,9 +100,26 @@ pub fn research_validation_errors(artifact: &ArchitectureResearchArtifact) -> Ve
     push_non_empty_items(&mut errors, "open_questions", &artifact.open_questions);
     if let Some(path) = &artifact.recommended_ticket_graph_path {
         push_empty(&mut errors, "recommended_ticket_graph_path", path);
+        if !path.trim().is_empty() && !is_safe_repo_relative_path(path) {
+            errors.push(format!(
+                "recommended_ticket_graph_path must be a safe repo-relative path, got {path}"
+            ));
+        }
     }
     push_non_empty_items(&mut errors, "evidence_ids", &artifact.evidence_ids);
     errors
+}
+
+fn is_safe_repo_relative_path(path: &str) -> bool {
+    let path = path.trim();
+    if path.is_empty() {
+        return false;
+    }
+    let path = Path::new(path);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
 pub fn validate_or_error(report: &ResearchValidationReport) -> Result<()> {

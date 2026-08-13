@@ -29,6 +29,16 @@ mod product_to_code_research {
             .unwrap()
     }
 
+    fn write_temp_json(name: &str, value: Value) -> tempfile::TempPath {
+        let file = tempfile::Builder::new()
+            .prefix(name)
+            .suffix(".json")
+            .tempfile()
+            .unwrap();
+        serde_json::to_writer(file.as_file(), &value).unwrap();
+        file.into_temp_path()
+    }
+
     #[test]
     fn test_research_validate_accepts_complete_structured_artifact() {
         let output = run(&[
@@ -114,6 +124,30 @@ mod product_to_code_research {
     }
 
     #[test]
+    fn test_research_validate_rejects_invalid_initiative_semantics() {
+        let mut initiative: Value = serde_json::from_str(
+            &std::fs::read_to_string(fixture("initiative_minimal.json")).unwrap(),
+        )
+        .unwrap();
+        initiative["acceptance_criteria"] = serde_json::json!([]);
+        let initiative = write_temp_json("invalid-initiative", initiative);
+        let output = run(&[
+            "--json",
+            "product-to-code",
+            "research",
+            "validate",
+            "--artifact",
+            &fixture("architecture_research_valid.json"),
+            "--initiative",
+            initiative.to_str().unwrap(),
+        ]);
+
+        assert!(!output.status.success());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(error_text(&value).contains("acceptance_criteria"));
+    }
+
+    #[test]
     fn test_research_render_markdown_has_decisions_risks_and_open_questions() {
         let output = run(&[
             "product-to-code",
@@ -147,5 +181,30 @@ mod product_to_code_research {
         assert!(workflow.contains("artifact"));
         assert!(workflow.contains("ArchitectureResearchArtifact"));
         assert!(workflow.contains("rk --json product-to-code research validate"));
+    }
+
+    #[test]
+    fn test_architecture_research_workflow_loads_as_shared_cue() {
+        let output = Command::new("cue")
+            .args([
+                "vet",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../examples/workflows/research.cue"
+                ),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../crates/rk-workflow/src/schema.cue"
+                ),
+            ])
+            .output();
+        let Ok(output) = output else { return };
+
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

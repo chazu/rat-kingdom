@@ -7,7 +7,7 @@ package product_to_code
 	initiative_id:    #NonBlankString
 	researched_files: [#NonBlankString, ...#NonBlankString]
 	domain_terms?:    [...#NonBlankString]
-	architecture_decisions: [#NonBlankString, ...#NonBlankString]
+	architecture_decisions?: [...#NonBlankString]
 	constraints?:     [...#NonBlankString]
 	risks?:           [...#NonBlankString]
 	recommended_ticket_graph_path?: #NonBlankString | null

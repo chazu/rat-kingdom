@@ -10,6 +10,13 @@
 //     --param outfile=docs/research/tuplespace-concurrency.md
 //
 // Copy to ~/.rat-kingdom/workflows/ (global) or <repo>/.rk/workflows/.
+_input: {
+	question:   string | *"research question"
+	initiative: string | *"docs/product-to-code/initiative.json"
+	artifact:   string | *"docs/research/architecture-research.json"
+	outfile:    string | *"docs/research/findings.md"
+}
+
 workflow: {
 	name:        "research"
 	description: "one rat researches a question, writes+validates ArchitectureResearchArtifact JSON, renders Markdown, reports done"
