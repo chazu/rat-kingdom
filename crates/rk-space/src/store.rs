@@ -9,9 +9,14 @@
 
 use chrono::{DateTime, Utc};
 use rk_core::id::RecordId;
+use rk_core::sdlc::{
+    ConfiguredSourceName, SemanticStateDigest, SignalEnvelope, SignalPayload, SignalReceipt,
+    SignalSourcePrincipal,
+};
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
 use rk_core::Error;
-use rusqlite::{params_from_iter, Connection, OptionalExtension, Row};
+use rusqlite::{params_from_iter, Connection, OptionalExtension, Row, Transaction};
+use serde_json::json;
 use std::path::Path;
 
 pub(crate) struct Store {
@@ -42,7 +47,52 @@ CREATE TABLE IF NOT EXISTS coordinator_events (
 );
 CREATE INDEX IF NOT EXISTS idx_coordinator_events_sequence
     ON coordinator_events (sequence);
+CREATE TABLE IF NOT EXISTS sdlc_receipts (
+    source                  TEXT NOT NULL,
+    delivery_id             TEXT NOT NULL,
+    receipt_json            TEXT NOT NULL,
+    PRIMARY KEY (source, delivery_id)
+);
+CREATE TABLE IF NOT EXISTS sdlc_current_state (
+    source                  TEXT NOT NULL,
+    scope                   TEXT NOT NULL,
+    subject                 TEXT NOT NULL,
+    semantic_state_digest   TEXT NOT NULL,
+    first_delivery_id       TEXT NOT NULL,
+    last_delivery_id        TEXT NOT NULL,
+    first_seen_at           TEXT NOT NULL,
+    last_seen_at            TEXT NOT NULL,
+    fact_tuple_id           TEXT NOT NULL UNIQUE,
+    PRIMARY KEY (source, scope, subject)
+);
+CREATE TABLE IF NOT EXISTS sdlc_transitions (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    source                  TEXT NOT NULL,
+    scope                   TEXT NOT NULL,
+    subject                 TEXT NOT NULL,
+    delivery_id             TEXT NOT NULL,
+    previous_digest         TEXT,
+    current_digest          TEXT NOT NULL,
+    transition_tuple_id     TEXT NOT NULL UNIQUE,
+    created_at              TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sdlc_current_selector
+    ON sdlc_current_state (source, scope, subject);
+CREATE INDEX IF NOT EXISTS idx_sdlc_transitions_key
+    ON sdlc_transitions (source, scope, subject);
 ";
+
+pub(crate) struct AcceptedSdlcSignal {
+    pub receipt: SignalReceipt,
+    pub projected_tuples: Vec<Tuple>,
+}
+
+#[derive(Debug, Clone)]
+struct SdlcKey {
+    scope: String,
+    subject: String,
+    family: &'static str,
+}
 
 /// Bring an older DB up to the current schema. `CREATE TABLE IF NOT EXISTS`
 /// leaves an already-created table untouched, so a DB from before `strength`
@@ -114,6 +164,207 @@ impl Store {
         Ok(())
     }
 
+    pub fn accept_sdlc_signal(
+        &mut self,
+        envelope: &SignalEnvelope,
+        principal: &SignalSourcePrincipal,
+        rollback_injection: bool,
+    ) -> rk_core::Result<AcceptedSdlcSignal> {
+        envelope
+            .validate(&Default::default())
+            .map_err(|error| Error::InvalidTuple(error.to_string()))?;
+        let expected = SignalSourcePrincipal::for_source(&envelope.source);
+        if principal.as_str() != expected.as_str() {
+            return Err(Error::InvalidTuple(
+                "principal does not match signal source".into(),
+            ));
+        }
+
+        if let Some(receipt) = self.sdlc_receipt(&envelope.source, &envelope.delivery_id)? {
+            return Ok(AcceptedSdlcSignal {
+                receipt,
+                projected_tuples: vec![],
+            });
+        }
+
+        let accepted_at = Utc::now();
+        let digest = SemanticStateDigest::for_envelope(envelope)
+            .map_err(|error| Error::InvalidTuple(error.to_string()))?;
+        let key = sdlc_key(envelope);
+        let source = envelope.source.as_str().to_string();
+        let event_tuple = sdlc_event_tuple(envelope, principal, &key);
+        let tx = self.conn.transaction().map_err(sql_err)?;
+
+        let current = tx
+            .query_row(
+                "SELECT semantic_state_digest, first_delivery_id, first_seen_at, fact_tuple_id
+                 FROM sdlc_current_state
+                 WHERE source = ?1 AND scope = ?2 AND subject = ?3",
+                rusqlite::params![source, key.scope, key.subject],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sql_err)?;
+
+        let fact_id = current
+            .as_ref()
+            .map(|(_, _, _, id)| id.clone())
+            .unwrap_or_else(|| RecordId::new().to_string());
+        let first_delivery_id = current
+            .as_ref()
+            .map(|(_, id, _, _)| id.clone())
+            .unwrap_or_else(|| envelope.delivery_id.clone());
+        let first_seen_at = current
+            .as_ref()
+            .map(|(_, _, seen, _)| seen.clone())
+            .unwrap_or_else(|| accepted_at.to_rfc3339());
+        let transition_emitted = current
+            .as_ref()
+            .map(|(old, _, _, _)| old != digest.as_str())
+            .unwrap_or(true);
+        let fact_tuple = sdlc_fact_tuple(
+            &fact_id,
+            envelope,
+            principal,
+            &key,
+            digest.as_str(),
+            &first_delivery_id,
+            &first_seen_at,
+            accepted_at,
+        );
+
+        insert_tuple_tx(&tx, &event_tuple)?;
+        if current.is_some() {
+            tx.execute(
+                "UPDATE tuples SET payload = ?2, created_at = ?3 WHERE id = ?1",
+                rusqlite::params![
+                    fact_id,
+                    fact_tuple.payload.to_string(),
+                    accepted_at.to_rfc3339()
+                ],
+            )
+            .map_err(sql_err)?;
+        } else {
+            insert_tuple_tx(&tx, &fact_tuple)?;
+        }
+
+        tx.execute(
+            "INSERT INTO sdlc_current_state
+             (source, scope, subject, semantic_state_digest, first_delivery_id, last_delivery_id, first_seen_at, last_seen_at, fact_tuple_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(source, scope, subject) DO UPDATE SET
+               semantic_state_digest = excluded.semantic_state_digest,
+               last_delivery_id = excluded.last_delivery_id,
+               last_seen_at = excluded.last_seen_at",
+            rusqlite::params![source, key.scope, key.subject, digest.as_str(), first_delivery_id, envelope.delivery_id, first_seen_at, accepted_at.to_rfc3339(), fact_id],
+        ).map_err(sql_err)?;
+
+        let mut projected_tuples = vec![event_tuple.clone(), fact_tuple.clone()];
+        let transition_tuple_id = if transition_emitted {
+            let transition = sdlc_transition_tuple(
+                envelope,
+                principal,
+                &key,
+                current.as_ref().map(|(old, _, _, _)| old.as_str()),
+                digest.as_str(),
+            );
+            insert_tuple_tx(&tx, &transition)?;
+            tx.execute(
+                "INSERT INTO sdlc_transitions
+                 (source, scope, subject, delivery_id, previous_digest, current_digest, transition_tuple_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![source, key.scope, key.subject, envelope.delivery_id, current.as_ref().map(|(old, _, _, _)| old.as_str()), digest.as_str(), transition.id.to_string(), accepted_at.to_rfc3339()],
+            ).map_err(sql_err)?;
+            projected_tuples.push(transition.clone());
+            Some(transition.id.to_string())
+        } else {
+            None
+        };
+
+        let receipt = SignalReceipt::accepted(
+            format!("sdlc:receipt:{source}:{}", envelope.delivery_id),
+            principal.clone(),
+            envelope.delivery_id.clone(),
+            accepted_at,
+            digest,
+            event_tuple.id.to_string(),
+            vec![fact_id.clone()],
+            transition_emitted,
+        );
+        let receipt_json =
+            serde_json::to_string(&receipt).map_err(|error| Error::Other(error.to_string()))?;
+        tx.execute(
+            "INSERT INTO sdlc_receipts (source, delivery_id, receipt_json) VALUES (?1, ?2, ?3)",
+            rusqlite::params![source, envelope.delivery_id, receipt_json],
+        )
+        .map_err(sql_err)?;
+
+        if rollback_injection {
+            return Err(Error::Other("injected sdlc rollback".into()));
+        }
+        tx.commit().map_err(sql_err)?;
+        let _ = transition_tuple_id;
+        Ok(AcceptedSdlcSignal {
+            receipt,
+            projected_tuples,
+        })
+    }
+
+    pub fn sdlc_receipt(
+        &self,
+        source: &ConfiguredSourceName,
+        delivery_id: &str,
+    ) -> rk_core::Result<Option<SignalReceipt>> {
+        self.conn
+            .query_row(
+                "SELECT receipt_json FROM sdlc_receipts WHERE source = ?1 AND delivery_id = ?2",
+                rusqlite::params![source.as_str(), delivery_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql_err)?
+            .map(|json| stored_sdlc_receipt(&json))
+            .transpose()
+    }
+
+    pub fn current_sdlc_facts(
+        &self,
+        source: Option<&str>,
+        scope: Option<&str>,
+        subject: Option<&str>,
+    ) -> rk_core::Result<Vec<Tuple>> {
+        let mut sql = String::from(
+            "SELECT t.id, t.category, t.scope, t.identity, t.instance, t.lifecycle, t.payload, t.created_at, t.expires_at, t.strength
+             FROM sdlc_current_state s JOIN tuples t ON t.id = s.fact_tuple_id WHERE 1=1",
+        );
+        let mut args = Vec::new();
+        if let Some(value) = source {
+            sql.push_str(" AND s.source = ?");
+            args.push(value.to_string());
+        }
+        if let Some(value) = scope {
+            sql.push_str(" AND s.scope = ?");
+            args.push(value.to_string());
+        }
+        if let Some(value) = subject {
+            sql.push_str(" AND s.subject = ?");
+            args.push(value.to_string());
+        }
+        sql.push_str(" ORDER BY s.source, s.scope, s.subject");
+        let mut stmt = self.conn.prepare(&sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params_from_iter(args.iter()), row_to_tuple)
+            .map_err(sql_err)?;
+        rows.map(|row| row.map_err(sql_err)).collect()
+    }
+
     /// Persist a protected coordinator event and its journal row atomically.
     /// The SQLite sequence is the coordinator cursor: unlike a ULID it is
     /// assigned in commit order and remains stable across restart.
@@ -137,7 +388,8 @@ impl Store {
             ],
         )
         .map_err(sql_err)?;
-        let tuple_json = serde_json::to_string(tuple).map_err(|error| Error::Other(error.to_string()))?;
+        let tuple_json =
+            serde_json::to_string(tuple).map_err(|error| Error::Other(error.to_string()))?;
         tx.execute(
             "INSERT INTO coordinator_events (tuple_id, tuple_json) VALUES (?1, ?2)",
             rusqlite::params![tuple.id.to_string(), tuple_json],
@@ -183,11 +435,9 @@ impl Store {
 
     pub fn coordinator_latest_sequence(&self) -> rk_core::Result<Option<u64>> {
         self.conn
-            .query_row(
-                "SELECT MAX(sequence) FROM coordinator_events",
-                [],
-                |row| row.get::<_, Option<i64>>(0),
-            )
+            .query_row("SELECT MAX(sequence) FROM coordinator_events", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
             .map(|sequence| sequence.map(|value| value as u64))
             .map_err(sql_err)
     }
@@ -493,16 +743,14 @@ fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
                 .get::<String>(3)?
                 .parse()
                 .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-            let category = category.parse::<Category>().map_err(|e| {
-                rusqlite::Error::UserFunctionError(Box::new(e))
-            })?;
+            let category = category
+                .parse::<Category>()
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
             let created_at = DateTime::parse_from_rfc3339(&created_at)
                 .map(|t| t.with_timezone(&Utc))
                 .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-            let age_secs = now_ms
-                .saturating_sub(created_at.timestamp_millis())
-                .max(0) as f64
-                / 1000.0;
+            let age_secs =
+                now_ms.saturating_sub(created_at.timestamp_millis()).max(0) as f64 / 1000.0;
             let recency = 0.5f64.powf(age_secs / HOT_HALF_LIFE_SECS);
             Ok(category.weight() * recency * strength.unwrap_or(rk_core::tuple::FULL_STRENGTH))
         },
@@ -525,6 +773,171 @@ fn hot_score(tuple: &Tuple, now: DateTime<Utc>) -> f64 {
     let recency = 0.5f64.powf(age_secs / HOT_HALF_LIFE_SECS);
     let strength = tuple.strength.unwrap_or(rk_core::tuple::FULL_STRENGTH);
     tuple.category.weight() * recency * strength
+}
+
+fn insert_tuple_tx(tx: &Transaction<'_>, tuple: &Tuple) -> rk_core::Result<()> {
+    tx.execute(
+        "INSERT INTO tuples
+         (id, category, scope, identity, instance, lifecycle, payload, created_at, expires_at, strength)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            tuple.id.to_string(),
+            tuple.category.as_str(),
+            tuple.scope,
+            tuple.identity,
+            tuple.instance,
+            lifecycle_str(tuple.lifecycle),
+            tuple.payload.to_string(),
+            tuple.created_at.to_rfc3339(),
+            tuple.expires_at.map(|t| t.to_rfc3339()),
+            tuple.strength,
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn sdlc_key(envelope: &SignalEnvelope) -> SdlcKey {
+    match &envelope.payload {
+        SignalPayload::Ci(_) => SdlcKey {
+            scope: envelope.correlation.repo.clone().unwrap_or_default(),
+            subject: format!(
+                "ci:{}:{}:{}",
+                envelope.correlation.branch.as_deref().unwrap_or_default(),
+                envelope.correlation.workflow.as_deref().unwrap_or_default(),
+                envelope.correlation.job.as_deref().unwrap_or_default()
+            ),
+            family: "ci",
+        },
+        SignalPayload::Deployment(payload) => SdlcKey {
+            scope: payload.environment.clone(),
+            subject: format!("deployment:{}", payload.service),
+            family: "deployment",
+        },
+        SignalPayload::ProductionAlert(payload) => SdlcKey {
+            scope: payload.environment.clone(),
+            subject: format!("production_alert:{}:{}", payload.service, payload.alert_key),
+            family: "production_alert",
+        },
+    }
+}
+
+fn sdlc_event_tuple(
+    envelope: &SignalEnvelope,
+    principal: &SignalSourcePrincipal,
+    key: &SdlcKey,
+) -> Tuple {
+    let mut tuple = Tuple::new(
+        Category::Event,
+        key.scope.clone(),
+        format!(
+            "sdlc:event:{}:{}",
+            envelope.source.as_str(),
+            envelope.delivery_id
+        ),
+        principal.as_str(),
+        json!({"source": envelope.source.as_str(), "delivery_id": envelope.delivery_id, "family": key.family, "subject": key.subject, "kind": envelope.kind, "summary": envelope.summary, "occurred_at": envelope.occurred_at, "observed_at": envelope.observed_at, "correlation": envelope.correlation, "refs": envelope.refs, "attributes": envelope.attributes, "payload": envelope.payload}),
+    );
+    tuple.created_at = envelope.observed_at;
+    tuple
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sdlc_fact_tuple(
+    id: &str,
+    envelope: &SignalEnvelope,
+    principal: &SignalSourcePrincipal,
+    key: &SdlcKey,
+    digest: &str,
+    first_delivery_id: &str,
+    first_seen_at: &str,
+    accepted_at: DateTime<Utc>,
+) -> Tuple {
+    let current = match &envelope.payload {
+        SignalPayload::Ci(payload) => {
+            json!({"status": payload.status, "conclusion": payload.conclusion, "commit_sha": envelope.correlation.commit_sha})
+        }
+        SignalPayload::Deployment(payload) => {
+            json!({"environment": payload.environment, "service": payload.service, "version": payload.version})
+        }
+        SignalPayload::ProductionAlert(payload) => {
+            json!({"environment": payload.environment, "service": payload.service, "alert_key": payload.alert_key, "state": payload.state, "severity": payload.severity})
+        }
+    };
+    let mut tuple = Tuple::new(Category::Fact, key.scope.clone(), format!("sdlc:current:{}:{}", envelope.source.as_str(), key.subject), principal.as_str(), json!({"source": envelope.source.as_str(), "family": key.family, "subject": key.subject, "semantic_state_digest": digest, "first_delivery_id": first_delivery_id, "last_delivery_id": envelope.delivery_id, "first_seen_at": first_seen_at, "last_seen_at": accepted_at, "current": current})).with_lifecycle(Lifecycle::Furniture);
+    tuple.id = id.parse().unwrap_or_else(|_| RecordId::new());
+    tuple.created_at = accepted_at;
+    tuple
+}
+
+fn sdlc_transition_tuple(
+    envelope: &SignalEnvelope,
+    principal: &SignalSourcePrincipal,
+    key: &SdlcKey,
+    previous_digest: Option<&str>,
+    current_digest: &str,
+) -> Tuple {
+    let mut tuple = Tuple::new(
+        Category::Event,
+        key.scope.clone(),
+        format!(
+            "sdlc:transition:{}:{}:{}",
+            envelope.source.as_str(),
+            key.scope,
+            key.subject
+        ),
+        principal.as_str(),
+        json!({"source": envelope.source.as_str(), "delivery_id": envelope.delivery_id, "family": key.family, "subject": key.subject, "previous_digest": previous_digest, "current_digest": current_digest}),
+    );
+    tuple.created_at = envelope.observed_at;
+    tuple
+}
+
+fn stored_sdlc_receipt(json: &str) -> rk_core::Result<SignalReceipt> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    let get_str = |field: &'static str| -> rk_core::Result<String> {
+        value
+            .get(field)
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| Error::InvalidTuple(format!("stored receipt missing {field}")))
+    };
+    let source = SignalSourcePrincipal::from_stored_source_principal(&get_str("source")?)
+        .map_err(|error| Error::InvalidTuple(error.to_string()))?;
+    let accepted_at = DateTime::parse_from_rfc3339(&get_str("accepted_at")?)
+        .map(|time| time.with_timezone(&Utc))
+        .map_err(|error| Error::InvalidTuple(error.to_string()))?;
+    let semantic_state_digest =
+        serde_json::from_value(value.get("semantic_state_digest").cloned().ok_or_else(|| {
+            Error::InvalidTuple("stored receipt missing semantic_state_digest".into())
+        })?)?;
+    let projected_fact_ids = value
+        .get("projected_fact_ids")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| Error::InvalidTuple("stored receipt missing projected_fact_ids".into()))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| Error::InvalidTuple("stored receipt fact id is not a string".into()))
+        })
+        .collect::<rk_core::Result<Vec<_>>>()?;
+    Ok(SignalReceipt::accepted(
+        get_str("receipt_id")?,
+        source,
+        get_str("delivery_id")?,
+        accepted_at,
+        semantic_state_digest,
+        get_str("projected_event_id")?,
+        projected_fact_ids,
+        value
+            .get("transition_emitted")
+            .and_then(|value| value.as_bool())
+            .ok_or_else(|| {
+                Error::InvalidTuple("stored receipt missing transition_emitted".into())
+            })?,
+    ))
 }
 
 fn lifecycle_str(l: Lifecycle) -> &'static str {
@@ -614,13 +1027,23 @@ mod tests {
         store.insert(&tuple("a", json!({}))).unwrap(); // Event
         store.insert(&tuple("b", json!({}))).unwrap(); // Event
         store
-            .insert(&Tuple::new(Category::Obstacle, "repo", "c", "rat", json!({})))
+            .insert(&Tuple::new(
+                Category::Obstacle,
+                "repo",
+                "c",
+                "rat",
+                json!({}),
+            ))
             .unwrap();
         store
             .insert(&Tuple::new(Category::Need, "repo", "d", "rat", json!({})))
             .unwrap();
 
-        assert_eq!(store.count_in_categories(&[]).unwrap(), 0, "empty set is zero");
+        assert_eq!(
+            store.count_in_categories(&[]).unwrap(),
+            0,
+            "empty set is zero"
+        );
         assert_eq!(store.count_in_categories(&[Category::Event]).unwrap(), 2);
         assert_eq!(
             store
@@ -864,9 +1287,7 @@ mod tests {
             store.insert(t).unwrap();
         }
 
-        let ranked = store
-            .query_ranked(&Pattern::default(), now, None)
-            .unwrap();
+        let ranked = store.query_ranked(&Pattern::default(), now, None).unwrap();
         let order: Vec<&str> = ranked.iter().map(|t| t.identity.as_str()).collect();
         // Fact outweighs the fresh claim; the stale faint claim sinks last.
         assert_eq!(order, vec!["hot-fact", "fresh", "stale"]);

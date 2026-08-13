@@ -15,8 +15,10 @@
 
 mod store;
 
+use rk_core::sdlc::{ConfiguredSourceName, SignalEnvelope, SignalReceipt, SignalSourcePrincipal};
 use rk_core::tuple::{Lifecycle, Pattern, Tuple};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
@@ -104,6 +106,7 @@ pub struct Space {
     inner: Arc<Mutex<Inner>>,
     events: broadcast::Sender<Tuple>,
     coordinator_events: broadcast::Sender<CoordinatorEvent>,
+    sdlc_rollback_injection: Arc<AtomicBool>,
 }
 
 impl Space {
@@ -126,7 +129,52 @@ impl Space {
             })),
             events,
             coordinator_events,
+            sdlc_rollback_injection: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Accept a hardened SDLC signal, persist its occurrence receipt, update the
+    /// current state, and project Event/Fact tuples atomically. Duplicate
+    /// `(source, delivery_id)` deliveries return the original receipt without
+    /// appending daemon shadow state.
+    pub fn accept_sdlc_signal(
+        &self,
+        envelope: SignalEnvelope,
+        principal: SignalSourcePrincipal,
+    ) -> rk_core::Result<SignalReceipt> {
+        let rollback_injection = self.sdlc_rollback_injection.load(Ordering::SeqCst);
+        let mut inner = self.lock();
+        let accepted = inner
+            .store
+            .accept_sdlc_signal(&envelope, &principal, rollback_injection)?;
+        drop(inner);
+
+        for tuple in accepted.projected_tuples {
+            let _ = self.events.send(tuple);
+        }
+        Ok(accepted.receipt)
+    }
+
+    pub fn get_sdlc_receipt(
+        &self,
+        source: &ConfiguredSourceName,
+        delivery_id: &str,
+    ) -> rk_core::Result<Option<SignalReceipt>> {
+        self.lock().store.sdlc_receipt(source, delivery_id)
+    }
+
+    pub fn current_sdlc_facts(
+        &self,
+        source: Option<&str>,
+        scope: Option<&str>,
+        subject: Option<&str>,
+    ) -> rk_core::Result<Vec<Tuple>> {
+        self.lock().store.current_sdlc_facts(source, scope, subject)
+    }
+
+    pub fn enable_sdlc_rollback_injection_for_tests(&self, enabled: bool) {
+        self.sdlc_rollback_injection
+            .store(enabled, Ordering::SeqCst);
     }
 
     /// Write a tuple: persist, wake matching waiters, publish to the event
@@ -184,11 +232,7 @@ impl Space {
     /// Non-blocking read capped at `limit` rows. RPC callers use this bounded
     /// form so a broad operator scan cannot materialize an unbounded SQLite
     /// result before the protocol frame-size guard gets a chance to run.
-    pub fn scan_limited(
-        &self,
-        pattern: &Pattern,
-        limit: usize,
-    ) -> rk_core::Result<Vec<Tuple>> {
+    pub fn scan_limited(&self, pattern: &Pattern, limit: usize) -> rk_core::Result<Vec<Tuple>> {
         self.lock().store.query(pattern, false, Some(limit))
     }
 
@@ -220,11 +264,7 @@ impl Space {
     /// tuples scored by `category_weight × recency × strength`, strongest first,
     /// optionally capped to the top `limit`. Read-only sugar over [`Space::scan`]
     /// — the oldest-first path and the waiter-wake predicate are untouched.
-    pub fn scan_hot(
-        &self,
-        pattern: &Pattern,
-        limit: Option<usize>,
-    ) -> rk_core::Result<Vec<Tuple>> {
+    pub fn scan_hot(&self, pattern: &Pattern, limit: Option<usize>) -> rk_core::Result<Vec<Tuple>> {
         self.lock()
             .store
             .query_ranked(pattern, chrono::Utc::now(), limit)
@@ -666,14 +706,20 @@ mod tests {
         let space = Space::open(&path).unwrap();
         let first = space
             .out_coordinator(
-                event("workflow_state_changed", json!({"instance": "wf-1", "revision": 1}))
-                    .with_lifecycle(Lifecycle::Furniture),
+                event(
+                    "workflow_state_changed",
+                    json!({"instance": "wf-1", "revision": 1}),
+                )
+                .with_lifecycle(Lifecycle::Furniture),
             )
             .unwrap();
         let second = space
             .out_coordinator(
-                event("workflow_state_changed", json!({"instance": "wf-1", "revision": 2}))
-                    .with_lifecycle(Lifecycle::Furniture),
+                event(
+                    "workflow_state_changed",
+                    json!({"instance": "wf-1", "revision": 2}),
+                )
+                .with_lifecycle(Lifecycle::Furniture),
             )
             .unwrap();
         assert!(first < second);
