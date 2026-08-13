@@ -52,6 +52,7 @@ const OPERATOR_ACTOR: &str = "operator";
 
 type FactVoteKey = (String, String, String);
 type FactVoteState = (DateTime<Utc>, RecordId, String);
+type RequestClock = fn() -> DateTime<Utc>;
 
 fn ingest_state_filter(params: &IngestStateParams) -> (Option<String>, Option<String>) {
     if let Some(alert_key) = &params.alert_key {
@@ -155,6 +156,7 @@ pub struct Daemon {
     fact_vote_lock: std::sync::Mutex<()>,
     started: Instant,
     shutdown_tx: watch::Sender<bool>,
+    request_clock: RequestClock,
 }
 
 #[derive(Debug, Default)]
@@ -416,6 +418,7 @@ impl Daemon {
             fact_vote_lock: std::sync::Mutex::new(()),
             started: Instant::now(),
             shutdown_tx,
+            request_clock: Utc::now,
         })
     }
 
@@ -1238,10 +1241,36 @@ impl Daemon {
             .into_iter()
             .filter(|instance| req.repo.as_deref().is_none_or(|r| instance.repo == r))
             .collect();
+        let tickets = self
+            .tickets
+            .list(req.repo.clone(), None, None)
+            .unwrap_or_default();
+        let approval_grants = self
+            .action_approvals
+            .list_grants()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|grant| req.repo.as_deref().is_none_or(|repo| grant.scope.repo.identity == repo))
+            .collect();
+        let sdlc_ci_facts = self
+            .space
+            .current_sdlc_facts(None, Some("ci"), None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|fact| req.repo.as_deref().is_none_or(|repo| {
+                fact.payload
+                    .get("subject")
+                    .and_then(Value::as_str)
+                    .is_some_and(|subject| subject.starts_with(&format!("{repo}:")))
+            }))
+            .collect();
         crate::factory_analytics::AnalyticsInputs {
             repo,
             agents,
             instances,
+            tickets,
+            approval_grants,
+            sdlc_ci_facts,
         }
     }
 
@@ -1708,28 +1737,34 @@ impl Daemon {
             "factory.scorecards" => {
                 match parse_params::<crate::factory_analytics::FactoryAnalyticsRequest>(&req.params)
                 {
-                    Ok(analytics) => reply(Response::ok(
-                        id,
-                        crate::factory_analytics::scorecards_response(
-                            &self.factory_analytics_inputs(&analytics),
-                            &analytics,
-                            chrono::Utc::now(),
-                        ),
-                    )),
+                    Ok(analytics) => match analytics.validate() {
+                        Ok(()) => reply(Response::ok(
+                            id,
+                            crate::factory_analytics::scorecards_response(
+                                &self.factory_analytics_inputs(&analytics),
+                                &analytics,
+                                (self.request_clock)(),
+                            ),
+                        )),
+                        Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+                    },
                     Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
                 }
             }
             "factory.recommend" => {
                 match parse_params::<crate::factory_analytics::FactoryAnalyticsRequest>(&req.params)
                 {
-                    Ok(analytics) => reply(Response::ok(
-                        id,
-                        crate::factory_analytics::recommend_response(
-                            &self.factory_analytics_inputs(&analytics),
-                            &analytics,
-                            chrono::Utc::now(),
-                        ),
-                    )),
+                    Ok(analytics) => match analytics.validate() {
+                        Ok(()) => reply(Response::ok(
+                            id,
+                            crate::factory_analytics::recommend_response(
+                                &self.factory_analytics_inputs(&analytics),
+                                &analytics,
+                                (self.request_clock)(),
+                            ),
+                        )),
+                        Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+                    },
                     Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
                 }
             }

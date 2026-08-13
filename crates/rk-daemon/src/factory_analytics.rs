@@ -20,13 +20,17 @@ use rk_core::factory::outcome_events::{FactoryMetricPayload, StructuredOutcomeIn
 use rk_core::factory::outcome_facts::{
     OutcomeEvidenceKind, OutcomeFact, OutcomeFactBuilder, OutcomeFactSource,
 };
-use rk_core::factory::recommendations::evaluate_recommendation_report;
+use rk_core::action::ApprovalGrant;
+use rk_core::factory::recommendations::{
+    evaluate_recommendation_report, RecommendationSuppression, SuppressionReason,
+};
 use rk_core::factory::scorecards::{
     aggregate_scorecards, FactoryScorecard, ScorecardProjection, ScorecardQuery,
 };
 
 use crate::agents::{AgentRecord, AgentState};
 use crate::workflow_exec::Instance;
+use rk_core::tuple::Tuple;
 
 /// Wire schema version of the read-only analytics envelopes.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -36,6 +40,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 const AVAILABLE_FAMILIES: &[OutcomeEvidenceKind] = &[
     OutcomeEvidenceKind::AgentRecord,
     OutcomeEvidenceKind::WorkflowInstance,
+    OutcomeEvidenceKind::Phase4CiSignal,
+    OutcomeEvidenceKind::HumanGateDecision,
+    OutcomeEvidenceKind::RecurrenceKey,
 ];
 
 /// Source families with no structured RK store yet. Reported as unobserved with
@@ -44,10 +51,7 @@ const UNOBSERVED_FAMILIES: &[OutcomeEvidenceKind] = &[
     OutcomeEvidenceKind::Phase3Contract,
     OutcomeEvidenceKind::Phase3VerifiedDelivery,
     OutcomeEvidenceKind::StructuredReviewerRework,
-    OutcomeEvidenceKind::Phase4CiSignal,
     OutcomeEvidenceKind::StructuredRevert,
-    OutcomeEvidenceKind::HumanGateDecision,
-    OutcomeEvidenceKind::RecurrenceKey,
     OutcomeEvidenceKind::PricingSnapshot,
 ];
 
@@ -64,6 +68,26 @@ pub struct FactoryAnalyticsRequest {
 }
 
 impl FactoryAnalyticsRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        match self.repo.as_deref() {
+            Some(repo) if !repo.trim().is_empty() => {}
+            _ => return Err("repo is required and must be non-empty".into()),
+        }
+        if let Some(group_by) = self.group_by.as_deref() {
+            match group_by {
+                "composite" | "task_class" | "workflow" | "harness" | "model"
+                | "task_class_workflow" | "all" => {}
+                other => return Err(format!("unsupported group_by {other:?}; expected composite, task_class, workflow, harness, model, task_class_workflow, or all")),
+            }
+        }
+        if let (Some(since), Some(until)) = (self.since, self.until) {
+            if since > until {
+                return Err("since must be <= until".into());
+            }
+        }
+        Ok(())
+    }
+
     fn projection(&self) -> ScorecardProjection {
         match self.group_by.as_deref() {
             Some("task_class") => ScorecardProjection::TaskClass,
@@ -83,8 +107,12 @@ pub struct AnalyticsInputs {
     pub repo: String,
     pub agents: Vec<AgentRecord>,
     pub instances: Vec<Instance>,
+    pub tickets: Vec<Tuple>,
+    pub approval_grants: Vec<ApprovalGrant>,
+    pub sdlc_ci_facts: Vec<Tuple>,
 }
 
+#[cfg(test)]
 /// Convert decimal USD to integer micro-USD with round-half-away-from-zero.
 /// Non-finite or negative costs yield `None` (cost unavailable for that run).
 fn usd_to_micro(usd: f64) -> Option<u64> {
@@ -187,37 +215,127 @@ fn normalize_inputs(
             FactoryMetricPayload::Run { count: 1 },
         ));
 
-        // Cost: harness-reported cost with an explicit pricing evidence id.
-        if let Some(micro_usd) = usd_to_micro(agent.cost_usd).filter(|m| *m > 0) {
-            structured.push(base(
-                run_id.clone(),
-                OutcomeEvidenceKind::AgentRecord,
-                FactoryMetricPayload::Cost {
-                    micro_usd,
-                    pricing_evidence_id: Some(format!("harness-reported:{run_id}")),
-                },
-            ));
-        }
+        // AgentRecord stores final cost but not the pricing snapshot id, so cost
+        // remains unavailable rather than fabricating `pricing_evidence_id`.
+        // Agent timestamps use an agent generation id, not the workflow instance
+        // id, so workflow lead time is normalized only from WorkflowInstance.
+    }
 
-        // Lead time from explicit lifecycle timestamps on the same run. The core
-        // only accepts it when workflow_instance_id == run_id == completed_run_id,
-        // so use the stable run id for all three.
-        let started = agent.created_at.timestamp_millis();
-        let completed = agent.updated_at.timestamp_millis();
-        if completed >= started {
-            let mut lead = base(
-                run_id.clone(),
-                OutcomeEvidenceKind::AgentRecord,
-                FactoryMetricPayload::LeadTime {
-                    started_at_ms: started,
-                    completed_at_ms: completed,
-                    run_id: run_id.clone(),
-                    completed_run_id: run_id.clone(),
-                },
-            );
-            lead.workflow_instance_id = Some(run_id.clone());
-            structured.push(lead);
-        }
+    for instance in &inputs.instances {
+        let archived = instance.archived_at.is_some();
+        let observed_at_ms = instance.completed_at.unwrap_or(instance.started_at).timestamp_millis();
+        let payload = if let Some(completed_at) = instance.completed_at {
+            FactoryMetricPayload::LeadTime {
+                started_at_ms: instance.started_at.timestamp_millis(),
+                completed_at_ms: completed_at.timestamp_millis(),
+                run_id: instance.id.clone(),
+                completed_run_id: instance.id.clone(),
+            }
+        } else {
+            FactoryMetricPayload::Unknown
+        };
+        structured.push(StructuredOutcomeInput {
+            repo: inputs.repo.clone(),
+            source_family: OutcomeEvidenceKind::WorkflowInstance,
+            source_id: instance.id.clone(),
+            source_version: Some(instance.revision.to_string()),
+            archived,
+            archive_reason: None,
+            observed_at_ms,
+            task_class: None,
+            workflow: Some(instance.workflow.clone()),
+            harness: None,
+            model: None,
+            agent_id: None,
+            workflow_instance_id: Some(instance.id.clone()),
+            ticket_id: None,
+            phase3_outcome_id: None,
+            phase4_signal_id: None,
+            recurrence_key: None,
+            coalesce_key: None,
+            payload,
+            decoy_prose: String::new(),
+        });
+    }
+
+    for ticket in &inputs.tickets {
+        let Some(key) = ticket.payload.get("coalesce_key").and_then(Value::as_str) else { continue; };
+        if key.trim().is_empty() { continue; }
+        structured.push(StructuredOutcomeInput {
+            repo: inputs.repo.clone(), source_family: OutcomeEvidenceKind::RecurrenceKey,
+            source_id: ticket.identity.clone(), source_version: None, archived: false,
+            archive_reason: None, observed_at_ms: ticket.created_at.timestamp_millis(),
+            task_class: None, workflow: None, harness: None, model: None, agent_id: None,
+            workflow_instance_id: None, ticket_id: Some(ticket.identity.clone()),
+            phase3_outcome_id: None, phase4_signal_id: None,
+            recurrence_key: Some(key.trim().to_owned()), coalesce_key: Some(key.trim().to_owned()),
+            payload: FactoryMetricPayload::Recurrence, decoy_prose: String::new(),
+        });
+    }
+
+    for grant in &inputs.approval_grants {
+        structured.push(StructuredOutcomeInput {
+            repo: inputs.repo.clone(), source_family: OutcomeEvidenceKind::HumanGateDecision,
+            source_id: grant.proposal_id.clone(), source_version: Some(grant.digest.clone()), archived: false,
+            archive_reason: None, observed_at_ms: grant.approved_at.timestamp_millis(),
+            task_class: None, workflow: None, harness: None, model: None,
+            agent_id: Some(grant.requester.clone()), workflow_instance_id: grant.instance_id.clone(),
+            ticket_id: None, phase3_outcome_id: None, phase4_signal_id: None,
+            recurrence_key: None, coalesce_key: None,
+            payload: FactoryMetricPayload::HumanIntervention { count: 1 }, decoy_prose: String::new(),
+        });
+    }
+
+    for fact in &inputs.sdlc_ci_facts {
+        let source_id = fact
+            .payload
+            .get("last_delivery_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or(&fact.identity)
+            .to_owned();
+        let conclusion = fact
+            .payload
+            .pointer("/current/conclusion")
+            .or_else(|| fact.payload.pointer("/current/status"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let failed = matches!(conclusion.as_str(), "failure" | "failed" | "error" | "cancelled" | "timed_out");
+        structured.push(StructuredOutcomeInput {
+            repo: inputs.repo.clone(),
+            source_family: OutcomeEvidenceKind::Phase4CiSignal,
+            source_id: source_id.clone(),
+            source_version: None,
+            archived: false,
+            archive_reason: None,
+            observed_at_ms: fact
+                .payload
+                .get("observed_at")
+                .and_then(Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp_millis())
+                .unwrap_or_else(|| fact.created_at.timestamp_millis()),
+            task_class: None,
+            workflow: fact
+                .payload
+                .get("subject")
+                .and_then(Value::as_str)
+                .and_then(|subject| subject.split(':').nth(2))
+                .filter(|workflow| !workflow.trim().is_empty())
+                .map(str::to_owned),
+            harness: None,
+            model: None,
+            agent_id: None,
+            workflow_instance_id: None,
+            ticket_id: None,
+            phase3_outcome_id: None,
+            phase4_signal_id: Some(source_id),
+            recurrence_key: None,
+            coalesce_key: None,
+            payload: FactoryMetricPayload::Ci { failed, recovered: false },
+            decoy_prose: String::new(),
+        });
     }
 
     let unavailable = UNOBSERVED_FAMILIES
@@ -329,7 +447,38 @@ pub fn recommend_response(
     generated_at: chrono::DateTime<chrono::Utc>,
 ) -> Value {
     let rows = scorecards(inputs, req);
-    let report = evaluate_recommendation_report(&rows);
+    let mut report = evaluate_recommendation_report(&rows);
+    if let Some(min_sample) = req.min_sample {
+        for recommendation in &mut report.recommendations {
+            let metric_sample = recommendation
+                .evidence
+                .denominator
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(recommendation.sample_size);
+            if metric_sample < min_sample {
+                recommendation.advice = None;
+                recommendation.suppressed = true;
+                recommendation.suppression_reason = Some(SuppressionReason::LowSample);
+                recommendation.thresholds.min_sample_size = min_sample;
+                report.suppressions.push(RecommendationSuppression {
+                    rule: recommendation.rule,
+                    reason: SuppressionReason::LowSample,
+                    subject_group_key: recommendation.subject_group_key.clone(),
+                    source_family: recommendation.metric_availability.source_family,
+                    source_counts: recommendation.source_counts.clone(),
+                });
+            } else if recommendation.thresholds.min_sample_size < min_sample {
+                recommendation.thresholds.min_sample_size = min_sample;
+            }
+        }
+        report.suppressions.sort_by(|l, r| {
+            (&l.subject_group_key, &l.rule, &l.reason)
+                .cmp(&(&r.subject_group_key, &r.rule, &r.reason))
+        });
+        report.suppressions.dedup_by(|l, r| {
+            l.subject_group_key == r.subject_group_key && l.rule == r.rule && l.reason == r.reason
+        });
+    }
     let (source_counts, availability, mut warnings) = availability_envelope(&rows);
     warnings.extend(report.warnings.iter().cloned());
     warnings.sort();
@@ -339,6 +488,7 @@ pub fn recommend_response(
         "repo": inputs.repo,
         "generated_at": generated_at,
         "group_by": req.projection(),
+        "min_sample": req.min_sample,
         "include_archived": req.include_archived,
         "nature": report.nature,
         "source_counts": source_counts,
@@ -431,6 +581,9 @@ mod tests {
             repo: "rat-kingdom".into(),
             agents: vec![a, b],
             instances: vec![instance("wf-1", "implement-featureset")],
+            tickets: Vec::new(),
+            approval_grants: Vec::new(),
+            sdlc_ci_facts: Vec::new(),
         }
     }
 
@@ -445,9 +598,11 @@ mod tests {
         // Workflow grouping comes from the instance, harness/model from the agent.
         assert!(structured
             .iter()
+            .filter(|s| s.source_family == OutcomeEvidenceKind::AgentRecord)
             .all(|s| s.workflow.as_deref() == Some("implement-featureset")));
         assert!(structured
             .iter()
+            .filter(|s| s.source_family == OutcomeEvidenceKind::AgentRecord)
             .all(|s| s.harness.as_deref() == Some("claude")));
         // task_class is never inferred; stays None -> normalizes to unknown.
         assert!(structured.iter().all(|s| s.task_class.is_none()));
@@ -476,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn scorecards_count_runs_and_cost() {
+    fn scorecards_count_runs_and_marks_cost_unobserved_without_pricing_snapshot() {
         let req = FactoryAnalyticsRequest::default();
         let resp = scorecards_response(&inputs(), &req, Utc.timestamp_opt(2_000, 0).unwrap());
         let cards = resp["scorecards"].as_array().unwrap();
@@ -489,8 +644,9 @@ mod tests {
             .iter()
             .map(|c| c["metrics"]["total_cost_micro_usd"].as_u64().unwrap())
             .sum();
-        // 0.25 + 0.10 USD = 350_000 micro-USD.
-        assert_eq!(total_cost, 350_000);
+        // AgentRecord stores final cost but no pricing snapshot id. Do not invent
+        // pricing_evidence_id, even for non-zero structured cost fields.
+        assert_eq!(total_cost, 0);
     }
 
     #[test]
@@ -611,8 +767,12 @@ mod tests {
         }
         let (structured, _) = normalize_inputs(&only_live);
         assert!(
-            structured.is_empty(),
-            "in-flight runs contribute no terminal facts"
+            structured
+                .iter()
+                .filter(|s| s.source_family == OutcomeEvidenceKind::AgentRecord)
+                .count()
+                == 0,
+            "in-flight agents contribute no terminal agent facts"
         );
     }
 }
