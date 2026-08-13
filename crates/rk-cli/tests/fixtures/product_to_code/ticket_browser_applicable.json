@@ -1,0 +1,1 @@
+{"id":"NODE-browser","title":"Browser delivery","description":"Browser delivery ticket","acceptance_criterion_ids":["AC-1"],"feature_set_ids":["FS-browser"],"browser_acceptance_applicable":true,"browser_acceptance_criterion_ids":["AC-1"]}

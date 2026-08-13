@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use rk_core::paths::Layout;
 use rk_core::product_to_code::contracts::{
-    ArchitectureResearchArtifact, InitiativeContract, TicketGraph,
+    ArchitectureResearchArtifact, GenericEvidence, InitiativeContract, TicketGraph,
+    TicketGraphNode, VerificationReport,
 };
+use rk_core::product_to_code::evidence::{delivery_gate, dispatch_gate, validate_evidence_item};
 use rk_daemon::Client;
 use serde_json::json;
 use std::path::PathBuf;
@@ -93,15 +95,83 @@ pub async fn run(layout: &Layout, command: ProductToCodeCommand, json_output: bo
     match command {
         ProductToCodeCommand::Research { command } => run_research(command, json_output),
         ProductToCodeCommand::Graph { command } => run_graph(layout, command, json_output).await,
+        ProductToCodeCommand::Evidence { command } => run_evidence(command, json_output),
+        ProductToCodeCommand::DispatchGate(args) => run_dispatch_gate(args, json_output),
+        ProductToCodeCommand::DeliveryGate(args) => run_delivery_gate(args, json_output),
     }
+}
+
+fn run_evidence(command: EvidenceCommand, json_output: bool) -> Result<i32> {
+    match command {
+        EvidenceCommand::Validate(args) => {
+            let evidence: GenericEvidence = read_json(&args.evidence)?;
+            let initiative: InitiativeContract = read_json(&args.initiative)?;
+            let errors = validate_evidence_item(&evidence, &initiative);
+            let output = json!({
+                "schema": "product_to_code.evidence.validate.v1",
+                "valid": errors.is_empty(),
+                "evidence_id": evidence.id,
+                "kind": evidence.kind,
+                "producer": evidence.producer,
+                "errors": errors,
+            });
+            print_json_or_errors(&output, json_output)?;
+            Ok(if output["valid"].as_bool().unwrap_or(false) {
+                0
+            } else {
+                1
+            })
+        }
+    }
+}
+
+fn run_dispatch_gate(args: DispatchGateArgs, json_output: bool) -> Result<i32> {
+    let ticket: TicketGraphNode = read_json(&args.ticket)?;
+    let evidence = read_evidence_dir(&args.evidence_dir)?;
+    let report = dispatch_gate(&ticket, &evidence);
+    let code = if report.valid { 0 } else { 1 };
+    let output = serde_json::to_value(report)?;
+    print_json_or_errors(&output, json_output)?;
+    Ok(code)
+}
+
+fn run_delivery_gate(args: DeliveryGateArgs, json_output: bool) -> Result<i32> {
+    let ticket: TicketGraphNode = read_json(&args.ticket)?;
+    let report: VerificationReport = read_json(&args.verification_report)?;
+    let initiative = if let Some(path) = args.initiative {
+        read_json(&path)?
+    } else {
+        InitiativeContract {
+            id: report.initiative_id.clone(),
+            title: "delivery gate synthetic initiative".to_string(),
+            scope: "delivery gate".to_string(),
+            acceptance_criteria: ticket
+                .acceptance_criterion_ids
+                .iter()
+                .map(
+                    |id| rk_core::product_to_code::contracts::AcceptanceCriterion {
+                        id: id.clone(),
+                        text: id.clone(),
+                        browser_acceptance_applicable: false,
+                    },
+                )
+                .collect(),
+            browser_acceptance_applicable: false,
+        }
+    };
+    let evidence = read_evidence_dir(&args.evidence_dir)?;
+    let gate = delivery_gate(&initiative, &ticket, &report, &evidence);
+    let code = if gate.valid { 0 } else { 1 };
+    let output = serde_json::to_value(gate)?;
+    print_json_or_errors(&output, json_output)?;
+    Ok(code)
 }
 
 async fn run_graph(layout: &Layout, command: GraphCommand, json_output: bool) -> Result<i32> {
     match command {
         GraphCommand::Validate(args) => {
             let (graph, initiative) = read_graph_and_initiative(&args.graph, &args.initiative)?;
-            let criterion_ids = criterion_ids(&initiative);
-            let report = graph.validation_report(&criterion_ids);
+            let report = graph.validation_report_for_initiative(&initiative);
             if json_output {
                 println!("{}", serde_json::to_string(&report)?);
             } else if report.valid {
@@ -115,15 +185,14 @@ async fn run_graph(layout: &Layout, command: GraphCommand, json_output: bool) ->
         }
         GraphCommand::DryRun(args) => {
             let (graph, initiative) = read_graph_and_initiative(&args.graph, &args.initiative)?;
-            let criterion_ids = criterion_ids(&initiative);
-            let report = graph.validation_report(&criterion_ids);
+            let report = graph.validation_report_for_initiative(&initiative);
             if !report.valid {
                 if json_output {
                     println!("{}", serde_json::to_string(&report)?);
                 }
                 return Ok(1);
             }
-            let apply_plan = graph.apply_plan(&args.repo, &criterion_ids)?;
+            let apply_plan = graph.apply_plan_for_initiative(&args.repo, &initiative)?;
             let mutations = apply_plan.mutations();
             let output = json!({
                 "schema": "product_to_code.ticket_graph.dry_run.v1",
