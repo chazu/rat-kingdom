@@ -1,6 +1,6 @@
 use rk_core::factory::{
     outcome_events::{FactoryMetricPayload, FactoryOutcomeEvent, StructuredOutcomeInput},
-    outcome_facts::{OutcomeFactBuilder, OutcomeFactSource},
+    outcome_facts::{OutcomeFactBuilder, OutcomeFactGroupKey, OutcomeFactSource},
     OutcomeEvidenceKind, OutcomeStatus,
 };
 
@@ -259,6 +259,67 @@ fn missing_source_family_is_unobserved_with_availability_counts() {
         .unwrap();
     assert!(!unobserved.availability.available);
     assert_eq!(unobserved.source_counts.event_count, 0);
+}
+
+#[test]
+fn unavailable_sources_keep_explicit_repo_and_composite_scope_across_repos() {
+    let repo_a = base(
+        OutcomeEvidenceKind::AgentRecord,
+        "agent-a",
+        FactoryMetricPayload::Run { count: 1 },
+    );
+    let mut repo_b = base(
+        OutcomeEvidenceKind::AgentRecord,
+        "agent-b",
+        FactoryMetricPayload::Run { count: 1 },
+    );
+    repo_b.repo = "repo-b".into();
+
+    let facts = OutcomeFactBuilder::from_structured_inputs(
+        [repo_a, repo_b],
+        [
+            OutcomeFactSource::unavailable_for(
+                OutcomeEvidenceKind::Phase4CiSignal,
+                "repo-a",
+                OutcomeFactGroupKey {
+                    task_class: Some("bugfix".into()),
+                    workflow: Some("ci".into()),
+                    harness: Some("cargo".into()),
+                    model: Some("claude".into()),
+                },
+            ),
+            OutcomeFactSource::unavailable_for(
+                OutcomeEvidenceKind::Phase4CiSignal,
+                "repo-b",
+                OutcomeFactGroupKey {
+                    task_class: Some("feature".into()),
+                    workflow: Some("ci".into()),
+                    harness: Some("nextest".into()),
+                    model: Some("gpt".into()),
+                },
+            ),
+        ],
+    )
+    .build();
+
+    let unavailable: Vec<_> = facts
+        .iter()
+        .filter(|fact| fact.status == OutcomeStatus::Unobserved)
+        .collect();
+    assert_eq!(unavailable.len(), 2);
+    assert!(unavailable.iter().any(|fact| {
+        fact.repo == "repo-a"
+            && fact.group_key.task_class.as_deref() == Some("bugfix")
+            && fact.group_key.harness.as_deref() == Some("cargo")
+            && fact.group_key.model.as_deref() == Some("claude")
+    }));
+    assert!(unavailable.iter().any(|fact| {
+        fact.repo == "repo-b"
+            && fact.group_key.task_class.as_deref() == Some("feature")
+            && fact.group_key.harness.as_deref() == Some("nextest")
+            && fact.group_key.model.as_deref() == Some("gpt")
+    }));
+    assert!(!unavailable.iter().any(|fact| fact.repo == "unknown"));
 }
 
 #[test]
@@ -556,7 +617,7 @@ fn cost_and_lead_time_require_structured_evidence_and_valid_same_run_timestamps(
             .find(|f| f.source.source_id == "bad-cost")
             .unwrap()
             .cost_micro_usd,
-        Some(99)
+        None
     );
     assert_eq!(
         facts
@@ -687,6 +748,46 @@ fn archived_only_family_still_emits_availability_metadata_when_archived_excluded
 }
 
 #[test]
+fn archived_only_metadata_keeps_distinct_workflow_scopes() {
+    let mut archived_ci = base(
+        OutcomeEvidenceKind::Phase4CiSignal,
+        "archived-ci",
+        FactoryMetricPayload::Ci {
+            failed: true,
+            recovered: false,
+        },
+    );
+    archived_ci.archived = true;
+    archived_ci.workflow = Some("build".into());
+    archived_ci.harness = Some("cargo".into());
+    archived_ci.model = Some("claude".into());
+    let mut archived_deploy = archived_ci.clone();
+    archived_deploy.source_id = "archived-deploy".into();
+    archived_deploy.workflow = Some("deploy".into());
+    archived_deploy.harness = Some("smoke".into());
+    archived_deploy.model = Some("gpt".into());
+
+    let facts =
+        OutcomeFactBuilder::from_structured_inputs([archived_ci, archived_deploy], []).build();
+
+    assert_eq!(facts.len(), 2);
+    assert!(facts.iter().all(|fact| fact.repo == "repo-a"));
+    assert!(facts
+        .iter()
+        .all(|fact| fact.source.kind == OutcomeEvidenceKind::Phase4CiSignal));
+    assert!(facts.iter().any(|fact| {
+        fact.group_key.workflow.as_deref() == Some("build")
+            && fact.group_key.harness.as_deref() == Some("cargo")
+            && fact.group_key.model.as_deref() == Some("claude")
+    }));
+    assert!(facts.iter().any(|fact| {
+        fact.group_key.workflow.as_deref() == Some("deploy")
+            && fact.group_key.harness.as_deref() == Some("smoke")
+            && fact.group_key.model.as_deref() == Some("gpt")
+    }));
+}
+
+#[test]
 fn source_counts_count_distinct_sources_but_events_count_events() {
     let first = base(
         OutcomeEvidenceKind::AgentRecord,
@@ -747,7 +848,7 @@ fn cost_and_lead_time_accept_only_valid_direct_run_evidence() {
         "direct-cost",
         FactoryMetricPayload::Cost {
             micro_usd: 7,
-            pricing_evidence_id: None,
+            pricing_evidence_id: Some("price-1".into()),
         },
     );
     let pricing_only = base(
@@ -811,4 +912,20 @@ fn cost_and_lead_time_accept_only_valid_direct_run_evidence() {
             .lead_time_ms,
         None
     );
+}
+
+#[test]
+fn agent_record_cost_rejects_blank_pricing_evidence_id() {
+    let blank_cost = base(
+        OutcomeEvidenceKind::AgentRecord,
+        "blank-cost",
+        FactoryMetricPayload::Cost {
+            micro_usd: 99,
+            pricing_evidence_id: Some(" \t\n ".into()),
+        },
+    );
+
+    let facts = OutcomeFactBuilder::from_structured_inputs([blank_cost], []).build();
+
+    assert_eq!(facts[0].cost_micro_usd, None);
 }

@@ -58,6 +58,8 @@ pub struct OutcomeFactSource {
     pub kind: OutcomeEvidenceKind,
     pub source_id: String,
     pub warnings: Vec<String>,
+    pub repo: Option<String>,
+    pub group_key: Option<OutcomeFactGroupKey>,
 }
 
 impl OutcomeFactSource {
@@ -66,6 +68,22 @@ impl OutcomeFactSource {
             kind,
             source_id: "unavailable".into(),
             warnings: vec!["source_family_unobserved".into()],
+            repo: None,
+            group_key: None,
+        }
+    }
+
+    pub fn unavailable_for(
+        kind: OutcomeEvidenceKind,
+        repo: impl Into<String>,
+        group_key: OutcomeFactGroupKey,
+    ) -> Self {
+        Self {
+            kind,
+            source_id: "unavailable".into(),
+            warnings: vec!["source_family_unobserved".into()],
+            repo: Some(repo.into()),
+            group_key: Some(group_key),
         }
     }
 }
@@ -142,12 +160,12 @@ impl OutcomeFactBuilder {
         let default_repo = single_repo(&self.events).unwrap_or_else(|| "unknown".into());
         let default_group_key = single_group_key(&self.events).unwrap_or_else(unknown_group_key);
         facts.extend(self.unavailable.into_iter().map(|source| {
-            unobserved_fact(
-                source,
-                default_repo.clone(),
-                default_group_key.clone(),
-                SourceCounts::default(),
-            )
+            let repo = source.repo.clone().unwrap_or_else(|| default_repo.clone());
+            let group_key = source
+                .group_key
+                .clone()
+                .unwrap_or_else(|| default_group_key.clone());
+            unobserved_fact(source, repo, group_key, SourceCounts::default())
         }));
         if !self.include_archived {
             for source in archived_only_sources(&self.events) {
@@ -156,10 +174,12 @@ impl OutcomeFactBuilder {
                         kind: source.1,
                         source_id: "archived_only".into(),
                         warnings: vec!["source_family_archived_only".into()],
+                        repo: Some(source.0.clone()),
+                        group_key: Some(source.2.clone()),
                     },
                     source.0,
-                    unknown_group_key(),
                     source.2,
+                    source.3,
                 ));
             }
         }
@@ -235,9 +255,9 @@ fn fact_from_event(event: &FactoryOutcomeEvent, all_events: &[FactoryOutcomeEven
             OutcomeEvidenceKind::AgentRecord,
             FactoryMetricPayload::Cost {
                 micro_usd,
-                pricing_evidence_id: Some(_),
+                pricing_evidence_id: Some(pricing_evidence_id),
             },
-        ) => Some(*micro_usd),
+        ) if !pricing_evidence_id.trim().is_empty() => Some(*micro_usd),
         _ => None,
     };
     let lead_time_ms = match event.metric_payload {
@@ -282,6 +302,8 @@ fn fact_from_event(event: &FactoryOutcomeEvent, all_events: &[FactoryOutcomeEven
             kind: event.source_family,
             source_id: event.source_id.clone(),
             warnings,
+            repo: Some(event.repo.clone()),
+            group_key: Some(group_key_for_event(event)),
         },
         availability: SourceAvailability {
             source_family: event.source_family,
@@ -494,23 +516,62 @@ fn single_group_key(events: &[FactoryOutcomeEvent]) -> Option<OutcomeFactGroupKe
 
 fn archived_only_sources(
     events: &[FactoryOutcomeEvent],
-) -> Vec<(String, OutcomeEvidenceKind, SourceCounts)> {
+) -> Vec<(
+    String,
+    OutcomeEvidenceKind,
+    OutcomeFactGroupKey,
+    SourceCounts,
+)> {
     let mut sources = Vec::new();
-    let mut repo_families = BTreeSet::new();
+    let mut scopes = BTreeSet::new();
     for event in events {
-        repo_families.insert((event.repo.clone(), event.source_family));
+        scopes.insert((
+            event.repo.clone(),
+            event.source_family,
+            group_key_for_event(event),
+        ));
     }
 
-    for (repo, source_family) in repo_families {
+    for (repo, source_family, group_key) in scopes {
         let matching: Vec<_> = events
             .iter()
-            .filter(|event| event.repo == repo && event.source_family == source_family)
+            .filter(|event| {
+                event.repo == repo
+                    && event.source_family == source_family
+                    && group_key_for_event(event) == group_key
+            })
             .collect();
         if matching.iter().all(|event| event.archived) {
-            let counts = source_counts_for(matching[0], events);
-            sources.push((repo, source_family, counts));
+            let counts = source_counts_for_scope(&repo, source_family, &group_key, events);
+            sources.push((repo, source_family, group_key, counts));
         }
     }
 
     sources
+}
+
+fn source_counts_for_scope(
+    repo: &str,
+    source_family: OutcomeEvidenceKind,
+    group_key: &OutcomeFactGroupKey,
+    all_events: &[FactoryOutcomeEvent],
+) -> SourceCounts {
+    let mut counts = SourceCounts::default();
+    let mut active_sources = BTreeSet::new();
+    let mut archived_sources = BTreeSet::new();
+    for candidate in all_events.iter().filter(|candidate| {
+        candidate.repo == repo
+            && candidate.source_family == source_family
+            && group_key_for_event(candidate) == *group_key
+    }) {
+        counts.event_count = counts.event_count.saturating_add(1);
+        if candidate.archived {
+            archived_sources.insert(candidate.source_id.clone());
+        } else {
+            active_sources.insert(candidate.source_id.clone());
+        }
+    }
+    counts.active_source_count = active_sources.len().try_into().unwrap_or(u32::MAX);
+    counts.archived_source_count = archived_sources.len().try_into().unwrap_or(u32::MAX);
+    counts
 }
