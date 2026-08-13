@@ -173,7 +173,7 @@ mod tests {
             )
             .unwrap();
             let params = serde_json::from_value(json!({"kind":"status", "principal":"operator", "source":"other", "instance":"castle"})).unwrap();
-            assert!(crate::ingest_auth::event_payload(&principal, params).is_err());
+            assert!(crate::ingest_auth::validate_event(&principal, &params).is_err());
         }
 
         #[tokio::test]
@@ -190,15 +190,25 @@ mod tests {
                     method: "ingest.event".into(),
                     auth: token.clone(),
                     caller: caller.clone(),
-                    params: json!({"kind":"status", "scope":"ignored"}),
+                    params: json!({"kind":"status"}),
                 },
             )
             .await;
-            assert!(ok.error.is_none(), "source ingest should pass: {ok:?}");
-            assert_eq!(
-                ok.result.as_ref().unwrap()["tuple"]["scope"],
-                rk_core::tuple::SYSTEM_SCOPE
-            );
+            assert!(ok.error.is_none(), "source ingest should validate: {ok:?}");
+            assert_eq!(ok.result.as_ref().unwrap()["status"], "ingest_not_wired");
+            assert_eq!(ok.result.as_ref().unwrap()["accepted"], false);
+            let scoped = raw_request(
+                &layout,
+                Request {
+                    id: "scope".into(),
+                    method: "ingest.event".into(),
+                    auth: token.clone(),
+                    caller: caller.clone(),
+                    params: json!({"kind":"status", "scope":"repo"}),
+                },
+            )
+            .await;
+            assert_eq!(scoped.error.unwrap().code, crate::proto::codes::BAD_PARAMS);
             let denied = raw_request(
                 &layout,
                 Request {
@@ -228,7 +238,7 @@ mod tests {
             )
             .unwrap();
             let params = serde_json::from_value(json!({"kind":"workflow"})).unwrap();
-            assert!(crate::ingest_auth::event_payload(&principal, params).is_err());
+            assert!(crate::ingest_auth::validate_event(&principal, &params).is_err());
         }
 
         #[test]
@@ -472,15 +482,27 @@ mod tests {
                 method: "ingest.event".into(),
                 auth: token.clone(),
                 caller: caller.clone(),
-                params: json!({"kind": "status", "scope": "repo", "payload": {"ok": true}}),
+                params: json!({"kind": "status", "payload": {"ok": true}}),
             },
         )
         .await;
-        assert!(ok.error.is_none(), "ingest.event should succeed: {ok:?}");
-        let tuple = ok.result.unwrap()["tuple"].clone();
-        assert_eq!(tuple["instance"], "source:probe");
-        assert_eq!(tuple["identity"], "ingest.status");
-        assert_eq!(tuple["payload"]["source"], "probe");
+        assert!(ok.error.is_none(), "ingest.event should validate: {ok:?}");
+        let result = ok.result.unwrap();
+        assert_eq!(result["accepted"], false);
+        assert_eq!(result["status"], "ingest_not_wired");
+        assert_eq!(result["source"], "probe");
+        assert_eq!(result["kind"], "status");
+
+        let mut operator_for_scan = connect(&layout).await;
+        let scan = operator_for_scan
+            .call("space.scan", json!({"category": "event"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            scan["tuples"].as_array().unwrap().len(),
+            0,
+            "Task 2 must not persist raw source payloads as generic tuples"
+        );
 
         let state = raw_request(
             &layout,
@@ -497,7 +519,9 @@ mod tests {
             state.error.is_none(),
             "ingest.state should succeed: {state:?}"
         );
-        assert_eq!(state.result.unwrap()["tuples"].as_array().unwrap().len(), 1);
+        let state_result = state.result.unwrap();
+        assert_eq!(state_result["status"], "ingest_not_wired");
+        assert_eq!(state_result["tuples"].as_array().unwrap().len(), 0);
 
         let cases = [
             (

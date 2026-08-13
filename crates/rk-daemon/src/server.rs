@@ -4206,21 +4206,17 @@ impl Daemon {
             Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
         };
         let kind = params.kind.clone();
-        let payload = match crate::ingest_auth::event_payload(&principal, params) {
-            Ok(payload) => payload,
+        match crate::ingest_auth::validate_event(&principal, &params) {
+            Ok(()) => {}
             Err(error) => return Response::err(req.id, codes::FORBIDDEN, error),
-        };
-        let tuple = Tuple::new(
-            Category::Event,
-            rk_core::tuple::SYSTEM_SCOPE,
-            format!("ingest.{kind}"),
-            format!("source:{}", principal.name),
-            payload,
-        );
-        match self.space.out(tuple.clone()) {
-            Ok(()) => Response::ok(req.id, json!({"tuple": tuple})),
-            Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
         }
+        // Task 2 is auth/allowlist only. Task 4 wires canonical SignalEnvelope
+        // ingestion through rk-space::accept_sdlc_signal; until then do not
+        // persist raw source payloads as generic tuples.
+        Response::ok(
+            req.id,
+            json!({"accepted": false, "status": "ingest_not_wired", "source": principal.name, "kind": kind}),
+        )
     }
 
     fn handle_ingest_state(&self, req: Request) -> Response {
@@ -4252,24 +4248,10 @@ impl Daemon {
                 );
             }
         }
-        let pattern = Pattern::category(Category::Event);
-        let rows = match self
-            .space
-            .scan_newest_limited(&pattern, requested.saturating_add(1))
-        {
-            Ok(rows) => rows,
-            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
-        };
-        let identity = params.kind.map(|kind| format!("ingest.{kind}"));
-        let mut tuples: Vec<_> = rows
-            .into_iter()
-            .filter(|tuple| tuple.instance == format!("source:{}", principal.name))
-            .filter(|tuple| identity.as_ref().is_none_or(|id| &tuple.identity == id))
-            .take(requested)
-            .collect();
-        let truncated = tuples.len() == requested;
-        tuples.truncate(requested);
-        Response::ok(req.id, json!({"tuples": tuples, "truncated": truncated}))
+        Response::ok(
+            req.id,
+            json!({"tuples": [], "truncated": false, "status": "ingest_not_wired"}),
+        )
     }
 
     async fn handle_blocking(&self, req: Request, destructive: bool) -> Response {

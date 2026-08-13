@@ -1,7 +1,7 @@
 use rk_core::config::IngestConfig;
 use rk_core::sdlc::SignalLimits;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashSet;
 
 pub const SOURCE_CALLER_PREFIX: &str = "source:";
@@ -15,6 +15,7 @@ pub struct SourcePrincipal {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngestEventParams {
     pub kind: String,
     #[serde(default)]
@@ -87,10 +88,10 @@ pub fn source_caller(name: &str) -> String {
     format!("{SOURCE_CALLER_PREFIX}{name}")
 }
 
-pub fn event_payload(
+pub fn validate_event(
     principal: &SourcePrincipal,
-    params: IngestEventParams,
-) -> Result<Value, String> {
+    params: &IngestEventParams,
+) -> Result<(), String> {
     if params.principal.is_some() || params.source.is_some() || params.instance.is_some() {
         return Err("source principal is derived from the verified token; inline principal/source/instance fields are not accepted".into());
     }
@@ -100,9 +101,5 @@ pub fn event_payload(
             principal.name, params.kind
         ));
     }
-    Ok(json!({
-        "source": principal.name,
-        "kind": params.kind,
-        "payload": params.payload,
-    }))
+    Ok(())
 }
