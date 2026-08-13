@@ -3,6 +3,7 @@
 pub mod action;
 pub mod config;
 pub mod error;
+pub mod factory;
 pub mod id;
 pub mod identity;
 pub mod names;
