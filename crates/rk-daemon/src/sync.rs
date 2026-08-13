@@ -168,12 +168,23 @@ impl Syncer {
             .copied()
             .filter(|id| !local_view.taken.contains(id))
             .collect();
+        let persisted_in_delta: std::collections::BTreeSet<RecordId> =
+            delta.tuples.iter().map(|tuple| tuple.id).collect();
         let mut takes = 0;
-        for id in prev_known.difference(&live_ids) {
-            if alive_in_log.contains(id) {
-                records.push(self.notes.record(SyncOp::Take { tuple_id: *id }));
-                takes += 1;
+        for id in alive_in_log.difference(&live_ids) {
+            let Some(tuple) = local_view.tuples.get(id) else {
+                continue;
+            };
+            let synthetic_castle_presence = tuple.scope == rk_core::tuple::SYSTEM_SCOPE
+                && tuple.identity == "castle_presence";
+            let observed_locally = prev_known.contains(id)
+                || persisted_in_delta.contains(id)
+                || (tuple.instance == self.castle && !synthetic_castle_presence);
+            if !observed_locally {
+                continue;
             }
+            records.push(self.notes.record(SyncOp::Take { tuple_id: *id }));
+            takes += 1;
         }
         self.notes.append(&records)?;
         // Advance only after the complete local export is durable. If append
@@ -348,6 +359,43 @@ mod tests {
     use rk_core::tuple::Category;
     use serde_json::json;
 
+    fn create_legacy_database(path: &std::path::Path, tuples: &[&Tuple]) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tuples (
+                id TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                identity TEXT NOT NULL,
+                instance TEXT NOT NULL,
+                lifecycle TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                strength REAL
+            );",
+        )
+        .unwrap();
+        for tuple in tuples {
+            conn.execute(
+                "INSERT INTO tuples
+                 (id, category, scope, identity, instance, lifecycle, payload,
+                  created_at, expires_at, strength)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'session', ?6, ?7, NULL, NULL)",
+                rusqlite::params![
+                    tuple.id.to_string(),
+                    tuple.category.as_str(),
+                    tuple.scope,
+                    tuple.identity,
+                    tuple.instance,
+                    tuple.payload.to_string(),
+                    tuple.created_at.to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        }
+    }
+
     /// Two castles (two RK_HOMEs) share a bare remote; a tuple written on A
     /// appears in B's space after each side runs a cycle — and a blocked
     /// reader on B is woken by the imported tuple.
@@ -469,6 +517,122 @@ mod tests {
         assert!(syncer.notes.own_records().unwrap().iter().any(
             |record| matches!(&record.op, SyncOp::Out { tuple } if tuple.id == delayed_id)
         ));
+    }
+
+    #[tokio::test]
+    async fn local_delete_is_replicated_after_restart_without_presence_state() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let syncer = Syncer::new(&layout, "castle-a", None).unwrap();
+        let tuple = Tuple::new(
+            Category::Fact,
+            "repo",
+            "deleted-after-export",
+            "castle-a",
+            json!({}),
+        );
+        let id = tuple.id;
+        space.out(tuple).unwrap();
+        assert_eq!(syncer.run_cycle(&space).unwrap().exported, 1);
+        assert!(space.delete(id).unwrap());
+        std::fs::remove_file(home.path().join("sync-presence")).unwrap();
+        drop(syncer);
+
+        let restarted = Syncer::new(&layout, "castle-a", None).unwrap();
+        assert_eq!(
+            restarted.run_cycle(&space).unwrap().takes,
+            1,
+            "an own Out missing locally must produce a Take even when restart lost presence state"
+        );
+    }
+
+    #[tokio::test]
+    async fn immediately_consumed_import_is_replicated_as_a_take() {
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare"]).unwrap();
+        let url = remote.path().to_string_lossy().to_string();
+        let home_a = tempfile::tempdir().unwrap();
+        let home_b = tempfile::tempdir().unwrap();
+        let layout_a = Layout::at(home_a.path());
+        let layout_b = Layout::at(home_b.path());
+        layout_a.ensure().unwrap();
+        layout_b.ensure().unwrap();
+        let space_a = Space::open_in_memory().unwrap();
+        let space_b = Space::open_in_memory().unwrap();
+        let syncer_a = Syncer::new(&layout_a, "castle-a", Some(&url)).unwrap();
+        let syncer_b = Syncer::new(&layout_b, "castle-b", Some(&url)).unwrap();
+        let tuple = Tuple::new(
+            Category::Need,
+            "repo",
+            "consume-on-import",
+            "castle-a",
+            json!({}),
+        );
+        let id = tuple.id;
+        space_a.out(tuple).unwrap();
+        syncer_a.run_cycle(&space_a).unwrap();
+        let waiter = {
+            let space = space_b.clone();
+            tokio::spawn(async move {
+                space
+                    .take(
+                        &Pattern::category(Category::Need).identity("consume-on-import"),
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+            })
+        };
+
+        syncer_b.run_cycle(&space_b).unwrap();
+        assert_eq!(waiter.await.unwrap().unwrap().unwrap().id, id);
+        std::fs::remove_file(home_b.path().join("sync-presence")).ok();
+        assert_eq!(
+            syncer_b.run_cycle(&space_b).unwrap().takes,
+            1,
+            "the persistence journal must prove the imported tuple existed before the blocked take consumed it"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_ulid_cursor_replays_history_and_rewrites_decimal() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let now = chrono::Utc::now();
+        let mut delayed = Tuple::new(
+            Category::Fact,
+            "repo",
+            "legacy-delayed",
+            "castle-a",
+            json!({}),
+        );
+        delayed.id = RecordId::floor_at(now);
+        let delayed_id = delayed.id;
+        let mut old_boundary = Tuple::new(
+            Category::Fact,
+            "repo",
+            "legacy-boundary",
+            "castle-b",
+            json!({}),
+        );
+        old_boundary.id = RecordId::floor_at(now + chrono::Duration::days(1));
+        create_legacy_database(&layout.db_path(), &[&old_boundary, &delayed]);
+        std::fs::write(
+            home.path().join("sync-cursor"),
+            old_boundary.id.to_string(),
+        )
+        .unwrap();
+
+        let space = Space::open(&layout.db_path()).unwrap();
+        let syncer = Syncer::new(&layout, "castle-a", None).unwrap();
+        assert_eq!(syncer.run_cycle(&space).unwrap().exported, 1);
+        assert!(syncer.notes.own_records().unwrap().iter().any(
+            |record| matches!(&record.op, SyncOp::Out { tuple } if tuple.id == delayed_id)
+        ));
+        let rewritten = std::fs::read_to_string(home.path().join("sync-cursor")).unwrap();
+        assert_eq!(rewritten.trim().parse::<u64>().unwrap(), 2);
     }
 
     /// A daemon-authored obstacle (supervisor liveness/budget signal, or the

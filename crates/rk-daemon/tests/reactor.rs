@@ -163,6 +163,43 @@ fn ping() -> Tuple {
     )
 }
 
+fn create_legacy_database(path: &Path, tuples: &[&Tuple]) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE tuples (
+            id TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            identity TEXT NOT NULL,
+            instance TEXT NOT NULL,
+            lifecycle TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT,
+            strength REAL
+        );",
+    )
+    .unwrap();
+    for tuple in tuples {
+        conn.execute(
+            "INSERT INTO tuples
+             (id, category, scope, identity, instance, lifecycle, payload,
+              created_at, expires_at, strength)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'session', ?6, ?7, NULL, NULL)",
+            rusqlite::params![
+                tuple.id.to_string(),
+                tuple.category.as_str(),
+                tuple.scope,
+                tuple.identity,
+                tuple.instance,
+                tuple.payload.to_string(),
+                tuple.created_at.to_rfc3339(),
+            ],
+        )
+        .unwrap();
+    }
+}
+
 /// Full path: the live daemon's reactor loop wakes off the feed and fires the
 /// workflow when a matching tuple is written over the wire.
 #[tokio::test]
@@ -330,6 +367,73 @@ async fn restart_after_future_record_id_processes_normal_write() {
         1,
         "a persisted sequence must survive restart and wall-clock rollback"
     );
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+#[tokio::test]
+async fn deleted_tuple_is_still_dispatched_from_the_persistence_journal() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    write_trigger(&layout);
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+    let tuple = ping();
+    let id = tuple.id;
+    space.out(tuple).unwrap();
+    assert!(space.delete(id).unwrap());
+
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        1,
+        "a take or delete before the scan must not erase the persisted insertion event"
+    );
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+#[tokio::test]
+async fn legacy_ulid_cursor_replays_migrated_history_and_rewrites_decimal() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    write_trigger(&layout);
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+
+    let now = chrono::Utc::now();
+    let mut delayed = ping();
+    delayed.id = RecordId::floor_at(now);
+    let mut old_boundary = Tuple::new(
+        Category::Event,
+        "myrepo",
+        "old-boundary",
+        "Whisker",
+        json!({}),
+    );
+    old_boundary.id = RecordId::floor_at(now + chrono::Duration::days(1));
+    create_legacy_database(&layout.db_path(), &[&old_boundary, &delayed]);
+    std::fs::write(
+        home.path().join("reactor-cursor"),
+        old_boundary.id.to_string(),
+    )
+    .unwrap();
+
+    let space = rk_space::Space::open(&layout.db_path()).unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space);
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        1,
+        "legacy conversion must replay a delayed low-ID historical tuple"
+    );
+    let rewritten = std::fs::read_to_string(home.path().join("reactor-cursor")).unwrap();
+    assert_eq!(rewritten.trim().parse::<u64>().unwrap(), 2);
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
