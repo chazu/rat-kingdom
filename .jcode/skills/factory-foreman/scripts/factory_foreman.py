@@ -25,8 +25,26 @@ COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("definitions", ("rk", "--json", "workflow", "defs", "--repo", "{repo_path}")),
     ("tickets", ("rk", "--json", "ticket", "list", "--repo", "{repo}")),
 )
+OPTIONAL_FACTORY_DISPLAY_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "factory_scorecards",
+        (
+            "rk",
+            "--json",
+            "factory",
+            "scorecards",
+            "--repo",
+            "{repo}",
+            "--group-by",
+            "all",
+            "--include-archived",
+        ),
+    ),
+    ("factory_recommend", ("rk", "--json", "factory", "recommend", "--repo", "{repo}")),
+)
 STATUS_ARGV = ("rk", "--json", "daemon", "status")
 BUDGET_PRESSURE_RATIO = 0.8
+LOW_SAMPLE_THRESHOLD = 3
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 
@@ -135,7 +153,9 @@ def daemon_preflight(runner: Runner) -> Observation:
     return _observe(PREFLIGHT_COMMAND, STATUS_ARGV, runner)
 
 
-def collect_snapshot(repo: str, runner: Runner) -> FactorySnapshot:
+def collect_snapshot(
+    repo: str, runner: Runner, *, include_factory_display: bool = False
+) -> FactorySnapshot:
     observations: dict[str, Observation] = {}
     preflight = daemon_preflight(runner)
 
@@ -156,6 +176,11 @@ def collect_snapshot(repo: str, runner: Runner) -> FactorySnapshot:
             for part in argv_template
         )
         observations[command] = _observe(command, argv, runner)
+
+    if include_factory_display:
+        for command, argv_template in OPTIONAL_FACTORY_DISPLAY_COMMANDS:
+            argv = tuple(repo if part == "{repo}" else part for part in argv_template)
+            observations[command] = _observe(command, argv, runner)
 
     return _snapshot(repo, observations)
 
@@ -597,11 +622,15 @@ def main(argv: list[str] | None = None, runner: Runner | None = None) -> Command
     try:
         args = parser.parse_args(argv)
         if args.command == "snapshot":
-            snapshot = collect_snapshot(args.repo, runner)
+            snapshot = collect_snapshot(
+                args.repo, runner, include_factory_display=args.include_factory_display
+            )
             stdout = _render_snapshot(snapshot, args.format)
             return CommandResult(_snapshot_exit_code(snapshot), stdout, "")
         if args.command == "triage":
-            snapshot = collect_snapshot(args.repo, runner)
+            snapshot = collect_snapshot(
+                args.repo, runner, include_factory_display=args.include_factory_display
+            )
             triage = classify_snapshot(snapshot)
             stdout = _render_triage(snapshot, triage, args.format)
             return CommandResult(_snapshot_exit_code(snapshot), stdout, "")
@@ -634,6 +663,7 @@ def _build_parser() -> argparse.ArgumentParser:
         command = subcommands.add_parser(name)
         command.add_argument("--repo", required=True)
         command.add_argument("--format", choices=("json", "markdown"), required=True)
+        command.add_argument("--include-factory-display", action="store_true")
 
     propose = subcommands.add_parser("propose-workflow")
     propose.add_argument("workflow")
@@ -684,6 +714,7 @@ def _render_snapshot(snapshot: FactorySnapshot, output_format: str) -> str:
     for name, observation in snapshot.observations.items():
         status = "ok" if observation.ok else f"DEGRADED: {observation.error}"
         lines.append(f"- {name}: {status}")
+    _append_factory_display(lines, snapshot)
     return "\n".join(lines) + "\n"
 
 
@@ -717,7 +748,124 @@ def _render_triage(snapshot: FactorySnapshot, triage: TriageReport, output_forma
     else:
         for finding in triage.findings:
             lines.append(f"- {finding.severity.upper()} {finding.category}: {finding.summary}")
+    _append_factory_display(lines, snapshot)
     return "\n".join(lines) + "\n"
+
+
+def _append_factory_display(lines: list[str], snapshot: FactorySnapshot) -> None:
+    scorecards = snapshot.observations.get("factory_scorecards")
+    recommendations = snapshot.observations.get("factory_recommend")
+    if scorecards is None and recommendations is None:
+        return
+
+    lines.extend(["", "## Factory Foreman Display", "", "Read-only advisory display."])
+    if scorecards is None:
+        lines.append("- Source availability: unavailable")
+    elif not scorecards.ok:
+        lines.append(f"- Source availability: unavailable ({scorecards.error})")
+    else:
+        lines.append(f"- Source availability: {_source_availability(scorecards.data)}")
+        unobserved = _unobserved_metrics(scorecards.data)
+        if unobserved:
+            lines.append(f"- Unobserved metrics: {', '.join(unobserved)}")
+        rows = _scorecard_rows(scorecards.data)
+        visible_rows = [row for row in rows if _samples(row) >= LOW_SAMPLE_THRESHOLD]
+        suppressed = len(rows) - len(visible_rows)
+        lines.append("")
+        lines.append("### Scorecards")
+        if visible_rows:
+            for row in visible_rows:
+                metric_bits = _scorecard_metric_bits(row)
+                suffix = f" ({', '.join(metric_bits)})" if metric_bits else ""
+                lines.append(f"- {_row_label(row)}{suffix}")
+        else:
+            lines.append("- No sufficiently sampled rows.")
+        lines.append(f"- Suppressed low-sample rows: {suppressed}")
+
+    lines.extend(["", "### Recommendations"])
+    if recommendations is None:
+        lines.append("- ADVISORY only: recommendations source unavailable.")
+    elif not recommendations.ok:
+        lines.append(f"- ADVISORY only: recommendations unavailable ({recommendations.error}).")
+    else:
+        rendered = _recommendation_lines(recommendations.data)
+        lines.extend(rendered or ["- ADVISORY only: no recommendations."])
+
+
+def _source_availability(data: Any) -> str:
+    if isinstance(data, dict):
+        source = data.get("source")
+        if isinstance(source, dict) and source.get("available") is False:
+            return "unavailable"
+        available = data.get("available")
+        if available is False:
+            return "unavailable"
+    return "available"
+
+
+def _unobserved_metrics(data: Any) -> list[str]:
+    metrics: list[str] = []
+    if isinstance(data, dict):
+        for container in (data, data.get("source")):
+            if isinstance(container, dict):
+                value = container.get("unobserved_metrics") or container.get("unobserved")
+                if isinstance(value, list):
+                    metrics.extend(str(metric) for metric in value if str(metric).strip())
+    for row in _scorecard_rows(data):
+        value = row.get("unobserved_metrics") or row.get("unobserved")
+        if isinstance(value, list):
+            metrics.extend(str(metric) for metric in value if str(metric).strip())
+    return sorted(set(metrics))
+
+
+def _scorecard_rows(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)]
+    if isinstance(data, dict):
+        for key in ("rows", "scorecards", "groups", "items"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [row for row in value if isinstance(row, dict)]
+    return []
+
+
+def _samples(row: dict[str, Any]) -> float:
+    return _first_number(row, "samples", "sample_count", "n", "count") or 0
+
+
+def _row_label(row: dict[str, Any]) -> str:
+    return _first_string(row, "group", "label", "name", "agent", "workflow") or "scorecard row"
+
+
+def _scorecard_metric_bits(row: dict[str, Any]) -> list[str]:
+    bits: list[str] = []
+    samples = _samples(row)
+    if samples:
+        bits.append(f"samples={int(samples) if samples.is_integer() else samples}")
+    success_rate = _first_number(row, "success_rate", "successRate")
+    if success_rate is not None:
+        bits.append(f"success_rate={success_rate:g}")
+    return bits
+
+
+def _recommendation_lines(data: Any) -> list[str]:
+    if isinstance(data, dict):
+        value = data.get("recommendations") or data.get("items") or data.get("rows")
+    else:
+        value = data
+    if not isinstance(value, list):
+        return []
+    lines: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            summary = _first_string(item, "summary", "recommendation", "title", "message")
+            rationale = _first_string(item, "rationale", "reason")
+            if summary:
+                suffix = f" Rationale: {rationale}" if rationale else ""
+                lines.append(f"- ADVISORY only: {summary}{suffix}")
+        elif str(item).strip():
+            lines.append(f"- ADVISORY only: {item}")
+    return lines
 
 
 def _proposal(workflow: str, repo: str, params: list[str], coordinator: str | None) -> dict[str, Any]:

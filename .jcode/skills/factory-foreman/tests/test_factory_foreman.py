@@ -27,6 +27,18 @@ SNAPSHOT_ARGVS = [
     ("rk", "--json", "workflow", "defs", "--repo", REPO_PATH),
     ("rk", "--json", "ticket", "list", "--repo", REPO),
 ]
+FACTORY_SCORECARDS_ARGV = (
+    "rk",
+    "--json",
+    "factory",
+    "scorecards",
+    "--repo",
+    REPO,
+    "--group-by",
+    "all",
+    "--include-archived",
+)
+FACTORY_RECOMMEND_ARGV = ("rk", "--json", "factory", "recommend", "--repo", REPO)
 
 
 def fixture(name):
@@ -124,6 +136,42 @@ class FactoryForemanSnapshotTests(unittest.TestCase):
             SNAPSHOT_ARGVS[6]: CommandResult(0, fixture("tickets"), ""),
         }
 
+    def default_results_with_factory_display(self):
+        results = self.default_results()
+        results[FACTORY_SCORECARDS_ARGV] = CommandResult(
+            0,
+            json.dumps(
+                {
+                    "source": {"available": True, "unobserved_metrics": ["review_latency"]},
+                    "rows": [
+                        {
+                            "group": "agent:alpha",
+                            "samples": 8,
+                            "success_rate": 0.75,
+                            "unobserved_metrics": ["cost_usd"],
+                        },
+                        {"group": "agent:beta", "samples": 1, "success_rate": 1.0},
+                    ],
+                }
+            ),
+            "",
+        )
+        results[FACTORY_RECOMMEND_ARGV] = CommandResult(
+            0,
+            json.dumps(
+                {
+                    "recommendations": [
+                        {
+                            "summary": "Prefer alpha for repair workflows.",
+                            "rationale": "Higher observed success rate.",
+                        }
+                    ]
+                }
+            ),
+            "",
+        )
+        return results
+
     def test_daemon_preflight_uses_strict_status_before_observations(self):
         runner = FakeRunner(self.default_results())
 
@@ -144,6 +192,37 @@ class FactoryForemanSnapshotTests(unittest.TestCase):
         collect_snapshot(REPO, runner)
 
         self.assertEqual(runner.calls[1:], SNAPSHOT_ARGVS)
+
+    def test_collect_snapshot_optionally_collects_factory_scorecards_and_recommendations_after_preflight(self):
+        runner = FakeRunner(self.default_results_with_factory_display())
+
+        snapshot = collect_snapshot(REPO, runner, include_factory_display=True)
+
+        self.assertEqual(runner.calls[0], STATUS_ARGV)
+        self.assertEqual(runner.calls[-2:], [FACTORY_SCORECARDS_ARGV, FACTORY_RECOMMEND_ARGV])
+        self.assertTrue(snapshot.observations["factory_scorecards"].ok)
+        self.assertTrue(snapshot.observations["factory_recommend"].ok)
+
+    def test_collect_snapshot_skips_factory_display_when_strict_preflight_fails(self):
+        runner = FakeRunner({STATUS_ARGV: CommandResult(1, "", "daemon down")})
+
+        snapshot = collect_snapshot(REPO, runner, include_factory_display=True)
+
+        self.assertEqual(runner.calls, [STATUS_ARGV])
+        self.assertNotIn("factory_scorecards", snapshot.observations)
+        self.assertNotIn("factory_recommend", snapshot.observations)
+
+    def test_collect_snapshot_degrades_when_optional_factory_display_commands_are_unavailable(self):
+        results = self.default_results()
+        results[FACTORY_SCORECARDS_ARGV] = CommandResult(2, "", "unknown command scorecards")
+        results[FACTORY_RECOMMEND_ARGV] = CommandResult(2, "", "unknown command recommend")
+        runner = FakeRunner(results)
+
+        snapshot = collect_snapshot(REPO, runner, include_factory_display=True)
+
+        self.assertFalse(snapshot.observations["factory_scorecards"].ok)
+        self.assertFalse(snapshot.observations["factory_recommend"].ok)
+        self.assertIn("factory_scorecards", snapshot.errors[0])
 
     def test_collect_snapshot_resolves_defs_repo_from_observed_repository_path(self):
         runner = FakeRunner(self.default_results())
@@ -359,6 +438,25 @@ class FactoryForemanCliTests(unittest.TestCase):
         self.assertEqual(payload["schema"], 1)
         self.assertEqual(payload["repo"], REPO)
         self.assertIsInstance(payload["findings"], list)
+
+    def test_triage_markdown_renders_optional_factory_display_as_advisory_without_controls(self):
+        result = self.run_cli(
+            ["triage", "--repo", REPO, "--format", "markdown", "--include-factory-display"],
+            runner=FakeRunner(FactoryForemanSnapshotTests().default_results_with_factory_display()),
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("## Factory Foreman Display", result.stdout)
+        self.assertIn("Source availability: available", result.stdout)
+        self.assertIn("Unobserved metrics:", result.stdout)
+        self.assertIn("review_latency", result.stdout)
+        self.assertIn("cost_usd", result.stdout)
+        self.assertIn("agent:alpha", result.stdout)
+        self.assertIn("Suppressed low-sample rows: 1", result.stdout)
+        self.assertIn("ADVISORY only: Prefer alpha for repair workflows.", result.stdout)
+        forbidden = ["apply", "dispatch", "policy", "config", "workflow run", "ticket create", "approve", "gate"]
+        for token in forbidden:
+            self.assertNotIn(token, result.stdout.lower())
 
     def test_partial_snapshot_warning_is_visible(self):
         results = FactoryForemanSnapshotTests().default_results()
