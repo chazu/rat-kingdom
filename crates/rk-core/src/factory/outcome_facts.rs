@@ -30,6 +30,21 @@ pub enum OutcomeEvidenceKind {
     PricingSnapshot,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum OutcomeMetricKind {
+    Run,
+    TaskClass,
+    Accepted,
+    Reworked,
+    Ci,
+    Reverted,
+    HumanIntervention,
+    Recurrence,
+    Cost,
+    LeadTime,
+    Unknown,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct OutcomeFactGroupKey {
     pub task_class: Option<String>,
@@ -79,10 +94,12 @@ pub struct OutcomeFact {
     pub source: OutcomeFactSource,
     pub availability: SourceAvailability,
     pub source_counts: SourceCounts,
+    pub metric_kind: OutcomeMetricKind,
     pub archived: bool,
     pub archive_source_family: Option<OutcomeEvidenceKind>,
     pub human_interventions: u32,
     pub recurrence_count: u32,
+    pub recurrence_key: Option<String>,
     pub cost_micro_usd: Option<u64>,
     pub lead_time_ms: Option<u64>,
 }
@@ -188,20 +205,32 @@ fn fact_from_event(event: &FactoryOutcomeEvent, all_events: &[FactoryOutcomeEven
     };
     let recurrence_count = match (&event.source_family, &event.metric_payload) {
         (OutcomeEvidenceKind::RecurrenceKey, FactoryMetricPayload::Recurrence)
-            if event.recurrence_key.is_some() || event.coalesce_key.is_some() =>
+            if event
+                .recurrence_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty())
+                || event
+                    .coalesce_key
+                    .as_deref()
+                    .is_some_and(|key| !key.trim().is_empty()) =>
         {
             1
         }
         _ => 0,
     };
+    let recurrence_key = if recurrence_count > 0 {
+        event
+            .recurrence_key
+            .as_deref()
+            .or(event.coalesce_key.as_deref())
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    let metric_kind = metric_kind_from_payload(&event.metric_payload);
     let cost_micro_usd = match (&event.source_family, &event.metric_payload) {
-        (
-            OutcomeEvidenceKind::AgentRecord,
-            FactoryMetricPayload::Cost {
-                micro_usd,
-                pricing_evidence_id: None,
-            },
-        ) => Some(*micro_usd),
         (
             OutcomeEvidenceKind::AgentRecord,
             FactoryMetricPayload::Cost {
@@ -259,10 +288,12 @@ fn fact_from_event(event: &FactoryOutcomeEvent, all_events: &[FactoryOutcomeEven
             available: true,
         },
         source_counts,
+        metric_kind,
         archived: event.archived,
         archive_source_family: event.archived.then_some(event.source_family),
         human_interventions,
         recurrence_count,
+        recurrence_key,
         cost_micro_usd,
         lead_time_ms,
     };
@@ -288,16 +319,34 @@ fn unobserved_fact(
             available: false,
         },
         source_counts,
+        metric_kind: OutcomeMetricKind::Unknown,
         source,
         archived: false,
         archive_source_family: None,
         human_interventions: 0,
         recurrence_count: 0,
+        recurrence_key: None,
         cost_micro_usd: None,
         lead_time_ms: None,
     };
     fact.fact_id = stable_hash(&fact);
     fact
+}
+
+fn metric_kind_from_payload(payload: &FactoryMetricPayload) -> OutcomeMetricKind {
+    match payload {
+        FactoryMetricPayload::Run { .. } => OutcomeMetricKind::Run,
+        FactoryMetricPayload::TaskClass => OutcomeMetricKind::TaskClass,
+        FactoryMetricPayload::Accepted { .. } => OutcomeMetricKind::Accepted,
+        FactoryMetricPayload::Reworked { .. } => OutcomeMetricKind::Reworked,
+        FactoryMetricPayload::Ci { .. } => OutcomeMetricKind::Ci,
+        FactoryMetricPayload::Reverted { .. } => OutcomeMetricKind::Reverted,
+        FactoryMetricPayload::HumanIntervention { .. } => OutcomeMetricKind::HumanIntervention,
+        FactoryMetricPayload::Recurrence => OutcomeMetricKind::Recurrence,
+        FactoryMetricPayload::Cost { .. } => OutcomeMetricKind::Cost,
+        FactoryMetricPayload::LeadTime { .. } => OutcomeMetricKind::LeadTime,
+        FactoryMetricPayload::Unknown => OutcomeMetricKind::Unknown,
+    }
 }
 
 fn source_counts_for(
