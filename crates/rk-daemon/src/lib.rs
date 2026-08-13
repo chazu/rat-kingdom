@@ -1,6 +1,7 @@
 //! rat-kingdom daemon: NDJSON-over-UDS server hosting the tuplespace, plus the
 //! client used by `rk`.
 
+pub mod action_approval;
 pub mod agent_log;
 pub mod agents;
 pub mod client;
@@ -23,14 +24,14 @@ pub mod sync;
 pub mod tickets;
 pub mod workflow_exec;
 
-pub use client::{Client, WatchStream};
+pub use client::{Client, ClientRpcError, WatchStream};
 pub use server::Daemon;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rk_core::paths::Layout;
     use crate::proto::{Request, Response};
+    use rk_core::paths::Layout;
     use serde_json::json;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -193,7 +194,10 @@ mod tests {
         let decoded: Response = serde_json::from_str(&response).unwrap();
         assert!(decoded.error.is_none());
 
-        assert_eq!(operator.call("ping", json!({})).await.unwrap(), json!("pong"));
+        assert_eq!(
+            operator.call("ping", json!({})).await.unwrap(),
+            json!("pong")
+        );
         operator.call("stop", json!({})).await.unwrap();
         handle.await.unwrap().unwrap();
     }
@@ -511,10 +515,13 @@ mod tests {
                 json!({"repo": "myrepo", "instance": "wf-1", "after": first_cursor}),
             )
             .await
-        .unwrap();
+            .unwrap();
         assert_eq!(initial["events"].as_array().unwrap().len(), 1);
         assert_eq!(initial["events"][0]["event"]["payload"]["revision"], 2);
-        assert_eq!(initial["snapshot"]["workflows"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            initial["snapshot"]["workflows"].as_array().unwrap().len(),
+            0
+        );
         assert_eq!(initial["resync_required"], false);
 
         space
@@ -547,10 +554,7 @@ mod tests {
         let _handle = tokio::spawn(daemon.run());
         let mut client = connect(&layout).await;
         client
-            .call(
-                "coordinator.register",
-                json!({"coordinator": "session-1"}),
-            )
+            .call("coordinator.register", json!({"coordinator": "session-1"}))
             .await
             .unwrap();
         let cursor = space

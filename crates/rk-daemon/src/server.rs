@@ -5,13 +5,14 @@
 use crate::coordinator::CoordinatorFilter;
 use crate::proto::{codes, Request, Response};
 use chrono::{DateTime, Utc};
+use rk_core::action::{ApprovalStatus, WorkflowRunAction};
 use rk_core::id::RecordId;
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, SYSTEM_SCOPE};
 use rk_space::{CoordinatorEvent, Space};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -103,6 +104,7 @@ pub struct Daemon {
     /// persistence supplies restart safety; this lock prevents concurrent
     /// operator retries in one daemon from racing the same worktree.
     onboarding_apply_lock: tokio::sync::Mutex<()>,
+    action_approvals: crate::action_approval::ActionApprovalStore,
     tickets: Arc<crate::tickets::Tickets>,
     coordinator_sessions: std::sync::Mutex<crate::coordinator::CoordinatorSessions>,
     /// Serializes read/append cycles for one agent's effective fact vote.
@@ -327,6 +329,9 @@ impl Daemon {
             std::sync::Mutex::new(crate::coordinator::CoordinatorSessions::load(
                 &layout.home().join("coordinator-sessions.json"),
             )?);
+        let action_approvals = crate::action_approval::ActionApprovalStore::load(
+            layout.home().join("factory-actions.json"),
+        )?;
         Ok(Self {
             layout,
             space,
@@ -358,6 +363,7 @@ impl Daemon {
             repos,
             onboarding_sessions,
             onboarding_apply_lock: tokio::sync::Mutex::new(()),
+            action_approvals,
             tickets,
             coordinator_sessions,
             fact_vote_lock: std::sync::Mutex::new(()),
@@ -908,6 +914,9 @@ impl Daemon {
                 | "repo.onboard.status"
                 | "repo.onboard.report"
                 | "workflow.run"
+                | "factory.propose_action"
+                | "factory.approve_action"
+                | "factory.execute_action"
                 | "workflow.approve"
                 | "workflow.archive"
                 | "workflow.unarchive"
@@ -1393,6 +1402,9 @@ impl Daemon {
                 )
             }
             "workflow.run" => reply(self.handle_workflow_run(req).await),
+            "factory.propose_action" => reply(self.handle_factory_propose_action(req)),
+            "factory.approve_action" => reply(self.handle_factory_approve_action(req)),
+            "factory.execute_action" => reply(self.handle_factory_execute_action(req).await),
             "workflow.list" => {
                 let params: WorkflowListParams = match parse_params(&req.params) {
                     Ok(p) => p,
@@ -1955,10 +1967,7 @@ impl Daemon {
             match tokio::task::spawn_blocking(move || {
                 let (policy, digest) =
                     rk_workflow::load_repository_policy_with_digest(&policy_file_for_load)?;
-                Ok::<_, rk_core::Error>(crate::repos::ActivatedRepositoryPolicy {
-                    digest,
-                    policy,
-                })
+                Ok::<_, rk_core::Error>(crate::repos::ActivatedRepositoryPolicy { digest, policy })
             })
             .await
             {
@@ -2009,9 +2018,7 @@ impl Daemon {
                     rk_workflow::DeliveryMode::Pr => rk_core::config::MergeMode::Pr,
                     rk_workflow::DeliveryMode::Merge
                     | rk_workflow::DeliveryMode::MergePush
-                    | rk_workflow::DeliveryMode::PushBranch => {
-                        rk_core::config::MergeMode::Direct
-                    }
+                    | rk_workflow::DeliveryMode::PushBranch => rk_core::config::MergeMode::Direct,
                 })
                 .or(params.merge_mode)
                 .unwrap_or(self.default_merge_mode),
@@ -2668,10 +2675,7 @@ impl Daemon {
             let activated = tokio::task::spawn_blocking(move || {
                 let (policy, digest) =
                     rk_workflow::load_repository_policy_with_digest(&policy_file_for_load)?;
-                Ok::<_, rk_core::Error>(crate::repos::ActivatedRepositoryPolicy {
-                    digest,
-                    policy,
-                })
+                Ok::<_, rk_core::Error>(crate::repos::ActivatedRepositoryPolicy { digest, policy })
             })
             .await;
             let activated = match activated {
@@ -2681,17 +2685,21 @@ impl Daemon {
                         "activated repository policy digest drifted: expected {}, found {}",
                         contract.target_digest, activated.digest
                     );
-                    let _ = self.onboarding_sessions.lock().ok().and_then(|mut sessions| {
-                        sessions
-                            .fail_activation(
-                                &params.session,
-                                &params.proposal,
-                                &params.digest,
-                                &contract.operation_id,
-                                detail.clone(),
-                            )
-                            .ok()
-                    });
+                    let _ = self
+                        .onboarding_sessions
+                        .lock()
+                        .ok()
+                        .and_then(|mut sessions| {
+                            sessions
+                                .fail_activation(
+                                    &params.session,
+                                    &params.proposal,
+                                    &params.digest,
+                                    &contract.operation_id,
+                                    detail.clone(),
+                                )
+                                .ok()
+                        });
                     return Response::err(req.id, codes::BAD_PARAMS, detail);
                 }
                 Ok(Err(error)) => {
@@ -3206,6 +3214,141 @@ impl Daemon {
             Ok(Err(e)) => Response::err(req.id, codes::INTERNAL, e.to_string()),
             Err(e) => Response::err(req.id, codes::INTERNAL, format!("respawn task failed: {e}")),
         }
+    }
+
+    fn handle_factory_propose_action(&self, req: Request) -> Response {
+        let params: FactoryProposeParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        if params.kind != "workflow.run" {
+            return Response::err(req.id, codes::BAD_PARAMS, "unsupported action kind");
+        }
+        let action = match self.resolve_workflow_action(params.action) {
+            Ok(action) => action,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        };
+        match self
+            .action_approvals
+            .propose(&req.caller, action, params.ttl_seconds)
+        {
+            Ok(proposal) => Response::ok(
+                req.id,
+                json!({"proposal": proposal, "digest": proposal.digest}),
+            ),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    fn handle_factory_approve_action(&self, req: Request) -> Response {
+        let params: FactoryApproveParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        match self
+            .action_approvals
+            .approve(&params.proposal_id, &params.digest, &req.caller)
+        {
+            Ok(approval) => Response::ok(req.id, json!({"approval": approval})),
+            Err(e) => Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        }
+    }
+
+    async fn handle_factory_execute_action(&self, req: Request) -> Response {
+        let params: FactoryExecuteParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let action = match self.resolve_workflow_action(params.action) {
+            Ok(action) => action,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        };
+        let grant = match self.action_approvals.begin_execute(
+            &params.proposal_id,
+            &params.digest,
+            &req.caller,
+            &action,
+        ) {
+            Ok(grant) => grant,
+            Err(e) => return Response::err(req.id, codes::FORBIDDEN, e.to_string()),
+        };
+        if let Some(instance_id) = grant.instance_id.as_deref() {
+            if let Some(instance) = self.engine().status_any(instance_id) {
+                return Response::ok(req.id, json!({"instance": instance, "approval": grant}));
+            }
+        }
+        if grant.status == ApprovalStatus::Consumed {
+            return Response::err(req.id, codes::FORBIDDEN, "approval already consumed");
+        }
+        let engine = self.engine();
+        let handle = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
+            let _entered = handle.enter();
+            engine.run_owned(
+                &action.name,
+                &action.repo_path,
+                action.params.into_iter().collect(),
+                action.coordinator,
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(instance)) => {
+                let approval = match self
+                    .action_approvals
+                    .finish_success(&params.proposal_id, &instance.id)
+                {
+                    Ok(approval) => approval,
+                    Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+                };
+                Response::ok(req.id, json!({"instance": instance, "approval": approval}))
+            }
+            Ok(Err(e)) => {
+                let _ = self
+                    .action_approvals
+                    .finish_failed(&params.proposal_id, &e.to_string());
+                Response::err(req.id, codes::INTERNAL, e.to_string())
+            }
+            Err(e) => {
+                let msg = format!("workflow task failed: {e}");
+                let _ = self
+                    .action_approvals
+                    .finish_failed(&params.proposal_id, &msg);
+                Response::err(req.id, codes::INTERNAL, msg)
+            }
+        }
+    }
+
+    fn resolve_workflow_action(
+        &self,
+        params: WorkflowRunParams,
+    ) -> rk_core::Result<WorkflowRunAction> {
+        let submitted = std::path::PathBuf::from(&params.repo);
+        let canonical_submitted = if submitted.exists() {
+            submitted.canonicalize()?
+        } else {
+            submitted
+        };
+        let repos = self
+            .repos
+            .lock()
+            .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
+        let record = repos
+            .get(&params.repo)
+            .cloned()
+            .or_else(|| repos.get_by_path(&canonical_submitted).cloned())
+            .ok_or_else(|| {
+                rk_core::Error::other(format!("repository is not registered: {}", params.repo))
+            })?;
+        let canonical_path = record.path.canonicalize().unwrap_or(record.path.clone());
+        Ok(WorkflowRunAction {
+            name: params.name,
+            repo: record.name.clone(),
+            repo_identity: record.name,
+            repo_path: canonical_path.display().to_string(),
+            params: params.params.into_iter().collect::<BTreeMap<_, _>>(),
+            coordinator: params.coordinator,
+        })
     }
 
     async fn handle_workflow_run(&self, req: Request) -> Response {
@@ -4001,6 +4144,27 @@ struct ScanParams {
     hot: bool,
     #[serde(default)]
     top: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct FactoryProposeParams {
+    kind: String,
+    action: WorkflowRunParams,
+    #[serde(default)]
+    ttl_seconds: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct FactoryApproveParams {
+    proposal_id: String,
+    digest: String,
+}
+
+#[derive(Deserialize)]
+struct FactoryExecuteParams {
+    proposal_id: String,
+    digest: String,
+    action: WorkflowRunParams,
 }
 
 #[derive(Deserialize)]
