@@ -9,6 +9,7 @@ use crate::proto::{codes, Request, Response};
 use chrono::{DateTime, Utc};
 use rk_core::action::{
     ActionProposal, ApprovalGrant, ApprovalStatus, FactoryAction, TicketGraphApplyAction,
+    TicketGraphAppliedEdge, TicketGraphApplyExecutionResult, TicketGraphApplyPreconditions,
     WorkflowRunAction,
 };
 use rk_core::id::RecordId;
@@ -141,6 +142,10 @@ pub struct Daemon {
     /// persistence supplies restart safety; this lock prevents concurrent
     /// operator retries in one daemon from racing the same worktree.
     onboarding_apply_lock: tokio::sync::Mutex<()>,
+    /// Serializes one daemon's approved ticket-graph execution. Durable
+    /// checkpoints and idempotent ticket coalesce keys provide restart safety;
+    /// this lock prevents concurrent operator retries racing those checkpoints.
+    ticket_graph_apply_lock: tokio::sync::Mutex<()>,
     action_approvals: crate::action_approval::ActionApprovalStore,
     tickets: Arc<crate::tickets::Tickets>,
     coordinator_sessions: std::sync::Mutex<crate::coordinator::CoordinatorSessions>,
@@ -402,6 +407,7 @@ impl Daemon {
             repos,
             onboarding_sessions,
             onboarding_apply_lock: tokio::sync::Mutex::new(()),
+            ticket_graph_apply_lock: tokio::sync::Mutex::new(()),
             action_approvals,
             tickets,
             coordinator_sessions,
@@ -3550,7 +3556,18 @@ impl Daemon {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
-        let action = match self.resolve_workflow_action(params.action) {
+        match params.kind.as_deref().unwrap_or("workflow.run") {
+            "ticket_graph.apply" => {
+                return self.handle_ticket_graph_apply_execute(req, params).await;
+            }
+            "workflow.run" => {}
+            _ => return Response::err(req.id, codes::BAD_PARAMS, "unsupported action kind"),
+        }
+        let workflow_params: WorkflowRunParams = match serde_json::from_value(params.action) {
+            Ok(action) => action,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        };
+        let action = match self.resolve_workflow_action(workflow_params) {
             Ok(action) => action,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
         };
@@ -3637,6 +3654,217 @@ impl Daemon {
         }
     }
 
+    async fn handle_ticket_graph_apply_execute(
+        &self,
+        req: Request,
+        params: FactoryExecuteParams,
+    ) -> Response {
+        let submitted = match self.resolve_ticket_graph_apply_action(params.action) {
+            Ok(action) => action,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        };
+        let proposal = match self.action_approvals.proposal(&params.proposal_id) {
+            Ok(Some(proposal)) => proposal,
+            Ok(None) => return Response::err(req.id, codes::FORBIDDEN, "unknown proposal"),
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        let stored = match proposal.action.clone() {
+            FactoryAction::TicketGraphApply(action) => action,
+            FactoryAction::WorkflowRun(_) => {
+                return Response::err(req.id, codes::FORBIDDEN, "proposal action kind mismatch");
+            }
+        };
+        if submitted.repo != stored.repo
+            || submitted.repo_identity != stored.repo_identity
+            || submitted.repo_path != stored.repo_path
+            || submitted.graph != stored.graph
+            || submitted.initiative != stored.initiative
+            || submitted.apply_plan != stored.apply_plan
+        {
+            return Response::err(req.id, codes::FORBIDDEN, "action digest mismatch");
+        }
+
+        let factory_action = FactoryAction::TicketGraphApply(stored.clone());
+        let grant = match self.action_approvals.begin_execute_action(
+            &params.proposal_id,
+            &params.digest,
+            &req.caller,
+            &factory_action,
+        ) {
+            Ok(grant) => grant,
+            Err(e) => return Response::err(req.id, codes::FORBIDDEN, e.to_string()),
+        };
+        let _guard = self.ticket_graph_apply_lock.lock().await;
+        let existing = match self.action_approvals.ticket_graph_result(&params.proposal_id) {
+            Ok(result) => result,
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        if let Some(mut result) = existing.clone().filter(|result| result.status == "completed") {
+            result.idempotent_replay = true;
+            return Response::ok(req.id, json!({"result": result, "approval": grant}));
+        }
+        if existing.is_none() && submitted.preconditions != stored.preconditions {
+            let message = format!(
+                "ticket graph CAS mismatch: expected repo_head={} ticket_store_digest={}, actual repo_head={} ticket_store_digest={}",
+                stored.preconditions.repo_head,
+                stored.preconditions.ticket_store_digest,
+                submitted.preconditions.repo_head,
+                submitted.preconditions.ticket_store_digest,
+            );
+            let _ = self
+                .action_approvals
+                .finish_failed(&params.proposal_id, &message);
+            return Response::err(req.id, codes::FORBIDDEN, message);
+        }
+        let Some(execution_id) = grant.execution_id.clone() else {
+            return Response::err(req.id, codes::INTERNAL, "approval missing execution id");
+        };
+        let mut result = existing.unwrap_or_else(|| TicketGraphApplyExecutionResult {
+            execution_id: execution_id.clone(),
+            graph_id: stored.graph.id.clone(),
+            graph_node_to_ticket_id: BTreeMap::new(),
+            created_ticket_ids: Vec::new(),
+            created_dependency_edges: Vec::new(),
+            idempotent_replay: false,
+            status: "executing".into(),
+        });
+        if result.graph_node_to_ticket_id.is_empty() {
+            result = match self
+                .action_approvals
+                .checkpoint_ticket_graph_result(&params.proposal_id, result)
+            {
+                Ok(result) => result,
+                Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+            };
+        }
+
+        let applied = self
+            .apply_ticket_graph(&params.proposal_id, &stored, result)
+            .await;
+        match applied {
+            Ok(mut result) => {
+                result.status = "completed".into();
+                let result = match self
+                    .action_approvals
+                    .checkpoint_ticket_graph_result(&params.proposal_id, result)
+                {
+                    Ok(result) => result,
+                    Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+                };
+                let approval = match self
+                    .action_approvals
+                    .finish_success(&params.proposal_id, &execution_id)
+                {
+                    Ok(approval) => approval,
+                    Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+                };
+                self.emit_factory_event(crate::factory_events::event_tuple(
+                    &stored.repo_identity,
+                    &req.caller,
+                    "ticket.changed",
+                    "ticket_graph.apply",
+                    json!({"graph_id": stored.graph.id, "execution_id": execution_id}),
+                    "approved ticket graph applied",
+                    json!({"proposal_id": params.proposal_id, "status": result.status, "created_ticket_ids": result.created_ticket_ids}),
+                ));
+                Response::ok(req.id, json!({"result": result, "approval": approval}))
+            }
+            Err(e) => {
+                let _ = self
+                    .action_approvals
+                    .finish_failed(&params.proposal_id, &e.to_string());
+                Response::err(req.id, codes::INTERNAL, e.to_string())
+            }
+        }
+    }
+
+    async fn apply_ticket_graph(
+        &self,
+        proposal_id: &str,
+        action: &TicketGraphApplyAction,
+        mut result: TicketGraphApplyExecutionResult,
+    ) -> rk_core::Result<TicketGraphApplyExecutionResult> {
+        for node_id in &action.apply_plan.topological_order {
+            if result.graph_node_to_ticket_id.contains_key(node_id) {
+                continue;
+            }
+            let create = action
+                .apply_plan
+                .creates
+                .iter()
+                .find(|create| create.stable_graph_node_id == *node_id)
+                .ok_or_else(|| {
+                    rk_core::Error::other(format!(
+                        "ticket graph apply plan missing create for {node_id}"
+                    ))
+                })?;
+            let labels = std::iter::once("product-to-code".to_string())
+                .chain(std::iter::once(format!("graph:{}", action.graph.id)))
+                .chain(std::iter::once(format!("node:{node_id}")))
+                .chain(
+                    create
+                        .acceptance_criterion_ids
+                        .iter()
+                        .map(|criterion| format!("criterion:{criterion}")),
+                )
+                .collect();
+            let (ticket, _created) = self
+                .tickets
+                .create_idempotent(crate::tickets::NewTicket {
+                    title: create.title.clone(),
+                    body: Some(create.description.clone()),
+                    scope: action.repo_identity.clone(),
+                    parent: None,
+                    priority: "normal".into(),
+                    labels,
+                    depends_on: Vec::new(),
+                    created_by: Some(format!("factory:{}", result.execution_id)),
+                    coalesce_key: Some(format!(
+                        "factory:ticket-graph:{}:{node_id}",
+                        result.execution_id
+                    )),
+                })
+                .await?;
+            result
+                .graph_node_to_ticket_id
+                .insert(node_id.clone(), ticket.identity.clone());
+            if !result.created_ticket_ids.contains(&ticket.identity) {
+                result.created_ticket_ids.push(ticket.identity);
+            }
+            result = self
+                .action_approvals
+                .checkpoint_ticket_graph_result(proposal_id, result)?;
+        }
+
+        for dependency in &action.apply_plan.dependencies {
+            let blocked_ticket_id = result
+                .graph_node_to_ticket_id
+                .get(&dependency.blocked_graph_node_id)
+                .cloned()
+                .ok_or_else(|| rk_core::Error::other("missing blocked ticket mapping"))?;
+            let dependency_ticket_id = result
+                .graph_node_to_ticket_id
+                .get(&dependency.dependency_graph_node_id)
+                .cloned()
+                .ok_or_else(|| rk_core::Error::other("missing dependency ticket mapping"))?;
+            let edge = TicketGraphAppliedEdge {
+                blocked_ticket_id: blocked_ticket_id.clone(),
+                dependency_ticket_id: dependency_ticket_id.clone(),
+            };
+            if result.created_dependency_edges.contains(&edge) {
+                continue;
+            }
+            self.tickets
+                .add_dep(&blocked_ticket_id, &dependency_ticket_id)
+                .await?;
+            result.created_dependency_edges.push(edge);
+            result = self
+                .action_approvals
+                .checkpoint_ticket_graph_result(proposal_id, result)?;
+        }
+        Ok(result)
+    }
+
     fn resolve_workflow_action(
         &self,
         params: WorkflowRunParams,
@@ -3699,6 +3927,11 @@ impl Daemon {
         let apply_plan = params
             .graph
             .apply_plan_for_initiative(&record.name, &params.initiative)?;
+        drop(repos);
+        let preconditions = TicketGraphApplyPreconditions {
+            repo_head: repository_head(&canonical_path)?,
+            ticket_store_digest: self.tickets.snapshot_digest(&record.name)?,
+        };
         Ok(TicketGraphApplyAction {
             repo: record.name.clone(),
             repo_identity: record.name,
@@ -3706,6 +3939,7 @@ impl Daemon {
             graph: params.graph,
             initiative: params.initiative,
             apply_plan,
+            preconditions,
         })
     }
 
@@ -4689,7 +4923,9 @@ struct FactoryApproveParams {
 struct FactoryExecuteParams {
     proposal_id: String,
     digest: String,
-    action: WorkflowRunParams,
+    #[serde(default)]
+    kind: Option<String>,
+    action: Value,
 }
 
 #[derive(Deserialize)]
@@ -4829,6 +5065,27 @@ struct BlockingParams {
     pattern: PatternParams,
     #[serde(default)]
     timeout_ms: Option<u64>,
+}
+
+fn repository_head(path: &std::path::Path) -> rk_core::Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "HEAD"])
+        .env("LC_ALL", "C")
+        .output()?;
+    if !output.status.success() {
+        return Err(rk_core::Error::other(format!(
+            "cannot resolve repository HEAD for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if head.is_empty() {
+        return Err(rk_core::Error::other("repository HEAD is empty"));
+    }
+    Ok(head)
 }
 
 /// Read a repo's configured URL for `remote` by shelling to git, so the host

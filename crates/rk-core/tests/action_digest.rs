@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use chrono::{TimeZone, Utc};
 use rk_core::action::{
     action_digest, canonical_digest, canonical_json_bytes, ActionKind, ActionProposal, ActionRisk,
-    ActionScope, FactoryAction, RepoScope, TicketGraphApplyAction, WorkflowRunAction,
+    ActionScope, FactoryAction, RepoScope, TicketGraphApplyAction, TicketGraphApplyPreconditions,
+    WorkflowRunAction,
 };
 use rk_core::product_to_code::contracts::{
     AcceptanceCriterion, InitiativeContract, TicketGraph, TicketGraphEdge, TicketGraphNode,
@@ -90,6 +91,10 @@ fn ticket_graph_apply() -> TicketGraphApplyAction {
         graph,
         initiative,
         apply_plan,
+        preconditions: TicketGraphApplyPreconditions {
+            repo_head: "abc123".into(),
+            ticket_store_digest: "tickets-empty".into(),
+        },
     }
 }
 

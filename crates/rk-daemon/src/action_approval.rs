@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, path::Path, sync::Mutex};
 
 use chrono::{Duration, Utc};
 use rk_core::action::{
-    action_digest, ActionDigestPayload, ActionProposal, ActionScope, ApprovalGrant, ApprovalStatus,
-    FactoryAction, RepoScope, WorkflowRunAction,
+    action_digest, ActionDigestPayload, ActionKind, ActionProposal, ActionScope, ApprovalGrant,
+    ApprovalStatus, FactoryAction, TicketGraphApplyExecutionResult, WorkflowRunAction,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 struct StoreData {
     proposals: BTreeMap<String, ActionProposal>,
     grants: BTreeMap<String, ApprovalGrant>,
+    #[serde(default)]
+    ticket_graph_results: BTreeMap<String, TicketGraphApplyExecutionResult>,
 }
 
 pub struct ActionApprovalStore {
@@ -127,7 +129,8 @@ impl ActionApprovalStore {
             approved_at: Utc::now(),
             expires_at: proposal.expires_at,
             execution_id: None,
-            instance_id: Some(bound_instance_id(&proposal.id, &proposal.digest)),
+            instance_id: (proposal.kind == ActionKind::WorkflowRun)
+                .then(|| bound_instance_id(&proposal.id, &proposal.digest)),
             failure: None,
             consumed_at: None,
         };
@@ -143,6 +146,21 @@ impl ActionApprovalStore {
         caller: &str,
         action: &WorkflowRunAction,
     ) -> rk_core::Result<ApprovalGrant> {
+        self.begin_execute_action(
+            proposal_id,
+            digest,
+            caller,
+            &FactoryAction::WorkflowRun(action.clone()),
+        )
+    }
+
+    pub fn begin_execute_action(
+        &self,
+        proposal_id: &str,
+        digest: &str,
+        caller: &str,
+        action: &FactoryAction,
+    ) -> rk_core::Result<ApprovalGrant> {
         let mut data = self.lock()?;
         let proposal = data
             .proposals
@@ -151,12 +169,9 @@ impl ActionApprovalStore {
             .ok_or_else(|| rk_core::Error::other("unknown proposal"))?;
         let mut recomputed = proposal.clone();
         recomputed.digest.clear();
-        recomputed.action = FactoryAction::WorkflowRun(action.clone());
+        recomputed.action = action.clone();
         recomputed.scope = ActionScope {
-            repo: RepoScope {
-                identity: action.repo_identity.clone(),
-                path: action.repo_path.clone(),
-            },
+            repo: action.repo_scope(),
         };
         let payload = ActionDigestPayload::from_proposal(&recomputed);
         recomputed.digest = action_digest(&payload)?;
@@ -185,7 +200,7 @@ impl ActionApprovalStore {
                         Utc::now().timestamp_nanos_opt().unwrap_or_default()
                     ));
                 }
-                if grant.instance_id.is_none() {
+                if grant.instance_id.is_none() && action.kind() == ActionKind::WorkflowRun {
                     grant.instance_id = Some(bound_instance_id(&proposal.id, &proposal.digest));
                 }
                 grant.failure = None;
@@ -244,6 +259,67 @@ impl ActionApprovalStore {
     pub fn list_grants(&self) -> rk_core::Result<Vec<ApprovalGrant>> {
         let data = self.lock()?;
         Ok(data.grants.values().cloned().collect())
+    }
+
+    pub fn proposal(&self, proposal_id: &str) -> rk_core::Result<Option<ActionProposal>> {
+        let data = self.lock()?;
+        Ok(data.proposals.get(proposal_id).cloned())
+    }
+
+    pub fn ticket_graph_result(
+        &self,
+        proposal_id: &str,
+    ) -> rk_core::Result<Option<TicketGraphApplyExecutionResult>> {
+        let data = self.lock()?;
+        Ok(data.ticket_graph_results.get(proposal_id).cloned())
+    }
+
+    pub fn checkpoint_ticket_graph_result(
+        &self,
+        proposal_id: &str,
+        checkpoint: TicketGraphApplyExecutionResult,
+    ) -> rk_core::Result<TicketGraphApplyExecutionResult> {
+        let mut data = self.lock()?;
+        let merged = data
+            .ticket_graph_results
+            .entry(proposal_id.to_string())
+            .or_insert_with(|| checkpoint.clone());
+        if merged.execution_id != checkpoint.execution_id || merged.graph_id != checkpoint.graph_id
+        {
+            return Err(rk_core::Error::other(
+                "ticket graph execution checkpoint binding mismatch",
+            ));
+        }
+        for (node, ticket) in checkpoint.graph_node_to_ticket_id {
+            match merged.graph_node_to_ticket_id.get(&node) {
+                Some(existing) if existing != &ticket => {
+                    return Err(rk_core::Error::other(
+                        "ticket graph node mapping checkpoint mismatch",
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    merged.graph_node_to_ticket_id.insert(node, ticket);
+                }
+            }
+        }
+        for ticket in checkpoint.created_ticket_ids {
+            if !merged.created_ticket_ids.contains(&ticket) {
+                merged.created_ticket_ids.push(ticket);
+            }
+        }
+        for edge in checkpoint.created_dependency_edges {
+            if !merged.created_dependency_edges.contains(&edge) {
+                merged.created_dependency_edges.push(edge);
+            }
+        }
+        if checkpoint.status == "completed" {
+            merged.status = checkpoint.status;
+        }
+        merged.idempotent_replay = false;
+        let out = merged.clone();
+        self.persist(&data)?;
+        Ok(out)
     }
 
     fn lock(&self) -> rk_core::Result<std::sync::MutexGuard<'_, StoreData>> {
@@ -468,5 +544,32 @@ mod tests {
         assert_eq!(first.status, ApprovalStatus::Executing);
         assert_eq!(first.instance_id, second.instance_id);
         assert!(first.instance_id.is_some());
+    }
+
+    #[test]
+    fn ticket_graph_execution_checkpoint_persists_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("approvals.json");
+        let checkpoint = TicketGraphApplyExecutionResult {
+            execution_id: "exec-1".into(),
+            graph_id: "GRAPH-1".into(),
+            graph_node_to_ticket_id: [("NODE-1".into(), "TKT-1".into())].into_iter().collect(),
+            created_ticket_ids: vec!["TKT-1".into()],
+            created_dependency_edges: Vec::new(),
+            idempotent_replay: false,
+            status: "executing".into(),
+        };
+        ActionApprovalStore::load(&path)
+            .unwrap()
+            .checkpoint_ticket_graph_result("proposal-1", checkpoint.clone())
+            .unwrap();
+
+        assert_eq!(
+            ActionApprovalStore::load(&path)
+                .unwrap()
+                .ticket_graph_result("proposal-1")
+                .unwrap(),
+            Some(checkpoint)
+        );
     }
 }

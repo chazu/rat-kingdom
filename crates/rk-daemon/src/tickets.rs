@@ -11,6 +11,7 @@
 //! All mutations (create and update) serialize through one lock so the
 //! take-and-replace of an update cannot interleave with another mutation.
 
+use rk_core::action::canonical_digest;
 use rk_core::id::RecordId;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
 use rk_space::Space;
@@ -109,7 +110,28 @@ impl Tickets {
     }
 
     pub async fn create(&self, t: NewTicket) -> rk_core::Result<Tuple> {
+        self.create_idempotent(t)
+            .await
+            .map(|(ticket, _created)| ticket)
+    }
+
+    /// Create once for a stable coalesce key. The lookup and insert share the
+    /// ticket mutation lock, so concurrent/restarted factory execution cannot
+    /// mint two tickets for the same graph node.
+    pub async fn create_idempotent(&self, t: NewTicket) -> rk_core::Result<(Tuple, bool)> {
         let _guard = self.lock.lock().await;
+        if let Some(key) = t.coalesce_key.as_deref() {
+            if let Some(existing) = self
+                .space
+                .scan(&Pattern::category(Category::Task).scope(&t.scope))?
+                .into_iter()
+                .find(|ticket| {
+                    ticket.payload.get("coalesce_key").and_then(Value::as_str) == Some(key)
+                })
+            {
+                return Ok((existing, false));
+            }
+        }
         // Dependencies must reference tickets that already exist. (A brand-new
         // ticket has no dependents, so it can never close a cycle here.)
         for dep in &t.depends_on {
@@ -140,7 +162,20 @@ impl Tickets {
         let tuple = Tuple::new(Category::Task, t.scope, id, self.castle.clone(), payload)
             .with_lifecycle(Lifecycle::Session);
         self.space.out(tuple.clone())?;
-        Ok(tuple)
+        Ok((tuple, true))
+    }
+
+    /// Deterministic CAS digest over the repository's current ticket identities
+    /// and payloads. This deliberately excludes tuple timestamps/strength so an
+    /// unrelated storage rewrite cannot invalidate an approved graph apply.
+    pub fn snapshot_digest(&self, scope: &str) -> rk_core::Result<String> {
+        let mut rows = self
+            .list(Some(scope.to_string()), None, None)?
+            .into_iter()
+            .map(|ticket| (ticket.identity, ticket.payload))
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        canonical_digest(&rows)
     }
 
     pub fn get(&self, id: &str) -> rk_core::Result<Option<Tuple>> {

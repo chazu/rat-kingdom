@@ -62,6 +62,30 @@ pub struct TicketGraphApplyAction {
     pub graph: TicketGraph,
     pub initiative: InitiativeContract,
     pub apply_plan: TicketGraphApplyPlan,
+    pub preconditions: TicketGraphApplyPreconditions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TicketGraphApplyPreconditions {
+    pub repo_head: String,
+    pub ticket_store_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TicketGraphAppliedEdge {
+    pub blocked_ticket_id: String,
+    pub dependency_ticket_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TicketGraphApplyExecutionResult {
+    pub execution_id: String,
+    pub graph_id: String,
+    pub graph_node_to_ticket_id: BTreeMap<String, String>,
+    pub created_ticket_ids: Vec<String>,
+    pub created_dependency_edges: Vec<TicketGraphAppliedEdge>,
+    pub idempotent_replay: bool,
+    pub status: String,
 }
 
 /// A canonical factory action. Human-readable commands are never digest input.
