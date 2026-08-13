@@ -1,5 +1,6 @@
 import copy
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -464,6 +465,31 @@ class FactoryForemanCliTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
                 self.assertIn("proposal", result.stderr)
                 self.assertIn("object", result.stderr)
+
+    def test_validate_proposal_subprocess_routes_non_object_json_error_to_stderr(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "proposal.json"
+            path.write_text("[]", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "factory_foreman.py"),
+                    "validate-proposal",
+                    "--proposal-file",
+                    str(path),
+                    "--approved-id",
+                    "approved-id",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("invalid proposal object", result.stderr)
+        self.assertNotIn("argv", result.stderr)
 
     def test_propose_workflow_rejects_invalid_param_without_equals(self):
         result = self.run_cli(

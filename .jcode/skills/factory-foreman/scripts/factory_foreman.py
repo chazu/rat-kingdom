@@ -7,6 +7,7 @@ import hashlib
 import json
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -735,6 +736,8 @@ def proposal_id(argv: list[str]) -> str:
 
 if __name__ == "__main__":
     result = main()
-    print(result.stdout, end="")
-    print(result.stderr, end="")
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
     raise SystemExit(result.returncode)
