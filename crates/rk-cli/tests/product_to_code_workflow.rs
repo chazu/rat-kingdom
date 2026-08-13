@@ -340,7 +340,11 @@ mod product_to_code_workflow {
         assert!(value["approval_instructions"]
             .as_str()
             .unwrap()
-            .contains("rk factory approve"));
+            .contains("rk factory approve --proposal-file"));
+        assert!(value["approval_instructions"]
+            .as_str()
+            .unwrap()
+            .contains("rk factory execute-action --proposal-file"));
         assert!(value["authority_boundary"]
             .as_str()
             .unwrap()

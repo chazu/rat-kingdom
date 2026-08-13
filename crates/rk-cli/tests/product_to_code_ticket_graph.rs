@@ -394,6 +394,15 @@ mod product_to_code_ticket_graph {
         assert_eq!(value["proposal_id"], value["digest"]);
         assert_eq!(value["proposal_id"].as_str().unwrap().len(), 64);
         assert_eq!(value["canonical_action"]["kind"], "ticket_graph.apply");
+        assert_eq!(value["execution_action"]["repo"], "fixture");
+        assert_eq!(
+            value["execution_action"]["graph"]["id"],
+            "GRAPH-product-to-code"
+        );
+        assert_eq!(
+            value["execution_action"]["initiative"]["id"],
+            "INIT-product-to-code"
+        );
         assert_eq!(
             value["canonical_action"]["graph"]["nodes"][0]["id"],
             "NODE-contracts"
@@ -411,11 +420,11 @@ mod product_to_code_ticket_graph {
         assert!(value["approval_instructions"]
             .as_str()
             .unwrap()
-            .contains("rk factory approve"));
+            .contains("rk factory approve --proposal-file"));
         assert!(value["approval_instructions"]
             .as_str()
             .unwrap()
-            .contains(value["proposal_id"].as_str().unwrap()));
+            .contains("rk factory execute-action --proposal-file"));
         assert!(value["authority_boundary"]
             .as_str()
             .unwrap()
@@ -424,6 +433,59 @@ mod product_to_code_ticket_graph {
             .as_str()
             .unwrap()
             .contains("local CLI did not apply"));
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_graph_proposal_file_approves_and_executes_ticket_minting() {
+        let (home, _repo, handle) = daemon_fixture().await;
+        let layout = Layout::at(home.path());
+        let proposal = json_success(run_with_layout(
+            &layout,
+            &[
+                "--json",
+                "product-to-code",
+                "graph",
+                "propose-apply",
+                "--graph",
+                &fixture("ticket_graph_valid.json"),
+                "--initiative",
+                &fixture("initiative_minimal.json"),
+                "--repo",
+                "fixture",
+            ],
+        ));
+        let proposal_file = home.path().join("graph-proposal.json");
+        fs::write(&proposal_file, serde_json::to_vec_pretty(&proposal).unwrap()).unwrap();
+
+        let approved = json_success(run_with_layout(
+            &layout,
+            &[
+                "--json",
+                "factory",
+                "approve",
+                "--proposal-file",
+                proposal_file.to_str().unwrap(),
+            ],
+        ));
+        assert_eq!(approved["approval"]["proposal_id"], proposal["proposal_id"]);
+
+        let executed = json_success(run_with_layout(
+            &layout,
+            &[
+                "--json",
+                "factory",
+                "execute-action",
+                "--proposal-file",
+                proposal_file.to_str().unwrap(),
+            ],
+        ));
+        assert_eq!(executed["result"]["status"], "completed");
+        assert_eq!(executed["approval"]["status"], "consumed");
+        let created = executed["result"]["created_ticket_ids"].as_array().unwrap();
+        assert_eq!(created.len(), 2);
+        assert!(created.iter().all(|id| id.as_str().unwrap().starts_with("TKT-")));
 
         handle.abort();
     }

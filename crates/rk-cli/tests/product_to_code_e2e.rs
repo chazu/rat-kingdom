@@ -98,6 +98,22 @@ mod product_to_code_e2e {
         git(dir.path(), &["config", "user.email", "test@example.com"]);
         git(dir.path(), &["config", "user.name", "Test"]);
         fs::write(dir.path().join("README.md"), "# Fixture\n").unwrap();
+        fs::create_dir_all(dir.path().join(".rk/workflows")).unwrap();
+        fs::write(
+            dir.path().join(".rk/workflows/implement-featureset.cue"),
+            r#"
+workflow: {
+    name: "implement-featureset"
+    params: {
+        taskId: {type: "string", required: true}
+        taskDescription: {type: "string", required: true}
+    }
+    agents: {default: {harness: "fake"}}
+    steps: [{type: "gate", gateType: "timer", duration: "1s"}]
+}
+"#,
+        )
+        .unwrap();
         git(dir.path(), &["add", "."]);
         git(dir.path(), &["commit", "-m", "initial"]);
         dir
@@ -180,9 +196,9 @@ mod product_to_code_e2e {
 
     // -- Offline lifecycle stages -----------------------------------------
 
-    /// Research validates, the graph validates, the graph dry-run mints exactly
-    /// the plan without mutating anything, and the daemon-backed graph apply and
-    /// workflow dispatch produce typed proposals only.
+    /// Research validates, the graph validates, the graph dry-run previews the
+    /// plan, and an operator can approve and execute the typed dispatch proposal
+    /// through the public factory CLI without any local mutation shortcut.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_e2e_product_to_code_happy_path_produces_apply_and_dispatch_proposals() {
         // Stage 1: research validates offline.
@@ -262,17 +278,44 @@ mod product_to_code_e2e {
         ));
         assert_eq!(value["kind"], "product_to_code.dispatch");
         assert_eq!(value["submitted_to_daemon"], true);
+        assert_eq!(value["execution_action"]["repo"], "fixture");
+        assert_eq!(
+            value["execution_action"]["graph_id"],
+            "GRAPH-product-to-code"
+        );
         let dispatches = value["canonical_action"]["dispatches"].as_array().unwrap();
         assert_eq!(dispatches.len(), 1);
         assert_eq!(dispatches[0]["graph_node_id"], "NODE-contracts");
         let minted = mapping["NODE-contracts"].as_str().unwrap();
         assert!(minted.starts_with("TKT-"));
         assert_eq!(dispatches[0]["ticket_id"], minted);
-        // No local approve/apply shortcut is offered.
-        assert!(value["approval_instructions"]
-            .as_str()
-            .unwrap()
-            .contains("rk factory approve"));
+        let proposal_file = home.path().join("dispatch-proposal.json");
+        fs::write(&proposal_file, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let approved = json_success(run_with_layout(
+            &layout,
+            &[
+                "--json",
+                "factory",
+                "approve",
+                "--proposal-file",
+                proposal_file.to_str().unwrap(),
+            ],
+        ));
+        assert_eq!(approved["approval"]["proposal_id"], value["proposal_id"]);
+        let executed = json_success(run_with_layout(
+            &layout,
+            &[
+                "--json",
+                "factory",
+                "execute-action",
+                "--proposal-file",
+                proposal_file.to_str().unwrap(),
+            ],
+        ));
+        assert_eq!(executed["result"]["status"], "completed");
+        assert_eq!(executed["approval"]["status"], "consumed");
+        assert_eq!(executed["result"]["dispatched"].as_array().unwrap().len(), 1);
+        assert_eq!(executed["result"]["blocked"].as_array().unwrap().len(), 1);
 
         handle.abort();
     }

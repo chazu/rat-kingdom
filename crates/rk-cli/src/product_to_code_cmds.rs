@@ -327,6 +327,7 @@ async fn run_workflow(
         "dispatches": dispatches,
         "blocked": blocked,
     });
+    let execution_action = action.clone();
     let result = client
         .call(
             "factory.propose_action",
@@ -347,8 +348,9 @@ async fn run_workflow(
         "dispatches": result["proposal"]["action"]["dispatches"],
         "blocked": result["proposal"]["action"]["blocked"],
         "canonical_action": result["proposal"]["action"],
+        "execution_action": execution_action,
         "human_display": format!("Review and approve product_to_code.dispatch proposal {proposal_id}"),
-        "approval_instructions": format!("Use rk factory approve {proposal_id} {digest}; no local approved-id dispatch path exists here"),
+        "approval_instructions": "Save this JSON, then run rk factory approve --proposal-file <proposal.json> followed by rk factory execute-action --proposal-file <proposal.json>",
         "proposal_id": proposal_id,
         "proposal": result.get("proposal").cloned().unwrap_or(serde_json::Value::Null),
         "digest": digest,
@@ -540,6 +542,7 @@ async fn run_graph(layout: &Layout, command: GraphCommand, json_output: bool) ->
                 "graph": graph,
                 "initiative": initiative,
             });
+            let execution_action = action.clone();
             let mut client = Client::connect_or_spawn(layout).await?;
             let result = client
                 .call(
@@ -556,8 +559,9 @@ async fn run_graph(layout: &Layout, command: GraphCommand, json_output: bool) ->
                 "authority": "daemon accepted authority boundary; local CLI did not apply ticket mutations",
                 "authority_boundary": "daemon factory.propose_action owns proposal persistence; approval/apply happen outside this CLI command; local CLI did not apply ticket mutations",
                 "canonical_action": result["proposal"]["action"],
+                "execution_action": execution_action,
                 "human_display": format!("Review and approve ticket_graph.apply proposal {proposal_id}"),
-                "approval_instructions": format!("Use rk factory approve {proposal_id} {digest}; no local approved-id apply path exists here"),
+                "approval_instructions": "Save this JSON, then run rk factory approve --proposal-file <proposal.json> followed by rk factory execute-action --proposal-file <proposal.json>",
                 "proposal_id": proposal_id,
                 "proposal": result.get("proposal").cloned().unwrap_or(serde_json::Value::Null),
                 "digest": digest,
