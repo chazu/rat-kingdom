@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
 fn git(root: &Path, args: &[&str]) {
@@ -119,6 +119,32 @@ fn failed(output: Output, code: i32) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+struct ChildReaper {
+    child: Child,
+}
+
+impl ChildReaper {
+    fn new(child: Child) -> Self {
+        Self { child }
+    }
+
+    fn stdout(&mut self) -> std::process::ChildStdout {
+        self.child.stdout.take().unwrap()
+    }
+
+    fn kill_and_wait(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+    }
+}
+
+impl Drop for ChildReaper {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_factory_snapshot_json_uses_read_rpc_without_mutation() {
     let (home, _repo, handle) = fixture().await;
@@ -216,7 +242,7 @@ fn test_factory_read_commands_do_not_autostart_missing_daemon() {
 async fn test_factory_events_watch_streams_native_ndjson() {
     let (home, _repo, handle) = fixture().await;
     let layout = Layout::at(home.path());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rk"))
+    let child = Command::new(env!("CARGO_BIN_EXE_rk"))
         .args([
             "--json",
             "factory",
@@ -238,6 +264,7 @@ async fn test_factory_events_watch_streams_native_ndjson() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
+    let mut child = ChildReaper::new(child);
     std::thread::sleep(Duration::from_millis(200));
     successful_json(run_rk(
         &layout,
@@ -253,10 +280,10 @@ async fn test_factory_events_watch_streams_native_ndjson() {
         ],
     ));
 
-    let stdout = child.stdout.take().unwrap();
+    let stdout = child.stdout();
     let mut lines = BufReader::new(stdout).lines();
     let line = lines.next().unwrap().unwrap();
-    child.kill().unwrap();
+    child.kill_and_wait();
     let event: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(event["kind"], "approval.changed");
     assert_eq!(event["repo"], "fixture");
