@@ -322,6 +322,11 @@ impl Daemon {
         self.review_sweep_config = cfg;
     }
 
+    #[doc(hidden)]
+    pub fn set_request_clock_for_tests(&mut self, clock: fn() -> DateTime<Utc>) {
+        self.request_clock = clock;
+    }
+
     fn with_space(
         layout: Layout,
         castle: String,
