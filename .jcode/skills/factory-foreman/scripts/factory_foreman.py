@@ -807,6 +807,13 @@ def _append_factory_display(lines: list[str], snapshot: FactorySnapshot) -> None
 
 def _source_availability(data: Any) -> str:
     if isinstance(data, dict):
+        availability = data.get("availability")
+        if isinstance(availability, list):
+            if any(
+                isinstance(item, dict) and item.get("available") is False
+                for item in availability
+            ):
+                return "partially unavailable"
         source = data.get("source")
         if isinstance(source, dict) and source.get("available") is False:
             return "unavailable"
@@ -819,6 +826,14 @@ def _source_availability(data: Any) -> str:
 def _unobserved_metrics(data: Any) -> list[str]:
     metrics: list[str] = []
     if isinstance(data, dict):
+        for item in data.get("availability") or []:
+            if isinstance(item, dict) and item.get("available") is False:
+                family = item.get("source_family")
+                if isinstance(family, str) and family.strip():
+                    metrics.append(family)
+        for warning in data.get("warnings") or []:
+            if isinstance(warning, str) and warning.strip():
+                metrics.append(warning)
         for container in (data, data.get("source")):
             if isinstance(container, dict):
                 value = container.get("unobserved_metrics") or container.get("unobserved")
@@ -835,7 +850,7 @@ def _scorecard_rows(data: Any) -> list[dict[str, Any]]:
     if isinstance(data, list):
         return [row for row in data if isinstance(row, dict)]
     if isinstance(data, dict):
-        for key in ("rows", "scorecards", "groups", "items"):
+        for key in ("scorecards", "rows", "groups", "items"):
             value = data.get(key)
             if isinstance(value, list):
                 return [row for row in value if isinstance(row, dict)]
@@ -843,10 +858,19 @@ def _scorecard_rows(data: Any) -> list[dict[str, Any]]:
 
 
 def _samples(row: dict[str, Any]) -> float:
-    return _first_number(row, "samples", "sample_count", "n", "count") or 0
+    return _first_number(row, "sample_size", "samples", "sample_count", "n", "count") or 0
 
 
 def _row_label(row: dict[str, Any]) -> str:
+    group_key = row.get("group_key")
+    if isinstance(group_key, dict):
+        parts = [
+            _first_string(group_key, key)
+            for key in ("task_class", "workflow", "harness", "model")
+        ]
+        label = "/".join(part for part in parts if part)
+        if label:
+            return label
     return _first_string(row, "group", "label", "name", "agent", "workflow") or "scorecard row"
 
 
@@ -856,8 +880,19 @@ def _scorecard_metric_bits(row: dict[str, Any]) -> list[str]:
     if samples:
         bits.append(f"samples={int(samples) if samples.is_integer() else samples}")
     success_rate = _first_number(row, "success_rate", "successRate")
+    metrics = row.get("metrics")
+    if success_rate is None and isinstance(metrics, dict):
+        accepted = _first_number(metrics, "accepted")
+        runs = _first_number(metrics, "accepted_sample_size", "runs")
+        if accepted is not None and runs:
+            success_rate = accepted / runs
     if success_rate is not None:
         bits.append(f"success_rate={success_rate:g}")
+    if isinstance(metrics, dict):
+        for key in ("rework_sample_size", "ci_sample_size", "cost_sample_size", "lead_time_sample_size"):
+            value = _first_number(metrics, key)
+            if value == 0:
+                bits.append(f"{key}=unobserved")
     return bits
 
 
@@ -871,8 +906,10 @@ def _recommendation_lines(data: Any) -> list[str]:
     lines: list[str] = []
     for item in value:
         if isinstance(item, dict):
+            if item.get("suppressed") is True:
+                continue
             summary = _first_string(item, "summary", "recommendation", "title", "message")
-            rationale = _first_string(item, "rationale", "reason")
+            rationale = _first_string(item, "advice", "rationale", "reason")
             if summary:
                 suffix = f" Rationale: {rationale}" if rationale else ""
                 lines.append(f"- ADVISORY only: {summary}{suffix}")

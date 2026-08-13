@@ -152,15 +152,56 @@ class FactoryForemanSnapshotTests(unittest.TestCase):
             0,
             json.dumps(
                 {
-                    "source": {"available": True, "unobserved_metrics": ["review_latency"]},
-                    "rows": [
+                    "schema_version": 1,
+                    "repo": REPO,
+                    "generated_at": "1970-01-01T00:00:00Z",
+                    "group_by": "Composite",
+                    "include_archived": True,
+                    "source_counts": [
+                        {"source_family": "AgentRecord", "active_source_count": 12, "archived_source_count": 0, "event_count": 12},
+                        {"source_family": "Phase4CiSignal", "active_source_count": 0, "archived_source_count": 0, "event_count": 0},
+                    ],
+                    "availability": [
+                        {"source_family": "AgentRecord", "available": True},
+                        {"source_family": "Phase4CiSignal", "available": False},
+                    ],
+                    "scorecards": [
                         {
-                            "group": "agent:alpha",
-                            "samples": 8,
-                            "success_rate": 0.75,
-                            "unobserved_metrics": ["cost_usd"],
+                            "group_key": {
+                                "task_class": "repair",
+                                "workflow": "review-fix",
+                                "harness": "jcode",
+                                "model": "claude-api:claude-fable-5",
+                            },
+                            "projection": "Composite",
+                            "projected": False,
+                            "metrics": {
+                                "runs": 12,
+                                "accepted": 9,
+                                "accepted_sample_size": 12,
+                                "reworked": 2,
+                                "rework_sample_size": 12,
+                                "ci_failed": 0,
+                                "ci_sample_size": 0,
+                                "unobserved": 1,
+                            },
+                            "availability": {
+                                "by_family": {
+                                    "AgentRecord": {"source_family": "AgentRecord", "available": True},
+                                    "Phase4CiSignal": {"source_family": "Phase4CiSignal", "available": False},
+                                }
+                            },
+                            "sample_size": 12,
+                            "metric_sort_key": "Composite",
                         },
-                        {"group": "agent:beta", "samples": 1, "success_rate": 1.0},
+                        {
+                            "group_key": {"task_class": "repair", "workflow": "low", "harness": "jcode", "model": "gpt-5.5"},
+                            "metrics": {"runs": 1, "accepted": 1},
+                            "sample_size": 1,
+                        },
+                    ],
+                    "warnings": [
+                        "source_family_unobserved: Phase4CiSignal has no structured RK store; metrics reported as unobserved, not zero"
                     ],
                 }
             ),
@@ -170,12 +211,60 @@ class FactoryForemanSnapshotTests(unittest.TestCase):
             0,
             json.dumps(
                 {
+                    "schema_version": 1,
+                    "repo": REPO,
+                    "generated_at": "1970-01-01T00:00:00Z",
+                    "group_by": "Composite",
+                    "include_archived": True,
+                    "nature": "advisory",
                     "recommendations": [
                         {
-                            "summary": "Prefer alpha for repair workflows.",
-                            "rationale": "Higher observed success rate.",
+                            "id": "low-acceptance:repair/review-fix/jcode/claude-api:claude-fable-5",
+                            "severity": "Medium",
+                            "rule": "LowAcceptance",
+                            "subject_group_key": {
+                                "task_class": "repair",
+                                "workflow": "review-fix",
+                                "harness": "jcode",
+                                "model": "claude-api:claude-fable-5",
+                            },
+                            "summary": "Acceptance rate trails comparable peers.",
+                            "advice": "Inspect recurring failure causes before changing routing.",
+                            "sample_size": 12,
+                            "suppressed": False,
+                            "suppression_reason": None,
+                        },
+                        {
+                            "id": "suppressed-low-sample",
+                            "severity": "Low",
+                            "rule": "HighRework",
+                            "subject_group_key": {
+                                "task_class": "repair",
+                                "workflow": "low",
+                                "harness": "jcode",
+                                "model": "gpt-5.5",
+                            },
+                            "summary": "Do not show this suppressed recommendation as advice.",
+                            "advice": "This suppressed advice must stay hidden.",
+                            "sample_size": 1,
+                            "suppressed": True,
+                            "suppression_reason": "LowSample",
+                        },
+                    ],
+                    "suppressions": [
+                        {
+                            "rule": "LowAcceptance",
+                            "reason": "MetricUnavailable",
+                            "subject_group_key": {
+                                "task_class": "repair",
+                                "workflow": "review-fix",
+                                "harness": "jcode",
+                                "model": "claude-api:claude-fable-5",
+                            },
+                            "source_family": "Phase4CiSignal",
                         }
-                    ]
+                    ],
+                    "warnings": [],
                 }
             ),
             "",
@@ -457,13 +546,19 @@ class FactoryForemanCliTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("## Factory Foreman Display", result.stdout)
-        self.assertIn("Source availability: available", result.stdout)
+        self.assertIn("Source availability: partially unavailable", result.stdout)
         self.assertIn("Unobserved metrics:", result.stdout)
-        self.assertIn("review_latency", result.stdout)
-        self.assertIn("cost_usd", result.stdout)
-        self.assertIn("agent:alpha", result.stdout)
+        self.assertIn("Phase4CiSignal", result.stdout)
+        self.assertIn("metrics reported as unobserved, not zero", result.stdout)
+        self.assertIn("repair/review-fix/jcode/claude-api:claude-fable-5", result.stdout)
+        self.assertIn("samples=12", result.stdout)
+        self.assertIn("success_rate=0.75", result.stdout)
+        self.assertIn("ci_sample_size=unobserved", result.stdout)
         self.assertIn("Suppressed low-sample rows: 1", result.stdout)
-        self.assertIn("ADVISORY only: Prefer alpha for repair workflows.", result.stdout)
+        self.assertIn("ADVISORY only: Acceptance rate trails comparable peers.", result.stdout)
+        self.assertIn("Inspect recurring failure causes before changing routing.", result.stdout)
+        self.assertNotIn("Do not show this suppressed recommendation", result.stdout)
+        self.assertNotIn("This suppressed advice must stay hidden", result.stdout)
         forbidden = ["apply", "dispatch", "policy", "config", "workflow run", "ticket create", "approve", "gate"]
         for token in forbidden:
             self.assertNotIn(token, result.stdout.lower())
