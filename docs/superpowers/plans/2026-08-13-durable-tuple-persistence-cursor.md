@@ -4,7 +4,7 @@
 
 **Goal:** Replace ULID ordering as the reactor and multiplayer sync durable cursor with a SQLite-assigned persistence sequence that is safe across delayed writers, independent database connections, process restarts, and wall-clock rollback.
 
-**Architecture:** Add a nullable `commit_sequence` column to the local `tuples` table plus a singleton sequence state row and an `AFTER INSERT` trigger. SQLite serializes writers, so the trigger assigns sequence numbers in persistence order inside the tuple's transaction. Existing rows receive a deterministic ULID-order baseline during migration. `Pattern.after_id` remains unchanged because it is a public tuple-id/time-floor predicate, not a persistence cursor.
+**Architecture:** Add a nullable `commit_sequence` column to the local `tuples` table, an append-only tuple persistence journal, a singleton sequence state row, and an `AFTER INSERT` trigger. SQLite serializes writers, so the trigger assigns the sequence and journal snapshot in persistence order inside the tuple's transaction. Existing rows receive a deterministic ULID-order baseline during migration. `Pattern.after_id` remains unchanged because it is a public tuple-id/time-floor predicate, not a persistence cursor.
 
 **Tech Stack:** Rust, SQLite/rusqlite, rk-space, rk-daemon reactor, rk-daemon multiplayer sync.
 
@@ -15,7 +15,7 @@
 - Do not remove or reinterpret `Pattern.after_id`; raw clients use it as an ID/time-floor filter.
 - Sequence assignment must occur inside the same SQLite transaction as tuple persistence.
 - Existing databases must migrate automatically. Historical rows use deterministic `id ASC` order because original commit order cannot be reconstructed.
-- Existing ULID cursor files must be read once and mapped only against the migrated historical baseline. New cursor files contain decimal sequence numbers.
+- Existing ULID cursor files must trigger a safe at-least-once replay of the migrated historical baseline because the old ordering cannot reveal which delayed lower-ID rows it skipped. New cursor files contain decimal sequence numbers.
 - Cursor advancement remains at-least-once: save only after the full reactor or sync batch succeeds.
 - Do not run `cargo fmt` and do not touch `.git-issue/`.
 - Serialize Cargo with `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1` and `-j1`.
@@ -59,11 +59,11 @@ Extend `tuples` with nullable `commit_sequence INTEGER`. Add `tuple_sequence_sta
 
 - [ ] **Step 5: Add the bounded delta API**
 
-Read the singleton boundary first, then select current tuples with `commit_sequence > after AND commit_sequence <= boundary ORDER BY commit_sequence ASC`. Return the captured boundary even when rows were deleted, so consumers can advance past vanished tuples without rescanning forever.
+Read the singleton boundary first, then select immutable tuple snapshots from the persistence journal with `commit_sequence > after AND commit_sequence <= boundary ORDER BY commit_sequence ASC`. Deletes and takes remove only live rows, never the insertion event the reactor still has to observe.
 
 - [ ] **Step 6: Add legacy cursor mapping**
 
-Map an old ULID cursor to `MAX(commit_sequence)` only among rows at or below `legacy_backfill_sequence` whose tuple ID is at or below the old cursor. Never include post-migration rows in this conversion, because a delayed low-ID write must remain replayable.
+Map any old ULID cursor to sequence zero. Replaying the deterministic historical baseline is the only lossless conversion because a delayed low-ID row may already have been skipped by the old cursor. Existing reactor markers and sync tuple identity make the replay idempotent.
 
 - [ ] **Step 7: Run storage tests and existing migration tests**
 
@@ -200,7 +200,7 @@ Create an old `tuples` schema without `commit_sequence`, insert rows out of cons
 
 - [ ] **Step 2: Add legacy cursor-file acceptance**
 
-Write ULID-form reactor and sync cursor files over a migrated database and verify each consumer resumes from the historical floor, then rewrites its cursor as decimal sequence text.
+Write ULID-form reactor and sync cursor files over a migrated database and verify each consumer safely replays historical rows, including a delayed low-ID row below the old cursor, then rewrites its cursor as decimal sequence text.
 
 - [ ] **Step 3: Stress focused regressions**
 

@@ -104,18 +104,20 @@ so the feed is used **only as a wake signal**. The source of truth is a durable
 cursor over the store:
 
 1. Each cycle captures the store's current persistence-sequence boundary, then
-   scans still-live tuples whose `commit_sequence` is greater than the saved
-   cursor and no greater than that boundary, in persistence order. SQLite assigns
-   the sequence inside the tuple's write transaction, so delayed writers,
-   concurrent connections, daemon restarts, and wall-clock rollback cannot place
-   a committed tuple behind the cursor.
+   scans the append-only tuple persistence journal for events whose
+   `commit_sequence` is greater than the saved cursor and no greater than that
+   boundary, in persistence order. The journal keeps the tuple snapshot even if
+   a take, delete, or expiry removes the live row before the reactor scans it.
+   SQLite assigns the sequence and journal row inside the tuple's write
+   transaction, so delayed writers, concurrent connections, daemon restarts, and
+   wall-clock rollback cannot place a committed tuple behind the cursor.
 2. Every new tuple is matched against all loaded triggers and any matches are
    dispatched.
 3. The cursor advances to the captured boundary and is persisted as a decimal
-   sequence in `~/.rat-kingdom/reactor-cursor`. Advancing to the boundary also
-   moves past writes that were deleted before the scan, so an empty delta cannot
-   make the reactor rescan the same range forever. Legacy ULID cursor files are
-   mapped once against the migration's deterministic historical backfill.
+   sequence in `~/.rat-kingdom/reactor-cursor`. A legacy ULID cursor cannot prove
+   which delayed lower-ID writes the old ordering skipped, so migration safely
+   replays the deterministic historical baseline from sequence zero. Durable
+   reactor markers make that one-time at-least-once replay idempotent.
 
 This is the same cursor discipline the multiplayer sync loop uses. A dropped
 feed event changes nothing: the next scan — woken by the interval tick if
@@ -164,9 +166,9 @@ the reactor on nearly every tuple. Three things keep a cycle bounded:
 
 1. **Bounded firing scan.** The delta scan is
    `commit_sequence > cursor AND commit_sequence <= boundary`, resolved from the
-   unique persistence-sequence index rather than a full-table read filtered down
-   in Rust. A wake materialises only the still-live tuples committed since the
-   cursor, however large the store.
+   journal's persistence-sequence primary key rather than a full-table read
+   filtered down in Rust. A wake materialises only the tuple events committed
+   since the cursor, however large the live store or historical journal.
 2. **Cached trigger parse.** Trigger files are parsed with `cue` (a subprocess
    per file). The parse is cached and reused until a file's `(mtime, len)` stamp
    changes, so a steady-state burst reparses nothing — the `cue` shell-outs, the
