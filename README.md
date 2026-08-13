@@ -30,13 +30,13 @@ tuplespace db, worktrees, logs, workflow definitions, sync state.
 
 ## Factory Foreman
 
-The repository-local Jcode Factory Foreman provides deterministic read-only triage plus native daemon snapshots/events, five local stdio MCP tools, and digest-bound typed `workflow.run` proposals whose execution authority remains in the daemon. Start the compatibility triage helper with:
+The repository-local Jcode Factory Foreman provides deterministic read-only triage plus native daemon snapshots/events, read-only structured-source-only self-optimization scorecards and advisory recommendations, five local stdio MCP tools, and digest-bound typed `workflow.run` proposals whose execution authority remains in the daemon. Start the compatibility triage helper with:
 
 ```bash
 python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py triage --repo rat-kingdom --format markdown
 ```
 
-The helper never auto-starts the daemon: strict `rk --json daemon status` must pass before observation. Native typed automation uses `rk --json factory ...` or `rk-mcp`; exact digest approval is daemon-enforced for that factory path, but legacy `workflow.run` is not globally gated. See [docs/factory-foreman.md](docs/factory-foreman.md) for authority, CLI/MCP schemas, snapshot/replay/watch semantics, renderer usage, recovery, and limitations.
+The helper never auto-starts the daemon: strict `rk --json daemon status` must pass before observation. Native typed automation uses `rk --json factory ...` or `rk-mcp`; exact digest approval is daemon-enforced for that factory path, but legacy `workflow.run` is not globally gated. Scorecards and recommendations are read-only and advisory: they use structured sources, treat missing families as unobserved, keep static routing unchanged, and cannot mutate policy, config, workflows, tickets, approvals, or dispatch. See [docs/factory-foreman.md](docs/factory-foreman.md) for authority, CLI/MCP schemas, scorecard schema, recommendation thresholds, snapshot/replay/watch semantics, renderer usage, recovery, and limitations.
 
 The **product-to-code lifecycle** (`rk product-to-code ...`) turns a product initiative into implemented, independently verified code through offline, contract-validated artifacts and two canonical typed factory actions: `ticket_graph.apply` (mint tickets from a validated graph) and `product_to_code.dispatch` (launch `implement-featureset` for unblocked minted tickets). The CLI only proposes; the daemon applies after authenticated operator approval with status, digest, and CAS checks. See [docs/product-to-code.md](docs/product-to-code.md).
 

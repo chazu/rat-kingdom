@@ -236,6 +236,125 @@ The Phase 1 helper emits these categories:
 
 Unknown findings are intentionally preserved. They need future classifiers when recurring patterns become understood.
 
+## Read-only self-optimization scorecards and recommendations
+
+Phase 5 Factory Foreman analytics add two read-only daemon RPCs and matching CLI commands:
+
+```bash
+rk --json factory scorecards --repo <registered-name-or-path> --group-by all --include-archived
+rk --json factory recommend --repo <registered-name-or-path> --group-by all --include-archived
+```
+
+The daemon methods are `factory.scorecards` and `factory.recommend`. They are advisory observation APIs only. They do not rewrite policy, config, workflow definitions, workflow instances, tickets, approval grants, queues, routing tables, agent records, or dispatch state. They do not spawn agents, enqueue workflows, approve gates, close tickets, land changes, revert changes, run shell commands, or apply recommendations. Existing static routing remains authoritative and unchanged.
+
+### Durable structured outcome ledger semantics
+
+Scorecards are derived from durable structured outcome events. The ledger may be materialized or reconstructed from immutable snapshots, but it has event-ledger semantics rather than heuristic cache semantics. Each event carries schema version, deterministic event id, repository, source family, source id/version, archive marker and reason, observed timestamp, explicit dimensions, linked ids, recurrence/coalescing keys, and one structured metric payload.
+
+The normal event shape is:
+
+```json
+{
+  "schema_version": 1,
+  "event_id": "stable sha256 over canonical structured fields",
+  "repo": "rat-kingdom",
+  "source_family": "agent_record",
+  "source_id": "run-or-source-id",
+  "source_version": "optional version",
+  "archived": false,
+  "archive_reason": null,
+  "observed_at_ms": 0,
+  "task_class": "explicit-task-class-or-null",
+  "workflow": "workflow-id-or-null",
+  "harness": "harness-id-or-null",
+  "model": "model-id-or-null",
+  "agent_id": "agent-id-or-null",
+  "workflow_instance_id": "instance-id-or-null",
+  "ticket_id": "ticket-id-or-null",
+  "phase3_outcome_id": "outcome-id-or-null",
+  "phase4_signal_id": "signal-id-or-null",
+  "recurrence_key": "recurrence-key-or-null",
+  "coalesce_key": "coalesce-key-or-null",
+  "metric_payload": {"kind": "run", "count": 1}
+}
+```
+
+The event id is deterministic over canonical structured fields. It must not include ingestion time, current clock, vector order, map iteration order, transcript text, terminal text, or other unstable inputs.
+
+### Structured source-to-metric matrix
+
+Factory analytics are structured-source-only. They never parse raw logs, prose, issue comments, Markdown, prompt text, transcript text, terminal output, console output, or unstructured agent chatter. Missing fields become `unknown` or `unobserved`, not synthetic success or failure.
+
+| Metric or dimension | Structured source only | Forbidden inference | Missing behavior |
+| --- | --- | --- | --- |
+| `runs` | Explicit `AgentRecord` or workflow `Instance` ids. | Counting log lines, prompt files, status prose, or terminal output. | Unobserved unless explicit run dimensions exist. |
+| `task_class` | Explicit Phase 3 contract, ticket field, or structured outcome field. | Titles, labels, prose, filenames, workflow names, model names, prompts, or summaries. | Dimension is `unknown`; recommendations that require task class are suppressed. |
+| `workflow` | Workflow `Instance` id/name. | Command text, transcript text, or terminal output. | Dimension is `unknown`; same workflow comparisons are suppressed. |
+| `harness` | Explicit harness field on agent/run/instance data. | Binary path, CLI output, labels, or model route. | Dimension is `unknown` and can still be aggregated. |
+| `model` | Explicit model field on agent/run data. | Prompt text, transcript text, agent label, or inferred provider. | Dimension is `unknown` and can still be aggregated. |
+| `accepted` | Phase 3 verified delivery or land structured outcome. | Absence of rework, green CI, closing prose, or issue comments. | Metric unavailable for that run unless explicit outcome exists. |
+| `reworked` | Structured reviewer rework transition. | Review comment prose, TODO text, or labels. | Metric unavailable for that run. |
+| `ci_failed` / `ci_recovered` | Phase 4 CI signals. Recovery needs explicit failed then explicit recovered/pass for the same key. | Build-log text or later acceptance. | Metric unavailable unless structured signal exists. |
+| `reverted` | Structured revert event linked to run, ticket, or landed outcome. | Commit-message search or prose. | Metric unavailable for that run. |
+| `human_interventions` | Explicit gate, approval, or decision event. | Mentions, comments, delay, or approval prose. | Metric unavailable for that run. |
+| `recurrence` | Explicit non-empty `recurrence_key` or coalesce key. | Similarity over titles, stack traces, logs, or prose. | Metric unavailable without explicit key. |
+| `cost_micro_usd` | Structured cost or token usage plus explicit pricing snapshot. | Estimating from model name alone. | Metric unavailable for that run. |
+| `lead_time_ms` | Structured lifecycle timestamps for the same run. | File mtimes, commit times, transcript timestamps, or terminal timestamps. | Metric unavailable on missing or invalid timestamps. |
+| `archive_state` | Explicit source archive marker or archived-history read API. | Treating absence from an active query as archived. | Unknown archive state is `unobserved`. |
+
+`task_class` provenance is explicit by design. A task class must originate from a Phase 3 contract, ticket field, or structured outcome field. It is never inferred from logs, prose, labels, titles, filenames, workflow names, model names, harness names, or prompt text.
+
+### Archive semantics and missing sources
+
+Archived history is counted separately from active history. `include_archived=false` excludes archived events from metric numerators and denominators while still reporting archived availability and source counts. `include_archived=true` includes archived events in metrics and also exposes active/archived splits.
+
+A source is archived only when that source family carries an archive marker or is returned by an explicit archived-history API. Completed workflow instances are not archived merely because they are completed. Closed tickets are archived only when the ticket store defines or exposes that state as archived. Old CI signals, approvals, and outcomes are not archived by age alone.
+
+Missing source families are reported as unobserved, not as zero. Responses preserve source health with availability and source counts, including `available`, `active_source_count`, `archived_source_count`, and `event_count`. An unavailable metric must not look healthy, and recommendations must not emit action text for unavailable metrics.
+
+### Scorecard response schema and metrics
+
+`factory.scorecards` returns schema `1`, `repo`, `include_archived`, `scorecards`, top-level `source_counts`, and top-level `availability`. Rows are deterministic: sorted by composite group key, projection, metric key, and stable identifiers.
+
+Each scorecard row contains:
+
+- `group_key`: `task_class`, `workflow`, `harness`, and `model`, using `unknown` when a structured dimension is absent.
+- `projection`: `composite`, `task_class`, `workflow`, `harness`, `model`, `task_class_workflow`, or `all`.
+- `projected`: whether the row is a projection rather than the primary composite row.
+- `metrics`: `runs`, `accepted`, `reworked`, `ci_failed`, `ci_recovered`, `reverted`, `unknown`, `unobserved`, `active_runs`, `archived_runs`, `total_cost_micro_usd`, `average_cost_micro_usd`, `cost_sample_size`, `median_lead_time_ms`, `p95_lead_time_ms`, `lead_time_sample_size`, `human_interventions`, `intervention_sample_size`, `recurrence_count`, `distinct_recurrence_keys`, and `recurrence_sample_size`.
+- `status_counts`: explicit outcome status totals.
+- `evidence_counts`: available evidence counts by structured source family.
+- `source_counts`: active, archived, and event counts by source family.
+- `availability`: source-family availability, with missing families represented as unobserved.
+- `sample_size`: explicit run sample size used for row-level recommendations.
+
+Costs are integer micro-USD. Lead time uses explicit start and completion timestamps for the same run. Median and p95 use deterministic nearest-rank selection over available lead-time values. Recurrence counts only explicit recurrence/coalesce keys that repeat within the same composite group.
+
+### Deterministic advisory recommendation rules
+
+`factory.recommend` returns schema `1`, `repo`, `include_archived`, the scorecards evidence, top-level `source_counts`, top-level `availability`, and an advisory recommendation report. The report includes `nature: "advisory"`, `recommendations`, `suppressions`, and `warnings`.
+
+Recommendation rules are deterministic and thresholded:
+
+| Rule | Minimum sample | Trigger |
+| --- | ---: | --- |
+| `low_acceptance` | 10 | Acceptance below 60% when a comparable peer in the same task class and workflow is at least 80%. |
+| `high_rework` | 10 | Rework rate at least 25%. |
+| `ci_instability` | 8 | CI failure or instability rate at least 15%. |
+| `reverts` | 5 | Revert rate at least 10%. |
+| `high_cost` | 8 | Average cost at least 1.5x the comparable median and above the absolute configured floor. |
+| `slow_lead_time` | 8 | p95 lead time at least 1.5x the comparable median. |
+| `human_intervention` | 8 | Human intervention rate at least 30%. |
+| `recurrence` | 5 | Recurrence count at least 3. |
+
+Low-sample suppression hides recommendation action text while still reporting observed metrics, sample size, availability, source counts, and exact suppression reason. Suppression reasons include `below_threshold`, `low_sample`, `metric_unavailable`, and `no_comparable_peer`.
+
+Peer comparisons are valid only between comparable profiles with the same `task_class` and `workflow`. Rules may compare different harness and/or model profiles inside that boundary, but they must not compare across task classes or workflows. If a metric family is unavailable, recommendations may warn that it is unavailable or unobserved, but they must not advise an action from that metric.
+
+### Display and safety boundary
+
+Factory Foreman displays may render scorecards and recommendations after strict daemon preflight, but they remain display-only. They must not add apply buttons, approval shortcuts, dispatch buttons, mutation links, policy/config editors, workflow editors, ticket mutation controls, queue mutation controls, or approval/gate decision controls.
+
 ## Evidence versus hypothesis discipline
 
 Treat command output, parsed JSON fields, inbox rows, workflow states, costs, and ticket matches as evidence. Treat inferred causes, likely fixes, and dispatch recommendations as hypotheses.
