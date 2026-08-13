@@ -185,6 +185,10 @@ impl Reactor {
             if let Err(e) = self.notify_escalation(tuple) {
                 warn!(tuple = %tuple.id, error = %e, "reactor escalation notify failed");
             }
+            if let Err(e) = self.react_to_sdlc_ci_transition(tuple) {
+                retryable_failure = true;
+                warn!(tuple = %tuple.id, error = %e, "reactor SDLC CI reaction failed");
+            }
             for loaded in &triggers {
                 match self.try_fire(loaded, tuple, &registry) {
                     Ok(true) => fired += 1,
@@ -217,6 +221,8 @@ impl Reactor {
                 }
             }
         }
+
+        fired += self.react_to_sdlc_ci_transition_backlog()?;
 
         // Whole-store recomputes (quorum promotion, obstacle coalescence). Their
         // INPUT is deliberately the whole store, not the cursor delta: a
@@ -868,6 +874,183 @@ impl Reactor {
         Ok(true)
     }
 
+    /// Built-in SDLC CI reaction. Storage emits exactly one transition tuple per
+    /// semantic state change, so reactions are based on those durable transition
+    /// outputs rather than occurrence counts. A failed current state produces one
+    /// diagnostic need. A recovered current state acknowledges only if this
+    /// subject previously had a diagnostic, making standalone recovery inert.
+    fn react_to_sdlc_ci_transition(&self, tuple: &Tuple) -> rk_core::Result<bool> {
+        if tuple.category != Category::Event || tuple.scope != "ci" {
+            return Ok(false);
+        }
+        if tuple.payload.get("family").and_then(Value::as_str) != Some("ci") {
+            return Ok(false);
+        }
+        if !tuple.identity.starts_with("sdlc:transition:") {
+            return Ok(false);
+        }
+        let key = format!("sdlc-ci@{}", tuple.id);
+        if self.already_fired(&key)? {
+            return Ok(false);
+        }
+        let Some(subject) = tuple.payload.get("subject").and_then(Value::as_str) else {
+            return Ok(false);
+        };
+        let source = tuple
+            .payload
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let Some(current) = self.current_ci_fact(source, subject)? else {
+            return Ok(false);
+        };
+        let status = current
+            .payload
+            .get("current")
+            .and_then(|v| v.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        if ci_status_failed(status) {
+            self.write_ci_diagnostic(&key, tuple, &current)?;
+            return Ok(true);
+        }
+        if ci_status_recovered(status) && self.has_ci_diagnostic(subject)? {
+            self.write_ci_recovery(&key, tuple, &current)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn react_to_sdlc_ci_transition_backlog(&self) -> rk_core::Result<usize> {
+        let transitions = self.space.scan(&Pattern::category(Category::Event).scope("ci"))?;
+        let mut fired = 0;
+        for tuple in transitions
+            .iter()
+            .filter(|tuple| tuple.identity.starts_with("sdlc:transition:"))
+        {
+            if self.react_to_sdlc_ci_transition(tuple)? {
+                fired += 1;
+            }
+        }
+        Ok(fired)
+    }
+
+    fn current_ci_fact(&self, source: &str, subject: &str) -> rk_core::Result<Option<Tuple>> {
+        Ok(self
+            .space
+            .scan(&Pattern::category(Category::Fact).scope("ci"))?
+            .into_iter()
+            .find(|tuple| {
+                tuple.identity.starts_with("sdlc:current:")
+                    && tuple.payload.get("source").and_then(Value::as_str) == Some(source)
+                    && tuple.payload.get("family").and_then(Value::as_str) == Some("ci")
+                    && tuple.payload.get("subject").and_then(Value::as_str) == Some(subject)
+            }))
+    }
+
+    fn has_ci_diagnostic(&self, subject: &str) -> rk_core::Result<bool> {
+        Ok(self
+            .space
+            .scan(&Pattern::category(Category::Need).identity("sdlc_ci_diagnostic"))?
+            .iter()
+            .any(|tuple| tuple.payload.get("subject").and_then(Value::as_str) == Some(subject)))
+    }
+
+    fn write_ci_diagnostic(
+        &self,
+        key: &str,
+        transition: &Tuple,
+        current: &Tuple,
+    ) -> rk_core::Result<()> {
+        let subject = transition
+            .payload
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let mut diagnostic = Tuple::new(
+            Category::Need,
+            "ci",
+            "sdlc_ci_diagnostic",
+            REACTOR_INSTANCE,
+            json!({
+                "family": "ci",
+                "subject": subject,
+                "source": transition.payload.get("source"),
+                "delivery_id": transition.payload.get("delivery_id"),
+                "transition_tuple": transition.id.to_string(),
+                "current_fact": current.id.to_string(),
+                "proposal_path": "phase2_advisory_proposal",
+                "phase2": {
+                    "kind": "advisory_proposal",
+                    "requires_approval": true,
+                    "effect": "diagnostic_only"
+                },
+                "diagnostic": {
+                    "summary": "CI transitioned to failed; inspect evidence and propose any fix through the approval boundary",
+                    "current": current.payload.get("current")
+                }
+            }),
+        );
+        diagnostic.lifecycle = Lifecycle::Furniture;
+        self.space.out(diagnostic)?;
+        self.mark_sdlc_ci_reacted(key, transition, "diagnostic")
+    }
+
+    fn write_ci_recovery(
+        &self,
+        key: &str,
+        transition: &Tuple,
+        current: &Tuple,
+    ) -> rk_core::Result<()> {
+        let subject = transition
+            .payload
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let mut recovered = Tuple::new(
+            Category::Fact,
+            "ci",
+            "sdlc_ci_recovered",
+            REACTOR_INSTANCE,
+            json!({
+                "family": "ci",
+                "subject": subject,
+                "source": transition.payload.get("source"),
+                "delivery_id": transition.payload.get("delivery_id"),
+                "transition_tuple": transition.id.to_string(),
+                "current_fact": current.id.to_string(),
+                "current": current.payload.get("current")
+            }),
+        );
+        recovered.lifecycle = Lifecycle::Furniture;
+        self.space.out(recovered)?;
+        self.mark_sdlc_ci_reacted(key, transition, "recovered")
+    }
+
+    fn mark_sdlc_ci_reacted(&self, key: &str, tuple: &Tuple, kind: &str) -> rk_core::Result<()> {
+        let mut marker = Tuple::new(
+            Category::Event,
+            SYSTEM_SCOPE,
+            MARKER_IDENTITY,
+            REACTOR_INSTANCE,
+            json!({
+                "key": key,
+                "kind": kind,
+                "tuple": tuple.id.to_string(),
+            }),
+        );
+        marker.lifecycle = Lifecycle::Ephemeral;
+        if self.config.marker_ttl_secs > 0 {
+            let ttl_secs = i64::try_from(self.config.marker_ttl_secs.min(MAX_MARKER_TTL_SECS))
+                .expect("MAX_MARKER_TTL_SECS must fit i64");
+            marker.expires_at = Some(
+                chrono::Utc::now() + chrono::Duration::seconds(ttl_secs),
+            );
+        }
+        self.space.out(marker)
+    }
+
     /// Durable "already notified" marker for the built-in escalation push. It
     /// has no trigger/workflow of its own, so it writes the marker directly,
     /// sharing `MARKER_IDENTITY` + the `key` field so [`already_fired`] de-dups
@@ -1111,6 +1294,20 @@ fn ticket_is_done(t: &Tuple) -> bool {
     matches!(
         t.payload.get("status").and_then(Value::as_str),
         Some("done") | Some("closed")
+    )
+}
+
+fn ci_status_failed(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "fail" | "failed" | "failure"
+    )
+}
+
+fn ci_status_recovered(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "pass" | "passed" | "passing" | "success" | "succeeded" | "recovered"
     )
 }
 
