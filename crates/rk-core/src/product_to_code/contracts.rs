@@ -121,6 +121,12 @@ impl GenericEvidence {
             push_empty(&mut errors, "artifact_paths", artifact_path);
         }
         if self.kind == "browser_acceptance" {
+            if self.artifact_paths.is_empty() {
+                errors.push(
+                    "artifact_paths must contain at least one item for browser_acceptance evidence"
+                        .to_string(),
+                );
+            }
             push_payload_string(&mut errors, &self.payload, "url");
             push_payload_string(&mut errors, &self.payload, "scenario");
             push_payload_non_empty_string_array(&mut errors, &self.payload, "steps");

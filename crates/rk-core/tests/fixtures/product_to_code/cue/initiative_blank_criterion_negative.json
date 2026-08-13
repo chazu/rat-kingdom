@@ -1,0 +1,9 @@
+{
+  "id": "INIT-product-to-code",
+  "title": "Product to code contracts",
+  "scope": "offline-contracts",
+  "browser_acceptance_applicable": true,
+  "acceptance_criteria": [
+    { "id": "   ", "text": "   " }
+  ]
+}

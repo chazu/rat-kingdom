@@ -141,7 +141,7 @@ fn test_initiative_rejects_blank_acceptance_criterion_text() {
 fn test_browser_acceptance_evidence_requires_typed_non_empty_payload() {
     let mut evidence: GenericEvidence =
         serde_json::from_str(&fixture("evidence_browser_acceptance.json")).unwrap();
-    evidence.artifact_paths = vec!["  ".to_string()];
+    evidence.artifact_paths.clear();
     evidence.payload = serde_json::json!({
         "url": "",
         "scenario": 42,
@@ -156,6 +156,26 @@ fn test_browser_acceptance_evidence_requires_typed_non_empty_payload() {
     assert!(err.contains("payload.scenario"));
     assert!(err.contains("payload.steps"));
     assert!(err.contains("payload.observations"));
+}
+
+#[test]
+fn test_browser_acceptance_evidence_rejects_whitespace_artifact_paths() {
+    let mut evidence: GenericEvidence =
+        serde_json::from_str(&fixture("evidence_browser_acceptance.json")).unwrap();
+    evidence.artifact_paths = vec!["  ".to_string()];
+
+    let err = evidence.validate().unwrap_err().to_string();
+
+    assert!(err.contains("artifact_paths"));
+}
+
+#[test]
+fn test_browser_acceptance_evidence_accepts_required_artifact_paths() {
+    let evidence: GenericEvidence =
+        serde_json::from_str(&fixture("evidence_browser_acceptance.json")).unwrap();
+
+    evidence.validate().unwrap();
+    assert!(!evidence.artifact_paths.is_empty());
 }
 
 #[test]

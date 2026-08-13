@@ -1,14 +1,16 @@
 package product_to_code
 
+#NonBlankString: string & =~"\\S"
+
 #AcceptanceCriterion: {
-	id:   string & !=""
-	text: string & !=""
+	id:   #NonBlankString
+	text: #NonBlankString
 }
 
 #InitiativeContract: {
-	id:                             string & !=""
-	title:                          string & !=""
-	scope:                          string & !=""
+	id:                             #NonBlankString
+	title:                          #NonBlankString
+	scope:                          #NonBlankString
 	browser_acceptance_applicable: bool
 	acceptance_criteria: [#AcceptanceCriterion, ...#AcceptanceCriterion]
 }

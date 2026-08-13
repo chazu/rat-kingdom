@@ -1,17 +1,19 @@
 package product_to_code
 
+#NonBlankString: string & =~"\\S"
+
 #ArchitectureResearchArtifact: {
-	id:               string & !=""
-	initiative_id:    string & !=""
-	researched_files: [string & !="", ...(string & !="")]
-	domain_terms?:    [...string]
-	architecture_decisions: [string & !="", ...(string & !="")]
-	constraints?:     [...string]
-	risks?:           [...string]
-	recommended_ticket_graph_path?: string | null
-	evidence_ids?:    [...string & !=""]
+	id:               #NonBlankString
+	initiative_id:    #NonBlankString
+	researched_files: [#NonBlankString, ...#NonBlankString]
+	domain_terms?:    [...#NonBlankString]
+	architecture_decisions: [#NonBlankString, ...#NonBlankString]
+	constraints?:     [...#NonBlankString]
+	risks?:           [...#NonBlankString]
+	recommended_ticket_graph_path?: #NonBlankString | null
+	evidence_ids?:    [...#NonBlankString]
 } & ({
-	open_questions: [string & !="", ...(string & !="")]
+	open_questions: [#NonBlankString, ...#NonBlankString]
 	open_questions_exhausted?: bool
 } | {
 	open_questions?: []
