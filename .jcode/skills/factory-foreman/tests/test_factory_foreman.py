@@ -14,15 +14,16 @@ from factory_foreman import CommandResult, FactorySnapshot, Observation, collect
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 REPO = "demo"
+REPO_PATH = "/tmp/demo-repo"
 
 STATUS_ARGV = ("rk", "--json", "daemon", "status")
 SNAPSHOT_ARGVS = [
     ("rk", "--json", "list"),
     ("rk", "--json", "inbox"),
     ("rk", "--json", "workflow", "list"),
-    ("rk", "--json", "workflow", "defs", "--repo", REPO),
     ("rk", "--json", "cost", "--fleet"),
     ("rk", "--json", "repo", "show", REPO),
+    ("rk", "--json", "workflow", "defs", "--repo", REPO_PATH),
     ("rk", "--json", "ticket", "list", "--repo", REPO),
 ]
 
@@ -116,9 +117,9 @@ class FactoryForemanSnapshotTests(unittest.TestCase):
             SNAPSHOT_ARGVS[0]: CommandResult(0, fixture("agents"), ""),
             SNAPSHOT_ARGVS[1]: CommandResult(0, fixture("inbox"), ""),
             SNAPSHOT_ARGVS[2]: CommandResult(0, fixture("workflows"), ""),
-            SNAPSHOT_ARGVS[3]: CommandResult(0, fixture("definitions"), ""),
-            SNAPSHOT_ARGVS[4]: CommandResult(0, fixture("cost"), ""),
-            SNAPSHOT_ARGVS[5]: CommandResult(0, fixture("repository"), ""),
+            SNAPSHOT_ARGVS[3]: CommandResult(0, fixture("cost"), ""),
+            SNAPSHOT_ARGVS[4]: CommandResult(0, fixture("repository"), ""),
+            SNAPSHOT_ARGVS[5]: CommandResult(0, fixture("definitions"), ""),
             SNAPSHOT_ARGVS[6]: CommandResult(0, fixture("tickets"), ""),
         }
 
@@ -142,6 +143,16 @@ class FactoryForemanSnapshotTests(unittest.TestCase):
         collect_snapshot(REPO, runner)
 
         self.assertEqual(runner.calls[1:], SNAPSHOT_ARGVS)
+
+    def test_collect_snapshot_resolves_defs_repo_from_observed_repository_path(self):
+        runner = FakeRunner(self.default_results())
+
+        snapshot = collect_snapshot(REPO, runner)
+
+        self.assertTrue(snapshot.observations["repository"].ok)
+        self.assertEqual(snapshot.observations["repository"].data["path"], REPO_PATH)
+        self.assertIn(("rk", "--json", "workflow", "defs", "--repo", REPO_PATH), runner.calls)
+        self.assertNotIn(("rk", "--json", "workflow", "defs", "--repo", REPO), runner.calls)
 
     def test_collect_snapshot_preserves_successes_when_one_command_fails(self):
         results = self.default_results()
@@ -286,6 +297,37 @@ class FactoryForemanClassificationTests(unittest.TestCase):
         report = self.classify(snapshot)
 
         self.assertEqual(report.findings, [])
+
+    def test_live_direct_list_shapes_are_consumed_without_ticket_history_noise(self):
+        live = fixture_json("live_direct_shapes")
+        snapshot = snapshot_from_fixture()
+        observations = dict(snapshot.observations)
+        for name in ("agents", "inbox", "workflows", "cost", "tickets"):
+            observations[name] = Observation(True, name, data=copy.deepcopy(live[name]))
+        snapshot = FactorySnapshot(
+            snapshot.schema,
+            snapshot.generated_at,
+            snapshot.repo,
+            True,
+            observations,
+            [],
+        )
+
+        report = self.classify(snapshot)
+
+        categories = [finding.category for finding in report.findings]
+        self.assertEqual(
+            set(categories),
+            {"orphaned-agent", "empty-harness-result", "budget-pressure"},
+        )
+        by_category = {finding.category: finding for finding in report.findings}
+        self.assertEqual(by_category["orphaned-agent"].subject, "agent-live-orphan")
+        self.assertEqual(by_category["orphaned-agent"].agent, "agent-live-orphan")
+        self.assertEqual(by_category["empty-harness-result"].workflow_instance, "inst-empty-live")
+        self.assertEqual(by_category["budget-pressure"].workflow_instance, "inst-budget-live")
+        self.assertIn('"spent_usd": 8.5', by_category["budget-pressure"].evidence)
+        self.assertNotIn("permission-or-authority", categories)
+        self.assertNotIn("stale-or-moved-base", categories)
 
 
 class ExplodingRunner:

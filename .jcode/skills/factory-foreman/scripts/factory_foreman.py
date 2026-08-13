@@ -19,9 +19,9 @@ COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("agents", ("rk", "--json", "list")),
     ("inbox", ("rk", "--json", "inbox")),
     ("workflows", ("rk", "--json", "workflow", "list")),
-    ("definitions", ("rk", "--json", "workflow", "defs", "--repo", "{repo}")),
     ("cost", ("rk", "--json", "cost", "--fleet")),
     ("repository", ("rk", "--json", "repo", "show", "{repo}")),
+    ("definitions", ("rk", "--json", "workflow", "defs", "--repo", "{repo_path}")),
     ("tickets", ("rk", "--json", "ticket", "list", "--repo", "{repo}")),
 )
 STATUS_ARGV = ("rk", "--json", "daemon", "status")
@@ -142,8 +142,18 @@ def collect_snapshot(repo: str, runner: Runner) -> FactorySnapshot:
         observations[PREFLIGHT_COMMAND] = preflight
         return _snapshot(repo, observations)
 
+    repo_path = repo
     for command, argv_template in COMMANDS:
-        argv = tuple(repo if part == "{repo}" else part for part in argv_template)
+        if command == "definitions":
+            repository = observations.get("repository")
+            if repository and repository.ok and isinstance(repository.data, dict):
+                path = repository.data.get("path")
+                if isinstance(path, str) and path.strip():
+                    repo_path = path
+        argv = tuple(
+            repo if part == "{repo}" else repo_path if part == "{repo_path}" else part
+            for part in argv_template
+        )
         observations[command] = _observe(command, argv, runner)
 
     return _snapshot(repo, observations)
@@ -191,21 +201,75 @@ def _snapshot(repo: str, observations: dict[str, Observation]) -> FactorySnapsho
 
 def _snapshot_rows(snapshot: FactorySnapshot) -> list[tuple[str, dict[str, Any]]]:
     rows: list[tuple[str, dict[str, Any]]] = []
+    instance_spend = _instance_spend(snapshot.observations.get("cost"))
     for name, observation in snapshot.observations.items():
         if not observation.ok:
             rows.append((name, {"kind": "observation-failed", "detail": observation.error}))
             continue
 
         data = observation.data
+        if isinstance(data, list) and name in {"agents", "inbox", "workflows"}:
+            for row in data:
+                if isinstance(row, dict):
+                    rows.append((name, _enrich_live_row(name, row, instance_spend)))
+            continue
         if isinstance(data, dict):
             for key in ("workflows", "messages", "inbox", "items", "agents"):
                 values = data.get(key)
                 if isinstance(values, list):
-                    rows.extend((name, row) for row in values if isinstance(row, dict))
+                    rows.extend(
+                        (name, _enrich_live_row(name, row, instance_spend))
+                        for row in values
+                        if isinstance(row, dict)
+                    )
                     break
     for error in snapshot.errors:
         rows.append(("snapshot", {"kind": "snapshot-error", "detail": error}))
     return rows
+
+
+def _instance_spend(observation: Observation | None) -> dict[str, float]:
+    if observation is None or not observation.ok or not isinstance(observation.data, dict):
+        return {}
+    instances = observation.data.get("instances")
+    if not isinstance(instances, list):
+        return {}
+    spend: dict[str, float] = {}
+    for instance in instances:
+        if not isinstance(instance, dict):
+            continue
+        instance_id = _first_string(instance, "instance", "id", "workflow_instance")
+        spent = _first_number(instance, "spent_usd")
+        if instance_id and spent is not None:
+            spend[instance_id] = spent
+    return spend
+
+
+def _enrich_live_row(
+    source: str, row: dict[str, Any], instance_spend: dict[str, float]
+) -> dict[str, Any]:
+    enriched = dict(row)
+    if source == "inbox" and enriched.get("kind") == "agent-orphaned":
+        subject = _first_string(enriched, "subject")
+        if subject and not _first_string(
+            enriched, "agent", "agent_name", "agentName", "owner"
+        ):
+            enriched["agent"] = subject
+    workflow_instance = _first_string(
+        enriched,
+        "workflow_instance",
+        "instance_id",
+        "workflowInstance",
+        "instance",
+        "id",
+    )
+    if (
+        source == "workflows"
+        and workflow_instance in instance_spend
+        and "spent_usd" not in enriched
+    ):
+        enriched["spent_usd"] = instance_spend[workflow_instance]
+    return enriched
 
 
 def _classify_row(source: str, row: dict[str, Any]) -> list[Finding]:
@@ -301,7 +365,7 @@ def _classify_row(source: str, row: dict[str, Any]) -> list[Finding]:
         )
         return findings
 
-    text_category = _classify_text(lower)
+    text_category = _classify_text(lower) if _is_failure(row) else None
     if text_category is not None:
         category, severity, summary, next_step = text_category
         findings.append(
@@ -342,7 +406,9 @@ def _budget_pressure(
     agent: str | None,
     source: str,
 ) -> Finding | None:
-    spend = _first_number(row, "spend_usd", "cost_usd", "usage_usd", "current_spend_usd")
+    spend = _first_number(
+        row, "spend_usd", "spent_usd", "cost_usd", "usage_usd", "current_spend_usd"
+    )
     maximum = _first_number(
         row,
         "instance_max_usd",
@@ -397,15 +463,20 @@ def _is_timeout(row: dict[str, Any], lower: str) -> bool:
 
 def _is_empty_harness_result(row: dict[str, Any]) -> bool:
     harness = row.get("harness_result") or row.get("harnessResult")
+    context = row.get("context")
+    if not isinstance(harness, dict) and isinstance(context, dict):
+        harness = context.get("previous_result")
     if not isinstance(harness, dict):
         return False
     usage = harness.get("usage") if isinstance(harness.get("usage"), dict) else {}
+    cost = _first_number(harness, "cost_usd", "spent_usd", "usage_usd")
     return (
         _is_failure(row)
         and harness.get("declared_done") is False
         and not str(harness.get("result") or "").strip()
         and not str(harness.get("error") or "").strip()
         and all(_number(value) == 0 for value in usage.values())
+        and (cost is None or cost == 0)
     )
 
 
