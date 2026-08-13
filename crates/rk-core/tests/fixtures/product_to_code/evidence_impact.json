@@ -1,0 +1,16 @@
+{
+  "id": "EVID-impact",
+  "kind": "impact",
+  "producer": {
+    "kind": "external-tool",
+    "name": "offline impact reporter",
+    "version": "1.0.0",
+    "invocation": "impact --offline"
+  },
+  "summary": "Static impact analysis for product-to-code contracts",
+  "artifact_paths": ["artifacts/impact/product-to-code.json"],
+  "payload": {
+    "affected_files": ["crates/rk-core/src/lib.rs"],
+    "risk": "low"
+  }
+}
