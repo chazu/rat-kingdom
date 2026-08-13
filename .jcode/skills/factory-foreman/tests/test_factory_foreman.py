@@ -308,6 +308,15 @@ class FactoryForemanCliTests(unittest.TestCase):
         self.assertIn("## Snapshot Health", result.stdout)
         self.assertIn("## Findings", result.stdout)
 
+    def test_triage_json_exposes_live_contract_top_level_fields(self):
+        result = self.run_cli(["triage", "--repo", REPO, "--format", "json"])
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(payload["schema"], 1)
+        self.assertEqual(payload["repo"], REPO)
+        self.assertIsInstance(payload["findings"], list)
+
     def test_partial_snapshot_warning_is_visible(self):
         results = FactoryForemanSnapshotTests().default_results()
         results[SNAPSHOT_ARGVS[1]] = CommandResult(1, "", "inbox failed")

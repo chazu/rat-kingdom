@@ -615,9 +615,20 @@ def _render_snapshot(snapshot: FactorySnapshot, output_format: str) -> str:
 
 def _render_triage(snapshot: FactorySnapshot, triage: TriageReport, output_format: str) -> str:
     if output_format == "json":
+        snapshot_payload = snapshot.to_dict()
         return (
             json.dumps(
-                {"snapshot": snapshot.to_dict(), "triage": triage.to_dict()},
+                {
+                    "schema": 1,
+                    "repo": snapshot.repo,
+                    "findings": triage.to_dict()["findings"],
+                    "snapshot": snapshot_payload,
+                    "snapshot_health": {
+                        "healthy": snapshot.healthy,
+                        "errors": snapshot.errors,
+                    },
+                    "observations": snapshot_payload["observations"],
+                },
                 sort_keys=True,
             )
             + "\n"
