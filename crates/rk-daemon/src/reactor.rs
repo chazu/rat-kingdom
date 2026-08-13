@@ -246,8 +246,8 @@ impl Reactor {
         // / open ticket, not the cursor. But re-scanning + materialising the whole
         // store on EVERY wake is the cost TKT-29 targets. Gate WHETHER to
         // recompute on whether the relevant category population *changed* since
-        // last cycle — an exact SQL COUNT (no row materialisation, and immune to
-        // independent of the persistence cursor, whose SQLite sequence is exact).
+        // last cycle — an exact SQL COUNT (no row materialisation and independent
+        // of the persistence cursor, whose SQLite sequence is exact).
         // A promotion / coalescence can only newly qualify when an endorsement /
         // obstacle is ADDED, which moves the count; a burst of unrelated writes
         // leaves it unchanged, so the full scan is skipped. The first cycle
