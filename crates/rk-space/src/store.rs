@@ -16,11 +16,16 @@ use rk_core::sdlc::{
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
 use rk_core::Error;
 use rusqlite::{
-    params_from_iter, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
+    params_from_iter, Connection, ErrorCode, OptionalExtension, Row, Transaction,
+    TransactionBehavior,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::{
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
 
 pub(crate) struct Store {
     conn: Connection,
@@ -86,6 +91,27 @@ CREATE INDEX IF NOT EXISTS idx_sdlc_current_selector
 CREATE INDEX IF NOT EXISTS idx_sdlc_transitions_key
     ON sdlc_transitions (source, scope, subject);
 ";
+
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const SQLITE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+fn enable_wal(conn: &Connection) -> rk_core::Result<()> {
+    let deadline = Instant::now() + SQLITE_BUSY_TIMEOUT;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+                ) && Instant::now() < deadline =>
+            {
+                thread::sleep(SQLITE_BUSY_RETRY_DELAY);
+            }
+            Err(error) => return Err(sql_err(error)),
+        }
+    }
+}
 
 pub(crate) struct AcceptedSdlcSignal {
     pub receipt: SignalReceipt,
@@ -220,10 +246,8 @@ fn valid_rfc3339_field(payload: &serde_json::Value, field: &str) -> Option<Strin
 impl Store {
     pub fn open(path: &Path) -> rk_core::Result<Self> {
         let conn = Connection::open(path).map_err(sql_err)?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(sql_err)?;
-        conn.pragma_update(None, "busy_timeout", 5000)
-            .map_err(sql_err)?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT).map_err(sql_err)?;
+        enable_wal(&conn)?;
         register_functions(&conn).map_err(sql_err)?;
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
         migrate(&conn)?;

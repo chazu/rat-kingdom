@@ -368,8 +368,8 @@ fn test_duplicate_delivery_race_independent_opens_returns_original_without_extra
         let path = path.clone();
         let barrier = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
-            let space = Space::open(&path).unwrap();
             barrier.wait();
+            let space = Space::open(&path).unwrap();
             space
                 .accept_sdlc_signal(ci("race", "failure", 30), principal())
                 .unwrap()
