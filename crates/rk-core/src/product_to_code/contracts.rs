@@ -29,7 +29,11 @@ impl InitiativeContract {
                 .iter()
                 .map(|criterion| criterion.id.as_str()),
             "acceptance_criteria.id",
-        )
+        )?;
+        for criterion in &self.acceptance_criteria {
+            require_non_empty("acceptance_criteria.text", &criterion.text)?;
+        }
+        Ok(())
     }
 }
 
@@ -113,14 +117,14 @@ impl GenericEvidence {
         push_empty(&mut errors, "producer.kind", &self.producer.kind);
         push_empty(&mut errors, "producer.name", &self.producer.name);
         push_empty(&mut errors, "summary", &self.summary);
+        for artifact_path in &self.artifact_paths {
+            push_empty(&mut errors, "artifact_paths", artifact_path);
+        }
         if self.kind == "browser_acceptance" {
-            for field in ["url", "scenario", "steps", "observations"] {
-                if self.payload.get(field).is_none() {
-                    errors.push(format!(
-                        "payload.{field} is required for browser_acceptance evidence"
-                    ));
-                }
-            }
+            push_payload_string(&mut errors, &self.payload, "url");
+            push_payload_string(&mut errors, &self.payload, "scenario");
+            push_payload_non_empty_string_array(&mut errors, &self.payload, "steps");
+            push_payload_non_empty_string_array(&mut errors, &self.payload, "observations");
         }
         finish(errors)
     }
@@ -167,14 +171,29 @@ impl TicketGraph {
             .iter()
             .map(String::as_str)
             .collect();
+        let mut mapped_criteria = HashSet::new();
         for node in &self.nodes {
             push_empty(&mut errors, "nodes.id", &node.id);
             push_empty(&mut errors, "nodes.title", &node.title);
             push_empty(&mut errors, "nodes.description", &node.description);
             for criterion_id in &node.acceptance_criterion_ids {
-                if !criteria.contains(criterion_id.as_str()) {
+                if criterion_id.trim().is_empty() {
+                    errors.push("nodes.acceptance_criterion_ids must not be empty".to_string());
+                } else if !criteria.contains(criterion_id.as_str()) {
                     errors.push(format!("unknown acceptance criterion {criterion_id}"));
                 }
+                if !mapped_criteria.insert(criterion_id.as_str()) {
+                    errors.push(format!(
+                        "duplicate acceptance criterion mapping {criterion_id}"
+                    ));
+                }
+            }
+        }
+        for criterion_id in criteria {
+            if !mapped_criteria.contains(criterion_id) {
+                errors.push(format!(
+                    "missing acceptance criterion mapping {criterion_id}"
+                ));
             }
         }
         for edge in &self.edges {
@@ -208,12 +227,33 @@ pub struct AcceptanceCriterionVerification {
 
 impl VerificationReport {
     pub fn validate(&self) -> Result<()> {
+        self.validate_inner(None, None)
+    }
+
+    pub fn validate_against(
+        &self,
+        acceptance_criterion_ids: &[String],
+        evidence_ids: &[String],
+    ) -> Result<()> {
+        self.validate_inner(Some(acceptance_criterion_ids), Some(evidence_ids))
+    }
+
+    fn validate_inner(
+        &self,
+        acceptance_criterion_ids: Option<&[String]>,
+        evidence_ids: Option<&[String]>,
+    ) -> Result<()> {
         let mut errors = Vec::new();
         push_empty(&mut errors, "id", &self.id);
         push_empty(&mut errors, "initiative_id", &self.initiative_id);
         if self.entries.is_empty() {
             errors.push("entries must map at least one acceptance criterion".to_string());
         }
+        let criteria = acceptance_criterion_ids
+            .map(|ids| ids.iter().map(String::as_str).collect::<HashSet<_>>());
+        let known_evidence =
+            evidence_ids.map(|ids| ids.iter().map(String::as_str).collect::<HashSet<_>>());
+        let mut verified_criteria = HashSet::new();
         for entry in &self.entries {
             push_empty(
                 &mut errors,
@@ -221,11 +261,42 @@ impl VerificationReport {
                 &entry.acceptance_criterion_id,
             );
             push_empty(&mut errors, "entries.status", &entry.status);
+            if let Some(criteria) = &criteria {
+                if !criteria.contains(entry.acceptance_criterion_id.as_str()) {
+                    errors.push(format!(
+                        "unknown acceptance criterion verification {}",
+                        entry.acceptance_criterion_id
+                    ));
+                }
+                if !verified_criteria.insert(entry.acceptance_criterion_id.as_str()) {
+                    errors.push(format!(
+                        "duplicate acceptance criterion verification {}",
+                        entry.acceptance_criterion_id
+                    ));
+                }
+            }
             if entry.evidence_ids.is_empty() {
                 errors.push(format!(
                     "{} must reference at least one evidence id",
                     entry.acceptance_criterion_id
                 ));
+            }
+            for evidence_id in &entry.evidence_ids {
+                push_empty(&mut errors, "entries.evidence_ids", evidence_id);
+                if let Some(known_evidence) = &known_evidence {
+                    if !known_evidence.contains(evidence_id.as_str()) {
+                        errors.push(format!("unknown evidence id {evidence_id}"));
+                    }
+                }
+            }
+        }
+        if let Some(criteria) = &criteria {
+            for criterion_id in criteria {
+                if !verified_criteria.contains(criterion_id) {
+                    errors.push(format!(
+                        "missing acceptance criterion verification {criterion_id}"
+                    ));
+                }
             }
         }
         finish(errors)
@@ -264,6 +335,42 @@ fn ensure_unique<'a>(values: impl IntoIterator<Item = &'a str>, field: &str) -> 
 fn push_empty(errors: &mut Vec<String>, field: &str, value: &str) {
     if value.trim().is_empty() {
         errors.push(format!("{field} must not be empty"));
+    }
+}
+
+fn push_payload_string(errors: &mut Vec<String>, payload: &Value, field: &str) {
+    match payload.get(field).and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => {}
+        Some(_) => errors.push(format!("payload.{field} must not be empty")),
+        None if payload.get(field).is_some() => {
+            errors.push(format!("payload.{field} must be a string"));
+        }
+        None => errors.push(format!(
+            "payload.{field} is required for browser_acceptance evidence"
+        )),
+    }
+}
+
+fn push_payload_non_empty_string_array(errors: &mut Vec<String>, payload: &Value, field: &str) {
+    match payload.get(field).and_then(Value::as_array) {
+        Some(values) if values.is_empty() => {
+            errors.push(format!("payload.{field} must contain at least one item"));
+        }
+        Some(values) => {
+            for value in values {
+                match value.as_str() {
+                    Some(text) if !text.trim().is_empty() => {}
+                    Some(_) => errors.push(format!("payload.{field} items must not be empty")),
+                    None => errors.push(format!("payload.{field} items must be strings")),
+                }
+            }
+        }
+        None if payload.get(field).is_some() => {
+            errors.push(format!("payload.{field} must be an array of strings"));
+        }
+        None => errors.push(format!(
+            "payload.{field} is required for browser_acceptance evidence"
+        )),
     }
 }
 

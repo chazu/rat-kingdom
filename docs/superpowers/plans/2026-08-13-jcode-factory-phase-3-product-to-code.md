@@ -76,7 +76,7 @@ Implement these exact test methods:
 Run:
 
 ```bash
-cargo test -p rk-core product_to_code_contracts --test product_to_code_contracts
+cargo test -p rk-core --test product_to_code_contracts
 ```
 
 Expected: failure because the contract modules and fixtures do not exist.
@@ -512,7 +512,7 @@ Clearly label limitations:
 - [ ] **Step 4: Run full verification**
 
 ```bash
-cargo test -p rk-core product_to_code_contracts --test product_to_code_contracts
+cargo test -p rk-core --test product_to_code_contracts
 cargo test -p rk-cli product_to_code_research --test product_to_code_research
 cargo test -p rk-cli product_to_code_ticket_graph --test product_to_code_ticket_graph
 cargo test -p rk-cli product_to_code_evidence_gates --test product_to_code_evidence_gates

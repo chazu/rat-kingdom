@@ -102,7 +102,19 @@ fn test_ticket_graph_fixture_preserves_nodes_edges_and_acceptance_links() {
 fn test_verification_report_maps_each_acceptance_criterion_to_evidence() {
     let report: VerificationReport =
         serde_json::from_str(&fixture("verification_report_valid.json")).unwrap();
-    report.validate().unwrap();
+    let evidence_ids = [
+        "evidence_test_run.json",
+        "evidence_impact.json",
+        "evidence_review.json",
+    ]
+    .map(|name| {
+        let evidence: GenericEvidence = serde_json::from_str(&fixture(name)).unwrap();
+        evidence.validate().unwrap();
+        evidence.id
+    });
+    report
+        .validate_against(&["AC-1".to_string(), "AC-2".to_string()], &evidence_ids)
+        .unwrap();
 
     assert_eq!(report.entries.len(), 2);
     assert_eq!(report.entries[0].acceptance_criterion_id, "AC-1");
@@ -115,39 +127,118 @@ fn test_verification_report_maps_each_acceptance_criterion_to_evidence() {
 }
 
 #[test]
+fn test_initiative_rejects_blank_acceptance_criterion_text() {
+    let mut initiative: InitiativeContract =
+        serde_json::from_str(&fixture("initiative_minimal.json")).unwrap();
+    initiative.acceptance_criteria[0].text = "   ".to_string();
+
+    let err = initiative.validate().unwrap_err().to_string();
+
+    assert!(err.contains("acceptance_criteria.text"));
+}
+
+#[test]
+fn test_browser_acceptance_evidence_requires_typed_non_empty_payload() {
+    let mut evidence: GenericEvidence =
+        serde_json::from_str(&fixture("evidence_browser_acceptance.json")).unwrap();
+    evidence.artifact_paths = vec!["  ".to_string()];
+    evidence.payload = serde_json::json!({
+        "url": "",
+        "scenario": 42,
+        "steps": [],
+        "observations": [""]
+    });
+
+    let err = evidence.validate().unwrap_err().to_string();
+
+    assert!(err.contains("artifact_paths"));
+    assert!(err.contains("payload.url"));
+    assert!(err.contains("payload.scenario"));
+    assert!(err.contains("payload.steps"));
+    assert!(err.contains("payload.observations"));
+}
+
+#[test]
+fn test_ticket_graph_rejects_duplicate_missing_and_unknown_criterion_mappings() {
+    let mut graph: TicketGraph = serde_json::from_str(&fixture("ticket_graph_valid.json")).unwrap();
+    graph.nodes[0].acceptance_criterion_ids = vec!["AC-1".to_string(), "AC-2".to_string()];
+    graph.nodes[1].acceptance_criterion_ids = vec!["AC-2".to_string(), "AC-404".to_string()];
+
+    let err = graph
+        .validate(&["AC-1".to_string(), "AC-2".to_string(), "AC-3".to_string()])
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("duplicate acceptance criterion mapping AC-2"));
+    assert!(err.contains("missing acceptance criterion mapping AC-3"));
+    assert!(err.contains("unknown acceptance criterion AC-404"));
+}
+
+#[test]
+fn test_verification_report_rejects_duplicate_missing_and_unknown_evidence_references() {
+    let mut report: VerificationReport =
+        serde_json::from_str(&fixture("verification_report_valid.json")).unwrap();
+    report.entries[0].acceptance_criterion_id = "AC-2".to_string();
+    report.entries[0].evidence_ids = vec!["EVID-missing".to_string()];
+
+    let err = report
+        .validate_against(
+            &["AC-1".to_string(), "AC-2".to_string(), "AC-3".to_string()],
+            &["EVID-impact".to_string(), "EVID-review".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("duplicate acceptance criterion verification AC-2"));
+    assert!(err.contains("missing acceptance criterion verification AC-1"));
+    assert!(err.contains("missing acceptance criterion verification AC-3"));
+    assert!(err.contains("unknown evidence id EVID-missing"));
+}
+
+#[test]
 fn test_contract_modules_do_not_reference_jcode_browser_or_gitnexus_crates() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let files = [
-        root.join("Cargo.toml"),
-        root.join("crates/rk-core/Cargo.toml"),
+    let mut files = vec![root.join("Cargo.toml")];
+    files.extend(
+        fs::read_dir(root.join("crates"))
+            .expect("crates directory is readable")
+            .map(|entry| {
+                entry
+                    .expect("crate entry is readable")
+                    .path()
+                    .join("Cargo.toml")
+            }),
+    );
+    files.extend([
         root.join("crates/rk-core/src/product_to_code/mod.rs"),
         root.join("crates/rk-core/src/product_to_code/contracts.rs"),
-    ];
+    ]);
+    files.sort();
+    files.dedup();
+
     let forbidden = ["jcode", "browser", "gitnexus", "playwright", "thirtyfour"];
 
     for file in files {
-        if file.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml") {
-            let contents = fs::read_to_string(&file).unwrap_or_default().to_lowercase();
+        let contents = fs::read_to_string(&file)
+            .unwrap_or_else(|err| panic!("{} must be readable: {err}", file.display()))
+            .to_lowercase();
+        let lines: Box<dyn Iterator<Item = &str>> =
+            if file.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml") {
+                Box::new(contents.lines())
+            } else {
+                Box::new(
+                    contents
+                        .lines()
+                        .filter(|line| line.trim_start().starts_with("use ")),
+                )
+            };
+        for line in lines {
             for word in forbidden {
                 assert!(
-                    !contents.contains(word),
+                    !line.contains(word),
                     "{} must not reference forbidden runtime dependency/import {word}",
                     file.display()
                 );
-            }
-        } else {
-            let contents = fs::read_to_string(&file).unwrap_or_default().to_lowercase();
-            for line in contents
-                .lines()
-                .filter(|line| line.trim_start().starts_with("use "))
-            {
-                for word in forbidden {
-                    assert!(
-                        !line.contains(word),
-                        "{} must not import forbidden runtime dependency {word}",
-                        file.display()
-                    );
-                }
             }
         }
     }

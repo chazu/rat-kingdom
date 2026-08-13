@@ -10,11 +10,23 @@ package product_to_code
 	invocation?: string | null
 }
 
+#BrowserAcceptancePayload: {
+	url:          string & !=""
+	scenario:     string & !=""
+	steps:        [string & !="", ...(string & !="")]
+	observations: [string & !="", ...(string & !="")]
+}
+
 #GenericEvidence: {
-	id:             string & !=""
-	kind:           #EvidenceKind
-	producer:       #ProducerIdentity
-	summary:        string & !=""
+	id:              string & !=""
+	kind:            #EvidenceKind
+	producer:        #ProducerIdentity
+	summary:         string & !=""
 	artifact_paths?: [...string & !=""]
-	payload?:       _
+	if kind == "browser_acceptance" {
+		payload: #BrowserAcceptancePayload
+	}
+	if kind != "browser_acceptance" {
+		payload?: _
+	}
 }
