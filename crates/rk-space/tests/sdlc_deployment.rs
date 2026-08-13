@@ -1,10 +1,12 @@
 use chrono::{TimeZone, Utc};
+use rk_core::id::RecordId;
 use rk_core::sdlc::{
     ConfiguredSourceName, Correlation, DeploymentSignal, SignalEnvelope, SignalKind, SignalPayload,
     SignalRef, SignalSourcePrincipal,
 };
 use rk_core::tuple::{Category, Pattern};
 use rk_space::Space;
+use serde_json::json;
 use std::collections::BTreeMap;
 
 fn ts(n: i64) -> chrono::DateTime<Utc> {
@@ -192,4 +194,93 @@ fn test_deployment_projection_does_not_enqueue_mutation() {
         .scan(&Pattern::category(Category::Need))
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn test_legacy_deployment_ordering_is_backfilled_before_stale_ingest() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("space.sqlite");
+    let fact_id = RecordId::new().to_string();
+    let occurred_at = ts(20).to_rfc3339();
+    let observed_at = ts(21).to_rfc3339();
+    let payload = json!({
+        "source": "deploy-agent",
+        "family": "deployment",
+        "subject": "prod:api",
+        "semantic_state_digest": "legacy-v2",
+        "first_delivery_id": "legacy-v2",
+        "last_delivery_id": "legacy-v2",
+        "first_seen_at": observed_at,
+        "last_seen_at": observed_at,
+        "occurred_at": occurred_at,
+        "observed_at": observed_at,
+        "current": {
+            "environment": "prod",
+            "service": "api",
+            "version": "v2",
+            "commit_sha": "deadbeef00000020",
+            "repo": "rat-kingdom",
+            "branch": "main"
+        }
+    });
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tuples (
+                id TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                identity TEXT NOT NULL,
+                instance TEXT NOT NULL,
+                lifecycle TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                strength REAL
+            );
+            CREATE TABLE sdlc_current_state (
+                source TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                semantic_state_digest TEXT NOT NULL,
+                first_delivery_id TEXT NOT NULL,
+                last_delivery_id TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                fact_tuple_id TEXT NOT NULL UNIQUE,
+                PRIMARY KEY (source, scope, subject)
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tuples
+             (id, category, scope, identity, instance, lifecycle, payload, created_at, expires_at, strength)
+             VALUES (?1, 'fact', 'deployment', 'sdlc:current:deploy-agent:prod:api',
+                     'source:deploy-agent', 'furniture', ?2, ?3, NULL, NULL)",
+            rusqlite::params![fact_id, payload.to_string(), observed_at],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sdlc_current_state
+             (source, scope, subject, semantic_state_digest, first_delivery_id, last_delivery_id,
+              first_seen_at, last_seen_at, fact_tuple_id)
+             VALUES ('deploy-agent', 'deployment', 'prod:api', 'legacy-v2', 'legacy-v2',
+                     'legacy-v2', ?1, ?1, ?2)",
+            rusqlite::params![observed_at, fact_id],
+        )
+        .unwrap();
+    }
+
+    let space = Space::open(&path).unwrap();
+    let receipt = space
+        .accept_sdlc_signal(
+            deployment("delayed-v1", "prod", "api", "v1", 10),
+            principal(),
+        )
+        .unwrap();
+    assert!(!receipt.transition_emitted);
+    assert_eq!(
+        current_fact(&space, "prod", "api").payload["current"]["version"],
+        "v2"
+    );
 }

@@ -7,10 +7,11 @@ use rk_core::sdlc::{
 };
 use rk_core::tuple::{Category, Pattern};
 use rk_daemon::reactor::{Reactor, REACTOR_INSTANCE};
+use rk_daemon::repos::{RepoRecord, RepoRegistry};
 use rk_daemon::supervisor::Supervisor;
 use rk_daemon::tickets::Tickets;
 use rk_daemon::workflow_exec::WorkflowEngine;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -135,6 +136,16 @@ fn diagnoses(space: &rk_space::Space) -> Vec<rk_core::tuple::Tuple> {
         .collect()
 }
 
+fn processed_alerts(space: &rk_space::Space) -> Vec<rk_core::tuple::Tuple> {
+    space
+        .scan(
+            &Pattern::category(Category::Fact)
+                .identity("sdlc_alert_processed")
+                .scope("system"),
+        )
+        .unwrap()
+}
+
 #[test]
 fn test_alert_firing_creates_read_only_diagnosis_context() {
     let home = tempfile::tempdir().unwrap();
@@ -228,6 +239,8 @@ fn test_alert_diagnosis_rejects_executable_action_and_command_fields() {
         ("action", "restart"),
         ("command", "kubectl rollout restart"),
         ("executable", "ssh"),
+        ("rollback_action", "observe only"),
+        ("note", "please restart api"),
     ]
     .into_iter()
     .enumerate()
@@ -245,6 +258,12 @@ fn test_alert_diagnosis_rejects_executable_action_and_command_fields() {
 
     run_after(&space, &layout);
     assert!(diagnoses(&space).is_empty());
+
+    let mut unsafe_ref = alert("alert-unsafe-ref", "firing", 39);
+    unsafe_ref.refs[0].label = "action".into();
+    assert!(space
+        .accept_sdlc_signal(unsafe_ref, principal("alerts"))
+        .is_err());
 }
 
 #[test]
@@ -403,4 +422,150 @@ fn test_alert_diagnosis_marks_deployment_provenance_unknown_or_ambiguous() {
     let provenance = &diagnoses(&ambiguous_space)[0].payload["deployment_provenance"];
     assert_eq!(provenance["status"], "ambiguous");
     assert_eq!(provenance["candidates"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn test_alert_occurrence_is_loaded_through_durable_receipt_not_spoof_identity() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let mut spoof = rk_core::tuple::Tuple::new(
+        Category::Event,
+        "production_alert",
+        "sdlc:event:alerts:alert-spoof",
+        "attacker",
+        json!({
+            "source": "alerts",
+            "delivery_id": "alert-spoof",
+            "family": "production_alert",
+            "subject": "prod:api:latency",
+            "kind": "production_alert_firing",
+            "summary": "spoof",
+            "occurred_at": "2026-01-01T00:00:00Z",
+            "observed_at": "2026-01-01T00:00:01Z",
+            "correlation": {},
+            "refs": [{"label": "spoof", "url": "https://spoof.invalid"}],
+            "attributes": {},
+            "payload": {"type": "production_alert", "environment": "prod", "service": "api", "alert_key": "latency", "severity": "page", "state": "firing"}
+        }),
+    );
+    spoof.id = "00000000000000000000000000".parse().unwrap();
+    space.out(spoof).unwrap();
+    let receipt = space
+        .accept_sdlc_signal(alert("alert-spoof", "firing", 90), principal("alerts"))
+        .unwrap();
+
+    run_after(&space, &layout);
+    let diagnosis = diagnoses(&space).remove(0);
+    assert_eq!(
+        diagnosis.payload["occurrence_event"],
+        receipt.projected_event_id
+    );
+    assert_eq!(diagnosis.payload["receipt_id"], receipt.receipt_id);
+    assert_eq!(diagnosis.payload["refs"][0]["label"], "runbook");
+}
+
+#[test]
+fn test_resolved_alert_processing_is_durable_across_reactor_restart() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    let space = rk_space::Space::open_in_memory().unwrap();
+    space
+        .accept_sdlc_signal(alert("resolved-only", "resolved", 100), principal("alerts"))
+        .unwrap();
+
+    run_after(&space, &layout);
+    assert_eq!(processed_alerts(&space).len(), 1);
+    run_after(&space, &layout);
+    assert_eq!(processed_alerts(&space).len(), 1);
+    assert!(diagnoses(&space).is_empty());
+}
+
+#[test]
+fn test_deployment_projection_does_not_fire_configured_workflow() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    std::fs::create_dir_all(layout.triggers_dir()).unwrap();
+    std::fs::create_dir_all(repo.path().join(".rk/workflows")).unwrap();
+    std::fs::write(
+        repo.path().join(".rk/workflows/danger.cue"),
+        r#"workflow: {
+            name: "danger"
+            params: {}
+            agents: {default: {harness: "fake", model: "sonnet"}}
+            steps: [{type: "run", command: "true"}]
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        layout.triggers_dir().join("deployment.cue"),
+        r#"triggers: [{
+            name: "unsafe-deployment-trigger"
+            match: {scope: "deployment"}
+            run: "danger"
+            repo: "fixture"
+        }]"#,
+    )
+    .unwrap();
+    RepoRegistry::load(&layout.home().join("repos.json"))
+        .unwrap()
+        .add(RepoRecord {
+            name: "fixture".into(),
+            path: repo.path().to_path_buf(),
+            created_at: Utc::now(),
+            merge_mode: Default::default(),
+            remote: None,
+            host: None,
+            activated_policy: None,
+        })
+        .unwrap();
+    let space = rk_space::Space::open_in_memory().unwrap();
+    space
+        .accept_sdlc_signal(
+            deployment("deploy-trigger", "v1", 110),
+            principal("deploy-agent"),
+        )
+        .unwrap();
+
+    let tickets = Arc::new(Tickets::new(space.clone(), "test-castle".into()));
+    let supervisor = Arc::new(
+        Supervisor::new(
+            layout.clone(),
+            "test-castle".into(),
+            "fake".into(),
+            rk_ledger::Budget::default(),
+            rk_ledger::FleetBudget::default(),
+            space.clone(),
+            tickets.clone(),
+        )
+        .unwrap(),
+    );
+    let engine = Arc::new(WorkflowEngine::new(
+        layout.clone(),
+        supervisor.clone(),
+        space.clone(),
+        tickets.clone(),
+        Default::default(),
+        Default::default(),
+        "fake".into(),
+        false,
+        false,
+        false,
+        Vec::new(),
+        vec!["main".into(), "master".into()],
+    ));
+    let reactor = Reactor::new(
+        space,
+        engine.clone(),
+        tickets,
+        Some(supervisor),
+        layout,
+        ReactorConfig::default(),
+    );
+    assert_eq!(reactor.run_cycle().unwrap(), 0);
+    assert!(engine.list().is_empty());
 }

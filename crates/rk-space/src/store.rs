@@ -146,11 +146,63 @@ fn migrate(conn: &Connection) -> rk_core::Result<()> {
             .map_err(sql_err)?;
         }
     }
+    backfill_legacy_deployment_ordering(conn)?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_tuples_strength
              ON tuples (strength) WHERE strength IS NOT NULL;",
     )
     .map_err(sql_err)
+}
+
+fn backfill_legacy_deployment_ordering(conn: &Connection) -> rk_core::Result<()> {
+    let rows = {
+        let mut statement = conn
+            .prepare(
+                "SELECT state.source, state.subject, tuples.payload
+                 FROM sdlc_current_state AS state
+                 JOIN tuples ON tuples.id = state.fact_tuple_id
+                 WHERE state.scope = 'deployment'
+                   AND (state.current_occurred_at IS NULL
+                        OR state.current_observed_at IS NULL)",
+            )
+            .map_err(sql_err)?;
+        let mapped = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(sql_err)?;
+        mapped.collect::<Result<Vec<_>, _>>().map_err(sql_err)?
+    };
+
+    for (source, subject, payload_json) in rows {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_json) else {
+            continue;
+        };
+        let occurred_at = valid_rfc3339_field(&payload, "occurred_at");
+        let observed_at = valid_rfc3339_field(&payload, "observed_at");
+        if occurred_at.is_none() && observed_at.is_none() {
+            continue;
+        }
+        conn.execute(
+            "UPDATE sdlc_current_state
+             SET current_occurred_at = COALESCE(current_occurred_at, ?1),
+                 current_observed_at = COALESCE(current_observed_at, ?2)
+             WHERE source = ?3 AND scope = 'deployment' AND subject = ?4",
+            rusqlite::params![occurred_at, observed_at, source, subject],
+        )
+        .map_err(sql_err)?;
+    }
+    Ok(())
+}
+
+fn valid_rfc3339_field(payload: &serde_json::Value, field: &str) -> Option<String> {
+    let value = payload.get(field)?.as_str()?;
+    DateTime::parse_from_rfc3339(value).ok()?;
+    Some(value.to_string())
 }
 
 impl Store {
@@ -919,7 +971,7 @@ fn occurrence_advances_current(
         .as_deref()
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
     else {
-        return true;
+        return false;
     };
     let incoming_occurred_at = envelope.occurred_at.fixed_offset();
     if incoming_occurred_at != current_occurred_at {
@@ -931,7 +983,7 @@ fn occurrence_advances_current(
         .as_deref()
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
     else {
-        return true;
+        return false;
     };
     envelope.observed_at.fixed_offset() > current_observed_at
 }

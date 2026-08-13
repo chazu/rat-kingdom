@@ -223,8 +223,12 @@ impl SignalEnvelope {
             self.kind,
             SignalKind::ProductionAlertFiring | SignalKind::ProductionAlertResolved
         ) {
+            reject_alert_diagnostic_field("summary", "summary", &self.summary)?;
+            for signal_ref in &self.refs {
+                reject_alert_diagnostic_field("ref", &signal_ref.label, &signal_ref.url)?;
+            }
             for (key, value) in &self.attributes {
-                reject_alert_mutation_field(key, value)?;
+                reject_alert_diagnostic_field("attribute", key, value)?;
             }
         }
         ConfiguredSourceName::new(self.source.as_str())?;
@@ -293,9 +297,14 @@ impl SignalEnvelope {
                 require_matching(&self.correlation.service, &payload.service, "service")?;
                 require_matching(&self.correlation.alert_key, &payload.alert_key, "alert_key")?;
                 reject_secret_like("payload", &payload.state)?;
+                reject_alert_diagnostic_field("payload", "environment", &payload.environment)?;
+                reject_alert_diagnostic_field("payload", "service", &payload.service)?;
+                reject_alert_diagnostic_field("payload", "alert_key", &payload.alert_key)?;
+                reject_alert_diagnostic_field("payload", "state", &payload.state)?;
                 if let Some(severity) = &payload.severity {
                     validate_identity("severity", severity)?;
                     reject_secret_like("payload", severity)?;
+                    reject_alert_diagnostic_field("payload", "severity", severity)?;
                 }
             }
             _ => return Err(SignalValidationError::PayloadKindMismatch),
@@ -558,24 +567,51 @@ fn reject_secret_like(kind: &'static str, key: &str) -> Result<(), SignalValidat
     Ok(())
 }
 
-fn reject_alert_mutation_field(key: &str, value: &str) -> Result<(), SignalValidationError> {
-    let key = key.trim().to_ascii_lowercase();
-    let value = value.trim().to_ascii_lowercase();
-    let forbidden_keys = [
+fn reject_alert_diagnostic_field(
+    kind: &'static str,
+    key: &str,
+    value: &str,
+) -> Result<(), SignalValidationError> {
+    if alert_diagnostic_text_is_unsafe(key) || alert_diagnostic_text_is_unsafe(value) {
+        return Err(SignalValidationError::SecretLikeField(
+            kind,
+            "<redacted>".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether text is unsafe to copy into a production-alert diagnosis context.
+///
+/// Matching is token-based rather than substring-based: `rollback_action` and
+/// `please restart api` are rejected, while benign words such as
+/// `redeployment` are not mistaken for executable intent. Percent-encoded text
+/// is decoded to a bounded fixed point and fails closed when normalization is
+/// ambiguous.
+pub fn alert_diagnostic_text_is_unsafe(value: &str) -> bool {
+    let normalized = match percent_decode_ascii_fixed_point(value) {
+        Ok(value) => value,
+        Err(()) => return true,
+    };
+    let tokens = normalized
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    const FORBIDDEN: &[&str] = &[
         "action",
         "argv",
         "command",
         "executable",
         "shell",
         "tool",
-        "rollback",
-        "restart",
-        "scale",
-        "deploy",
-        "delete",
-        "patch",
-    ];
-    let forbidden_values = [
+        "credential",
+        "credentials",
+        "secret",
+        "token",
+        "bearer",
+        "password",
+        "authorization",
+        "cookie",
         "rollback",
         "restart",
         "scale",
@@ -584,19 +620,11 @@ fn reject_alert_mutation_field(key: &str, value: &str) -> Result<(), SignalValid
         "patch",
         "ssh",
         "kubectl",
-        "terraform apply",
     ];
-    if forbidden_keys.contains(&key.as_str())
-        || forbidden_values
-            .iter()
-            .any(|forbidden| value == *forbidden || value.starts_with(&format!("{forbidden} ")))
-    {
-        return Err(SignalValidationError::SecretLikeField(
-            "attribute",
-            "<redacted>".into(),
-        ));
-    }
-    Ok(())
+    tokens.iter().any(|token| FORBIDDEN.contains(token))
+        || tokens
+            .windows(2)
+            .any(|pair| matches!(pair, ["terraform", "apply"] | ["api", "key"]))
 }
 
 fn is_url_like(value: &str) -> bool {
