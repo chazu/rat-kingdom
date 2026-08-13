@@ -82,9 +82,13 @@ pub enum FactoryMetricPayload {
     Recurrence,
     Cost {
         micro_usd: u64,
+        pricing_evidence_id: Option<String>,
     },
     LeadTime {
-        ms: u64,
+        started_at_ms: i64,
+        completed_at_ms: i64,
+        run_id: String,
+        completed_run_id: String,
     },
     Unknown,
 }

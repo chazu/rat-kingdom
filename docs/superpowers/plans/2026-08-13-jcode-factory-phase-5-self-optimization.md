@@ -154,7 +154,7 @@ Use synthetic structured fixtures. Include decoy log strings, prose fields, comm
 - [ ] **Step 2: Run tests and verify RED**
 
 ```bash
-cargo test -p rk-core factory_outcome_facts -- --nocapture
+cargo test -p rk-core --test factory_outcome_facts -- --nocapture
 ```
 
 Expected: failure because outcome event/fact types and normalization do not exist.
@@ -167,7 +167,7 @@ Do not add log readers, regex parsing over text logs, shell commands, transcript
 
 - [ ] **Step 4: Run tests and verify GREEN**
 
-Run the `cargo test -p rk-core factory_outcome_facts -- --nocapture` command. Expected: all outcome fact tests pass.
+Run the `cargo test -p rk-core --test factory_outcome_facts -- --nocapture` command. Expected: all outcome fact tests pass.
 
 - [ ] **Step 5: Commit**
 

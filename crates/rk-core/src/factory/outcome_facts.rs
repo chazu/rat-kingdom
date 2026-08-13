@@ -118,7 +118,7 @@ impl OutcomeFactBuilder {
             .events
             .iter()
             .filter(|event| self.include_archived || !event.archived)
-            .map(fact_from_event)
+            .map(|event| fact_from_event(event, &self.events))
             .collect();
 
         facts.extend(self.unavailable.into_iter().map(unobserved_fact));
@@ -133,18 +133,20 @@ impl OutcomeFactBuilder {
     }
 }
 
-fn fact_from_event(event: &FactoryOutcomeEvent) -> OutcomeFact {
+fn fact_from_event(event: &FactoryOutcomeEvent, all_events: &[FactoryOutcomeEvent]) -> OutcomeFact {
     let mut warnings = Vec::new();
-    let task_class = if task_class_source_allows(event.source_family) {
+    let task_class = if event.task_class.is_some() && task_class_source_allows(event) {
         event.task_class.clone()
     } else {
-        if event.task_class.is_none() {
+        if event.task_class.is_some() {
+            warnings.push("task_class_forbidden_source: explicit Phase 3 contract, ticket, or structured outcome provenance required".into());
+        } else {
             warnings.push("task_class_unobserved: explicit Phase 3 contract, ticket, or outcome field required".into());
         }
-        None
+        Some("unknown".into())
     };
 
-    let status = status_from_structured_payload(event);
+    let status = status_from_structured_payload(event, all_events);
     let human_interventions = match (&event.source_family, &event.metric_payload) {
         (
             OutcomeEvidenceKind::HumanGateDecision,
@@ -161,15 +163,32 @@ fn fact_from_event(event: &FactoryOutcomeEvent) -> OutcomeFact {
         _ => 0,
     };
     let cost_micro_usd = match (&event.source_family, &event.metric_payload) {
-        (OutcomeEvidenceKind::PricingSnapshot, FactoryMetricPayload::Cost { micro_usd }) => {
-            Some(*micro_usd)
-        }
+        (
+            OutcomeEvidenceKind::AgentRecord | OutcomeEvidenceKind::PricingSnapshot,
+            FactoryMetricPayload::Cost {
+                micro_usd,
+                pricing_evidence_id: Some(_),
+            },
+        ) => Some(*micro_usd),
         _ => None,
     };
     let lead_time_ms = match event.metric_payload {
-        FactoryMetricPayload::LeadTime { ms } => Some(ms),
+        FactoryMetricPayload::LeadTime {
+            started_at_ms,
+            completed_at_ms,
+            ref run_id,
+            ref completed_run_id,
+        } if event.source_family == OutcomeEvidenceKind::WorkflowInstance
+            && run_id == completed_run_id
+            && completed_at_ms >= started_at_ms =>
+        {
+            completed_at_ms
+                .checked_sub(started_at_ms)
+                .and_then(|ms| u64::try_from(ms).ok())
+        }
         _ => None,
     };
+    let source_counts = source_counts_for(event, all_events);
 
     let mut fact = OutcomeFact {
         fact_id: String::new(),
@@ -177,9 +196,9 @@ fn fact_from_event(event: &FactoryOutcomeEvent) -> OutcomeFact {
         repo: event.repo.clone(),
         group_key: OutcomeFactGroupKey {
             task_class,
-            workflow: event.workflow.clone(),
-            harness: event.harness.clone(),
-            model: event.model.clone(),
+            workflow: event.workflow.clone().or_else(|| Some("unknown".into())),
+            harness: event.harness.clone().or_else(|| Some("unknown".into())),
+            model: event.model.clone().or_else(|| Some("unknown".into())),
         },
         status,
         evidence_kind: event.source_family,
@@ -192,11 +211,7 @@ fn fact_from_event(event: &FactoryOutcomeEvent) -> OutcomeFact {
             source_family: event.source_family,
             available: true,
         },
-        source_counts: SourceCounts {
-            active_source_count: u32::from(!event.archived),
-            archived_source_count: u32::from(event.archived),
-            event_count: 1,
-        },
+        source_counts,
         archived: event.archived,
         archive_source_family: event.archived.then_some(event.source_family),
         human_interventions,
@@ -233,14 +248,36 @@ fn unobserved_fact(source: OutcomeFactSource) -> OutcomeFact {
     fact
 }
 
-fn task_class_source_allows(kind: OutcomeEvidenceKind) -> bool {
-    matches!(
-        kind,
-        OutcomeEvidenceKind::Phase3Contract | OutcomeEvidenceKind::Phase3VerifiedDelivery
-    )
+fn source_counts_for(
+    event: &FactoryOutcomeEvent,
+    all_events: &[FactoryOutcomeEvent],
+) -> SourceCounts {
+    let mut counts = SourceCounts::default();
+    for candidate in all_events.iter().filter(|candidate| {
+        candidate.repo == event.repo && candidate.source_family == event.source_family
+    }) {
+        counts.event_count = counts.event_count.saturating_add(1);
+        if candidate.archived {
+            counts.archived_source_count = counts.archived_source_count.saturating_add(1);
+        } else {
+            counts.active_source_count = counts.active_source_count.saturating_add(1);
+        }
+    }
+    counts
 }
 
-fn status_from_structured_payload(event: &FactoryOutcomeEvent) -> OutcomeStatus {
+fn task_class_source_allows(event: &FactoryOutcomeEvent) -> bool {
+    matches!(
+        event.source_family,
+        OutcomeEvidenceKind::Phase3Contract | OutcomeEvidenceKind::Phase3VerifiedDelivery
+    ) || event.ticket_id.is_some()
+        || event.phase3_outcome_id.is_some()
+}
+
+fn status_from_structured_payload(
+    event: &FactoryOutcomeEvent,
+    all_events: &[FactoryOutcomeEvent],
+) -> OutcomeStatus {
     match (&event.source_family, &event.metric_payload) {
         (
             OutcomeEvidenceKind::Phase3VerifiedDelivery,
@@ -261,11 +298,34 @@ fn status_from_structured_payload(event: &FactoryOutcomeEvent) -> OutcomeStatus 
             FactoryMetricPayload::Ci {
                 recovered: true, ..
             },
-        ) => OutcomeStatus::CiRecovered,
+        ) if has_prior_failed_ci_signal(event, all_events) => OutcomeStatus::CiRecovered,
         (
             OutcomeEvidenceKind::StructuredRevert,
             FactoryMetricPayload::Reverted { reverted: true },
         ) => OutcomeStatus::Reverted,
         _ => OutcomeStatus::Unknown,
     }
+}
+
+fn has_prior_failed_ci_signal(
+    recovered: &FactoryOutcomeEvent,
+    all_events: &[FactoryOutcomeEvent],
+) -> bool {
+    let Some(failed_signal_id) = recovered.phase4_signal_id.as_deref() else {
+        return false;
+    };
+    all_events.iter().any(|event| {
+        event.source_family == OutcomeEvidenceKind::Phase4CiSignal
+            && event.source_id == failed_signal_id
+            && event.workflow_instance_id == recovered.workflow_instance_id
+            && event.source_version == recovered.source_version
+            && event.observed_at_ms < recovered.observed_at_ms
+            && matches!(
+                event.metric_payload,
+                FactoryMetricPayload::Ci {
+                    failed: true,
+                    recovered: false
+                }
+            )
+    })
 }
