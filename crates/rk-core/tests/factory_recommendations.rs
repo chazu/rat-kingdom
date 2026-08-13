@@ -428,6 +428,7 @@ fn low_sample_suppression_uses_metric_observed_denominator_not_runs() {
         assert!(rec.suppressed, "{rule:?} should be suppressed");
         assert_eq!(rec.suppression_reason, Some(SuppressionReason::LowSample));
         assert_eq!(rec.evidence.denominator, Some(1));
+        assert_eq!(rec.sample_size, 1);
     }
 }
 

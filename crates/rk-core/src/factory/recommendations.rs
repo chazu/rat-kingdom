@@ -804,6 +804,10 @@ fn make_rec(
     suppression_reason: Option<SuppressionReason>,
 ) -> FactoryRecommendation {
     let source_counts = source_counts(row, family);
+    let sample_size = evidence
+        .denominator
+        .map(|denominator| denominator.min(u64::from(u32::MAX)) as u32)
+        .unwrap_or(0);
     FactoryRecommendation {
         id: format!(
             "{}:{}:{}:{}:{}:{}",
@@ -826,7 +830,7 @@ fn make_rec(
         evidence_count: source_counts.event_count,
         source_count: source_counts.active_source_count + source_counts.archived_source_count,
         source_counts,
-        sample_size: row.sample_size,
+        sample_size,
         suppressed,
         suppression_reason,
     }
