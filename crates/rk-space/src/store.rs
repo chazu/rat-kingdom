@@ -15,8 +15,11 @@ use rk_core::sdlc::{
 };
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
 use rk_core::Error;
-use rusqlite::{params_from_iter, Connection, OptionalExtension, Row, Transaction};
+use rusqlite::{
+    params_from_iter, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
+};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 pub(crate) struct Store {
@@ -173,6 +176,7 @@ impl Store {
         envelope
             .validate(&Default::default())
             .map_err(|error| Error::InvalidTuple(error.to_string()))?;
+        reject_sdlc_storage_secret_like(&envelope.summary)?;
         let expected = SignalSourcePrincipal::for_source(&envelope.source);
         if principal.as_str() != expected.as_str() {
             return Err(Error::InvalidTuple(
@@ -180,7 +184,17 @@ impl Store {
             ));
         }
 
-        if let Some(receipt) = self.sdlc_receipt(&envelope.source, &envelope.delivery_id)? {
+        let digest = SemanticStateDigest::for_envelope(envelope)
+            .map_err(|error| Error::InvalidTuple(error.to_string()))?;
+        let key = sdlc_key(envelope);
+        let source = envelope.source.as_str().to_string();
+        let event_tuple = sdlc_event_tuple(envelope, principal, &key);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+
+        if let Some(receipt) = sdlc_receipt_tx(&tx, &source, &envelope.delivery_id)? {
             return Ok(AcceptedSdlcSignal {
                 receipt,
                 projected_tuples: vec![],
@@ -188,12 +202,6 @@ impl Store {
         }
 
         let accepted_at = Utc::now();
-        let digest = SemanticStateDigest::for_envelope(envelope)
-            .map_err(|error| Error::InvalidTuple(error.to_string()))?;
-        let key = sdlc_key(envelope);
-        let source = envelope.source.as_str().to_string();
-        let event_tuple = sdlc_event_tuple(envelope, principal, &key);
-        let tx = self.conn.transaction().map_err(sql_err)?;
 
         let current = tx
             .query_row(
@@ -216,7 +224,9 @@ impl Store {
         let fact_id = current
             .as_ref()
             .map(|(_, _, _, id)| id.clone())
-            .unwrap_or_else(|| RecordId::new().to_string());
+            .unwrap_or_else(|| {
+                stable_record_id(&["sdlc", "fact", &source, &key.scope, &key.subject]).to_string()
+            });
         let first_delivery_id = current
             .as_ref()
             .map(|(_, id, _, _)| id.clone())
@@ -800,23 +810,32 @@ fn insert_tuple_tx(tx: &Transaction<'_>, tuple: &Tuple) -> rk_core::Result<()> {
 fn sdlc_key(envelope: &SignalEnvelope) -> SdlcKey {
     match &envelope.payload {
         SignalPayload::Ci(_) => SdlcKey {
-            scope: envelope.correlation.repo.clone().unwrap_or_default(),
+            scope: "ci".into(),
             subject: format!(
-                "ci:{}:{}:{}",
+                "{}:{}:{}:{}:{}",
+                envelope.correlation.repo.as_deref().unwrap_or_default(),
                 envelope.correlation.branch.as_deref().unwrap_or_default(),
                 envelope.correlation.workflow.as_deref().unwrap_or_default(),
-                envelope.correlation.job.as_deref().unwrap_or_default()
+                envelope.correlation.job.as_deref().unwrap_or_default(),
+                envelope
+                    .correlation
+                    .commit_sha
+                    .as_deref()
+                    .unwrap_or_default()
             ),
             family: "ci",
         },
         SignalPayload::Deployment(payload) => SdlcKey {
-            scope: payload.environment.clone(),
-            subject: format!("deployment:{}", payload.service),
+            scope: "deployment".into(),
+            subject: format!("{}:{}", payload.environment, payload.service),
             family: "deployment",
         },
         SignalPayload::ProductionAlert(payload) => SdlcKey {
-            scope: payload.environment.clone(),
-            subject: format!("production_alert:{}:{}", payload.service, payload.alert_key),
+            scope: "production_alert".into(),
+            subject: format!(
+                "{}:{}:{}",
+                payload.environment, payload.service, payload.alert_key
+            ),
             family: "production_alert",
         },
     }
@@ -838,6 +857,12 @@ fn sdlc_event_tuple(
         principal.as_str(),
         json!({"source": envelope.source.as_str(), "delivery_id": envelope.delivery_id, "family": key.family, "subject": key.subject, "kind": envelope.kind, "summary": envelope.summary, "occurred_at": envelope.occurred_at, "observed_at": envelope.observed_at, "correlation": envelope.correlation, "refs": envelope.refs, "attributes": envelope.attributes, "payload": envelope.payload}),
     );
+    tuple.id = stable_record_id(&[
+        "sdlc",
+        "event",
+        envelope.source.as_str(),
+        &envelope.delivery_id,
+    ]);
     tuple.created_at = envelope.observed_at;
     tuple
 }
@@ -889,8 +914,77 @@ fn sdlc_transition_tuple(
         principal.as_str(),
         json!({"source": envelope.source.as_str(), "delivery_id": envelope.delivery_id, "family": key.family, "subject": key.subject, "previous_digest": previous_digest, "current_digest": current_digest}),
     );
+    tuple.id = stable_record_id(&[
+        "sdlc",
+        "transition",
+        envelope.source.as_str(),
+        &key.scope,
+        &key.subject,
+        &envelope.delivery_id,
+        current_digest,
+    ]);
     tuple.created_at = envelope.observed_at;
     tuple
+}
+
+fn stable_record_id(parts: &[&str]) -> RecordId {
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut hasher = Sha256::new();
+    hasher.update(b"rk-stable-record-id-v1");
+    for part in parts {
+        hasher.update([0]);
+        hasher.update(part.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut value = [0u8; 16];
+    value.copy_from_slice(&digest[..16]);
+    value[0] &= 0x7f;
+    let mut n = u128::from_be_bytes(value);
+    let mut out = [b'0'; 26];
+    for ch in out.iter_mut().rev() {
+        *ch = ALPHABET[(n & 31) as usize];
+        n >>= 5;
+    }
+    std::str::from_utf8(&out)
+        .expect("stable ULID alphabet is UTF-8")
+        .parse()
+        .expect("stable id encoder emits valid ULIDs")
+}
+
+fn reject_sdlc_storage_secret_like(value: &str) -> rk_core::Result<()> {
+    let lower = value.to_ascii_lowercase();
+    let secret_words = [
+        "secret",
+        "token",
+        "bearer",
+        "api_key",
+        "apikey",
+        "raw",
+        "telemetry",
+    ];
+    if secret_words.iter().any(|word| lower.contains(word)) {
+        Err(Error::InvalidTuple(
+            "secret-like SDLC summary rejected".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn sdlc_receipt_tx(
+    tx: &Transaction<'_>,
+    source: &str,
+    delivery_id: &str,
+) -> rk_core::Result<Option<SignalReceipt>> {
+    tx.query_row(
+        "SELECT receipt_json FROM sdlc_receipts WHERE source = ?1 AND delivery_id = ?2",
+        rusqlite::params![source, delivery_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(sql_err)?
+    .map(|json| stored_sdlc_receipt(&json))
+    .transpose()
 }
 
 fn stored_sdlc_receipt(json: &str) -> rk_core::Result<SignalReceipt> {
@@ -902,8 +996,12 @@ fn stored_sdlc_receipt(json: &str) -> rk_core::Result<SignalReceipt> {
             .map(ToOwned::to_owned)
             .ok_or_else(|| Error::InvalidTuple(format!("stored receipt missing {field}")))
     };
-    let source = SignalSourcePrincipal::from_stored_source_principal(&get_str("source")?)
+    let source_name =
+        ConfiguredSourceName::new(get_str("source")?.strip_prefix("source:").ok_or_else(|| {
+            Error::InvalidTuple("stored receipt source is not source principal".into())
+        })?)
         .map_err(|error| Error::InvalidTuple(error.to_string()))?;
+    let source = SignalSourcePrincipal::for_source(&source_name);
     let accepted_at = DateTime::parse_from_rfc3339(&get_str("accepted_at")?)
         .map(|time| time.with_timezone(&Utc))
         .map_err(|error| Error::InvalidTuple(error.to_string()))?;
