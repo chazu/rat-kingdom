@@ -47,6 +47,50 @@ fn create_legacy_database(path: &std::path::Path, tuples: &[&Tuple]) {
     }
 }
 
+fn create_sequence_only_database_after_deletion(path: &std::path::Path, surviving: &Tuple) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE tuples (
+            id TEXT PRIMARY KEY,
+            commit_sequence INTEGER,
+            category TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            identity TEXT NOT NULL,
+            instance TEXT NOT NULL,
+            lifecycle TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT,
+            strength REAL
+        );
+        CREATE TABLE tuple_sequence_state (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            last_sequence INTEGER NOT NULL,
+            legacy_backfill_sequence INTEGER NOT NULL
+        );
+        INSERT INTO tuple_sequence_state
+            (singleton, last_sequence, legacy_backfill_sequence)
+        VALUES (1, 2, 2);",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO tuples
+         (id, commit_sequence, category, scope, identity, instance, lifecycle,
+          payload, created_at, expires_at, strength)
+         VALUES (?1, 2, ?2, ?3, ?4, ?5, 'session', ?6, ?7, NULL, NULL)",
+        rusqlite::params![
+            surviving.id.to_string(),
+            surviving.category.as_str(),
+            surviving.scope,
+            surviving.identity,
+            surviving.instance,
+            surviving.payload.to_string(),
+            surviving.created_at.to_rfc3339(),
+        ],
+    )
+    .unwrap();
+}
+
 #[test]
 fn delayed_lower_record_id_replays_after_persistence_boundary() {
     let space = Space::open_in_memory().unwrap();
@@ -164,6 +208,27 @@ fn legacy_database_backfills_deterministically_without_hiding_new_low_ids() {
         space.persistence_delta(Some(2)).unwrap().tuples,
         vec![post_migration_low]
     );
+}
+
+#[test]
+fn sequence_only_database_with_deleted_history_upgrades_without_rewinding() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sequence-only-deletion.db");
+    let surviving = fact(RecordId::floor_at(Utc::now()), "surviving-sequence-two");
+    create_sequence_only_database_after_deletion(&db, &surviving);
+
+    let space = Space::open(&db).unwrap();
+    assert_eq!(space.latest_persistence_sequence().unwrap(), 2);
+    assert_eq!(space.persistence_delta(None).unwrap().tuples, vec![surviving]);
+
+    let future = fact(
+        RecordId::floor_at(Utc::now() + Duration::days(1)),
+        "post-upgrade-sequence-three",
+    );
+    space.out(future.clone()).unwrap();
+    let delta = space.persistence_delta(Some(2)).unwrap();
+    assert_eq!(delta.boundary, 3);
+    assert_eq!(delta.tuples, vec![future]);
 }
 
 #[test]

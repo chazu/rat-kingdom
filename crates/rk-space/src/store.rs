@@ -56,7 +56,10 @@ CREATE TABLE IF NOT EXISTS tuple_sequence_state (
                                         AND last_sequence >= 0),
     legacy_backfill_sequence     INTEGER NOT NULL
                                  CHECK (typeof(legacy_backfill_sequence) = 'integer'
-                                        AND legacy_backfill_sequence >= 0)
+                                        AND legacy_backfill_sequence >= 0),
+    journal_floor_sequence       INTEGER NOT NULL DEFAULT 0
+                                 CHECK (typeof(journal_floor_sequence) = 'integer'
+                                        AND journal_floor_sequence >= 0)
 );
 CREATE TABLE IF NOT EXISTS tuple_persistence_events (
     commit_sequence INTEGER PRIMARY KEY,
@@ -186,7 +189,11 @@ struct CurrentSdlcState {
 /// existed needs an explicit `ALTER`. The duplicate-column error on an
 /// up-to-date DB is the one expected exception; every other migration error is
 /// returned so the daemon cannot operate against a partially upgraded store.
-fn migrate(conn: &mut Connection, sequence_schema_preexisting: bool) -> rk_core::Result<()> {
+fn migrate(
+    conn: &mut Connection,
+    sequence_schema_preexisting: bool,
+    journal_schema_preexisting: bool,
+) -> rk_core::Result<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql_err)?;
@@ -219,6 +226,26 @@ fn migrate(conn: &mut Connection, sequence_schema_preexisting: bool) -> rk_core:
         )
         .map_err(sql_err)?;
     }
+    let journal_floor_exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('tuple_sequence_state')
+                  WHERE name = 'journal_floor_sequence'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_err)?;
+    if !journal_floor_exists {
+        tx.execute(
+            "ALTER TABLE tuple_sequence_state
+             ADD COLUMN journal_floor_sequence INTEGER NOT NULL DEFAULT 0
+             CHECK (typeof(journal_floor_sequence) = 'integer'
+                    AND journal_floor_sequence >= 0)",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
     for column in ["current_occurred_at", "current_observed_at"] {
         let exists: bool = tx
             .query_row(
@@ -239,6 +266,15 @@ fn migrate(conn: &mut Connection, sequence_schema_preexisting: bool) -> rk_core:
     }
     backfill_tuple_sequences(&tx, sequence_schema_preexisting)?;
     backfill_tuple_persistence_events(&tx)?;
+    if sequence_schema_preexisting && !journal_schema_preexisting {
+        tx.execute(
+            "UPDATE tuple_sequence_state
+                SET journal_floor_sequence = last_sequence
+              WHERE singleton = 1",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
     validate_sequence_journal(&tx)?;
     backfill_legacy_deployment_ordering(&tx)?;
     tx.execute_batch(
@@ -267,6 +303,9 @@ fn migrate(conn: &mut Connection, sequence_schema_preexisting: bool) -> rk_core:
                     AND typeof(legacy_backfill_sequence) = 'integer'
                     AND legacy_backfill_sequence >= 0
                     AND legacy_backfill_sequence <= last_sequence
+                    AND typeof(journal_floor_sequence) = 'integer'
+                    AND journal_floor_sequence >= 0
+                    AND journal_floor_sequence <= last_sequence
              ) THEN RAISE(ABORT, 'invalid tuple persistence sequence state') END;
              UPDATE tuple_sequence_state
                 SET last_sequence = last_sequence + 1
@@ -376,8 +415,9 @@ fn backfill_tuple_sequences(
         None => conn
             .execute(
                 "INSERT INTO tuple_sequence_state
-                 (singleton, last_sequence, legacy_backfill_sequence)
-                 VALUES (1, ?1, ?1)",
+                 (singleton, last_sequence, legacy_backfill_sequence,
+                  journal_floor_sequence)
+                 VALUES (1, ?1, ?1, 0)",
                 [next],
             )
             .map(|_| ())
@@ -406,33 +446,56 @@ fn backfill_tuple_persistence_events(conn: &Connection) -> rk_core::Result<()> {
 }
 
 fn validate_sequence_journal(conn: &Connection) -> rk_core::Result<i64> {
-    let (last, legacy, event_count, first_event, last_event): (i64, i64, i64, i64, i64) = conn
-        .query_row(
-            "SELECT state.last_sequence,
-                    state.legacy_backfill_sequence,
-                    (SELECT COUNT(*) FROM tuple_persistence_events),
-                    COALESCE((SELECT MIN(commit_sequence) FROM tuple_persistence_events), 0),
-                    COALESCE((SELECT MAX(commit_sequence) FROM tuple_persistence_events), 0)
-               FROM tuple_sequence_state AS state
-              WHERE state.singleton = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )
-        .map_err(sql_err)?;
-    let contiguous = if last == 0 {
-        event_count == 0 && first_event == 0 && last_event == 0
+    let (last, legacy, floor, suffix_count, first_suffix, last_suffix, invalid_count):
+        (i64, i64, i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT state.last_sequence,
+                        state.legacy_backfill_sequence,
+                        state.journal_floor_sequence,
+                        (SELECT COUNT(*) FROM tuple_persistence_events
+                          WHERE commit_sequence > state.journal_floor_sequence),
+                        COALESCE((SELECT MIN(commit_sequence)
+                                    FROM tuple_persistence_events
+                                   WHERE commit_sequence > state.journal_floor_sequence), 0),
+                        COALESCE((SELECT MAX(commit_sequence)
+                                    FROM tuple_persistence_events
+                                   WHERE commit_sequence > state.journal_floor_sequence), 0),
+                        (SELECT COUNT(*) FROM tuple_persistence_events
+                          WHERE commit_sequence < 1
+                             OR commit_sequence > state.last_sequence)
+                   FROM tuple_sequence_state AS state
+                  WHERE state.singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .map_err(sql_err)?;
+    let suffix_contiguous = if last == floor {
+        suffix_count == 0 && first_suffix == 0 && last_suffix == 0
+    } else if last > floor {
+        suffix_count == last - floor
+            && first_suffix == floor + 1
+            && last_suffix == last
     } else {
-        event_count == last && first_event == 1 && last_event == last
+        false
     };
-    if last < 0 || legacy < 0 || legacy > last || !contiguous {
+    if last < 0
+        || legacy < 0
+        || legacy > last
+        || floor < 0
+        || floor > last
+        || invalid_count != 0
+        || !suffix_contiguous
+    {
         return Err(Error::Other(
             "tuple persistence sequence state disagrees with immutable journal".into(),
         ));
@@ -507,8 +570,22 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_err)?;
+        let journal_schema_preexisting = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master
+                      WHERE type = 'table' AND name = 'tuple_persistence_events'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
-        migrate(&mut conn, sequence_schema_preexisting)?;
+        migrate(
+            &mut conn,
+            sequence_schema_preexisting,
+            journal_schema_preexisting,
+        )?;
         Ok(Self { conn })
     }
 
@@ -516,8 +593,13 @@ impl Store {
         let mut conn = Connection::open_in_memory().map_err(sql_err)?;
         register_functions(&conn).map_err(sql_err)?;
         let sequence_schema_preexisting = false;
+        let journal_schema_preexisting = false;
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
-        migrate(&mut conn, sequence_schema_preexisting)?;
+        migrate(
+            &mut conn,
+            sequence_schema_preexisting,
+            journal_schema_preexisting,
+        )?;
         Ok(Self { conn })
     }
 
