@@ -1,0 +1,28 @@
+{
+  "schema": "factory.snapshot.v1",
+  "generated_at": "2026-08-13T10:15:00Z",
+  "repo": "rat-kingdom",
+  "source": "daemon.live",
+  "connection": {
+    "kind": "daemon",
+    "status": "connected",
+    "endpoint": "unix:///tmp/rat-kingdom.sock"
+  },
+  "repo_resync": {"status": "idle", "source": "repo.watch"},
+  "approvals": [
+    {
+      "proposal_id": "typed-prop-1",
+      "status": "pending",
+      "canonical_digest": "sha256:typedabc",
+      "requester": "foreman",
+      "scope": "workflow.run repair --repo rat-kingdom",
+      "expires_at": "2026-08-13T11:15:00Z"
+    }
+  ],
+  "workflow_runs": [{"id": "wf-typed-1", "workflow": "repair", "state": "running", "repo": "rat-kingdom"}],
+  "agents": [{"id": "agent-typed-1", "state": "busy", "task": "repair", "repo": "rat-kingdom"}],
+  "tickets": [{"id": "RK-17", "status": "open", "title": "Fix typed replay dashboard", "repo": "rat-kingdom"}],
+  "inbox": [{"id": "msg-typed-1", "state": "unread", "subject": "typed approval", "from": "daemon"}],
+  "budget": {"spent_usd": 2.5, "limit_usd": 10.0},
+  "degraded_sources": []
+}

@@ -62,6 +62,40 @@ class FactoryDashboardTests(unittest.TestCase):
             ],
         }
 
+
+    def fixture(self, name):
+        path = Path(__file__).resolve().parent / "fixtures" / "dashboard" / name
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_dashboard_consumes_typed_replay_boundary_kind_and_source(self):
+        output = self.render(self.fixture("typed_snapshot.json"), self.fixture("typed_replay.json"))
+        self.assertIn("## Data Source", output)
+        self.assertIn("Snapshot: `daemon.live`", output)
+        self.assertIn("Events: `daemon.replay`", output)
+        self.assertIn("boundary cursor: `evt-0000`", output)
+        self.assertIn("approval.requested", output)
+        self.assertIn("workflow.started", output)
+        self.assertNotIn("unknown | digest approval requested", output)
+
+    def test_dashboard_tolerates_legacy_replay_aliases(self):
+        events = self.base_events()
+        events.update({"source": "legacy.replay", "truncated": True, "boundary_cursor": "cursor-legacy"})
+        output = self.render(self.base_snapshot(), events)
+        self.assertIn("Events: `legacy.replay`", output)
+        self.assertIn("boundary cursor: `cursor-legacy`", output)
+        self.assertIn("approval.requested", output)
+
+    def test_dashboard_safely_renders_malformed_connection_values(self):
+        snapshot = self.base_snapshot()
+        snapshot["connection"] = [
+            {"status": "connected"},
+            {"endpoint": "unix:///tmp/rk.sock"},
+        ]
+        output = self.render(snapshot, self.base_events())
+        self.assertIn("## Connection State", output)
+        self.assertIn("Malformed connection", output)
+        self.assertIn("status", output)
+
     def test_dashboard_renders_snapshot_and_events_sections(self):
         output = self.render(self.base_snapshot(), self.base_events())
         for heading in [

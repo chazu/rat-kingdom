@@ -68,8 +68,8 @@ A failed observation remains in top-level `observations` and nested `snapshot.ob
 
 The repository-owned dashboard renderer consumes JSON artifacts that have already been obtained from typed factory read interfaces:
 
-- `--snapshot PATH`: one JSON document from `factory.snapshot`, containing the current connection state and factory projection such as approvals, workflow runs, agents, tickets, inbox, budget, degraded sources, and repository resync state when present.
-- `--events PATH`: one JSON document from `factory.events.replay`, containing replay metadata such as cursor or boundary cursor, `truncated`, and the recent event list.
+- `--snapshot PATH`: one JSON document from `factory.snapshot`, containing the current connection state and factory projection such as approvals, workflow runs, agents, tickets, inbox, budget, degraded sources, and repository resync state when present. The renderer displays the snapshot source so readers can distinguish live data from saved or replayed data.
+- `--events PATH`: one JSON document from `factory.events.replay`, containing replay metadata such as cursor, typed replay `boundary`, `truncated`, and the recent event list. Event rows use typed event `kind`; legacy `boundary_cursor` and `type` aliases are tolerated for old artifacts.
 - `--output PATH`: the Markdown file to create or replace.
 
 Run it from the repository root:
@@ -81,7 +81,7 @@ python3 .jcode/skills/factory-foreman/dashboard/render_factory_dashboard.py \
   --output "$JCODE_SCRATCH_DIR/factory-dashboard.md"
 ```
 
-The output is deterministic Markdown with sections for connection and resync state, approvals, workflow runs, agents, tickets, inbox, budget, recent events, and degraded data. Replay truncation and its boundary must remain visible so a reader does not mistake a partial replay for complete history. A running resync is rendered as resyncing, while stale or failed inputs remain visibly degraded.
+The output is deterministic Markdown with sections for data source, connection and resync state, approvals, workflow runs, agents, tickets, inbox, budget, recent events, and degraded data. Replay truncation and its boundary must remain visible so a reader does not mistake a partial replay for complete history. A running resync is rendered as resyncing, while stale or failed inputs remain visibly degraded. Malformed `connection` values are rendered as malformed input instead of raising a traceback.
 
 The renderer uses only the Python standard library. Its boundary is intentionally strict:
 
@@ -91,7 +91,7 @@ The renderer uses only the Python standard library. Its boundary is intentionall
 - no proposal approval, workflow execution, or other mutation;
 - no authority beyond the contents of the supplied files.
 
-MCP and CLI are upstream ways to acquire typed JSON, not dependencies called by the renderer. A Jcode side panel may display the generated Markdown, but neither the renderer nor the side panel is a source of truth or an execution boundary. Daemon state remains authoritative, including whether a proposal is actually approved.
+MCP and CLI are upstream ways to acquire typed JSON, not dependencies called by the renderer. A Jcode side panel may display the generated Markdown, but neither the renderer nor the side panel is a source of truth or an execution boundary. Daemon state remains authoritative, including whether a proposal is actually approved. Typed execution requires daemon-verifiable exact digest approval; the Phase 1 helper remains a fallback for legacy/manual proposal validation only.
 
 ## Approval examples
 
@@ -112,7 +112,7 @@ Before execution, run:
 python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py validate-proposal --proposal-file <file> --approved-id <proposal_id>
 ```
 
-Then execute only the returned validated `argv`. Require reapproval for any changed argv.
+Then execute only the returned validated `argv` when using the Phase 1 fallback helper path. Typed execution must instead verify daemon-recorded approval of the exact canonical digest before dispatch. Require reapproval for any changed argv.
 
 ## Recovery behavior
 

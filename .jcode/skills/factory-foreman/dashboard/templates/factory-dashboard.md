@@ -5,13 +5,20 @@ The renderer keeps Markdown generation in Python so values can be escaped and ro
 can be sorted deterministically.
 
 1. Factory Dashboard
-2. Connection State
-3. Resync State
-4. Approvals
-5. Workflow Runs
-6. Agents
-7. Tickets
-8. Inbox
-9. Budget
-10. Recent Events
-11. Degraded Data
+2. Data Source
+3. Connection State
+4. Resync State
+5. Approvals
+6. Workflow Runs
+7. Agents
+8. Tickets
+9. Inbox
+10. Budget
+11. Recent Events
+12. Degraded Data
+
+The Recent Events section consumes typed replay `boundary` metadata and event
+`kind` fields. Legacy `boundary_cursor` and `type` aliases are tolerated for old
+artifacts only. The dashboard is display-only: typed execution still requires
+daemon-verifiable approval of the exact canonical digest, while the Phase 1
+helper remains a fallback for legacy/manual proposal validation.

@@ -1,0 +1,12 @@
+{
+  "schema": "factory.events.replay.v1",
+  "source": "daemon.replay",
+  "cursor": "evt-0003",
+  "from_cursor": "evt-0001",
+  "boundary": "evt-0000",
+  "truncated": true,
+  "events": [
+    {"cursor": "evt-0002", "kind": "workflow.started", "summary": "repair workflow started"},
+    {"cursor": "evt-0003", "kind": "approval.requested", "summary": "digest approval requested"}
+  ]
+}

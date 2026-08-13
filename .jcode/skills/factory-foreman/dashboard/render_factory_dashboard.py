@@ -45,8 +45,14 @@ def render_dashboard(snapshot: dict[str, Any], events: dict[str, Any]) -> str:
     add(f"- Overall state: **{overall_state(snapshot)}**")
     add("")
 
+    add("## Data Source")
+    add(f"- Snapshot: {code(data_source(snapshot, 'live'))}")
+    add(f"- Events: {code(data_source(events, 'replay'))}")
+    add("")
+
     add("## Connection State")
-    mapping_section(lines, snapshot.get("connection") or snapshot.get("connection_state") or {})
+    connection = snapshot.get("connection") or snapshot.get("connection_state") or {}
+    mapping_section(lines, safe_mapping(connection, "connection"))
 
     add("## Resync State")
     resync = as_dict(snapshot.get("repo_resync"))
@@ -96,14 +102,14 @@ def render_dashboard(snapshot: dict[str, Any], events: dict[str, Any]) -> str:
     add(f"- From cursor: {code(events.get('from_cursor', ''))}")
     add(f"- Cursor: {code(events.get('cursor', ''))}")
     if events.get("truncated"):
-        boundary = events.get("boundary_cursor") or events.get("oldest_cursor") or events.get("from_cursor")
+        boundary = events.get("boundary") or events.get("boundary_cursor") or events.get("oldest_cursor") or events.get("from_cursor")
         add(f"- WARNING: replay truncated, boundary cursor: {code(boundary)}")
     event_rows = rows(events, "events")
     if event_rows:
-        add("| cursor | type | summary |")
+        add("| cursor | kind | summary |")
         add("| --- | --- | --- |")
-        for item in stable_rows(event_rows, "cursor", "type"):
-            add("| " + " | ".join([cell(item.get("cursor")), cell(item.get("type")), cell(pick(item, "summary", "message", "subject"))]) + " |")
+        for item in stable_rows(event_rows, "cursor", "kind", "type"):
+            add("| " + " | ".join([cell(item.get("cursor")), cell(pick(item, "kind", "type")), cell(pick(item, "summary", "message", "subject"))]) + " |")
     else:
         add(EMPTY)
     add("")
@@ -147,6 +153,18 @@ def degraded_sources(snapshot: dict[str, Any]) -> list[str]:
     if str(resync.get("status", "")).lower() in {"failed", "error"}:
         found.append(f"{resync.get('source', 'repo_resync')}: {resync.get('error', 'failed')}")
     return found
+
+
+def data_source(mapping: dict[str, Any], default: str) -> Any:
+    return pick(mapping, "source", "mode", "data_source", default=default)
+
+
+def safe_mapping(value: Any, name: str) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if value in (None, ""):
+        return {}
+    return {f"Malformed {name}": value}
 
 
 def mapping_section(lines: list[str], mapping: dict[str, Any]) -> None:

@@ -1,6 +1,6 @@
 # Factory Foreman
 
-Factory Foreman is a repository-local Jcode skill for read-only Rat Kingdom factory triage. It collects deterministic snapshots from existing `rk --json` commands, classifies known reliability symptoms, and can prepare workflow dispatch proposals that require explicit human approval before any mutation.
+Factory Foreman is a repository-local Jcode skill for read-only Rat Kingdom factory triage. It collects deterministic snapshots from existing `rk --json` commands, classifies known reliability symptoms, and can prepare workflow dispatch proposals that require explicit human approval before any mutation. Typed execution paths additionally require daemon-verifiable approval of the exact canonical digest before dispatch; the Phase 1 helper remains a fallback for legacy/manual proposal validation.
 
 Phase 1 intentionally changes no Rat Kingdom daemon, workflow, ticket, repository-policy, or harness semantics.
 
@@ -63,7 +63,7 @@ python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py validate-propos
   --approved-id <proposal_id>
 ```
 
-Validation reloads the saved proposal, recomputes the SHA-256 proposal ID from canonical compact JSON for the `argv` list, and emits the exact `argv` only when it matches the approved ID. It never executes the `argv`.
+Validation reloads the saved proposal, recomputes the SHA-256 proposal ID from canonical compact JSON for the `argv` list, and emits the exact `argv` only when it matches the approved ID. It never executes the `argv`. This is the Phase 1 fallback guard. Typed execution must verify daemon-recorded approval of the exact canonical digest instead of trusting the helper alone.
 
 ## Read-only observation set
 
@@ -180,12 +180,12 @@ Exact boundary:
 1. Run read-only triage.
 2. Choose an existing workflow definition when dispatch is appropriate.
 3. Render and save a `propose-workflow` JSON proposal with `proposal_id`, `argv`, and `command`.
-4. Stop and ask for approval of that exact `proposal_id` or exact command.
-5. Only after a later user message approves it, run `validate-proposal`.
-6. Execute only the validated `argv` returned by validation.
+4. Stop and ask for approval of that exact `proposal_id` or exact command. Typed execution must use daemon-verifiable approval of the exact canonical digest.
+5. Only after a later user message approves it, run `validate-proposal` for the Phase 1 fallback helper flow.
+6. Execute only the validated `argv` returned by validation for that fallback flow, or only the daemon-verified digest-approved typed action for typed execution.
 7. If workflow, repo, parameter, coordinator, or argv order changed, render a new proposal and require new approval.
 
-Approval identity is proposal-digest checked in the helper, while the fact that a human approved remains enforced by the Jcode skill rather than cryptographically attested by the daemon.
+Approval identity is proposal-digest checked in the helper for the Phase 1 fallback flow. Typed execution requires daemon-verifiable exact digest approval before dispatch; human approval text and helper validation alone are not sufficient for typed execution.
 
 The helper never executes `workflow run`, `spawn`, `dismiss`, `approve`, `reject`, `revert`, ticket mutations, or tuple writes during snapshot, triage, proposal rendering, or proposal validation.
 
@@ -206,7 +206,7 @@ Inputs and output:
 - `--events PATH` reads one event replay JSON document. The renderer presents recent events together with replay cursor, truncation, and boundary information when supplied.
 - `--output PATH` writes the rendered Markdown file. Parent directories and input artifacts are prepared by the caller.
 
-The Markdown view includes `Factory Dashboard`, `Connection State`, `Resync State`, `Approvals`, `Workflow Runs`, `Agents`, `Tickets`, `Inbox`, `Budget`, `Recent Events`, and `Degraded Data`. It keeps partial-history and health conditions visible: a truncated replay shows its boundary, a running repository resync is labelled `RESYNCING`, and stale or failed sources are labelled `DEGRADED`.
+The Markdown view includes `Factory Dashboard`, `Data Source`, `Connection State`, `Resync State`, `Approvals`, `Workflow Runs`, `Agents`, `Tickets`, `Inbox`, `Budget`, `Recent Events`, and `Degraded Data`. It keeps partial-history and health conditions visible: a truncated replay shows its typed `boundary` when present, event rows use typed `kind` while tolerating legacy `type`, a running repository resync is labelled `RESYNCING`, and stale or failed sources are labelled `DEGRADED`. Malformed `connection` values are rendered as malformed input rather than raising a traceback.
 
 ### Renderer boundary
 
@@ -217,7 +217,7 @@ The renderer uses the Python standard library only and is deliberately not an in
 - It does not invoke `rk-mcp`, host an MCP server, or expose MCP tools.
 - It does not fetch live state, approve proposals, execute commands, or mutate Rat Kingdom state.
 
-CLI and MCP are upstream options for producing the input files. The renderer only reads those files and writes Markdown. The output can be displayed in a Jcode side panel, but the renderer and side panel are not a control plane or source of truth. Proposal rows remain proposals until authoritative daemon snapshot data says they are approved, and display of an approval or digest never grants execution authority.
+CLI and MCP are upstream options for producing the input files. The renderer only reads those files and writes Markdown. The output can be displayed in a Jcode side panel, but the renderer and side panel are not a control plane or source of truth. Proposal rows remain proposals until authoritative daemon snapshot data says they are approved, and display of an approval or digest never grants execution authority. Typed execution still requires daemon-verifiable exact digest approval; the Phase 1 helper remains a fallback for legacy/manual dispatch preparation.
 
 ## Monitoring after approved dispatch
 
@@ -264,6 +264,6 @@ Phase 1 limitations are deliberate:
 - no cryptographic or daemon-enforced approval token.
 - no automatic dispatch.
 - read commands are preceded by strict `rk --json daemon status`, but once connected they may still cause ordinary daemon logging or access-time state.
-- approval identity is proposal-digest checked in the helper, while the fact that a human approved remains enforced by the Jcode skill rather than cryptographically attested by the daemon.
+- approval identity is proposal-digest checked by the Phase 1 helper only as a fallback legacy/manual guard. Typed execution requires daemon-verifiable exact digest approval before dispatch.
 - no CI, deployment, or production signal ingestion.
 - deterministic hints are not root causes.
