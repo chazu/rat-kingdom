@@ -107,6 +107,10 @@ mod factory_analytics_cli {
             suppressed.contains("(none)"),
             "daemon wire schema with no suppressions must render no suppressed records:\n{text}"
         );
+        assert!(
+            !suppressed.contains("available=false") && !suppressed.contains("sample="),
+            "suppressed markdown must not fabricate availability or sample fields:\n{text}"
+        );
         // Advisory language, no mutation controls.
         for banned in ["--apply", "dispatch", "rewrite-policy", "update-workflow"] {
             assert!(!text.contains(banned), "markdown must not contain {banned}");

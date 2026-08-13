@@ -566,11 +566,18 @@ fn render_recommend_markdown(result: &Value) -> String {
         Some(sup) if !sup.is_empty() => {
             for entry in sup {
                 let source_counts = &entry["source_counts"];
+                let subject = &entry["subject_group_key"];
                 out.push_str(&format!(
-                    "- {}: {} (source={} available=false sample={})\n",
+                    "- {}: {} (source_family={} task_class={} workflow={} harness={} model={} active_source_count={} archived_source_count={} event_count={})\n",
                     entry["rule"].as_str().unwrap_or("?"),
                     entry["reason"].as_str().unwrap_or("?"),
                     entry["source_family"].as_str().unwrap_or("?"),
+                    subject["task_class"].as_str().unwrap_or("?"),
+                    subject["workflow"].as_str().unwrap_or("?"),
+                    subject["harness"].as_str().unwrap_or("?"),
+                    subject["model"].as_str().unwrap_or("?"),
+                    source_counts["active_source_count"].as_u64().unwrap_or(0),
+                    source_counts["archived_source_count"].as_u64().unwrap_or(0),
                     source_counts["event_count"].as_u64().unwrap_or(0),
                 ));
             }
@@ -616,7 +623,7 @@ mod tests {
                 {
                     "id": "active",
                     "severity": "warning",
-                    "rule": "HighRework",
+                    "rule": "high_rework",
                     "summary": "rework is elevated",
                     "advice": "Review rework evidence for repeated reviewer findings.",
                     "suppressed": false,
@@ -628,11 +635,11 @@ mod tests {
                 {
                     "id": "suppressed",
                     "severity": "warning",
-                    "rule": "CiInstability",
+                    "rule": "ci_instability",
                     "summary": "ci instability",
                     "advice": null,
                     "suppressed": true,
-                    "suppression_reason": "MetricUnavailable",
+                    "suppression_reason": "metric_unavailable",
                     "sample_size": 12,
                     "source_count": 0,
                     "source_counts": {"active_source_count": 0, "archived_source_count": 0, "event_count": 0},
@@ -641,7 +648,7 @@ mod tests {
                 {
                     "id": "empty-advice",
                     "severity": "info",
-                    "rule": "Recurrence",
+                    "rule": "recurrence",
                     "summary": "recurrence",
                     "advice": "",
                     "suppressed": false,
@@ -653,8 +660,8 @@ mod tests {
             ],
             "suppressions": [
                 {
-                    "rule": "CiInstability",
-                    "reason": "MetricUnavailable",
+                    "rule": "ci_instability",
+                    "reason": "metric_unavailable",
                     "subject_group_key": {"task_class": "unknown", "workflow": "unknown", "harness": "unknown", "model": "unknown"},
                     "source_family": "Phase4CiSignal",
                     "source_counts": {"active_source_count": 0, "archived_source_count": 0, "event_count": 0}
@@ -667,13 +674,20 @@ mod tests {
         let active = markdown.split("## Recommendations").nth(1).unwrap().split("## Suppressed").next().unwrap();
         let suppressed = markdown.split("## Suppressed").nth(1).unwrap();
 
-        assert!(active.contains("HighRework"), "active section: {active}");
-        assert!(!active.contains("CiInstability"), "active section must omit suppressed records: {active}");
-        assert!(!active.contains("Recurrence"), "active section must omit empty advice: {active}");
-        assert!(suppressed.contains("CiInstability"), "suppressed section: {suppressed}");
-        assert!(suppressed.contains("MetricUnavailable"), "suppressed section: {suppressed}");
-        assert!(suppressed.contains("Phase4CiSignal"), "suppressed section: {suppressed}");
-        assert!(suppressed.contains("available=false"), "suppressed section: {suppressed}");
-        assert!(suppressed.contains("sample=0"), "suppressed section: {suppressed}");
+        assert!(active.contains("high_rework"), "active section: {active}");
+        assert!(!active.contains("ci_instability"), "active section must omit suppressed records: {active}");
+        assert!(!active.contains("recurrence"), "active section must omit empty advice: {active}");
+        assert!(suppressed.contains("ci_instability"), "suppressed section: {suppressed}");
+        assert!(suppressed.contains("metric_unavailable"), "suppressed section: {suppressed}");
+        assert!(suppressed.contains("source_family=Phase4CiSignal"), "suppressed section: {suppressed}");
+        assert!(suppressed.contains("task_class=unknown"), "suppressed section: {suppressed}");
+        assert!(suppressed.contains("workflow=unknown"), "suppressed section: {suppressed}");
+        assert!(suppressed.contains("harness=unknown"), "suppressed section: {suppressed}");
+        assert!(suppressed.contains("model=unknown"), "suppressed section: {suppressed}");
+        assert!(suppressed.contains("active_source_count=0"), "suppressed section: {suppressed}");
+        assert!(suppressed.contains("archived_source_count=0"), "suppressed section: {suppressed}");
+        assert!(suppressed.contains("event_count=0"), "suppressed section: {suppressed}");
+        assert!(!suppressed.contains("available=false"), "suppressed section must not fabricate availability: {suppressed}");
+        assert!(!suppressed.contains("sample="), "suppressed section must not relabel event_count as sample: {suppressed}");
     }
 }
