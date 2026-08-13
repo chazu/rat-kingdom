@@ -19,6 +19,8 @@ pub enum ActionKind {
     WorkflowRun,
     #[serde(rename = "ticket_graph.apply")]
     TicketGraphApply,
+    #[serde(rename = "product_to_code.dispatch")]
+    ProductToCodeDispatch,
 }
 
 /// Coarse safety classification used by every action surface.
@@ -88,6 +90,60 @@ pub struct TicketGraphApplyExecutionResult {
     pub status: String,
 }
 
+/// One canonical `implement-featureset` workflow dispatch for a minted ticket.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProductToCodeWorkflowDispatch {
+    pub graph_node_id: String,
+    pub ticket_id: String,
+    pub workflow: String,
+    pub params: BTreeMap<String, Value>,
+}
+
+/// A graph node whose dispatch gate did not pass; listed separately from
+/// dispatched nodes and never executed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProductToCodeBlockedNode {
+    pub graph_node_id: String,
+    pub reasons: Vec<String>,
+}
+
+/// Canonical Phase 3 product-to-code workflow dispatch action. References the
+/// prior approved `ticket_graph.apply` execution and its graph-node-id to
+/// minted TKT-id mapping; daemon-executed only after Phase 2 approval.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProductToCodeDispatchAction {
+    pub repo: String,
+    pub repo_identity: String,
+    pub repo_path: String,
+    pub initiative: InitiativeContract,
+    pub graph_id: String,
+    pub graph_apply_proposal_id: String,
+    pub graph_apply_execution_id: String,
+    pub graph_node_to_ticket_id: BTreeMap<String, String>,
+    pub dispatches: Vec<ProductToCodeWorkflowDispatch>,
+    pub blocked: Vec<ProductToCodeBlockedNode>,
+    pub preconditions: TicketGraphApplyPreconditions,
+}
+
+/// Durable result of a `product_to_code.dispatch` execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProductToCodeDispatchedWorkflow {
+    pub graph_node_id: String,
+    pub ticket_id: String,
+    pub workflow: String,
+    pub instance_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProductToCodeDispatchExecutionResult {
+    pub execution_id: String,
+    pub graph_id: String,
+    pub dispatched: Vec<ProductToCodeDispatchedWorkflow>,
+    pub blocked: Vec<ProductToCodeBlockedNode>,
+    pub idempotent_replay: bool,
+    pub status: String,
+}
+
 /// A canonical factory action. Human-readable commands are never digest input.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind")]
@@ -96,6 +152,8 @@ pub enum FactoryAction {
     WorkflowRun(WorkflowRunAction),
     #[serde(rename = "ticket_graph.apply")]
     TicketGraphApply(TicketGraphApplyAction),
+    #[serde(rename = "product_to_code.dispatch")]
+    ProductToCodeDispatch(ProductToCodeDispatchAction),
 }
 
 impl FactoryAction {
@@ -104,6 +162,7 @@ impl FactoryAction {
         match self {
             Self::WorkflowRun(_) => ActionKind::WorkflowRun,
             Self::TicketGraphApply(_) => ActionKind::TicketGraphApply,
+            Self::ProductToCodeDispatch(_) => ActionKind::ProductToCodeDispatch,
         }
     }
 
@@ -112,6 +171,7 @@ impl FactoryAction {
         match self {
             Self::WorkflowRun(_) => ActionRisk::Mutation,
             Self::TicketGraphApply(_) => ActionRisk::Mutation,
+            Self::ProductToCodeDispatch(_) => ActionRisk::Mutation,
         }
     }
 
@@ -123,6 +183,10 @@ impl FactoryAction {
                 path: action.repo_path.clone(),
             },
             Self::TicketGraphApply(action) => RepoScope {
+                identity: action.repo_identity.clone(),
+                path: action.repo_path.clone(),
+            },
+            Self::ProductToCodeDispatch(action) => RepoScope {
                 identity: action.repo_identity.clone(),
                 path: action.repo_path.clone(),
             },

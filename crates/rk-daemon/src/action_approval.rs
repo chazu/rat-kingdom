@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, path::Path, sync::Mutex};
 use chrono::{Duration, Utc};
 use rk_core::action::{
     action_digest, ActionDigestPayload, ActionKind, ActionProposal, ActionScope, ApprovalGrant,
-    ApprovalStatus, FactoryAction, TicketGraphApplyExecutionResult, WorkflowRunAction,
+    ApprovalStatus, FactoryAction, ProductToCodeDispatchExecutionResult,
+    TicketGraphApplyExecutionResult, WorkflowRunAction,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,6 +15,8 @@ struct StoreData {
     grants: BTreeMap<String, ApprovalGrant>,
     #[serde(default)]
     ticket_graph_results: BTreeMap<String, TicketGraphApplyExecutionResult>,
+    #[serde(default)]
+    product_to_code_results: BTreeMap<String, ProductToCodeDispatchExecutionResult>,
 }
 
 pub struct ActionApprovalStore {
@@ -270,6 +273,73 @@ impl ActionApprovalStore {
         Ok(data.ticket_graph_results.get(proposal_id).cloned())
     }
 
+    pub fn product_to_code_result(
+        &self,
+        proposal_id: &str,
+    ) -> rk_core::Result<Option<ProductToCodeDispatchExecutionResult>> {
+        let data = self.lock()?;
+        Ok(data.product_to_code_results.get(proposal_id).cloned())
+    }
+
+    pub fn checkpoint_product_to_code_result(
+        &self,
+        proposal_id: &str,
+        checkpoint: ProductToCodeDispatchExecutionResult,
+    ) -> rk_core::Result<ProductToCodeDispatchExecutionResult> {
+        let mut data = self.lock()?;
+        let out = merge_product_to_code_checkpoint(&mut data, proposal_id, checkpoint)?;
+        self.persist(&data)?;
+        Ok(out)
+    }
+
+    /// Mirror of [`Self::finish_ticket_graph_success`] for the Phase 3
+    /// `product_to_code.dispatch` executor: same Phase 2 grant binding checks,
+    /// same consumed transition, no parallel approval path.
+    pub fn finish_product_to_code_success(
+        &self,
+        proposal_id: &str,
+        checkpoint: ProductToCodeDispatchExecutionResult,
+    ) -> rk_core::Result<(ProductToCodeDispatchExecutionResult, ApprovalGrant)> {
+        if checkpoint.status != "completed" {
+            return Err(rk_core::Error::other(
+                "product_to_code dispatch completion requires completed checkpoint",
+            ));
+        }
+        let mut data = self.lock()?;
+        let existing_grant = data
+            .grants
+            .get(proposal_id)
+            .cloned()
+            .ok_or_else(|| rk_core::Error::other("unknown approval"))?;
+        if existing_grant.kind != ActionKind::ProductToCodeDispatch
+            || existing_grant.execution_id.as_deref() != Some(checkpoint.execution_id.as_str())
+        {
+            return Err(rk_core::Error::other(
+                "product_to_code dispatch completion approval binding mismatch",
+            ));
+        }
+        if !matches!(
+            existing_grant.status,
+            ApprovalStatus::Executing | ApprovalStatus::Consumed
+        ) {
+            return Err(rk_core::Error::other(
+                "product_to_code dispatch completion approval is not executing",
+            ));
+        }
+        let result = merge_product_to_code_checkpoint(&mut data, proposal_id, checkpoint)?;
+        let grant = data
+            .grants
+            .get_mut(proposal_id)
+            .expect("validated approval remains present under one lock");
+        grant.status = ApprovalStatus::Consumed;
+        grant.instance_id = Some(result.execution_id.clone());
+        grant.failure = None;
+        grant.consumed_at.get_or_insert_with(Utc::now);
+        let approval = grant.clone();
+        self.persist(&data)?;
+        Ok((result, approval))
+    }
+
     pub fn checkpoint_ticket_graph_result(
         &self,
         proposal_id: &str,
@@ -408,6 +478,40 @@ fn proposal_nonce(now: &chrono::DateTime<Utc>, requester: &str) -> String {
         "{}:{requester}",
         now.timestamp_nanos_opt().unwrap_or_default()
     )
+}
+
+fn merge_product_to_code_checkpoint(
+    data: &mut StoreData,
+    proposal_id: &str,
+    checkpoint: ProductToCodeDispatchExecutionResult,
+) -> rk_core::Result<ProductToCodeDispatchExecutionResult> {
+    let mut merged = data
+        .product_to_code_results
+        .get(proposal_id)
+        .cloned()
+        .unwrap_or_else(|| checkpoint.clone());
+    if merged.execution_id != checkpoint.execution_id || merged.graph_id != checkpoint.graph_id {
+        return Err(rk_core::Error::other(
+            "product_to_code dispatch execution checkpoint binding mismatch",
+        ));
+    }
+    for dispatched in checkpoint.dispatched {
+        if !merged
+            .dispatched
+            .iter()
+            .any(|existing| existing.ticket_id == dispatched.ticket_id)
+        {
+            merged.dispatched.push(dispatched);
+        }
+    }
+    merged.blocked = checkpoint.blocked;
+    if checkpoint.status == "completed" {
+        merged.status = checkpoint.status;
+    }
+    merged.idempotent_replay = false;
+    data.product_to_code_results
+        .insert(proposal_id.to_string(), merged.clone());
+    Ok(merged)
 }
 
 fn bound_instance_id(proposal_id: &str, digest: &str) -> String {
