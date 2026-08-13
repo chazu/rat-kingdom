@@ -21,7 +21,10 @@ fn git(root: &Path, args: &[&str]) {
 }
 
 fn repository() -> tempfile::TempDir {
-    let dir = tempfile::Builder::new().prefix("rk-factory-cli").tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("rk-factory-cli")
+        .tempdir()
+        .unwrap();
     git(dir.path(), &["init", "-b", "main"]);
     git(dir.path(), &["config", "user.email", "test@example.com"]);
     git(dir.path(), &["config", "user.name", "Test"]);
@@ -104,7 +107,13 @@ fn successful_json(output: Output) -> Value {
 }
 
 fn failed(output: Output, code: i32) -> String {
-    assert_eq!(output.status.code(), Some(code), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(code),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
@@ -136,7 +145,10 @@ async fn test_factory_propose_workflow_sends_typed_action_not_shell_command() {
     assert_eq!(value["action"]["repo"], "fixture");
     assert_eq!(value["action"]["params"]["taskId"], "hello");
     assert_eq!(value["action"]["coordinator"], "coord-1");
-    assert!(value.get("argv").is_none(), "factory proposal must not expose shell argv authority");
+    assert!(
+        value.get("argv").is_none(),
+        "factory proposal must not expose shell argv authority"
+    );
     handle.abort();
 }
 
@@ -146,18 +158,41 @@ async fn test_factory_approve_sends_no_identity_param() {
     let layout = Layout::at(home.path());
     let proposal = successful_json(run_rk(
         &layout,
-        &["--json", "factory", "propose-workflow", "noop", "--repo", "fixture", "--param", "taskId=hello"],
+        &[
+            "--json",
+            "factory",
+            "propose-workflow",
+            "noop",
+            "--repo",
+            "fixture",
+            "--param",
+            "taskId=hello",
+        ],
     ));
     let proposal_id = proposal["proposal"]["id"].as_str().unwrap();
     let digest = proposal["digest"].as_str().unwrap();
 
-    let approved = successful_json(run_rk(&layout, &["--json", "factory", "approve", proposal_id, digest]));
+    let approved = successful_json(run_rk(
+        &layout,
+        &["--json", "factory", "approve", proposal_id, digest],
+    ));
     assert_eq!(approved["approval"]["proposal_id"], proposal_id);
     assert_eq!(approved["approval"]["digest"], digest);
     assert!(approved["approval"].get("actor").is_none());
 
     let stderr = failed(
-        run_rk(&layout, &["--json", "factory", "approve", proposal_id, digest, "--by", "mallory"]),
+        run_rk(
+            &layout,
+            &[
+                "--json",
+                "factory",
+                "approve",
+                proposal_id,
+                digest,
+                "--by",
+                "mallory",
+            ],
+        ),
         2,
     );
     assert!(stderr.contains("unexpected") || stderr.contains("unrecognized"));
@@ -169,12 +204,32 @@ async fn test_factory_approve_requires_exact_digest() {
     let (home, _repo, handle) = fixture().await;
     let layout = Layout::at(home.path());
 
-    failed(run_rk(&layout, &["--json", "factory", "approve", "proposal-1"]), 2);
+    failed(
+        run_rk(&layout, &["--json", "factory", "approve", "proposal-1"]),
+        2,
+    );
     let stderr = failed(
-        run_rk(&layout, &["--json", "factory", "approve", "proposal-1", "not-a-digest"]),
+        run_rk(
+            &layout,
+            &["--json", "factory", "approve", "proposal-1", "not-a-digest"],
+        ),
         2,
     );
     assert!(stderr.contains("digest") || stderr.contains("64"));
+    let stderr = failed(
+        run_rk(
+            &layout,
+            &[
+                "--json",
+                "factory",
+                "approve",
+                "proposal-1",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ],
+        ),
+        2,
+    );
+    assert!(stderr.contains("digest") || stderr.contains("lowercase"));
     handle.abort();
 }
 
@@ -184,11 +239,23 @@ async fn test_factory_execute_workflow_preserves_param_values_with_spaces() {
     let layout = Layout::at(home.path());
     let proposal = successful_json(run_rk(
         &layout,
-        &["--json", "factory", "propose-workflow", "noop", "--repo", "fixture", "--param", "taskId=value with spaces"],
+        &[
+            "--json",
+            "factory",
+            "propose-workflow",
+            "noop",
+            "--repo",
+            "fixture",
+            "--param",
+            "taskId=value with spaces",
+        ],
     ));
     let proposal_id = proposal["proposal"]["id"].as_str().unwrap();
     let digest = proposal["digest"].as_str().unwrap();
-    successful_json(run_rk(&layout, &["--json", "factory", "approve", proposal_id, digest]));
+    successful_json(run_rk(
+        &layout,
+        &["--json", "factory", "approve", proposal_id, digest],
+    ));
 
     let executed = successful_json(run_rk(
         &layout,
@@ -207,7 +274,10 @@ async fn test_factory_execute_workflow_preserves_param_values_with_spaces() {
         ],
     ));
 
-    assert_eq!(executed["instance"]["params"]["taskId"], "value with spaces");
+    assert_eq!(
+        executed["instance"]["params"]["taskId"],
+        "value with spaces"
+    );
     handle.abort();
 }
 
@@ -217,11 +287,23 @@ async fn test_factory_execute_prints_instance_json_on_success() {
     let layout = Layout::at(home.path());
     let proposal = successful_json(run_rk(
         &layout,
-        &["--json", "factory", "propose-workflow", "noop", "--repo", "fixture", "--param", "taskId=hello"],
+        &[
+            "--json",
+            "factory",
+            "propose-workflow",
+            "noop",
+            "--repo",
+            "fixture",
+            "--param",
+            "taskId=hello",
+        ],
     ));
     let proposal_id = proposal["proposal"]["id"].as_str().unwrap();
     let digest = proposal["digest"].as_str().unwrap();
-    successful_json(run_rk(&layout, &["--json", "factory", "approve", proposal_id, digest]));
+    successful_json(run_rk(
+        &layout,
+        &["--json", "factory", "approve", proposal_id, digest],
+    ));
 
     let executed = successful_json(run_rk(
         &layout,
@@ -241,7 +323,10 @@ async fn test_factory_execute_prints_instance_json_on_success() {
     ));
 
     assert_eq!(executed["instance"]["workflow"], "noop");
-    assert_eq!(executed["instance"]["repo"], repo.path().to_string_lossy().as_ref());
+    assert_eq!(
+        executed["instance"]["repo"],
+        repo.path().to_string_lossy().as_ref()
+    );
     assert_eq!(executed["approval"]["status"], "consumed");
     handle.abort();
 }

@@ -160,7 +160,11 @@ fn parse_param(pair: &str) -> Result<(String, String), String> {
 }
 
 fn parse_digest(digest: &str) -> Result<String, String> {
-    if digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         Ok(digest.to_string())
     } else {
         Err("digest must be exactly 64 hexadecimal characters".into())
