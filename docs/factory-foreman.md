@@ -258,7 +258,7 @@ The normal event shape is:
   "schema_version": 1,
   "event_id": "stable sha256 over canonical structured fields",
   "repo": "rat-kingdom",
-  "source_family": "agent_record",
+  "source_family": "AgentRecord",
   "source_id": "run-or-source-id",
   "source_version": "optional version",
   "archived": false,
@@ -298,7 +298,7 @@ Factory analytics are structured-source-only. They never parse raw logs, prose, 
 | `reverted` | Structured revert event linked to run, ticket, or landed outcome. | Commit-message search or prose. | Metric unavailable for that run. |
 | `human_interventions` | Explicit gate, approval, or decision event. | Mentions, comments, delay, or approval prose. | Metric unavailable for that run. |
 | `recurrence` | Explicit non-empty `recurrence_key` or coalesce key. | Similarity over titles, stack traces, logs, or prose. | Metric unavailable without explicit key. |
-| `cost_micro_usd` | Structured cost or token usage plus explicit pricing snapshot. | Estimating from model name alone. | Metric unavailable for that run. |
+| `cost_micro_usd` | Structured cost reported directly by `AgentRecord`, or structured token usage plus an explicit pricing snapshot. | Estimating from model name alone. | Metric unavailable for that run. |
 | `lead_time_ms` | Structured lifecycle timestamps for the same run. | File mtimes, commit times, transcript timestamps, or terminal timestamps. | Metric unavailable on missing or invalid timestamps. |
 | `archive_state` | Explicit source archive marker or archived-history read API. | Treating absence from an active query as archived. | Unknown archive state is `unobserved`. |
 
