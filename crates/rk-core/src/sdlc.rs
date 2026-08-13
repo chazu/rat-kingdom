@@ -219,6 +219,14 @@ impl SignalEnvelope {
             validate_identity("attribute.key", key)?;
             validate_identity("attribute.value", value)?;
         }
+        if matches!(
+            self.kind,
+            SignalKind::ProductionAlertFiring | SignalKind::ProductionAlertResolved
+        ) {
+            for (key, value) in &self.attributes {
+                reject_alert_mutation_field(key, value)?;
+            }
+        }
         ConfiguredSourceName::new(self.source.as_str())?;
         self.validate_correlation()?;
         self.validate_payload()
@@ -547,6 +555,47 @@ fn reject_secret_like(kind: &'static str, key: &str) -> Result<(), SignalValidat
         _ => {}
     }
 
+    Ok(())
+}
+
+fn reject_alert_mutation_field(key: &str, value: &str) -> Result<(), SignalValidationError> {
+    let key = key.trim().to_ascii_lowercase();
+    let value = value.trim().to_ascii_lowercase();
+    let forbidden_keys = [
+        "action",
+        "argv",
+        "command",
+        "executable",
+        "shell",
+        "tool",
+        "rollback",
+        "restart",
+        "scale",
+        "deploy",
+        "delete",
+        "patch",
+    ];
+    let forbidden_values = [
+        "rollback",
+        "restart",
+        "scale",
+        "deploy",
+        "delete",
+        "patch",
+        "ssh",
+        "kubectl",
+        "terraform apply",
+    ];
+    if forbidden_keys.contains(&key.as_str())
+        || forbidden_values
+            .iter()
+            .any(|forbidden| value == *forbidden || value.starts_with(&format!("{forbidden} ")))
+    {
+        return Err(SignalValidationError::SecretLikeField(
+            "attribute",
+            "<redacted>".into(),
+        ));
+    }
     Ok(())
 }
 

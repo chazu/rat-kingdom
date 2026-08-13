@@ -86,6 +86,15 @@ struct TriggerCache {
     triggers: Vec<Loaded>,
 }
 
+struct AlertDiagnosisContext {
+    state: String,
+    environment: String,
+    service: String,
+    alert: Value,
+    refs: Value,
+    attributes: Value,
+}
+
 pub struct Reactor {
     space: Space,
     engine: Arc<WorkflowEngine>,
@@ -189,13 +198,22 @@ impl Reactor {
                 retryable_failure = true;
                 warn!(tuple = %tuple.id, error = %e, "reactor SDLC CI reaction failed");
             }
-            for loaded in &triggers {
-                match self.try_fire(loaded, tuple, &registry) {
-                    Ok(true) => fired += 1,
-                    Ok(false) => {}
-                    Err(e) => {
-                        retryable_failure = true;
-                        warn!(trigger = %loaded.trigger.name, error = %e, "reactor dispatch failed")
+            if let Err(e) = self.react_to_sdlc_alert_transition(tuple) {
+                retryable_failure = true;
+                warn!(tuple = %tuple.id, error = %e, "reactor SDLC alert reaction failed");
+            }
+            // Production alert tuples are observation-only. They may create the
+            // built-in diagnostic context above, but repo-configured triggers may
+            // never turn them into workflow dispatch or production mutation.
+            if !is_production_alert_sdlc_tuple(tuple) {
+                for loaded in &triggers {
+                    match self.try_fire(loaded, tuple, &registry) {
+                        Ok(true) => fired += 1,
+                        Ok(false) => {}
+                        Err(e) => {
+                            retryable_failure = true;
+                            warn!(trigger = %loaded.trigger.name, error = %e, "reactor dispatch failed")
+                        }
                     }
                 }
             }
@@ -223,6 +241,7 @@ impl Reactor {
         }
 
         fired += self.react_to_sdlc_ci_transition_backlog()?;
+        fired += self.react_to_sdlc_alert_transition_backlog()?;
 
         // Whole-store recomputes (quorum promotion, obstacle coalescence). Their
         // INPUT is deliberately the whole store, not the cursor delta: a
@@ -936,6 +955,223 @@ impl Reactor {
         Ok(fired)
     }
 
+    /// Built-in production-alert reaction. It emits a permanent, read-only
+    /// diagnosis context for each transition into `firing`. It never dispatches
+    /// a workflow, carries no executable/action fields, and uses the exact
+    /// occurrence event named by the transition so a rapid later resolution
+    /// cannot erase the evidence that originally fired.
+    fn react_to_sdlc_alert_transition(&self, tuple: &Tuple) -> rk_core::Result<bool> {
+        if !is_production_alert_transition(tuple) {
+            return Ok(false);
+        }
+        let key = format!("sdlc-alert@{}", tuple.id);
+        if self.already_fired(&key)? || self.has_alert_diagnosis(tuple.id)? {
+            return Ok(false);
+        }
+        let source = tuple
+            .payload
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let Some(delivery_id) = tuple.payload.get("delivery_id").and_then(Value::as_str) else {
+            return Ok(false);
+        };
+        let Some(occurrence) = self.alert_occurrence(source, delivery_id)? else {
+            return Ok(false);
+        };
+        let Some(context) = alert_diagnosis_context(&occurrence) else {
+            self.mark_sdlc_alert_reacted(&key, tuple, "rejected")?;
+            return Ok(false);
+        };
+        if context.state == "resolved" {
+            self.mark_sdlc_alert_reacted(&key, tuple, "resolved")?;
+            return Ok(false);
+        }
+        if context.state != "firing" {
+            self.mark_sdlc_alert_reacted(&key, tuple, "ignored")?;
+            return Ok(false);
+        }
+
+        let subject = tuple
+            .payload
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let current = self.current_alert_fact(source, subject)?;
+        let provenance = self.deployment_provenance(&context.environment, &context.service)?;
+        self.write_alert_diagnosis(
+            &key,
+            tuple,
+            &occurrence,
+            current.as_ref(),
+            context,
+            provenance,
+        )?;
+        Ok(true)
+    }
+
+    fn react_to_sdlc_alert_transition_backlog(&self) -> rk_core::Result<usize> {
+        let transitions = self
+            .space
+            .scan(&Pattern::category(Category::Event).scope("production_alert"))?;
+        let mut fired = 0;
+        for tuple in transitions
+            .iter()
+            .filter(|tuple| is_production_alert_transition(tuple))
+        {
+            if self.react_to_sdlc_alert_transition(tuple)? {
+                fired += 1;
+            }
+        }
+        Ok(fired)
+    }
+
+    fn alert_occurrence(&self, source: &str, delivery_id: &str) -> rk_core::Result<Option<Tuple>> {
+        let identity = format!("sdlc:event:{source}:{delivery_id}");
+        Ok(self
+            .space
+            .scan(
+                &Pattern::category(Category::Event)
+                    .scope("production_alert")
+                    .identity(identity),
+            )?
+            .into_iter()
+            .next())
+    }
+
+    fn current_alert_fact(&self, source: &str, subject: &str) -> rk_core::Result<Option<Tuple>> {
+        Ok(self
+            .space
+            .current_sdlc_facts(Some(source), Some("production_alert"), Some(subject))?
+            .into_iter()
+            .next())
+    }
+
+    fn deployment_provenance(&self, environment: &str, service: &str) -> rk_core::Result<Value> {
+        let subject = format!("{environment}:{service}");
+        let mut facts = self
+            .space
+            .current_sdlc_facts(None, Some("deployment"), Some(&subject))?;
+        facts.sort_by(|left, right| {
+            left.payload
+                .get("source")
+                .and_then(Value::as_str)
+                .cmp(&right.payload.get("source").and_then(Value::as_str))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let candidates = facts
+            .iter()
+            .map(|fact| {
+                let current = fact.payload.get("current").cloned().unwrap_or(Value::Null);
+                json!({
+                    "fact_id": fact.id.to_string(),
+                    "source": fact.payload.get("source"),
+                    "receipt_id": fact.payload.get("receipt_id"),
+                    "artifact_revision": safe_diagnostic_metadata(current.get("version")),
+                    "commit_sha": safe_diagnostic_metadata(current.get("commit_sha")),
+                    "repo": safe_diagnostic_metadata(current.get("repo")),
+                    "branch": safe_diagnostic_metadata(current.get("branch")),
+                })
+            })
+            .collect::<Vec<_>>();
+        let status = match candidates.len() {
+            0 => "unknown",
+            1 => "known",
+            _ => "ambiguous",
+        };
+        Ok(json!({"status": status, "candidates": candidates}))
+    }
+
+    fn has_alert_diagnosis(&self, transition_id: RecordId) -> rk_core::Result<bool> {
+        let transition_id = transition_id.to_string();
+        Ok(self
+            .space
+            .scan(&Pattern::category(Category::Need).identity("sdlc_alert_diagnosis"))?
+            .iter()
+            .any(|tuple| {
+                tuple
+                    .payload
+                    .get("transition_tuple")
+                    .and_then(Value::as_str)
+                    == Some(transition_id.as_str())
+            }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_alert_diagnosis(
+        &self,
+        key: &str,
+        transition: &Tuple,
+        occurrence: &Tuple,
+        current: Option<&Tuple>,
+        context: AlertDiagnosisContext,
+        provenance: Value,
+    ) -> rk_core::Result<()> {
+        let source = transition
+            .payload
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let delivery_id = transition
+            .payload
+            .get("delivery_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let subject = transition
+            .payload
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let mut diagnosis = Tuple::new(
+            Category::Need,
+            "production_alert",
+            "sdlc_alert_diagnosis",
+            REACTOR_INSTANCE,
+            json!({
+                "family": "production_alert",
+                "source": source,
+                "subject": subject,
+                "delivery_id": delivery_id,
+                "receipt_id": format!("sdlc:receipt:{source}:{delivery_id}"),
+                "occurrence_event": occurrence.id.to_string(),
+                "transition_tuple": transition.id.to_string(),
+                "current_alert_fact": current.map(|tuple| tuple.id.to_string()),
+                "read_only": true,
+                "diagnostic_only": true,
+                "alert": context.alert,
+                "refs": context.refs,
+                "attributes": context.attributes,
+                "deployment_provenance": provenance,
+            }),
+        );
+        diagnosis.lifecycle = Lifecycle::Furniture;
+        self.space.out(diagnosis)?;
+        self.mark_sdlc_alert_reacted(key, transition, "diagnostic")
+    }
+
+    fn mark_sdlc_alert_reacted(&self, key: &str, tuple: &Tuple, kind: &str) -> rk_core::Result<()> {
+        let mut marker = Tuple::new(
+            Category::Event,
+            SYSTEM_SCOPE,
+            MARKER_IDENTITY,
+            REACTOR_INSTANCE,
+            json!({
+                "key": key,
+                "kind": format!("alert-{kind}"),
+                "tuple": tuple.id.to_string(),
+            }),
+        );
+        marker.lifecycle = Lifecycle::Ephemeral;
+        if self.config.marker_ttl_secs > 0 {
+            let ttl_secs = i64::try_from(self.config.marker_ttl_secs.min(MAX_MARKER_TTL_SECS))
+                .expect("MAX_MARKER_TTL_SECS must fit i64");
+            marker.expires_at = Some(
+                chrono::Utc::now() + chrono::Duration::seconds(ttl_secs),
+            );
+        }
+        self.space.out(marker)
+    }
+
     fn current_ci_fact(&self, source: &str, subject: &str) -> rk_core::Result<Option<Tuple>> {
         Ok(self
             .space
@@ -1297,6 +1533,178 @@ fn ticket_is_done(t: &Tuple) -> bool {
     )
 }
 
+fn is_production_alert_sdlc_tuple(tuple: &Tuple) -> bool {
+    tuple.scope == "production_alert"
+        && (tuple.identity.starts_with("sdlc:")
+            || tuple.payload.get("family").and_then(Value::as_str) == Some("production_alert"))
+}
+
+fn is_production_alert_transition(tuple: &Tuple) -> bool {
+    tuple.category == Category::Event
+        && is_production_alert_sdlc_tuple(tuple)
+        && tuple.identity.starts_with("sdlc:transition:")
+}
+
+fn alert_diagnosis_context(occurrence: &Tuple) -> Option<AlertDiagnosisContext> {
+    if occurrence.category != Category::Event || occurrence.scope != "production_alert" {
+        return None;
+    }
+    let root = occurrence.payload.as_object()?;
+    let allowed_root = [
+        "source",
+        "delivery_id",
+        "family",
+        "subject",
+        "kind",
+        "summary",
+        "occurred_at",
+        "observed_at",
+        "correlation",
+        "refs",
+        "attributes",
+        "payload",
+    ];
+    if root.keys().any(|key| !allowed_root.contains(&key.as_str()))
+        || root.get("family").and_then(Value::as_str) != Some("production_alert")
+    {
+        return None;
+    }
+
+    let alert = root.get("payload")?.as_object()?;
+    let allowed_alert = [
+        "type",
+        "environment",
+        "service",
+        "alert_key",
+        "severity",
+        "state",
+    ];
+    if alert
+        .keys()
+        .any(|key| !allowed_alert.contains(&key.as_str()))
+        || alert.get("type").and_then(Value::as_str) != Some("production_alert")
+    {
+        return None;
+    }
+    let state = alert.get("state")?.as_str()?.to_string();
+    let environment = alert.get("environment")?.as_str()?.to_string();
+    let service = alert.get("service")?.as_str()?.to_string();
+    for value in alert.values().filter_map(Value::as_str) {
+        if unsafe_alert_context_text(value) {
+            return None;
+        }
+    }
+
+    let refs = root.get("refs")?.as_array()?;
+    for signal_ref in refs {
+        let signal_ref = signal_ref.as_object()?;
+        if signal_ref.len() != 2
+            || !signal_ref.contains_key("label")
+            || !signal_ref.contains_key("url")
+            || signal_ref.values().any(|value| {
+                value
+                    .as_str()
+                    .map(unsafe_alert_context_text)
+                    .unwrap_or(true)
+            })
+        {
+            return None;
+        }
+    }
+
+    let attributes = root.get("attributes")?.as_object()?;
+    if attributes.iter().any(|(key, value)| {
+        unsafe_alert_context_key(key)
+            || value
+                .as_str()
+                .map(unsafe_alert_context_text)
+                .unwrap_or(true)
+    }) {
+        return None;
+    }
+
+    Some(AlertDiagnosisContext {
+        state,
+        environment,
+        service,
+        alert: json!({
+            "environment": alert.get("environment"),
+            "service": alert.get("service"),
+            "alert_key": alert.get("alert_key"),
+            "severity": alert.get("severity"),
+            "state": alert.get("state"),
+        }),
+        refs: Value::Array(refs.clone()),
+        attributes: Value::Object(attributes.clone()),
+    })
+}
+
+fn unsafe_alert_context_key(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "action"
+            | "argv"
+            | "command"
+            | "executable"
+            | "shell"
+            | "tool"
+            | "credential"
+            | "credentials"
+            | "token"
+            | "password"
+            | "authorization"
+            | "cookie"
+            | "rollback"
+            | "restart"
+            | "scale"
+            | "deploy"
+            | "delete"
+            | "patch"
+    )
+}
+
+fn unsafe_alert_context_text(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    let credential_words = [
+        "secret",
+        "token",
+        "bearer",
+        "api_key",
+        "apikey",
+        "password",
+        "authorization",
+        "cookie",
+        "credential",
+    ];
+    if credential_words.iter().any(|word| value.contains(word)) {
+        return true;
+    }
+    [
+        "rollback",
+        "restart",
+        "scale",
+        "deploy",
+        "delete",
+        "patch",
+        "ssh",
+        "kubectl",
+        "terraform apply",
+    ]
+    .iter()
+    .any(|forbidden| value == *forbidden || value.starts_with(&format!("{forbidden} ")))
+}
+
+fn safe_diagnostic_metadata(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(text)) if !unsafe_alert_context_text(text) => {
+            Value::String(text.clone())
+        }
+        Some(Value::Null) | None => Value::Null,
+        Some(value) if !value.is_string() => value.clone(),
+        _ => Value::Null,
+    }
+}
+
 fn ci_status_failed(status: &str) -> bool {
     matches!(
         status.to_ascii_lowercase().as_str(),
@@ -1564,5 +1972,18 @@ mod tests {
             agent("Orphan", "repoA", Orphaned),
         ];
         assert!(convention_steer_targets(&agents, SYSTEM_SCOPE).is_empty());
+    }
+
+    #[test]
+    fn production_alert_sdlc_tuples_are_reserved_from_configured_triggers() {
+        let alert = Tuple::new(
+            Category::Event,
+            "production_alert",
+            "sdlc:event:alerts:delivery-1",
+            "source:alerts",
+            json!({"family": "production_alert"}),
+        );
+        assert!(is_production_alert_sdlc_tuple(&alert));
+        assert!(!is_production_alert_sdlc_tuple(&tuple()));
     }
 }
