@@ -36,6 +36,37 @@ pub enum ProductToCodeCommand {
         #[command(subcommand)]
         command: VerifyReportCommand,
     },
+    /// Compose product-to-code workflow proposals (typed daemon proposals only).
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WorkflowCommand {
+    /// Validate local artifacts, then submit a typed product_to_code.dispatch
+    /// proposal referencing the prior approved graph apply execution.
+    Propose(WorkflowProposeArgs),
+}
+
+#[derive(Args)]
+pub struct WorkflowProposeArgs {
+    /// InitiativeContract JSON file.
+    #[arg(long)]
+    initiative: PathBuf,
+    /// ArchitectureResearchArtifact JSON file.
+    #[arg(long)]
+    research: PathBuf,
+    /// TicketGraph JSON file.
+    #[arg(long)]
+    graph: PathBuf,
+    /// Directory of GenericEvidence JSON files used by the dispatch gate.
+    #[arg(long)]
+    evidence_dir: PathBuf,
+    /// Registered repository name or path for the dispatch proposal.
+    #[arg(long, default_value = ".")]
+    repo: String,
 }
 
 #[derive(Subcommand)]
@@ -178,7 +209,159 @@ pub async fn run(layout: &Layout, command: ProductToCodeCommand, json_output: bo
         ProductToCodeCommand::DispatchGate(args) => run_dispatch_gate(args, json_output),
         ProductToCodeCommand::DeliveryGate(args) => run_delivery_gate(args, json_output),
         ProductToCodeCommand::VerifyReport { command } => run_verify_report(command, json_output),
+        ProductToCodeCommand::Workflow { command } => {
+            run_workflow(layout, command, json_output).await
+        }
     }
+}
+
+/// Thin wiring for the product-to-code workflow composition: validate local
+/// artifacts (research before graph, graph before dispatch), split graph nodes
+/// into dispatchable vs blocked by the generic impact-evidence dispatch gate,
+/// and submit ONE typed `product_to_code.dispatch` proposal through the same
+/// Phase 2 `factory.propose_action` path as graph propose-apply. No local
+/// mutation and no approved-id shortcut exist here; the daemon owns approval
+/// and dispatch.
+async fn run_workflow(
+    layout: &Layout,
+    command: WorkflowCommand,
+    json_output: bool,
+) -> Result<i32> {
+    let WorkflowCommand::Propose(args) = command;
+    let initiative: InitiativeContract = read_json(&args.initiative)?;
+    let research: ArchitectureResearchArtifact = read_json(&args.research)?;
+    let research_report = research.validate_for_initiative(&initiative);
+    if !research_report.valid {
+        let output = json!({
+            "schema": "product_to_code.workflow.propose.v1",
+            "stage": "research",
+            "valid": false,
+            "submitted_to_daemon": false,
+            "errors": research_report.errors,
+        });
+        print_json_or_errors(&output, json_output)?;
+        return Ok(1);
+    }
+    let graph: TicketGraph = read_json(&args.graph)?;
+    let graph_report = graph.validation_report_for_initiative(&initiative);
+    if !graph_report.valid {
+        let output = json!({
+            "schema": "product_to_code.workflow.propose.v1",
+            "stage": "graph",
+            "valid": false,
+            "submitted_to_daemon": false,
+            "errors": graph_report.errors,
+        });
+        print_json_or_errors(&output, json_output)?;
+        return Ok(1);
+    }
+
+    // Dispatch gate per node: nodes without current generic impact evidence
+    // are blocked and listed separately; they are never dispatched.
+    let evidence = read_evidence_dir(&args.evidence_dir)?;
+    let mut dispatches = Vec::new();
+    let mut blocked = Vec::new();
+    for node_id in &graph_report.topological_order {
+        let Some(node) = graph.nodes.iter().find(|node| &node.id == node_id) else {
+            continue;
+        };
+        let gate = dispatch_gate(node, &evidence);
+        if gate.valid {
+            dispatches.push(json!({
+                "graph_node_id": node.id,
+                "task_description": node.description,
+            }));
+        } else {
+            blocked.push(json!({
+                "graph_node_id": node.id,
+                "reasons": gate.errors,
+            }));
+        }
+    }
+
+    // The dispatch proposal is bound to the prior approved graph apply
+    // execution. Find its proposal through the daemon's approval records.
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let snapshot = client.call("factory.snapshot", json!({})).await?;
+    let proposals = snapshot["snapshot"]["approvals"]["proposals"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let grants = snapshot["snapshot"]["approvals"]["grants"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let graph_apply_proposal_id = proposals
+        .iter()
+        .filter(|proposal| {
+            proposal["kind"] == "ticket_graph.apply"
+                && proposal["action"]["graph"]["id"] == json!(graph.id)
+        })
+        .filter_map(|proposal| proposal["id"].as_str())
+        .find(|id| {
+            grants
+                .iter()
+                .any(|grant| grant["proposal_id"] == json!(id) && grant["status"] == "consumed")
+        })
+        .map(str::to_string);
+    let Some(graph_apply_proposal_id) = graph_apply_proposal_id else {
+        let output = json!({
+            "schema": "product_to_code.workflow.propose.v1",
+            "stage": "graph_apply",
+            "valid": false,
+            "submitted_to_daemon": false,
+            "errors": [format!(
+                "no consumed ticket_graph.apply execution found for graph {}; run graph propose-apply, approve, and execute it first",
+                graph.id
+            )],
+        });
+        print_json_or_errors(&output, json_output)?;
+        return Ok(1);
+    };
+
+    let action = json!({
+        "repo": args.repo,
+        "initiative": initiative,
+        "graph_id": graph.id,
+        "graph_apply_proposal_id": graph_apply_proposal_id,
+        "dispatches": dispatches,
+        "blocked": blocked,
+    });
+    let result = client
+        .call(
+            "factory.propose_action",
+            json!({"kind": "product_to_code.dispatch", "action": action}),
+        )
+        .await?;
+    let proposal_id = result["proposal"]["id"].as_str().unwrap_or("?");
+    let digest = result["digest"].as_str().unwrap_or("?");
+    let output = json!({
+        "schema": "product_to_code.workflow.propose.v1",
+        "stage": "dispatch",
+        "kind": "product_to_code.dispatch",
+        "valid": true,
+        "submitted_to_daemon": true,
+        "authority": "daemon accepted authority boundary; local CLI did not dispatch workflows",
+        "authority_boundary": "daemon factory.propose_action owns proposal persistence; approval/dispatch happen outside this CLI command; local CLI did not dispatch workflows",
+        "graph_apply_proposal_id": graph_apply_proposal_id,
+        "dispatches": result["proposal"]["action"]["dispatches"],
+        "blocked": result["proposal"]["action"]["blocked"],
+        "canonical_action": result["proposal"]["action"],
+        "human_display": format!("Review and approve product_to_code.dispatch proposal {proposal_id}"),
+        "approval_instructions": format!("Use rk factory approve {proposal_id} {digest}; no local approved-id dispatch path exists here"),
+        "proposal_id": proposal_id,
+        "proposal": result.get("proposal").cloned().unwrap_or(serde_json::Value::Null),
+        "digest": digest,
+    });
+    if json_output {
+        println!("{}", serde_json::to_string(&output)?);
+    } else {
+        println!(
+            "proposed product_to_code.dispatch {}",
+            output["digest"].as_str().unwrap_or("?")
+        );
+    }
+    Ok(0)
 }
 
 fn run_verify_report(command: VerifyReportCommand, json_output: bool) -> Result<i32> {
