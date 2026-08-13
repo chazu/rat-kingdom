@@ -1,8 +1,9 @@
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::{json, Value};
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 fn git(dir: &Path, args: &[&str]) {
@@ -83,6 +84,28 @@ async fn mcp_call(layout: &Layout, id: u64, name: &str, arguments: Value) -> Val
     };
     let mut connect = || async { Client::connect_as_operator(layout).await };
     serde_json::to_value(rk_mcp::handle_request(req, &mut connect).await).unwrap()
+}
+
+fn run_rk_mcp_stdio(input: &[u8]) -> Output {
+    let home = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rk-mcp"))
+        .env("RK_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(input).unwrap();
+    drop(child.stdin.take());
+    child.wait_with_output().unwrap()
+}
+
+fn stdout_json_lines(output: &Output) -> Vec<Value> {
+    String::from_utf8(output.stdout.clone())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 #[tokio::test]
@@ -182,6 +205,148 @@ async fn raw_stdio_rejects_invalid_and_missing_jsonrpc_without_dispatch_or_noise
         assert_eq!(response["error"]["code"], -32600);
         assert!(response.get("result").is_none());
     }
+}
+
+#[tokio::test]
+async fn initialized_notification_is_accepted_without_response_or_daemon_dispatch() {
+    let input = br#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+"#;
+    let mut output = Vec::new();
+    let mut connect =
+        || async { Err::<Client, _>(rk_core::Error::other("notification connected")) };
+    rk_mcp::serve(&input[..], &mut output, &mut connect)
+        .await
+        .unwrap();
+    assert!(
+        output.is_empty(),
+        "notifications must not produce stdout responses"
+    );
+}
+
+#[test]
+fn subprocess_initialize_notification_list_and_call_keep_stdout_protocol_only() {
+    let input = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"factory_snapshot","arguments":{"schema":1,"repo":"repo-a"}}}
+"#;
+    let output = run_rk_mcp_stdio(input);
+    assert!(output.status.success());
+    let responses = stdout_json_lines(&output);
+    assert_eq!(responses.len(), 3, "notification must emit no response");
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[0]["result"]["serverInfo"]["name"], "rk-mcp");
+    assert_eq!(responses[1]["id"], 2);
+    assert!(responses[1]["result"]["tools"].as_array().unwrap().len() >= 5);
+    assert_eq!(responses[2]["id"], 3);
+    assert_eq!(responses[2]["error"]["code"], -32000);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("daemon connection failed"),
+        "stderr: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn raw_stdio_rejects_unknown_top_level_fields_and_non_object_params() {
+    let input = br#"{"jsonrpc":"2.0","id":14,"method":"tools/list","params":{},"extra":true}
+{"jsonrpc":"2.0","id":15,"method":"tools/list","params":[]}
+{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"factory_snapshot","arguments":{"schema":1,"repo":"repo-a"},"extra":true}}
+"#;
+    let mut output = Vec::new();
+    let mut connect =
+        || async { Err::<Client, _>(rk_core::Error::other("strict params connected")) };
+    rk_mcp::serve(&input[..], &mut output, &mut connect)
+        .await
+        .unwrap();
+    let text = String::from_utf8(output).unwrap();
+    let responses: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 3);
+    assert_eq!(responses[0]["id"], 14);
+    assert_eq!(responses[0]["error"]["code"], -32600);
+    assert_eq!(responses[1]["id"], 15);
+    assert_eq!(responses[1]["error"]["code"], -32602);
+    assert!(responses[1]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("params must be an object"));
+    assert_eq!(responses[2]["id"], 16);
+    assert_eq!(responses[2]["error"]["code"], -32602);
+    assert!(responses[2]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("unknown field"));
+}
+
+#[tokio::test]
+async fn raw_stdio_invalid_utf8_returns_controlled_parse_error_and_continues() {
+    let mut input = b"{\"jsonrpc\":\"2.0\",\"id\":".to_vec();
+    input.push(0xff);
+    input.extend_from_slice(
+        b"}\n{\"jsonrpc\":\"2.0\",\"id\":17,\"method\":\"tools/list\",\"params\":{}}\n",
+    );
+    let mut output = Vec::new();
+    let mut connect = || async { Err::<Client, _>(rk_core::Error::other("utf8 connected")) };
+    rk_mcp::serve(&input[..], &mut output, &mut connect)
+        .await
+        .unwrap();
+    let text = String::from_utf8(output).unwrap();
+    let responses: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        responses.len(),
+        2,
+        "invalid UTF-8 must not terminate stdio loop"
+    );
+    assert_eq!(responses[0]["id"], Value::Null);
+    assert_eq!(responses[0]["error"]["code"], -32700);
+    assert!(responses[0]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("invalid UTF-8"));
+    assert_eq!(responses[1]["id"], 17);
+    assert!(responses[1].get("error").is_none(), "{responses:?}");
+}
+
+#[test]
+fn subprocess_rejects_unknown_fields_params_array_and_invalid_utf8_with_stderr_diagnostics() {
+    let mut input = br#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"factory_snapshot","arguments":{"schema":1,"repo":"repo-a","extra":true}}}
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"factory_snapshot","arguments":[]}}
+"#
+    .to_vec();
+    input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":");
+    input.push(0xff);
+    input.extend_from_slice(b"}\n");
+
+    let output = run_rk_mcp_stdio(&input);
+    assert!(output.status.success());
+    let responses = stdout_json_lines(&output);
+    assert_eq!(responses.len(), 3);
+    assert_eq!(responses[0]["id"], 10);
+    assert_eq!(responses[0]["error"]["code"], -32602);
+    assert!(responses[0]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("unknown field"));
+    assert_eq!(responses[1]["id"], 11);
+    assert_eq!(responses[1]["error"]["code"], -32602);
+    assert!(responses[1]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("arguments must be an object"));
+    assert_eq!(responses[2]["id"], Value::Null);
+    assert_eq!(responses[2]["error"]["code"], -32700);
+    assert!(responses[2]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("invalid UTF-8"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid UTF-8 request"), "stderr: {stderr}");
 }
 
 #[tokio::test]

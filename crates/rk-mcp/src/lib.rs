@@ -30,6 +30,7 @@ const TOOLS: &[(&str, &str)] = &[
 ];
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JsonRpcRequest {
     #[serde(default)]
     pub jsonrpc: Option<String>,
@@ -37,6 +38,26 @@ pub struct JsonRpcRequest {
     pub method: String,
     #[serde(default)]
     pub params: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonRpcMessage {
+    #[serde(default)]
+    jsonrpc: Option<String>,
+    #[serde(default)]
+    id: Option<Value>,
+    method: String,
+    #[serde(default)]
+    params: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolCallParams {
+    name: String,
+    #[serde(default)]
+    arguments: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,12 +79,14 @@ pub struct JsonRpcError {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FactorySnapshotRequest {
     pub schema: u8,
     pub repo: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FactoryEventsReplayRequest {
     pub schema: u8,
     pub repo: String,
@@ -75,6 +98,7 @@ pub struct FactoryEventsReplayRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowRunRequest {
     pub schema: u8,
     pub workflow: String,
@@ -88,6 +112,7 @@ pub struct WorkflowRunRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApproveActionRequest {
     pub schema: u8,
     pub proposal_id: String,
@@ -95,6 +120,7 @@ pub struct ApproveActionRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecuteApprovedWorkflowRunRequest {
     pub schema: u8,
     pub proposal_id: String,
@@ -142,21 +168,81 @@ where
     Fut: Future<Output = rk_core::Result<C>>,
     C: DaemonCaller,
 {
-    let mut line = String::new();
+    let mut line = Vec::new();
     loop {
         line.clear();
-        if input.read_line(&mut line).await? == 0 {
+        if input.read_until(b'\n', &mut line).await? == 0 {
             return Ok(());
         }
-        let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
-            Ok(req) => handle_request(req, &mut connect).await,
-            Err(err) => JsonRpcResponse::err(Value::Null, -32700, format!("parse error: {err}")),
+        let response = match std::str::from_utf8(&line) {
+            Ok(text) => handle_message(text, &mut connect).await,
+            Err(err) => {
+                eprintln!("rk-mcp: invalid UTF-8 request: {err}");
+                Some(JsonRpcResponse::err(
+                    Value::Null,
+                    -32700,
+                    format!("parse error: invalid UTF-8: {err}"),
+                ))
+            }
+        };
+        let Some(response) = response else {
+            continue;
         };
         let mut bytes = serde_json::to_vec(&response)?;
         bytes.push(b'\n');
         output.write_all(&bytes).await?;
         output.flush().await?;
     }
+}
+
+async fn handle_message<F, Fut, C>(text: &str, connect: &mut F) -> Option<JsonRpcResponse>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = rk_core::Result<C>>,
+    C: DaemonCaller,
+{
+    let value = match serde_json::from_str::<Value>(text) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("rk-mcp: parse error: {err}");
+            return Some(JsonRpcResponse::err(
+                Value::Null,
+                -32700,
+                format!("parse error: {err}"),
+            ));
+        }
+    };
+    let msg = match serde_json::from_value::<JsonRpcMessage>(value.clone()) {
+        Ok(msg) => msg,
+        Err(err) => {
+            eprintln!("rk-mcp: invalid request: {err}");
+            return Some(JsonRpcResponse::err(
+                value.get("id").cloned().unwrap_or(Value::Null),
+                -32600,
+                format!("invalid request: {err}"),
+            ));
+        }
+    };
+
+    let Some(id) = msg.id else {
+        if msg.method != "notifications/initialized" {
+            eprintln!("rk-mcp: ignored notification method {}", msg.method);
+        }
+        return None;
+    };
+
+    Some(
+        handle_request(
+            JsonRpcRequest {
+                jsonrpc: msg.jsonrpc,
+                id,
+                method: msg.method,
+                params: msg.params.unwrap_or_else(|| json!({})),
+            },
+            connect,
+        )
+        .await,
+    )
 }
 
 pub async fn handle_request<F, Fut, C>(req: JsonRpcRequest, connect: &mut F) -> JsonRpcResponse
@@ -167,6 +253,9 @@ where
 {
     if req.jsonrpc.as_deref() != Some("2.0") {
         return JsonRpcResponse::err(req.id, -32600, "invalid request");
+    }
+    if !req.params.is_object() {
+        return JsonRpcResponse::err(req.id, -32602, "params must be an object");
     }
 
     match req.method.as_str() {
@@ -190,22 +279,33 @@ where
     Fut: Future<Output = rk_core::Result<C>>,
     C: DaemonCaller,
 {
-    let name = match params.get("name").and_then(Value::as_str) {
-        Some(name) => name,
-        None => return JsonRpcResponse::err(id, -32602, "missing tool name"),
+    let tool_params = match serde_json::from_value::<ToolCallParams>(params) {
+        Ok(params) => params,
+        Err(err) => return JsonRpcResponse::err(id, -32602, format!("invalid params: {err}")),
     };
-    let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
-    let prepared = match prepare_tool(name, arguments) {
+    let prepared = match prepare_tool(
+        &tool_params.name,
+        tool_params.arguments.unwrap_or(Value::Null),
+    ) {
         Ok(prepared) => prepared,
         Err(err) => return JsonRpcResponse::err(id, -32602, err),
     };
     let mut client = match connect().await {
         Ok(client) => client,
-        Err(err) => return JsonRpcResponse::err(id, -32000, err.to_string()),
+        Err(err) => {
+            eprintln!("rk-mcp: daemon connection failed: {err}");
+            return JsonRpcResponse::err(id, -32000, err.to_string());
+        }
     };
     match client.call_raw(&prepared.method, prepared.params).await {
         Ok(resp) => daemon_to_mcp(id, resp),
-        Err(err) => JsonRpcResponse::err(id, -32000, err.to_string()),
+        Err(err) => {
+            eprintln!(
+                "rk-mcp: daemon transport failed for {}: {err}",
+                prepared.method
+            );
+            JsonRpcResponse::err(id, -32000, err.to_string())
+        }
     }
 }
 
@@ -215,6 +315,9 @@ struct PreparedCall {
 }
 
 fn prepare_tool(name: &str, arguments: Value) -> Result<PreparedCall, String> {
+    if !arguments.is_object() {
+        return Err("arguments must be an object".into());
+    }
     match name {
         "factory_snapshot" => {
             let args: FactorySnapshotRequest = parse_args(arguments)?;
@@ -291,6 +394,9 @@ fn propose_params(args: WorkflowRunRequest) -> Value {
 }
 
 fn parse_args<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, String> {
+    if !value.is_object() {
+        return Err("invalid arguments: arguments must be an object".into());
+    }
     serde_json::from_value(value).map_err(|err| format!("invalid arguments: {err}"))
 }
 
@@ -322,6 +428,10 @@ fn daemon_to_mcp(id: Value, resp: DaemonResponse) -> JsonRpcResponse {
 }
 
 fn daemon_error(id: Value, error: RpcError) -> JsonRpcResponse {
+    eprintln!(
+        "rk-mcp: daemon connection failed: {}: {}",
+        error.code, error.message
+    );
     JsonRpcResponse {
         jsonrpc: "2.0",
         id,
