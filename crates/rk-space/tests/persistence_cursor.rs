@@ -232,6 +232,36 @@ fn sequence_only_database_with_deleted_history_upgrades_without_rewinding() {
 }
 
 #[test]
+fn sequence_only_database_recovers_from_failed_pre_journal_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("partial-journal-upgrade.db");
+    let surviving = fact(RecordId::floor_at(Utc::now()), "surviving-partial-upgrade");
+    create_sequence_only_database_after_deletion(&db, &surviving);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE tuple_persistence_events (
+            commit_sequence INTEGER PRIMARY KEY,
+            id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            identity TEXT NOT NULL,
+            instance TEXT NOT NULL,
+            lifecycle TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT,
+            strength REAL
+        );",
+    )
+    .unwrap();
+    drop(conn);
+
+    let space = Space::open(&db).unwrap();
+    assert_eq!(space.latest_persistence_sequence().unwrap(), 2);
+    assert_eq!(space.persistence_delta(None).unwrap().tuples, vec![surviving]);
+}
+
+#[test]
 fn reopening_fails_closed_when_migrated_sequence_state_is_missing() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("missing-state.db");

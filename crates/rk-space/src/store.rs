@@ -192,7 +192,7 @@ struct CurrentSdlcState {
 fn migrate(
     conn: &mut Connection,
     sequence_schema_preexisting: bool,
-    journal_schema_preexisting: bool,
+    journal_guards_preexisting: bool,
 ) -> rk_core::Result<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -266,7 +266,11 @@ fn migrate(
     }
     backfill_tuple_sequences(&tx, sequence_schema_preexisting)?;
     backfill_tuple_persistence_events(&tx)?;
-    if sequence_schema_preexisting && !journal_schema_preexisting {
+    if sequence_schema_preexisting
+        && !journal_guards_preexisting
+        && !journal_floor_exists
+        && !journal_is_fully_backfilled(&tx)?
+    {
         tx.execute(
             "UPDATE tuple_sequence_state
                 SET journal_floor_sequence = last_sequence
@@ -348,6 +352,28 @@ fn migrate(
     )
     .map_err(sql_err)?;
     tx.commit().map_err(sql_err)
+}
+
+fn journal_is_fully_backfilled(conn: &Connection) -> rk_core::Result<bool> {
+    let (last, count, first, final_sequence): (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT state.last_sequence,
+                    (SELECT COUNT(*) FROM tuple_persistence_events),
+                    COALESCE((SELECT MIN(commit_sequence)
+                                FROM tuple_persistence_events), 0),
+                    COALESCE((SELECT MAX(commit_sequence)
+                                FROM tuple_persistence_events), 0)
+               FROM tuple_sequence_state AS state
+              WHERE state.singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(sql_err)?;
+    Ok(if last == 0 {
+        count == 0 && first == 0 && final_sequence == 0
+    } else {
+        last > 0 && count == last && first == 1 && final_sequence == last
+    })
 }
 
 fn backfill_tuple_sequences(
@@ -570,11 +596,16 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_err)?;
-        let journal_schema_preexisting = conn
+        let journal_guards_preexisting = conn
             .query_row(
                 "SELECT EXISTS(
                      SELECT 1 FROM sqlite_master
-                      WHERE type = 'table' AND name = 'tuple_persistence_events'
+                      WHERE type = 'trigger'
+                        AND name = 'tuple_persistence_events_reject_update'
+                 ) OR EXISTS(
+                     SELECT 1 FROM sqlite_master
+                      WHERE type = 'trigger'
+                        AND name = 'tuple_persistence_events_reject_delete'
                  )",
                 [],
                 |row| row.get(0),
@@ -584,7 +615,7 @@ impl Store {
         migrate(
             &mut conn,
             sequence_schema_preexisting,
-            journal_schema_preexisting,
+            journal_guards_preexisting,
         )?;
         Ok(Self { conn })
     }
@@ -593,12 +624,12 @@ impl Store {
         let mut conn = Connection::open_in_memory().map_err(sql_err)?;
         register_functions(&conn).map_err(sql_err)?;
         let sequence_schema_preexisting = false;
-        let journal_schema_preexisting = false;
+        let journal_guards_preexisting = false;
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
         migrate(
             &mut conn,
             sequence_schema_preexisting,
-            journal_schema_preexisting,
+            journal_guards_preexisting,
         )?;
         Ok(Self { conn })
     }
