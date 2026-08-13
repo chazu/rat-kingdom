@@ -38,7 +38,17 @@ FACTORY_SCORECARDS_ARGV = (
     "all",
     "--include-archived",
 )
-FACTORY_RECOMMEND_ARGV = ("rk", "--json", "factory", "recommend", "--repo", REPO)
+FACTORY_RECOMMEND_ARGV = (
+    "rk",
+    "--json",
+    "factory",
+    "recommend",
+    "--repo",
+    REPO,
+    "--group-by",
+    "all",
+    "--include-archived",
+)
 
 
 def fixture(name):

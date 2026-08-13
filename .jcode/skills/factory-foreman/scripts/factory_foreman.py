@@ -40,7 +40,20 @@ OPTIONAL_FACTORY_DISPLAY_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "--include-archived",
         ),
     ),
-    ("factory_recommend", ("rk", "--json", "factory", "recommend", "--repo", "{repo}")),
+    (
+        "factory_recommend",
+        (
+            "rk",
+            "--json",
+            "factory",
+            "recommend",
+            "--repo",
+            "{repo}",
+            "--group-by",
+            "all",
+            "--include-archived",
+        ),
+    ),
 )
 STATUS_ARGV = ("rk", "--json", "daemon", "status")
 BUDGET_PRESSURE_RATIO = 0.8
