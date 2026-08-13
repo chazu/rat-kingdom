@@ -514,6 +514,21 @@ fn require_matching(
 
 fn reject_secret_like(kind: &'static str, key: &str) -> Result<(), SignalValidationError> {
     let lower = key.to_ascii_lowercase();
+    if contains_secret_word(&lower) || contains_url_userinfo_credentials(&lower) {
+        return Err(SignalValidationError::SecretLikeField(kind, key.into()));
+    }
+
+    let normalized = percent_decode_ascii_bounded(key);
+    if normalized != lower
+        && (contains_secret_word(&normalized) || contains_url_userinfo_credentials(&normalized))
+    {
+        return Err(SignalValidationError::SecretLikeField(kind, key.into()));
+    }
+
+    Ok(())
+}
+
+fn contains_secret_word(value: &str) -> bool {
     let secret_words = [
         "secret",
         "token",
@@ -535,9 +550,53 @@ fn reject_secret_like(kind: &'static str, key: &str) -> Result<(), SignalValidat
         "kubectl",
         "terraform",
     ];
-    if secret_words.iter().any(|word| lower.contains(word)) {
-        Err(SignalValidationError::SecretLikeField(kind, key.into()))
-    } else {
-        Ok(())
+    secret_words.iter().any(|word| value.contains(word))
+}
+
+fn contains_url_userinfo_credentials(value: &str) -> bool {
+    let Some(authority_start) = value.find("://").map(|index| index + 3) else {
+        return false;
+    };
+    let authority = value[authority_start..]
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let Some(userinfo) = authority.rsplit_once('@').map(|(userinfo, _)| userinfo) else {
+        return false;
+    };
+
+    userinfo.contains(':')
+}
+
+fn percent_decode_ascii_bounded(value: &str) -> String {
+    const MAX_NORMALIZED_BYTES: usize = 4096;
+
+    let bytes = value.as_bytes();
+    let mut normalized = String::with_capacity(value.len().min(MAX_NORMALIZED_BYTES));
+    let mut index = 0;
+    while index < bytes.len() && normalized.len() < MAX_NORMALIZED_BYTES {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                normalized.push(char::from((high << 4) | low).to_ascii_lowercase());
+                index += 3;
+                continue;
+            }
+        }
+
+        normalized.push(char::from(bytes[index]).to_ascii_lowercase());
+        index += 1;
+    }
+
+    normalized
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }

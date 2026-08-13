@@ -117,6 +117,36 @@ fn test_correlation_rejects_empty_identity_for_transition_signals() {
 }
 
 #[test]
+fn test_url_refs_reject_encoded_sensitive_query_keys_and_userinfo() {
+    for url in [
+        "https://example.invalid/build?api%5Fkey=redacted",
+        "https://example.invalid/build?Api%5fKey=redacted",
+        "https://example.invalid/build?token%3Dredacted",
+        "https://user:redacted@example.invalid/build",
+        "https://USER:ReDaCtEd@example.invalid/build",
+    ] {
+        let mut envelope = base_envelope(SignalKind::CiFailed);
+        envelope.refs = vec![SignalRef {
+            label: "build".into(),
+            url: url.into(),
+        }];
+
+        assert_invalid(&envelope);
+    }
+}
+
+#[test]
+fn test_url_refs_allow_benign_percent_encoding_without_raw_telemetry() {
+    let mut envelope = base_envelope(SignalKind::CiFailed);
+    envelope.refs = vec![SignalRef {
+        label: "build".into(),
+        url: "https://example.invalid/build?job%5Fid=unit%2Dtests&branch=main".into(),
+    }];
+
+    envelope.validate(&SignalLimits::default()).unwrap();
+}
+
+#[test]
 fn test_signal_limits_reject_raw_telemetry_shape() {
     let mut envelope = base_envelope(SignalKind::CiFailed);
     envelope
