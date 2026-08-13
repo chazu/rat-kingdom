@@ -1222,23 +1222,22 @@ impl Daemon {
             req.since.is_none_or(|since| ms >= since)
                 && req.until.is_none_or(|until| ms <= until)
         };
-        let agents = if req.include_archived {
-            self.supervisor.list_all()
-        } else {
-            self.supervisor.list()
-        }
-        .into_iter()
-        .filter(|agent| req.repo.as_deref().is_none_or(|r| agent.repo_name == r))
-        .filter(|agent| in_window(agent.updated_at.timestamp_millis()))
-        .collect();
-        let instances = if req.include_archived {
-            self.engine().list_all()
-        } else {
-            self.engine().list()
-        }
-        .into_iter()
-        .filter(|instance| req.repo.as_deref().is_none_or(|r| instance.repo == r))
-        .collect();
+        // Always read active + archived immutable snapshots. The pure fact/
+        // scorecard layer applies include_archived to metric numerators while
+        // retaining archived source counts and archived-only availability.
+        let agents = self
+            .supervisor
+            .list_all()
+            .into_iter()
+            .filter(|agent| req.repo.as_deref().is_none_or(|r| agent.repo_name == r))
+            .filter(|agent| in_window(agent.updated_at.timestamp_millis()))
+            .collect();
+        let instances = self
+            .engine()
+            .list_all()
+            .into_iter()
+            .filter(|instance| req.repo.as_deref().is_none_or(|r| instance.repo == r))
+            .collect();
         crate::factory_analytics::AnalyticsInputs {
             repo,
             agents,

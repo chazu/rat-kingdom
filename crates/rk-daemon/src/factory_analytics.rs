@@ -110,10 +110,13 @@ fn is_settled(state: AgentState) -> bool {
 }
 
 /// Normalize structured records into outcome facts. Pure over owned clones.
-fn normalize_facts(inputs: &AnalyticsInputs, include_archived: bool) -> Vec<OutcomeFact> {
+fn normalize_facts(inputs: &AnalyticsInputs) -> Vec<OutcomeFact> {
     let (structured, unavailable) = normalize_inputs(inputs);
+    // Keep archived facts in the immutable fact set so source metadata always
+    // exposes active/archived splits. `ScorecardQuery::include_archived` alone
+    // controls whether archived facts enter metric numerators/denominators.
     OutcomeFactBuilder::from_structured_inputs(structured, unavailable)
-        .include_archived(include_archived)
+        .include_archived(true)
         .build()
 }
 
@@ -179,7 +182,7 @@ fn normalize_inputs(
 
         // One run per settled agent generation.
         structured.push(base(
-            format!("{run_id}:run"),
+            run_id.clone(),
             OutcomeEvidenceKind::AgentRecord,
             FactoryMetricPayload::Run { count: 1 },
         ));
@@ -187,7 +190,7 @@ fn normalize_inputs(
         // Cost: harness-reported cost with an explicit pricing evidence id.
         if let Some(micro_usd) = usd_to_micro(agent.cost_usd).filter(|m| *m > 0) {
             structured.push(base(
-                format!("{run_id}:cost"),
+                run_id.clone(),
                 OutcomeEvidenceKind::AgentRecord,
                 FactoryMetricPayload::Cost {
                     micro_usd,
@@ -203,7 +206,7 @@ fn normalize_inputs(
         let completed = agent.updated_at.timestamp_millis();
         if completed >= started {
             let mut lead = base(
-                format!("{run_id}:lead"),
+                run_id.clone(),
                 OutcomeEvidenceKind::AgentRecord,
                 FactoryMetricPayload::LeadTime {
                     started_at_ms: started,
@@ -226,7 +229,7 @@ fn normalize_inputs(
 }
 
 fn scorecards(inputs: &AnalyticsInputs, req: &FactoryAnalyticsRequest) -> Vec<FactoryScorecard> {
-    let facts = normalize_facts(inputs, req.include_archived);
+    let facts = normalize_facts(inputs);
     aggregate_scorecards(
         &facts,
         ScorecardQuery {
@@ -239,8 +242,8 @@ fn scorecards(inputs: &AnalyticsInputs, req: &FactoryAnalyticsRequest) -> Vec<Fa
 /// Source counts and availability metadata rolled up across observed families,
 /// so unavailable metrics are visible and cannot look healthy.
 fn availability_envelope(rows: &[FactoryScorecard]) -> (Value, Value, Vec<String>) {
-    use std::collections::BTreeMap;
     use rk_core::factory::outcome_facts::SourceCounts;
+    use std::collections::BTreeMap;
 
     let mut counts: BTreeMap<OutcomeEvidenceKind, SourceCounts> = BTreeMap::new();
     let mut available: BTreeMap<OutcomeEvidenceKind, bool> = BTreeMap::new();
@@ -255,7 +258,10 @@ fn availability_envelope(rows: &[FactoryScorecard]) -> (Value, Value, Vec<String
         counts.entry(*family).or_default();
         available.entry(*family).or_insert(false);
     }
-    for row in rows {
+    // Every aggregation request always includes the canonical composite rows.
+    // Roll top-level metadata up from those rows only: projection rows repeat
+    // the same facts for display and must not multiply source/event counts.
+    for row in rows.iter().filter(|row| !row.projected) {
         for (family, sc) in &row.source_counts.by_family {
             let entry = counts.entry(*family).or_default();
             entry.active_source_count += sc.active_source_count;
@@ -353,7 +359,12 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    fn agent(name: &str, harness: &str, model: Option<&str>, instance: Option<&str>) -> AgentRecord {
+    fn agent(
+        name: &str,
+        harness: &str,
+        model: Option<&str>,
+        instance: Option<&str>,
+    ) -> AgentRecord {
         AgentRecord {
             name: name.into(),
             role: "rat".into(),
@@ -435,7 +446,9 @@ mod tests {
         assert!(structured
             .iter()
             .all(|s| s.workflow.as_deref() == Some("implement-featureset")));
-        assert!(structured.iter().all(|s| s.harness.as_deref() == Some("claude")));
+        assert!(structured
+            .iter()
+            .all(|s| s.harness.as_deref() == Some("claude")));
         // task_class is never inferred; stays None -> normalizes to unknown.
         assert!(structured.iter().all(|s| s.task_class.is_none()));
     }
@@ -501,7 +514,12 @@ mod tests {
         assert!(resp["recommendations"].is_array());
         // No mutation-shaped fields leak into the payload.
         let blob = resp.to_string();
-        for banned in ["\"apply\"", "\"dispatch\"", "rewrite-policy", "update-workflow"] {
+        for banned in [
+            "\"apply\"",
+            "\"dispatch\"",
+            "rewrite-policy",
+            "update-workflow",
+        ] {
             assert!(!blob.contains(banned), "payload must not contain {banned}");
         }
     }
@@ -515,6 +533,76 @@ mod tests {
         assert_eq!(usd_to_micro(f64::INFINITY), None);
     }
 
+    fn source_count<'a>(response: &'a Value, family: &str) -> &'a Value {
+        response["source_counts"]
+            .as_array()
+            .expect("source counts array")
+            .iter()
+            .find(|entry| entry["source_family"] == json!(family))
+            .unwrap_or_else(|| panic!("missing source count for {family}"))
+    }
+
+    #[test]
+    fn archived_history_is_reported_even_when_excluded_from_metrics() {
+        let mut with_archived = inputs();
+        let mut archived = agent("rat-3", "claude", Some("sonnet"), Some("wf-1"));
+        archived.archived_at = Some(Utc.timestamp_opt(1_100, 0).unwrap());
+        with_archived.agents.push(archived);
+        let at = Utc.timestamp_opt(2_000, 0).unwrap();
+
+        let excluded = scorecards_response(&with_archived, &FactoryAnalyticsRequest::default(), at);
+        let excluded_runs: u64 = excluded["scorecards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| !row["projected"].as_bool().unwrap_or(false))
+            .map(|row| row["metrics"]["runs"].as_u64().unwrap())
+            .sum();
+        assert_eq!(excluded_runs, 2);
+        let counts = source_count(&excluded, "AgentRecord");
+        assert_eq!(counts["active_source_count"], json!(2));
+        assert_eq!(counts["archived_source_count"], json!(1));
+
+        let included = scorecards_response(
+            &with_archived,
+            &FactoryAnalyticsRequest {
+                include_archived: true,
+                ..Default::default()
+            },
+            at,
+        );
+        let included_runs: u64 = included["scorecards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| !row["projected"].as_bool().unwrap_or(false))
+            .map(|row| row["metrics"]["runs"].as_u64().unwrap())
+            .sum();
+        assert_eq!(included_runs, 3);
+    }
+
+    #[test]
+    fn top_level_source_counts_do_not_multiply_across_projections() {
+        let at = Utc.timestamp_opt(2_000, 0).unwrap();
+        let composite = scorecards_response(&inputs(), &FactoryAnalyticsRequest::default(), at);
+        let all = scorecards_response(
+            &inputs(),
+            &FactoryAnalyticsRequest {
+                group_by: Some("all".into()),
+                ..Default::default()
+            },
+            at,
+        );
+        assert_eq!(
+            source_count(&composite, "AgentRecord"),
+            source_count(&all, "AgentRecord")
+        );
+        assert_eq!(
+            source_count(&all, "AgentRecord")["active_source_count"],
+            json!(2)
+        );
+    }
+
     #[test]
     fn live_agents_produce_no_facts() {
         let mut only_live = inputs();
@@ -522,6 +610,9 @@ mod tests {
             a.state = AgentState::Running;
         }
         let (structured, _) = normalize_inputs(&only_live);
-        assert!(structured.is_empty(), "in-flight runs contribute no terminal facts");
+        assert!(
+            structured.is_empty(),
+            "in-flight runs contribute no terminal facts"
+        );
     }
 }
