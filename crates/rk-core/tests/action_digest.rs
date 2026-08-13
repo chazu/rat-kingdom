@@ -5,6 +5,9 @@ use rk_core::action::{
     action_digest, canonical_digest, canonical_json_bytes, ActionKind, ActionProposal, ActionRisk,
     ActionScope, FactoryAction, RepoScope, TicketGraphApplyAction, WorkflowRunAction,
 };
+use rk_core::product_to_code::contracts::{
+    AcceptanceCriterion, InitiativeContract, TicketGraph, TicketGraphEdge, TicketGraphNode,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -27,16 +30,66 @@ fn workflow_run(params: BTreeMap<String, Value>) -> WorkflowRunAction {
 }
 
 fn ticket_graph_apply() -> TicketGraphApplyAction {
+    let initiative = InitiativeContract {
+        id: "INIT-product-to-code".into(),
+        title: "Product to code".into(),
+        scope: "offline-contracts".into(),
+        acceptance_criteria: vec![
+            AcceptanceCriterion {
+                id: "AC-1".into(),
+                text: "Contracts exist".into(),
+                browser_acceptance_applicable: false,
+            },
+            AcceptanceCriterion {
+                id: "AC-2".into(),
+                text: "Tests exist".into(),
+                browser_acceptance_applicable: false,
+            },
+        ],
+        browser_acceptance_applicable: false,
+    };
+    let graph = TicketGraph {
+        id: "GRAPH-product-to-code".into(),
+        initiative_id: initiative.id.clone(),
+        nodes: vec![
+            TicketGraphNode {
+                id: "NODE-contracts".into(),
+                title: "Add contracts".into(),
+                description: "Add typed contracts".into(),
+                acceptance_criterion_ids: vec!["AC-1".into()],
+                feature_set_ids: Vec::new(),
+                browser_acceptance_applicable: false,
+                browser_acceptance_criterion_ids: Vec::new(),
+            },
+            TicketGraphNode {
+                id: "NODE-tests".into(),
+                title: "Add tests".into(),
+                description: "Add regression tests".into(),
+                acceptance_criterion_ids: vec!["AC-2".into()],
+                feature_set_ids: Vec::new(),
+                browser_acceptance_applicable: false,
+                browser_acceptance_criterion_ids: Vec::new(),
+            },
+        ],
+        edges: vec![TicketGraphEdge {
+            from: "NODE-contracts".into(),
+            to: "NODE-tests".into(),
+            relationship: "depends_on".into(),
+        }],
+    };
+    let acceptance_ids = initiative
+        .acceptance_criteria
+        .iter()
+        .map(|criterion| criterion.id.clone())
+        .collect::<Vec<_>>();
+    let apply_plan = graph.apply_plan("rat-kingdom", &acceptance_ids).unwrap();
     TicketGraphApplyAction {
         repo: "rat-kingdom".into(),
         repo_identity: "repo-01".into(),
         repo_path: "/srv/repos/rat-kingdom".into(),
-        graph: json!({"id":"GRAPH-product-to-code"}),
-        initiative: json!({"id":"INIT-product-to-code"}),
-        topological_order: vec!["NODE-contracts".into(), "NODE-tests".into()],
-        mutations: vec![
-            json!({"operation":"ticket.create","stable_graph_node_id":"NODE-contracts"}),
-        ],
+        graph,
+        initiative,
+        apply_plan,
     }
 }
 
@@ -142,7 +195,7 @@ fn test_ticket_graph_apply_kind_risk_and_digest_are_canonical() {
     let action = FactoryAction::TicketGraphApply(ticket_graph_apply());
     let same = FactoryAction::TicketGraphApply(ticket_graph_apply());
     let mut changed = ticket_graph_apply();
-    changed.topological_order.reverse();
+    changed.apply_plan.topological_order.reverse();
 
     assert_eq!(action.kind(), ActionKind::TicketGraphApply);
     assert_eq!(action.risk(), ActionRisk::Mutation);

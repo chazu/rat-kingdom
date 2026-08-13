@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod product_to_code_ticket_graph {
-    use super::*;
     use rk_core::paths::Layout;
     use rk_daemon::{Client, Daemon};
     use serde_json::Value;
@@ -335,6 +334,16 @@ mod product_to_code_ticket_graph {
         assert_eq!(value["canonical_action"]["kind"], "ticket_graph.apply");
         assert_eq!(
             value["canonical_action"]["graph"]["nodes"][0]["id"],
+            "NODE-contracts"
+        );
+        assert!(value["canonical_action"].get("topological_order").is_none());
+        assert!(value["canonical_action"].get("mutations").is_none());
+        assert_eq!(
+            value["canonical_action"]["apply_plan"]["topological_order"],
+            serde_json::json!(["NODE-contracts", "NODE-tests"])
+        );
+        assert_eq!(
+            value["canonical_action"]["apply_plan"]["creates"][0]["stable_graph_node_id"],
             "NODE-contracts"
         );
         assert!(value["approval_instructions"]

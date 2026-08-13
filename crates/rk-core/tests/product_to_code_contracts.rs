@@ -197,6 +197,49 @@ fn test_ticket_graph_fixture_preserves_nodes_edges_and_acceptance_links() {
 }
 
 #[test]
+fn test_ticket_graph_apply_plan_is_typed_and_recomputed_from_graph() {
+    let graph: TicketGraph = serde_json::from_str(&fixture("ticket_graph_valid.json")).unwrap();
+
+    let plan = graph
+        .apply_plan("rat-kingdom", &["AC-1".to_string(), "AC-2".to_string()])
+        .unwrap();
+
+    assert_eq!(plan.topological_order, vec!["NODE-contracts", "NODE-tests"]);
+    assert_eq!(plan.creates.len(), 2);
+    assert_eq!(plan.creates[0].operation, "ticket.create");
+    assert_eq!(plan.creates[0].stable_graph_node_id, "NODE-contracts");
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.dependencies.len(), 1);
+    assert_eq!(
+        plan.dependencies[0].dependency_graph_node_id,
+        "NODE-contracts"
+    );
+    assert_eq!(plan.dependencies[0].blocked_graph_node_id, "NODE-tests");
+    assert_eq!(plan.mutations().len(), 3);
+}
+
+#[test]
+fn test_ticket_graph_and_initiative_reject_unknown_fields() {
+    let mut graph: serde_json::Value =
+        serde_json::from_str(&fixture("ticket_graph_valid.json")).unwrap();
+    graph["topological_order"] = serde_json::json!(["NODE-tests"]);
+    let graph_err = serde_json::from_value::<TicketGraph>(graph).unwrap_err();
+    assert!(
+        graph_err.to_string().contains("unknown field"),
+        "{graph_err}"
+    );
+
+    let mut initiative: serde_json::Value =
+        serde_json::from_str(&fixture("initiative_minimal.json")).unwrap();
+    initiative["derived"] = serde_json::json!(true);
+    let initiative_err = serde_json::from_value::<InitiativeContract>(initiative).unwrap_err();
+    assert!(
+        initiative_err.to_string().contains("unknown field"),
+        "{initiative_err}"
+    );
+}
+
+#[test]
 fn test_verification_report_maps_each_acceptance_criterion_to_evidence() {
     let report: VerificationReport =
         serde_json::from_str(&fixture("verification_report_valid.json")).unwrap();

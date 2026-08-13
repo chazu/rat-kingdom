@@ -9,6 +9,7 @@ use serde::{ser, Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::product_to_code::contracts::{InitiativeContract, TicketGraph, TicketGraphApplyPlan};
 use crate::Result;
 
 /// Stable wire identifier for a supported factory action.
@@ -58,10 +59,9 @@ pub struct TicketGraphApplyAction {
     pub repo: String,
     pub repo_identity: String,
     pub repo_path: String,
-    pub graph: Value,
-    pub initiative: Value,
-    pub topological_order: Vec<String>,
-    pub mutations: Vec<Value>,
+    pub graph: TicketGraph,
+    pub initiative: InitiativeContract,
+    pub apply_plan: TicketGraphApplyPlan,
 }
 
 /// A canonical factory action. Human-readable commands are never digest input.

@@ -1,16 +1,19 @@
 use crate::{Error, Result};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptanceCriterion {
     pub id: String,
     pub text: String,
+    #[serde(default)]
+    pub browser_acceptance_applicable: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InitiativeContract {
     pub id: String,
@@ -39,7 +42,7 @@ impl InitiativeContract {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ArchitectureResearchArtifact {
     pub id: String,
@@ -76,7 +79,7 @@ impl ArchitectureResearchArtifact {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProducerIdentity {
     pub kind: String,
@@ -85,7 +88,7 @@ pub struct ProducerIdentity {
     pub invocation: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GenericEvidence {
     pub id: String,
@@ -137,7 +140,7 @@ impl GenericEvidence {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TicketGraph {
     pub id: String,
@@ -147,7 +150,7 @@ pub struct TicketGraph {
     pub edges: Vec<TicketGraphEdge>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TicketGraphNode {
     pub id: String,
@@ -155,9 +158,15 @@ pub struct TicketGraphNode {
     pub description: String,
     #[serde(default)]
     pub acceptance_criterion_ids: Vec<String>,
+    #[serde(default)]
+    pub feature_set_ids: Vec<String>,
+    #[serde(default)]
+    pub browser_acceptance_applicable: bool,
+    #[serde(default)]
+    pub browser_acceptance_criterion_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TicketGraphEdge {
     pub from: String,
@@ -244,6 +253,22 @@ impl TicketGraph {
         }
     }
 
+    pub fn apply_plan(
+        &self,
+        repo: &str,
+        acceptance_criterion_ids: &[String],
+    ) -> Result<TicketGraphApplyPlan> {
+        let report = self.validation_report(acceptance_criterion_ids);
+        if !report.valid {
+            return Err(Error::other(report.errors.join("; ")));
+        }
+        Ok(TicketGraphApplyPlan::from_graph(
+            self,
+            repo,
+            report.topological_order,
+        ))
+    }
+
     fn topological_order_and_cycle(&self) -> (Vec<String>, Option<Vec<String>>) {
         let mut ids: BTreeSet<String> = self.nodes.iter().map(|node| node.id.clone()).collect();
         for edge in &self.edges {
@@ -323,7 +348,83 @@ impl TicketGraph {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketGraphApplyPlan {
+    pub topological_order: Vec<String>,
+    pub creates: Vec<TicketCreateFact>,
+    pub updates: Vec<Value>,
+    pub dependencies: Vec<TicketDependencyFact>,
+    pub dispatches: Vec<Value>,
+    pub blocked: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketCreateFact {
+    pub operation: String,
+    pub stable_graph_node_id: String,
+    pub repo: String,
+    pub title: String,
+    pub description: String,
+    pub acceptance_criterion_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TicketDependencyFact {
+    pub operation: String,
+    pub blocked_graph_node_id: String,
+    pub dependency_graph_node_id: String,
+    pub relationship: String,
+}
+
+impl TicketGraphApplyPlan {
+    fn from_graph(graph: &TicketGraph, repo: &str, topological_order: Vec<String>) -> Self {
+        let creates = topological_order
+            .iter()
+            .filter_map(|id| graph.nodes.iter().find(|node| &node.id == id))
+            .map(|node| TicketCreateFact {
+                operation: "ticket.create".to_string(),
+                stable_graph_node_id: node.id.clone(),
+                repo: repo.to_string(),
+                title: node.title.clone(),
+                description: node.description.clone(),
+                acceptance_criterion_ids: node.acceptance_criterion_ids.clone(),
+            })
+            .collect();
+        let dependencies = graph
+            .edges
+            .iter()
+            .map(|edge| TicketDependencyFact {
+                operation: "ticket.dep.add".to_string(),
+                blocked_graph_node_id: edge.to.clone(),
+                dependency_graph_node_id: edge.from.clone(),
+                relationship: edge.relationship.clone(),
+            })
+            .collect();
+        Self {
+            topological_order,
+            creates,
+            updates: Vec::new(),
+            dependencies,
+            dispatches: Vec::new(),
+            blocked: Vec::new(),
+        }
+    }
+
+    pub fn mutations(&self) -> Vec<Value> {
+        self.creates
+            .iter()
+            .map(|create| serde_json::to_value(create).expect("ticket create fact serializes"))
+            .chain(self.dependencies.iter().map(|dependency| {
+                serde_json::to_value(dependency).expect("ticket dependency fact serializes")
+            }))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TicketGraphValidationReport {
     pub valid: bool,
     pub graph_id: String,
