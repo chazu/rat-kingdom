@@ -16,6 +16,8 @@ use crate::Result;
 pub enum ActionKind {
     #[serde(rename = "workflow.run")]
     WorkflowRun,
+    #[serde(rename = "ticket_graph.apply")]
+    TicketGraphApply,
 }
 
 /// Coarse safety classification used by every action surface.
@@ -51,12 +53,25 @@ pub struct WorkflowRunAction {
     pub coordinator: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TicketGraphApplyAction {
+    pub repo: String,
+    pub repo_identity: String,
+    pub repo_path: String,
+    pub graph: Value,
+    pub initiative: Value,
+    pub topological_order: Vec<String>,
+    pub mutations: Vec<Value>,
+}
+
 /// A canonical factory action. Human-readable commands are never digest input.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind")]
 pub enum FactoryAction {
     #[serde(rename = "workflow.run")]
     WorkflowRun(WorkflowRunAction),
+    #[serde(rename = "ticket_graph.apply")]
+    TicketGraphApply(TicketGraphApplyAction),
 }
 
 impl FactoryAction {
@@ -64,6 +79,7 @@ impl FactoryAction {
     pub const fn kind(&self) -> ActionKind {
         match self {
             Self::WorkflowRun(_) => ActionKind::WorkflowRun,
+            Self::TicketGraphApply(_) => ActionKind::TicketGraphApply,
         }
     }
 
@@ -71,6 +87,21 @@ impl FactoryAction {
     pub const fn risk(&self) -> ActionRisk {
         match self {
             Self::WorkflowRun(_) => ActionRisk::Mutation,
+            Self::TicketGraphApply(_) => ActionRisk::Mutation,
+        }
+    }
+
+    #[must_use]
+    pub fn repo_scope(&self) -> RepoScope {
+        match self {
+            Self::WorkflowRun(action) => RepoScope {
+                identity: action.repo_identity.clone(),
+                path: action.repo_path.clone(),
+            },
+            Self::TicketGraphApply(action) => RepoScope {
+                identity: action.repo_identity.clone(),
+                path: action.repo_path.clone(),
+            },
         }
     }
 }

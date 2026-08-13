@@ -43,6 +43,62 @@ fn test_architecture_research_artifact_requires_decisions_and_open_questions() {
 }
 
 #[test]
+fn test_architecture_research_artifact_requires_decisions_constraints_or_risks_not_decisions_only()
+{
+    let mut artifact: ArchitectureResearchArtifact = serde_json::from_str(&fixture(
+        "architecture_research_invalid_empty_decisions.json",
+    ))
+    .unwrap();
+    artifact.architecture_decisions.clear();
+    artifact.constraints = vec!["Must stay offline".to_string()];
+    artifact.risks.clear();
+    artifact.open_questions = vec!["Should graph ordering be exported?".to_string()];
+
+    artifact.validate().unwrap();
+
+    artifact.constraints.clear();
+    artifact.risks = vec!["May miss concurrent WIP".to_string()];
+    artifact.validate().unwrap();
+}
+
+#[test]
+fn test_architecture_research_artifact_rejects_unsafe_repo_relative_paths() {
+    let mut artifact: ArchitectureResearchArtifact = serde_json::from_str(&fixture(
+        "architecture_research_invalid_empty_decisions.json",
+    ))
+    .unwrap();
+    artifact.researched_files = vec!["crates/rk-core/src/product_to_code/contracts.rs".to_string()];
+    artifact.architecture_decisions = vec!["Keep contracts offline".to_string()];
+    artifact.open_questions = vec!["Should graph ordering be exported?".to_string()];
+    artifact.recommended_ticket_graph_path =
+        Some("target/product-to-code/tickets.json".to_string());
+    artifact.researched_files = vec!["../secret.md".to_string(), "/tmp/secret.md".to_string()];
+    artifact.recommended_ticket_graph_path = Some("../tickets.json".to_string());
+
+    let err = artifact.validate().unwrap_err().to_string();
+
+    assert!(err.contains("researched_files"));
+    assert!(err.contains("recommended_ticket_graph_path"));
+}
+
+#[test]
+fn test_architecture_research_artifact_rejects_unknown_json_fields() {
+    let mut value: serde_json::Value = serde_json::from_str(&fixture(
+        "architecture_research_invalid_empty_decisions.json",
+    ))
+    .unwrap();
+    value["researched_files"] =
+        serde_json::json!(["crates/rk-core/src/product_to_code/contracts.rs"]);
+    value["architecture_decisions"] = serde_json::json!(["Keep contracts offline"]);
+    value["open_questions"] = serde_json::json!(["Should graph ordering be exported?"]);
+    value["undeclared"] = serde_json::json!(true);
+
+    let err = serde_json::from_value::<ArchitectureResearchArtifact>(value).unwrap_err();
+
+    assert!(err.to_string().contains("unknown field"), "{err}");
+}
+
+#[test]
 fn test_architecture_research_artifact_rejects_whitespace_required_and_optional_lists() {
     let mut artifact: ArchitectureResearchArtifact = serde_json::from_str(&fixture(
         "architecture_research_invalid_empty_decisions.json",
@@ -136,8 +192,8 @@ fn test_ticket_graph_fixture_preserves_nodes_edges_and_acceptance_links() {
     assert_eq!(decoded.nodes.len(), 2);
     assert_eq!(decoded.edges.len(), 1);
     assert_eq!(decoded.nodes[0].acceptance_criterion_ids, vec!["AC-1"]);
-    assert_eq!(decoded.edges[0].from, "TKT-contracts");
-    assert_eq!(decoded.edges[0].to, "TKT-tests");
+    assert_eq!(decoded.edges[0].from, "NODE-contracts");
+    assert_eq!(decoded.edges[0].to, "NODE-tests");
 }
 
 #[test]
@@ -327,6 +383,49 @@ fn test_architecture_research_rejects_whitespace_required_and_optional_strings()
     assert!(err.contains("open_questions"));
     assert!(err.contains("recommended_ticket_graph_path"));
     assert!(err.contains("evidence_ids"));
+}
+
+#[test]
+fn test_architecture_research_validate_for_initiative_rejects_invalid_initiative_contract() {
+    let artifact = ArchitectureResearchArtifact {
+        id: "ARCH-valid".to_string(),
+        initiative_id: "INIT-product-to-code".to_string(),
+        researched_files: vec!["crates/rk-core/src/product_to_code/contracts.rs".to_string()],
+        domain_terms: vec![],
+        architecture_decisions: vec![],
+        constraints: vec!["Must stay offline".to_string()],
+        risks: vec![],
+        open_questions: vec![],
+        open_questions_exhausted: true,
+        recommended_ticket_graph_path: Some("docs/tickets/product-to-code.json".to_string()),
+        evidence_ids: vec![],
+    };
+    let mut initiative: InitiativeContract =
+        serde_json::from_str(&fixture("initiative_minimal.json")).unwrap();
+    initiative.acceptance_criteria[0].text = "   ".to_string();
+
+    let report = artifact.validate_for_initiative(&initiative);
+
+    assert!(!report.valid);
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains("acceptance_criteria.text")),
+        "{:?}",
+        report.errors
+    );
+}
+
+#[test]
+fn test_contract_json_deserialization_rejects_unknown_fields() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fixture("ticket_graph_valid.json")).unwrap();
+    value["undeclared"] = serde_json::json!(true);
+
+    let err = serde_json::from_value::<TicketGraph>(value).unwrap_err();
+
+    assert!(err.to_string().contains("unknown field"), "{err}");
 }
 
 #[test]

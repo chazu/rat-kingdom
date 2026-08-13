@@ -1,15 +1,17 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcceptanceCriterion {
     pub id: String,
     pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InitiativeContract {
     pub id: String,
     pub title: String,
@@ -38,6 +40,7 @@ impl InitiativeContract {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArchitectureResearchArtifact {
     pub id: String,
     pub initiative_id: String,
@@ -74,6 +77,7 @@ impl ArchitectureResearchArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProducerIdentity {
     pub kind: String,
     pub name: String,
@@ -82,6 +86,7 @@ pub struct ProducerIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GenericEvidence {
     pub id: String,
     pub kind: String,
@@ -133,6 +138,7 @@ impl GenericEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TicketGraph {
     pub id: String,
     pub initiative_id: String,
@@ -142,6 +148,7 @@ pub struct TicketGraph {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TicketGraphNode {
     pub id: String,
     pub title: String,
@@ -151,6 +158,7 @@ pub struct TicketGraphNode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TicketGraphEdge {
     pub from: String,
     pub to: String,
@@ -159,6 +167,14 @@ pub struct TicketGraphEdge {
 
 impl TicketGraph {
     pub fn validate(&self, acceptance_criterion_ids: &[String]) -> Result<()> {
+        let report = self.validation_report(acceptance_criterion_ids);
+        finish(report.errors)
+    }
+
+    pub fn validation_report(
+        &self,
+        acceptance_criterion_ids: &[String],
+    ) -> TicketGraphValidationReport {
         let mut errors = Vec::new();
         push_empty(&mut errors, "id", &self.id);
         push_empty(&mut errors, "initiative_id", &self.initiative_id);
@@ -176,6 +192,12 @@ impl TicketGraph {
         let mut mapped_criteria = HashSet::new();
         for node in &self.nodes {
             push_empty(&mut errors, "nodes.id", &node.id);
+            if node.id.starts_with("TKT-") {
+                errors.push(format!(
+                    "graph node id {} must not be shaped like minted ticket id TKT-*",
+                    node.id
+                ));
+            }
             push_empty(&mut errors, "nodes.title", &node.title);
             push_empty(&mut errors, "nodes.description", &node.description);
             for criterion_id in &node.acceptance_criterion_ids {
@@ -207,11 +229,113 @@ impl TicketGraph {
             }
             push_empty(&mut errors, "edges.relationship", &edge.relationship);
         }
-        finish(errors)
+        let (topological_order, cycle_path) = self.topological_order_and_cycle();
+        if let Some(path) = &cycle_path {
+            errors.push(format!("cycle path {}", path.join(" -> ")));
+        }
+        TicketGraphValidationReport {
+            valid: errors.is_empty(),
+            graph_id: self.id.clone(),
+            initiative_id: self.initiative_id.clone(),
+            errors,
+            warnings: Vec::new(),
+            topological_order,
+            cycle_path,
+        }
+    }
+
+    fn topological_order_and_cycle(&self) -> (Vec<String>, Option<Vec<String>>) {
+        let mut ids: BTreeSet<String> = self.nodes.iter().map(|node| node.id.clone()).collect();
+        for edge in &self.edges {
+            ids.insert(edge.from.clone());
+            ids.insert(edge.to.clone());
+        }
+        let mut outgoing: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut indegree: BTreeMap<String, usize> = ids.iter().map(|id| (id.clone(), 0)).collect();
+        for edge in &self.edges {
+            if outgoing
+                .entry(edge.from.clone())
+                .or_default()
+                .insert(edge.to.clone())
+            {
+                *indegree.entry(edge.to.clone()).or_default() += 1;
+            }
+        }
+        let mut ready: BTreeSet<String> = indegree
+            .iter()
+            .filter(|(_, degree)| **degree == 0)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut order = Vec::new();
+        while let Some(id) = ready.pop_first() {
+            order.push(id.clone());
+            if let Some(nexts) = outgoing.get(&id) {
+                for next in nexts {
+                    if let Some(degree) = indegree.get_mut(next) {
+                        *degree -= 1;
+                        if *degree == 0 {
+                            ready.insert(next.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if order.len() == ids.len() {
+            (order, None)
+        } else {
+            let cycle_start = ids.iter().find(|id| !order.contains(id)).cloned();
+            (order, cycle_start.and_then(|start| self.find_cycle(&start)))
+        }
+    }
+
+    fn find_cycle(&self, start: &str) -> Option<Vec<String>> {
+        let mut outgoing: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for edge in &self.edges {
+            outgoing.entry(&edge.from).or_default().insert(&edge.to);
+        }
+        fn dfs<'a>(
+            node: &'a str,
+            outgoing: &BTreeMap<&'a str, BTreeSet<&'a str>>,
+            stack: &mut Vec<&'a str>,
+            seen: &mut HashSet<&'a str>,
+        ) -> Option<Vec<String>> {
+            if let Some(pos) = stack.iter().position(|existing| *existing == node) {
+                let mut cycle = stack[pos..]
+                    .iter()
+                    .map(|id| (*id).to_string())
+                    .collect::<Vec<_>>();
+                cycle.push(node.to_string());
+                return Some(cycle);
+            }
+            if !seen.insert(node) {
+                return None;
+            }
+            stack.push(node);
+            for next in outgoing.get(node).into_iter().flatten() {
+                if let Some(cycle) = dfs(next, outgoing, stack, seen) {
+                    return Some(cycle);
+                }
+            }
+            stack.pop();
+            None
+        }
+        dfs(start, &outgoing, &mut Vec::new(), &mut HashSet::new())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketGraphValidationReport {
+    pub valid: bool,
+    pub graph_id: String,
+    pub initiative_id: String,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+    pub topological_order: Vec<String>,
+    pub cycle_path: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationReport {
     pub id: String,
     pub initiative_id: String,
@@ -219,6 +343,7 @@ pub struct VerificationReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcceptanceCriterionVerification {
     pub acceptance_criterion_id: String,
     pub status: String,

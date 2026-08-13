@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use chrono::{TimeZone, Utc};
 use rk_core::action::{
     action_digest, canonical_digest, canonical_json_bytes, ActionKind, ActionProposal, ActionRisk,
-    ActionScope, FactoryAction, RepoScope, WorkflowRunAction,
+    ActionScope, FactoryAction, RepoScope, TicketGraphApplyAction, WorkflowRunAction,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -23,6 +23,20 @@ fn workflow_run(params: BTreeMap<String, Value>) -> WorkflowRunAction {
         repo_path: "/srv/repos/rat-kingdom".into(),
         params,
         coordinator: Some("factory".into()),
+    }
+}
+
+fn ticket_graph_apply() -> TicketGraphApplyAction {
+    TicketGraphApplyAction {
+        repo: "rat-kingdom".into(),
+        repo_identity: "repo-01".into(),
+        repo_path: "/srv/repos/rat-kingdom".into(),
+        graph: json!({"id":"GRAPH-product-to-code"}),
+        initiative: json!({"id":"INIT-product-to-code"}),
+        topological_order: vec!["NODE-contracts".into(), "NODE-tests".into()],
+        mutations: vec![
+            json!({"operation":"ticket.create","stable_graph_node_id":"NODE-contracts"}),
+        ],
     }
 }
 
@@ -121,6 +135,25 @@ fn test_digest_covers_action_kind_and_schema() {
 fn test_workflow_run_is_mutation_risk() {
     let action = FactoryAction::WorkflowRun(workflow_run(BTreeMap::new()));
     assert_eq!(action.risk(), ActionRisk::Mutation);
+}
+
+#[test]
+fn test_ticket_graph_apply_kind_risk_and_digest_are_canonical() {
+    let action = FactoryAction::TicketGraphApply(ticket_graph_apply());
+    let same = FactoryAction::TicketGraphApply(ticket_graph_apply());
+    let mut changed = ticket_graph_apply();
+    changed.topological_order.reverse();
+
+    assert_eq!(action.kind(), ActionKind::TicketGraphApply);
+    assert_eq!(action.risk(), ActionRisk::Mutation);
+    assert_eq!(
+        canonical_digest(&action).unwrap(),
+        canonical_digest(&same).unwrap()
+    );
+    assert_ne!(
+        canonical_digest(&action).unwrap(),
+        canonical_digest(&FactoryAction::TicketGraphApply(changed)).unwrap()
+    );
 }
 
 #[test]

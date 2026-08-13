@@ -65,6 +65,7 @@ impl ActionApprovalStore {
         };
         let payload = ActionDigestPayload::from_proposal(&proposal);
         proposal.digest = action_digest(&payload)?;
+        proposal.id = proposal.digest.clone();
         let mut data = self.lock()?;
         data.proposals.insert(proposal.id.clone(), proposal.clone());
         self.persist(&data)?;

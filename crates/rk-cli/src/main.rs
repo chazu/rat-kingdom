@@ -807,7 +807,7 @@ async fn main() -> Result<()> {
         },
         Command::Factory { command } => factory_cmds::run(&layout, command, cli.json).await?,
         Command::ProductToCode { command } => {
-            let code = product_to_code_cmds::run(command, cli.json)?;
+            let code = product_to_code_cmds::run(&layout, command, cli.json).await?;
             if code != 0 {
                 std::process::exit(code);
             }

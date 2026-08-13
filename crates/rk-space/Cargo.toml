@@ -12,6 +12,7 @@ rk-core.workspace = true
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 serde_json.workspace = true
 serde.workspace = true
+sha2.workspace = true
 chrono.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
 tracing.workspace = true
