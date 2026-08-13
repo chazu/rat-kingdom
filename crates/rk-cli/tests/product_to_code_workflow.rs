@@ -353,6 +353,40 @@ mod product_to_code_workflow {
         handle.abort();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_workflow_propose_rejects_consumed_apply_for_different_graph_revision() {
+        let (home, _repo, handle, _mapping) = daemon_with_applied_graph().await;
+        let layout = Layout::at(home.path());
+        let mut graph = read_fixture_json("ticket_graph_valid.json");
+        graph["nodes"][0]["description"] = json!("Changed after the graph apply");
+        let graph_path = home.path().join("changed-graph.json");
+        fs::write(&graph_path, serde_json::to_vec_pretty(&graph).unwrap()).unwrap();
+
+        let value = json_failure(run_with_layout(
+            &layout,
+            &[
+                "--json",
+                "product-to-code",
+                "workflow",
+                "propose",
+                "--initiative",
+                &fixture("initiative_minimal.json"),
+                "--research",
+                &fixture("architecture_research_valid.json"),
+                "--graph",
+                graph_path.to_str().unwrap(),
+                "--evidence-dir",
+                &fixture("evidence_dispatch_partial"),
+                "--repo",
+                "fixture",
+            ],
+        ));
+
+        assert_eq!(value["stage"], "graph_apply");
+        assert!(errors_joined(&value).contains("exact graph revision"));
+        handle.abort();
+    }
+
     #[test]
     fn test_product_to_code_workflow_definition_lists_research_graph_apply_implement_and_verify_steps(
     ) {

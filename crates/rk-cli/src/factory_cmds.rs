@@ -416,11 +416,13 @@ fn proposal_execution_envelope(path: &Path) -> Result<ProposalExecutionEnvelope>
         .cloned()
         .ok_or_else(|| anyhow!("proposal file is missing object field execution_action"))?;
 
-    if let Some(proposal) = object.get("proposal").and_then(Value::as_object) {
-        require_matching_string(proposal, "id", &proposal_id, "proposal_id")?;
-        require_matching_string(proposal, "digest", &digest, "digest")?;
-        require_matching_string(proposal, "kind", &kind, "kind")?;
-    }
+    let proposal = object
+        .get("proposal")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("proposal must be a JSON object"))?;
+    require_matching_string(proposal, "id", &proposal_id, "proposal_id")?;
+    require_matching_string(proposal, "digest", &digest, "digest")?;
+    require_matching_string(proposal, "kind", &kind, "kind")?;
 
     Ok(ProposalExecutionEnvelope {
         proposal_id,
@@ -445,12 +447,15 @@ fn require_matching_string(
     expected: &str,
     top_level_field: &str,
 ) -> Result<()> {
-    if let Some(actual) = object.get(nested_field).and_then(Value::as_str) {
-        if actual != expected {
-            return Err(anyhow!(
-                "proposal file has conflicting {top_level_field}: top-level={expected} proposal.{nested_field}={actual}"
-            ));
-        }
+    let actual = object
+        .get(nested_field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("proposal file is missing string field proposal.{nested_field}"))?;
+    if actual != expected {
+        return Err(anyhow!(
+            "proposal file has conflicting {top_level_field}: top-level={expected} proposal.{nested_field}={actual}"
+        ));
     }
     Ok(())
 }

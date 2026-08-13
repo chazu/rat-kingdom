@@ -441,6 +441,59 @@ async fn test_factory_proposal_file_can_be_approved_and_executed_exactly() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_factory_proposal_file_rejects_malformed_nested_proposal_metadata() {
+    let (home, _repo, handle) = fixture().await;
+    let layout = Layout::at(home.path());
+    let digest = "a".repeat(64);
+
+    for (name, nested, expected) in [
+        ("not-object", json!([]), "proposal must be a JSON object"),
+        (
+            "missing-id",
+            json!({"digest": digest, "kind": "workflow.run"}),
+            "proposal.id",
+        ),
+        (
+            "wrong-id-type",
+            json!({"id": 7, "digest": digest, "kind": "workflow.run"}),
+            "proposal.id",
+        ),
+    ] {
+        let proposal_file = home.path().join(format!("malformed-{name}.json"));
+        std::fs::write(
+            &proposal_file,
+            serde_json::to_vec_pretty(&json!({
+                "schema": "factory.proposal.v1",
+                "proposal_id": digest,
+                "digest": digest,
+                "kind": "workflow.run",
+                "execution_action": {"name": "noop", "repo": "fixture", "params": {}},
+                "proposal": nested,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let stderr = failed(
+            run_rk(
+                &layout,
+                &[
+                    "--json",
+                    "factory",
+                    "execute-action",
+                    "--proposal-file",
+                    proposal_file.to_str().unwrap(),
+                ],
+            ),
+            1,
+        );
+        assert!(stderr.contains(expected), "{name}: {stderr}");
+    }
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_factory_approve_sends_no_identity_param() {
     let (home, _repo, handle) = fixture().await;
     let layout = Layout::at(home.path());

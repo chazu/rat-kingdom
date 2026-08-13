@@ -4153,6 +4153,21 @@ impl Daemon {
             rk_core::Error::other(format!("invalid product_to_code.dispatch action: {e}"))
         })?;
         params.initiative.validate()?;
+        if params.graph.id != params.graph_id {
+            return Err(rk_core::Error::other(format!(
+                "submitted graph revision {} does not match graph_id {}",
+                params.graph.id, params.graph_id
+            )));
+        }
+        let graph_report = params
+            .graph
+            .validation_report_for_initiative(&params.initiative);
+        if !graph_report.valid {
+            return Err(rk_core::Error::other(format!(
+                "submitted graph revision is invalid: {}",
+                graph_report.errors.join("; ")
+            )));
+        }
         let repo = params.repo.as_str();
         let submitted = std::path::PathBuf::from(repo);
         let canonical_submitted = if submitted.exists() {
@@ -4190,10 +4205,31 @@ impl Daemon {
                 params.graph_apply_proposal_id
             )));
         };
+        let apply_repo_path = std::path::PathBuf::from(&apply_action.repo_path)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(&apply_action.repo_path));
+        if apply_action.repo_identity != record.name || apply_repo_path != canonical_path {
+            return Err(rk_core::Error::other(format!(
+                "graph apply proposal {} belongs to a different repository",
+                params.graph_apply_proposal_id
+            )));
+        }
         if apply_action.graph.id != params.graph_id {
             return Err(rk_core::Error::other(format!(
                 "graph apply proposal {} applied graph {}, not {}",
                 params.graph_apply_proposal_id, apply_action.graph.id, params.graph_id
+            )));
+        }
+        if apply_action.initiative != params.initiative {
+            return Err(rk_core::Error::other(format!(
+                "graph apply proposal {} initiative revision does not match the submitted initiative",
+                params.graph_apply_proposal_id
+            )));
+        }
+        if apply_action.graph != params.graph {
+            return Err(rk_core::Error::other(format!(
+                "graph apply proposal {} graph revision does not match the submitted graph",
+                params.graph_apply_proposal_id
             )));
         }
         let apply_result = self
@@ -5445,6 +5481,7 @@ struct TicketGraphApplyParams {
 struct ProductToCodeDispatchParams {
     repo: String,
     initiative: InitiativeContract,
+    graph: TicketGraph,
     graph_id: String,
     graph_apply_proposal_id: String,
     dispatches: Vec<ProductToCodeDispatchRequest>,

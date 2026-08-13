@@ -144,6 +144,7 @@ fn dispatch_action(graph_apply_proposal_id: &str) -> Value {
     json!({
         "repo": "fixture",
         "initiative": fixture_json("initiative_minimal.json"),
+        "graph": fixture_json("ticket_graph_valid.json"),
         "graph_id": "GRAPH-product-to-code",
         "graph_apply_proposal_id": graph_apply_proposal_id,
         "dispatches": [
@@ -153,6 +154,60 @@ fn dispatch_action(graph_apply_proposal_id: &str) -> Value {
             {"graph_node_id": "NODE-tests", "reasons": ["dispatch gate requires current impact evidence covering ticket NODE-tests or its feature set"]}
         ],
     })
+}
+
+#[tokio::test]
+async fn test_dispatch_rejects_graph_apply_from_other_repo_or_graph_revision() {
+    let (_home, _repo, _layout, handle, mut client) = setup().await;
+    let (graph_proposal, _mapping) = apply_graph(&mut client).await;
+
+    let other_repo = repository();
+    client
+        .call(
+            "repo.add",
+            json!({"name": "other", "path": other_repo.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+    let mut other_repo_action = dispatch_action(&graph_proposal);
+    other_repo_action["repo"] = json!("other");
+    let err = client
+        .call(
+            "factory.propose_action",
+            json!({"kind": "product_to_code.dispatch", "action": other_repo_action}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("repository"), "{err}");
+
+    let mut changed_graph_action = dispatch_action(&graph_proposal);
+    changed_graph_action["graph"]["nodes"][0]["description"] =
+        json!("Changed after the graph apply");
+    let err = client
+        .call(
+            "factory.propose_action",
+            json!({"kind": "product_to_code.dispatch", "action": changed_graph_action}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("graph revision"), "{err}");
+
+    let mut changed_initiative_action = dispatch_action(&graph_proposal);
+    changed_initiative_action["initiative"]["title"] =
+        json!("Changed after the graph apply");
+    let err = client
+        .call(
+            "factory.propose_action",
+            json!({"kind": "product_to_code.dispatch", "action": changed_initiative_action}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("initiative revision"), "{err}");
+
+    stop(client, handle).await;
 }
 
 async fn propose_dispatch(client: &mut Client, graph_apply_proposal_id: &str) -> Value {

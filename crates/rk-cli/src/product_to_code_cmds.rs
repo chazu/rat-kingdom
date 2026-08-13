@@ -282,7 +282,9 @@ async fn run_workflow(
     // The dispatch proposal is bound to the prior approved graph apply
     // execution. Find its proposal through the daemon's approval records.
     let mut client = Client::connect_or_spawn(layout).await?;
-    let snapshot = client.call("factory.snapshot", json!({})).await?;
+    let snapshot = client
+        .call("factory.snapshot", json!({"repo": args.repo}))
+        .await?;
     let proposals = snapshot["snapshot"]["approvals"]["proposals"]
         .as_array()
         .cloned()
@@ -291,11 +293,14 @@ async fn run_workflow(
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let graph_value = serde_json::to_value(&graph)?;
+    let initiative_value = serde_json::to_value(&initiative)?;
     let graph_apply_proposal_id = proposals
         .iter()
         .filter(|proposal| {
             proposal["kind"] == "ticket_graph.apply"
-                && proposal["action"]["graph"]["id"] == json!(graph.id)
+                && proposal["action"].get("graph") == Some(&graph_value)
+                && proposal["action"].get("initiative") == Some(&initiative_value)
         })
         .filter_map(|proposal| proposal["id"].as_str())
         .find(|id| {
@@ -311,8 +316,9 @@ async fn run_workflow(
             "valid": false,
             "submitted_to_daemon": false,
             "errors": [format!(
-                "no consumed ticket_graph.apply execution found for graph {}; run graph propose-apply, approve, and execute it first",
-                graph.id
+                "no consumed ticket_graph.apply execution found for the exact graph revision {} and initiative {}; run graph propose-apply, approve, and execute it first",
+                graph.id,
+                initiative.id,
             )],
         });
         print_json_or_errors(&output, json_output)?;
@@ -322,6 +328,7 @@ async fn run_workflow(
     let action = json!({
         "repo": args.repo,
         "initiative": initiative,
+        "graph": graph,
         "graph_id": graph.id,
         "graph_apply_proposal_id": graph_apply_proposal_id,
         "dispatches": dispatches,
