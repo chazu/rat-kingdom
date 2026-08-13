@@ -29,6 +29,7 @@ pub struct IngestEventParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngestStateParams {
     #[serde(default)]
     pub kind: Option<String>,
@@ -102,4 +103,23 @@ pub fn validate_event(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IngestStateParams;
+    use serde_json::json;
+
+    #[test]
+    fn ingest_state_params_reject_unknown_fields() {
+        let err = serde_json::from_value::<IngestStateParams>(
+            json!({"kind": "status", "limit": 5, "principal": "operator"}),
+        )
+        .expect_err("ingest.state params must reject unexpected fields");
+
+        assert!(
+            err.to_string().contains("unknown field `principal`"),
+            "expected unknown field error, got: {err}"
+        );
+    }
 }

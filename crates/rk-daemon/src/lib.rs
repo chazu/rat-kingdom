@@ -523,6 +523,32 @@ mod tests {
         assert_eq!(state_result["status"], "ingest_not_wired");
         assert_eq!(state_result["tuples"].as_array().unwrap().len(), 0);
 
+        let unknown_state_field = raw_request(
+            &layout,
+            Request {
+                id: "state-unknown-field".into(),
+                method: "ingest.state".into(),
+                auth: token.clone(),
+                caller: caller.clone(),
+                params: json!({"kind": "status", "limit": 5, "principal": "operator"}),
+            },
+        )
+        .await;
+        assert_eq!(
+            unknown_state_field.error.unwrap().code,
+            crate::proto::codes::BAD_PARAMS,
+            "ingest.state must reject unexpected fields before any state/tuple writes"
+        );
+        let after_rejected_state = operator_for_scan
+            .call("space.scan", json!({"category": "event"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            after_rejected_state["tuples"].as_array().unwrap().len(),
+            0,
+            "rejected ingest.state requests must not persist tuple/state writes"
+        );
+
         let cases = [
             (
                 "spoofed-token",
