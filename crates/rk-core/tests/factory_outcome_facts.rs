@@ -153,6 +153,7 @@ fn normalizes_ci_failed_and_recovered_from_phase4_signals() {
         },
     );
     failed.workflow_instance_id = Some("run-1".into());
+    failed.workflow = Some("ci".into());
     failed.source_version = Some("commit-a".into());
     failed.observed_at_ms = 100;
     let mut recovered = base(
@@ -164,6 +165,7 @@ fn normalizes_ci_failed_and_recovered_from_phase4_signals() {
         },
     );
     recovered.workflow_instance_id = Some("run-1".into());
+    recovered.workflow = Some("ci".into());
     recovered.source_version = Some("commit-a".into());
     recovered.phase4_signal_id = Some("ci-failed".into());
     recovered.observed_at_ms = 200;
@@ -341,6 +343,7 @@ fn ci_recovered_rejects_standalone_mismatch_and_out_of_order_signals() {
         },
     );
     failed.workflow_instance_id = Some("run-1".into());
+    failed.workflow = Some("ci".into());
     failed.source_version = Some("commit-a".into());
     failed.observed_at_ms = 100;
 
@@ -353,6 +356,7 @@ fn ci_recovered_rejects_standalone_mismatch_and_out_of_order_signals() {
         },
     );
     recovered.workflow_instance_id = Some("run-1".into());
+    recovered.workflow = Some("ci".into());
     recovered.source_version = Some("commit-a".into());
     recovered.phase4_signal_id = Some("ci-failed-1".into());
     recovered.observed_at_ms = 200;
@@ -499,7 +503,7 @@ fn cost_and_lead_time_require_structured_evidence_and_valid_same_run_timestamps(
             pricing_evidence_id: None,
         },
     );
-    let good_lead = base(
+    let mut good_lead = base(
         OutcomeEvidenceKind::WorkflowInstance,
         "good-lead",
         FactoryMetricPayload::LeadTime {
@@ -509,7 +513,8 @@ fn cost_and_lead_time_require_structured_evidence_and_valid_same_run_timestamps(
             completed_run_id: "run-1".into(),
         },
     );
-    let negative = base(
+    good_lead.workflow_instance_id = Some("run-1".into());
+    let mut negative = base(
         OutcomeEvidenceKind::WorkflowInstance,
         "negative-lead",
         FactoryMetricPayload::LeadTime {
@@ -519,7 +524,8 @@ fn cost_and_lead_time_require_structured_evidence_and_valid_same_run_timestamps(
             completed_run_id: "run-1".into(),
         },
     );
-    let mismatch = base(
+    negative.workflow_instance_id = Some("run-1".into());
+    let mut mismatch = base(
         OutcomeEvidenceKind::WorkflowInstance,
         "mismatch-lead",
         FactoryMetricPayload::LeadTime {
@@ -529,6 +535,7 @@ fn cost_and_lead_time_require_structured_evidence_and_valid_same_run_timestamps(
             completed_run_id: "run-2".into(),
         },
     );
+    mismatch.workflow_instance_id = Some("run-1".into());
 
     let facts = OutcomeFactBuilder::from_structured_inputs(
         [good_cost, bad_cost, good_lead, negative, mismatch],
@@ -549,7 +556,7 @@ fn cost_and_lead_time_require_structured_evidence_and_valid_same_run_timestamps(
             .find(|f| f.source.source_id == "bad-cost")
             .unwrap()
             .cost_micro_usd,
-        None
+        Some(99)
     );
     assert_eq!(
         facts
@@ -571,6 +578,235 @@ fn cost_and_lead_time_require_structured_evidence_and_valid_same_run_timestamps(
         facts
             .iter()
             .find(|f| f.source.source_id == "mismatch-lead")
+            .unwrap()
+            .lead_time_ms,
+        None
+    );
+}
+
+#[test]
+fn ci_recovered_requires_named_prior_failed_signal_same_repo_nonblank_run_and_commit() {
+    let mut failed = base(
+        OutcomeEvidenceKind::Phase4CiSignal,
+        "failed-ok",
+        FactoryMetricPayload::Ci {
+            failed: true,
+            recovered: false,
+        },
+    );
+    failed.workflow = Some("ci".into());
+    failed.workflow_instance_id = Some("run-1".into());
+    failed.source_version = Some("commit-a".into());
+    failed.observed_at_ms = 100;
+
+    let mut recovered = base(
+        OutcomeEvidenceKind::Phase4CiSignal,
+        "recovered-ok",
+        FactoryMetricPayload::Ci {
+            failed: false,
+            recovered: true,
+        },
+    );
+    recovered.workflow = Some("ci".into());
+    recovered.workflow_instance_id = Some("run-1".into());
+    recovered.source_version = Some("commit-a".into());
+    recovered.phase4_signal_id = Some("failed-ok".into());
+    recovered.observed_at_ms = 200;
+
+    let mut none_none = recovered.clone();
+    none_none.source_id = "none-none".into();
+    none_none.workflow_instance_id = None;
+    none_none.source_version = None;
+    none_none.phase4_signal_id = Some("failed-none".into());
+    let mut failed_none = failed.clone();
+    failed_none.source_id = "failed-none".into();
+    failed_none.workflow_instance_id = None;
+    failed_none.source_version = None;
+
+    let mut blank_run = recovered.clone();
+    blank_run.source_id = "blank-run".into();
+    blank_run.workflow_instance_id = Some("".into());
+    let mut cross_repo = recovered.clone();
+    cross_repo.source_id = "cross-repo".into();
+    cross_repo.repo = "repo-b".into();
+    let mut wrong_workflow = recovered.clone();
+    wrong_workflow.source_id = "wrong-workflow".into();
+    wrong_workflow.workflow = Some("deploy".into());
+
+    let facts = OutcomeFactBuilder::from_structured_inputs(
+        [
+            failed,
+            failed_none,
+            recovered,
+            none_none,
+            blank_run,
+            cross_repo,
+            wrong_workflow,
+        ],
+        [],
+    )
+    .build();
+
+    let recovered_ids: Vec<_> = facts
+        .iter()
+        .filter(|f| f.status == OutcomeStatus::CiRecovered)
+        .map(|f| f.source.source_id.as_str())
+        .collect();
+    assert_eq!(recovered_ids, vec!["recovered-ok"]);
+}
+
+#[test]
+fn archived_only_family_still_emits_availability_metadata_when_archived_excluded() {
+    let mut archived_one = base(
+        OutcomeEvidenceKind::Phase4CiSignal,
+        "archived-ci-1",
+        FactoryMetricPayload::Ci {
+            failed: true,
+            recovered: false,
+        },
+    );
+    archived_one.archived = true;
+    let mut archived_two = archived_one.clone();
+    archived_two.source_id = "archived-ci-2".into();
+
+    let facts =
+        OutcomeFactBuilder::from_structured_inputs([archived_one, archived_two], []).build();
+
+    assert_eq!(facts.len(), 1);
+    let metadata = &facts[0];
+    assert_eq!(metadata.status, OutcomeStatus::Unobserved);
+    assert_eq!(metadata.repo, "repo-a");
+    assert_eq!(
+        metadata.availability.source_family,
+        OutcomeEvidenceKind::Phase4CiSignal
+    );
+    assert!(!metadata.availability.available);
+    assert_eq!(metadata.source_counts.active_source_count, 0);
+    assert_eq!(metadata.source_counts.archived_source_count, 2);
+    assert_eq!(metadata.source_counts.event_count, 2);
+}
+
+#[test]
+fn source_counts_count_distinct_sources_but_events_count_events() {
+    let first = base(
+        OutcomeEvidenceKind::AgentRecord,
+        "agent-a",
+        FactoryMetricPayload::Run { count: 1 },
+    );
+    let mut second_event_same_source = first.clone();
+    second_event_same_source.observed_at_ms = 20;
+    let mut archived = base(
+        OutcomeEvidenceKind::AgentRecord,
+        "agent-b",
+        FactoryMetricPayload::Run { count: 1 },
+    );
+    archived.archived = true;
+
+    let facts =
+        OutcomeFactBuilder::from_structured_inputs([first, second_event_same_source, archived], [])
+            .build();
+    let fact = facts
+        .iter()
+        .find(|f| f.source.source_id == "agent-a")
+        .unwrap();
+
+    assert_eq!(fact.source_counts.active_source_count, 1);
+    assert_eq!(fact.source_counts.archived_source_count, 1);
+    assert_eq!(fact.source_counts.event_count, 3);
+}
+
+#[test]
+fn task_class_rejects_blank_values_and_blank_provenance() {
+    let mut blank_class = base(
+        OutcomeEvidenceKind::Phase3Contract,
+        "blank-class",
+        FactoryMetricPayload::TaskClass,
+    );
+    blank_class.task_class = Some("  ".into());
+
+    let mut blank_ticket = base(
+        OutcomeEvidenceKind::AgentRecord,
+        "blank-ticket",
+        FactoryMetricPayload::TaskClass,
+    );
+    blank_ticket.task_class = Some("bugfix".into());
+    blank_ticket.ticket_id = Some(" ".into());
+
+    let facts = OutcomeFactBuilder::from_structured_inputs([blank_class, blank_ticket], []).build();
+
+    assert!(facts
+        .iter()
+        .all(|f| f.group_key.task_class.as_deref() == Some("unknown")));
+    assert!(facts.iter().all(|f| !f.source.warnings.is_empty()));
+}
+
+#[test]
+fn cost_and_lead_time_accept_only_valid_direct_run_evidence() {
+    let direct_cost = base(
+        OutcomeEvidenceKind::AgentRecord,
+        "direct-cost",
+        FactoryMetricPayload::Cost {
+            micro_usd: 7,
+            pricing_evidence_id: None,
+        },
+    );
+    let pricing_only = base(
+        OutcomeEvidenceKind::PricingSnapshot,
+        "pricing-only",
+        FactoryMetricPayload::Cost {
+            micro_usd: 99,
+            pricing_evidence_id: Some("price-1".into()),
+        },
+    );
+    let mut agent_lead = base(
+        OutcomeEvidenceKind::AgentRecord,
+        "agent-lead",
+        FactoryMetricPayload::LeadTime {
+            started_at_ms: 5,
+            completed_at_ms: 9,
+            run_id: "run-1".into(),
+            completed_run_id: "run-1".into(),
+        },
+    );
+    agent_lead.workflow_instance_id = Some("run-1".into());
+    let mut unbound_lead = agent_lead.clone();
+    unbound_lead.source_id = "unbound-lead".into();
+    unbound_lead.workflow_instance_id = None;
+
+    let facts = OutcomeFactBuilder::from_structured_inputs(
+        [direct_cost, pricing_only, agent_lead, unbound_lead],
+        [],
+    )
+    .build();
+
+    assert_eq!(
+        facts
+            .iter()
+            .find(|f| f.source.source_id == "direct-cost")
+            .unwrap()
+            .cost_micro_usd,
+        Some(7)
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .find(|f| f.source.source_id == "pricing-only")
+            .unwrap()
+            .cost_micro_usd,
+        None
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .find(|f| f.source.source_id == "agent-lead")
+            .unwrap()
+            .lead_time_ms,
+        Some(4)
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .find(|f| f.source.source_id == "unbound-lead")
             .unwrap()
             .lead_time_ms,
         None

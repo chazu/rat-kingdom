@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 use super::outcome_events::{
     stable_hash, FactoryMetricPayload, FactoryOutcomeEvent, StableHash, StructuredOutcomeInput,
@@ -121,7 +122,30 @@ impl OutcomeFactBuilder {
             .map(|event| fact_from_event(event, &self.events))
             .collect();
 
-        facts.extend(self.unavailable.into_iter().map(unobserved_fact));
+        let default_repo = single_repo(&self.events).unwrap_or_else(|| "unknown".into());
+        let default_group_key = single_group_key(&self.events).unwrap_or_else(unknown_group_key);
+        facts.extend(self.unavailable.into_iter().map(|source| {
+            unobserved_fact(
+                source,
+                default_repo.clone(),
+                default_group_key.clone(),
+                SourceCounts::default(),
+            )
+        }));
+        if !self.include_archived {
+            for source in archived_only_sources(&self.events) {
+                facts.push(unobserved_fact(
+                    OutcomeFactSource {
+                        kind: source.1,
+                        source_id: "archived_only".into(),
+                        warnings: vec!["source_family_archived_only".into()],
+                    },
+                    source.0,
+                    unknown_group_key(),
+                    source.2,
+                ));
+            }
+        }
         facts.sort_by(|left, right| {
             (&left.repo, &left.group_key, &left.fact_id).cmp(&(
                 &right.repo,
@@ -135,8 +159,16 @@ impl OutcomeFactBuilder {
 
 fn fact_from_event(event: &FactoryOutcomeEvent, all_events: &[FactoryOutcomeEvent]) -> OutcomeFact {
     let mut warnings = Vec::new();
-    let task_class = if event.task_class.is_some() && task_class_source_allows(event) {
-        event.task_class.clone()
+    let task_class = if event
+        .task_class
+        .as_deref()
+        .is_some_and(|task_class| !task_class.trim().is_empty())
+        && task_class_source_allows(event)
+    {
+        event
+            .task_class
+            .as_deref()
+            .map(|task_class| task_class.trim().to_owned())
     } else {
         if event.task_class.is_some() {
             warnings.push("task_class_forbidden_source: explicit Phase 3 contract, ticket, or structured outcome provenance required".into());
@@ -164,7 +196,14 @@ fn fact_from_event(event: &FactoryOutcomeEvent, all_events: &[FactoryOutcomeEven
     };
     let cost_micro_usd = match (&event.source_family, &event.metric_payload) {
         (
-            OutcomeEvidenceKind::AgentRecord | OutcomeEvidenceKind::PricingSnapshot,
+            OutcomeEvidenceKind::AgentRecord,
+            FactoryMetricPayload::Cost {
+                micro_usd,
+                pricing_evidence_id: None,
+            },
+        ) => Some(*micro_usd),
+        (
+            OutcomeEvidenceKind::AgentRecord,
             FactoryMetricPayload::Cost {
                 micro_usd,
                 pricing_evidence_id: Some(_),
@@ -178,7 +217,15 @@ fn fact_from_event(event: &FactoryOutcomeEvent, all_events: &[FactoryOutcomeEven
             completed_at_ms,
             ref run_id,
             ref completed_run_id,
-        } if event.source_family == OutcomeEvidenceKind::WorkflowInstance
+        } if matches!(
+            event.source_family,
+            OutcomeEvidenceKind::AgentRecord
+                | OutcomeEvidenceKind::WorkflowInstance
+                | OutcomeEvidenceKind::Phase3VerifiedDelivery
+        ) && event
+            .workflow_instance_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty() && id == run_id)
             && run_id == completed_run_id
             && completed_at_ms >= started_at_ms =>
         {
@@ -223,19 +270,24 @@ fn fact_from_event(event: &FactoryOutcomeEvent, all_events: &[FactoryOutcomeEven
     fact
 }
 
-fn unobserved_fact(source: OutcomeFactSource) -> OutcomeFact {
+fn unobserved_fact(
+    source: OutcomeFactSource,
+    repo: String,
+    group_key: OutcomeFactGroupKey,
+    source_counts: SourceCounts,
+) -> OutcomeFact {
     let mut fact = OutcomeFact {
         fact_id: String::new(),
         event_id: None,
-        repo: String::new(),
-        group_key: OutcomeFactGroupKey::default(),
+        repo,
+        group_key,
         status: OutcomeStatus::Unobserved,
         evidence_kind: source.kind,
         availability: SourceAvailability {
             source_family: source.kind,
             available: false,
         },
-        source_counts: SourceCounts::default(),
+        source_counts,
         source,
         archived: false,
         archive_source_family: None,
@@ -253,16 +305,20 @@ fn source_counts_for(
     all_events: &[FactoryOutcomeEvent],
 ) -> SourceCounts {
     let mut counts = SourceCounts::default();
+    let mut active_sources = BTreeSet::new();
+    let mut archived_sources = BTreeSet::new();
     for candidate in all_events.iter().filter(|candidate| {
         candidate.repo == event.repo && candidate.source_family == event.source_family
     }) {
         counts.event_count = counts.event_count.saturating_add(1);
         if candidate.archived {
-            counts.archived_source_count = counts.archived_source_count.saturating_add(1);
+            archived_sources.insert(candidate.source_id.clone());
         } else {
-            counts.active_source_count = counts.active_source_count.saturating_add(1);
+            active_sources.insert(candidate.source_id.clone());
         }
     }
+    counts.active_source_count = active_sources.len().try_into().unwrap_or(u32::MAX);
+    counts.archived_source_count = archived_sources.len().try_into().unwrap_or(u32::MAX);
     counts
 }
 
@@ -270,8 +326,14 @@ fn task_class_source_allows(event: &FactoryOutcomeEvent) -> bool {
     matches!(
         event.source_family,
         OutcomeEvidenceKind::Phase3Contract | OutcomeEvidenceKind::Phase3VerifiedDelivery
-    ) || event.ticket_id.is_some()
-        || event.phase3_outcome_id.is_some()
+    ) || event
+        .ticket_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+        || event
+            .phase3_outcome_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
 }
 
 fn status_from_structured_payload(
@@ -314,9 +376,27 @@ fn has_prior_failed_ci_signal(
     let Some(failed_signal_id) = recovered.phase4_signal_id.as_deref() else {
         return false;
     };
+    if failed_signal_id.trim().is_empty()
+        || recovered
+            .workflow
+            .as_deref()
+            .is_none_or(|workflow| workflow.trim().is_empty())
+        || recovered
+            .workflow_instance_id
+            .as_deref()
+            .is_none_or(|run| run.trim().is_empty())
+        || recovered
+            .source_version
+            .as_deref()
+            .is_none_or(|commit| commit.trim().is_empty())
+    {
+        return false;
+    }
     all_events.iter().any(|event| {
         event.source_family == OutcomeEvidenceKind::Phase4CiSignal
+            && event.repo == recovered.repo
             && event.source_id == failed_signal_id
+            && event.workflow == recovered.workflow
             && event.workflow_instance_id == recovered.workflow_instance_id
             && event.source_version == recovered.source_version
             && event.observed_at_ms < recovered.observed_at_ms
@@ -328,4 +408,60 @@ fn has_prior_failed_ci_signal(
                 }
             )
     })
+}
+
+fn unknown_group_key() -> OutcomeFactGroupKey {
+    OutcomeFactGroupKey {
+        task_class: Some("unknown".into()),
+        workflow: Some("unknown".into()),
+        harness: Some("unknown".into()),
+        model: Some("unknown".into()),
+    }
+}
+
+fn group_key_for_event(event: &FactoryOutcomeEvent) -> OutcomeFactGroupKey {
+    OutcomeFactGroupKey {
+        task_class: event
+            .task_class
+            .as_deref()
+            .filter(|task_class| !task_class.trim().is_empty() && task_class_source_allows(event))
+            .map(str::to_owned)
+            .or_else(|| Some("unknown".into())),
+        workflow: event.workflow.clone().or_else(|| Some("unknown".into())),
+        harness: event.harness.clone().or_else(|| Some("unknown".into())),
+        model: event.model.clone().or_else(|| Some("unknown".into())),
+    }
+}
+
+fn single_repo(events: &[FactoryOutcomeEvent]) -> Option<String> {
+    let repos: BTreeSet<_> = events.iter().map(|event| event.repo.clone()).collect();
+    (repos.len() == 1).then(|| repos.into_iter().next().unwrap())
+}
+
+fn single_group_key(events: &[FactoryOutcomeEvent]) -> Option<OutcomeFactGroupKey> {
+    let group_keys: BTreeSet<_> = events.iter().map(group_key_for_event).collect();
+    (group_keys.len() == 1).then(|| group_keys.into_iter().next().unwrap())
+}
+
+fn archived_only_sources(
+    events: &[FactoryOutcomeEvent],
+) -> Vec<(String, OutcomeEvidenceKind, SourceCounts)> {
+    let mut sources = Vec::new();
+    let mut repo_families = BTreeSet::new();
+    for event in events {
+        repo_families.insert((event.repo.clone(), event.source_family));
+    }
+
+    for (repo, source_family) in repo_families {
+        let matching: Vec<_> = events
+            .iter()
+            .filter(|event| event.repo == repo && event.source_family == source_family)
+            .collect();
+        if matching.iter().all(|event| event.archived) {
+            let counts = source_counts_for(matching[0], events);
+            sources.push((repo, source_family, counts));
+        }
+    }
+
+    sources
 }
