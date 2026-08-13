@@ -77,12 +77,14 @@ pub struct FactoryEventsReplayRequest {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WorkflowRunRequest {
     pub schema: u8,
-    pub name: String,
+    pub workflow: String,
     pub repo: String,
     #[serde(default)]
     pub params: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -163,6 +165,10 @@ where
     Fut: Future<Output = rk_core::Result<C>>,
     C: DaemonCaller,
 {
+    if req.jsonrpc.as_deref() != Some("2.0") {
+        return JsonRpcResponse::err(req.id, -32600, "invalid request");
+    }
+
     match req.method.as_str() {
         "initialize" => JsonRpcResponse::ok(
             req.id,
@@ -241,7 +247,7 @@ fn prepare_tool(name: &str, arguments: Value) -> Result<PreparedCall, String> {
             ensure_schema(args.schema)?;
             Ok(PreparedCall {
                 method: "factory.propose_action".into(),
-                params: json!({"kind":"workflow.run", "action": workflow_action(args)}),
+                params: propose_params(args),
             })
         }
         "approve_action" => {
@@ -268,11 +274,20 @@ fn prepare_tool(name: &str, arguments: Value) -> Result<PreparedCall, String> {
 }
 
 fn workflow_action(args: WorkflowRunRequest) -> Value {
-    let mut action = json!({"name": args.name, "repo": args.repo, "params": args.params});
+    let mut action = json!({"name": args.workflow, "repo": args.repo, "params": args.params});
     if let Some(coordinator) = args.coordinator {
         action["coordinator"] = json!(coordinator);
     }
     action
+}
+
+fn propose_params(args: WorkflowRunRequest) -> Value {
+    let ttl = args.ttl;
+    let mut params = json!({"kind":"workflow.run", "action": workflow_action(args)});
+    if let Some(ttl) = ttl {
+        params["ttl_seconds"] = json!(ttl);
+    }
+    params
 }
 
 fn parse_args<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, String> {
@@ -320,11 +335,82 @@ fn daemon_error(id: Value, error: RpcError) -> JsonRpcResponse {
 }
 
 fn tools() -> Vec<Value> {
-    TOOLS.iter().map(|(name, description)| json!({
-        "name": name,
-        "description": description,
-        "inputSchema": {"type":"object", "properties": {"schema": {"const": SCHEMA}}, "required": ["schema"]}
-    })).collect()
+    TOOLS
+        .iter()
+        .map(|(name, description)| {
+            json!({
+                "name": name,
+                "description": description,
+                "inputSchema": tool_schema(name)
+            })
+        })
+        .collect()
+}
+
+fn tool_schema(name: &str) -> Value {
+    match name {
+        "factory_snapshot" => object_schema(
+            json!({"schema": schema_property(), "repo": string_property("Repository name")}),
+            vec!["schema", "repo"],
+        ),
+        "factory_events_replay" => object_schema(
+            json!({
+                "schema": schema_property(),
+                "repo": string_property("Repository name"),
+                "after": {"type":"integer", "minimum":0, "description":"Exclusive event cursor to resume after"},
+                "limit": {"type":"integer", "minimum":1, "maximum":200, "description":"Maximum events to return"},
+                "kinds": {"type":"array", "items":{"type":"string"}, "description":"Optional event kind filters"}
+            }),
+            vec!["schema", "repo", "limit"],
+        ),
+        "propose_workflow_run" => object_schema(
+            json!({
+                "schema": schema_property(),
+                "workflow": string_property("Workflow name"),
+                "repo": string_property("Repository name"),
+                "params": {"type":"object", "additionalProperties": true, "description":"Workflow input parameters"},
+                "coordinator": string_property("Optional coordinator session identity"),
+                "ttl": {"type":"integer", "minimum":1, "description":"Optional proposal TTL in seconds"}
+            }),
+            vec!["schema", "workflow", "repo"],
+        ),
+        "approve_action" => object_schema(
+            json!({"schema": schema_property(), "proposal_id": string_property("Proposal id"), "digest": string_property("Expected proposal digest")}),
+            vec!["schema", "proposal_id", "digest"],
+        ),
+        "execute_approved_workflow_run" => object_schema(
+            json!({
+                "schema": schema_property(),
+                "proposal_id": string_property("Proposal id"),
+                "digest": string_property("Approved proposal digest"),
+                "action": object_schema(
+                    json!({
+                        "schema": schema_property(),
+                        "workflow": string_property("Workflow name"),
+                        "repo": string_property("Repository name"),
+                        "params": {"type":"object", "additionalProperties": true, "description":"Workflow input parameters"},
+                        "coordinator": string_property("Optional coordinator session identity"),
+                        "ttl": {"type":"integer", "minimum":1, "description":"Optional proposal TTL in seconds"}
+                    }),
+                    vec!["schema", "workflow", "repo"],
+                )
+            }),
+            vec!["schema", "proposal_id", "digest", "action"],
+        ),
+        _ => object_schema(json!({}), vec![]),
+    }
+}
+
+fn object_schema(properties: Value, required: Vec<&str>) -> Value {
+    json!({"type":"object", "additionalProperties": false, "properties": properties, "required": required})
+}
+
+fn schema_property() -> Value {
+    json!({"const": SCHEMA, "description":"MCP argument schema version"})
+}
+
+fn string_property(description: &str) -> Value {
+    json!({"type":"string", "minLength":1, "description": description})
 }
 
 impl JsonRpcResponse {

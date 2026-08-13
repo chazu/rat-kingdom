@@ -87,6 +87,24 @@ async fn mcp_call(layout: &Layout, id: u64, name: &str, arguments: Value) -> Val
 
 #[tokio::test]
 async fn initialize_and_tools_list_expose_exact_tool_set() {
+    let init_req = rk_mcp::JsonRpcRequest {
+        jsonrpc: Some("2.0".into()),
+        id: json!(0),
+        method: "initialize".into(),
+        params: json!({}),
+    };
+    let mut init_connect =
+        || async { Err::<Client, _>(rk_core::Error::other("initialize connected")) };
+    let init_response =
+        serde_json::to_value(rk_mcp::handle_request(init_req, &mut init_connect).await).unwrap();
+    assert_eq!(init_response["jsonrpc"], "2.0");
+    assert_eq!(init_response["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(init_response["result"]["serverInfo"]["name"], "rk-mcp");
+    assert_eq!(
+        init_response["result"]["capabilities"],
+        json!({"tools": {}})
+    );
+
     let req = rk_mcp::JsonRpcRequest {
         jsonrpc: Some("2.0".into()),
         id: json!(1),
@@ -111,6 +129,59 @@ async fn initialize_and_tools_list_expose_exact_tool_set() {
             "execute_approved_workflow_run"
         ]
     );
+
+    let schemas: Vec<_> = response["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| (tool["name"].as_str().unwrap(), tool["inputSchema"].clone()))
+        .collect();
+    let expected: Value =
+        serde_json::from_str(include_str!("fixtures/mcp_tool_input_schemas.json")).unwrap();
+    assert_eq!(json!(schemas), expected);
+}
+
+#[tokio::test]
+async fn rejects_jsonrpc_versions_other_than_2_0_before_dispatch() {
+    for (id, jsonrpc) in [(10, json!("1.0")), (11, Value::Null)] {
+        let req = rk_mcp::JsonRpcRequest {
+            jsonrpc: serde_json::from_value(jsonrpc).ok(),
+            id: json!(id),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let mut connect = || async { Err::<Client, _>(rk_core::Error::other("connected")) };
+        let response =
+            serde_json::to_value(rk_mcp::handle_request(req, &mut connect).await).unwrap();
+        assert_eq!(response["error"]["code"], -32600);
+        assert!(response["result"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn raw_stdio_rejects_invalid_and_missing_jsonrpc_without_dispatch_or_noise() {
+    let input = br#"{"jsonrpc":"1.0","id":12,"method":"tools/list","params":{}}
+{"id":13,"method":"tools/list","params":{}}
+"#;
+    let mut output = Vec::new();
+    let mut connect = || async { Err::<Client, _>(rk_core::Error::other("raw stdio connected")) };
+    rk_mcp::serve(&input[..], &mut output, &mut connect)
+        .await
+        .unwrap();
+    let text = String::from_utf8(output).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "stdout must contain one JSON response per request only: {text:?}"
+    );
+    for (line, id) in lines.into_iter().zip([12, 13]) {
+        let response: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], id);
+        assert_eq!(response["error"]["code"], -32600);
+        assert!(response.get("result").is_none());
+    }
 }
 
 #[tokio::test]
@@ -178,23 +249,33 @@ async fn propose_workflow_run_never_executes_the_workflow() {
         &layout,
         3,
         "propose_workflow_run",
-        json!({"schema":1, "name":"factory-test", "repo":"repo-a", "params":{"taskId":"one"}}),
+        json!({"schema":1, "workflow":"factory-test", "repo":"repo-a", "params":{"taskId":"one"}, "coordinator":"coord-a", "ttl":60}),
     )
     .await;
     assert!(response.get("error").is_none(), "{response}");
-    let mut client = connect(&layout).await;
-    let snapshot = client
-        .call("factory.snapshot", json!({"repo":"repo-a"}))
-        .await
+    let snapshot_response = mcp_call(
+        &layout,
+        30,
+        "factory_snapshot",
+        json!({"schema":1, "repo":"repo-a"}),
+    )
+    .await;
+    let text = snapshot_response["result"]["content"][0]["text"]
+        .as_str()
         .unwrap();
+    let snapshot: Value = serde_json::from_str(text).unwrap();
     assert_eq!(
-        snapshot["snapshot"]["approvals"].as_array().unwrap().len(),
+        snapshot["daemon"]["snapshot"]["approvals"]["proposals"]
+            .as_array()
+            .unwrap()
+            .len(),
         1
     );
-    assert!(snapshot["snapshot"]["workflows"]
+    assert!(snapshot["daemon"]["snapshot"]["workflows"]
         .as_array()
         .unwrap()
         .is_empty());
+    let mut client = connect(&layout).await;
     client.call("stop", json!({})).await.unwrap();
     handle.await.unwrap().unwrap();
 }
@@ -205,7 +286,7 @@ async fn missing_digest_rejects_before_connecting_to_daemon() {
         jsonrpc: Some("2.0".into()),
         id: json!(4),
         method: "tools/call".into(),
-        params: json!({"name":"execute_approved_workflow_run", "arguments":{"schema":1, "proposal_id":"p", "digest":"", "action":{"schema":1, "name":"factory-test", "repo":"repo-a", "params":{}}}}),
+        params: json!({"name":"execute_approved_workflow_run", "arguments":{"schema":1, "proposal_id":"p", "digest":"", "action":{"schema":1, "workflow":"factory-test", "repo":"repo-a", "params":{}}}}),
     };
     let mut connect =
         || async { Err::<Client, _>(rk_core::Error::other("digest validation connected")) };
@@ -223,8 +304,8 @@ async fn daemon_rpc_error_codes_survive_mcp_mapping() {
     let response = mcp_call(
         &layout,
         5,
-        "factory_snapshot",
-        json!({"schema":1, "repo":"missing"}),
+        "approve_action",
+        json!({"schema":1, "proposal_id":"missing", "digest":"sha256:nope"}),
     )
     .await;
     assert_eq!(response["error"]["code"], -32000);
