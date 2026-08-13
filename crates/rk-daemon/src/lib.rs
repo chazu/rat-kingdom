@@ -676,9 +676,12 @@ mod tests {
             .await
             .unwrap();
         let projected_tuple_count = scan["tuples"].as_array().unwrap().len();
-        assert_eq!(
-            scan["tuples"].as_array().unwrap().iter().any(|tuple| tuple["payload"] == json!({"ok": true})),
-            false,
+        assert!(
+            !scan["tuples"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tuple| tuple["payload"] == json!({"ok": true})),
             "ingest.event must not persist raw source payloads as generic tuples"
         );
 
