@@ -1098,6 +1098,11 @@ async fn fresh_obstacle_on_resolved_topic_steers_and_reinforces() {
     let decayed = resolutions(&space).pop().expect("trail survives one decay");
     assert!(decayed.strength.unwrap() < FULL_STRENGTH, "trail decayed");
 
+    // This test exercises resolution steering, not ULID cursor ordering. Cross
+    // the persisted cursor's millisecond boundary so the fresh wall is in the
+    // next deterministic delta instead of depending on random ULID suffix order.
+    std::thread::sleep(Duration::from_millis(2));
+
     // Another rat hits the same wall (different phrasing, same topic).
     let wall2 = obstacle("myrepo", "Nibbles", "Flaky SYNC test!!");
     space.out(wall2.clone()).unwrap();
