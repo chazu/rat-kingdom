@@ -609,6 +609,8 @@ def main(argv: list[str] | None = None, runner: Runner | None = None) -> Command
             return CommandResult(0, json.dumps(proposal, sort_keys=True) + "\n", "")
         if args.command == "validate-proposal":
             proposal = json.loads(Path(args.proposal_file).read_text(encoding="utf-8"))
+            if not isinstance(proposal, dict):
+                return CommandResult(1, "", "invalid proposal object\n")
             argv_value = proposal.get("argv")
             if not isinstance(argv_value, list) or not all(isinstance(part, str) for part in argv_value):
                 return CommandResult(1, "", "invalid proposal argv\n")

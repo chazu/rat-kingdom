@@ -444,6 +444,27 @@ class FactoryForemanCliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("argv", result.stdout)
 
+    def test_validate_proposal_rejects_non_object_json_without_executing(self):
+        for payload in ([], 42, "not object"):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir) / "proposal.json"
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                result = self.run_cli(
+                    [
+                        "validate-proposal",
+                        "--proposal-file",
+                        str(path),
+                        "--approved-id",
+                        "approved-id",
+                    ],
+                    runner=ExplodingRunner(),
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("proposal", result.stderr)
+                self.assertIn("object", result.stderr)
+
     def test_propose_workflow_rejects_invalid_param_without_equals(self):
         result = self.run_cli(
             ["propose-workflow", "repair", "--repo", REPO, "--param", "broken"],
