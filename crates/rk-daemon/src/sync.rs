@@ -127,20 +127,26 @@ impl Syncer {
     /// a Take, so an already-consumed tuple is never re-emitted.
     pub fn run_cycle(&self, space: &Space) -> rk_core::Result<CycleStats> {
         let _cycle = self.cycle_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let cursor = self.load_cursor();
+        let cursor = self.load_cursor(space)?.unwrap_or(0);
+        let delta = space.persistence_delta(Some(cursor))?;
         let all = space.scan(&Pattern::default())?;
-        let durable_live: Vec<&Tuple> = all
+        let live_ids: std::collections::BTreeSet<RecordId> = all
             .iter()
             .filter(|t| t.lifecycle != Lifecycle::Ephemeral)
+            .map(|t| t.id)
             .collect();
-        let live_ids: std::collections::BTreeSet<RecordId> =
-            durable_live.iter().map(|t| t.id).collect();
 
-        // (1) Export our own newly-authored durable tuples (cursor-bounded).
-        let ours: Vec<&Tuple> = durable_live
+        // (1) Export our own newly-persisted durable tuples. The SQLite sequence
+        // orders persistence, while `live_ids` prevents a tuple deleted before
+        // this cycle from being resurrected into the replication log.
+        let ours: Vec<&Tuple> = delta
+            .tuples
             .iter()
-            .copied()
-            .filter(|t| t.instance == self.castle && cursor.map(|c| t.id > c).unwrap_or(true))
+            .filter(|t| {
+                t.lifecycle != Lifecycle::Ephemeral
+                    && t.instance == self.castle
+                    && live_ids.contains(&t.id)
+            })
             .collect();
         let mut records: Vec<_> = ours
             .iter()
@@ -151,7 +157,6 @@ impl Syncer {
             })
             .collect();
         let exported = records.len();
-        let max_ours = ours.iter().map(|t| t.id).max();
 
         // (2) Export takes: durable tuples we knew were live last cycle, still
         //     alive in the log, but now gone from the space → we consumed them.
@@ -174,8 +179,8 @@ impl Syncer {
         // Advance only after the complete local export is durable. If append
         // fails, the cursor remains behind the tuple and the next cycle can
         // retry instead of silently losing the export.
-        if let Some(max) = max_ours {
-            self.save_cursor(max)?;
+        if delta.boundary > cursor {
+            self.save_cursor(delta.boundary)?;
         }
 
         // (3) Push our ref, fetch everyone else's.
@@ -273,16 +278,22 @@ impl Syncer {
         self.notes.actor()
     }
 
-    fn load_cursor(&self) -> Option<RecordId> {
-        std::fs::read_to_string(&self.cursor_file)
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
+    fn load_cursor(&self, space: &Space) -> rk_core::Result<Option<u64>> {
+        let Ok(raw) = std::fs::read_to_string(&self.cursor_file) else {
+            return Ok(None);
+        };
+        let raw = raw.trim();
+        if let Ok(sequence) = raw.parse::<u64>() {
+            return Ok(Some(sequence));
+        }
+        let Ok(legacy) = raw.parse::<RecordId>() else {
+            return Ok(None);
+        };
+        space.legacy_persistence_sequence(legacy)
     }
 
-    fn save_cursor(&self, id: RecordId) -> rk_core::Result<()> {
-        write_atomic(&self.cursor_file, &format!("{id}\n"))?;
+    fn save_cursor(&self, sequence: u64) -> rk_core::Result<()> {
+        write_atomic(&self.cursor_file, &format!("{sequence}\n"))?;
         Ok(())
     }
 
@@ -418,6 +429,46 @@ mod tests {
             .peers()
             .unwrap()
             .contains(&syncer_b.actor().to_string()));
+    }
+
+    #[tokio::test]
+    async fn delayed_lower_id_local_tuple_is_exported() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let syncer = Syncer::new(&layout, "castle-a", None).unwrap();
+        let now = chrono::Utc::now();
+        let mut delayed = Tuple::new(
+            Category::Fact,
+            "repo",
+            "delayed-local",
+            "castle-a",
+            json!({}),
+        );
+        delayed.id = RecordId::floor_at(now);
+        let delayed_id = delayed.id;
+        let mut boundary = Tuple::new(
+            Category::Fact,
+            "repo",
+            "boundary-local",
+            "castle-a",
+            json!({}),
+        );
+        boundary.id = RecordId::floor_at(now + chrono::Duration::days(1));
+
+        space.out(boundary).unwrap();
+        assert_eq!(syncer.run_cycle(&space).unwrap().exported, 1);
+        space.out(delayed).unwrap();
+
+        assert_eq!(
+            syncer.run_cycle(&space).unwrap().exported,
+            1,
+            "sync must export a delayed local tuple below the previous ULID cursor"
+        );
+        assert!(syncer.notes.own_records().unwrap().iter().any(
+            |record| matches!(&record.op, SyncOp::Out { tuple } if tuple.id == delayed_id)
+        ));
     }
 
     /// A daemon-authored obstacle (supervisor liveness/budget signal, or the
