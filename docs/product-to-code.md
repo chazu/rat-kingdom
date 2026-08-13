@@ -48,6 +48,9 @@ checks.
 ## Commands
 
 ```bash
+# Use a repository name already registered with the daemon.
+REPO=rat-kingdom
+
 # Validate the offline research artifact against the research contract.
 rk product-to-code research validate \
   --artifact research.json \
@@ -62,13 +65,13 @@ rk product-to-code graph validate \
 rk product-to-code graph dry-run \
   --graph graph.json \
   --initiative initiative.json \
-  --repo <registered-name-or-path>
+  --repo "$REPO"
 
 # Propose the daemon graph apply and save its exact execution envelope.
 rk --json product-to-code graph propose-apply \
   --graph graph.json \
   --initiative initiative.json \
-  --repo <registered-name-or-path> \
+  --repo "$REPO" \
   > graph-proposal.json
 
 # Inspect graph-proposal.json, then approve and execute the saved envelope.
@@ -82,7 +85,7 @@ rk --json product-to-code workflow propose \
   --research research.json \
   --graph graph.json \
   --evidence-dir evidence/ \
-  --repo <registered-name-or-path> \
+  --repo "$REPO" \
   > dispatch-proposal.json
 
 # Inspect dispatch-proposal.json, then approve and execute the saved envelope.
