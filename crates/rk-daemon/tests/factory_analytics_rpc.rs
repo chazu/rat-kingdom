@@ -7,7 +7,9 @@ mod fixture;
 
 use chrono::{TimeZone, Utc};
 use rk_core::paths::Layout;
+use rk_core::tuple::{Category, Tuple};
 use rk_daemon::{Client, Daemon};
+use rk_space::Space;
 use serde_json::{json, Value};
 use std::{path::Path, process::Command, time::Duration};
 
@@ -67,6 +69,18 @@ async fn setup() -> (
     tokio::task::JoinHandle<rk_core::Result<()>>,
     Client,
 ) {
+    let (home, repo_dir, layout, handle, _space, client) = setup_with_space().await;
+    (home, repo_dir, layout, handle, client)
+}
+
+async fn setup_with_space() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Layout,
+    tokio::task::JoinHandle<rk_core::Result<()>>,
+    Space,
+    Client,
+) {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     git(repo_dir.path(), &["init", "-b", "main"]);
@@ -80,7 +94,15 @@ async fn setup() -> (
     git(repo_dir.path(), &["commit", "-m", "init"]);
     std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     let layout = Layout::at(home.path());
-    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let space = Space::open_in_memory().unwrap();
+    let mut daemon = Daemon::with_space_for_tests(
+        layout.clone(),
+        "test-castle".into(),
+        "fake".into(),
+        rk_ledger::Budget::default(),
+        space.clone(),
+    )
+    .unwrap();
     daemon.set_request_clock_for_tests(fixed_clock);
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
@@ -88,7 +110,7 @@ async fn setup() -> (
         .call("repo.add", json!({"name":"repo-a", "path": repo_dir.path()}))
         .await
         .unwrap();
-    (home, repo_dir, layout, handle, client)
+    (home, repo_dir, layout, handle, space, client)
 }
 
 fn availability_of(resp: &Value, family: &str) -> bool {
@@ -100,6 +122,38 @@ fn availability_of(resp: &Value, family: &str) -> bool {
         .unwrap_or_else(|| panic!("family {family} missing from availability"))["available"]
         .as_bool()
         .unwrap()
+}
+
+fn source_count<'a>(resp: &'a Value, family: &str) -> &'a Value {
+    resp["source_counts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["source_family"] == json!(family))
+        .unwrap_or_else(|| panic!("missing source count for {family}"))
+}
+
+fn ci_event(delivery_id: &str, kind: &str, at: chrono::DateTime<Utc>) -> Tuple {
+    let mut tuple = Tuple::new(
+        Category::Event,
+        "ci",
+        format!("sdlc:event:github:{delivery_id}"),
+        "source:github",
+        json!({
+            "source": "github",
+            "delivery_id": delivery_id,
+            "family": "ci",
+            "subject": "repo-a:ci:build",
+            "kind": kind,
+            "summary": "structured event only",
+            "observed_at": at.to_rfc3339(),
+            "occurred_at": at.to_rfc3339(),
+            "correlation": {"repo": "repo-a", "workflow": "build", "commit_sha": "abc123"},
+            "payload": {"type": "ci", "status": "completed", "conclusion": "success"}
+        }),
+    );
+    tuple.created_at = at;
+    tuple
 }
 
 async fn run_factory_workflow(client: &mut Client, task: &str) {
@@ -298,6 +352,47 @@ async fn factory_rpcs_are_deterministic_and_read_only_across_repeated_calls() {
 
     let after = snapshot_state(&mut client).await;
     assert_eq!(before, after, "scorecards/recommend must not mutate factory state");
+
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn factory_analytics_scorecards_windows_workflow_approval_and_ci_sources() {
+    let (_home, _repo, _layout, handle, space, mut client) = setup_with_space().await;
+    run_factory_workflow(&mut client, "windowed").await;
+    client
+        .call(
+            "ticket.new",
+            json!({"title":"recurrent defect", "scope":"repo-a", "coalesce_key":"factory-analytics-window"}),
+        )
+        .await
+        .unwrap();
+    space
+        .out(ci_event("failed", "ci_failed", fixed_clock()))
+        .unwrap();
+    space
+        .out(ci_event("recovered", "ci_recovered", fixed_clock() + chrono::Duration::seconds(1)))
+        .unwrap();
+
+    let all = client
+        .call("factory.scorecards", json!({"repo":"repo-a"}))
+        .await
+        .unwrap();
+    assert_eq!(source_count(&all, "RecurrenceKey")["event_count"], json!(1));
+    assert_eq!(source_count(&all, "Phase4CiSignal")["event_count"], json!(2));
+
+    let future_since = (Utc::now() + chrono::Duration::days(1)).timestamp_millis();
+    let future = client
+        .call(
+            "factory.scorecards",
+            json!({"repo":"repo-a", "since": future_since}),
+        )
+        .await
+        .unwrap();
+    for family in ["AgentRecord", "WorkflowInstance", "HumanGateDecision", "RecurrenceKey", "Phase4CiSignal"] {
+        assert_eq!(source_count(&future, family)["event_count"], json!(0), "{family} must honor since");
+    }
 
     client.call("stop", json!({})).await.unwrap();
     handle.await.unwrap().unwrap();

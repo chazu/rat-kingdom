@@ -1233,6 +1233,8 @@ impl Daemon {
         // Always read active + archived immutable snapshots. The pure fact/
         // scorecard layer applies include_archived to metric numerators while
         // retaining archived source counts and archived-only availability.
+        let mut runtime_unavailable = Vec::new();
+        let mut read_warnings = Vec::new();
         let agents = self
             .supervisor
             .list_all()
@@ -1245,30 +1247,63 @@ impl Daemon {
             .list_all()
             .into_iter()
             .filter(|instance| req.repo.as_deref().is_none_or(|r| instance.repo == r))
+            .filter(|instance| {
+                let observed_at = instance.completed_at.unwrap_or(instance.started_at).timestamp_millis();
+                in_window(observed_at)
+            })
             .collect();
-        let tickets = self
-            .tickets
-            .list(req.repo.clone(), None, None)
-            .unwrap_or_default();
-        let approval_grants = self
-            .action_approvals
-            .list_grants()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|grant| req.repo.as_deref().is_none_or(|repo| grant.scope.repo.identity == repo))
-            .collect();
-        let sdlc_ci_facts = self
-            .space
-            .current_sdlc_facts(None, Some("ci"), None)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|fact| req.repo.as_deref().is_none_or(|repo| {
-                fact.payload
-                    .get("subject")
-                    .and_then(Value::as_str)
-                    .is_some_and(|subject| subject.starts_with(&format!("{repo}:")))
-            }))
-            .collect();
+        let tickets = match self.tickets.list(req.repo.clone(), None, None) {
+            Ok(tickets) => tickets
+                .into_iter()
+                .filter(|ticket| in_window(ticket.created_at.timestamp_millis()))
+                .collect(),
+            Err(error) => {
+                runtime_unavailable.push(rk_core::factory::outcome_facts::OutcomeEvidenceKind::RecurrenceKey);
+                read_warnings.push(format!("source_family_read_failed: RecurrenceKey unavailable: {error}"));
+                Vec::new()
+            }
+        };
+        let approval_grants = match self.action_approvals.list_grants() {
+            Ok(grants) => grants
+                .into_iter()
+                .filter(|grant| req.repo.as_deref().is_none_or(|repo| grant.scope.repo.identity == repo))
+                .filter(|grant| in_window(grant.approved_at.timestamp_millis()))
+                .collect(),
+            Err(error) => {
+                runtime_unavailable.push(rk_core::factory::outcome_facts::OutcomeEvidenceKind::HumanGateDecision);
+                read_warnings.push(format!("source_family_read_failed: HumanGateDecision unavailable: {error}"));
+                Vec::new()
+            }
+        };
+        let sdlc_ci_facts = match self.space.scan(&Pattern::category(Category::Event).scope("ci")) {
+            Ok(events) => events
+                .into_iter()
+                .filter(|event| {
+                    req.repo.as_deref().is_none_or(|repo| {
+                        event
+                            .payload
+                            .get("subject")
+                            .and_then(Value::as_str)
+                            .is_some_and(|subject| subject.starts_with(&format!("{repo}:")))
+                    })
+                })
+                .filter(|event| {
+                    let observed_at = event
+                        .payload
+                        .get("observed_at")
+                        .and_then(Value::as_str)
+                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.timestamp_millis())
+                        .unwrap_or_else(|| event.created_at.timestamp_millis());
+                    in_window(observed_at)
+                })
+                .collect(),
+            Err(error) => {
+                runtime_unavailable.push(rk_core::factory::outcome_facts::OutcomeEvidenceKind::Phase4CiSignal);
+                read_warnings.push(format!("source_family_read_failed: Phase4CiSignal unavailable: {error}"));
+                Vec::new()
+            }
+        };
         crate::factory_analytics::AnalyticsInputs {
             repo,
             agents,
@@ -1276,6 +1311,8 @@ impl Daemon {
             tickets,
             approval_grants,
             sdlc_ci_facts,
+            runtime_unavailable,
+            read_warnings,
         }
     }
 

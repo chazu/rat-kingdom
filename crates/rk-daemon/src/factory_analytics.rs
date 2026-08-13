@@ -110,6 +110,8 @@ pub struct AnalyticsInputs {
     pub tickets: Vec<Tuple>,
     pub approval_grants: Vec<ApprovalGrant>,
     pub sdlc_ci_facts: Vec<Tuple>,
+    pub runtime_unavailable: Vec<OutcomeEvidenceKind>,
+    pub read_warnings: Vec<String>,
 }
 
 #[cfg(test)]
@@ -286,36 +288,48 @@ fn normalize_inputs(
         });
     }
 
-    for fact in &inputs.sdlc_ci_facts {
+    let mut prior_failed_by_subject_commit = std::collections::BTreeMap::<(String, String), String>::new();
+    let mut ci_events = inputs.sdlc_ci_facts.iter().collect::<Vec<_>>();
+    ci_events.sort_by_key(|fact| (structured_time_ms(fact, "observed_at"), fact.identity.clone()));
+    for fact in ci_events {
+        if !is_structured_sdlc_ci_event(fact) {
+            continue;
+        }
         let source_id = fact
             .payload
-            .get("last_delivery_id")
+            .get("delivery_id")
             .and_then(Value::as_str)
             .filter(|id| !id.trim().is_empty())
             .unwrap_or(&fact.identity)
             .to_owned();
-        let conclusion = fact
+        let Some(kind) = fact
             .payload
-            .pointer("/current/conclusion")
-            .or_else(|| fact.payload.pointer("/current/status"))
+            .get("kind")
             .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let failed = matches!(conclusion.as_str(), "failure" | "failed" | "error" | "cancelled" | "timed_out");
+            .map(|kind| kind.to_ascii_lowercase()) else { continue; };
+        let failed = kind == "ci_failed";
+        let recovered = kind == "ci_recovered";
+        if !failed && !recovered {
+            continue;
+        }
+        let subject = fact.payload.get("subject").and_then(Value::as_str).unwrap_or_default();
+        let source_version = fact
+            .payload
+            .pointer("/correlation/commit_sha")
+            .and_then(Value::as_str)
+            .filter(|sha| !sha.trim().is_empty())
+            .map(str::to_owned);
+        let prior_failed = source_version.as_ref().and_then(|commit| {
+            prior_failed_by_subject_commit.remove(&(subject.to_owned(), commit.clone()))
+        });
         structured.push(StructuredOutcomeInput {
             repo: inputs.repo.clone(),
             source_family: OutcomeEvidenceKind::Phase4CiSignal,
             source_id: source_id.clone(),
-            source_version: None,
+            source_version: source_version.clone(),
             archived: false,
             archive_reason: None,
-            observed_at_ms: fact
-                .payload
-                .get("observed_at")
-                .and_then(Value::as_str)
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.timestamp_millis())
-                .unwrap_or_else(|| fact.created_at.timestamp_millis()),
+            observed_at_ms: structured_time_ms(fact, "observed_at"),
             task_class: None,
             workflow: fact
                 .payload
@@ -327,23 +341,52 @@ fn normalize_inputs(
             harness: None,
             model: None,
             agent_id: None,
-            workflow_instance_id: None,
+            workflow_instance_id: Some(subject.to_owned()).filter(|subject| !subject.trim().is_empty()),
             ticket_id: None,
             phase3_outcome_id: None,
-            phase4_signal_id: Some(source_id),
+            phase4_signal_id: if recovered { prior_failed } else { Some(source_id.clone()) },
             recurrence_key: None,
             coalesce_key: None,
-            payload: FactoryMetricPayload::Ci { failed, recovered: false },
+            payload: FactoryMetricPayload::Ci { failed, recovered },
             decoy_prose: String::new(),
         });
+        if failed {
+            if let Some(commit) = source_version {
+                prior_failed_by_subject_commit.insert((subject.to_owned(), commit), source_id);
+            }
+        }
     }
 
     let unavailable = UNOBSERVED_FAMILIES
         .iter()
+        .chain(inputs.runtime_unavailable.iter())
         .map(|family| OutcomeFactSource::unavailable(*family))
         .collect();
 
     (structured, unavailable)
+}
+
+fn is_structured_sdlc_ci_event(tuple: &Tuple) -> bool {
+    let source = tuple.payload.get("source").and_then(Value::as_str).unwrap_or_default();
+    let delivery_id = tuple
+        .payload
+        .get("delivery_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    tuple.identity == format!("sdlc:event:{source}:{delivery_id}")
+        && tuple.scope == "ci"
+        && tuple.payload.get("family").and_then(Value::as_str) == Some("ci")
+        && tuple.payload.get("kind").and_then(Value::as_str).is_some()
+}
+
+fn structured_time_ms(tuple: &Tuple, field: &str) -> i64 {
+    tuple
+        .payload
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or_else(|| tuple.created_at.timestamp_millis())
 }
 
 fn scorecards(inputs: &AnalyticsInputs, req: &FactoryAnalyticsRequest) -> Vec<FactoryScorecard> {
@@ -359,18 +402,22 @@ fn scorecards(inputs: &AnalyticsInputs, req: &FactoryAnalyticsRequest) -> Vec<Fa
 
 /// Source counts and availability metadata rolled up across observed families,
 /// so unavailable metrics are visible and cannot look healthy.
-fn availability_envelope(rows: &[FactoryScorecard]) -> (Value, Value, Vec<String>) {
+fn availability_envelope(
+    rows: &[FactoryScorecard],
+    runtime_unavailable: &[OutcomeEvidenceKind],
+    read_warnings: &[String],
+) -> (Value, Value, Vec<String>) {
     use rk_core::factory::outcome_facts::SourceCounts;
     use std::collections::BTreeMap;
 
     let mut counts: BTreeMap<OutcomeEvidenceKind, SourceCounts> = BTreeMap::new();
     let mut available: BTreeMap<OutcomeEvidenceKind, bool> = BTreeMap::new();
-    // AgentRecord and WorkflowInstance are structured stores the daemon always
-    // reads, so they are available regardless of row count. Every other family
-    // has no structured RK store yet and stays unobserved until one exists.
+    // Structured stores the daemon can read are available regardless of row
+    // count unless that read failed at runtime. Families still lacking a durable
+    // store stay unobserved until one exists.
     for family in AVAILABLE_FAMILIES {
         counts.entry(*family).or_default();
-        available.insert(*family, true);
+        available.insert(*family, !runtime_unavailable.contains(family));
     }
     for family in UNOBSERVED_FAMILIES {
         counts.entry(*family).or_default();
@@ -388,7 +435,9 @@ fn availability_envelope(rows: &[FactoryScorecard]) -> (Value, Value, Vec<String
         }
         for (family, avail) in &row.availability.by_family {
             let entry = available.entry(*family).or_insert(false);
-            *entry = *entry || avail.available;
+            if !runtime_unavailable.contains(family) {
+                *entry = *entry || avail.available;
+            }
         }
     }
 
@@ -408,13 +457,14 @@ fn availability_envelope(rows: &[FactoryScorecard]) -> (Value, Value, Vec<String
         .map(|(family, avail)| json!({"source_family": family, "available": avail}))
         .collect::<Vec<_>>());
 
-    let warnings = available
+    let mut warnings = available
         .iter()
-        .filter(|(_, avail)| !**avail)
+        .filter(|(family, avail)| !**avail && !runtime_unavailable.contains(family))
         .map(|(family, _)| {
             format!("source_family_unobserved: {family:?} has no structured RK store; metrics reported as unobserved, not zero")
         })
         .collect::<Vec<_>>();
+    warnings.extend(read_warnings.iter().cloned());
 
     (source_counts, availability, warnings)
 }
@@ -426,7 +476,8 @@ pub fn scorecards_response(
     generated_at: chrono::DateTime<chrono::Utc>,
 ) -> Value {
     let rows = scorecards(inputs, req);
-    let (source_counts, availability, warnings) = availability_envelope(&rows);
+    let (source_counts, availability, warnings) =
+        availability_envelope(&rows, &inputs.runtime_unavailable, &inputs.read_warnings);
     json!({
         "schema_version": SCHEMA_VERSION,
         "repo": inputs.repo,
@@ -455,7 +506,7 @@ pub fn recommend_response(
                 .denominator
                 .and_then(|value| u32::try_from(value).ok())
                 .unwrap_or(recommendation.sample_size);
-            if metric_sample < min_sample {
+            if !recommendation.suppressed && metric_sample < min_sample {
                 recommendation.advice = None;
                 recommendation.suppressed = true;
                 recommendation.suppression_reason = Some(SuppressionReason::LowSample);
@@ -479,7 +530,8 @@ pub fn recommend_response(
             l.subject_group_key == r.subject_group_key && l.rule == r.rule && l.reason == r.reason
         });
     }
-    let (source_counts, availability, mut warnings) = availability_envelope(&rows);
+    let (source_counts, availability, mut warnings) =
+        availability_envelope(&rows, &inputs.runtime_unavailable, &inputs.read_warnings);
     warnings.extend(report.warnings.iter().cloned());
     warnings.sort();
     warnings.dedup();
@@ -584,7 +636,33 @@ mod tests {
             tickets: Vec::new(),
             approval_grants: Vec::new(),
             sdlc_ci_facts: Vec::new(),
+            runtime_unavailable: Vec::new(),
+            read_warnings: Vec::new(),
         }
+    }
+
+    fn ci_event(delivery_id: &str, kind: &str, observed_at: i64, summary: &str) -> Tuple {
+        let at = Utc.timestamp_opt(observed_at, 0).unwrap();
+        let mut tuple = Tuple::new(
+            rk_core::tuple::Category::Event,
+            "ci",
+            format!("sdlc:event:github:{delivery_id}"),
+            "source:github",
+            json!({
+                "source": "github",
+                "delivery_id": delivery_id,
+                "family": "ci",
+                "subject": "rat-kingdom:ci:build",
+                "kind": kind,
+                "summary": summary,
+                "observed_at": at.to_rfc3339(),
+                "occurred_at": at.to_rfc3339(),
+                "correlation": {"repo": "rat-kingdom", "workflow": "build", "commit_sha": "abc123"},
+                "payload": {"type": "ci", "status": "completed", "conclusion": "success"}
+            }),
+        );
+        tuple.created_at = at;
+        tuple
     }
 
     #[test]
@@ -628,6 +706,86 @@ mod tests {
             .unwrap()
             .iter()
             .any(|w| w.as_str().unwrap().contains("Phase3VerifiedDelivery")));
+    }
+
+    #[test]
+    fn ci_history_uses_structured_sdlc_events_not_current_or_prose() {
+        let mut in_scope = inputs();
+        in_scope.sdlc_ci_facts = vec![
+            ci_event("delivery-failed", "ci_failed", 1_040, "failed then later recovered"),
+            ci_event("delivery-recovered", "ci_recovered", 1_050, "recovered from prior failure"),
+        ];
+        in_scope.sdlc_ci_facts.push({
+            let mut tuple = ci_event("delivery-current-only", "deployment_succeeded", 1_060, "prose says ci_failed");
+            tuple.identity = "sdlc:current:github:rat-kingdom:ci:build".into();
+            tuple.payload["current"] = json!({"conclusion":"failure"});
+            tuple
+        });
+
+        let req = FactoryAnalyticsRequest::default();
+        let resp = scorecards_response(&in_scope, &req, Utc.timestamp_opt(2_000, 0).unwrap());
+        let metrics = resp["scorecards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| !row["projected"].as_bool().unwrap_or(false))
+            .unwrap()["metrics"]
+            .clone();
+
+        assert_eq!(metrics["ci_failed"], json!(1));
+        assert_eq!(metrics["ci_recovered"], json!(1));
+    }
+
+    #[test]
+    fn runtime_read_degradation_marks_family_unavailable_with_warning() {
+        let mut degraded = inputs();
+        degraded.runtime_unavailable.push(OutcomeEvidenceKind::Phase4CiSignal);
+        degraded
+            .read_warnings
+            .push("source_family_read_failed: Phase4CiSignal unavailable: boom".into());
+
+        let resp = scorecards_response(
+            &degraded,
+            &FactoryAnalyticsRequest::default(),
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        let ci = resp["availability"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["source_family"] == json!("Phase4CiSignal"))
+            .unwrap();
+
+        assert_eq!(ci["available"], json!(false));
+        assert!(resp["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("source_family_read_failed: Phase4CiSignal")));
+    }
+
+    #[test]
+    fn min_sample_does_not_override_metric_unavailable_suppression() {
+        let resp = recommend_response(
+            &inputs(),
+            &FactoryAnalyticsRequest {
+                min_sample: Some(10_000),
+                ..Default::default()
+            },
+            Utc.timestamp_opt(2_000, 0).unwrap(),
+        );
+        assert!(resp["recommendations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["metric_availability"]["available"] == json!(false))
+            .all(|r| r["suppression_reason"] == json!("metric_unavailable")));
+        assert!(!resp["suppressions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["reason"] == json!("low_sample")
+                && s["source_family"] == json!("PricingSnapshot")));
     }
 
     #[test]
