@@ -61,7 +61,15 @@ pub struct ArchitectureResearchArtifact {
 
 impl ArchitectureResearchArtifact {
     pub fn validate(&self) -> Result<()> {
-        finish(crate::product_to_code::research::research_validation_errors(self))
+        let mut errors = crate::product_to_code::research::research_validation_errors(self);
+        if self
+            .recommended_ticket_graph_path
+            .as_deref()
+            .is_some_and(|path| path.trim_ascii().is_empty())
+        {
+            errors.push("recommended_ticket_graph_path must not be empty".to_string());
+        }
+        finish(errors)
     }
 }
 
