@@ -1,0 +1,7 @@
+{
+  "id": "VR-missing",
+  "initiative_id": "INIT-verification",
+  "entries": [
+    {"acceptance_criterion_id": "AC-1", "status": "satisfied", "evidence_ids": ["EV-browser"]}
+  ]
+}

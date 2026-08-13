@@ -31,6 +31,42 @@ pub enum ProductToCodeCommand {
     DispatchGate(DispatchGateArgs),
     /// Require verification and applicable delivery evidence.
     DeliveryGate(DeliveryGateArgs),
+    /// Independent verification of acceptance criteria to evidence (no implementation authority).
+    VerifyReport {
+        #[command(subcommand)]
+        command: VerifyReportCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum VerifyReportCommand {
+    /// Validate a verification report maps every acceptance criterion to evidence or an explicit gap.
+    Validate(VerifyReportValidateArgs),
+    /// Render a verification report deterministically for humans.
+    Render(VerifyReportRenderArgs),
+}
+
+#[derive(Args)]
+pub struct VerifyReportValidateArgs {
+    /// VerificationReport JSON file.
+    #[arg(long)]
+    report: PathBuf,
+    /// InitiativeContract JSON file referenced by the report.
+    #[arg(long)]
+    initiative: PathBuf,
+    /// Directory of GenericEvidence JSON files referenced by the report.
+    #[arg(long)]
+    evidence_dir: PathBuf,
+}
+
+#[derive(Args)]
+pub struct VerifyReportRenderArgs {
+    /// VerificationReport JSON file.
+    #[arg(long)]
+    report: PathBuf,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = RenderFormat::Markdown)]
+    format: RenderFormat,
 }
 
 #[derive(Subcommand)]
@@ -141,6 +177,51 @@ pub async fn run(layout: &Layout, command: ProductToCodeCommand, json_output: bo
         ProductToCodeCommand::Evidence { command } => run_evidence(command, json_output),
         ProductToCodeCommand::DispatchGate(args) => run_dispatch_gate(args, json_output),
         ProductToCodeCommand::DeliveryGate(args) => run_delivery_gate(args, json_output),
+        ProductToCodeCommand::VerifyReport { command } => run_verify_report(command, json_output),
+    }
+}
+
+fn run_verify_report(command: VerifyReportCommand, json_output: bool) -> Result<i32> {
+    match command {
+        VerifyReportCommand::Validate(args) => {
+            let report: VerificationReport = read_json(&args.report)?;
+            let initiative: InitiativeContract = read_json(&args.initiative)?;
+            let evidence = read_evidence_dir(&args.evidence_dir)?;
+            let validation = rk_core::product_to_code::verification::validate_report(
+                &report,
+                &initiative,
+                &evidence,
+            );
+            let code = if validation.valid { 0 } else { 1 };
+            let output = serde_json::to_value(&validation)?;
+            print_json_or_errors(&output, json_output)?;
+            Ok(code)
+        }
+        VerifyReportCommand::Render(args) => {
+            let report: VerificationReport = read_json(&args.report)?;
+            match args.format {
+                RenderFormat::Json => {
+                    if json_output {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&json!({
+                                "schema": "product_to_code.verification_report.render.v1",
+                                "report": report,
+                            }))?
+                        );
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    }
+                }
+                RenderFormat::Markdown => {
+                    print!(
+                        "{}",
+                        rk_core::product_to_code::verification::render_markdown(&report)
+                    );
+                }
+            }
+            Ok(0)
+        }
     }
 }
 

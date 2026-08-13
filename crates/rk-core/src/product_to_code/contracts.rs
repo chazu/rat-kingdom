@@ -476,7 +476,13 @@ pub struct TicketGraphValidationReport {
 pub struct VerificationReport {
     pub id: String,
     pub initiative_id: String,
+    #[serde(default)]
+    pub verifier: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
     pub entries: Vec<AcceptanceCriterionVerification>,
+    #[serde(default)]
+    pub recommendation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,6 +493,8 @@ pub struct AcceptanceCriterionVerification {
     #[serde(default)]
     pub evidence_ids: Vec<String>,
     pub notes: Option<String>,
+    #[serde(default)]
+    pub gap: Option<String>,
 }
 
 impl VerificationReport {
@@ -525,6 +533,12 @@ impl VerificationReport {
                 &entry.acceptance_criterion_id,
             );
             push_empty(&mut errors, "entries.status", &entry.status);
+            if verification_status(&entry.status).is_none() {
+                errors.push(format!(
+                    "{} has invalid verification status {}",
+                    entry.acceptance_criterion_id, entry.status
+                ));
+            }
             if let Some(criteria) = &criteria {
                 if !criteria.contains(entry.acceptance_criterion_id.as_str()) {
                     errors.push(format!(
@@ -539,9 +553,22 @@ impl VerificationReport {
                     ));
                 }
             }
-            if entry.evidence_ids.is_empty() {
+            let has_gap = entry
+                .gap
+                .as_deref()
+                .is_some_and(|gap| !gap.trim().is_empty());
+            if entry.evidence_ids.is_empty()
+                && !has_gap
+                && verification_status(&entry.status) != Some("not_applicable")
+            {
                 errors.push(format!(
-                    "{} must reference at least one evidence id",
+                    "{} must reference at least one evidence id or explicit gap",
+                    entry.acceptance_criterion_id
+                ));
+            }
+            if entry.gap.as_deref().is_some_and(|gap| gap.trim().is_empty()) {
+                errors.push(format!(
+                    "{} gap must not be empty",
                     entry.acceptance_criterion_id
                 ));
             }
@@ -564,6 +591,16 @@ impl VerificationReport {
             }
         }
         finish(errors)
+    }
+}
+
+pub(crate) fn verification_status(status: &str) -> Option<&'static str> {
+    match status {
+        "satisfied" | "pass" | "passed" => Some("satisfied"),
+        "partially_satisfied" | "partial" => Some("partially_satisfied"),
+        "not_satisfied" | "fail" | "failed" => Some("not_satisfied"),
+        "not_applicable" => Some("not_applicable"),
+        _ => None,
     }
 }
 

@@ -1,0 +1,14 @@
+{
+  "id": "EV-browser",
+  "kind": "browser_acceptance",
+  "producer": {"kind": "external-tool", "name": "offline-browser-note"},
+  "summary": "Browser acceptance passed",
+  "artifact_paths": ["artifacts/browser.png"],
+  "payload": {
+    "url": "https://example.invalid/app",
+    "scenario": "complete the primary flow",
+    "steps": ["open app", "submit form"],
+    "observations": ["success state rendered"],
+    "acceptance_criterion_ids": ["AC-1"]
+  }
+}

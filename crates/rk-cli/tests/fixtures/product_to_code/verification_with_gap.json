@@ -1,0 +1,11 @@
+{
+  "id": "VR-gap",
+  "initiative_id": "INIT-verification",
+  "verifier": "independent-rat",
+  "scope": "delivery",
+  "recommendation": "hold",
+  "entries": [
+    {"acceptance_criterion_id": "AC-1", "status": "satisfied", "evidence_ids": ["EV-browser"], "notes": "browser flow passed"},
+    {"acceptance_criterion_id": "AC-2", "status": "partially_satisfied", "evidence_ids": [], "gap": "integration evidence is still missing"}
+  ]
+}
