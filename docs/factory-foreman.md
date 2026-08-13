@@ -35,6 +35,22 @@ rk --json factory execute-workflow <proposal-id> <digest> \
 
 `--param` is repeatable and CLI values are strings. Execution must repeat the exact typed action. A changed workflow, repository, parameter, or coordinator does not reuse the approval.
 
+Proposal-producing CLI commands also emit a structured JSON envelope that can be
+saved and forwarded through the generic public factory path:
+
+```bash
+rk --json <proposal-producing-command> ... > proposal.json
+rk --json factory approve --proposal-file proposal.json
+rk --json factory execute-action --proposal-file proposal.json
+```
+
+The envelope carries `proposal_id`, `digest`, `kind`, and the original typed
+`execution_action`. The daemon remains authoritative: it compares the forwarded
+envelope with its persisted canonical proposal and rejects edits, stale scope,
+expired or consumed approvals, and digest or caller mismatches. The positional
+`factory approve <proposal-id> <digest>` and workflow-specific
+`execute-workflow` commands remain available.
+
 ### Daemon digest authority
 
 Human-readable commands, dashboard text, MCP tool text, and the Phase 1 helper digest are not execution authority. For the native typed path, the daemon:
@@ -472,9 +488,10 @@ Unknown findings in that report need future classifiers once the failure pattern
 The product-to-code lifecycle turns a product initiative into implemented,
 independently verified code through offline, contract-validated artifacts and
 daemon-executed, operator-approved actions. It reuses the same Phase 2 canonical
-approval boundary documented above: the CLI only proposes typed actions, and the
-daemon alone applies them after an authenticated operator approval with status,
-digest, and CAS checks. See [product-to-code.md](./product-to-code.md) for the
+approval boundary documented above: the CLI prepares and forwards exact typed
+envelopes, while the daemon alone applies them after an authenticated operator
+approval with status, digest, and CAS checks. See
+[product-to-code.md](./product-to-code.md) for the
 full lifecycle, commands, contracts, and safety boundaries.
 
 The two mutating steps are both canonical typed factory actions:
@@ -489,13 +506,25 @@ The two mutating steps are both canonical typed factory actions:
 
 Both actions are validated, approved, and executed exclusively through
 `factory.propose_action`, `factory.approve_action`, and
-`factory.execute_action`. There is no local approve, apply, or dispatch
-shortcut, and RK performs no runtime call to Jcode, browser automation, or
-GitNexus during the lifecycle.
+`factory.execute_action`. The public CLI exposes that boundary through saved
+proposal files:
+
+```bash
+rk --json product-to-code graph propose-apply ... > graph-proposal.json
+rk --json factory approve --proposal-file graph-proposal.json
+rk --json factory execute-action --proposal-file graph-proposal.json
+
+rk --json product-to-code workflow propose ... > dispatch-proposal.json
+rk --json factory approve --proposal-file dispatch-proposal.json
+rk --json factory execute-action --proposal-file dispatch-proposal.json
+```
+
+There is no local apply or dispatch shortcut, and RK performs no runtime call to
+Jcode, browser automation, or GitNexus during the lifecycle.
 
 ## Phase 2 limitations
 
-- The five-tool MCP surface and typed CLI mutation documented here support only the initial `workflow.run` proposal, approval, and execution flow. This is not a claim that every mutation in Rat Kingdom is typed or gated this way.
+- The five-tool MCP surface supports only the initial `workflow.run` proposal, approval, and execution flow. The native CLI additionally forwards saved `ticket_graph.apply` and `product_to_code.dispatch` envelopes through the generic daemon action boundary. This is not a claim that every mutation in Rat Kingdom is typed or gated this way.
 - Legacy direct mutation RPCs and operator CLI flows may remain. In particular, legacy `workflow.run` is not globally gated. Jcode/MCP callers that require digest binding must use `factory.propose_action`, `factory.approve_action`, and `factory.execute_action` through the typed surfaces.
 - The factory event feed projects existing coordinator events. It is not external CI, deployment, production, or general SDLC ingestion, and it is not a separate durable journal.
 - `rk-mcp` uses local stdio and local daemon connectivity. It has no remote transport and no MCP streaming watch tool.
