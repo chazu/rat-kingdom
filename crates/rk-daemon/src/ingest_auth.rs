@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn ingest_state_params_reject_unknown_fields() {
         let err = serde_json::from_value::<IngestStateParams>(
-            json!({"kind": "status", "limit": 5, "principal": "operator"}),
+            json!({"limit": 5, "principal": "operator"}),
         )
         .expect_err("ingest.state params must reject unexpected fields");
 

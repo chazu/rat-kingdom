@@ -611,20 +611,41 @@ mod tests {
 
     #[tokio::test]
     async fn configured_source_auth_and_ingest_allowlist() {
+        fn envelope(source: &str, kind: &str) -> serde_json::Value {
+            json!({
+                "kind": kind,
+                "source": source,
+                "delivery_id": format!("delivery-{kind}"),
+                "occurred_at": "2026-08-13T00:00:00Z",
+                "observed_at": "2026-08-13T00:00:01Z",
+                "correlation": {
+                    "repo": "repo",
+                    "branch": "main",
+                    "workflow": "ci",
+                    "job": "test",
+                    "commit_sha": "abc123"
+                },
+                "summary": format!("{kind} from configured source"),
+                "refs": [],
+                "attributes": {},
+                "payload": {"type": "ci", "status": "failed", "conclusion": "failure"}
+            })
+        }
+
         let mut config = rk_core::config::Config::default();
         config.ingest.max_state_limit = 5;
         config.ingest.sources = vec![
             rk_core::config::IngestSourceConfig {
                 name: "probe".into(),
                 enabled: true,
-                allowed_kinds: vec!["status".into()],
+                allowed_kinds: vec!["ci_failed".into()],
                 max_state_limit: 99,
                 ..Default::default()
             },
             rk_core::config::IngestSourceConfig {
                 name: "disabled".into(),
                 enabled: false,
-                allowed_kinds: vec!["status".into()],
+                allowed_kinds: vec!["ci_failed".into()],
                 max_state_limit: 5,
                 ..Default::default()
             },
@@ -640,26 +661,25 @@ mod tests {
                 method: "ingest.event".into(),
                 auth: token.clone(),
                 caller: caller.clone(),
-                params: json!({"kind": "status", "payload": {"ok": true}}),
+                params: json!({"source":"probe", "envelope": envelope("probe", "ci_failed")}),
             },
         )
         .await;
         assert!(ok.error.is_none(), "ingest.event should validate: {ok:?}");
         let result = ok.result.unwrap();
-        assert_eq!(result["accepted"], false);
-        assert_eq!(result["status"], "ingest_not_wired");
-        assert_eq!(result["source"], "probe");
-        assert_eq!(result["kind"], "status");
+        assert_eq!(result["accepted"], true);
+        assert!(result["receipt"]["semantic_state_digest"].as_str().unwrap().starts_with("sha256:"));
 
         let mut operator_for_scan = connect(&layout).await;
         let scan = operator_for_scan
             .call("space.scan", json!({"category": "event"}))
             .await
             .unwrap();
+        let projected_tuple_count = scan["tuples"].as_array().unwrap().len();
         assert_eq!(
-            scan["tuples"].as_array().unwrap().len(),
-            0,
-            "Task 2 must not persist raw source payloads as generic tuples"
+            scan["tuples"].as_array().unwrap().iter().any(|tuple| tuple["payload"] == json!({"ok": true})),
+            false,
+            "ingest.event must not persist raw source payloads as generic tuples"
         );
 
         let state = raw_request(
@@ -669,7 +689,7 @@ mod tests {
                 method: "ingest.state".into(),
                 auth: token.clone(),
                 caller: caller.clone(),
-                params: json!({"kind": "status", "limit": 5}),
+                params: json!({"repo": "repo", "limit": 5}),
             },
         )
         .await;
@@ -678,8 +698,7 @@ mod tests {
             "ingest.state should succeed: {state:?}"
         );
         let state_result = state.result.unwrap();
-        assert_eq!(state_result["status"], "ingest_not_wired");
-        assert_eq!(state_result["tuples"].as_array().unwrap().len(), 0);
+        assert_eq!(state_result["facts"].as_array().unwrap().len(), 1);
 
         let unknown_state_field = raw_request(
             &layout,
@@ -688,7 +707,7 @@ mod tests {
                 method: "ingest.state".into(),
                 auth: token.clone(),
                 caller: caller.clone(),
-                params: json!({"kind": "status", "limit": 5, "principal": "operator"}),
+                params: json!({"repo": "repo", "limit": 5, "principal": "operator"}),
             },
         )
         .await;
@@ -703,7 +722,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             after_rejected_state["tuples"].as_array().unwrap().len(),
-            0,
+            projected_tuple_count,
             "rejected ingest.state requests must not persist tuple/state writes"
         );
 
@@ -713,7 +732,7 @@ mod tests {
                 "ingest.event",
                 caller.clone(),
                 layout.auth_token().unwrap(),
-                json!({"kind": "status"}),
+                json!({"source":"probe", "envelope": envelope("probe", "ci_failed")}),
                 crate::proto::codes::UNAUTHORIZED,
             ),
             (
@@ -721,15 +740,15 @@ mod tests {
                 "ingest.event",
                 caller.clone(),
                 token.clone(),
-                json!({"kind": "status", "principal": "operator"}),
-                crate::proto::codes::FORBIDDEN,
+                json!({"source":"probe", "envelope": envelope("probe", "ci_failed"), "principal": "operator"}),
+                crate::proto::codes::BAD_PARAMS,
             ),
             (
                 "disabled-source",
                 "ingest.event",
                 crate::ingest_auth::source_caller("disabled"),
                 crate::ingest_auth::derive_source_token(&layout.auth_token().unwrap(), "disabled"),
-                json!({"kind": "status"}),
+                json!({"source":"disabled", "envelope": envelope("disabled", "ci_failed")}),
                 crate::proto::codes::UNAUTHORIZED,
             ),
             (
@@ -737,7 +756,7 @@ mod tests {
                 "ingest.event",
                 crate::ingest_auth::source_caller("unknown"),
                 crate::ingest_auth::derive_source_token(&layout.auth_token().unwrap(), "unknown"),
-                json!({"kind": "status"}),
+                json!({"source":"unknown", "envelope": envelope("unknown", "ci_failed")}),
                 crate::proto::codes::UNAUTHORIZED,
             ),
             (
@@ -745,7 +764,7 @@ mod tests {
                 "ingest.event",
                 caller.clone(),
                 token.clone(),
-                json!({"kind": "workflow"}),
+                json!({"source":"probe", "envelope": envelope("probe", "ci_recovered")}),
                 crate::proto::codes::FORBIDDEN,
             ),
             (
@@ -753,7 +772,7 @@ mod tests {
                 "ingest.state",
                 caller.clone(),
                 token.clone(),
-                json!({"kind": "status", "limit": 6}),
+                json!({"repo": "repo", "limit": 6}),
                 crate::proto::codes::BAD_PARAMS,
             ),
             (
@@ -777,7 +796,7 @@ mod tests {
                 "ingest.event",
                 "Whisker".into(),
                 layout.agent_auth_token("Whisker").unwrap(),
-                json!({"kind": "status"}),
+                json!({"source":"probe", "envelope": envelope("probe", "ci_failed")}),
                 crate::proto::codes::FORBIDDEN,
             ),
         ];
