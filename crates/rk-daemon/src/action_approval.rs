@@ -6,6 +6,7 @@ use rk_core::action::{
     ApprovalGrant, ApprovalStatus, FactoryAction, RepoScope, WorkflowRunAction,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct StoreData {
@@ -92,6 +93,22 @@ impl ActionApprovalStore {
         if proposal.expires_at <= Utc::now() {
             return Err(rk_core::Error::other("proposal expired"));
         }
+        if let Some(existing) = data.grants.get(proposal_id) {
+            if existing.digest != digest
+                || existing.scope != proposal.scope
+                || existing.requester != proposal.requester
+            {
+                return Err(rk_core::Error::other("approval binding mismatch"));
+            }
+            return match existing.status {
+                ApprovalStatus::Approved => Ok(existing.clone()),
+                ApprovalStatus::Executing => {
+                    Err(rk_core::Error::other("approval already executing"))
+                }
+                ApprovalStatus::Consumed => Err(rk_core::Error::other("approval already consumed")),
+                ApprovalStatus::Failed => Err(rk_core::Error::other("approval already failed")),
+            };
+        }
         let grant = ApprovalGrant {
             schema: 1,
             proposal_id: proposal.id.clone(),
@@ -104,7 +121,7 @@ impl ActionApprovalStore {
             approved_at: Utc::now(),
             expires_at: proposal.expires_at,
             execution_id: None,
-            instance_id: None,
+            instance_id: Some(bound_instance_id(&proposal.id, &proposal.digest)),
             failure: None,
             consumed_at: None,
         };
@@ -161,6 +178,9 @@ impl ActionApprovalStore {
                         "exec-{}",
                         Utc::now().timestamp_nanos_opt().unwrap_or_default()
                     ));
+                }
+                if grant.instance_id.is_none() {
+                    grant.instance_id = Some(bound_instance_id(&proposal.id, &proposal.digest));
                 }
                 grant.failure = None;
                 let out = grant.clone();
@@ -232,4 +252,158 @@ fn proposal_nonce(now: &chrono::DateTime<Utc>, requester: &str) -> String {
         "{}:{requester}",
         now.timestamp_nanos_opt().unwrap_or_default()
     )
+}
+
+fn bound_instance_id(proposal_id: &str, digest: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rk.workflow.approval.instance.v1\0");
+    hasher.update(proposal_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(digest.as_bytes());
+    let hex = hex::encode(hasher.finalize());
+    format!("wf-{}", &hex[..32])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn action(repo_identity: &str, repo_path: &str) -> WorkflowRunAction {
+        WorkflowRunAction {
+            name: "factory-test".into(),
+            repo: repo_identity.into(),
+            repo_identity: repo_identity.into(),
+            repo_path: repo_path.into(),
+            params: [("taskId".into(), json!("one"))].into_iter().collect(),
+            coordinator: Some("coord-a".into()),
+        }
+    }
+
+    fn store() -> (tempfile::TempDir, ActionApprovalStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ActionApprovalStore::load(dir.path().join("approvals.json")).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn begin_execute_rejects_caller_mismatch() {
+        let (_dir, store) = store();
+        let action = action("repo-a", "/repo/a");
+        let proposal = store.propose("caller-a", action.clone(), None).unwrap();
+        store
+            .approve(&proposal.id, &proposal.digest, "operator")
+            .unwrap();
+        let err = store
+            .begin_execute(&proposal.id, &proposal.digest, "caller-b", &action)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("caller mismatch"), "{err}");
+    }
+
+    #[test]
+    fn begin_execute_rejects_scope_repo_mismatch() {
+        let (_dir, store) = store();
+        let original = action("repo-a", "/repo/a");
+        let proposal = store.propose("caller-a", original.clone(), None).unwrap();
+        store
+            .approve(&proposal.id, &proposal.digest, "operator")
+            .unwrap();
+        let changed = action("repo-b", "/repo/b");
+        let err = store
+            .begin_execute(&proposal.id, &proposal.digest, "caller-a", &changed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("digest mismatch") || err.contains("binding mismatch"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn begin_execute_rejects_expired_proposal() {
+        let (_dir, store) = store();
+        let action = action("repo-a", "/repo/a");
+        let proposal = store.propose("caller-a", action.clone(), Some(1)).unwrap();
+        store
+            .approve(&proposal.id, &proposal.digest, "operator")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let err = store
+            .begin_execute(&proposal.id, &proposal.digest, "caller-a", &action)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expired"), "{err}");
+    }
+
+    #[test]
+    fn approval_lifecycle_persists_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("approvals.json");
+        let action = action("repo-a", "/repo/a");
+        let (proposal_id, digest, instance_id) = {
+            let store = ActionApprovalStore::load(&path).unwrap();
+            let proposal = store.propose("caller-a", action.clone(), None).unwrap();
+            store
+                .approve(&proposal.id, &proposal.digest, "operator")
+                .unwrap();
+            let grant = store
+                .begin_execute(&proposal.id, &proposal.digest, "caller-a", &action)
+                .unwrap();
+            let instance_id = grant.instance_id.expect("instance bound before launch");
+            store.finish_success(&proposal.id, &instance_id).unwrap();
+            (proposal.id, proposal.digest, instance_id)
+        };
+        let reloaded = ActionApprovalStore::load(&path).unwrap();
+        let grant = reloaded
+            .begin_execute(&proposal_id, &digest, "caller-a", &action)
+            .unwrap();
+        assert_eq!(grant.status, ApprovalStatus::Consumed);
+        assert_eq!(grant.instance_id.as_deref(), Some(instance_id.as_str()));
+    }
+
+    #[test]
+    fn approve_rejects_lifecycle_reset_for_executing_or_consumed() {
+        let (_dir, store) = store();
+        let action = action("repo-a", "/repo/a");
+        let proposal = store.propose("caller-a", action.clone(), None).unwrap();
+        store
+            .approve(&proposal.id, &proposal.digest, "operator")
+            .unwrap();
+        let grant = store
+            .begin_execute(&proposal.id, &proposal.digest, "caller-a", &action)
+            .unwrap();
+        let err = store
+            .approve(&proposal.id, &proposal.digest, "operator")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already executing"), "{err}");
+        store
+            .finish_success(&proposal.id, grant.instance_id.as_deref().unwrap())
+            .unwrap();
+        let err = store
+            .approve(&proposal.id, &proposal.digest, "operator")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already consumed"), "{err}");
+    }
+
+    #[test]
+    fn concurrent_begin_execute_binds_single_instance() {
+        let (_dir, store) = store();
+        let action = action("repo-a", "/repo/a");
+        let proposal = store.propose("caller-a", action.clone(), None).unwrap();
+        store
+            .approve(&proposal.id, &proposal.digest, "operator")
+            .unwrap();
+        let first = store
+            .begin_execute(&proposal.id, &proposal.digest, "caller-a", &action)
+            .unwrap();
+        let second = store
+            .begin_execute(&proposal.id, &proposal.digest, "caller-a", &action)
+            .unwrap();
+        assert_eq!(first.status, ApprovalStatus::Executing);
+        assert_eq!(first.instance_id, second.instance_id);
+        assert!(first.instance_id.is_some());
+    }
 }

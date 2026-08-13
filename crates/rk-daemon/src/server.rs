@@ -3280,11 +3280,19 @@ impl Daemon {
         if grant.status == ApprovalStatus::Consumed {
             return Response::err(req.id, codes::FORBIDDEN, "approval already consumed");
         }
+        let Some(instance_id) = grant.instance_id.clone() else {
+            return Response::err(
+                req.id,
+                codes::INTERNAL,
+                "approval missing bound instance id",
+            );
+        };
         let engine = self.engine();
         let handle = tokio::runtime::Handle::current();
         let result = tokio::task::spawn_blocking(move || {
             let _entered = handle.enter();
-            engine.run_owned(
+            engine.run_owned_with_id(
+                instance_id,
                 &action.name,
                 &action.repo_path,
                 action.params.into_iter().collect(),

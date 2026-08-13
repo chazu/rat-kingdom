@@ -494,11 +494,7 @@ async fn collect_child_output(
     })
 }
 
-fn definition_inside_roots(
-    candidate: &Path,
-    repo: &str,
-    global_root: &Path,
-) -> Option<PathBuf> {
+fn definition_inside_roots(candidate: &Path, repo: &str, global_root: &Path) -> Option<PathBuf> {
     let candidate = candidate.canonicalize().ok()?;
     if !candidate.is_file() {
         return None;
@@ -740,6 +736,21 @@ impl WorkflowEngine {
         params: HashMap<String, Value>,
         coordinator: Option<String>,
     ) -> rk_core::Result<Instance> {
+        self.run_owned_with_id(prefixed_id("wf"), name, repo, params, coordinator)
+    }
+
+    /// Launch a workflow using a caller-supplied durable instance id. If that id
+    /// already exists, return its snapshot instead of dispatching a second copy.
+    /// Factory approvals use this to bind approval to a workflow instance before
+    /// launch and make retries/concurrent execute calls single-flight.
+    pub fn run_owned_with_id(
+        self: &Arc<Self>,
+        instance_id: String,
+        name: &str,
+        repo: &str,
+        params: HashMap<String, Value>,
+        coordinator: Option<String>,
+    ) -> rk_core::Result<Instance> {
         let file = self.find_definition(name, repo)?;
         let definition_digest = definition_digest(&file)?;
         let workflow = rk_workflow::load(&file, &params)?;
@@ -747,7 +758,7 @@ impl WorkflowEngine {
             self.is_automated_landing_definition(&file, &workflow.name);
 
         let instance = Instance {
-            id: prefixed_id("wf"),
+            id: instance_id,
             workflow: workflow.name.clone(),
             repo: repo.to_string(),
             coordinator,
@@ -768,7 +779,9 @@ impl WorkflowEngine {
             completed_at: None,
             archived_at: None,
         };
-        self.store(instance.clone());
+        if let Some(existing) = self.store_if_absent(instance.clone()) {
+            return Ok(existing);
+        }
         self.spawn_execution(instance.id.clone(), workflow, repo.to_string());
         Ok(instance)
     }
@@ -905,17 +918,14 @@ impl WorkflowEngine {
             .find_definition(&instance.definition, &instance.repo)
             .and_then(|file| {
                 let digest = definition_digest(&file)?;
-                if !instance.definition_digest.is_empty()
-                    && instance.definition_digest != digest
-                {
+                if !instance.definition_digest.is_empty() && instance.definition_digest != digest {
                     return Err(rk_core::Error::other(format!(
                         "definition digest changed (persisted {}, current {})",
                         instance.definition_digest, digest
                     )));
                 }
                 Ok((rk_workflow::load(&file, &instance.params)?, digest))
-            })
-        {
+            }) {
             Ok(loaded) => loaded,
             Err(e) => {
                 warn!(instance = %id, error = %e, "cannot resume workflow; failing instance");
@@ -1011,23 +1021,24 @@ impl WorkflowEngine {
                         .description
                         .as_ref()
                         .map(|d| interpolate(d, &ctx));
-                    let record = self.spawn_agent(SpawnParams {
-                        repo: repo.to_string(),
-                        task: title,
-                        prompt,
-                        role: spawn.role.clone(),
-                        coordination: spawn.coordination.clone(),
-                        harness: Some(resolved.harness),
-                        parent: None,
-                        base: spawn.branch.clone().or(ctx.active_branch.clone()),
-                        model: resolved.model,
-                        permission_mode: resolved.permission_mode,
-                        attach: false,
-                        workflow_instance: Some(id.to_string()),
-                        coordinator: self.coordinator(id),
-                        instance_max_usd: self.instance_budget(id),
-                    })
-                    .await?;
+                    let record = self
+                        .spawn_agent(SpawnParams {
+                            repo: repo.to_string(),
+                            task: title,
+                            prompt,
+                            role: spawn.role.clone(),
+                            coordination: spawn.coordination.clone(),
+                            harness: Some(resolved.harness),
+                            parent: None,
+                            base: spawn.branch.clone().or(ctx.active_branch.clone()),
+                            model: resolved.model,
+                            permission_mode: resolved.permission_mode,
+                            attach: false,
+                            workflow_instance: Some(id.to_string()),
+                            coordinator: self.coordinator(id),
+                            instance_max_usd: self.instance_budget(id),
+                        })
+                        .await?;
                     self.update(id, |i| {
                         i.context.active_agent = Some(record.name.clone());
                         i.context.active_branch = record.branch.clone();
@@ -1146,10 +1157,8 @@ impl WorkflowEngine {
                                 payload
                             }
                         };
-                        let approval_granted = decision
-                            .get("approved")
-                            .and_then(Value::as_bool)
-                            == Some(true);
+                        let approval_granted =
+                            decision.get("approved").and_then(Value::as_bool) == Some(true);
                         self.update(id, |i| {
                             i.context.previous_result = Some(decision);
                             i.context.awaited = Vec::new();
@@ -1372,7 +1381,12 @@ impl WorkflowEngine {
                     self.require_allowed_target(&target, repo, automated)?;
                     let result = self
                         .supervisor
-                        .land(std::path::Path::new(repo), &branch, &target, land.keep_branch)
+                        .land(
+                            std::path::Path::new(repo),
+                            &branch,
+                            &target,
+                            land.keep_branch,
+                        )
                         .await?;
                     self.update(id, |i| {
                         i.context.previous_result = Some(result.clone());
@@ -1591,25 +1605,26 @@ impl WorkflowEngine {
                 .description
                 .as_ref()
                 .map(|d| interpolate_item(d, &item, &ctx));
-            let record = self.spawn_agent(SpawnParams {
-                repo: repo.to_string(),
-                task: title,
-                prompt,
-                role: fe.role.clone(),
-                harness: Some(resolved.harness),
-                parent: None,
-                // Each rat gets its own branch off the base; fan-out never
-                // chains onto ctx.active_branch (that would serialize them).
-                base: fe.branch.clone(),
-                model: resolved.model,
-                permission_mode: resolved.permission_mode,
-                attach: false,
-                workflow_instance: Some(id.to_string()),
-                coordinator: self.coordinator(id),
-            instance_max_usd: instance_cap,
-            coordination: None,
-            })
-            .await?;
+            let record = self
+                .spawn_agent(SpawnParams {
+                    repo: repo.to_string(),
+                    task: title,
+                    prompt,
+                    role: fe.role.clone(),
+                    harness: Some(resolved.harness),
+                    parent: None,
+                    // Each rat gets its own branch off the base; fan-out never
+                    // chains onto ctx.active_branch (that would serialize them).
+                    base: fe.branch.clone(),
+                    model: resolved.model,
+                    permission_mode: resolved.permission_mode,
+                    attach: false,
+                    workflow_instance: Some(id.to_string()),
+                    coordinator: self.coordinator(id),
+                    instance_max_usd: instance_cap,
+                    coordination: None,
+                })
+                .await?;
             fanned.push(FannedAgent {
                 agent: record.name.clone(),
                 branch: record.branch.clone(),
@@ -2065,11 +2080,9 @@ impl WorkflowEngine {
             }
             child_command.env(name, interpolate(value, ctx));
         }
-        let child = child_command
-            .spawn()
-            .map_err(|e| {
-                rk_core::Error::other(format!("run step: failed to spawn `{command}`: {e}"))
-            })?;
+        let child = child_command.spawn().map_err(|e| {
+            rk_core::Error::other(format!("run step: failed to spawn `{command}`: {e}"))
+        })?;
 
         let outcome = collect_child_output(
             child,
@@ -2516,6 +2529,20 @@ impl WorkflowEngine {
         self.emit_state_event(&instance, "started");
     }
 
+    fn store_if_absent(&self, instance: Instance) -> Option<Instance> {
+        let mut instances = self.lock();
+        if let Some(existing) = instances.get(&instance.id) {
+            return Some(existing.clone());
+        }
+        instances.insert(instance.id.clone(), instance.clone());
+        if let Err(error) = self.persist(&instance) {
+            warn!(instance = %instance.id, %error, "failed to persist initial workflow state; skipping coordinator event");
+            return None;
+        }
+        self.emit_state_event(&instance, "started");
+        None
+    }
+
     fn update<F: FnOnce(&mut Instance)>(&self, id: &str, mutate: F) {
         self.update_with_reason(id, "state_changed", mutate);
     }
@@ -2573,11 +2600,11 @@ impl WorkflowEngine {
         });
         if let Err(error) = self.space.out_coordinator(
             Tuple::new(
-            Category::Event,
-            repo_name_of(&instance.repo),
-            "workflow_state_changed",
-            "daemon",
-            payload,
+                Category::Event,
+                repo_name_of(&instance.repo),
+                "workflow_state_changed",
+                "daemon",
+                payload,
             )
             .with_lifecycle(rk_core::tuple::Lifecycle::Furniture),
         ) {
@@ -2606,7 +2633,11 @@ impl WorkflowEngine {
         let path = dir.join(format!("{}.json", instance.id));
         let data = serde_json::to_vec_pretty(instance)?;
         let sequence = PERSIST_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = dir.join(format!("{}.json.tmp-{}-{sequence}", instance.id, std::process::id()));
+        let tmp = dir.join(format!(
+            "{}.json.tmp-{}-{sequence}",
+            instance.id,
+            std::process::id()
+        ));
         std::fs::write(&tmp, data)?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
@@ -3206,7 +3237,9 @@ mod tests {
             nested.canonicalize().unwrap()
         );
         assert!(resolve_worktree_cwd(&worktree, Some("../"), &ctx).is_err());
-        assert!(resolve_worktree_cwd(&worktree, Some(temp.path().to_str().unwrap()), &ctx).is_err());
+        assert!(
+            resolve_worktree_cwd(&worktree, Some(temp.path().to_str().unwrap()), &ctx).is_err()
+        );
     }
 
     #[tokio::test]

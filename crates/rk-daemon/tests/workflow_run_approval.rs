@@ -190,3 +190,53 @@ async fn test_execute_workflow_run_with_matching_approval_starts_instance() {
     client.call("stop", json!({})).await.unwrap();
     handle.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn test_concurrent_execute_approval_dispatches_once() {
+    let (_home, _repo_dir, layout, handle, mut client) = setup().await;
+    let proposed = client
+        .call(
+            "factory.propose_action",
+            json!({
+                "kind":"workflow.run",
+                "action":{"name":"factory-test","repo":"repo-a", "params":{"taskId":"one"}}
+            }),
+        )
+        .await
+        .unwrap();
+    let proposal_id = proposed["proposal"]["id"].as_str().unwrap().to_string();
+    let digest = proposed["proposal"]["digest"].as_str().unwrap().to_string();
+    client
+        .call(
+            "factory.approve_action",
+            json!({"proposal_id": proposal_id, "digest": digest}),
+        )
+        .await
+        .unwrap();
+
+    let mut c1 = connect(&layout).await;
+    let mut c2 = connect(&layout).await;
+    let req = json!({
+        "proposal_id": proposal_id,
+        "digest": digest,
+        "action":{"name":"factory-test","repo":"repo-a", "params":{"taskId":"one"}}
+    });
+    let (first, second) = tokio::join!(
+        c1.call("factory.execute_action", req.clone()),
+        c2.call("factory.execute_action", req),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first["instance"]["id"], second["instance"]["id"]);
+    assert_eq!(
+        first["approval"]["instance_id"],
+        second["approval"]["instance_id"]
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let listed = client.call("workflow.list", json!({})).await.unwrap();
+    let instances = listed["instances"].as_array().unwrap();
+    assert_eq!(instances.len(), 1, "{listed}");
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}
