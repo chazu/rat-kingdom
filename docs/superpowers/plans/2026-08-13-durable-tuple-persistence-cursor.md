@@ -4,7 +4,7 @@
 
 **Goal:** Replace ULID ordering as the reactor and multiplayer sync durable cursor with a SQLite-assigned persistence sequence that is safe across delayed writers, independent database connections, process restarts, and wall-clock rollback.
 
-**Architecture:** Add a nullable `commit_sequence` column to the local `tuples` table, an append-only tuple persistence journal, a singleton sequence state row, and an `AFTER INSERT` trigger. SQLite serializes writers, so the trigger assigns the sequence and journal snapshot in persistence order inside the tuple's transaction. Existing rows receive a deterministic ULID-order baseline during migration. `Pattern.after_id` remains unchanged because it is a public tuple-id/time-floor predicate, not a persistence cursor.
+**Architecture:** Add a nullable `commit_sequence` column to the local `tuples` table, an append-only tuple persistence journal, a singleton sequence state row, and an `AFTER INSERT` trigger. SQLite serializes writers, so the trigger assigns the sequence and journal snapshot in persistence order inside the tuple's transaction. Existing live rows receive a deterministic ULID-order baseline during migration. A journal floor preserves the historical high-water mark when pre-journal rows were already deleted, while a durable migration marker and immutable contiguous suffix distinguish a legitimate legacy prefix from current-journal corruption. `Pattern.after_id` remains unchanged because it is a public tuple-id/time-floor predicate, not a persistence cursor.
 
 **Tech Stack:** Rust, SQLite/rusqlite, rk-space, rk-daemon reactor, rk-daemon multiplayer sync.
 
@@ -14,7 +14,7 @@
 - Do not change `RecordId` generation or tuple wire formats.
 - Do not remove or reinterpret `Pattern.after_id`; raw clients use it as an ID/time-floor filter.
 - Sequence assignment must occur inside the same SQLite transaction as tuple persistence.
-- Existing databases must migrate automatically. Historical rows use deterministic `id ASC` order because original commit order cannot be reconstructed.
+- Existing databases must migrate automatically. Surviving historical rows use deterministic `id ASC` order because original commit order cannot be reconstructed. Deleted pre-journal history is explicitly bounded below the journal floor rather than fabricated or allowed to rewind the high-water mark.
 - Existing ULID cursor files must trigger a safe at-least-once replay of the migrated historical baseline because the old ordering cannot reveal which delayed lower-ID rows it skipped. New cursor files contain decimal sequence numbers.
 - Cursor advancement remains at-least-once: save only after the full reactor or sync batch succeeds.
 - Do not run `cargo fmt` and do not touch `.git-issue/`.
@@ -55,7 +55,7 @@ Expected: compilation fails because the persistence cursor API does not exist.
 
 - [ ] **Step 4: Add the SQLite sequence migration**
 
-Extend `tuples` with nullable `commit_sequence INTEGER`. Add `tuple_sequence_state(singleton, last_sequence, legacy_backfill_sequence)`. Under `BEGIN IMMEDIATE`, assign missing historical sequences in `id ASC` order, store the historical high-water mark, create a unique sequence index, and create an `AFTER INSERT` trigger that increments the singleton and writes the new sequence onto the inserted tuple.
+Extend `tuples` with nullable `commit_sequence INTEGER`. Add `tuple_sequence_state(singleton, last_sequence, legacy_backfill_sequence, journal_floor_sequence)`, an immutable persistence journal, and a durable migration marker. Under one `BEGIN IMMEDIATE` migration, assign surviving historical rows in `id ASC` order without lowering an existing sequence high-water mark, record any unrecoverable deleted prefix as the journal floor, create the unique sequence index, and install guarded triggers that atomically increment the singleton, assign the tuple sequence, and append its journal snapshot. Trusted journals must validate before any backfill and fail closed on gaps, replacement, mutation, overflow, or invalid sequence state.
 
 - [ ] **Step 5: Add the bounded delta API**
 

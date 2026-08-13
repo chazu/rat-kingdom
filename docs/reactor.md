@@ -119,6 +119,15 @@ cursor over the store:
    replays the deterministic historical baseline from sequence zero. Durable
    reactor markers make that one-time at-least-once replay idempotent.
 
+For an existing pre-journal database, migration preserves the sequence
+high-water mark even when older live rows have already been deleted. Surviving
+rows receive a deterministic `id ASC` baseline. The unrecoverable deleted prefix
+is recorded by `journal_floor_sequence`, and every event after that floor must
+form a complete, immutable, contiguous journal suffix. A durable migration
+marker distinguishes a legitimate legacy upgrade from a damaged current
+journal, so reopening never repairs trusted history from mutable live rows or
+silently rewinds the cursor.
+
 This is the same cursor discipline the multiplayer sync loop uses. A dropped
 feed event changes nothing: the next scan — woken by the interval tick if
 nothing else — still sees the tuple, because the cursor has not passed it. **The
@@ -140,7 +149,13 @@ marker still carries a TTL (`[reactor].marker_ttl_secs`, default one week) and
 self-collects, while its journal snapshot remains the permanent local dispatch
 ledger. Workflow launches also use a deterministic instance ID derived from the
 same `(trigger, tuple)` key, closing the crash window between instance persistence
-and marker persistence.
+and marker persistence. Initial instance state is written through a synced
+temporary file, atomically renamed, and followed by a parent-directory sync on
+Unix before execution starts. On daemon restart, all live and archived workflow
+IDs are loaded before reactor or scheduler dispatch tasks start. Only after
+those consumers are listening are persisted `Running` instances resumed. An
+archived stable ID is therefore still occupied and cannot be relaunched by a
+replayed tuple.
 
 ## Re-entrancy and storm control
 
