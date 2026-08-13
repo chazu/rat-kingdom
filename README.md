@@ -28,6 +28,16 @@ rk ping                                    # auto-starts the daemon → "pong"
 Everything lives under `~/.rat-kingdom/` (override with `RK_HOME`): config,
 tuplespace db, worktrees, logs, workflow definitions, sync state.
 
+## Factory Foreman
+
+The repository-local Jcode Factory Foreman skill provides read-only Rat Kingdom factory triage from existing `rk --json` commands, deterministic reliability categories, and approval-gated workflow dispatch proposals. Start with:
+
+```bash
+python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py triage --repo rat-kingdom --format markdown
+```
+
+It never auto-starts the daemon: strict `rk --json daemon status` must pass before any observation command runs. Mutating workflow dispatch requires a later human approval of the exact rendered proposal ID or command, followed by proposal validation. See [docs/factory-foreman.md](docs/factory-foreman.md) for installation, schema, categories, approval boundary, live acceptance evidence, monitoring, recovery, and Phase 1 limitations.
+
 ## Five-minute tour
 
 ```bash
