@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS sdlc_current_state (
     last_delivery_id        TEXT NOT NULL,
     first_seen_at           TEXT NOT NULL,
     last_seen_at            TEXT NOT NULL,
+    current_occurred_at     TEXT,
+    current_observed_at     TEXT,
     fact_tuple_id           TEXT NOT NULL UNIQUE,
     PRIMARY KEY (source, scope, subject)
 );
@@ -97,6 +99,16 @@ struct SdlcKey {
     family: &'static str,
 }
 
+#[derive(Debug, Clone)]
+struct CurrentSdlcState {
+    digest: String,
+    first_delivery_id: String,
+    first_seen_at: String,
+    fact_tuple_id: String,
+    current_occurred_at: Option<String>,
+    current_observed_at: Option<String>,
+}
+
 /// Bring an older DB up to the current schema. `CREATE TABLE IF NOT EXISTS`
 /// leaves an already-created table untouched, so a DB from before `strength`
 /// existed needs an explicit `ALTER`. The duplicate-column error on an
@@ -115,6 +127,24 @@ fn migrate(conn: &Connection) -> rk_core::Result<()> {
     if !strength_exists {
         conn.execute("ALTER TABLE tuples ADD COLUMN strength REAL", [])
             .map_err(sql_err)?;
+    }
+    for column in ["current_occurred_at", "current_observed_at"] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('sdlc_current_state') WHERE name = ?1
+                 )",
+                [column],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        if !exists {
+            conn.execute(
+                &format!("ALTER TABLE sdlc_current_state ADD COLUMN {column} TEXT"),
+                [],
+            )
+            .map_err(sql_err)?;
+        }
     }
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_tuples_strength
@@ -205,40 +235,50 @@ impl Store {
 
         let current = tx
             .query_row(
-                "SELECT semantic_state_digest, first_delivery_id, first_seen_at, fact_tuple_id
+                "SELECT semantic_state_digest, first_delivery_id, first_seen_at, fact_tuple_id,
+                        current_occurred_at, current_observed_at
                  FROM sdlc_current_state
                  WHERE source = ?1 AND scope = ?2 AND subject = ?3",
                 rusqlite::params![source, key.scope, key.subject],
                 |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
+                    Ok(CurrentSdlcState {
+                        digest: row.get(0)?,
+                        first_delivery_id: row.get(1)?,
+                        first_seen_at: row.get(2)?,
+                        fact_tuple_id: row.get(3)?,
+                        current_occurred_at: row.get(4)?,
+                        current_observed_at: row.get(5)?,
+                    })
                 },
             )
             .optional()
             .map_err(sql_err)?;
 
+        let advances_current = current
+            .as_ref()
+            .map(|current| occurrence_advances_current(envelope, &key, current))
+            .unwrap_or(true);
+
         let fact_id = current
             .as_ref()
-            .map(|(_, _, _, id)| id.clone())
+            .map(|current| current.fact_tuple_id.clone())
             .unwrap_or_else(|| {
                 stable_record_id(&["sdlc", "fact", &source, &key.scope, &key.subject]).to_string()
             });
         let first_delivery_id = current
             .as_ref()
-            .map(|(_, id, _, _)| id.clone())
+            .map(|current| current.first_delivery_id.clone())
             .unwrap_or_else(|| envelope.delivery_id.clone());
         let first_seen_at = current
             .as_ref()
-            .map(|(_, _, seen, _)| seen.clone())
+            .map(|current| current.first_seen_at.clone())
             .unwrap_or_else(|| accepted_at.to_rfc3339());
-        let transition_emitted = current
-            .as_ref()
-            .map(|(old, _, _, _)| old != digest.as_str())
-            .unwrap_or(true);
+        let transition_emitted = advances_current
+            && current
+                .as_ref()
+                .map(|current| current.digest != digest.as_str())
+                .unwrap_or(true);
+        let receipt_id = format!("sdlc:receipt:{source}:{}", envelope.delivery_id);
         let fact_tuple = sdlc_fact_tuple(
             &fact_id,
             envelope,
@@ -247,42 +287,62 @@ impl Store {
             digest.as_str(),
             &first_delivery_id,
             &first_seen_at,
+            &receipt_id,
             accepted_at,
         );
 
         insert_tuple_tx(&tx, &event_tuple)?;
-        if current.is_some() {
+        let mut projected_tuples = vec![event_tuple.clone()];
+        if advances_current {
+            if current.is_some() {
+                tx.execute(
+                    "UPDATE tuples SET payload = ?2, created_at = ?3 WHERE id = ?1",
+                    rusqlite::params![
+                        fact_id,
+                        fact_tuple.payload.to_string(),
+                        accepted_at.to_rfc3339()
+                    ],
+                )
+                .map_err(sql_err)?;
+            } else {
+                insert_tuple_tx(&tx, &fact_tuple)?;
+            }
+            projected_tuples.push(fact_tuple.clone());
+
             tx.execute(
-                "UPDATE tuples SET payload = ?2, created_at = ?3 WHERE id = ?1",
+                "INSERT INTO sdlc_current_state
+                 (source, scope, subject, semantic_state_digest, first_delivery_id, last_delivery_id,
+                  first_seen_at, last_seen_at, current_occurred_at, current_observed_at, fact_tuple_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(source, scope, subject) DO UPDATE SET
+                   semantic_state_digest = excluded.semantic_state_digest,
+                   last_delivery_id = excluded.last_delivery_id,
+                   last_seen_at = excluded.last_seen_at,
+                   current_occurred_at = excluded.current_occurred_at,
+                   current_observed_at = excluded.current_observed_at",
                 rusqlite::params![
-                    fact_id,
-                    fact_tuple.payload.to_string(),
-                    accepted_at.to_rfc3339()
+                    source,
+                    key.scope,
+                    key.subject,
+                    digest.as_str(),
+                    first_delivery_id,
+                    envelope.delivery_id,
+                    first_seen_at,
+                    accepted_at.to_rfc3339(),
+                    envelope.occurred_at.to_rfc3339(),
+                    envelope.observed_at.to_rfc3339(),
+                    fact_id
                 ],
             )
             .map_err(sql_err)?;
-        } else {
-            insert_tuple_tx(&tx, &fact_tuple)?;
         }
 
-        tx.execute(
-            "INSERT INTO sdlc_current_state
-             (source, scope, subject, semantic_state_digest, first_delivery_id, last_delivery_id, first_seen_at, last_seen_at, fact_tuple_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(source, scope, subject) DO UPDATE SET
-               semantic_state_digest = excluded.semantic_state_digest,
-               last_delivery_id = excluded.last_delivery_id,
-               last_seen_at = excluded.last_seen_at",
-            rusqlite::params![source, key.scope, key.subject, digest.as_str(), first_delivery_id, envelope.delivery_id, first_seen_at, accepted_at.to_rfc3339(), fact_id],
-        ).map_err(sql_err)?;
-
-        let mut projected_tuples = vec![event_tuple.clone(), fact_tuple.clone()];
         let transition_tuple_id = if transition_emitted {
             let transition = sdlc_transition_tuple(
                 envelope,
                 principal,
                 &key,
-                current.as_ref().map(|(old, _, _, _)| old.as_str()),
+                current.as_ref().map(|current| current.digest.as_str()),
                 digest.as_str(),
             );
             insert_tuple_tx(&tx, &transition)?;
@@ -290,7 +350,7 @@ impl Store {
                 "INSERT INTO sdlc_transitions
                  (source, scope, subject, delivery_id, previous_digest, current_digest, transition_tuple_id, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                rusqlite::params![source, key.scope, key.subject, envelope.delivery_id, current.as_ref().map(|(old, _, _, _)| old.as_str()), digest.as_str(), transition.id.to_string(), accepted_at.to_rfc3339()],
+                rusqlite::params![source, key.scope, key.subject, envelope.delivery_id, current.as_ref().map(|current| current.digest.as_str()), digest.as_str(), transition.id.to_string(), accepted_at.to_rfc3339()],
             ).map_err(sql_err)?;
             projected_tuples.push(transition.clone());
             Some(transition.id.to_string())
@@ -299,13 +359,17 @@ impl Store {
         };
 
         let receipt = SignalReceipt::accepted(
-            format!("sdlc:receipt:{source}:{}", envelope.delivery_id),
+            receipt_id,
             principal.clone(),
             envelope.delivery_id.clone(),
             accepted_at,
             digest,
             event_tuple.id.to_string(),
-            vec![fact_id.clone()],
+            if advances_current {
+                vec![fact_id.clone()]
+            } else {
+                vec![]
+            },
             transition_emitted,
         );
         let receipt_json =
@@ -841,6 +905,37 @@ fn sdlc_key(envelope: &SignalEnvelope) -> SdlcKey {
     }
 }
 
+fn occurrence_advances_current(
+    envelope: &SignalEnvelope,
+    key: &SdlcKey,
+    current: &CurrentSdlcState,
+) -> bool {
+    if key.family != "deployment" {
+        return true;
+    }
+
+    let Some(current_occurred_at) = current
+        .current_occurred_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+    else {
+        return true;
+    };
+    let incoming_occurred_at = envelope.occurred_at.fixed_offset();
+    if incoming_occurred_at != current_occurred_at {
+        return incoming_occurred_at > current_occurred_at;
+    }
+
+    let Some(current_observed_at) = current
+        .current_observed_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+    else {
+        return true;
+    };
+    envelope.observed_at.fixed_offset() > current_observed_at
+}
+
 fn sdlc_event_tuple(
     envelope: &SignalEnvelope,
     principal: &SignalSourcePrincipal,
@@ -876,6 +971,7 @@ fn sdlc_fact_tuple(
     digest: &str,
     first_delivery_id: &str,
     first_seen_at: &str,
+    receipt_id: &str,
     accepted_at: DateTime<Utc>,
 ) -> Tuple {
     let current = match &envelope.payload {
@@ -883,13 +979,41 @@ fn sdlc_fact_tuple(
             json!({"status": payload.status, "conclusion": payload.conclusion, "commit_sha": envelope.correlation.commit_sha})
         }
         SignalPayload::Deployment(payload) => {
-            json!({"environment": payload.environment, "service": payload.service, "version": payload.version})
+            json!({
+                "environment": payload.environment,
+                "service": payload.service,
+                "version": payload.version,
+                "commit_sha": envelope.correlation.commit_sha,
+                "repo": envelope.correlation.repo,
+                "branch": envelope.correlation.branch,
+            })
         }
         SignalPayload::ProductionAlert(payload) => {
             json!({"environment": payload.environment, "service": payload.service, "alert_key": payload.alert_key, "state": payload.state, "severity": payload.severity})
         }
     };
-    let mut tuple = Tuple::new(Category::Fact, key.scope.clone(), format!("sdlc:current:{}:{}", envelope.source.as_str(), key.subject), principal.as_str(), json!({"source": envelope.source.as_str(), "family": key.family, "subject": key.subject, "semantic_state_digest": digest, "first_delivery_id": first_delivery_id, "last_delivery_id": envelope.delivery_id, "first_seen_at": first_seen_at, "last_seen_at": accepted_at, "current": current})).with_lifecycle(Lifecycle::Furniture);
+    let mut tuple = Tuple::new(
+        Category::Fact,
+        key.scope.clone(),
+        format!("sdlc:current:{}:{}", envelope.source.as_str(), key.subject),
+        principal.as_str(),
+        json!({
+            "source": envelope.source.as_str(),
+            "family": key.family,
+            "subject": key.subject,
+            "semantic_state_digest": digest,
+            "receipt_id": receipt_id,
+            "first_delivery_id": first_delivery_id,
+            "last_delivery_id": envelope.delivery_id,
+            "first_seen_at": first_seen_at,
+            "last_seen_at": accepted_at,
+            "occurred_at": envelope.occurred_at.to_rfc3339(),
+            "observed_at": envelope.observed_at.to_rfc3339(),
+            "refs": envelope.refs,
+            "current": current,
+        }),
+    )
+    .with_lifecycle(Lifecycle::Furniture);
     tuple.id = id.parse().unwrap_or_else(|_| RecordId::new());
     tuple.created_at = accepted_at;
     tuple
