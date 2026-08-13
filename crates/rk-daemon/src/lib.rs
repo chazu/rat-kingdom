@@ -100,9 +100,30 @@ mod tests {
         fn source(name: &str) -> rk_core::config::IngestSourceConfig {
             rk_core::config::IngestSourceConfig {
                 name: name.into(),
-                allowed_kinds: vec!["status".into()],
+                allowed_kinds: vec!["ci_failed".into()],
                 ..Default::default()
             }
+        }
+
+        fn envelope(source: &str) -> serde_json::Value {
+            json!({
+                "kind": "ci_failed",
+                "source": source,
+                "delivery_id": "delivery-1",
+                "occurred_at": "2026-08-13T00:00:00Z",
+                "observed_at": "2026-08-13T00:00:01Z",
+                "correlation": {
+                    "repo": "repo",
+                    "branch": "main",
+                    "workflow": "ci",
+                    "job": "test",
+                    "commit_sha": "abc123"
+                },
+                "summary": "ci failed",
+                "refs": [],
+                "attributes": {},
+                "payload": {"type": "ci", "status": "failed", "conclusion": "failure"}
+            })
         }
 
         fn config_with_source(
@@ -172,7 +193,7 @@ mod tests {
                 &crate::ingest_auth::derive_source_token(root, "probe"),
             )
             .unwrap();
-            let params = serde_json::from_value(json!({"kind":"status", "principal":"operator", "source":"other", "instance":"castle"})).unwrap();
+            let params = serde_json::from_value(json!({"source":"other", "envelope": envelope("probe")})).unwrap();
             assert!(crate::ingest_auth::validate_event(&principal, &params).is_err());
         }
 
@@ -190,13 +211,12 @@ mod tests {
                     method: "ingest.event".into(),
                     auth: token.clone(),
                     caller: caller.clone(),
-                    params: json!({"kind":"status"}),
+                    params: json!({"source":"probe", "envelope": envelope("probe")}),
                 },
             )
             .await;
             assert!(ok.error.is_none(), "source ingest should validate: {ok:?}");
-            assert_eq!(ok.result.as_ref().unwrap()["status"], "ingest_not_wired");
-            assert_eq!(ok.result.as_ref().unwrap()["accepted"], false);
+            assert_eq!(ok.result.as_ref().unwrap()["accepted"], true);
             let scoped = raw_request(
                 &layout,
                 Request {
@@ -204,7 +224,7 @@ mod tests {
                     method: "ingest.event".into(),
                     auth: token.clone(),
                     caller: caller.clone(),
-                    params: json!({"kind":"status", "scope":"repo"}),
+                    params: json!({"source":"probe", "envelope": envelope("probe"), "scope":"repo"}),
                 },
             )
             .await;
@@ -237,7 +257,7 @@ mod tests {
                 &crate::ingest_auth::derive_source_token(root, "probe"),
             )
             .unwrap();
-            let params = serde_json::from_value(json!({"kind":"workflow"})).unwrap();
+            let params = serde_json::from_value(json!({"source":"probe", "envelope": {"kind": "ci_recovered", "source": "probe", "delivery_id": "delivery-2", "occurred_at": "2026-08-13T00:00:00Z", "observed_at": "2026-08-13T00:00:01Z", "correlation": {"repo": "repo", "branch": "main", "workflow": "ci", "job": "test", "commit_sha": "abc123"}, "summary": "ci recovered", "refs": [], "attributes": {}, "payload": {"type": "ci", "status": "passed", "conclusion": null}}})).unwrap();
             assert!(crate::ingest_auth::validate_event(&principal, &params).is_err());
         }
 

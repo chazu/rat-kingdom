@@ -13,6 +13,7 @@ use rk_core::action::{
 };
 use rk_core::id::RecordId;
 use rk_core::paths::Layout;
+use rk_core::sdlc::SignalSourcePrincipal;
 use rk_core::product_to_code::contracts::{InitiativeContract, TicketGraph};
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, SYSTEM_SCOPE};
 use rk_space::{CoordinatorEvent, Space};
@@ -48,6 +49,35 @@ const OPERATOR_ACTOR: &str = "operator";
 
 type FactVoteKey = (String, String, String);
 type FactVoteState = (DateTime<Utc>, RecordId, String);
+
+fn ingest_state_filter(params: &IngestStateParams) -> (Option<String>, Option<String>) {
+    if let Some(alert_key) = &params.alert_key {
+        return (
+            Some("production_alert".into()),
+            Some(format!(
+                "{}:{}:{}",
+                params.environment.as_deref().unwrap_or_default(),
+                params.service.as_deref().unwrap_or_default(),
+                alert_key
+            )),
+        );
+    }
+    if params.environment.is_some() || params.service.is_some() {
+        return (
+            Some("deployment".into()),
+            Some(format!(
+                "{}:{}",
+                params.environment.as_deref().unwrap_or_default(),
+                params.service.as_deref().unwrap_or_default()
+            )),
+        );
+    }
+    if let Some(repo) = &params.repo {
+        let _ = repo;
+        return (Some("ci".into()), None);
+    }
+    (None, None)
+}
 
 /// Who may close a ballot: its proposer, or the operator (TKT-184).
 ///
@@ -4265,18 +4295,22 @@ impl Daemon {
             Ok(params) => params,
             Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
         };
-        let kind = params.kind.clone();
         match crate::ingest_auth::validate_event(&principal, &params) {
             Ok(()) => {}
             Err(error) => return Response::err(req.id, codes::FORBIDDEN, error),
         }
-        // Task 2 is auth/allowlist only. Task 4 wires canonical SignalEnvelope
-        // ingestion through rk-space::accept_sdlc_signal; until then do not
-        // persist raw source payloads as generic tuples.
-        Response::ok(
-            req.id,
-            json!({"accepted": false, "status": "ingest_not_wired", "source": principal.name, "kind": kind}),
-        )
+        let source = match principal.configured_source() {
+            Ok(source) => source,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+        };
+        let receipt = match self.space.accept_sdlc_signal(
+            params.envelope,
+            SignalSourcePrincipal::for_source(&source),
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+        };
+        Response::ok(req.id, json!({"accepted": true, "receipt": receipt}))
     }
 
     fn handle_ingest_state(&self, req: Request) -> Response {
@@ -4299,19 +4333,19 @@ impl Daemon {
                 format!("limit exceeds source cap {}", principal.max_state_limit()),
             );
         }
-        if let Some(kind) = params.kind.as_deref() {
-            if !principal.allows_kind(kind) {
-                return Response::err(
-                    req.id,
-                    codes::FORBIDDEN,
-                    format!("source may not read kind {kind}"),
-                );
+        let source = Some(principal.name.as_str());
+        let (scope, subject) = ingest_state_filter(&params);
+        match self.space.current_sdlc_facts(source, scope.as_deref(), subject.as_deref()) {
+            Ok(mut facts) => {
+                if let Some(repo) = params.repo.as_deref() {
+                    let prefix = format!("{repo}:");
+                    facts.retain(|fact| fact.payload.get("subject").and_then(Value::as_str).is_some_and(|s| s.starts_with(&prefix)));
+                }
+                facts.truncate(requested);
+                Response::ok(req.id, json!({"facts": facts, "truncated": false}))
             }
+            Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
         }
-        Response::ok(
-            req.id,
-            json!({"tuples": [], "truncated": false, "status": "ingest_not_wired"}),
-        )
     }
 
     async fn handle_blocking(&self, req: Request, destructive: bool) -> Response {

@@ -2,6 +2,7 @@
 
 mod agent_cmds;
 mod factory_cmds;
+mod ingest_cmds;
 mod observe;
 mod product_to_code_cmds;
 mod repo_cmds;
@@ -161,6 +162,11 @@ enum Command {
     Ticket {
         #[command(subcommand)]
         command: TicketCommand,
+    },
+    /// Ingest canonical SDLC feedback events and read current facts.
+    Ingest {
+        #[command(subcommand)]
+        command: ingest_cmds::IngestCommand,
     },
     /// Typed factory proposal, approval, and execution commands.
     Factory {
@@ -812,6 +818,7 @@ async fn main() -> Result<()> {
                 std::process::exit(code);
             }
         }
+        Command::Ingest { command } => ingest_cmds::run(&layout, command, cli.json).await?,
         Command::Workflow { command } => {
             let mut client = Client::connect_or_spawn(&layout).await?;
             match command {

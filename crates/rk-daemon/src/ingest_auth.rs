@@ -1,7 +1,6 @@
 use rk_core::config::IngestConfig;
-use rk_core::sdlc::SignalLimits;
+use rk_core::sdlc::{ConfiguredSourceName, SignalEnvelope, SignalLimits};
 use serde::Deserialize;
-use serde_json::Value;
 use std::collections::HashSet;
 
 pub const SOURCE_CALLER_PREFIX: &str = "source:";
@@ -17,22 +16,21 @@ pub struct SourcePrincipal {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestEventParams {
-    pub kind: String,
-    #[serde(default)]
-    pub payload: Value,
-    #[serde(default)]
-    pub principal: Option<String>,
-    #[serde(default)]
-    pub source: Option<String>,
-    #[serde(default)]
-    pub instance: Option<String>,
+    pub source: String,
+    pub envelope: SignalEnvelope,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestStateParams {
     #[serde(default)]
-    pub kind: Option<String>,
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub environment: Option<String>,
+    #[serde(default)]
+    pub service: Option<String>,
+    #[serde(default)]
+    pub alert_key: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -79,6 +77,10 @@ impl SourcePrincipal {
     pub fn limits(&self) -> &SignalLimits {
         &self.limits
     }
+
+    pub fn configured_source(&self) -> Result<ConfiguredSourceName, rk_core::sdlc::SignalValidationError> {
+        ConfiguredSourceName::new(self.name.clone())
+    }
 }
 
 pub fn derive_source_token(root_token: &str, name: &str) -> String {
@@ -93,15 +95,23 @@ pub fn validate_event(
     principal: &SourcePrincipal,
     params: &IngestEventParams,
 ) -> Result<(), String> {
-    if params.principal.is_some() || params.source.is_some() || params.instance.is_some() {
-        return Err("source principal is derived from the verified token; inline principal/source/instance fields are not accepted".into());
+    if params.source != principal.name {
+        return Err("requested source does not match authenticated principal".into());
     }
-    if !principal.allows_kind(&params.kind) {
+    if params.envelope.source.as_str() != principal.name {
+        return Err("envelope source does not match authenticated principal".into());
+    }
+    let kind = serde_json::to_string(&params.envelope.kind)
+        .map_err(|_| "invalid signal kind".to_string())?
+        .trim_matches('"')
+        .to_string();
+    if !principal.allows_kind(&kind) {
         return Err(format!(
             "source {} may not ingest kind {}",
-            principal.name, params.kind
+            principal.name, kind
         ));
     }
+    params.envelope.validate(principal.limits()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
