@@ -249,7 +249,7 @@ The daemon methods are `factory.scorecards` and `factory.recommend`. They are ad
 
 ### Durable structured outcome source semantics
 
-Scorecards are derived only from durable structured source families that the daemon can read today. Phase 5 currently reconstructs analytic events from typed daemon records and snapshots. It does not have a separate durable analytics journal, and it does not infer outcomes from text. Each derived event carries schema version, deterministic event id, repository, source family, source id/version when available, archive marker and reason when available, observed timestamp when available, explicit dimensions, linked ids, recurrence/coalescing keys when available, and one structured metric payload.
+Scorecards are derived only from durable structured source families that the daemon can read today. Phase 5 currently reconstructs analytic events from typed daemon records, snapshots, and structured SDLC CI event history. It does not have a separate durable analytics journal, and it does not infer outcomes from text. Each derived event carries schema version, deterministic event id, repository, source family, source id/version when available, archive marker and reason when available, observed timestamp when available, explicit dimensions, linked ids, recurrence/coalescing keys when available, and one structured metric payload.
 
 The normal event shape is:
 
@@ -289,7 +289,7 @@ The currently available structured families are:
 
 - `AgentRecord`: durable agent/run records with explicit ids and available dimensions such as model, harness, timestamps, status, and linked workflow data when present.
 - `WorkflowInstance`: durable workflow instances with explicit ids, workflow names, lifecycle timestamps, status, and linked agent data when present.
-- `Phase4CiSignal`: structured current CI state for a key, including current failed/pass status. It is a current-state fact only.
+- `Phase4CiSignal`: structured SDLC CI event history for a key. Explicit `ci_failed` and `ci_recovered` events are normalized when their tuple identity, scope, family, kind, delivery id, subject, and commit correlation are structured.
 - `HumanGateDecision`: structured approval or gate decision facts for human intervention counting.
 - `RecurrenceKey`: structured recurrence or ticket coalescing keys for recurrence counting.
 
@@ -302,7 +302,7 @@ The following structured families are not available to Phase 5 today and must re
 
 Agent cost fields are not sufficient cost provenance by themselves. `AgentRecord` may carry usage or cost-like values, but Phase 5 must not report `cost_micro_usd` unless a durable pricing snapshot or an equally explicit structured cost provenance record is available for that run. No such source is available today, so cost metrics remain unavailable.
 
-Current Phase 4 CI facts can report present failed/pass state. They cannot report recovery history or recovery counts because Phase 5 does not yet have a transition/history read seam for failed-to-pass changes.
+Structured SDLC CI history can report explicit CI failures and explicit recoveries. A recovery counts only when the recovered event references a matching prior explicit failure for the same repository, structured subject, workflow, and commit correlation, with the failure observed earlier. Current green CI alone is not recovery evidence.
 
 | Metric or dimension | Structured source only | Forbidden inference | Missing behavior |
 | --- | --- | --- | --- |
@@ -313,8 +313,8 @@ Current Phase 4 CI facts can report present failed/pass state. They cannot repor
 | `model` | Explicit model field on agent/run data. | Prompt text, transcript text, agent label, or inferred provider. | Dimension is `unknown` and can still be aggregated. |
 | `accepted` | Phase 3 verified delivery or land structured outcome enumerator. This source is not available today. | Absence of rework, green CI, closing prose, or issue comments. | Metric unavailable for that run unless explicit outcome exists. |
 | `reworked` | Structured reviewer rework transition. This source is not available today. | Review comment prose, TODO text, or labels. | Metric unavailable for that run. |
-| `ci_failed` | Current structured Phase 4 CI signal state for the same key. | Build-log text, terminal text, or later acceptance. | Metric unavailable unless a structured current signal exists. |
-| `ci_recovered` | Phase 4 CI transition/history record proving failed then recovered/pass for the same key. This history seam is not available today. | Current green CI alone, build-log text, or later acceptance. | Metric unavailable until structured transition history exists. |
+| `ci_failed` | Explicit structured SDLC CI event with kind `ci_failed` for the same structured subject and commit correlation. | Build-log text, terminal text, or later acceptance. | Metric unavailable unless an explicit structured failure event exists. |
+| `ci_recovered` | Explicit structured SDLC CI event with kind `ci_recovered`, counted only when a matching prior explicit `ci_failed` event exists for the same structured subject and commit correlation. | Current green CI alone, build-log text, or later acceptance. | Metric unavailable unless the explicit recovery has matching prior failure evidence. |
 | `reverted` | Typed revert history linked to run, ticket, or landed outcome. This source is not available today. | Commit-message search or prose. | Metric unavailable for that run. |
 | `human_interventions` | Explicit `HumanGateDecision`, approval, or gate decision event. | Mentions, comments, delay, or approval prose. | Metric unavailable for that run. |
 | `recurrence` | Explicit non-empty `recurrence_key` or `RecurrenceKey` ticket coalesce key. | Similarity over titles, stack traces, logs, or prose. | Metric unavailable without explicit key. |
