@@ -247,9 +247,9 @@ rk --json factory recommend --repo <registered-name-or-path> --group-by all --in
 
 The daemon methods are `factory.scorecards` and `factory.recommend`. They are advisory observation APIs only. They do not rewrite policy, config, workflow definitions, workflow instances, tickets, approval grants, queues, routing tables, agent records, or dispatch state. They do not spawn agents, enqueue workflows, approve gates, close tickets, land changes, revert changes, run shell commands, or apply recommendations. Existing static routing remains authoritative and unchanged.
 
-### Durable structured outcome ledger semantics
+### Durable structured outcome source semantics
 
-Scorecards are derived from durable structured outcome events. The ledger may be materialized or reconstructed from immutable snapshots, but it has event-ledger semantics rather than heuristic cache semantics. Each event carries schema version, deterministic event id, repository, source family, source id/version, archive marker and reason, observed timestamp, explicit dimensions, linked ids, recurrence/coalescing keys, and one structured metric payload.
+Scorecards are derived only from durable structured source families that the daemon can read today. Phase 5 currently reconstructs analytic events from typed daemon records and snapshots. It does not have a separate durable analytics journal, and it does not infer outcomes from text. Each derived event carries schema version, deterministic event id, repository, source family, source id/version when available, archive marker and reason when available, observed timestamp when available, explicit dimensions, linked ids, recurrence/coalescing keys when available, and one structured metric payload.
 
 The normal event shape is:
 
@@ -285,6 +285,25 @@ The event id is deterministic over canonical structured fields. It must not incl
 
 Factory analytics are structured-source-only. They never parse raw logs, prose, issue comments, Markdown, prompt text, transcript text, terminal output, console output, or unstructured agent chatter. Missing fields become `unknown` or `unobserved`, not synthetic success or failure.
 
+The currently available structured families are:
+
+- `AgentRecord`: durable agent/run records with explicit ids and available dimensions such as model, harness, timestamps, status, and linked workflow data when present.
+- `WorkflowInstance`: durable workflow instances with explicit ids, workflow names, lifecycle timestamps, status, and linked agent data when present.
+- `Phase4CiSignal`: structured current CI state for a key, including current failed/pass status. It is a current-state fact only.
+- `HumanGateDecision`: structured approval or gate decision facts for human intervention counting.
+- `RecurrenceKey`: structured recurrence or ticket coalescing keys for recurrence counting.
+
+The following structured families are not available to Phase 5 today and must remain `unobserved` until explicit read seams exist:
+
+- Phase 3 contract outcome and verified delivery enumerators for acceptance or landed delivery.
+- Structured reviewer rework transitions.
+- Typed revert history linked to runs, tickets, or landed outcomes.
+- `PricingSnapshot` records for durable model pricing provenance.
+
+Agent cost fields are not sufficient cost provenance by themselves. `AgentRecord` may carry usage or cost-like values, but Phase 5 must not report `cost_micro_usd` unless a durable pricing snapshot or an equally explicit structured cost provenance record is available for that run. No such source is available today, so cost metrics remain unavailable.
+
+Current Phase 4 CI facts can report present failed/pass state. They cannot report recovery history or recovery counts because Phase 5 does not yet have a transition/history read seam for failed-to-pass changes.
+
 | Metric or dimension | Structured source only | Forbidden inference | Missing behavior |
 | --- | --- | --- | --- |
 | `runs` | Explicit `AgentRecord` or workflow `Instance` ids. | Counting log lines, prompt files, status prose, or terminal output. | Unobserved unless explicit run dimensions exist. |
@@ -292,13 +311,14 @@ Factory analytics are structured-source-only. They never parse raw logs, prose, 
 | `workflow` | Workflow `Instance` id/name. | Command text, transcript text, or terminal output. | Dimension is `unknown`; same workflow comparisons are suppressed. |
 | `harness` | Explicit harness field on agent/run/instance data. | Binary path, CLI output, labels, or model route. | Dimension is `unknown` and can still be aggregated. |
 | `model` | Explicit model field on agent/run data. | Prompt text, transcript text, agent label, or inferred provider. | Dimension is `unknown` and can still be aggregated. |
-| `accepted` | Phase 3 verified delivery or land structured outcome. | Absence of rework, green CI, closing prose, or issue comments. | Metric unavailable for that run unless explicit outcome exists. |
-| `reworked` | Structured reviewer rework transition. | Review comment prose, TODO text, or labels. | Metric unavailable for that run. |
-| `ci_failed` / `ci_recovered` | Phase 4 CI signals. Recovery needs explicit failed then explicit recovered/pass for the same key. | Build-log text or later acceptance. | Metric unavailable unless structured signal exists. |
-| `reverted` | Structured revert event linked to run, ticket, or landed outcome. | Commit-message search or prose. | Metric unavailable for that run. |
-| `human_interventions` | Explicit gate, approval, or decision event. | Mentions, comments, delay, or approval prose. | Metric unavailable for that run. |
-| `recurrence` | Explicit non-empty `recurrence_key` or coalesce key. | Similarity over titles, stack traces, logs, or prose. | Metric unavailable without explicit key. |
-| `cost_micro_usd` | Structured cost reported directly by `AgentRecord`, or structured token usage plus an explicit pricing snapshot. | Estimating from model name alone. | Metric unavailable for that run. |
+| `accepted` | Phase 3 verified delivery or land structured outcome enumerator. This source is not available today. | Absence of rework, green CI, closing prose, or issue comments. | Metric unavailable for that run unless explicit outcome exists. |
+| `reworked` | Structured reviewer rework transition. This source is not available today. | Review comment prose, TODO text, or labels. | Metric unavailable for that run. |
+| `ci_failed` | Current structured Phase 4 CI signal state for the same key. | Build-log text, terminal text, or later acceptance. | Metric unavailable unless a structured current signal exists. |
+| `ci_recovered` | Phase 4 CI transition/history record proving failed then recovered/pass for the same key. This history seam is not available today. | Current green CI alone, build-log text, or later acceptance. | Metric unavailable until structured transition history exists. |
+| `reverted` | Typed revert history linked to run, ticket, or landed outcome. This source is not available today. | Commit-message search or prose. | Metric unavailable for that run. |
+| `human_interventions` | Explicit `HumanGateDecision`, approval, or gate decision event. | Mentions, comments, delay, or approval prose. | Metric unavailable for that run. |
+| `recurrence` | Explicit non-empty `recurrence_key` or `RecurrenceKey` ticket coalesce key. | Similarity over titles, stack traces, logs, or prose. | Metric unavailable without explicit key. |
+| `cost_micro_usd` | Durable `PricingSnapshot`-backed cost provenance or another explicit durable cost provenance record. No such source is available today. | Estimating from model name alone, current pricing tables, or unproven `AgentRecord` cost-like fields. | Metric unavailable for that run. |
 | `lead_time_ms` | Structured lifecycle timestamps for the same run. | File mtimes, commit times, transcript timestamps, or terminal timestamps. | Metric unavailable on missing or invalid timestamps. |
 | `archive_state` | Explicit source archive marker or archived-history read API. | Treating absence from an active query as archived. | Unknown archive state is `unobserved`. |
 
