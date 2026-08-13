@@ -213,7 +213,7 @@ async fn test_second_approve_action_fails_without_lifecycle_reset_or_second_disp
         )
         .await
         .unwrap();
-    assert_eq!(approved["grant"]["status"], "approved");
+    assert_eq!(approved["approval"]["status"], "approved");
 
     let err = client
         .call(
