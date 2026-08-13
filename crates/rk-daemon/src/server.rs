@@ -1207,6 +1207,45 @@ impl Daemon {
         Ok(max_cursor(cursor, replay.boundary))
     }
 
+    /// Collect the owned, read-only structured records the Phase 5 analytics
+    /// adapter normalizes. This clones agent/workflow records out of their
+    /// stores and hands the adapter no mutation-capable handles: the adapter
+    /// cannot reach the registry, engine, tickets, approvals, queue, or
+    /// dispatch. Repo and since/until windowing is applied here so the pure
+    /// adapter only sees in-scope records.
+    fn factory_analytics_inputs(
+        &self,
+        req: &crate::factory_analytics::FactoryAnalyticsRequest,
+    ) -> crate::factory_analytics::AnalyticsInputs {
+        let repo = req.repo.clone().unwrap_or_default();
+        let in_window = |ms: i64| -> bool {
+            req.since.is_none_or(|since| ms >= since)
+                && req.until.is_none_or(|until| ms <= until)
+        };
+        let agents = if req.include_archived {
+            self.supervisor.list_all()
+        } else {
+            self.supervisor.list()
+        }
+        .into_iter()
+        .filter(|agent| req.repo.as_deref().is_none_or(|r| agent.repo_name == r))
+        .filter(|agent| in_window(agent.updated_at.timestamp_millis()))
+        .collect();
+        let instances = if req.include_archived {
+            self.engine().list_all()
+        } else {
+            self.engine().list()
+        }
+        .into_iter()
+        .filter(|instance| req.repo.as_deref().is_none_or(|r| instance.repo == r))
+        .collect();
+        crate::factory_analytics::AnalyticsInputs {
+            repo,
+            agents,
+            instances,
+        }
+    }
+
     fn factory_snapshot(&self, filter: &FactoryEventFilter) -> rk_core::Result<Value> {
         let coord = CoordinatorFilter {
             repo: filter.repo.clone(),
@@ -1667,6 +1706,34 @@ impl Daemon {
                 },
                 Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
             },
+            "factory.scorecards" => {
+                match parse_params::<crate::factory_analytics::FactoryAnalyticsRequest>(&req.params)
+                {
+                    Ok(analytics) => reply(Response::ok(
+                        id,
+                        crate::factory_analytics::scorecards_response(
+                            &self.factory_analytics_inputs(&analytics),
+                            &analytics,
+                            chrono::Utc::now(),
+                        ),
+                    )),
+                    Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+                }
+            }
+            "factory.recommend" => {
+                match parse_params::<crate::factory_analytics::FactoryAnalyticsRequest>(&req.params)
+                {
+                    Ok(analytics) => reply(Response::ok(
+                        id,
+                        crate::factory_analytics::recommend_response(
+                            &self.factory_analytics_inputs(&analytics),
+                            &analytics,
+                            chrono::Utc::now(),
+                        ),
+                    )),
+                    Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+                }
+            }
             "workflow.list" => {
                 let params: WorkflowListParams = match parse_params(&req.params) {
                     Ok(p) => p,

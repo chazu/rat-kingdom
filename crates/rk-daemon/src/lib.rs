@@ -8,6 +8,7 @@ pub mod client;
 pub mod coordinator;
 pub mod cron;
 pub mod drain;
+pub mod factory_analytics;
 pub mod factory_events;
 pub mod inbox;
 pub mod ingest_auth;
