@@ -12,7 +12,7 @@ use rk_daemon::reactor::{Reactor, REACTOR_INSTANCE};
 use rk_daemon::repos::{RepoRecord, RepoRegistry};
 use rk_daemon::supervisor::Supervisor;
 use rk_daemon::tickets::{NewTicket, Tickets};
-use rk_daemon::workflow_exec::WorkflowEngine;
+use rk_daemon::workflow_exec::{Selection, WorkflowEngine};
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -551,6 +551,76 @@ async fn workflow_launch_fails_when_initial_instance_cannot_be_persisted() {
 
     assert!(result.is_err(), "a workflow must not launch without durable instance state");
     assert!(engine.status("must-be-durable").is_none());
+}
+
+#[tokio::test]
+async fn archived_stable_instance_id_prevents_relaunch() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    std::fs::write(
+        repo.path().join(".rk/workflows/react-work.cue"),
+        r#"workflow: {
+            name: "react-work"
+            steps: [
+                {type: "run", command: "true"},
+                {type: "run", command: "true"},
+            ]
+        }"#,
+    )
+    .unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    let (_, engine) = build_reactor_and_engine_with_space(
+        &layout,
+        ReactorConfig::default(),
+        rk_space::Space::open_in_memory().unwrap(),
+    );
+    let id = "stable-archived".to_string();
+    engine
+        .run_owned_with_id(
+            id.clone(),
+            "react-work",
+            &repo.path().to_string_lossy(),
+            Default::default(),
+            None,
+        )
+        .unwrap();
+    for _ in 0..50 {
+        if engine
+            .status(&id)
+            .is_some_and(|instance| instance.status != rk_daemon::workflow_exec::InstanceStatus::Running)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    engine.archive(&Selection::Ids(vec![id.clone()])).unwrap();
+
+    let replay = engine
+        .run_owned_with_id(
+            id.clone(),
+            "react-work",
+            &repo.path().to_string_lossy(),
+            Default::default(),
+            None,
+        )
+        .unwrap();
+
+    assert!(replay.archived_at.is_some());
+    assert!(engine.status(&id).is_none());
+    assert_eq!(engine.list_archived().len(), 1);
+}
+
+#[test]
+fn daemon_rehydrates_workflows_before_starting_dispatch_loops() {
+    let source = include_str!("../src/server.rs");
+    let rehydrate = source.find("daemon.engine().rehydrate();").unwrap();
+    let reactor = source.find("// Reactor loop:").unwrap();
+    let scheduler = source.find("// Scheduler loop:").unwrap();
+
+    assert!(rehydrate < reactor);
+    assert!(rehydrate < scheduler);
 }
 
 /// A matching tuple must remain deliverable when its target repo is briefly

@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
@@ -831,18 +832,17 @@ impl WorkflowEngine {
         ));
     }
 
-    /// Load persisted instances from disk on daemon startup (TKT-52).
+    /// Load persisted instances into memory on daemon startup (TKT-52).
     ///
-    /// Every mutation already writes each instance to
-    /// `<home>/workflow-instances/<id>.json`; this is the missing read side.
-    /// Completed and failed instances are restored for history — so
-    /// `rk workflow status`/`list` and `rk approve` survive a restart — while
-    /// `Running` instances are additionally *resumed*: re-executed from their
-    /// persisted step cursor so a crash or restart mid-run no longer silently
-    /// drops an in-flight workflow (a parked approval gate, a fan-out waiting on
-    /// `wait_all`). Idempotent: instances already in memory are overwritten by
-    /// their on-disk snapshot, so calling it twice is harmless.
-    pub fn rehydrate(self: &Arc<Self>) {
+    /// Every mutation writes each instance to
+    /// `<home>/workflow-instances/<id>.json`; this restores that durable state
+    /// before reactor or scheduler dispatch can mint a duplicate stable id.
+    /// Completed and failed instances are loaded for history. Top-level
+    /// `Running` instances are returned to the caller but are not started here.
+    /// The daemon must call [`resume_rehydrated`](Self::resume_rehydrated) only
+    /// after event consumers are listening. Calling this method again replaces
+    /// the in-memory snapshots with the same durable state.
+    pub fn rehydrate(self: &Arc<Self>) -> Vec<Instance> {
         let mut resumable = Vec::new();
         for instance in self.read_instance_dir(&self.instances_dir()) {
             // Only top-level (depth 0) instances resume standalone. A nested
@@ -872,6 +872,14 @@ impl WorkflowEngine {
                 "resuming in-flight workflow instances after restart"
             );
         }
+        resumable
+    }
+
+    /// Resume the top-level running snapshots returned by [`rehydrate`](Self::rehydrate).
+    ///
+    /// This is deliberately separate from loading durable ids so startup can
+    /// close the duplicate-dispatch window before resumed workflows emit events.
+    pub fn resume_rehydrated(self: &Arc<Self>, resumable: Vec<Instance>) {
         for instance in resumable {
             self.resume(instance);
         }
@@ -2535,6 +2543,9 @@ impl WorkflowEngine {
         if let Some(existing) = instances.get(&instance.id) {
             return Ok(Some(existing.clone()));
         }
+        if let Some(existing) = self.lock_archived().get(&instance.id) {
+            return Ok(Some(existing.clone()));
+        }
         instances.insert(instance.id.clone(), instance.clone());
         if let Err(error) = self.persist(&instance) {
             instances.remove(&instance.id);
@@ -2630,18 +2641,9 @@ impl WorkflowEngine {
     }
 
     fn persist_to(&self, dir: &Path, instance: &Instance) -> rk_core::Result<()> {
-        std::fs::create_dir_all(dir)?;
         let path = dir.join(format!("{}.json", instance.id));
         let data = serde_json::to_vec_pretty(instance)?;
-        let sequence = PERSIST_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = dir.join(format!(
-            "{}.json.tmp-{}-{sequence}",
-            instance.id,
-            std::process::id()
-        ));
-        std::fs::write(&tmp, data)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        persist_bytes_atomically(&path, &data)
     }
 
     fn record_persistence_failure(&self, path: &Path, error: String) {
@@ -2672,6 +2674,52 @@ impl WorkflowEngine {
             Err(p) => p.into_inner(),
         }
     }
+}
+
+/// Replace one workflow snapshot durably.
+///
+/// The temporary file is synced before rename, then the parent directory is
+/// synced so both file contents and the directory entry survive a crash.
+fn persist_bytes_atomically(path: &Path, data: &[u8]) -> rk_core::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| rk_core::Error::other("workflow snapshot path has no parent"))?;
+    std::fs::create_dir_all(dir)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| rk_core::Error::other("workflow snapshot path has no file name"))?;
+    let sequence = PERSIST_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(
+        "{file_name}.tmp-{}-{sequence}",
+        std::process::id()
+    ));
+    let result = (|| -> rk_core::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        sync_directory(dir)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn sync_directory(dir: &Path) -> rk_core::Result<()> {
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_dir: &Path) -> rk_core::Result<()> {
+    Ok(())
 }
 
 /// A ticket flattened into the fields a fan-out task template can bind, plus the
@@ -2955,6 +3003,22 @@ fn step_label(step: &Step) -> String {
 mod tests {
     use super::*;
     use rk_core::id::RecordId;
+
+    #[test]
+    fn atomic_persist_replaces_file_without_temporary_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.json");
+
+        persist_bytes_atomically(&path, b"first").unwrap();
+        persist_bytes_atomically(&path, b"second").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("instance.json")]);
+    }
 
     #[test]
     fn interpolate_replaces_ctx_placeholders() {

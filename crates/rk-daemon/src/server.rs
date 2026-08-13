@@ -481,6 +481,12 @@ impl Daemon {
         let daemon = Arc::new(self);
         let mut shutdown_rx = daemon.shutdown_tx.subscribe();
 
+        // Restore every durable workflow id before any reactor or scheduler task
+        // can dispatch. Resume execution only after those consumers are listening
+        // so completion events remain observable without opening a duplicate-ID
+        // launch window during startup.
+        let resumable_workflows = daemon.engine().rehydrate();
+
         // GC loop: decay pheromone trails and collect faded/expired tuples —
         // escalation/analytics live elsewhere.
         {
@@ -748,13 +754,9 @@ impl Daemon {
             });
         }
 
-        // Rehydrate persisted workflow instances (TKT-52): restore status/list
-        // history and RESUME any that were mid-run when the daemon last stopped
-        // — a crash/restart no longer silently drops in-flight instances
-        // (parked gates, fan-outs awaiting wait_all). Runs after the socket bind
-        // (shared state is safe to touch) and after the reactor/scheduler are up
-        // so a resumed instance's completion event is observed by them.
-        daemon.engine().rehydrate();
+        // The maps were rehydrated before dispatch loops started. Now that
+        // reactor/scheduler consumers are listening, resume in-flight instances.
+        daemon.engine().resume_rehydrated(resumable_workflows);
 
         loop {
             tokio::select! {
