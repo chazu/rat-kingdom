@@ -184,6 +184,11 @@ fn test_transaction_rolls_back_when_tuple_projection_fails() {
         .scan(&Pattern::category(Category::Fact))
         .unwrap()
         .is_empty());
+    assert_eq!(
+        space.latest_persistence_sequence().unwrap(),
+        0,
+        "rolled-back tuple projections must not consume persistence sequences"
+    );
 }
 
 #[test]

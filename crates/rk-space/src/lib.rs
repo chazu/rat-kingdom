@@ -15,7 +15,7 @@
 
 mod store;
 
-pub use store::SdlcTransitionRecord;
+pub use store::{PersistenceDelta, SdlcTransitionRecord};
 
 use rk_core::sdlc::{ConfiguredSourceName, SignalEnvelope, SignalReceipt, SignalSourcePrincipal};
 use rk_core::tuple::{Lifecycle, Pattern, Tuple};
@@ -179,6 +179,28 @@ impl Space {
         subject: Option<&str>,
     ) -> rk_core::Result<Vec<Tuple>> {
         self.lock().store.current_sdlc_facts(source, scope, subject)
+    }
+
+    /// The durable SQLite persistence high-water mark for ordinary tuple writes.
+    /// Sequence zero means no tuple has been persisted yet.
+    pub fn latest_persistence_sequence(&self) -> rk_core::Result<u64> {
+        self.lock().store.latest_persistence_sequence()
+    }
+
+    /// Return current tuples persisted after `after`, ordered by SQLite commit
+    /// sequence, plus the captured durable boundary for at-least-once consumers.
+    pub fn persistence_delta(&self, after: Option<u64>) -> rk_core::Result<PersistenceDelta> {
+        self.lock().store.persistence_delta(after)
+    }
+
+    /// Convert a legacy ULID cursor against only the deterministic migration
+    /// baseline. Post-migration low-ULID writes are deliberately excluded so
+    /// they remain visible to the new persistence cursor.
+    pub fn legacy_persistence_sequence(
+        &self,
+        id: rk_core::id::RecordId,
+    ) -> rk_core::Result<Option<u64>> {
+        self.lock().store.legacy_persistence_sequence(id)
     }
 
     pub fn enable_sdlc_rollback_injection_for_tests(&self, enabled: bool) {
