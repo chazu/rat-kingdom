@@ -59,7 +59,7 @@ Implement these exact tests:
 Run:
 
 ```bash
-cargo test -p rk-core action_digest -- --nocapture
+cargo test -p rk-core --test action_digest -- --nocapture
 ```
 
 Expected: failure because `rk_core::action` does not exist.
@@ -390,7 +390,7 @@ git commit -m "feat: render factory dashboard state"
 Run:
 
 ```bash
-cargo test -p rk-core action_digest -- --nocapture
+cargo test -p rk-core --test action_digest -- --nocapture
 cargo test -p rk-daemon --test workflow_run_approval -- --nocapture
 cargo test -p rk-daemon --test factory_events -- --nocapture
 cargo test -p rk-cli --test workflow_run_approval -- --nocapture

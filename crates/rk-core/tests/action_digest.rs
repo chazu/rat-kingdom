@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 
 use chrono::{TimeZone, Utc};
 use rk_core::action::{
-    canonical_digest, canonical_json_bytes, ActionKind, ActionProposal, ActionRisk, ActionScope,
-    FactoryAction, RepoScope, WorkflowRunAction,
+    action_digest, canonical_digest, canonical_json_bytes, ActionKind, ActionProposal, ActionRisk,
+    ActionScope, FactoryAction, RepoScope, WorkflowRunAction,
 };
+use serde::Serialize;
 use serde_json::{json, Value};
 
 fn params(entries: &[(&str, Value)]) -> BTreeMap<String, Value> {
@@ -41,10 +42,21 @@ fn proposal(requester: &str) -> ActionProposal {
         },
         requester: requester.into(),
         action,
+        nonce: "nonce-01".into(),
         created_at: Utc.with_ymd_and_hms(2026, 8, 13, 10, 0, 0).unwrap(),
         expires_at: Utc.with_ymd_and_hms(2026, 8, 13, 10, 5, 0).unwrap(),
         status: "proposed".into(),
     }
+}
+
+#[derive(Serialize)]
+struct FloatPayload {
+    value: f64,
+}
+
+#[derive(Serialize)]
+struct NestedFloatPayload {
+    values: Vec<FloatPayload>,
 }
 
 #[test]
@@ -120,4 +132,64 @@ fn test_canonical_json_has_sorted_object_keys() {
         json,
         r#"{"action":"workflow.run","params":{"alpha":2,"zeta":1}}"#
     );
+}
+
+#[test]
+fn test_canonical_json_rejects_nan_before_value_serialization() {
+    let err = canonical_json_bytes(&FloatPayload { value: f64::NAN }).unwrap_err();
+
+    assert!(
+        err.to_string().contains("non-finite float"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_canonical_json_rejects_infinities_recursively_before_value_serialization() {
+    for value in [f64::INFINITY, f64::NEG_INFINITY] {
+        let err = canonical_json_bytes(&NestedFloatPayload {
+            values: vec![FloatPayload { value }],
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("non-finite float"),
+            "unexpected error for {value}: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_action_digest_payload_excludes_proposal_digest_and_status() {
+    let proposal = proposal("operator-a");
+    let baseline = proposal.digest_payload();
+    let mut changed_status = proposal.clone();
+    changed_status.status = "approved".into();
+    let mut changed_digest = proposal.clone();
+    changed_digest.digest = "tampered".into();
+
+    assert_eq!(
+        action_digest(&baseline).unwrap(),
+        action_digest(&changed_status.digest_payload()).unwrap()
+    );
+    assert_eq!(
+        action_digest(&baseline).unwrap(),
+        action_digest(&changed_digest.digest_payload()).unwrap()
+    );
+}
+
+#[test]
+fn test_action_digest_payload_binds_nonce_and_expiry() {
+    let proposal = proposal("operator-a");
+    let baseline = proposal.digest_payload();
+    let mut changed_nonce_proposal = proposal.clone();
+    changed_nonce_proposal.nonce = "nonce-02".into();
+    let changed_nonce = changed_nonce_proposal.digest_payload();
+    let mut changed_expiry_proposal = proposal.clone();
+    changed_expiry_proposal.expires_at = Utc.with_ymd_and_hms(2026, 8, 13, 10, 10, 0).unwrap();
+    let changed_expiry = changed_expiry_proposal.digest_payload();
+
+    let baseline_digest = action_digest(&baseline).unwrap();
+    assert_ne!(baseline_digest, action_digest(&changed_nonce).unwrap());
+    assert_ne!(baseline_digest, action_digest(&changed_expiry).unwrap());
 }
