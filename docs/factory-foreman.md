@@ -1,8 +1,81 @@
 # Factory Foreman
 
-Factory Foreman is a repository-local Jcode skill for read-only Rat Kingdom factory triage. It collects deterministic snapshots from existing `rk --json` commands, classifies known reliability symptoms, and can prepare workflow dispatch proposals that require explicit human approval before any mutation. Typed execution paths additionally require daemon-verifiable approval of the exact canonical digest before dispatch; the Phase 1 helper remains a fallback for legacy/manual proposal validation.
+Factory Foreman combines a repository-local Jcode triage skill with native typed Rat Kingdom factory interfaces. The Python helper collects deterministic read-only observations and classifies known reliability symptoms. The native CLI and MCP paths expose daemon snapshots and events plus an approval-gated `workflow.run` path whose authority remains in the daemon.
 
-Phase 1 intentionally changes no Rat Kingdom daemon, workflow, ticket, repository-policy, or harness semantics.
+The Python helper remains a compatibility and triage surface. It is not the source of typed approval or execution authority.
+
+## Native typed factory interface
+
+The global JSON flag comes before the subcommand:
+
+```bash
+rk --json factory snapshot --repo <registered-name-or-path>
+rk --json factory events replay --repo <registered-name-or-path> --after <cursor> --limit 256
+rk --json factory events watch --repo <registered-name-or-path> --after <cursor>
+```
+
+`snapshot` and `events replay` are finite reads and do not auto-start the daemon. `events watch` first emits the replay page as NDJSON event rows, then continues with live projected events. A missing daemon is an error for these read commands. Proposal, approval, and execution commands may connect or start the daemon through the ordinary CLI client behavior.
+
+The typed mutation sequence is:
+
+```bash
+rk --json factory propose-workflow <workflow> \
+  --repo <registered-name-or-path> \
+  --param KEY=VALUE \
+  --coordinator <session-id>
+
+rk --json factory approve <proposal-id> <digest>
+
+rk --json factory execute-workflow <proposal-id> <digest> \
+  --workflow <workflow> \
+  --repo <same-registered-name-or-path> \
+  --param KEY=VALUE \
+  --coordinator <same-session-id>
+```
+
+`--param` is repeatable and CLI values are strings. Execution must repeat the exact typed action. A changed workflow, repository, parameter, or coordinator does not reuse the approval.
+
+### Daemon digest authority
+
+Human-readable commands, dashboard text, MCP tool text, and the Phase 1 helper digest are not execution authority. For the native typed path, the daemon:
+
+1. resolves the supplied repository name or path against the registered repository record;
+2. replaces caller-supplied repository identity and path with the registered identity and canonical filesystem path;
+3. takes the requester and approving operator from authenticated request identity rather than action parameters;
+4. creates a versioned proposal and computes lowercase SHA-256 over recursively key-sorted compact JSON;
+5. persists the proposal and exact approval grant;
+6. immediately before execution, resolves the repository again and recomputes the action digest;
+7. rejects missing, unknown, expired, consumed, caller-mismatched, kind-mismatched, scope-mismatched, or tampered approvals.
+
+The immutable digest payload contains `schema`, `kind`, `risk`, daemon-resolved repository `scope` (`identity` and canonical `path`), authenticated `requester`, typed `action`, random `nonce`, and `expires_at`. Proposal lifecycle fields such as `id`, `digest`, `created_at`, and `status` are not digest input. For `workflow.run`, the action covers workflow name, repository reference, daemon-resolved identity/path, sorted parameters, and optional coordinator.
+
+Approval grants persist `proposal_id`, digest, kind, scope, requester, authenticated `approved_by`, timestamps, and status. Status advances through `approved`, `executing`, and `consumed`, or `failed`. Persisted execution and instance IDs make retry/restart handling idempotent enough to return or resume the recorded execution instead of starting a second workflow. A consumed approval cannot execute twice.
+
+This does **not** mean legacy `workflow.run` is globally digest-gated. Existing direct operator CLI/RPC workflows remain available. Jcode and MCP automation that needs this approval boundary must use the typed `factory.*` proposal path.
+
+### Five MCP tools
+
+`rk-mcp` is a local stdio JSON-RPC/MCP facade. `tools/list` publishes exactly these schema-versioned tools:
+
+| Tool | Purpose | Required arguments |
+| --- | --- | --- |
+| `factory_snapshot` | Read one finite daemon snapshot. | `schema: 1`, `repo` |
+| `factory_events_replay` | Read one bounded event page. | `schema: 1`, `repo`, `limit`, optional `kinds`, optional `after` |
+| `propose_workflow_run` | Create, but do not execute, a typed proposal. | `schema: 1`, `workflow`, `repo`, optional `params`, optional `coordinator`, optional `ttl` |
+| `approve_action` | Approve one proposal by exact digest. | `schema: 1`, `proposal_id`, `digest` |
+| `execute_approved_workflow_run` | Execute the exact approved action. | `schema: 1`, `proposal_id`, `digest`, nested `action` matching the workflow request schema |
+
+Unknown fields are rejected. The MCP process connects to the local daemon without spawning it, forwards daemon RPC error codes in structured tool errors, and inherits daemon authentication and caller semantics. It offers bounded replay, not a streaming watch tool.
+
+### Snapshot, replay, and watch semantics
+
+`factory.snapshot` returns schema `1`, the latest durable cursor, and a snapshot containing filtered agents, workflows, tickets, approvals (`proposals` and `grants`), budget, inbox, and repository resync state. Repository filters accept a registered repository name or path. `--include-archived` includes archived agent and workflow records.
+
+Factory events are a projection of existing durable coordinator events whose tuple identity is `factory_event`. Each projected event has schema, monotonic cursor, occurrence time, kind, repo, authenticated caller, source, subject, summary, and payload. This is not a second journal.
+
+Replay scans events strictly after `after`, returns at most 256 events, and includes `boundary` plus `truncated`. Filters may restrict repository and repeat `--kind`. Because projection and filtering happen after the bounded durable scan, a page may contain fewer matching projected events than the scan limit.
+
+Watch subscribes before replay, returns the finite replay response, then streams `factory.event` notifications after the replay boundary while suppressing duplicate cursors. If durable catch-up is truncated it emits `factory.resync` with `resync_required: true` and a boundary. If the live broadcast receiver lags, the CLI reports a `lagged` notification and the daemon performs durable catch-up before continuing. Consumers must treat the cursor as the ordering/resume token and refresh the snapshot when resync is required.
 
 ## Installation and discovery
 
@@ -255,15 +328,14 @@ The 2026-08-13 local acceptance run wrote its JSON artifact under `$JCODE_SCRATC
 
 Unknown findings in that report need future classifiers once the failure patterns are understood.
 
-## Phase 1 limitations
+## Phase 2 limitations
 
-Phase 1 limitations are deliberate:
-
-- no typed MCP transport.
-- no daemon subscription.
-- no cryptographic or daemon-enforced approval token.
-- no automatic dispatch.
-- read commands are preceded by strict `rk --json daemon status`, but once connected they may still cause ordinary daemon logging or access-time state.
-- approval identity is proposal-digest checked by the Phase 1 helper only as a fallback legacy/manual guard. Typed execution requires daemon-verifiable exact digest approval before dispatch.
-- no CI, deployment, or production signal ingestion.
-- deterministic hints are not root causes.
+- The five-tool MCP surface and typed CLI mutation documented here support only the initial `workflow.run` proposal, approval, and execution flow. This is not a claim that every mutation in Rat Kingdom is typed or gated this way.
+- Legacy direct mutation RPCs and operator CLI flows may remain. In particular, legacy `workflow.run` is not globally gated. Jcode/MCP callers that require digest binding must use `factory.propose_action`, `factory.approve_action`, and `factory.execute_action` through the typed surfaces.
+- The factory event feed projects existing coordinator events. It is not external CI, deployment, production, or general SDLC ingestion, and it is not a separate durable journal.
+- `rk-mcp` uses local stdio and local daemon connectivity. It has no remote transport and no MCP streaming watch tool.
+- The dashboard is a pure renderer over saved snapshot and replay files. It is not live, authoritative, or a control plane.
+- The Python triage helper provides deterministic hints, not proven root causes or daemon authority. Its legacy `argv` digest is not interchangeable with the daemon canonical typed-action digest.
+- A canonical digest proves that approval and execution refer to the same exact typed action, scope, requester, nonce, and expiry. It does not prove the workflow is safe, useful, or a good human decision.
+- Snapshot and replay are bounded views. Truncation or resync signals require cursor-aware recovery and a fresh snapshot.
+- Disposable acceptance must use an isolated `RK_HOME` plus a disposable registered Git repository and workflow path. Do not run mutating acceptance against an ambient Rat Kingdom daemon or the working repository.

@@ -30,13 +30,13 @@ tuplespace db, worktrees, logs, workflow definitions, sync state.
 
 ## Factory Foreman
 
-The repository-local Jcode Factory Foreman skill provides read-only Rat Kingdom factory triage from existing `rk --json` commands, deterministic reliability categories, and approval-gated workflow dispatch proposals. Start with:
+The repository-local Jcode Factory Foreman provides deterministic read-only triage plus native daemon snapshots/events, five local stdio MCP tools, and digest-bound typed `workflow.run` proposals whose execution authority remains in the daemon. Start the compatibility triage helper with:
 
 ```bash
 python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py triage --repo rat-kingdom --format markdown
 ```
 
-It never auto-starts the daemon: strict `rk --json daemon status` must pass before any observation command runs. Mutating workflow dispatch requires a later human approval of the exact rendered proposal ID or command, followed by proposal validation. See [docs/factory-foreman.md](docs/factory-foreman.md) for installation, schema, categories, approval boundary, live acceptance evidence, monitoring, recovery, and Phase 1 limitations.
+The helper never auto-starts the daemon: strict `rk --json daemon status` must pass before observation. Native typed automation uses `rk --json factory ...` or `rk-mcp`; exact digest approval is daemon-enforced for that factory path, but legacy `workflow.run` is not globally gated. See [docs/factory-foreman.md](docs/factory-foreman.md) for authority, CLI/MCP schemas, snapshot/replay/watch semantics, renderer usage, recovery, and limitations.
 
 ## Five-minute tour
 
