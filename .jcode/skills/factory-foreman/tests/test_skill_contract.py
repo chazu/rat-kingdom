@@ -88,6 +88,39 @@ class FactoryForemanSkillContractTests(unittest.TestCase):
         for phrase in required:
             self.assertIn(phrase, self.skill_text)
 
+    def test_reference_documents_current_triage_json_contract(self):
+        required_terms = [
+            '"schema": 1',
+            '"repo": "repository name"',
+            '"findings": [',
+            '"snapshot": {',
+            '"snapshot_health": {',
+            '"observations": {',
+            '"schema": "factory-foreman.snapshot.v1"',
+            '"generated_at": "1970-01-01T00:00:00Z"',
+            '"healthy": false',
+            '"errors": []',
+            '"definitions"',
+        ]
+        for term in required_terms:
+            self.assertIn(term, self.reference_text)
+        self.assertNotIn('"workflow_defs"', self.reference_text)
+
+    def test_reference_documents_every_emitted_triage_category(self):
+        categories = [
+            "budget-pressure",
+            "empty-harness-result",
+            "missing-rk-executable",
+            "named-check-failure",
+            "orphaned-agent",
+            "permission-or-authority",
+            "stale-or-moved-base",
+            "unknown",
+            "workflow-timeout",
+        ]
+        for category in categories:
+            self.assertIn(f"`{category}`", self.reference_text)
+
 
 if __name__ == "__main__":
     unittest.main()

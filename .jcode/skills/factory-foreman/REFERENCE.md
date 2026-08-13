@@ -4,7 +4,7 @@ This reference supports the `factory-foreman` skill for Rat Kingdom factory, fle
 
 ## Categories
 
-Common triage categories emitted by the helper include:
+Triage categories emitted by the helper include:
 
 - `missing-rk-executable`: `rk` is unavailable to a worker or environment.
 - `empty-harness-result`: a workflow returned no declared harness result.
@@ -12,6 +12,8 @@ Common triage categories emitted by the helper include:
 - `workflow-timeout`: a workflow instance exceeded its timeout.
 - `orphaned-agent`: an agent appears detached from an active workflow.
 - `budget-pressure`: a workflow instance is close to its configured budget.
+- `permission-or-authority`: a worker lacks permission or authority for the requested action.
+- `stale-or-moved-base`: a workflow appears based on stale or moved repository state.
 - `unknown`: evidence did not match a known category and must be preserved.
 
 ## JSON schema
@@ -21,35 +23,46 @@ Common triage categories emitted by the helper include:
 ```json
 {
   "schema": 1,
-  "generated_at": "ISO-8601 timestamp",
   "repo": "repository name",
-  "healthy": false,
+  "findings": [
+    {
+      "category": "named-check-failure",
+      "severity": "high",
+      "subject": "cargo test",
+      "summary": "Named check failed.",
+      "evidence": "observed output or JSON field",
+      "recommended_next_step": "Inspect and rerun the named check before landing.",
+      "workflow_instance": "workflow id when known",
+      "agent": "agent id when known"
+    }
+  ],
   "snapshot": {
+    "schema": "factory-foreman.snapshot.v1",
+    "generated_at": "1970-01-01T00:00:00Z",
+    "repo": "repository name",
+    "healthy": false,
     "observations": {
       "agents": {"ok": true, "command": "rk --json list", "data": {}},
       "inbox": {"ok": true, "command": "rk --json inbox", "data": {}},
       "workflows": {"ok": true, "command": "rk --json workflow list", "data": {}},
-      "workflow_defs": {"ok": true, "command": "rk --json workflow defs --repo <repo>", "data": {}},
+      "definitions": {"ok": true, "command": "rk --json workflow defs --repo <repo>", "data": {}},
       "cost": {"ok": true, "command": "rk --json cost --fleet", "data": {}},
       "repository": {"ok": true, "command": "rk --json repo show <repo>", "data": {}},
       "tickets": {"ok": true, "command": "rk --json ticket list --repo <repo>", "data": {}}
     },
     "errors": []
   },
-  "findings": [
-    {
-      "category": "named-check-failure",
-      "severity": "high",
-      "subject": "cargo test",
-      "evidence": "observed output or JSON field",
-      "workflow_instance": "workflow id when known",
-      "agent": "agent id when known"
-    }
-  ]
+  "snapshot_health": {
+    "healthy": false,
+    "errors": []
+  },
+  "observations": {
+    "definitions": {"ok": true, "command": "rk --json workflow defs --repo <repo>", "data": {}}
+  }
 }
 ```
 
-A failed observation remains in `observations` with `ok: false` and an `error`. Report that degradation before drawing conclusions.
+A failed observation remains in top-level `observations` and nested `snapshot.observations` with `ok: false` and an `error`. Report that degradation before drawing conclusions.
 
 ## Approval examples
 
