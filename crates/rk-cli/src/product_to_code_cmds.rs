@@ -22,6 +22,49 @@ pub enum ProductToCodeCommand {
         #[command(subcommand)]
         command: GraphCommand,
     },
+    /// Validate generic evidence and gate dispatch or delivery.
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommand,
+    },
+    /// Require impact evidence before feature dispatch.
+    DispatchGate(DispatchGateArgs),
+    /// Require verification and applicable delivery evidence.
+    DeliveryGate(DeliveryGateArgs),
+}
+
+#[derive(Subcommand)]
+pub enum EvidenceCommand {
+    /// Validate one local generic evidence JSON file against an initiative.
+    Validate(EvidenceValidateArgs),
+}
+
+#[derive(Args)]
+pub struct EvidenceValidateArgs {
+    #[arg(long)]
+    evidence: PathBuf,
+    #[arg(long)]
+    initiative: PathBuf,
+}
+
+#[derive(Args)]
+pub struct DispatchGateArgs {
+    #[arg(long)]
+    ticket: PathBuf,
+    #[arg(long)]
+    evidence_dir: PathBuf,
+}
+
+#[derive(Args)]
+pub struct DeliveryGateArgs {
+    #[arg(long)]
+    ticket: PathBuf,
+    #[arg(long)]
+    verification_report: PathBuf,
+    #[arg(long)]
+    evidence_dir: PathBuf,
+    #[arg(long)]
+    initiative: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -277,7 +320,6 @@ fn read_graph_and_initiative(
     Ok((read_json(graph)?, initiative))
 }
 
-
 fn run_research(command: ResearchCommand, json_output: bool) -> Result<i32> {
     match command {
         ResearchCommand::Validate(args) => {
@@ -321,4 +363,31 @@ fn run_research(command: ResearchCommand, json_output: bool) -> Result<i32> {
 fn read_json<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<T> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parse {} as JSON", path.display()))
+}
+
+fn read_evidence_dir(path: &PathBuf) -> Result<Vec<GenericEvidence>> {
+    let mut files = std::fs::read_dir(path)
+        .with_context(|| format!("read evidence dir {}", path.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    files.sort_by_key(|entry| entry.path());
+    files
+        .into_iter()
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .map(|entry| read_json(&entry.path()))
+        .collect()
+}
+
+fn print_json_or_errors(value: &serde_json::Value, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string(value)?);
+    } else if value["valid"].as_bool().unwrap_or(false) {
+        println!("valid");
+    } else if let Some(errors) = value["errors"].as_array() {
+        for error in errors {
+            if let Some(error) = error.as_str() {
+                eprintln!("error: {error}");
+            }
+        }
+    }
+    Ok(())
 }

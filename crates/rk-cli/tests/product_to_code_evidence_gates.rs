@@ -109,6 +109,36 @@ mod product_to_code_evidence_gates {
     }
 
     #[test]
+    fn test_dispatch_gate_rejects_malformed_impact_contract() {
+        let value = json_failure(run(&[
+            "--json",
+            "product-to-code",
+            "dispatch-gate",
+            "--ticket",
+            &fixture("ticket_browser_applicable.json"),
+            "--evidence-dir",
+            &fixture("evidence_malformed_impact"),
+        ]));
+        let errors = value["errors"].to_string();
+        assert!(errors.contains("summary must not be empty"), "{errors}");
+    }
+
+    #[test]
+    fn test_dispatch_gate_rejects_impact_without_current_artifact_hash() {
+        let value = json_failure(run(&[
+            "--json",
+            "product-to-code",
+            "dispatch-gate",
+            "--ticket",
+            &fixture("ticket_browser_applicable.json"),
+            "--evidence-dir",
+            &fixture("evidence_missing_current_hash"),
+        ]));
+        let errors = value["errors"].to_string();
+        assert!(errors.contains("current_artifact_hash"), "{errors}");
+    }
+
+    #[test]
     fn test_delivery_gate_requires_browser_acceptance_when_applicable() {
         let value = json_failure(run(&[
             "--json",
@@ -140,6 +170,28 @@ mod product_to_code_evidence_gates {
         ]));
         assert_eq!(value["valid"], true);
         assert_eq!(value["mapped_criteria"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_delivery_gate_rejects_verification_report_for_other_initiative() {
+        let value = json_failure(run(&[
+            "--json",
+            "product-to-code",
+            "delivery-gate",
+            "--ticket",
+            &fixture("ticket_non_browser.json"),
+            "--verification-report",
+            &fixture("verification_non_browser.json"),
+            "--evidence-dir",
+            &fixture("evidence_test_review"),
+            "--initiative",
+            &fixture("initiative_other.json"),
+        ]));
+        let errors = value["errors"].to_string();
+        assert!(
+            errors.contains("must match initiative id INIT-other"),
+            "{errors}"
+        );
     }
 
     #[test]

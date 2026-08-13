@@ -48,7 +48,8 @@ pub fn dispatch_gate(ticket: &TicketGraphNode, evidence: &[GenericEvidence]) -> 
     let mut errors = Vec::new();
     let mut accepted = Vec::new();
     for item in evidence.iter().filter(|item| item.kind == "impact") {
-        let item_errors = validate_impact_payload(item, Some(ticket));
+        let mut item_errors = contract_errors(item);
+        item_errors.extend(validate_impact_payload(item, Some(ticket)));
         if item_errors.is_empty() {
             accepted.push(item.id.clone());
         } else {
@@ -78,11 +79,20 @@ pub fn delivery_gate(
     evidence: &[GenericEvidence],
 ) -> GateReport {
     let known_evidence: Vec<String> = evidence.iter().map(|item| item.id.clone()).collect();
-    let mut errors = report
-        .validate_against(&ticket.acceptance_criterion_ids, &known_evidence)
-        .err()
-        .map(|error| vec![error.to_string()])
-        .unwrap_or_default();
+    let mut errors = Vec::new();
+    if report.initiative_id != initiative.id {
+        errors.push(format!(
+            "verification report initiative_id {} must match initiative id {}",
+            report.initiative_id, initiative.id
+        ));
+    }
+    errors.extend(
+        report
+            .validate_against(&ticket.acceptance_criterion_ids, &known_evidence)
+            .err()
+            .map(|error| vec![error.to_string()])
+            .unwrap_or_default(),
+    );
 
     let mut applicable: BTreeSet<String> = BTreeSet::new();
     if initiative.browser_acceptance_applicable || ticket_browser_applicable(ticket) {
@@ -148,6 +158,7 @@ fn validate_impact_payload(
 ) -> Vec<String> {
     let mut errors = Vec::new();
     require_payload_string(&mut errors, evidence, "artifact_hash");
+    require_payload_string(&mut errors, evidence, "current_artifact_hash");
     require_payload_string(&mut errors, evidence, "timestamp");
     require_payload_array(&mut errors, evidence, "covers", "ticket_ids");
     require_payload_array(&mut errors, evidence, "covers", "files_or_symbols");
@@ -172,7 +183,7 @@ fn validate_impact_payload(
                 evidence.id, ticket.id
             ));
         }
-        if current_hash.is_some() && current_hash != artifact_hash {
+        if current_hash != artifact_hash {
             errors.push(format!(
                 "impact evidence {} artifact_hash is stale for ticket {}",
                 evidence.id, ticket.id
