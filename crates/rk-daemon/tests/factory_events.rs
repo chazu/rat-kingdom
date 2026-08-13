@@ -414,10 +414,7 @@ async fn test_watch_durable_catchup_after_truncated_boundary() {
         .unwrap();
     assert_eq!(initial["events"].as_array().unwrap().len(), 1);
     assert!(initial["events"][0]["cursor"].as_u64().unwrap() > boundary);
-    assert_eq!(
-        initial["events"][0]["payload"]["proposal_id"].is_string(),
-        true
-    );
+    assert!(initial["events"][0]["payload"]["proposal_id"].is_string());
     client.call("stop", json!({})).await.unwrap();
     handle.await.unwrap().unwrap();
 }
