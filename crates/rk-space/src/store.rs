@@ -74,6 +74,9 @@ CREATE TABLE IF NOT EXISTS tuple_persistence_events (
     expires_at      TEXT,
     strength        REAL
 );
+CREATE TABLE IF NOT EXISTS rk_store_migrations (
+    version TEXT PRIMARY KEY
+);
 CREATE TABLE IF NOT EXISTS coordinator_events (
     sequence   INTEGER PRIMARY KEY AUTOINCREMENT,
     tuple_id   TEXT NOT NULL UNIQUE,
@@ -192,11 +195,12 @@ struct CurrentSdlcState {
 fn migrate(
     conn: &mut Connection,
     sequence_schema_preexisting: bool,
-    journal_guards_preexisting: bool,
+    journal_trusted: bool,
 ) -> rk_core::Result<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql_err)?;
+    tx.execute_batch(SCHEMA).map_err(sql_err)?;
     let strength_exists: bool = tx
         .query_row(
             "SELECT EXISTS(
@@ -265,21 +269,24 @@ fn migrate(
         }
     }
     backfill_tuple_sequences(&tx, sequence_schema_preexisting)?;
-    backfill_tuple_persistence_events(&tx)?;
-    if sequence_schema_preexisting
-        && !journal_guards_preexisting
-        && !journal_floor_exists
-        && !journal_is_fully_backfilled(&tx)?
-    {
-        tx.execute(
-            "UPDATE tuple_sequence_state
-                SET journal_floor_sequence = last_sequence
-              WHERE singleton = 1",
-            [],
-        )
-        .map_err(sql_err)?;
+    if journal_trusted {
+        validate_sequence_journal(&tx)?;
+    } else {
+        backfill_tuple_persistence_events(&tx)?;
+        if sequence_schema_preexisting
+            && !journal_floor_exists
+            && !journal_is_fully_backfilled(&tx)?
+        {
+            tx.execute(
+                "UPDATE tuple_sequence_state
+                    SET journal_floor_sequence = last_sequence
+                  WHERE singleton = 1",
+                [],
+            )
+            .map_err(sql_err)?;
+        }
+        validate_sequence_journal(&tx)?;
     }
-    validate_sequence_journal(&tx)?;
     backfill_legacy_deployment_ordering(&tx)?;
     tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_tuples_strength
@@ -348,7 +355,9 @@ fn migrate(
          BEFORE DELETE ON tuple_persistence_events
          BEGIN
              SELECT RAISE(ABORT, 'tuple persistence journal is immutable');
-         END;",
+         END;
+         INSERT OR IGNORE INTO rk_store_migrations (version)
+         VALUES ('tuple_persistence_journal_v1');",
     )
     .map_err(sql_err)?;
     tx.commit().map_err(sql_err)
@@ -580,6 +589,31 @@ fn valid_rfc3339_field(payload: &serde_json::Value, field: &str) -> Option<Strin
     Some(value.to_string())
 }
 
+fn journal_marker_exists(conn: &Connection) -> rk_core::Result<bool> {
+    let marker_table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                  WHERE type = 'table' AND name = 'rk_store_migrations'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_err)?;
+    if !marker_table_exists {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM rk_store_migrations
+              WHERE version = 'tuple_persistence_journal_v1'
+         )",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(sql_err)
+}
+
 impl Store {
     pub fn open(path: &Path) -> rk_core::Result<Self> {
         let mut conn = Connection::open(path).map_err(sql_err)?;
@@ -611,11 +645,23 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_err)?;
-        conn.execute_batch(SCHEMA).map_err(sql_err)?;
+        let journal_floor_preexisting: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('tuple_sequence_state')
+                      WHERE name = 'journal_floor_sequence'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        let journal_marker_preexisting = journal_marker_exists(&conn)?;
         migrate(
             &mut conn,
             sequence_schema_preexisting,
-            journal_guards_preexisting,
+            journal_guards_preexisting
+                || journal_floor_preexisting
+                || journal_marker_preexisting,
         )?;
         Ok(Self { conn })
     }
@@ -624,13 +670,8 @@ impl Store {
         let mut conn = Connection::open_in_memory().map_err(sql_err)?;
         register_functions(&conn).map_err(sql_err)?;
         let sequence_schema_preexisting = false;
-        let journal_guards_preexisting = false;
-        conn.execute_batch(SCHEMA).map_err(sql_err)?;
-        migrate(
-            &mut conn,
-            sequence_schema_preexisting,
-            journal_guards_preexisting,
-        )?;
+        let journal_trusted = false;
+        migrate(&mut conn, sequence_schema_preexisting, journal_trusted)?;
         Ok(Self { conn })
     }
 

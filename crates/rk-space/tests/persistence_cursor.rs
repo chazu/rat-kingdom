@@ -387,6 +387,52 @@ fn persistence_delta_rejects_a_missing_retained_journal_event() {
 }
 
 #[test]
+fn reopening_does_not_heal_a_missing_trusted_journal_event_from_live_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("trusted-journal-gap.db");
+    {
+        let space = Space::open(&db).unwrap();
+        space
+            .out(fact(RecordId::floor_at(Utc::now()), "trusted-event"))
+            .unwrap();
+    }
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER tuple_persistence_events_reject_delete;
+         DELETE FROM tuple_persistence_events;",
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(Space::open(&db).is_err(), "trusted journal gaps must fail closed");
+}
+
+#[test]
+fn failed_migration_does_not_leave_journal_schema_residue() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("atomic-migration.db");
+    let surviving = fact(RecordId::floor_at(Utc::now()), "missing-state");
+    create_sequence_only_database_after_deletion(&db, &surviving);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("DELETE FROM tuple_sequence_state", []).unwrap();
+    drop(conn);
+
+    assert!(Space::open(&db).is_err());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let journal_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                  WHERE type = 'table' AND name = 'tuple_persistence_events'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!journal_exists, "failed migration DDL must roll back atomically");
+}
+
+#[test]
 fn persistence_journal_rejects_insert_or_replace_of_an_existing_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("journal-replace.db");
