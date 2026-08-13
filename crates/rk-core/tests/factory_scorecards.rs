@@ -183,7 +183,7 @@ fn counts_runs_accepted_reworked_ci_failed_ci_recovered_reverted_unknown_and_uno
     assert_eq!(row.metrics.ci_failed, 1);
     assert_eq!(row.metrics.ci_recovered, 1);
     assert_eq!(row.metrics.reverted, 1);
-    assert_eq!(row.metrics.unknown, 2);
+    assert_eq!(row.metrics.unknown, 0);
     assert_eq!(rows.last().unwrap().metrics.unobserved, 1);
     assert_eq!(row.status_counts.get(&OutcomeStatus::Accepted), Some(&1));
 }
@@ -234,7 +234,141 @@ fn counts_only_explicit_run_facts_as_runs_without_triple_counting_agent_metrics(
     assert_eq!(row.metrics.archived_runs, 0);
     assert_eq!(row.metrics.cost_sample_size, 1);
     assert_eq!(row.metrics.lead_time_sample_size, 1);
-    assert_eq!(row.metrics.unknown, 4);
+    assert_eq!(row.metrics.unknown, 0);
+    assert_eq!(row.sample_size, 1);
+    assert!(row.status_counts.get(&OutcomeStatus::Unknown).is_none());
+}
+
+#[test]
+fn deduplicates_requested_projections_and_prefers_available_sources_deterministically() {
+    let rows = aggregate_scorecards(
+        &facts(vec![base(
+            OutcomeEvidenceKind::AgentRecord,
+            "run-a",
+            FactoryMetricPayload::Run { count: 1 },
+        )]),
+        ScorecardQuery {
+            projections: vec![ScorecardProjection::All, ScorecardProjection::All],
+            include_archived: false,
+        },
+    );
+
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.projection == ScorecardProjection::All)
+            .count(),
+        1
+    );
+    assert!(
+        rows.iter()
+            .find(|row| row.projection == ScorecardProjection::All)
+            .unwrap()
+            .availability
+            .by_family
+            .get(&OutcomeEvidenceKind::AgentRecord)
+            .unwrap()
+            .available
+    );
+}
+
+#[test]
+fn projected_source_counts_union_distinct_source_ids_by_group() {
+    let mut second = base(
+        OutcomeEvidenceKind::AgentRecord,
+        "source-b",
+        FactoryMetricPayload::Run { count: 1 },
+    );
+    second.harness = Some("harness-b".into());
+
+    let rows = aggregate_scorecards(
+        &facts(vec![
+            base(
+                OutcomeEvidenceKind::AgentRecord,
+                "source-a",
+                FactoryMetricPayload::Run { count: 1 },
+            ),
+            second,
+        ]),
+        ScorecardQuery {
+            projections: vec![ScorecardProjection::All],
+            include_archived: false,
+        },
+    );
+
+    let all = rows
+        .iter()
+        .find(|row| row.projection == ScorecardProjection::All)
+        .unwrap();
+    let counts = all
+        .source_counts
+        .by_family
+        .get(&OutcomeEvidenceKind::AgentRecord)
+        .unwrap();
+    assert_eq!(counts.active_source_count, 2);
+    assert_eq!(counts.archived_source_count, 0);
+    assert_eq!(counts.event_count, 2);
+}
+
+#[test]
+fn projected_recurrence_does_not_merge_same_key_across_distinct_composites() {
+    let mut first = base(
+        OutcomeEvidenceKind::RecurrenceKey,
+        "rec-a",
+        FactoryMetricPayload::Recurrence,
+    );
+    first.recurrence_key = Some("same".into());
+    let mut second = base(
+        OutcomeEvidenceKind::RecurrenceKey,
+        "rec-b",
+        FactoryMetricPayload::Recurrence,
+    );
+    second.recurrence_key = Some("same".into());
+    second.harness = Some("other-harness".into());
+
+    let rows = aggregate_scorecards(
+        &facts(vec![first, second]),
+        ScorecardQuery {
+            projections: vec![ScorecardProjection::TaskClassWorkflow],
+            include_archived: false,
+        },
+    );
+
+    let projected = rows
+        .iter()
+        .find(|row| row.projection == ScorecardProjection::TaskClassWorkflow)
+        .unwrap();
+    assert_eq!(projected.metrics.recurrence_count, 0);
+    assert_eq!(projected.metrics.distinct_recurrence_keys, 0);
+    assert_eq!(projected.metrics.recurrence_sample_size, 2);
+}
+
+#[test]
+fn cost_and_nearest_rank_arithmetic_are_overflow_safe() {
+    let mut expensive_a = base(
+        OutcomeEvidenceKind::AgentRecord,
+        "cost-a",
+        FactoryMetricPayload::Cost {
+            micro_usd: u64::MAX,
+            pricing_evidence_id: Some("pricing".into()),
+        },
+    );
+    expensive_a.observed_at_ms = 1;
+    let mut expensive_b = base(
+        OutcomeEvidenceKind::AgentRecord,
+        "cost-b",
+        FactoryMetricPayload::Cost {
+            micro_usd: u64::MAX,
+            pricing_evidence_id: Some("pricing".into()),
+        },
+    );
+    expensive_b.observed_at_ms = 2;
+    let rows = aggregate_scorecards(
+        &facts(vec![expensive_a, expensive_b]),
+        ScorecardQuery::default(),
+    );
+
+    assert_eq!(rows[0].metrics.total_cost_micro_usd, u64::MAX);
+    assert_eq!(rows[0].metrics.average_cost_micro_usd, Some(u64::MAX));
 }
 
 #[test]
@@ -340,6 +474,58 @@ fn computes_lead_time_median_and_p95_nearest_rank() {
     assert_eq!(rows[0].metrics.median_lead_time_ms, Some(30));
     assert_eq!(rows[0].metrics.p95_lead_time_ms, Some(50));
     assert_eq!(rows[0].metrics.lead_time_sample_size, 5);
+}
+
+#[test]
+fn computes_nearest_rank_for_one_and_two_lead_time_samples() {
+    let one = {
+        let mut input = base(
+            OutcomeEvidenceKind::WorkflowInstance,
+            "lead-one",
+            FactoryMetricPayload::LeadTime {
+                started_at_ms: 0,
+                completed_at_ms: 10,
+                run_id: "one".into(),
+                completed_run_id: "one".into(),
+            },
+        );
+        input.workflow_instance_id = Some("one".into());
+        input
+    };
+    let mut two_a = one.clone();
+    two_a.source_id = "lead-two-a".into();
+    two_a.workflow_instance_id = Some("two-a".into());
+    if let FactoryMetricPayload::LeadTime {
+        run_id,
+        completed_run_id,
+        ..
+    } = &mut two_a.payload
+    {
+        *run_id = "two-a".into();
+        *completed_run_id = "two-a".into();
+    }
+    let mut two_b = one.clone();
+    two_b.source_id = "lead-two-b".into();
+    two_b.workflow_instance_id = Some("two-b".into());
+    if let FactoryMetricPayload::LeadTime {
+        completed_at_ms,
+        run_id,
+        completed_run_id,
+        ..
+    } = &mut two_b.payload
+    {
+        *completed_at_ms = 20;
+        *run_id = "two-b".into();
+        *completed_run_id = "two-b".into();
+    }
+
+    let one_row = aggregate_scorecards(&facts(vec![one]), ScorecardQuery::default());
+    assert_eq!(one_row[0].metrics.median_lead_time_ms, Some(10));
+    assert_eq!(one_row[0].metrics.p95_lead_time_ms, Some(10));
+
+    let two_rows = aggregate_scorecards(&facts(vec![two_a, two_b]), ScorecardQuery::default());
+    assert_eq!(two_rows[0].metrics.median_lead_time_ms, Some(10));
+    assert_eq!(two_rows[0].metrics.p95_lead_time_ms, Some(20));
 }
 
 #[test]
@@ -463,9 +649,14 @@ fn includes_evidence_and_source_counts_by_family() {
         OutcomeEvidenceKind::PricingSnapshot,
     ] {
         assert_eq!(row.evidence_counts.by_kind.get(&kind), Some(&1));
+        let expected_events = if kind == OutcomeEvidenceKind::PricingSnapshot {
+            2
+        } else {
+            1
+        };
         assert_eq!(
             row.source_counts.by_family.get(&kind).unwrap().event_count,
-            1
+            expected_events
         );
     }
 }

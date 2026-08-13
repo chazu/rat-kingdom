@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -91,7 +91,9 @@ struct Accumulator {
     row: FactoryScorecard,
     costs: Vec<u64>,
     lead_times: Vec<u64>,
-    recurrence_keys: Vec<String>,
+    recurrence_keys: Vec<(ScorecardGroupKey, String)>,
+    active_sources: BTreeMap<OutcomeEvidenceKind, BTreeSet<String>>,
+    archived_sources: BTreeMap<OutcomeEvidenceKind, BTreeSet<String>>,
 }
 
 impl Default for FactoryScorecard {
@@ -115,6 +117,8 @@ pub fn aggregate_scorecards(facts: &[OutcomeFact], query: ScorecardQuery) -> Vec
     let mut accs: BTreeMap<(ScorecardGroupKey, ScorecardProjection), Accumulator> = BTreeMap::new();
     let mut projections = vec![ScorecardProjection::Composite];
     projections.extend(query.projections);
+    projections.sort();
+    projections.dedup();
 
     for fact in facts {
         for projection in &projections {
@@ -125,7 +129,7 @@ pub fn aggregate_scorecards(facts: &[OutcomeFact], query: ScorecardQuery) -> Vec
                     let mut acc = Accumulator::default();
                     acc.row.group_key = key.clone();
                     acc.row.projection = projection.clone();
-                    acc.row.projected = *projection != ScorecardProjection::Composite;
+                    acc.row.projected = projection != &ScorecardProjection::Composite;
                     acc.row.metric_sort_key = metric_sort_key(projection);
                     acc
                 });
@@ -155,48 +159,59 @@ fn add_fact(acc: &mut Accumulator, fact: &OutcomeFact, include_archived: bool) {
     acc.row
         .availability
         .by_family
-        .insert(fact.availability.source_family, fact.availability.clone());
+        .entry(fact.availability.source_family)
+        .and_modify(|availability| {
+            availability.available |= fact.availability.available;
+        })
+        .or_insert_with(|| fact.availability.clone());
     let counts = acc
         .row
         .source_counts
         .by_family
         .entry(fact.evidence_kind)
         .or_default();
-    counts.active_source_count = counts
-        .active_source_count
-        .max(fact.source_counts.active_source_count);
-    counts.archived_source_count = counts
-        .archived_source_count
-        .max(fact.source_counts.archived_source_count);
-    counts.event_count = counts.event_count.max(fact.source_counts.event_count);
+    counts.event_count = counts.event_count.saturating_add(1);
+    if fact.availability.available {
+        if fact.archived {
+            acc.archived_sources
+                .entry(fact.evidence_kind)
+                .or_default()
+                .insert(fact.source.source_id.clone());
+        } else {
+            acc.active_sources
+                .entry(fact.evidence_kind)
+                .or_default()
+                .insert(fact.source.source_id.clone());
+        }
+    }
 
     if fact.archived && !include_archived {
         return;
     }
 
-    *acc.row
-        .status_counts
-        .entry(fact.status.clone())
-        .or_default() += 1;
-    if fact.status != OutcomeStatus::Unobserved {
-        acc.row.sample_size += 1;
-    }
     if is_explicit_run_fact(fact) {
         acc.row.metrics.runs += 1;
+        acc.row.sample_size += 1;
         if fact.archived {
             acc.row.metrics.archived_runs += 1;
         } else {
             acc.row.metrics.active_runs += 1;
         }
     }
-    match fact.status {
-        OutcomeStatus::Accepted => acc.row.metrics.accepted += 1,
-        OutcomeStatus::Reworked => acc.row.metrics.reworked += 1,
-        OutcomeStatus::CiFailed => acc.row.metrics.ci_failed += 1,
-        OutcomeStatus::CiRecovered => acc.row.metrics.ci_recovered += 1,
-        OutcomeStatus::Reverted => acc.row.metrics.reverted += 1,
-        OutcomeStatus::Unknown => acc.row.metrics.unknown += 1,
-        OutcomeStatus::Unobserved => acc.row.metrics.unobserved += 1,
+    if contributes_status(fact) {
+        *acc.row
+            .status_counts
+            .entry(fact.status.clone())
+            .or_default() += 1;
+        match fact.status {
+            OutcomeStatus::Accepted => acc.row.metrics.accepted += 1,
+            OutcomeStatus::Reworked => acc.row.metrics.reworked += 1,
+            OutcomeStatus::CiFailed => acc.row.metrics.ci_failed += 1,
+            OutcomeStatus::CiRecovered => acc.row.metrics.ci_recovered += 1,
+            OutcomeStatus::Reverted => acc.row.metrics.reverted += 1,
+            OutcomeStatus::Unknown => acc.row.metrics.unknown += 1,
+            OutcomeStatus::Unobserved => acc.row.metrics.unobserved += 1,
+        }
     }
     if fact.evidence_kind == OutcomeEvidenceKind::AgentRecord {
         if let Some(cost) = fact.cost_micro_usd {
@@ -215,7 +230,10 @@ fn add_fact(acc: &mut Accumulator, fact: &OutcomeFact, include_archived: bool) {
         acc.row.metrics.intervention_sample_size += 1;
     }
     if let Some(key) = fact.recurrence_key.as_ref().filter(|key| !key.is_empty()) {
-        acc.recurrence_keys.push(key.clone());
+        acc.recurrence_keys.push((
+            project_key(&fact.group_key, &ScorecardProjection::Composite),
+            key.clone(),
+        ));
         acc.row.metrics.recurrence_sample_size += 1;
     }
 }
@@ -225,25 +243,52 @@ fn is_explicit_run_fact(fact: &OutcomeFact) -> bool {
         && fact.metric_kind == OutcomeMetricKind::Run
 }
 
+fn contributes_status(fact: &OutcomeFact) -> bool {
+    if fact.status == OutcomeStatus::Unobserved {
+        return true;
+    }
+    matches!(
+        fact.metric_kind,
+        OutcomeMetricKind::Accepted
+            | OutcomeMetricKind::Reworked
+            | OutcomeMetricKind::Ci
+            | OutcomeMetricKind::Reverted
+    )
+}
+
 fn finalize(mut acc: Accumulator) -> FactoryScorecard {
     acc.costs.sort_unstable();
     acc.lead_times.sort_unstable();
     acc.recurrence_keys.sort();
-    acc.row.metrics.total_cost_micro_usd = acc.costs.iter().sum();
+    for (kind, sources) in acc.active_sources {
+        acc.row
+            .source_counts
+            .by_family
+            .entry(kind)
+            .or_default()
+            .active_source_count = sources.len().try_into().unwrap_or(u32::MAX);
+    }
+    for (kind, sources) in acc.archived_sources {
+        acc.row
+            .source_counts
+            .by_family
+            .entry(kind)
+            .or_default()
+            .archived_source_count = sources.len().try_into().unwrap_or(u32::MAX);
+    }
+    let total_cost: u128 = acc.costs.iter().map(|cost| u128::from(*cost)).sum();
+    acc.row.metrics.total_cost_micro_usd = total_cost.min(u128::from(u64::MAX)) as u64;
     acc.row.metrics.cost_sample_size = acc.costs.len() as u32;
     acc.row.metrics.average_cost_micro_usd = if acc.costs.is_empty() {
         None
     } else {
-        Some(div_round_half_away(
-            acc.row.metrics.total_cost_micro_usd,
-            acc.costs.len() as u64,
-        ))
+        Some(div_round_half_away(total_cost, acc.costs.len() as u128))
     };
     acc.row.metrics.lead_time_sample_size = acc.lead_times.len() as u32;
     acc.row.metrics.median_lead_time_ms = nearest_rank(&acc.lead_times, 50, 100);
     acc.row.metrics.p95_lead_time_ms = nearest_rank(&acc.lead_times, 95, 100);
 
-    let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+    let mut counts: BTreeMap<(ScorecardGroupKey, String), u32> = BTreeMap::new();
     for key in acc.recurrence_keys {
         *counts.entry(key).or_default() += 1;
     }
@@ -256,8 +301,12 @@ fn finalize(mut acc: Accumulator) -> FactoryScorecard {
     acc.row
 }
 
-fn div_round_half_away(total: u64, denom: u64) -> u64 {
-    (total + denom / 2) / denom
+fn div_round_half_away(total: u128, denom: u128) -> u64 {
+    let rounded = total
+        .saturating_add(denom / 2)
+        .checked_div(denom)
+        .unwrap_or(u128::from(u64::MAX));
+    rounded.min(u128::from(u64::MAX)) as u64
 }
 
 fn nearest_rank(values: &[u64], numerator: usize, denominator: usize) -> Option<u64> {
