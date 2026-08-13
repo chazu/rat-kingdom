@@ -1,0 +1,275 @@
+use rk_core::paths::Layout;
+use rk_daemon::{Client, Daemon};
+use serde_json::{json, Value};
+use std::path::Path;
+use std::process::{Command, Output};
+use std::time::Duration;
+
+fn git(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn repository() -> tempfile::TempDir {
+    let dir = tempfile::Builder::new().prefix("rk-factory-cli").tempdir().unwrap();
+    git(dir.path(), &["init", "-b", "main"]);
+    git(dir.path(), &["config", "user.email", "test@example.com"]);
+    git(dir.path(), &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(dir.path().join(".rk/workflows")).unwrap();
+    std::fs::write(dir.path().join("README.md"), "# Fixture\n").unwrap();
+    std::fs::write(
+        dir.path().join(".rk/workflows/noop.cue"),
+        r#"
+workflow: {
+    name: "noop"
+    params: {taskId: {type: "string", required: true}}
+    agents: {default: {harness: "fake", model: "sonnet"}}
+    steps: [
+        {type: "run", command: "true"},
+        {type: "run", command: "true"},
+    ]
+}
+"#,
+    )
+    .unwrap();
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-m", "initial"]);
+    dir
+}
+
+async fn connect(layout: &Layout) -> Client {
+    for _ in 0..100 {
+        if let Ok(client) = Client::connect_as_operator(layout).await {
+            return client;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("daemon did not start");
+}
+
+async fn fixture() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tokio::task::JoinHandle<rk_core::Result<()>>,
+) {
+    let home = tempfile::tempdir().unwrap();
+    let repo = repository();
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+    client
+        .call(
+            "repo.add",
+            json!({"name": "fixture", "path": repo.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+    (home, repo, handle)
+}
+
+fn run_rk(layout: &Layout, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_rk"))
+        .args(args)
+        .env("RK_HOME", layout.home())
+        .env_remove("RK_AGENT")
+        .env_remove("RK_AUTH_TOKEN")
+        .env_remove("RK_TASK")
+        .env_remove("RK_REPO")
+        .env_remove("RK_ROLE")
+        .env_remove("RK_BRANCH")
+        .env_remove("RK_WORKTREE")
+        .output()
+        .unwrap()
+}
+
+fn successful_json(output: Output) -> Value {
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn failed(output: Output, code: i32) -> String {
+    assert_eq!(output.status.code(), Some(code), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_factory_propose_workflow_sends_typed_action_not_shell_command() {
+    let (home, _repo, handle) = fixture().await;
+    let layout = Layout::at(home.path());
+
+    let value = successful_json(run_rk(
+        &layout,
+        &[
+            "--json",
+            "factory",
+            "propose-workflow",
+            "noop",
+            "--repo",
+            "fixture",
+            "--param",
+            "taskId=hello",
+            "--coordinator",
+            "coord-1",
+        ],
+    ));
+
+    assert_eq!(value["schema"], "factory.proposal.v1");
+    assert_eq!(value["risk"], "mutation");
+    assert!(value["digest"].as_str().is_some());
+    assert_eq!(value["action"]["name"], "noop");
+    assert_eq!(value["action"]["repo"], "fixture");
+    assert_eq!(value["action"]["params"]["taskId"], "hello");
+    assert_eq!(value["action"]["coordinator"], "coord-1");
+    assert!(value.get("argv").is_none(), "factory proposal must not expose shell argv authority");
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_factory_approve_sends_no_identity_param() {
+    let (home, _repo, handle) = fixture().await;
+    let layout = Layout::at(home.path());
+    let proposal = successful_json(run_rk(
+        &layout,
+        &["--json", "factory", "propose-workflow", "noop", "--repo", "fixture", "--param", "taskId=hello"],
+    ));
+    let proposal_id = proposal["proposal"]["id"].as_str().unwrap();
+    let digest = proposal["digest"].as_str().unwrap();
+
+    let approved = successful_json(run_rk(&layout, &["--json", "factory", "approve", proposal_id, digest]));
+    assert_eq!(approved["approval"]["proposal_id"], proposal_id);
+    assert_eq!(approved["approval"]["digest"], digest);
+    assert!(approved["approval"].get("actor").is_none());
+
+    let stderr = failed(
+        run_rk(&layout, &["--json", "factory", "approve", proposal_id, digest, "--by", "mallory"]),
+        2,
+    );
+    assert!(stderr.contains("unexpected") || stderr.contains("unrecognized"));
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_factory_approve_requires_exact_digest() {
+    let (home, _repo, handle) = fixture().await;
+    let layout = Layout::at(home.path());
+
+    failed(run_rk(&layout, &["--json", "factory", "approve", "proposal-1"]), 2);
+    let stderr = failed(
+        run_rk(&layout, &["--json", "factory", "approve", "proposal-1", "not-a-digest"]),
+        2,
+    );
+    assert!(stderr.contains("digest") || stderr.contains("64"));
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_factory_execute_workflow_preserves_param_values_with_spaces() {
+    let (home, _repo, handle) = fixture().await;
+    let layout = Layout::at(home.path());
+    let proposal = successful_json(run_rk(
+        &layout,
+        &["--json", "factory", "propose-workflow", "noop", "--repo", "fixture", "--param", "taskId=value with spaces"],
+    ));
+    let proposal_id = proposal["proposal"]["id"].as_str().unwrap();
+    let digest = proposal["digest"].as_str().unwrap();
+    successful_json(run_rk(&layout, &["--json", "factory", "approve", proposal_id, digest]));
+
+    let executed = successful_json(run_rk(
+        &layout,
+        &[
+            "--json",
+            "factory",
+            "execute-workflow",
+            proposal_id,
+            digest,
+            "--workflow",
+            "noop",
+            "--repo",
+            "fixture",
+            "--param",
+            "taskId=value with spaces",
+        ],
+    ));
+
+    assert_eq!(executed["instance"]["params"]["taskId"], "value with spaces");
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_factory_execute_prints_instance_json_on_success() {
+    let (home, repo, handle) = fixture().await;
+    let layout = Layout::at(home.path());
+    let proposal = successful_json(run_rk(
+        &layout,
+        &["--json", "factory", "propose-workflow", "noop", "--repo", "fixture", "--param", "taskId=hello"],
+    ));
+    let proposal_id = proposal["proposal"]["id"].as_str().unwrap();
+    let digest = proposal["digest"].as_str().unwrap();
+    successful_json(run_rk(&layout, &["--json", "factory", "approve", proposal_id, digest]));
+
+    let executed = successful_json(run_rk(
+        &layout,
+        &[
+            "--json",
+            "factory",
+            "execute-workflow",
+            proposal_id,
+            digest,
+            "--workflow",
+            "noop",
+            "--repo",
+            "fixture",
+            "--param",
+            "taskId=hello",
+        ],
+    ));
+
+    assert_eq!(executed["instance"]["workflow"], "noop");
+    assert_eq!(executed["instance"]["repo"], repo.path().to_string_lossy().as_ref());
+    assert_eq!(executed["approval"]["status"], "consumed");
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_factory_execute_rejects_param_without_equals() {
+    let (home, _repo, handle) = fixture().await;
+    let layout = Layout::at(home.path());
+
+    let stderr = failed(
+        run_rk(
+            &layout,
+            &[
+                "--json",
+                "factory",
+                "execute-workflow",
+                "proposal-1",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--workflow",
+                "noop",
+                "--repo",
+                "fixture",
+                "--param",
+                "broken",
+            ],
+        ),
+        2,
+    );
+    assert!(stderr.contains("--param") || stderr.contains("key=value"));
+    handle.abort();
+}
