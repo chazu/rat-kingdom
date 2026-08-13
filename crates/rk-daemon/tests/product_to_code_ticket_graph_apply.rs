@@ -204,6 +204,9 @@ async fn test_daemon_ticket_graph_apply_rejects_digest_mismatch() {
         err.contains("digest mismatch") || err.contains("forbidden"),
         "{err}"
     );
+    assert!(err.contains("expected="), "{err}");
+    assert!(err.contains("provided="), "{err}");
+    assert!(err.contains("recomputed="), "{err}");
     assert!(tickets(&mut client).await.is_empty());
     stop(client, handle).await;
 }

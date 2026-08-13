@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::warn;
 
 /// The status lifecycle a ticket may move through.
@@ -93,6 +93,10 @@ pub struct Tickets {
     lock: Mutex<()>,
 }
 
+pub(crate) struct TicketMutationGuard<'a> {
+    _guard: MutexGuard<'a, ()>,
+}
+
 impl Tickets {
     pub fn new(space: Space, castle: String) -> Self {
         Self {
@@ -119,7 +123,21 @@ impl Tickets {
     /// ticket mutation lock, so concurrent/restarted factory execution cannot
     /// mint two tickets for the same graph node.
     pub async fn create_idempotent(&self, t: NewTicket) -> rk_core::Result<(Tuple, bool)> {
-        let _guard = self.lock.lock().await;
+        let guard = self.mutation_guard().await;
+        self.create_idempotent_locked(&guard, t)
+    }
+
+    pub(crate) async fn mutation_guard(&self) -> TicketMutationGuard<'_> {
+        TicketMutationGuard {
+            _guard: self.lock.lock().await,
+        }
+    }
+
+    pub(crate) fn create_idempotent_locked(
+        &self,
+        _guard: &TicketMutationGuard<'_>,
+        t: NewTicket,
+    ) -> rk_core::Result<(Tuple, bool)> {
         if let Some(key) = t.coalesce_key.as_deref() {
             if let Some(existing) = self
                 .space
@@ -169,9 +187,31 @@ impl Tickets {
     /// and payloads. This deliberately excludes tuple timestamps/strength so an
     /// unrelated storage rewrite cannot invalidate an approved graph apply.
     pub fn snapshot_digest(&self, scope: &str) -> rk_core::Result<String> {
+        self.snapshot_digest_filtered(scope, None)
+    }
+
+    pub(crate) fn snapshot_digest_excluding_created_by(
+        &self,
+        _guard: &TicketMutationGuard<'_>,
+        scope: &str,
+        created_by: &str,
+    ) -> rk_core::Result<String> {
+        self.snapshot_digest_filtered(scope, Some(created_by))
+    }
+
+    fn snapshot_digest_filtered(
+        &self,
+        scope: &str,
+        excluded_created_by: Option<&str>,
+    ) -> rk_core::Result<String> {
         let mut rows = self
             .list(Some(scope.to_string()), None, None)?
             .into_iter()
+            .filter(|ticket| {
+                excluded_created_by.is_none_or(|excluded| {
+                    ticket.payload.get("created_by").and_then(Value::as_str) != Some(excluded)
+                })
+            })
             .map(|ticket| (ticket.identity, ticket.payload))
             .collect::<Vec<_>>();
         rows.sort_by(|left, right| left.0.cmp(&right.0));
@@ -317,10 +357,19 @@ impl Tickets {
     /// Add a `id depends-on dep` edge, rejecting self-loops, missing tickets,
     /// and any edge that would close a cycle.
     pub async fn add_dep(&self, id: &str, dep: &str) -> rk_core::Result<Tuple> {
+        let guard = self.mutation_guard().await;
+        self.add_dep_locked(&guard, id, dep).await
+    }
+
+    pub(crate) async fn add_dep_locked(
+        &self,
+        _guard: &TicketMutationGuard<'_>,
+        id: &str,
+        dep: &str,
+    ) -> rk_core::Result<Tuple> {
         if id == dep {
             return Err(rk_core::Error::other("a ticket cannot depend on itself"));
         }
-        let _guard = self.lock.lock().await;
         let by_id = self.all_by_id()?;
         if !by_id.contains_key(id) {
             return Err(rk_core::Error::other(format!("no such ticket: {id}")));
@@ -604,6 +653,51 @@ mod tests {
         assert!(a.identity.starts_with(ID_PREFIX));
         assert!(b.identity.starts_with(ID_PREFIX));
         assert_ne!(a.identity, b.identity);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mutation_guard_serializes_ordinary_ticket_creates() {
+        let tickets = std::sync::Arc::new(tickets());
+        let guard = tickets.mutation_guard().await;
+        let contender = tickets.clone();
+        let mut pending = tokio::spawn(async move {
+            contender
+                .create(new("blocked", "repo", None))
+                .await
+                .unwrap()
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut pending)
+                .await
+                .is_err(),
+            "ordinary create bypassed the shared mutation lock"
+        );
+        drop(guard);
+        assert!(pending.await.unwrap().identity.starts_with(ID_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn external_snapshot_digest_excludes_current_factory_execution_only() {
+        let tickets = tickets();
+        tickets
+            .create(new("external", "repo", None))
+            .await
+            .unwrap();
+        let baseline = tickets.snapshot_digest("repo").unwrap();
+        let guard = tickets.mutation_guard().await;
+        let mut owned = new("owned", "repo", None);
+        owned.created_by = Some("factory:exec-1".into());
+        owned.coalesce_key = Some("factory:ticket-graph:exec-1:NODE-1".into());
+        tickets.create_idempotent_locked(&guard, owned).unwrap();
+
+        assert_eq!(
+            tickets
+                .snapshot_digest_excluding_created_by(&guard, "repo", "factory:exec-1")
+                .unwrap(),
+            baseline
+        );
+        assert_ne!(tickets.snapshot_digest("repo").unwrap(), baseline);
     }
 
     #[tokio::test]

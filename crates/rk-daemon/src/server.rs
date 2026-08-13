@@ -3674,6 +3674,7 @@ impl Daemon {
                 return Response::err(req.id, codes::FORBIDDEN, "proposal action kind mismatch");
             }
         };
+        let submitted_action = FactoryAction::TicketGraphApply(submitted.clone());
         if submitted.repo != stored.repo
             || submitted.repo_identity != stored.repo_identity
             || submitted.repo_path != stored.repo_path
@@ -3681,7 +3682,19 @@ impl Daemon {
             || submitted.initiative != stored.initiative
             || submitted.apply_plan != stored.apply_plan
         {
-            return Response::err(req.id, codes::FORBIDDEN, "action digest mismatch");
+            let recomputed = crate::action_approval::recompute_proposal_digest(
+                &proposal,
+                &submitted_action,
+            )
+            .unwrap_or_else(|error| format!("<error:{error}>"));
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                format!(
+                    "action digest mismatch: expected={} provided={} recomputed={recomputed}",
+                    proposal.digest, params.digest
+                ),
+            );
         }
 
         let factory_action = FactoryAction::TicketGraphApply(stored.clone());
@@ -3694,31 +3707,48 @@ impl Daemon {
             Ok(grant) => grant,
             Err(e) => return Response::err(req.id, codes::FORBIDDEN, e.to_string()),
         };
+        let Some(execution_id) = grant.execution_id.clone() else {
+            return Response::err(req.id, codes::INTERNAL, "approval missing execution id");
+        };
         let _guard = self.ticket_graph_apply_lock.lock().await;
+        let ticket_guard = self.tickets.mutation_guard().await;
         let existing = match self.action_approvals.ticket_graph_result(&params.proposal_id) {
             Ok(result) => result,
             Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
         };
         if let Some(mut result) = existing.clone().filter(|result| result.status == "completed") {
+            let (reconciled, approval) = match self
+                .action_approvals
+                .finish_ticket_graph_success(&params.proposal_id, result.clone())
+            {
+                Ok(value) => value,
+                Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+            };
+            result = reconciled;
             result.idempotent_replay = true;
-            return Response::ok(req.id, json!({"result": result, "approval": grant}));
+            return Response::ok(req.id, json!({"result": result, "approval": approval}));
         }
-        if existing.is_none() && submitted.preconditions != stored.preconditions {
+        let actual_preconditions = match self.ticket_graph_live_preconditions(
+            &stored,
+            &ticket_guard,
+            &execution_id,
+        ) {
+            Ok(preconditions) => preconditions,
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        if actual_preconditions != stored.preconditions {
             let message = format!(
                 "ticket graph CAS mismatch: expected repo_head={} ticket_store_digest={}, actual repo_head={} ticket_store_digest={}",
                 stored.preconditions.repo_head,
                 stored.preconditions.ticket_store_digest,
-                submitted.preconditions.repo_head,
-                submitted.preconditions.ticket_store_digest,
+                actual_preconditions.repo_head,
+                actual_preconditions.ticket_store_digest,
             );
             let _ = self
                 .action_approvals
                 .finish_failed(&params.proposal_id, &message);
             return Response::err(req.id, codes::FORBIDDEN, message);
         }
-        let Some(execution_id) = grant.execution_id.clone() else {
-            return Response::err(req.id, codes::INTERNAL, "approval missing execution id");
-        };
         let mut result = existing.unwrap_or_else(|| TicketGraphApplyExecutionResult {
             execution_id: execution_id.clone(),
             graph_id: stored.graph.id.clone(),
@@ -3739,23 +3769,16 @@ impl Daemon {
         }
 
         let applied = self
-            .apply_ticket_graph(&params.proposal_id, &stored, result)
+            .apply_ticket_graph(&params.proposal_id, &stored, &ticket_guard, result)
             .await;
         match applied {
             Ok(mut result) => {
                 result.status = "completed".into();
-                let result = match self
+                let (result, approval) = match self
                     .action_approvals
-                    .checkpoint_ticket_graph_result(&params.proposal_id, result)
+                    .finish_ticket_graph_success(&params.proposal_id, result)
                 {
-                    Ok(result) => result,
-                    Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
-                };
-                let approval = match self
-                    .action_approvals
-                    .finish_success(&params.proposal_id, &execution_id)
-                {
-                    Ok(approval) => approval,
+                    Ok(value) => value,
                     Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
                 };
                 self.emit_factory_event(crate::factory_events::event_tuple(
@@ -3778,10 +3801,28 @@ impl Daemon {
         }
     }
 
+    fn ticket_graph_live_preconditions(
+        &self,
+        action: &TicketGraphApplyAction,
+        ticket_guard: &crate::tickets::TicketMutationGuard<'_>,
+        execution_id: &str,
+    ) -> rk_core::Result<TicketGraphApplyPreconditions> {
+        let created_by = format!("factory:{execution_id}");
+        Ok(TicketGraphApplyPreconditions {
+            repo_head: repository_head(std::path::Path::new(&action.repo_path))?,
+            ticket_store_digest: self.tickets.snapshot_digest_excluding_created_by(
+                ticket_guard,
+                &action.repo_identity,
+                &created_by,
+            )?,
+        })
+    }
+
     async fn apply_ticket_graph(
         &self,
         proposal_id: &str,
         action: &TicketGraphApplyAction,
+        ticket_guard: &crate::tickets::TicketMutationGuard<'_>,
         mut result: TicketGraphApplyExecutionResult,
     ) -> rk_core::Result<TicketGraphApplyExecutionResult> {
         for node_id in &action.apply_plan.topological_order {
@@ -3808,9 +3849,9 @@ impl Daemon {
                         .map(|criterion| format!("criterion:{criterion}")),
                 )
                 .collect();
-            let (ticket, _created) = self
-                .tickets
-                .create_idempotent(crate::tickets::NewTicket {
+            let (ticket, _created) = self.tickets.create_idempotent_locked(
+                ticket_guard,
+                crate::tickets::NewTicket {
                     title: create.title.clone(),
                     body: Some(create.description.clone()),
                     scope: action.repo_identity.clone(),
@@ -3823,8 +3864,8 @@ impl Daemon {
                         "factory:ticket-graph:{}:{node_id}",
                         result.execution_id
                     )),
-                })
-                .await?;
+                },
+            )?;
             result
                 .graph_node_to_ticket_id
                 .insert(node_id.clone(), ticket.identity.clone());
@@ -3855,7 +3896,7 @@ impl Daemon {
                 continue;
             }
             self.tickets
-                .add_dep(&blocked_ticket_id, &dependency_ticket_id)
+                .add_dep_locked(ticket_guard, &blocked_ticket_id, &dependency_ticket_id)
                 .await?;
             result.created_dependency_edges.push(edge);
             result = self

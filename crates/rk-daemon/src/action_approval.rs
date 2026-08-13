@@ -167,22 +167,15 @@ impl ActionApprovalStore {
             .get(proposal_id)
             .cloned()
             .ok_or_else(|| rk_core::Error::other("unknown proposal"))?;
-        let mut recomputed = proposal.clone();
-        recomputed.digest.clear();
-        recomputed.action = action.clone();
-        recomputed.scope = ActionScope {
-            repo: action.repo_scope(),
-        };
-        let payload = ActionDigestPayload::from_proposal(&recomputed);
-        recomputed.digest = action_digest(&payload)?;
-        if proposal.digest != digest || recomputed.digest != digest {
-            return Err(rk_core::Error::other("action digest mismatch"));
+        let recomputed_digest = recompute_proposal_digest(&proposal, action)?;
+        if proposal.digest != digest || recomputed_digest != digest {
+            return Err(rk_core::Error::other(format!(
+                "action digest mismatch: expected={} provided={} recomputed={}",
+                proposal.digest, digest, recomputed_digest
+            )));
         }
         if proposal.requester != caller {
             return Err(rk_core::Error::other("caller mismatch"));
-        }
-        if proposal.expires_at <= Utc::now() {
-            return Err(rk_core::Error::other("proposal expired"));
         }
         let grant = data
             .grants
@@ -193,6 +186,9 @@ impl ActionApprovalStore {
         }
         match grant.status {
             ApprovalStatus::Approved | ApprovalStatus::Failed => {
+                if proposal.expires_at <= Utc::now() {
+                    return Err(rk_core::Error::other("proposal expired"));
+                }
                 grant.status = ApprovalStatus::Executing;
                 if grant.execution_id.is_none() {
                     grant.execution_id = Some(format!(
@@ -280,46 +276,54 @@ impl ActionApprovalStore {
         checkpoint: TicketGraphApplyExecutionResult,
     ) -> rk_core::Result<TicketGraphApplyExecutionResult> {
         let mut data = self.lock()?;
-        let merged = data
-            .ticket_graph_results
-            .entry(proposal_id.to_string())
-            .or_insert_with(|| checkpoint.clone());
-        if merged.execution_id != checkpoint.execution_id || merged.graph_id != checkpoint.graph_id
-        {
-            return Err(rk_core::Error::other(
-                "ticket graph execution checkpoint binding mismatch",
-            ));
-        }
-        for (node, ticket) in checkpoint.graph_node_to_ticket_id {
-            match merged.graph_node_to_ticket_id.get(&node) {
-                Some(existing) if existing != &ticket => {
-                    return Err(rk_core::Error::other(
-                        "ticket graph node mapping checkpoint mismatch",
-                    ));
-                }
-                Some(_) => {}
-                None => {
-                    merged.graph_node_to_ticket_id.insert(node, ticket);
-                }
-            }
-        }
-        for ticket in checkpoint.created_ticket_ids {
-            if !merged.created_ticket_ids.contains(&ticket) {
-                merged.created_ticket_ids.push(ticket);
-            }
-        }
-        for edge in checkpoint.created_dependency_edges {
-            if !merged.created_dependency_edges.contains(&edge) {
-                merged.created_dependency_edges.push(edge);
-            }
-        }
-        if checkpoint.status == "completed" {
-            merged.status = checkpoint.status;
-        }
-        merged.idempotent_replay = false;
-        let out = merged.clone();
+        let out = merge_ticket_graph_checkpoint(&mut data, proposal_id, checkpoint)?;
         self.persist(&data)?;
         Ok(out)
+    }
+
+    pub fn finish_ticket_graph_success(
+        &self,
+        proposal_id: &str,
+        checkpoint: TicketGraphApplyExecutionResult,
+    ) -> rk_core::Result<(TicketGraphApplyExecutionResult, ApprovalGrant)> {
+        if checkpoint.status != "completed" {
+            return Err(rk_core::Error::other(
+                "ticket graph completion requires completed checkpoint",
+            ));
+        }
+        let mut data = self.lock()?;
+        let existing_grant = data
+            .grants
+            .get(proposal_id)
+            .cloned()
+            .ok_or_else(|| rk_core::Error::other("unknown approval"))?;
+        if existing_grant.kind != ActionKind::TicketGraphApply
+            || existing_grant.execution_id.as_deref() != Some(checkpoint.execution_id.as_str())
+        {
+            return Err(rk_core::Error::other(
+                "ticket graph completion approval binding mismatch",
+            ));
+        }
+        if !matches!(
+            existing_grant.status,
+            ApprovalStatus::Executing | ApprovalStatus::Consumed
+        ) {
+            return Err(rk_core::Error::other(
+                "ticket graph completion approval is not executing",
+            ));
+        }
+        let result = merge_ticket_graph_checkpoint(&mut data, proposal_id, checkpoint)?;
+        let grant = data
+            .grants
+            .get_mut(proposal_id)
+            .expect("validated approval remains present under one lock");
+        grant.status = ApprovalStatus::Consumed;
+        grant.instance_id = Some(result.execution_id.clone());
+        grant.failure = None;
+        grant.consumed_at.get_or_insert_with(Utc::now);
+        let approval = grant.clone();
+        self.persist(&data)?;
+        Ok((result, approval))
     }
 
     fn lock(&self) -> rk_core::Result<std::sync::MutexGuard<'_, StoreData>> {
@@ -337,6 +341,66 @@ impl ActionApprovalStore {
         std::fs::rename(tmp, &self.path)?;
         Ok(())
     }
+}
+
+pub(crate) fn recompute_proposal_digest(
+    proposal: &ActionProposal,
+    action: &FactoryAction,
+) -> rk_core::Result<String> {
+    let mut recomputed = proposal.clone();
+    recomputed.digest.clear();
+    recomputed.action = action.clone();
+    recomputed.scope = ActionScope {
+        repo: action.repo_scope(),
+    };
+    action_digest(&ActionDigestPayload::from_proposal(&recomputed))
+}
+
+fn merge_ticket_graph_checkpoint(
+    data: &mut StoreData,
+    proposal_id: &str,
+    checkpoint: TicketGraphApplyExecutionResult,
+) -> rk_core::Result<TicketGraphApplyExecutionResult> {
+    let mut merged = data
+        .ticket_graph_results
+        .get(proposal_id)
+        .cloned()
+        .unwrap_or_else(|| checkpoint.clone());
+    if merged.execution_id != checkpoint.execution_id || merged.graph_id != checkpoint.graph_id {
+        return Err(rk_core::Error::other(
+            "ticket graph execution checkpoint binding mismatch",
+        ));
+    }
+    for (node, ticket) in checkpoint.graph_node_to_ticket_id {
+        match merged.graph_node_to_ticket_id.get(&node) {
+            Some(existing) if existing != &ticket => {
+                return Err(rk_core::Error::other(
+                    "ticket graph node mapping checkpoint mismatch",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                merged.graph_node_to_ticket_id.insert(node, ticket);
+            }
+        }
+    }
+    for ticket in checkpoint.created_ticket_ids {
+        if !merged.created_ticket_ids.contains(&ticket) {
+            merged.created_ticket_ids.push(ticket);
+        }
+    }
+    for edge in checkpoint.created_dependency_edges {
+        if !merged.created_dependency_edges.contains(&edge) {
+            merged.created_dependency_edges.push(edge);
+        }
+    }
+    if checkpoint.status == "completed" {
+        merged.status = checkpoint.status;
+    }
+    merged.idempotent_replay = false;
+    data.ticket_graph_results
+        .insert(proposal_id.to_string(), merged.clone());
+    Ok(merged)
 }
 
 fn proposal_nonce(now: &chrono::DateTime<Utc>, requester: &str) -> String {
@@ -359,6 +423,10 @@ fn bound_instance_id(proposal_id: &str, digest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rk_core::action::{TicketGraphApplyAction, TicketGraphApplyPreconditions};
+    use rk_core::product_to_code::contracts::{
+        AcceptanceCriterion, InitiativeContract, TicketGraph, TicketGraphNode,
+    };
     use serde_json::json;
 
     fn action(repo_identity: &str, repo_path: &str) -> WorkflowRunAction {
@@ -376,6 +444,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ActionApprovalStore::load(dir.path().join("approvals.json")).unwrap();
         (dir, store)
+    }
+
+    fn ticket_graph_action() -> TicketGraphApplyAction {
+        let initiative = InitiativeContract {
+            id: "INIT-1".into(),
+            title: "Initiative".into(),
+            scope: "test".into(),
+            acceptance_criteria: vec![AcceptanceCriterion {
+                id: "AC-1".into(),
+                text: "Ship it".into(),
+                browser_acceptance_applicable: false,
+            }],
+            browser_acceptance_applicable: false,
+        };
+        let graph = TicketGraph {
+            id: "GRAPH-1".into(),
+            initiative_id: initiative.id.clone(),
+            nodes: vec![TicketGraphNode {
+                id: "NODE-1".into(),
+                title: "Implement".into(),
+                description: "Implement it".into(),
+                acceptance_criterion_ids: vec!["AC-1".into()],
+                feature_set_ids: Vec::new(),
+                browser_acceptance_applicable: false,
+                browser_acceptance_criterion_ids: Vec::new(),
+            }],
+            edges: Vec::new(),
+        };
+        let apply_plan = graph
+            .apply_plan_for_initiative("repo-a", &initiative)
+            .unwrap();
+        TicketGraphApplyAction {
+            repo: "repo-a".into(),
+            repo_identity: "repo-a".into(),
+            repo_path: "/repo/a".into(),
+            graph,
+            initiative,
+            apply_plan,
+            preconditions: TicketGraphApplyPreconditions {
+                repo_head: "abc123".into(),
+                ticket_store_digest: "tickets-empty".into(),
+            },
+        }
     }
 
     #[test]
@@ -426,6 +537,47 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("expired"), "{err}");
+    }
+
+    #[test]
+    fn executing_approval_can_resume_after_proposal_expiry() {
+        let (_dir, store) = store();
+        let action = action("repo-a", "/repo/a");
+        let proposal = store.propose("caller-a", action.clone(), Some(1)).unwrap();
+        store
+            .approve(&proposal.id, &proposal.digest, "operator")
+            .unwrap();
+        let first = store
+            .begin_execute(&proposal.id, &proposal.digest, "caller-a", &action)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+
+        let resumed = store
+            .begin_execute(&proposal.id, &proposal.digest, "caller-a", &action)
+            .unwrap();
+        assert_eq!(resumed.status, ApprovalStatus::Executing);
+        assert_eq!(resumed.execution_id, first.execution_id);
+        assert_eq!(resumed.instance_id, first.instance_id);
+    }
+
+    #[test]
+    fn digest_mismatch_reports_expected_provided_and_recomputed_values() {
+        let (_dir, store) = store();
+        let original = action("repo-a", "/repo/a");
+        let proposal = store.propose("caller-a", original, None).unwrap();
+        store
+            .approve(&proposal.id, &proposal.digest, "operator")
+            .unwrap();
+        let changed = action("repo-b", "/repo/b");
+
+        let err = store
+            .begin_execute(&proposal.id, &"0".repeat(64), "caller-a", &changed)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected="), "{err}");
+        assert!(err.contains("provided="), "{err}");
+        assert!(err.contains("recomputed="), "{err}");
+        assert!(err.contains(&proposal.digest), "{err}");
     }
 
     #[test]
@@ -571,5 +723,46 @@ mod tests {
                 .unwrap(),
             Some(checkpoint)
         );
+    }
+
+    #[test]
+    fn ticket_graph_completion_atomically_consumes_and_heals_approval() {
+        let (_dir, store) = store();
+        let action = FactoryAction::TicketGraphApply(ticket_graph_action());
+        let proposal = store
+            .propose_action("caller-a", action.clone(), None)
+            .unwrap();
+        store
+            .approve(&proposal.id, &proposal.digest, "operator")
+            .unwrap();
+        let executing = store
+            .begin_execute_action(&proposal.id, &proposal.digest, "caller-a", &action)
+            .unwrap();
+        let checkpoint = TicketGraphApplyExecutionResult {
+            execution_id: executing.execution_id.clone().unwrap(),
+            graph_id: "GRAPH-1".into(),
+            graph_node_to_ticket_id: [("NODE-1".into(), "TKT-1".into())].into_iter().collect(),
+            created_ticket_ids: vec!["TKT-1".into()],
+            created_dependency_edges: Vec::new(),
+            idempotent_replay: false,
+            status: "completed".into(),
+        };
+
+        let (first_result, first_approval) = store
+            .finish_ticket_graph_success(&proposal.id, checkpoint.clone())
+            .unwrap();
+        assert_eq!(first_result, checkpoint);
+        assert_eq!(first_approval.status, ApprovalStatus::Consumed);
+        assert_eq!(
+            first_approval.instance_id.as_deref(),
+            Some(checkpoint.execution_id.as_str())
+        );
+
+        let (replayed_result, replayed_approval) = store
+            .finish_ticket_graph_success(&proposal.id, checkpoint)
+            .unwrap();
+        assert_eq!(replayed_result.status, "completed");
+        assert_eq!(replayed_approval.status, ApprovalStatus::Consumed);
+        assert_eq!(replayed_approval.consumed_at, first_approval.consumed_at);
     }
 }
