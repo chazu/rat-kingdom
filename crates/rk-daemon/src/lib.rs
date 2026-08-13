@@ -246,6 +246,143 @@ mod tests {
             handle.await.unwrap().unwrap();
         }
 
+        #[tokio::test]
+        async fn test_ingest_event_requires_local_authenticated_client() {
+            let (_dir, layout, handle) =
+                start_daemon_with_config(config_with_source(source("probe"))).await;
+            let response = raw_request(
+                &layout,
+                Request {
+                    id: "bad-auth".into(),
+                    method: "ingest.event".into(),
+                    auth: layout.auth_token().unwrap(),
+                    caller: crate::ingest_auth::source_caller("probe"),
+                    params: json!({"source":"probe", "envelope": envelope("probe")}),
+                },
+            )
+            .await;
+            assert_eq!(response.error.unwrap().code, crate::proto::codes::UNAUTHORIZED);
+            let mut operator = connect(&layout).await;
+            operator.call("stop", json!({})).await.unwrap();
+            handle.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_ingest_event_rejects_unknown_source() {
+            let (_dir, layout, handle) =
+                start_daemon_with_config(config_with_source(source("probe"))).await;
+            let response = raw_request(
+                &layout,
+                Request {
+                    id: "unknown".into(),
+                    method: "ingest.event".into(),
+                    auth: crate::ingest_auth::derive_source_token(&layout.auth_token().unwrap(), "unknown"),
+                    caller: crate::ingest_auth::source_caller("unknown"),
+                    params: json!({"source":"unknown", "envelope": envelope("unknown")}),
+                },
+            )
+            .await;
+            assert_eq!(response.error.unwrap().code, crate::proto::codes::UNAUTHORIZED);
+            let mut operator = connect(&layout).await;
+            operator.call("stop", json!({})).await.unwrap();
+            handle.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_ingest_event_validates_before_persisting() {
+            let (_dir, layout, handle) =
+                start_daemon_with_config(config_with_source(source("probe"))).await;
+            let token = crate::ingest_auth::derive_source_token(&layout.auth_token().unwrap(), "probe");
+            let mut bad = envelope("probe");
+            bad["summary"] = json!("");
+            let response = raw_request(
+                &layout,
+                Request {
+                    id: "invalid".into(),
+                    method: "ingest.event".into(),
+                    auth: token,
+                    caller: crate::ingest_auth::source_caller("probe"),
+                    params: json!({"source":"probe", "envelope": bad}),
+                },
+            )
+            .await;
+            assert_eq!(response.error.unwrap().code, crate::proto::codes::FORBIDDEN);
+            let mut operator = connect(&layout).await;
+            let scan = operator.call("space.scan", json!({"category":"event"})).await.unwrap();
+            assert_eq!(scan["tuples"].as_array().unwrap().len(), 0);
+            operator.call("stop", json!({})).await.unwrap();
+            handle.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_ingest_event_returns_receipt_with_semantic_state_digest() {
+            let (_dir, layout, handle) =
+                start_daemon_with_config(config_with_source(source("probe"))).await;
+            let result = ingest_probe(&layout).await;
+            assert_eq!(result["accepted"], true);
+            assert!(result["receipt"]["semantic_state_digest"].as_str().unwrap().starts_with("sha256:"));
+            let mut operator = connect(&layout).await;
+            operator.call("stop", json!({})).await.unwrap();
+            handle.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_ingest_event_projects_event_tuple() {
+            let (_dir, layout, handle) =
+                start_daemon_with_config(config_with_source(source("probe"))).await;
+            let result = ingest_probe(&layout).await;
+            let mut operator = connect(&layout).await;
+            let scan = operator.call("space.scan", json!({"category":"event", "scope":"ci"})).await.unwrap();
+            let tuples = scan["tuples"].as_array().unwrap();
+            assert!(tuples.iter().any(|tuple| tuple["id"] == result["receipt"]["projected_event_id"]));
+            operator.call("stop", json!({})).await.unwrap();
+            handle.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_ingest_event_projects_current_fact_tuple() {
+            let (_dir, layout, handle) =
+                start_daemon_with_config(config_with_source(source("probe"))).await;
+            let result = ingest_probe(&layout).await;
+            let fact_id = result["receipt"]["projected_fact_ids"][0].clone();
+            let mut source_client = Client::connect_as(&layout, &crate::ingest_auth::source_caller("probe")).await.unwrap();
+            let state = source_client.call("ingest.state", json!({"repo":"repo"})).await.unwrap();
+            assert!(state["facts"].as_array().unwrap().iter().any(|fact| fact["id"] == fact_id));
+            let mut operator = connect(&layout).await;
+            operator.call("stop", json!({})).await.unwrap();
+            handle.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_ingest_state_returns_current_facts_without_raw_payload() {
+            let (_dir, layout, handle) =
+                start_daemon_with_config(config_with_source(source("probe"))).await;
+            ingest_probe(&layout).await;
+            let mut source_client = Client::connect_as(&layout, &crate::ingest_auth::source_caller("probe")).await.unwrap();
+            let state = source_client.call("ingest.state", json!({"repo":"repo"})).await.unwrap();
+            let fact = &state["facts"].as_array().unwrap()[0];
+            assert!(fact["payload"].get("current").is_some());
+            assert!(fact["payload"].get("payload").is_none());
+            let mut operator = connect(&layout).await;
+            operator.call("stop", json!({})).await.unwrap();
+            handle.await.unwrap().unwrap();
+        }
+
+        async fn ingest_probe(layout: &Layout) -> serde_json::Value {
+            let response = raw_request(
+                layout,
+                Request {
+                    id: "ingest-probe".into(),
+                    method: "ingest.event".into(),
+                    auth: crate::ingest_auth::derive_source_token(&layout.auth_token().unwrap(), "probe"),
+                    caller: crate::ingest_auth::source_caller("probe"),
+                    params: json!({"source":"probe", "envelope": envelope("probe")}),
+                },
+            )
+            .await;
+            response.result.unwrap()
+        }
+
         #[test]
         fn test_allowed_kinds_are_enforced_by_source() {
             let config = config_with_source(source("probe"));
