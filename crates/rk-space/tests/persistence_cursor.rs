@@ -292,6 +292,28 @@ fn persistence_delta_rejects_a_missing_retained_journal_event() {
 }
 
 #[test]
+fn persistence_journal_rejects_insert_or_replace_of_an_existing_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("journal-replace.db");
+    let space = Space::open(&db).unwrap();
+    let original = fact(RecordId::floor_at(Utc::now()), "original");
+    space.out(original.clone()).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+
+    let replacement = conn.execute(
+        "INSERT OR REPLACE INTO tuple_persistence_events
+         (commit_sequence, id, category, scope, identity, instance, lifecycle,
+          payload, created_at, expires_at, strength)
+         VALUES (1, 'replacement', 'fact', 'repo', 'replacement', 'castle-a',
+                 'session', '{}', ?1, NULL, NULL)",
+        [Utc::now().to_rfc3339()],
+    );
+
+    assert!(replacement.is_err(), "REPLACE must not mutate the immutable journal");
+    assert_eq!(space.persistence_delta(None).unwrap().tuples, vec![original]);
+}
+
+#[test]
 fn negative_sequence_state_is_reported_as_corruption() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("negative-state.db");

@@ -284,6 +284,16 @@ fn migrate(conn: &mut Connection, sequence_schema_preexisting: bool) -> rk_core:
                     NEW.expires_at, NEW.strength
                FROM tuple_sequence_state WHERE singleton = 1;
          END;
+         DROP TRIGGER IF EXISTS tuple_persistence_events_reject_replace;
+         CREATE TRIGGER tuple_persistence_events_reject_replace
+         BEFORE INSERT ON tuple_persistence_events
+         FOR EACH ROW WHEN EXISTS (
+             SELECT 1 FROM tuple_persistence_events
+              WHERE commit_sequence = NEW.commit_sequence
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'tuple persistence journal is immutable');
+         END;
          DROP TRIGGER IF EXISTS tuple_persistence_events_reject_update;
          CREATE TRIGGER tuple_persistence_events_reject_update
          BEFORE UPDATE ON tuple_persistence_events
@@ -377,13 +387,17 @@ fn backfill_tuple_sequences(
 
 fn backfill_tuple_persistence_events(conn: &Connection) -> rk_core::Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO tuple_persistence_events
+        "INSERT INTO tuple_persistence_events
          (commit_sequence, id, category, scope, identity, instance, lifecycle,
           payload, created_at, expires_at, strength)
          SELECT commit_sequence, id, category, scope, identity, instance,
                 lifecycle, payload, created_at, expires_at, strength
-           FROM tuples
+           FROM tuples AS tuple
           WHERE commit_sequence IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM tuple_persistence_events AS event
+                 WHERE event.commit_sequence = tuple.commit_sequence
+            )
           ORDER BY commit_sequence ASC",
         [],
     )
