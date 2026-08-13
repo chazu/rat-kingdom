@@ -253,12 +253,48 @@ impl TicketGraph {
         }
     }
 
+    pub fn validation_report_for_initiative(
+        &self,
+        initiative: &InitiativeContract,
+    ) -> TicketGraphValidationReport {
+        let acceptance_criterion_ids = initiative
+            .acceptance_criteria
+            .iter()
+            .map(|criterion| criterion.id.clone())
+            .collect::<Vec<_>>();
+        let mut report = self.validation_report(&acceptance_criterion_ids);
+        if self.initiative_id != initiative.id {
+            report.errors.push(format!(
+                "graph initiative_id {} must match initiative id {}",
+                self.initiative_id, initiative.id
+            ));
+            report.valid = false;
+        }
+        report
+    }
+
     pub fn apply_plan(
         &self,
         repo: &str,
         acceptance_criterion_ids: &[String],
     ) -> Result<TicketGraphApplyPlan> {
         let report = self.validation_report(acceptance_criterion_ids);
+        if !report.valid {
+            return Err(Error::other(report.errors.join("; ")));
+        }
+        Ok(TicketGraphApplyPlan::from_graph(
+            self,
+            repo,
+            report.topological_order,
+        ))
+    }
+
+    pub fn apply_plan_for_initiative(
+        &self,
+        repo: &str,
+        initiative: &InitiativeContract,
+    ) -> Result<TicketGraphApplyPlan> {
+        let report = self.validation_report_for_initiative(initiative);
         if !report.valid {
             return Err(Error::other(report.errors.join("; ")));
         }

@@ -3677,12 +3677,6 @@ impl Daemon {
             rk_core::Error::other(format!("invalid ticket_graph.apply action: {e}"))
         })?;
         params.initiative.validate()?;
-        let acceptance_criterion_ids = params
-            .initiative
-            .acceptance_criteria
-            .iter()
-            .map(|criterion| criterion.id.clone())
-            .collect::<Vec<_>>();
         let repo = params.repo.as_str();
         let submitted = std::path::PathBuf::from(repo);
         let canonical_submitted = if submitted.exists() {
@@ -3704,7 +3698,7 @@ impl Daemon {
         let canonical_path = record.path.canonicalize().unwrap_or(record.path.clone());
         let apply_plan = params
             .graph
-            .apply_plan(&record.name, &acceptance_criterion_ids)?;
+            .apply_plan_for_initiative(&record.name, &params.initiative)?;
         Ok(TicketGraphApplyAction {
             repo: record.name.clone(),
             repo_identity: record.name,

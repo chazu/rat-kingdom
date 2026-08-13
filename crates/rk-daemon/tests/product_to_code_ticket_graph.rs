@@ -157,6 +157,31 @@ async fn test_ticket_graph_apply_rejects_extra_or_tampered_derived_fields() {
 }
 
 #[tokio::test]
+async fn test_ticket_graph_apply_rejects_initiative_id_mismatch() {
+    let (_home, _repo, handle, mut client) = setup().await;
+    let mut mismatched = initiative();
+    mismatched["id"] = json!("INIT-other");
+
+    let err = propose(
+        &mut client,
+        json!({"repo": "fixture", "graph": graph(), "initiative": mismatched}),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        err.contains(
+            "graph initiative_id INIT-product-to-code must match initiative id INIT-other"
+        ),
+        "{err}"
+    );
+
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn test_ticket_graph_apply_rejects_malformed_missing_and_cyclic_graphs() {
     let (_home, _repo, handle, mut client) = setup().await;
 

@@ -286,6 +286,31 @@ fn test_ticket_graph_apply_plan_is_typed_and_recomputed_from_graph() {
 }
 
 #[test]
+fn test_ticket_graph_rejects_initiative_id_mismatch() {
+    let graph: TicketGraph = serde_json::from_str(&fixture("ticket_graph_valid.json")).unwrap();
+    let mut initiative: InitiativeContract =
+        serde_json::from_str(&fixture("initiative_minimal.json")).unwrap();
+    initiative.id = "INIT-other".to_string();
+
+    let report = graph.validation_report_for_initiative(&initiative);
+    assert!(!report.valid);
+    let errors = report.errors.join("\n");
+    assert!(
+        errors.contains(
+            "graph initiative_id INIT-product-to-code must match initiative id INIT-other"
+        ),
+        "{errors}"
+    );
+    assert!(
+        graph
+            .apply_plan_for_initiative("rat-kingdom", &initiative)
+            .unwrap_err()
+            .to_string()
+            .contains("must match initiative id INIT-other")
+    );
+}
+
+#[test]
 fn test_ticket_graph_and_initiative_reject_unknown_fields() {
     let mut graph: serde_json::Value =
         serde_json::from_str(&fixture("ticket_graph_valid.json")).unwrap();

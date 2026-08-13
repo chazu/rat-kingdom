@@ -120,6 +120,19 @@ mod product_to_code_ticket_graph {
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
+    fn mismatched_initiative_path() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rk-ticket-graph-mismatched-initiative-{}.json",
+            std::process::id()
+        ));
+        let mut initiative: Value =
+            serde_json::from_str(&fs::read_to_string(fixture("initiative_minimal.json")).unwrap())
+                .unwrap();
+        initiative["id"] = serde_json::json!("INIT-other");
+        fs::write(&path, serde_json::to_string(&initiative).unwrap()).unwrap();
+        path
+    }
+
     #[test]
     fn test_graph_validate_accepts_acyclic_graph_with_existing_acceptance_refs() {
         let value = json_success(run(&[
@@ -270,6 +283,34 @@ mod product_to_code_ticket_graph {
     }
 
     #[test]
+    fn test_graph_validate_rejects_initiative_id_mismatch() {
+        let initiative_path = mismatched_initiative_path();
+        let value = json_failure(run(&[
+            "--json",
+            "product-to-code",
+            "graph",
+            "validate",
+            "--graph",
+            &fixture("ticket_graph_valid.json"),
+            "--initiative",
+            initiative_path.to_str().unwrap(),
+        ]));
+        let errors = value["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            errors.contains(
+                "graph initiative_id INIT-product-to-code must match initiative id INIT-other"
+            ),
+            "{errors}"
+        );
+    }
+
+    #[test]
     fn test_graph_dry_run_is_read_only_and_lists_exact_mutations() {
         let temp_state = tempfile::tempdir().unwrap();
         let before = fs::read_dir(temp_state.path()).unwrap().count();
@@ -304,6 +345,27 @@ mod product_to_code_ticket_graph {
             value["dependencies"][0]["blocked_graph_node_id"],
             "NODE-tests"
         );
+    }
+
+    #[test]
+    fn test_graph_dry_run_rejects_initiative_id_mismatch() {
+        let initiative_path = mismatched_initiative_path();
+        let value = json_failure(run(&[
+            "--json",
+            "product-to-code",
+            "graph",
+            "dry-run",
+            "--graph",
+            &fixture("ticket_graph_valid.json"),
+            "--initiative",
+            initiative_path.to_str().unwrap(),
+        ]));
+        assert!(value["errors"].as_array().unwrap().iter().any(|error| {
+            error
+                .as_str()
+                .unwrap()
+                .contains("must match initiative id INIT-other")
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -362,6 +424,36 @@ mod product_to_code_ticket_graph {
             .as_str()
             .unwrap()
             .contains("local CLI did not apply"));
+
+        handle.abort();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_graph_propose_apply_rejects_initiative_id_mismatch_before_daemon() {
+        let (home, _repo, handle) = daemon_fixture().await;
+        let layout = Layout::at(home.path());
+        let initiative_path = mismatched_initiative_path();
+
+        let value = json_failure(run_with_layout(
+            &layout,
+            &[
+                "--json",
+                "product-to-code",
+                "graph",
+                "propose-apply",
+                "--graph",
+                &fixture("ticket_graph_valid.json"),
+                "--initiative",
+                initiative_path.to_str().unwrap(),
+                "--repo",
+                "fixture",
+            ],
+        ));
+        assert!(value["errors"].as_array().unwrap().iter().any(|error| {
+            error
+                .as_str()
+                .unwrap()
+                .contains("must match initiative id INIT-other")
+        }));
 
         handle.abort();
     }

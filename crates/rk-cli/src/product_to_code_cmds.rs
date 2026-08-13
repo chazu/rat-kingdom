@@ -221,8 +221,7 @@ async fn run_graph(layout: &Layout, command: GraphCommand, json_output: bool) ->
         }
         GraphCommand::ProposeApply(args) => {
             let (graph, initiative) = read_graph_and_initiative(&args.graph, &args.initiative)?;
-            let criterion_ids = criterion_ids(&initiative);
-            let report = graph.validation_report(&criterion_ids);
+            let report = graph.validation_report_for_initiative(&initiative);
             if !report.valid {
                 if json_output {
                     println!("{}", serde_json::to_string(&report)?);
@@ -276,14 +275,6 @@ fn read_graph_and_initiative(
     let initiative: InitiativeContract = read_json(initiative)?;
     initiative.validate()?;
     Ok((read_json(graph)?, initiative))
-}
-
-fn criterion_ids(initiative: &InitiativeContract) -> Vec<String> {
-    initiative
-        .acceptance_criteria
-        .iter()
-        .map(|criterion| criterion.id.clone())
-        .collect()
 }
 
 
