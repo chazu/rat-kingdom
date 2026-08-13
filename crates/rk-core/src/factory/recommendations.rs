@@ -204,7 +204,7 @@ pub fn evaluate_recommendation_report(rows: &[FactoryScorecard]) -> AdvisoryReco
                 RecommendationRule::HighRework,
                 OutcomeEvidenceKind::StructuredReviewerRework,
                 row.metrics.reworked,
-                row.metrics.runs,
+                row.metrics.rework_sample_size,
                 10,
                 (25, 100),
             ),
@@ -217,7 +217,7 @@ pub fn evaluate_recommendation_report(rows: &[FactoryScorecard]) -> AdvisoryReco
                 RecommendationRule::Reverts,
                 OutcomeEvidenceKind::StructuredRevert,
                 row.metrics.reverted,
-                row.metrics.runs,
+                row.metrics.revert_sample_size,
                 5,
                 (10, 100),
             ),
@@ -262,19 +262,19 @@ fn eval_low_acceptance(
             rule,
             family,
             SuppressionReason::MetricUnavailable,
-            evidence(row.metrics.accepted, row.metrics.runs, None),
+            evidence(row.metrics.accepted, row.metrics.accepted_sample_size, None),
             None,
         );
         return;
     }
-    if row.metrics.runs < 10 {
+    if row.metrics.accepted_sample_size < 10 {
         push_suppressed(
             report,
             row,
             rule,
             family,
             SuppressionReason::LowSample,
-            evidence(row.metrics.accepted, row.metrics.runs, None),
+            evidence(row.metrics.accepted, row.metrics.accepted_sample_size, None),
             None,
         );
         return;
@@ -286,7 +286,7 @@ fn eval_low_acceptance(
             rule,
             family,
             SuppressionReason::NoComparablePeer,
-            evidence(row.metrics.accepted, row.metrics.runs, None),
+            evidence(row.metrics.accepted, row.metrics.accepted_sample_size, None),
             None,
         );
         return;
@@ -298,24 +298,30 @@ fn eval_low_acceptance(
             !std::ptr::eq(*p, row)
                 && same_group(row, p)
                 && is_available(p, family)
-                && p.metrics.runs >= 10
-                && at_least(p.metrics.accepted, p.metrics.runs, 80, 100)
+                && p.metrics.accepted_sample_size >= 10
+                && at_least(p.metrics.accepted, p.metrics.accepted_sample_size, 80, 100)
         })
         .max_by(|a, b| {
             ratio_cmp(
                 a.metrics.accepted,
-                a.metrics.runs,
+                a.metrics.accepted_sample_size,
                 b.metrics.accepted,
-                b.metrics.runs,
+                b.metrics.accepted_sample_size,
             )
         });
     let comparison = peer.map(|p| ComparisonEvidence {
         peer_numerator: Some(p.metrics.accepted.into()),
-        peer_denominator: Some(p.metrics.runs.into()),
+        peer_denominator: Some(p.metrics.accepted_sample_size.into()),
         comparable_median: None,
         comparable_sample_size: 1,
     });
-    if !below(row.metrics.accepted, row.metrics.runs, 60, 100) || peer.is_none() {
+    if !below(
+        row.metrics.accepted,
+        row.metrics.accepted_sample_size,
+        60,
+        100,
+    ) || peer.is_none()
+    {
         push_suppressed(
             report,
             row,
@@ -326,7 +332,7 @@ fn eval_low_acceptance(
             } else {
                 SuppressionReason::BelowThreshold
             },
-            evidence(row.metrics.accepted, row.metrics.runs, None),
+            evidence(row.metrics.accepted, row.metrics.accepted_sample_size, None),
             comparison,
         );
         return;
@@ -336,7 +342,7 @@ fn eval_low_acceptance(
         row,
         rule,
         family,
-        evidence(row.metrics.accepted, row.metrics.runs, None),
+        evidence(row.metrics.accepted, row.metrics.accepted_sample_size, None),
         comparison,
     );
 }
@@ -348,11 +354,7 @@ fn eval_ci(
 ) {
     let rule = RecommendationRule::CiInstability;
     let family = OutcomeEvidenceKind::Phase4CiSignal;
-    let n = row.metrics.ci_failed;
-    let unrecovered = row
-        .metrics
-        .ci_failed
-        .saturating_sub(row.metrics.ci_recovered);
+    let n = row.metrics.ci_sample_size;
     if !is_available(row, family) {
         push_suppressed(
             report,
@@ -360,7 +362,11 @@ fn eval_ci(
             rule,
             family,
             SuppressionReason::MetricUnavailable,
-            evidence(unrecovered, n, None),
+            evidence(
+                row.metrics.ci_failed,
+                n,
+                Some(row.metrics.ci_recovered.into()),
+            ),
             None,
         );
         return;
@@ -372,7 +378,11 @@ fn eval_ci(
             rule,
             family,
             SuppressionReason::LowSample,
-            evidence(unrecovered, n, None),
+            evidence(
+                row.metrics.ci_failed,
+                n,
+                Some(row.metrics.ci_recovered.into()),
+            ),
             None,
         );
         return;
@@ -384,17 +394,21 @@ fn eval_ci(
             rule,
             family,
             SuppressionReason::NoComparablePeer,
-            evidence(unrecovered, n, None),
+            evidence(
+                row.metrics.ci_failed,
+                n,
+                Some(row.metrics.ci_recovered.into()),
+            ),
             None,
         );
         return;
     }
     let median = comparable_median(rows, row, family, |p| {
         Some(rate_per_million(
-            p.metrics.ci_failed.saturating_sub(p.metrics.ci_recovered),
             p.metrics.ci_failed,
+            p.metrics.ci_sample_size,
         ))
-        .filter(|_| p.metrics.ci_failed >= 8)
+        .filter(|_| p.metrics.ci_sample_size >= 8)
     });
     let comp = median.map(|m| ComparisonEvidence {
         peer_numerator: None,
@@ -402,15 +416,19 @@ fn eval_ci(
         comparable_median: Some(m),
         comparable_sample_size: comparable_count(rows, row, family),
     });
-    if at_least(unrecovered, n, 15, 100)
-        && median.is_some_and(|m| rate_per_million(unrecovered, n) > m)
+    if at_least(row.metrics.ci_failed, n, 15, 100)
+        && median.is_some_and(|m| rate_per_million(row.metrics.ci_failed, n) > m)
     {
         push_active(
             report,
             row,
             rule,
             family,
-            evidence(unrecovered, n, None),
+            evidence(
+                row.metrics.ci_failed,
+                n,
+                Some(row.metrics.ci_recovered.into()),
+            ),
             comp,
         );
     } else {
@@ -420,7 +438,11 @@ fn eval_ci(
             rule,
             family,
             SuppressionReason::BelowThreshold,
-            evidence(unrecovered, n, None),
+            evidence(
+                row.metrics.ci_failed,
+                n,
+                Some(row.metrics.ci_recovered.into()),
+            ),
             comp,
         );
     }

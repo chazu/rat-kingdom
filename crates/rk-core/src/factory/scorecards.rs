@@ -36,10 +36,18 @@ pub struct ScorecardGroupKey {
 pub struct ScorecardMetrics {
     pub runs: u32,
     pub accepted: u32,
+    #[serde(default)]
+    pub accepted_sample_size: u32,
     pub reworked: u32,
+    #[serde(default)]
+    pub rework_sample_size: u32,
     pub ci_failed: u32,
+    #[serde(default)]
+    pub ci_sample_size: u32,
     pub ci_recovered: u32,
     pub reverted: u32,
+    #[serde(default)]
+    pub revert_sample_size: u32,
     pub unknown: u32,
     pub unobserved: u32,
     pub active_runs: u32,
@@ -235,6 +243,18 @@ fn add_fact(acc: &mut Accumulator, fact: &OutcomeFact, include_archived: bool) {
             OutcomeStatus::Unobserved => acc.row.metrics.unobserved += 1,
         }
     }
+    match fact.metric_kind {
+        OutcomeMetricKind::Accepted => acc.row.metrics.accepted_sample_size += 1,
+        OutcomeMetricKind::Reworked => acc.row.metrics.rework_sample_size += 1,
+        OutcomeMetricKind::Ci => acc.row.metrics.ci_sample_size += 1,
+        OutcomeMetricKind::Reverted => acc.row.metrics.revert_sample_size += 1,
+        OutcomeMetricKind::HumanIntervention
+            if fact.evidence_kind == OutcomeEvidenceKind::HumanGateDecision =>
+        {
+            acc.row.metrics.intervention_sample_size += 1;
+        }
+        _ => {}
+    }
     if fact.evidence_kind == OutcomeEvidenceKind::AgentRecord {
         if let Some(cost) = fact.cost_micro_usd {
             acc.costs.push(cost);
@@ -249,7 +269,6 @@ fn add_fact(acc: &mut Accumulator, fact: &OutcomeFact, include_archived: bool) {
             .metrics
             .human_interventions
             .saturating_add(fact.human_interventions);
-        acc.row.metrics.intervention_sample_size += 1;
     }
     if let Some(key) = fact.recurrence_key.as_ref().filter(|key| !key.is_empty()) {
         acc.recurrence_keys.push((
@@ -295,34 +314,19 @@ fn finalize(mut acc: Accumulator) -> FactoryScorecard {
     acc.lead_times.sort_unstable();
     acc.recurrence_keys.sort();
     for (kind, sources) in acc.active_sources {
-        let counts = acc
-            .row
-            .source_counts
-            .by_family
-            .entry(kind)
-            .or_default();
+        let counts = acc.row.source_counts.by_family.entry(kind).or_default();
         counts.active_source_count = counts
             .active_source_count
             .max(sources.len().try_into().unwrap_or(u32::MAX));
     }
     for (kind, sources) in acc.archived_sources {
-        let counts = acc
-            .row
-            .source_counts
-            .by_family
-            .entry(kind)
-            .or_default();
+        let counts = acc.row.source_counts.by_family.entry(kind).or_default();
         counts.archived_source_count = counts
             .archived_source_count
             .max(sources.len().try_into().unwrap_or(u32::MAX));
     }
     for (kind, metadata_counts) in acc.metadata_source_counts {
-        let counts = acc
-            .row
-            .source_counts
-            .by_family
-            .entry(kind)
-            .or_default();
+        let counts = acc.row.source_counts.by_family.entry(kind).or_default();
         counts.active_source_count = counts
             .active_source_count
             .max(metadata_counts.active_source_count);

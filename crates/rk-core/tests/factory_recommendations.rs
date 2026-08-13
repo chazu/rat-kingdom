@@ -41,6 +41,14 @@ fn available(
     active: u32,
     events: u32,
 ) -> FactoryScorecard {
+    match family {
+        OutcomeEvidenceKind::Phase3VerifiedDelivery => row.metrics.accepted_sample_size = events,
+        OutcomeEvidenceKind::StructuredReviewerRework => row.metrics.rework_sample_size = events,
+        OutcomeEvidenceKind::Phase4CiSignal => row.metrics.ci_sample_size = events,
+        OutcomeEvidenceKind::StructuredRevert => row.metrics.revert_sample_size = events,
+        OutcomeEvidenceKind::HumanGateDecision => row.metrics.intervention_sample_size = events,
+        _ => {}
+    }
     row.availability.by_family.insert(
         family,
         SourceAvailability {
@@ -169,6 +177,7 @@ fn exact_plan_rules_emit_advice_only_when_thresholds_and_comparable_groups_match
     let mut peer_a = observed(runs(row("bugfix", "wf-a", "harness-b", "model-b"), 10, 8));
     peer_a.metrics.ci_failed = 8;
     peer_a.metrics.ci_recovered = 8;
+    peer_a.metrics.ci_failed = 1;
     peer_a.metrics.average_cost_micro_usd = Some(100);
     peer_a.metrics.cost_sample_size = 8;
     peer_a.metrics.p95_lead_time_ms = Some(100);
@@ -177,6 +186,7 @@ fn exact_plan_rules_emit_advice_only_when_thresholds_and_comparable_groups_match
     let mut peer_b = observed(runs(row("bugfix", "wf-a", "harness-c", "model-c"), 10, 9));
     peer_b.metrics.ci_failed = 8;
     peer_b.metrics.ci_recovered = 8;
+    peer_b.metrics.ci_failed = 1;
     peer_b.metrics.average_cost_micro_usd = Some(80);
     peer_b.metrics.cost_sample_size = 8;
     peer_b.metrics.p95_lead_time_ms = Some(80);
@@ -208,6 +218,7 @@ fn observed_below_threshold_samples_emit_suppressed_rows_with_reasons() {
     let mut target = observed(runs(row("bugfix", "wf-a", "harness-a", "model-a"), 10, 10));
     target.metrics.ci_failed = 1;
     target.metrics.ci_recovered = 0;
+    target.metrics.ci_sample_size = 7;
     target.metrics.average_cost_micro_usd = Some(999);
     target.metrics.cost_sample_size = 7;
     target.metrics.p95_lead_time_ms = Some(999);
@@ -391,4 +402,62 @@ fn full_composite_key_separates_subjects_with_same_task_class_and_workflow() {
     assert_eq!(active[0].subject_group_key, harness_a.group_key);
     assert_eq!(active[1].subject_group_key, harness_b.group_key);
     assert_ne!(active[0].id, active[1].id);
+}
+
+#[test]
+fn low_sample_suppression_uses_metric_observed_denominator_not_runs() {
+    let mut target = observed(runs(row("bugfix", "wf-a", "harness-a", "model-a"), 100, 0));
+    target.metrics.accepted_sample_size = 1;
+    target.metrics.reworked = 1;
+    target.metrics.rework_sample_size = 1;
+    target.metrics.reverted = 1;
+    target.metrics.revert_sample_size = 1;
+
+    let report = evaluate_recommendation_report(&[target]);
+
+    for rule in [
+        RecommendationRule::LowAcceptance,
+        RecommendationRule::HighRework,
+        RecommendationRule::Reverts,
+    ] {
+        let rec = report
+            .recommendations
+            .iter()
+            .find(|rec| rec.rule == rule)
+            .expect("suppressed recommendation");
+        assert!(rec.suppressed, "{rule:?} should be suppressed");
+        assert_eq!(rec.suppression_reason, Some(SuppressionReason::LowSample));
+        assert_eq!(rec.evidence.denominator, Some(1));
+    }
+}
+
+#[test]
+fn ci_instability_uses_ci_availability_denominator_and_reports_recovery_separately() {
+    let mut target = observed(runs(
+        row("bugfix", "wf-a", "harness-a", "model-a"),
+        100,
+        100,
+    ));
+    target.metrics.ci_failed = 2;
+    target.metrics.ci_recovered = 1;
+    target.metrics.ci_sample_size = 10;
+
+    let mut peer = observed(runs(
+        row("bugfix", "wf-a", "harness-b", "model-b"),
+        100,
+        100,
+    ));
+    peer.metrics.ci_failed = 1;
+    peer.metrics.ci_recovered = 1;
+    peer.metrics.ci_sample_size = 10;
+
+    let rec = evaluate_recommendations(&[target, peer])
+        .into_iter()
+        .find(|rec| rec.rule == RecommendationRule::CiInstability)
+        .expect("ci recommendation");
+
+    assert!(!rec.suppressed);
+    assert_eq!(rec.evidence.numerator, Some(2));
+    assert_eq!(rec.evidence.denominator, Some(10));
+    assert_eq!(rec.evidence.metric_value, Some(1));
 }

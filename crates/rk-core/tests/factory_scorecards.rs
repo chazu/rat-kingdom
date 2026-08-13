@@ -401,7 +401,10 @@ fn source_counts_do_not_collapse_same_source_id_across_repos_or_projections() {
         &facts(vec![first, second]),
         ScorecardQuery {
             include_archived: false,
-            projections: vec![ScorecardProjection::All, ScorecardProjection::TaskClassWorkflow],
+            projections: vec![
+                ScorecardProjection::All,
+                ScorecardProjection::TaskClassWorkflow,
+            ],
         },
     );
 
@@ -428,6 +431,101 @@ fn source_counts_do_not_collapse_same_source_id_across_repos_or_projections() {
         .unwrap();
     assert_eq!(projected_counts.active_source_count, 2);
     assert_eq!(projected_counts.event_count, 2);
+}
+
+#[test]
+fn status_denominators_count_explicit_zero_observations_without_inferring_from_runs() {
+    let rows = aggregate_scorecards(
+        &facts(vec![
+            base(
+                OutcomeEvidenceKind::AgentRecord,
+                "run-a",
+                FactoryMetricPayload::Run { count: 1 },
+            ),
+            base(
+                OutcomeEvidenceKind::AgentRecord,
+                "run-b",
+                FactoryMetricPayload::Run { count: 1 },
+            ),
+            base(
+                OutcomeEvidenceKind::Phase3VerifiedDelivery,
+                "accepted-no",
+                FactoryMetricPayload::Accepted {
+                    verified_delivery: false,
+                    landed: false,
+                },
+            ),
+            base(
+                OutcomeEvidenceKind::StructuredReviewerRework,
+                "rework-no",
+                FactoryMetricPayload::Reworked { requested: false },
+            ),
+            base(
+                OutcomeEvidenceKind::StructuredRevert,
+                "revert-no",
+                FactoryMetricPayload::Reverted { reverted: false },
+            ),
+            base(
+                OutcomeEvidenceKind::HumanGateDecision,
+                "human-zero",
+                FactoryMetricPayload::HumanIntervention { count: 0 },
+            ),
+        ]),
+        ScorecardQuery::default(),
+    );
+
+    let row = rows
+        .iter()
+        .find(|row| row.group_key.harness == "harness-a")
+        .unwrap();
+    assert_eq!(row.metrics.runs, 2);
+    assert_eq!(row.metrics.accepted, 0);
+    assert_eq!(row.metrics.accepted_sample_size, 1);
+    assert_eq!(row.metrics.reworked, 0);
+    assert_eq!(row.metrics.rework_sample_size, 1);
+    assert_eq!(row.metrics.reverted, 0);
+    assert_eq!(row.metrics.revert_sample_size, 1);
+    assert_eq!(row.metrics.human_interventions, 0);
+    assert_eq!(row.metrics.intervention_sample_size, 1);
+}
+
+#[test]
+fn ci_instability_denominator_is_ci_observations_and_recovery_is_separate() {
+    let rows = aggregate_scorecards(
+        &facts(vec![
+            base(
+                OutcomeEvidenceKind::AgentRecord,
+                "run-a",
+                FactoryMetricPayload::Run { count: 1 },
+            ),
+            base(
+                OutcomeEvidenceKind::Phase4CiSignal,
+                "ci-ok",
+                FactoryMetricPayload::Ci {
+                    failed: false,
+                    recovered: false,
+                },
+            ),
+            base(
+                OutcomeEvidenceKind::Phase4CiSignal,
+                "ci-failed",
+                FactoryMetricPayload::Ci {
+                    failed: true,
+                    recovered: false,
+                },
+            ),
+        ]),
+        ScorecardQuery::default(),
+    );
+
+    let row = rows
+        .iter()
+        .find(|row| row.group_key.harness == "harness-a")
+        .unwrap();
+    assert_eq!(row.metrics.runs, 1);
+    assert_eq!(row.metrics.ci_failed, 1);
+    assert_eq!(row.metrics.ci_recovered, 0);
+    assert_eq!(row.metrics.ci_sample_size, 2);
 }
 
 #[test]
