@@ -1,17 +1,75 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
+use futures::StreamExt;
 use rk_core::paths::Layout;
 use rk_daemon::Client;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 #[derive(Subcommand)]
 pub enum FactoryCommand {
+    /// Read the native factory snapshot without starting the daemon.
+    Snapshot(FactorySnapshotArgs),
+    /// Read or watch the native factory event feed without starting the daemon.
+    Events {
+        #[command(subcommand)]
+        command: FactoryEventsCommand,
+    },
     /// Propose a typed workflow.run action for operator approval.
     ProposeWorkflow(FactoryProposeWorkflowArgs),
     /// Approve an exact factory action digest.
     Approve(FactoryApproveArgs),
     /// Execute an approved typed workflow.run action.
     ExecuteWorkflow(FactoryExecuteWorkflowArgs),
+}
+
+#[derive(Subcommand)]
+pub enum FactoryEventsCommand {
+    /// Replay a finite page of native factory events.
+    Replay(FactoryEventsReplayArgs),
+    /// Watch native factory events as NDJSON.
+    Watch(FactoryEventsWatchArgs),
+}
+
+#[derive(Args)]
+pub struct FactorySnapshotArgs {
+    /// Registered repository name or path filter.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Stable coordinator-session id filter.
+    #[arg(long)]
+    pub coordinator: Option<String>,
+    /// Include archived records in daemon snapshot views.
+    #[arg(long)]
+    pub include_archived: bool,
+}
+
+#[derive(Args)]
+pub struct FactoryEventsReplayArgs {
+    /// Replay events after this cursor.
+    #[arg(long)]
+    pub after: Option<u64>,
+    /// Registered repository name or path filter.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Event kind filter. Repeat for multiple kinds.
+    #[arg(long = "kind")]
+    pub kinds: Vec<String>,
+    /// Maximum events to replay. The daemon clamps to its native bound.
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Args)]
+pub struct FactoryEventsWatchArgs {
+    /// Watch events after this cursor.
+    #[arg(long)]
+    pub after: Option<u64>,
+    /// Registered repository name or path filter.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Event kind filter. Repeat for multiple kinds.
+    #[arg(long = "kind")]
+    pub kinds: Vec<String>,
 }
 
 #[derive(Args)]
@@ -60,9 +118,64 @@ pub struct FactoryExecuteWorkflowArgs {
 }
 
 pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) -> Result<()> {
-    let mut client = Client::connect_or_spawn(layout).await?;
     match command {
+        FactoryCommand::Snapshot(args) => {
+            let mut client = Client::connect(layout).await?;
+            let params = snapshot_params(args);
+            let result = client.call("factory.snapshot", params).await?;
+            if json_output {
+                println!("{result}");
+            } else {
+                let snapshot = &result["snapshot"];
+                println!(
+                    "factory snapshot: agents={} workflows={} tickets={} approvals={}",
+                    snapshot["agents"].as_array().map(Vec::len).unwrap_or(0),
+                    snapshot["workflows"].as_array().map(Vec::len).unwrap_or(0),
+                    snapshot["tickets"].as_array().map(Vec::len).unwrap_or(0),
+                    snapshot["approvals"].as_array().map(Vec::len).unwrap_or(0)
+                );
+            }
+        }
+        FactoryCommand::Events { command } => match command {
+            FactoryEventsCommand::Replay(args) => {
+                let mut client = Client::connect(layout).await?;
+                let result = client
+                    .call("factory.events.replay", replay_params(args))
+                    .await?;
+                if json_output {
+                    println!("{result}");
+                } else {
+                    print_events(&result["events"]);
+                }
+            }
+            FactoryEventsCommand::Watch(args) => {
+                let client = Client::connect(layout).await?;
+                let (initial, mut stream) = client
+                    .call_then_stream("factory.events.watch", watch_params(args))
+                    .await?;
+                if json_output {
+                    print_events_json(&initial["events"]);
+                } else {
+                    print_events(&initial["events"]);
+                }
+                while let Some(note) = stream.next().await? {
+                    if note["method"].as_str() == Some("factory.event") {
+                        if json_output {
+                            println!("{}", note["params"]);
+                        } else {
+                            print_event(&note["params"]);
+                        }
+                    } else if note["method"].as_str() == Some("lagged") {
+                        eprintln!(
+                            "(factory events lagged: missed {})",
+                            note["params"]["missed"]
+                        );
+                    }
+                }
+            }
+        },
         FactoryCommand::ProposeWorkflow(args) => {
+            let mut client = Client::connect_or_spawn(layout).await?;
             let action = workflow_action(args.workflow, args.repo, args.params, args.coordinator);
             let result = client
                 .call(
@@ -91,6 +204,7 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
             }
         }
         FactoryCommand::Approve(args) => {
+            let mut client = Client::connect_or_spawn(layout).await?;
             let result = client
                 .call(
                     "factory.approve_action",
@@ -107,6 +221,7 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
             }
         }
         FactoryCommand::ExecuteWorkflow(args) => {
+            let mut client = Client::connect_or_spawn(layout).await?;
             let action = workflow_action(args.workflow, args.repo, args.params, args.coordinator);
             let result = client
                 .call(
@@ -125,6 +240,75 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
         }
     }
     Ok(())
+}
+
+fn snapshot_params(args: FactorySnapshotArgs) -> Value {
+    let mut map = Map::new();
+    insert_some(&mut map, "repo", args.repo);
+    insert_some(&mut map, "coordinator", args.coordinator);
+    if args.include_archived {
+        map.insert("include_archived".into(), Value::Bool(true));
+    }
+    Value::Object(map)
+}
+
+fn replay_params(args: FactoryEventsReplayArgs) -> Value {
+    let mut map = event_filter_params(args.after, args.repo, args.kinds);
+    if let Some(limit) = args.limit {
+        map.insert("limit".into(), json!(limit));
+    }
+    Value::Object(map)
+}
+
+fn watch_params(args: FactoryEventsWatchArgs) -> Value {
+    Value::Object(event_filter_params(args.after, args.repo, args.kinds))
+}
+
+fn event_filter_params(
+    after: Option<u64>,
+    repo: Option<String>,
+    kinds: Vec<String>,
+) -> Map<String, Value> {
+    let mut map = Map::new();
+    if let Some(after) = after {
+        map.insert("after".into(), json!(after));
+    }
+    insert_some(&mut map, "repo", repo);
+    if !kinds.is_empty() {
+        map.insert("kinds".into(), json!(kinds));
+    }
+    map
+}
+
+fn insert_some(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
+    if let Some(value) = value {
+        map.insert(key.into(), Value::String(value));
+    }
+}
+
+fn print_events_json(events: &Value) {
+    if let Some(events) = events.as_array() {
+        for event in events {
+            println!("{event}");
+        }
+    }
+}
+
+fn print_events(events: &Value) {
+    match events.as_array() {
+        Some(events) if !events.is_empty() => events.iter().for_each(print_event),
+        _ => println!("(no factory events)"),
+    }
+}
+
+fn print_event(event: &Value) {
+    println!(
+        "{} {} {} {}",
+        event["cursor"].as_u64().unwrap_or(0),
+        event["kind"].as_str().unwrap_or("?"),
+        event["repo"].as_str().unwrap_or("?"),
+        event["summary"].as_str().unwrap_or("")
+    );
 }
 
 fn workflow_action(

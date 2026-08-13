@@ -1,8 +1,9 @@
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 fn git(root: &Path, args: &[&str]) {
@@ -115,6 +116,150 @@ fn failed(output: Output, code: i32) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_factory_snapshot_json_uses_read_rpc_without_mutation() {
+    let (home, _repo, handle) = fixture().await;
+    let layout = Layout::at(home.path());
+
+    let value = successful_json(run_rk(
+        &layout,
+        &[
+            "--json",
+            "factory",
+            "snapshot",
+            "--repo",
+            "fixture",
+            "--coordinator",
+            "coord-1",
+            "--include-archived",
+        ],
+    ));
+
+    assert_eq!(value["schema"], 1);
+    assert!(value["snapshot"].is_object());
+    let replay = successful_json(run_rk(
+        &layout,
+        &["--json", "factory", "events", "replay", "--limit", "20"],
+    ));
+    let events = replay["events"].as_array().unwrap();
+    assert!(events.iter().all(|event| {
+        !matches!(
+            event["source"].as_str(),
+            Some("factory.propose_action" | "factory.execute_action" | "workflow.run")
+        )
+    }));
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_factory_events_replay_is_finite_and_filters_kind() {
+    let (home, _repo, handle) = fixture().await;
+    let layout = Layout::at(home.path());
+    successful_json(run_rk(
+        &layout,
+        &[
+            "--json",
+            "factory",
+            "propose-workflow",
+            "noop",
+            "--repo",
+            "fixture",
+            "--param",
+            "taskId=hello",
+        ],
+    ));
+
+    let value = successful_json(run_rk(
+        &layout,
+        &[
+            "--json",
+            "factory",
+            "events",
+            "replay",
+            "--repo",
+            "fixture",
+            "--kind",
+            "approval.changed",
+            "--limit",
+            "1",
+        ],
+    ));
+
+    assert_eq!(value["schema"], 1);
+    assert_eq!(value["events"].as_array().unwrap().len(), 1);
+    assert_eq!(value["events"][0]["repo"], "fixture");
+    assert_eq!(value["events"][0]["kind"], "approval.changed");
+    assert!(value["boundary"].as_u64().is_some());
+    handle.abort();
+}
+
+#[test]
+fn test_factory_read_commands_do_not_autostart_missing_daemon() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+
+    let stderr = failed(run_rk(&layout, &["--json", "factory", "snapshot"]), 1);
+
+    assert!(
+        stderr.contains("connect") || stderr.contains("No such file") || stderr.contains("daemon")
+    );
+    assert!(
+        !layout.socket_path().exists(),
+        "read command must not create daemon socket"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_factory_events_watch_streams_native_ndjson() {
+    let (home, _repo, handle) = fixture().await;
+    let layout = Layout::at(home.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rk"))
+        .args([
+            "--json",
+            "factory",
+            "events",
+            "watch",
+            "--repo",
+            "fixture",
+            "--kind",
+            "approval.changed",
+        ])
+        .env("RK_HOME", layout.home())
+        .env_remove("RK_AGENT")
+        .env_remove("RK_AUTH_TOKEN")
+        .env_remove("RK_TASK")
+        .env_remove("RK_REPO")
+        .env_remove("RK_ROLE")
+        .env_remove("RK_BRANCH")
+        .env_remove("RK_WORKTREE")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    successful_json(run_rk(
+        &layout,
+        &[
+            "--json",
+            "factory",
+            "propose-workflow",
+            "noop",
+            "--repo",
+            "fixture",
+            "--param",
+            "taskId=hello",
+        ],
+    ));
+
+    let stdout = child.stdout.take().unwrap();
+    let mut lines = BufReader::new(stdout).lines();
+    let line = lines.next().unwrap().unwrap();
+    child.kill().unwrap();
+    let event: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(event["kind"], "approval.changed");
+    assert_eq!(event["repo"], "fixture");
+    handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
