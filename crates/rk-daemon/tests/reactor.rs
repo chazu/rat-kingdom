@@ -526,6 +526,33 @@ async fn existing_stable_reactor_instance_prevents_duplicate_launch_without_mark
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
+#[tokio::test]
+async fn workflow_launch_fails_when_initial_instance_cannot_be_persisted() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let (_, engine) = build_reactor_and_engine_with_space(
+        &layout,
+        ReactorConfig::default(),
+        space,
+    );
+    std::fs::write(layout.home().join("workflow-instances"), "not a directory").unwrap();
+
+    let result = engine.run_owned_with_id(
+        "must-be-durable".into(),
+        "react-work",
+        &repo.path().to_string_lossy(),
+        Default::default(),
+        None,
+    );
+
+    assert!(result.is_err(), "a workflow must not launch without durable instance state");
+    assert!(engine.status("must-be-durable").is_none());
+}
+
 /// A matching tuple must remain deliverable when its target repo is briefly
 /// unavailable. The old reactor advanced the cursor while logging a warning,
 /// permanently dropping the event before an operator could register the repo.

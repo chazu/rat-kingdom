@@ -779,7 +779,7 @@ impl WorkflowEngine {
             completed_at: None,
             archived_at: None,
         };
-        if let Some(existing) = self.store_if_absent(instance.clone()) {
+        if let Some(existing) = self.store_if_absent(instance.clone())? {
             return Ok(existing);
         }
         self.spawn_execution(instance.id.clone(), workflow, repo.to_string());
@@ -1510,7 +1510,7 @@ impl WorkflowEngine {
             archived_at: None,
         };
         let child_id = child.id.clone();
-        self.store(child);
+        self.store(child)?;
         info!(parent = %parent_id, child = %child_id, workflow = %workflow_name, depth, "running sub-workflow inline");
         // Execute the child on this task so the parent step joins on it. finalize
         // records the terminal status and emits the child's own completion event,
@@ -2519,28 +2519,29 @@ impl WorkflowEngine {
         self.lock().get(id).and_then(|i| i.coordinator.clone())
     }
 
-    fn store(&self, instance: Instance) {
+    fn store(&self, instance: Instance) -> rk_core::Result<()> {
         let mut instances = self.lock();
         instances.insert(instance.id.clone(), instance.clone());
         if let Err(error) = self.persist(&instance) {
-            warn!(instance = %instance.id, %error, "failed to persist initial workflow state; skipping coordinator event");
-            return;
+            instances.remove(&instance.id);
+            return Err(error);
         }
         self.emit_state_event(&instance, "started");
+        Ok(())
     }
 
-    fn store_if_absent(&self, instance: Instance) -> Option<Instance> {
+    fn store_if_absent(&self, instance: Instance) -> rk_core::Result<Option<Instance>> {
         let mut instances = self.lock();
         if let Some(existing) = instances.get(&instance.id) {
-            return Some(existing.clone());
+            return Ok(Some(existing.clone()));
         }
         instances.insert(instance.id.clone(), instance.clone());
         if let Err(error) = self.persist(&instance) {
-            warn!(instance = %instance.id, %error, "failed to persist initial workflow state; skipping coordinator event");
-            return None;
+            instances.remove(&instance.id);
+            return Err(error);
         }
         self.emit_state_event(&instance, "started");
-        None
+        Ok(None)
     }
 
     fn update<F: FnOnce(&mut Instance)>(&self, id: &str, mutate: F) {
