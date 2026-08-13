@@ -10,6 +10,43 @@ fn fact(id: RecordId, identity: &str) -> Tuple {
     tuple
 }
 
+fn create_legacy_database(path: &std::path::Path, tuples: &[&Tuple]) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE tuples (
+            id TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            identity TEXT NOT NULL,
+            instance TEXT NOT NULL,
+            lifecycle TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT,
+            strength REAL
+        );",
+    )
+    .unwrap();
+    for tuple in tuples {
+        conn.execute(
+            "INSERT INTO tuples
+             (id, category, scope, identity, instance, lifecycle, payload,
+              created_at, expires_at, strength)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'session', ?6, ?7, NULL, NULL)",
+            rusqlite::params![
+                tuple.id.to_string(),
+                tuple.category.as_str(),
+                tuple.scope,
+                tuple.identity,
+                tuple.instance,
+                tuple.payload.to_string(),
+                tuple.created_at.to_rfc3339(),
+            ],
+        )
+        .unwrap();
+    }
+}
+
 #[test]
 fn delayed_lower_record_id_replays_after_persistence_boundary() {
     let space = Space::open_in_memory().unwrap();
@@ -79,18 +116,18 @@ fn independent_connections_share_one_persistence_sequence() {
 }
 
 #[test]
-fn deleted_rows_still_advance_the_captured_boundary() {
+fn deleted_rows_remain_replayable_in_the_persistence_journal() {
     let space = Space::open_in_memory().unwrap();
     let tuple = fact(RecordId::floor_at(Utc::now()), "short-lived");
     let id = tuple.id;
-    space.out(tuple).unwrap();
+    space.out(tuple.clone()).unwrap();
     let boundary = space.latest_persistence_sequence().unwrap();
     assert!(space.delete(id).unwrap());
 
     let delta = space.persistence_delta(None).unwrap();
 
     assert_eq!(delta.boundary, boundary);
-    assert!(delta.tuples.is_empty());
+    assert_eq!(delta.tuples, vec![tuple]);
 }
 
 #[test]
@@ -103,49 +140,14 @@ fn legacy_database_backfills_deterministically_without_hiding_new_low_ids() {
         RecordId::floor_at(now + Duration::days(1)),
         "legacy-high",
     );
-    {
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE tuples (
-                id TEXT PRIMARY KEY,
-                category TEXT NOT NULL,
-                scope TEXT NOT NULL,
-                identity TEXT NOT NULL,
-                instance TEXT NOT NULL,
-                lifecycle TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                expires_at TEXT,
-                strength REAL
-            );",
-        )
-        .unwrap();
-        for tuple in [&high, &low] {
-            conn.execute(
-                "INSERT INTO tuples
-                 (id, category, scope, identity, instance, lifecycle, payload,
-                  created_at, expires_at, strength)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'session', ?6, ?7, NULL, NULL)",
-                rusqlite::params![
-                    tuple.id.to_string(),
-                    tuple.category.as_str(),
-                    tuple.scope,
-                    tuple.identity,
-                    tuple.instance,
-                    tuple.payload.to_string(),
-                    tuple.created_at.to_rfc3339(),
-                ],
-            )
-            .unwrap();
-        }
-    }
+    create_legacy_database(&db, &[&high, &low]);
 
     let space = Space::open(&db).unwrap();
     let migrated = space.persistence_delta(None).unwrap();
     assert_eq!(migrated.boundary, 2);
     assert_eq!(migrated.tuples, vec![low.clone(), high.clone()]);
-    assert_eq!(space.legacy_persistence_sequence(low.id).unwrap(), Some(1));
-    assert_eq!(space.legacy_persistence_sequence(high.id).unwrap(), Some(2));
+    assert_eq!(space.legacy_persistence_sequence(low.id).unwrap(), Some(0));
+    assert_eq!(space.legacy_persistence_sequence(high.id).unwrap(), Some(0));
 
     let post_migration_low = fact(
         RecordId::floor_at(now - Duration::days(1)),
@@ -155,11 +157,103 @@ fn legacy_database_backfills_deterministically_without_hiding_new_low_ids() {
     assert_eq!(space.latest_persistence_sequence().unwrap(), 3);
     assert_eq!(
         space.legacy_persistence_sequence(high.id).unwrap(),
-        Some(2),
-        "legacy conversion must never consume a post-migration low ULID"
+        Some(0),
+        "legacy conversion must replay the historical baseline so a tuple the old ULID cursor skipped is recovered"
     );
     assert_eq!(
         space.persistence_delta(Some(2)).unwrap().tuples,
         vec![post_migration_low]
     );
+}
+
+#[test]
+fn reopening_fails_closed_when_migrated_sequence_state_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("missing-state.db");
+    let tuple = fact(RecordId::floor_at(Utc::now()), "deleted-before-corruption");
+    {
+        let space = Space::open(&db).unwrap();
+        space.out(tuple.clone()).unwrap();
+        assert!(space.delete(tuple.id).unwrap());
+    }
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("DELETE FROM tuple_sequence_state", []).unwrap();
+    drop(conn);
+
+    assert!(
+        Space::open(&db).is_err(),
+        "an already-migrated database must not reconstruct a lower high-water mark from live rows"
+    );
+}
+
+#[test]
+fn insert_aborts_when_sequence_state_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("missing-live-state.db");
+    let space = Space::open(&db).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("DELETE FROM tuple_sequence_state", []).unwrap();
+    drop(conn);
+    let tuple = fact(RecordId::floor_at(Utc::now()), "must-not-persist");
+
+    assert!(space.out(tuple.clone()).is_err());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tuples WHERE id = ?1",
+            [tuple.id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "the tuple insert must roll back with the trigger");
+}
+
+#[test]
+fn sequence_overflow_aborts_without_persisting_the_tuple() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("overflow.db");
+    let space = Space::open(&db).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE tuple_sequence_state SET last_sequence = ?1 WHERE singleton = 1",
+        [i64::MAX],
+    )
+    .unwrap();
+    drop(conn);
+    let tuple = fact(RecordId::floor_at(Utc::now()), "overflow");
+
+    assert!(space.out(tuple.clone()).is_err());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tuples WHERE id = ?1",
+            [tuple.id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn persistence_delta_rejects_cursor_above_sqlite_integer_range() {
+    let space = Space::open_in_memory().unwrap();
+    let invalid = (i64::MAX as u64) + 1;
+
+    assert!(space.persistence_delta(Some(invalid)).is_err());
+}
+
+#[test]
+fn negative_sequence_state_is_reported_as_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("negative-state.db");
+    let space = Space::open(&db).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "PRAGMA ignore_check_constraints = ON;
+         UPDATE tuple_sequence_state SET last_sequence = -1 WHERE singleton = 1;",
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(space.latest_persistence_sequence().is_err());
 }

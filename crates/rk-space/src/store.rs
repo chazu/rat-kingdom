@@ -51,8 +51,25 @@ CREATE INDEX IF NOT EXISTS idx_tuples_expiry
     ON tuples (expires_at) WHERE expires_at IS NOT NULL;
 CREATE TABLE IF NOT EXISTS tuple_sequence_state (
     singleton                    INTEGER PRIMARY KEY CHECK (singleton = 1),
-    last_sequence                INTEGER NOT NULL,
+    last_sequence                INTEGER NOT NULL
+                                 CHECK (typeof(last_sequence) = 'integer'
+                                        AND last_sequence >= 0),
     legacy_backfill_sequence     INTEGER NOT NULL
+                                 CHECK (typeof(legacy_backfill_sequence) = 'integer'
+                                        AND legacy_backfill_sequence >= 0)
+);
+CREATE TABLE IF NOT EXISTS tuple_persistence_events (
+    commit_sequence INTEGER PRIMARY KEY,
+    id              TEXT NOT NULL,
+    category        TEXT NOT NULL,
+    scope           TEXT NOT NULL,
+    identity        TEXT NOT NULL,
+    instance        TEXT NOT NULL,
+    lifecycle       TEXT NOT NULL,
+    payload         TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    expires_at      TEXT,
+    strength        REAL
 );
 CREATE TABLE IF NOT EXISTS coordinator_events (
     sequence   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,7 +186,7 @@ struct CurrentSdlcState {
 /// existed needs an explicit `ALTER`. The duplicate-column error on an
 /// up-to-date DB is the one expected exception; every other migration error is
 /// returned so the daemon cannot operate against a partially upgraded store.
-fn migrate(conn: &mut Connection) -> rk_core::Result<()> {
+fn migrate(conn: &mut Connection, sequence_schema_preexisting: bool) -> rk_core::Result<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql_err)?;
@@ -220,17 +237,36 @@ fn migrate(conn: &mut Connection) -> rk_core::Result<()> {
             .map_err(sql_err)?;
         }
     }
-    backfill_tuple_sequences(&tx)?;
+    backfill_tuple_sequences(&tx, sequence_schema_preexisting)?;
+    backfill_tuple_persistence_events(&tx)?;
     backfill_legacy_deployment_ordering(&tx)?;
     tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_tuples_strength
              ON tuples (strength) WHERE strength IS NOT NULL;
          CREATE UNIQUE INDEX IF NOT EXISTS idx_tuples_commit_sequence
              ON tuples (commit_sequence) WHERE commit_sequence IS NOT NULL;
-         CREATE TRIGGER IF NOT EXISTS tuples_assign_commit_sequence
+         DROP TRIGGER IF EXISTS tuples_reject_explicit_commit_sequence;
+         CREATE TRIGGER tuples_reject_explicit_commit_sequence
+         BEFORE INSERT ON tuples
+         FOR EACH ROW WHEN NEW.commit_sequence IS NOT NULL
+         BEGIN
+             SELECT RAISE(ABORT, 'tuple commit sequence is database-assigned');
+         END;
+         DROP TRIGGER IF EXISTS tuples_assign_commit_sequence;
+         CREATE TRIGGER tuples_assign_commit_sequence
          AFTER INSERT ON tuples
          FOR EACH ROW WHEN NEW.commit_sequence IS NULL
          BEGIN
+             SELECT CASE WHEN NOT EXISTS (
+                 SELECT 1 FROM tuple_sequence_state
+                  WHERE singleton = 1
+                    AND typeof(last_sequence) = 'integer'
+                    AND last_sequence >= 0
+                    AND last_sequence < 9223372036854775807
+                    AND typeof(legacy_backfill_sequence) = 'integer'
+                    AND legacy_backfill_sequence >= 0
+                    AND legacy_backfill_sequence <= last_sequence
+             ) THEN RAISE(ABORT, 'invalid tuple persistence sequence state') END;
              UPDATE tuple_sequence_state
                 SET last_sequence = last_sequence + 1
               WHERE singleton = 1;
@@ -239,13 +275,23 @@ fn migrate(conn: &mut Connection) -> rk_core::Result<()> {
                     SELECT last_sequence FROM tuple_sequence_state WHERE singleton = 1
                 )
               WHERE id = NEW.id;
+             INSERT INTO tuple_persistence_events
+                 (commit_sequence, id, category, scope, identity, instance,
+                  lifecycle, payload, created_at, expires_at, strength)
+             SELECT last_sequence, NEW.id, NEW.category, NEW.scope, NEW.identity,
+                    NEW.instance, NEW.lifecycle, NEW.payload, NEW.created_at,
+                    NEW.expires_at, NEW.strength
+               FROM tuple_sequence_state WHERE singleton = 1;
          END;",
     )
     .map_err(sql_err)?;
     tx.commit().map_err(sql_err)
 }
 
-fn backfill_tuple_sequences(conn: &Connection) -> rk_core::Result<()> {
+fn backfill_tuple_sequences(
+    conn: &Connection,
+    sequence_schema_preexisting: bool,
+) -> rk_core::Result<()> {
     let existing_state: Option<(i64, i64)> = conn
         .query_row(
             "SELECT last_sequence, legacy_backfill_sequence
@@ -262,10 +308,19 @@ fn backfill_tuple_sequences(conn: &Connection) -> rk_core::Result<()> {
             |row| row.get(0),
         )
         .map_err(sql_err)?;
-    let mut next = existing_state
-        .map(|(last, _)| last)
-        .unwrap_or(0)
-        .max(assigned_max);
+    if sequence_schema_preexisting && existing_state.is_none() {
+        return Err(Error::Other(
+            "missing tuple persistence sequence state in migrated database".into(),
+        ));
+    }
+    if let Some((last, legacy)) = existing_state {
+        if last < 0 || legacy < 0 || legacy > last || last < assigned_max {
+            return Err(Error::Other(
+                "invalid tuple persistence sequence state".into(),
+            ));
+        }
+    }
+    let mut next = existing_state.map(|(last, _)| last).unwrap_or(0);
     let missing_ids = {
         let mut statement = conn
             .prepare("SELECT id FROM tuples WHERE commit_sequence IS NULL ORDER BY id ASC")
@@ -305,6 +360,22 @@ fn backfill_tuple_sequences(conn: &Connection) -> rk_core::Result<()> {
             .map(|_| ())
             .map_err(sql_err),
     }
+}
+
+fn backfill_tuple_persistence_events(conn: &Connection) -> rk_core::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO tuple_persistence_events
+         (commit_sequence, id, category, scope, identity, instance, lifecycle,
+          payload, created_at, expires_at, strength)
+         SELECT commit_sequence, id, category, scope, identity, instance,
+                lifecycle, payload, created_at, expires_at, strength
+           FROM tuples
+          WHERE commit_sequence IS NOT NULL
+          ORDER BY commit_sequence ASC",
+        [],
+    )
+    .map(|_| ())
+    .map_err(sql_err)
 }
 
 fn backfill_legacy_deployment_ordering(conn: &Connection) -> rk_core::Result<()> {
@@ -364,16 +435,27 @@ impl Store {
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT).map_err(sql_err)?;
         enable_wal(&conn)?;
         register_functions(&conn).map_err(sql_err)?;
+        let sequence_schema_preexisting = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('tuples')
+                      WHERE name = 'commit_sequence'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
-        migrate(&mut conn)?;
+        migrate(&mut conn, sequence_schema_preexisting)?;
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> rk_core::Result<Self> {
         let mut conn = Connection::open_in_memory().map_err(sql_err)?;
         register_functions(&conn).map_err(sql_err)?;
+        let sequence_schema_preexisting = false;
         conn.execute_batch(SCHEMA).map_err(sql_err)?;
-        migrate(&mut conn)?;
+        migrate(&mut conn, sequence_schema_preexisting)?;
         Ok(Self { conn })
     }
 
@@ -670,31 +752,36 @@ impl Store {
     }
 
     pub fn latest_persistence_sequence(&self) -> rk_core::Result<u64> {
-        self.conn
+        let sequence = self
+            .conn
             .query_row(
                 "SELECT last_sequence FROM tuple_sequence_state WHERE singleton = 1",
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|sequence| sequence as u64)
-            .map_err(sql_err)
+            .map_err(sql_err)?;
+        u64::try_from(sequence)
+            .map_err(|_| Error::Other("invalid negative tuple persistence sequence".into()))
     }
 
     pub fn persistence_delta(&self, after: Option<u64>) -> rk_core::Result<PersistenceDelta> {
         let boundary = self.latest_persistence_sequence()?;
-        let after = after.unwrap_or(0);
+        let after = i64::try_from(after.unwrap_or(0))
+            .map_err(|_| Error::Other("tuple persistence cursor exceeds SQLite range".into()))?;
+        let boundary_sql = i64::try_from(boundary)
+            .map_err(|_| Error::Other("tuple persistence boundary exceeds SQLite range".into()))?;
         let mut statement = self
             .conn
             .prepare(
                 "SELECT id, category, scope, identity, instance, lifecycle, payload,
                         created_at, expires_at, strength
-                 FROM tuples
+                 FROM tuple_persistence_events
                  WHERE commit_sequence > ?1 AND commit_sequence <= ?2
                  ORDER BY commit_sequence ASC",
             )
             .map_err(sql_err)?;
         let rows = statement
-            .query_map([after as i64, boundary as i64], row_to_tuple)
+            .query_map([after, boundary_sql], row_to_tuple)
             .map_err(sql_err)?;
         let tuples = rows
             .map(|row| row.map_err(sql_err))
@@ -702,22 +789,13 @@ impl Store {
         Ok(PersistenceDelta { boundary, tuples })
     }
 
-    pub fn legacy_persistence_sequence(
-        &self,
-        id: RecordId,
-    ) -> rk_core::Result<Option<u64>> {
-        self.conn
-            .query_row(
-                "SELECT MAX(tuples.commit_sequence)
-                 FROM tuples, tuple_sequence_state
-                 WHERE tuple_sequence_state.singleton = 1
-                   AND tuples.commit_sequence <= tuple_sequence_state.legacy_backfill_sequence
-                   AND tuples.id <= ?1",
-                [id.to_string()],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .map(|sequence| sequence.map(|value| value as u64))
-            .map_err(sql_err)
+    pub fn legacy_persistence_sequence(&self, _id: RecordId) -> rk_core::Result<Option<u64>> {
+        self.latest_persistence_sequence()?;
+        // ULID ordering could already have skipped a delayed lower-ID write before
+        // this migration. The only lossless conversion is an at-least-once replay
+        // of the deterministic historical baseline. Reactor markers and sync tuple
+        // identity make that replay idempotent.
+        Ok(Some(0))
     }
 
     /// Persist a protected coordinator event and its journal row atomically.
