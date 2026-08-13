@@ -15,6 +15,8 @@
 
 mod store;
 
+pub use store::SdlcTransitionRecord;
+
 use rk_core::sdlc::{ConfiguredSourceName, SignalEnvelope, SignalReceipt, SignalSourcePrincipal};
 use rk_core::tuple::{Lifecycle, Pattern, Tuple};
 use std::path::Path;
@@ -161,6 +163,13 @@ impl Space {
         delivery_id: &str,
     ) -> rk_core::Result<Option<SignalReceipt>> {
         self.lock().store.sdlc_receipt(source, delivery_id)
+    }
+
+    pub fn get_sdlc_transition(
+        &self,
+        transition_tuple_id: &str,
+    ) -> rk_core::Result<Option<SdlcTransitionRecord>> {
+        self.lock().store.sdlc_transition(transition_tuple_id)
     }
 
     pub fn current_sdlc_facts(

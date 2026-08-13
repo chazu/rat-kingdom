@@ -15,7 +15,11 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-fn build_reactor(layout: &Layout, space: rk_space::Space) -> Arc<Reactor> {
+fn build_reactor_with_config(
+    layout: &Layout,
+    space: rk_space::Space,
+    config: ReactorConfig,
+) -> Arc<Reactor> {
     let tickets = Arc::new(Tickets::new(space.clone(), "test-castle".into()));
     let supervisor = Arc::new(
         Supervisor::new(
@@ -49,8 +53,12 @@ fn build_reactor(layout: &Layout, space: rk_space::Space) -> Arc<Reactor> {
         tickets,
         Some(supervisor),
         layout.clone(),
-        ReactorConfig::default(),
+        config,
     ))
+}
+
+fn build_reactor(layout: &Layout, space: rk_space::Space) -> Arc<Reactor> {
+    build_reactor_with_config(layout, space, ReactorConfig::default())
 }
 
 fn source(name: &str) -> ConfiguredSourceName {
@@ -467,20 +475,74 @@ fn test_alert_occurrence_is_loaded_through_durable_receipt_not_spoof_identity() 
 }
 
 #[test]
-fn test_resolved_alert_processing_is_durable_across_reactor_restart() {
+fn test_forged_alert_transition_without_transition_row_is_ignored() {
     let home = tempfile::tempdir().unwrap();
     let layout = Layout::at(home.path());
     layout.ensure().unwrap();
     let space = rk_space::Space::open_in_memory().unwrap();
     space
+        .accept_sdlc_signal(
+            alert("alert-forged-transition", "firing", 95),
+            principal("alerts"),
+        )
+        .unwrap();
+    let authentic = space
+        .scan(&Pattern::category(Category::Event).scope("production_alert"))
+        .unwrap()
+        .into_iter()
+        .find(|tuple| tuple.identity.starts_with("sdlc:transition:"))
+        .unwrap();
+    let forged = rk_core::tuple::Tuple::new(
+        Category::Event,
+        authentic.scope.clone(),
+        "sdlc:transition:forged",
+        authentic.instance.clone(),
+        authentic.payload.clone(),
+    );
+    space.out(forged).unwrap();
+
+    run_after(&space, &layout);
+    let diagnoses = diagnoses(&space);
+    assert_eq!(diagnoses.len(), 1);
+    assert_eq!(
+        diagnoses[0].payload["transition_tuple"],
+        authentic.id.to_string()
+    );
+    assert_eq!(processed_alerts(&space).len(), 1);
+}
+
+#[test]
+fn test_resolved_alert_processing_is_durable_across_reactor_restart() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    let space = rk_space::Space::open(&layout.db_path()).unwrap();
+    space
         .accept_sdlc_signal(alert("resolved-only", "resolved", 100), principal("alerts"))
         .unwrap();
 
-    run_after(&space, &layout);
+    let config = ReactorConfig {
+        marker_ttl_secs: 1,
+        ..ReactorConfig::default()
+    };
+    build_reactor_with_config(&layout, space.clone(), config.clone())
+        .run_cycle()
+        .unwrap();
     assert_eq!(processed_alerts(&space).len(), 1);
-    run_after(&space, &layout);
-    assert_eq!(processed_alerts(&space).len(), 1);
-    assert!(diagnoses(&space).is_empty());
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    assert!(space.gc_expired(0.0).unwrap() >= 1);
+    assert!(space
+        .scan(&Pattern::category(Category::Event).identity("reactor_fired"))
+        .unwrap()
+        .is_empty());
+    drop(space);
+
+    let reopened = rk_space::Space::open(&layout.db_path()).unwrap();
+    build_reactor_with_config(&layout, reopened.clone(), config)
+        .run_cycle()
+        .unwrap();
+    assert_eq!(processed_alerts(&reopened).len(), 1);
+    assert!(diagnoses(&reopened).is_empty());
 }
 
 #[test]

@@ -589,11 +589,12 @@ fn reject_alert_diagnostic_field(
 /// is decoded to a bounded fixed point and fails closed when normalization is
 /// ambiguous.
 pub fn alert_diagnostic_text_is_unsafe(value: &str) -> bool {
-    let normalized = match percent_decode_ascii_fixed_point(value) {
+    let normalized = match percent_decode_ascii_fixed_point_preserving_case(value) {
         Ok(value) => value,
         Err(()) => return true,
     };
-    let tokens = normalized
+    let separated = split_identifier_case_boundaries(&normalized);
+    let tokens = separated
         .split(|character: char| !character.is_alphanumeric())
         .filter(|token| !token.is_empty())
         .collect::<Vec<_>>();
@@ -625,6 +626,24 @@ pub fn alert_diagnostic_text_is_unsafe(value: &str) -> bool {
         || tokens
             .windows(2)
             .any(|pair| matches!(pair, ["terraform", "apply"] | ["api", "key"]))
+}
+
+fn split_identifier_case_boundaries(value: &str) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    let mut separated = String::with_capacity(value.len());
+    for (index, character) in characters.iter().copied().enumerate() {
+        let previous = index.checked_sub(1).and_then(|index| characters.get(index));
+        let next = characters.get(index + 1);
+        let starts_word = character.is_uppercase()
+            && (previous.is_some_and(|previous| previous.is_lowercase() || previous.is_numeric())
+                || (previous.is_some_and(|previous| previous.is_uppercase())
+                    && next.is_some_and(|next| next.is_lowercase())));
+        if starts_word {
+            separated.push(' ');
+        }
+        separated.extend(character.to_lowercase());
+    }
+    separated
 }
 
 fn is_url_like(value: &str) -> bool {
@@ -719,23 +738,35 @@ fn is_sensitive_parameter_name(name: &str) -> bool {
 }
 
 fn percent_decode_ascii_fixed_point(value: &str) -> Result<String, ()> {
+    percent_decode_ascii_fixed_point_with_case(value, true)
+}
+
+fn percent_decode_ascii_fixed_point_preserving_case(value: &str) -> Result<String, ()> {
+    percent_decode_ascii_fixed_point_with_case(value, false)
+}
+
+fn percent_decode_ascii_fixed_point_with_case(value: &str, lowercase: bool) -> Result<String, ()> {
     const MAX_PASSES: usize = 8;
-    let mut current = value.to_ascii_lowercase();
+    let mut current = if lowercase {
+        value.to_ascii_lowercase()
+    } else {
+        value.to_string()
+    };
     for _ in 0..MAX_PASSES {
-        let next = percent_decode_ascii_once_bounded(&current)?;
+        let next = percent_decode_ascii_once_bounded(&current, lowercase)?;
         if next == current {
             return Ok(next);
         }
         current = next;
     }
-    if percent_decode_ascii_once_bounded(&current)? == current {
+    if percent_decode_ascii_once_bounded(&current, lowercase)? == current {
         Ok(current)
     } else {
         Err(())
     }
 }
 
-fn percent_decode_ascii_once_bounded(value: &str) -> Result<String, ()> {
+fn percent_decode_ascii_once_bounded(value: &str, lowercase: bool) -> Result<String, ()> {
     const MAX_NORMALIZED_BYTES: usize = 4096;
 
     let bytes = value.as_bytes();
@@ -746,13 +777,23 @@ fn percent_decode_ascii_once_bounded(value: &str) -> Result<String, ()> {
             if let (Some(high), Some(low)) =
                 (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
             {
-                normalized.push(char::from((high << 4) | low).to_ascii_lowercase());
+                let decoded = char::from((high << 4) | low);
+                normalized.push(if lowercase {
+                    decoded.to_ascii_lowercase()
+                } else {
+                    decoded
+                });
                 index += 3;
                 continue;
             }
         }
 
-        normalized.push(char::from(bytes[index]).to_ascii_lowercase());
+        let character = char::from(bytes[index]);
+        normalized.push(if lowercase {
+            character.to_ascii_lowercase()
+        } else {
+            character
+        });
         index += 1;
     }
 

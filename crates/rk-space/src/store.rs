@@ -92,6 +92,18 @@ pub(crate) struct AcceptedSdlcSignal {
     pub projected_tuples: Vec<Tuple>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdlcTransitionRecord {
+    pub source: String,
+    pub scope: String,
+    pub subject: String,
+    pub delivery_id: String,
+    pub previous_digest: Option<String>,
+    pub current_digest: String,
+    pub transition_tuple_id: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone)]
 struct SdlcKey {
     scope: String,
@@ -458,6 +470,33 @@ impl Store {
             .map_err(sql_err)?
             .map(|json| stored_sdlc_receipt(&json))
             .transpose()
+    }
+
+    pub fn sdlc_transition(
+        &self,
+        transition_tuple_id: &str,
+    ) -> rk_core::Result<Option<SdlcTransitionRecord>> {
+        self.conn
+            .query_row(
+                "SELECT source, scope, subject, delivery_id, previous_digest,
+                        current_digest, transition_tuple_id, created_at
+                 FROM sdlc_transitions WHERE transition_tuple_id = ?1",
+                [transition_tuple_id],
+                |row| {
+                    Ok(SdlcTransitionRecord {
+                        source: row.get(0)?,
+                        scope: row.get(1)?,
+                        subject: row.get(2)?,
+                        delivery_id: row.get(3)?,
+                        previous_digest: row.get(4)?,
+                        current_digest: row.get(5)?,
+                        transition_tuple_id: row.get(6)?,
+                        created_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sql_err)
     }
 
     pub fn current_sdlc_facts(

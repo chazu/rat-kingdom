@@ -431,6 +431,39 @@ fn test_state_bearing_payload_fields_are_required_and_consistent() {
 }
 
 #[test]
+fn test_production_alert_diagnosis_rejects_camel_case_mutation_fields() {
+    let mut alert = base_envelope(SignalKind::ProductionAlertFiring);
+    alert.correlation = Correlation {
+        environment: Some("prod".into()),
+        service: Some("api".into()),
+        alert_key: Some("latency".into()),
+        ..Correlation::default()
+    };
+    alert.payload = ProductionAlertSignal {
+        environment: "prod".into(),
+        service: "api".into(),
+        alert_key: "latency".into(),
+        severity: Some("page".into()),
+        state: "firing".into(),
+    }
+    .into();
+
+    for key in ["rollbackAction", "recommendedAction", "restartCommand"] {
+        let mut unsafe_alert = alert.clone();
+        unsafe_alert
+            .attributes
+            .insert(key.into(), "observe only".into());
+        assert_invalid(&unsafe_alert);
+    }
+
+    let mut unsafe_value = alert;
+    unsafe_value
+        .attributes
+        .insert("note".into(), "terraformApply".into());
+    assert_invalid(&unsafe_value);
+}
+
+#[test]
 fn test_secret_values_and_token_bearing_urls_are_rejected() {
     let mut attribute_value = base_envelope(SignalKind::CiFailed);
     attribute_value

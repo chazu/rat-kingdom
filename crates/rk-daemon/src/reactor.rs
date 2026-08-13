@@ -99,6 +99,7 @@ struct AlertDiagnosisContext {
 struct AlertOccurrence {
     tuple: Tuple,
     receipt_id: String,
+    semantic_state_digest: String,
 }
 
 pub struct Reactor {
@@ -971,6 +972,35 @@ impl Reactor {
         if !is_production_alert_transition(tuple) {
             return Ok(false);
         }
+        let transition_id = tuple.id.to_string();
+        let Some(transition) = self.space.get_sdlc_transition(&transition_id)? else {
+            return Ok(false);
+        };
+        let payload_source = tuple.payload.get("source").and_then(Value::as_str);
+        let payload_delivery = tuple.payload.get("delivery_id").and_then(Value::as_str);
+        let payload_subject = tuple.payload.get("subject").and_then(Value::as_str);
+        let payload_previous = tuple.payload.get("previous_digest").and_then(Value::as_str);
+        let payload_current = tuple.payload.get("current_digest").and_then(Value::as_str);
+        let Ok(transition_source) = ConfiguredSourceName::new(&transition.source) else {
+            return Ok(false);
+        };
+        let expected_principal = SignalSourcePrincipal::for_source(&transition_source);
+        if transition.transition_tuple_id != transition_id
+            || transition.scope != tuple.scope
+            || tuple.instance != expected_principal.as_str()
+            || tuple.identity
+                != format!(
+                    "sdlc:transition:{}:{}:{}",
+                    transition.source, transition.scope, transition.subject
+                )
+            || payload_source != Some(transition.source.as_str())
+            || payload_delivery != Some(transition.delivery_id.as_str())
+            || payload_subject != Some(transition.subject.as_str())
+            || payload_previous != transition.previous_digest.as_deref()
+            || payload_current != Some(transition.current_digest.as_str())
+        {
+            return Ok(false);
+        }
         let key = format!("sdlc-alert@{}", tuple.id);
         if self.has_alert_processed(tuple.id)? {
             return Ok(false);
@@ -983,17 +1013,14 @@ impl Reactor {
             self.mark_sdlc_alert_reacted(&key, tuple, "legacy-marker")?;
             return Ok(false);
         }
-        let source = tuple
-            .payload
-            .get("source")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let Some(delivery_id) = tuple.payload.get("delivery_id").and_then(Value::as_str) else {
-            return Ok(false);
-        };
+        let source = transition.source.as_str();
+        let delivery_id = transition.delivery_id.as_str();
         let Some(occurrence) = self.alert_occurrence(source, delivery_id)? else {
             return Ok(false);
         };
+        if occurrence.semantic_state_digest != transition.current_digest {
+            return Ok(false);
+        }
         let occurrence_subject = occurrence
             .tuple
             .payload
@@ -1088,6 +1115,7 @@ impl Reactor {
         Ok(Some(AlertOccurrence {
             tuple,
             receipt_id: receipt.receipt_id,
+            semantic_state_digest: receipt.semantic_state_digest.as_str().to_string(),
         }))
     }
 
