@@ -11,6 +11,7 @@ members = [
     "crates/rk-mux",
     "crates/rk-daemon",
     "crates/rk-cli",
+    "crates/rk-mcp",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ rk-sync = { path = "crates/rk-sync" }
 rk-workflow = { path = "crates/rk-workflow" }
 rk-mux = { path = "crates/rk-mux" }
 rk-daemon = { path = "crates/rk-daemon" }
+rk-mcp = { path = "crates/rk-mcp" }
 
 anyhow = "1"
 thiserror = "2"
