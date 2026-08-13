@@ -103,12 +103,19 @@ it drops events for any consumer that lags. A trigger must never miss an event,
 so the feed is used **only as a wake signal**. The source of truth is a durable
 cursor over the store:
 
-1. Each cycle scans the store for tuples with `id` greater than the saved cursor
-   (ULIDs sort by creation time), in order.
+1. Each cycle captures the store's current persistence-sequence boundary, then
+   scans still-live tuples whose `commit_sequence` is greater than the saved
+   cursor and no greater than that boundary, in persistence order. SQLite assigns
+   the sequence inside the tuple's write transaction, so delayed writers,
+   concurrent connections, daemon restarts, and wall-clock rollback cannot place
+   a committed tuple behind the cursor.
 2. Every new tuple is matched against all loaded triggers and any matches are
    dispatched.
-3. The cursor advances to the newest scanned id and is persisted to
-   `~/.rat-kingdom/reactor-cursor`.
+3. The cursor advances to the captured boundary and is persisted as a decimal
+   sequence in `~/.rat-kingdom/reactor-cursor`. Advancing to the boundary also
+   moves past writes that were deleted before the scan, so an empty delta cannot
+   make the reactor rescan the same range forever. Legacy ULID cursor files are
+   mapped once against the migration's deterministic historical backfill.
 
 This is the same cursor discipline the multiplayer sync loop uses. A dropped
 feed event changes nothing: the next scan — woken by the interval tick if
@@ -155,10 +162,11 @@ forever. Three guards, defence-in-depth:
 A wake must stay cheap even under a sustained write burst, when the feed wakes
 the reactor on nearly every tuple. Three things keep a cycle bounded:
 
-1. **Bounded firing scan.** The delta scan is `id > cursor` resolved from the
-   `id` PRIMARY KEY index (`Pattern::after`), not a full-table read filtered down
-   in Rust. A wake materialises only the tuples added since the cursor, however
-   large the store.
+1. **Bounded firing scan.** The delta scan is
+   `commit_sequence > cursor AND commit_sequence <= boundary`, resolved from the
+   unique persistence-sequence index rather than a full-table read filtered down
+   in Rust. A wake materialises only the still-live tuples committed since the
+   cursor, however large the store.
 2. **Cached trigger parse.** Trigger files are parsed with `cue` (a subprocess
    per file). The parse is cached and reused until a file's `(mtime, len)` stamp
    changes, so a steady-state burst reparses nothing — the `cue` shell-outs, the
@@ -172,11 +180,10 @@ the reactor on nearly every tuple. Three things keep a cycle bounded:
    Convention / open ticket, not the cursor), but only when their relevant
    category population changed since the previous cycle. The gate is an exact SQL
    `COUNT` over `Endorsement`/`Suggestion` (promotion) and `Obstacle`/`Need`
-   (coalescence) — cheap (no row materialisation) and, unlike a cursor delta,
-   immune to the same-millisecond ULID ordering that could otherwise drop a
-   just-added tuple from the change signal. A wake carrying only unrelated writes
-   (claims, facts, harness results) does no whole-store scan at all. The first
-   cycle after start always recomputes, to catch up on any pre-existing backlog.
+   (coalescence) — cheap (no row materialisation) and independent of tuple ID or
+   cursor ordering. A wake carrying only unrelated writes (claims, facts, harness
+   results) does no whole-store scan at all. The first cycle after start always
+   recomputes, to catch up on any pre-existing backlog.
 
 ## First-boot backlog
 
