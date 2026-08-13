@@ -340,6 +340,16 @@ fn migrate(
          FOR EACH ROW WHEN EXISTS (
              SELECT 1 FROM tuple_persistence_events
               WHERE commit_sequence = NEW.commit_sequence
+                AND (id IS NOT NEW.id
+                     OR category IS NOT NEW.category
+                     OR scope IS NOT NEW.scope
+                     OR identity IS NOT NEW.identity
+                     OR instance IS NOT NEW.instance
+                     OR lifecycle IS NOT NEW.lifecycle
+                     OR payload IS NOT NEW.payload
+                     OR created_at IS NOT NEW.created_at
+                     OR expires_at IS NOT NEW.expires_at
+                     OR strength IS NOT NEW.strength)
          )
          BEGIN
              SELECT RAISE(ABORT, 'tuple persistence journal is immutable');

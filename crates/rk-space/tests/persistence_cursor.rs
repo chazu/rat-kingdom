@@ -455,6 +455,35 @@ fn persistence_journal_rejects_insert_or_replace_of_an_existing_sequence() {
 }
 
 #[test]
+fn current_journal_allows_older_insert_or_ignore_backfill_to_be_a_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("journal-old-backfill.db");
+    let original = fact(RecordId::floor_at(Utc::now()), "original");
+    {
+        let space = Space::open(&db).unwrap();
+        space.out(original.clone()).unwrap();
+    }
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO tuple_persistence_events
+         (commit_sequence, id, category, scope, identity, instance, lifecycle,
+          payload, created_at, expires_at, strength)
+         SELECT commit_sequence, id, category, scope, identity, instance,
+                lifecycle, payload, created_at, expires_at, strength
+           FROM tuples
+          WHERE commit_sequence IS NOT NULL
+          ORDER BY commit_sequence ASC",
+        [],
+    );
+
+    assert_eq!(inserted.unwrap(), 0, "older backfill must remain an exact no-op");
+    drop(conn);
+    let reopened = Space::open(&db).unwrap();
+    assert_eq!(reopened.persistence_delta(None).unwrap().tuples, vec![original]);
+}
+
+#[test]
 fn negative_sequence_state_is_reported_as_corruption() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("negative-state.db");
