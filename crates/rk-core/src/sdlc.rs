@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -14,7 +14,7 @@ pub enum SignalKind {
     ProductionAlertResolved,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ConfiguredSourceName(String);
 
 impl ConfiguredSourceName {
@@ -32,13 +32,23 @@ impl ConfiguredSourceName {
     }
 }
 
+impl<'de> Deserialize<'de> for ConfiguredSourceName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 impl fmt::Display for ConfiguredSourceName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SignalSourcePrincipal(String);
 
 impl SignalSourcePrincipal {
@@ -52,6 +62,18 @@ impl SignalSourcePrincipal {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SignalSourcePrincipal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let _ = String::deserialize(deserializer)?;
+        Err(serde::de::Error::custom(
+            SignalValidationError::InlinePrincipalRejected,
+        ))
     }
 }
 
@@ -187,15 +209,19 @@ impl SignalEnvelope {
         }
         for signal_ref in &self.refs {
             reject_secret_like("ref", &signal_ref.label)?;
+            reject_secret_like("ref", &signal_ref.url)?;
             validate_identity("ref.label", &signal_ref.label)?;
             validate_identity("ref.url", &signal_ref.url)?;
         }
         for (key, value) in &self.attributes {
             reject_secret_like("attribute", key)?;
+            reject_secret_like("attribute", value)?;
             validate_identity("attribute.key", key)?;
             validate_identity("attribute.value", value)?;
         }
-        self.validate_correlation()
+        ConfiguredSourceName::new(self.source.as_str())?;
+        self.validate_correlation()?;
+        self.validate_payload()
     }
 
     fn validate_correlation(&self) -> Result<(), SignalValidationError> {
@@ -216,6 +242,55 @@ impl SignalEnvelope {
                 require(&self.correlation.service, "service")?;
                 require(&self.correlation.alert_key, "alert_key")?;
             }
+        }
+        Ok(())
+    }
+
+    fn validate_payload(&self) -> Result<(), SignalValidationError> {
+        match (&self.kind, &self.payload) {
+            (SignalKind::CiFailed | SignalKind::CiRecovered, SignalPayload::Ci(payload)) => {
+                validate_identity("status", &payload.status)?;
+                reject_secret_like("payload", &payload.status)?;
+                if let Some(conclusion) = &payload.conclusion {
+                    reject_secret_like("payload", conclusion)?;
+                }
+            }
+            (SignalKind::DeploymentSucceeded, SignalPayload::Deployment(payload)) => {
+                validate_identity("environment", &payload.environment)?;
+                validate_identity("service", &payload.service)?;
+                require_matching(
+                    &self.correlation.environment,
+                    &payload.environment,
+                    "environment",
+                )?;
+                require_matching(&self.correlation.service, &payload.service, "service")?;
+                if let Some(version) = &payload.version {
+                    validate_identity("version", version)?;
+                    reject_secret_like("payload", version)?;
+                }
+            }
+            (
+                SignalKind::ProductionAlertFiring | SignalKind::ProductionAlertResolved,
+                SignalPayload::ProductionAlert(payload),
+            ) => {
+                validate_identity("environment", &payload.environment)?;
+                validate_identity("service", &payload.service)?;
+                validate_identity("alert_key", &payload.alert_key)?;
+                validate_identity("state", &payload.state)?;
+                require_matching(
+                    &self.correlation.environment,
+                    &payload.environment,
+                    "environment",
+                )?;
+                require_matching(&self.correlation.service, &payload.service, "service")?;
+                require_matching(&self.correlation.alert_key, &payload.alert_key, "alert_key")?;
+                reject_secret_like("payload", &payload.state)?;
+                if let Some(severity) = &payload.severity {
+                    validate_identity("severity", severity)?;
+                    reject_secret_like("payload", severity)?;
+                }
+            }
+            _ => return Err(SignalValidationError::PayloadKindMismatch),
         }
         Ok(())
     }
@@ -286,27 +361,68 @@ impl SemanticStateDigest {
 struct CanonicalState<'a> {
     kind: &'a SignalKind,
     source: &'a ConfiguredSourceName,
-    correlation: &'a Correlation,
-    refs: Vec<&'a SignalRef>,
-    attributes: &'a BTreeMap<String, String>,
-    payload: &'a SignalPayload,
+    state: CanonicalStatePayload<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CanonicalStatePayload<'a> {
+    Ci {
+        repo: &'a str,
+        branch: &'a str,
+        workflow: &'a str,
+        job: &'a str,
+        commit_sha: &'a str,
+        status: &'a str,
+        conclusion: &'a Option<String>,
+    },
+    Deployment {
+        environment: &'a str,
+        service: &'a str,
+        version: &'a Option<String>,
+    },
+    ProductionAlert {
+        environment: &'a str,
+        service: &'a str,
+        alert_key: &'a str,
+        state: &'a str,
+        severity: &'a Option<String>,
+    },
 }
 
 impl<'a> From<&'a SignalEnvelope> for CanonicalState<'a> {
     fn from(envelope: &'a SignalEnvelope) -> Self {
-        let mut refs: Vec<&SignalRef> = envelope.refs.iter().collect();
-        refs.sort_by(|left, right| {
-            left.label
-                .cmp(&right.label)
-                .then_with(|| left.url.cmp(&right.url))
-        });
+        let state = match &envelope.payload {
+            SignalPayload::Ci(payload) => CanonicalStatePayload::Ci {
+                repo: envelope.correlation.repo.as_deref().unwrap_or_default(),
+                branch: envelope.correlation.branch.as_deref().unwrap_or_default(),
+                workflow: envelope.correlation.workflow.as_deref().unwrap_or_default(),
+                job: envelope.correlation.job.as_deref().unwrap_or_default(),
+                commit_sha: envelope
+                    .correlation
+                    .commit_sha
+                    .as_deref()
+                    .unwrap_or_default(),
+                status: &payload.status,
+                conclusion: &payload.conclusion,
+            },
+            SignalPayload::Deployment(payload) => CanonicalStatePayload::Deployment {
+                environment: &payload.environment,
+                service: &payload.service,
+                version: &payload.version,
+            },
+            SignalPayload::ProductionAlert(payload) => CanonicalStatePayload::ProductionAlert {
+                environment: &payload.environment,
+                service: &payload.service,
+                alert_key: &payload.alert_key,
+                state: &payload.state,
+                severity: &payload.severity,
+            },
+        };
         Self {
             kind: &envelope.kind,
             source: &envelope.source,
-            correlation: &envelope.correlation,
-            refs,
-            attributes: &envelope.attributes,
-            payload: &envelope.payload,
+            state,
         }
     }
 }
@@ -362,6 +478,10 @@ pub enum SignalValidationError {
     InvalidSourceToken,
     #[error("semantic digest failed")]
     DigestFailed,
+    #[error("signal kind does not match payload family")]
+    PayloadKindMismatch,
+    #[error("payload field does not match correlation: {0}")]
+    PayloadCorrelationMismatch(&'static str),
 }
 
 fn require(value: &Option<String>, field: &'static str) -> Result<(), SignalValidationError> {
@@ -379,11 +499,27 @@ fn validate_identity(field: &'static str, value: &str) -> Result<(), SignalValid
     }
 }
 
+fn require_matching(
+    correlation: &Option<String>,
+    payload: &str,
+    field: &'static str,
+) -> Result<(), SignalValidationError> {
+    require(correlation, field)?;
+    if correlation.as_deref() == Some(payload) {
+        Ok(())
+    } else {
+        Err(SignalValidationError::PayloadCorrelationMismatch(field))
+    }
+}
+
 fn reject_secret_like(kind: &'static str, key: &str) -> Result<(), SignalValidationError> {
     let lower = key.to_ascii_lowercase();
     let secret_words = [
         "secret",
         "token",
+        "bearer",
+        "api_key",
+        "apikey",
         "password",
         "authorization",
         "cookie",

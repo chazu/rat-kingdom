@@ -7,6 +7,13 @@ use rk_core::sdlc::{
     SignalReceipt, SignalRef, SignalSourcePrincipal, SourceToken,
 };
 
+fn assert_invalid(envelope: &SignalEnvelope) {
+    assert!(
+        envelope.validate(&SignalLimits::default()).is_err(),
+        "envelope should be rejected: {envelope:?}"
+    );
+}
+
 fn ts(seconds: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(seconds, 0).single().unwrap()
 }
@@ -207,4 +214,123 @@ fn test_signal_receipt_contains_digest_principal_delivery_and_tuple_ids() {
     assert_eq!(receipt.projected_event_id, "event-1");
     assert_eq!(receipt.projected_fact_ids, vec!["fact-1"]);
     assert!(receipt.transition_emitted);
+}
+
+#[test]
+fn test_serde_rejects_forged_configured_source_and_principal() {
+    let mut envelope_json = serde_json::to_value(base_envelope(SignalKind::CiFailed)).unwrap();
+    envelope_json["source"] = serde_json::json!("source:forged");
+
+    assert!(serde_json::from_value::<SignalEnvelope>(envelope_json).is_err());
+
+    let receipt_json = serde_json::json!({
+        "receipt_id": "receipt-1",
+        "source": "source:forged",
+        "delivery_id": "delivery-1",
+        "accepted_at": ts(12),
+        "semantic_state_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "projected_event_id": "event-1",
+        "projected_fact_ids": ["fact-1"],
+        "transition_emitted": true
+    });
+
+    assert!(serde_json::from_value::<SignalReceipt>(receipt_json).is_err());
+}
+
+#[test]
+fn test_signal_kind_must_match_payload_family() {
+    let mut envelope = base_envelope(SignalKind::DeploymentSucceeded);
+    envelope.correlation = Correlation {
+        environment: Some("prod".into()),
+        service: Some("api".into()),
+        ..Correlation::default()
+    };
+
+    assert_invalid(&envelope);
+}
+
+#[test]
+fn test_state_bearing_payload_fields_are_required_and_consistent() {
+    let mut ci = base_envelope(SignalKind::CiFailed);
+    if let rk_core::sdlc::SignalPayload::Ci(payload) = &mut ci.payload {
+        payload.status = "   ".into();
+    }
+    assert_invalid(&ci);
+
+    let mut alert = base_envelope(SignalKind::ProductionAlertFiring);
+    alert.correlation = Correlation {
+        environment: Some("prod".into()),
+        service: Some("api".into()),
+        alert_key: Some("latency".into()),
+        ..Correlation::default()
+    };
+    alert.payload = ProductionAlertSignal {
+        environment: "prod".into(),
+        service: "worker".into(),
+        alert_key: "latency".into(),
+        severity: Some("page".into()),
+        state: "firing".into(),
+    }
+    .into();
+    assert_invalid(&alert);
+}
+
+#[test]
+fn test_secret_values_and_token_bearing_urls_are_rejected() {
+    let mut attribute_value = base_envelope(SignalKind::CiFailed);
+    attribute_value
+        .attributes
+        .insert("note".into(), "Bearer abc123".into());
+    assert_invalid(&attribute_value);
+
+    let mut token_url = base_envelope(SignalKind::CiFailed);
+    token_url.refs = vec![SignalRef {
+        label: "build".into(),
+        url: "https://example.invalid/build?api_key=abc123".into(),
+    }];
+    assert_invalid(&token_url);
+
+    let mut password_url = base_envelope(SignalKind::CiFailed);
+    password_url.refs = vec![SignalRef {
+        label: "build".into(),
+        url: "https://user:password@example.invalid/build".into(),
+    }];
+    assert_invalid(&password_url);
+}
+
+#[test]
+fn test_deployment_digest_ignores_optional_repo_metadata_only() {
+    let mut left = base_envelope(SignalKind::DeploymentSucceeded);
+    left.correlation = Correlation {
+        repo: Some("rat-kingdom".into()),
+        environment: Some("prod".into()),
+        service: Some("api".into()),
+        ..Correlation::default()
+    };
+    left.payload = DeploymentSignal {
+        environment: "prod".into(),
+        service: "api".into(),
+        version: Some("v1".into()),
+    }
+    .into();
+
+    let mut repo_changed = left.clone();
+    repo_changed.correlation.repo = Some("renamed-repo".into());
+
+    let mut state_changed = left.clone();
+    state_changed.payload = DeploymentSignal {
+        environment: "prod".into(),
+        service: "api".into(),
+        version: Some("v2".into()),
+    }
+    .into();
+
+    assert_eq!(
+        SemanticStateDigest::for_envelope(&left).unwrap(),
+        SemanticStateDigest::for_envelope(&repo_changed).unwrap()
+    );
+    assert_ne!(
+        SemanticStateDigest::for_envelope(&left).unwrap(),
+        SemanticStateDigest::for_envelope(&state_changed).unwrap()
+    );
 }

@@ -118,7 +118,7 @@ Implement these exact tests:
 - [ ] **Step 2: Run tests and verify RED**
 
 ```bash
-cargo test -p rk-core sdlc -- --nocapture
+cargo test -p rk-core --test sdlc -- --nocapture
 ```
 
 Expected: failure because `rk_core::sdlc` does not exist or is incomplete.
@@ -139,7 +139,7 @@ Canonicalization requirements:
 - [ ] **Step 4: Run tests and verify GREEN**
 
 ```bash
-cargo test -p rk-core sdlc -- --nocapture
+cargo test -p rk-core --test sdlc -- --nocapture
 ```
 
 - [ ] **Step 5: Commit**
