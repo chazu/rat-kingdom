@@ -7,9 +7,13 @@ use crate::factory_events::FactoryEventFilter;
 use crate::ingest_auth::{IngestEventParams, IngestStateParams, SourcePrincipal};
 use crate::proto::{codes, Request, Response};
 use chrono::{DateTime, Utc};
-use rk_core::action::{ApprovalStatus, FactoryAction, TicketGraphApplyAction, WorkflowRunAction};
+use rk_core::action::{
+    ActionProposal, ApprovalGrant, ApprovalStatus, FactoryAction, TicketGraphApplyAction,
+    WorkflowRunAction,
+};
 use rk_core::id::RecordId;
 use rk_core::paths::Layout;
+use rk_core::product_to_code::contracts::{InitiativeContract, TicketGraph};
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, SYSTEM_SCOPE};
 use rk_space::{CoordinatorEvent, Space};
 use serde::Deserialize;
@@ -940,9 +944,6 @@ impl Daemon {
                 | "factory.propose_action"
                 | "factory.approve_action"
                 | "factory.execute_action"
-                | "factory.snapshot"
-                | "factory.events.replay"
-                | "factory.events.watch"
                 | "workflow.approve"
                 | "workflow.archive"
                 | "workflow.unarchive"
@@ -1106,6 +1107,9 @@ impl Daemon {
         mut rx: broadcast::Receiver<CoordinatorEvent>,
     ) -> std::io::Result<()> {
         let mut cursor = boundary;
+        cursor = self
+            .write_factory_durable_catchup(&mut write, &filter, cursor)
+            .await?;
         loop {
             match rx.recv().await {
                 Ok(coordinator_event)
@@ -1124,16 +1128,45 @@ impl Daemon {
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    let before = cursor;
+                    cursor = self
+                        .write_factory_durable_catchup(&mut write, &filter, cursor)
+                        .await?;
                     write_json_line(
                         &mut write,
-                        &json!({"method": "lagged", "params": {"missed": missed, "resync_required": true}}),
+                        &json!({"method": "lagged", "params": {"missed": missed, "resync_required": before == cursor, "cursor": cursor}}),
                     )
                     .await?;
-                    return Ok(());
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
             }
         }
+    }
+
+    async fn write_factory_durable_catchup(
+        &self,
+        write: &mut tokio::net::unix::OwnedWriteHalf,
+        filter: &FactoryEventFilter,
+        cursor: Option<u64>,
+    ) -> std::io::Result<Option<u64>> {
+        let mut catchup_filter = filter.clone();
+        catchup_filter.after = cursor;
+        let scanned = self
+            .space
+            .coordinator_events_after(cursor, catchup_filter.limit().saturating_add(1))
+            .map_err(std::io::Error::other)?;
+        let replay = crate::factory_events::replay(scanned, &catchup_filter);
+        for event in replay.events {
+            write_json_line(write, &json!({"method": "factory.event", "params": event})).await?;
+        }
+        if replay.truncated {
+            write_json_line(
+                write,
+                &json!({"method":"factory.resync", "params":{"truncated": true, "resync_required": true, "boundary": replay.boundary}}),
+            )
+            .await?;
+        }
+        Ok(max_cursor(cursor, replay.boundary))
     }
 
     fn factory_snapshot(&self, filter: &FactoryEventFilter) -> rk_core::Result<Value> {
@@ -1142,31 +1175,50 @@ impl Daemon {
             coordinator: filter.coordinator.clone(),
             ..Default::default()
         };
-        let agents = json!(if filter.include_archived {
+        let agents: Vec<_> = if filter.include_archived {
             self.supervisor.list_all()
         } else {
             self.supervisor.list()
-        });
-        let workflows = json!(if filter.include_archived {
+        }
+        .into_iter()
+        .filter(|agent| factory_matches_agent(filter, agent))
+        .collect();
+        let workflows: Vec<_> = if filter.include_archived {
             self.engine().list_all()
         } else {
             self.engine().list()
-        });
+        }
+        .into_iter()
+        .filter(|workflow| factory_matches_workflow(filter, workflow))
+        .collect();
         let tickets = self
             .tickets
             .list(filter.repo.clone(), None, None)
             .map(|tickets| json!(tickets))
             .unwrap_or_else(|_| json!([]));
+        let all_proposals = self.action_approvals.list()?;
+        let proposals: Vec<_> = all_proposals
+            .iter()
+            .filter(|proposal| factory_matches_proposal(filter, proposal))
+            .cloned()
+            .collect();
+        let grants: Vec<_> = self
+            .action_approvals
+            .list_grants()?
+            .into_iter()
+            .filter(|grant| factory_matches_grant(filter, grant, &all_proposals))
+            .collect();
         let approvals = json!({
-            "proposals": self.action_approvals.list()?,
-            "grants": self.action_approvals.list_grants()?,
+            "proposals": proposals,
+            "grants": grants,
         });
+        let budget = factory_filtered_budget(self.supervisor.fleet_rollup(), filter, &workflows);
         let snapshot = crate::factory_events::snapshot_value(
-            agents,
-            workflows,
+            json!(agents),
+            json!(workflows),
             tickets,
             json!([]),
-            self.supervisor.fleet_rollup(),
+            budget,
             approvals,
             json!({"cursor": self.latest_event_cursor(), "required": false}),
         );
@@ -3419,7 +3471,7 @@ impl Daemon {
                     "factory.propose_action",
                     json!({"proposal_id": proposal.id}),
                     "factory action approval proposed",
-                    json!({"proposal_id": proposal.id, "digest": proposal.digest, "status": proposal.status}),
+                    json!({"proposal_id": proposal.id, "digest": proposal.digest, "status": proposal.status, "coordinator": factory_action_coordinator(&proposal.action)}),
                 ));
                 Response::ok(
                     req.id,
@@ -3440,6 +3492,14 @@ impl Daemon {
             .approve(&params.proposal_id, &params.digest, &req.caller)
         {
             Ok(approval) => {
+                let coordinator = self.action_approvals.list().ok().and_then(|proposals| {
+                    proposals
+                        .into_iter()
+                        .find(|proposal| proposal.id == approval.proposal_id)
+                        .and_then(|proposal| {
+                            factory_action_coordinator(&proposal.action).map(str::to_string)
+                        })
+                });
                 self.emit_factory_event(crate::factory_events::event_tuple(
                     &approval.scope.repo.identity,
                     &req.caller,
@@ -3447,7 +3507,7 @@ impl Daemon {
                     "factory.approve_action",
                     json!({"proposal_id": approval.proposal_id}),
                     "workflow run approval approved",
-                    json!({"proposal_id": approval.proposal_id, "digest": approval.digest, "status": approval.status}),
+                    json!({"proposal_id": approval.proposal_id, "digest": approval.digest, "status": approval.status, "coordinator": coordinator}),
                 ));
                 Response::ok(req.id, json!({"approval": approval}))
             }
@@ -3510,23 +3570,24 @@ impl Daemon {
                     Ok(approval) => approval,
                     Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
                 };
+                let coordinator = instance.coordinator.clone();
                 self.emit_factory_event(crate::factory_events::event_tuple(
                     &approval.scope.repo.identity,
                     &req.caller,
                     "workflow.changed",
                     "workflow.run",
-                    json!({"id": instance.id, "workflow": instance.workflow}),
+                    json!({"id": instance.id, "workflow": instance.workflow, "coordinator": instance.coordinator}),
                     "workflow run started",
-                    json!({"id": instance.id, "status": instance.status, "proposal_id": params.proposal_id}),
+                    json!({"id": instance.id, "status": instance.status, "proposal_id": params.proposal_id, "coordinator": instance.coordinator}),
                 ));
                 self.emit_factory_event(crate::factory_events::event_tuple(
                     &approval.scope.repo.identity,
                     &req.caller,
                     "approval.changed",
                     "factory.execute_action",
-                    json!({"proposal_id": approval.proposal_id, "instance_id": instance.id}),
+                    json!({"proposal_id": approval.proposal_id, "instance_id": instance.id, "coordinator": coordinator}),
                     "workflow run approval consumed",
-                    json!({"proposal_id": approval.proposal_id, "digest": approval.digest, "status": approval.status, "instance_id": instance.id}),
+                    json!({"proposal_id": approval.proposal_id, "digest": approval.digest, "status": approval.status, "instance_id": instance.id, "coordinator": coordinator}),
                 ));
                 Response::ok(req.id, json!({"instance": instance, "approval": approval}))
             }
@@ -3582,10 +3643,17 @@ impl Daemon {
         &self,
         params: serde_json::Value,
     ) -> rk_core::Result<TicketGraphApplyAction> {
-        let repo = params
-            .get("repo")
-            .and_then(Value::as_str)
-            .ok_or_else(|| rk_core::Error::other("ticket_graph.apply repo is required"))?;
+        let params: TicketGraphApplyParams = serde_json::from_value(params).map_err(|e| {
+            rk_core::Error::other(format!("invalid ticket_graph.apply action: {e}"))
+        })?;
+        params.initiative.validate()?;
+        let acceptance_criterion_ids = params
+            .initiative
+            .acceptance_criteria
+            .iter()
+            .map(|criterion| criterion.id.clone())
+            .collect::<Vec<_>>();
+        let repo = params.repo.as_str();
         let submitted = std::path::PathBuf::from(repo);
         let canonical_submitted = if submitted.exists() {
             submitted.canonicalize()?
@@ -3604,24 +3672,16 @@ impl Daemon {
                 rk_core::Error::other(format!("repository is not registered: {repo}"))
             })?;
         let canonical_path = record.path.canonicalize().unwrap_or(record.path.clone());
+        let apply_plan = params
+            .graph
+            .apply_plan(&record.name, &acceptance_criterion_ids)?;
         Ok(TicketGraphApplyAction {
             repo: record.name.clone(),
             repo_identity: record.name,
             repo_path: canonical_path.display().to_string(),
-            graph: params.get("graph").cloned().unwrap_or(Value::Null),
-            initiative: params.get("initiative").cloned().unwrap_or(Value::Null),
-            topological_order: params
-                .get("topological_order")
-                .cloned()
-                .map(serde_json::from_value)
-                .transpose()?
-                .unwrap_or_default(),
-            mutations: params
-                .get("mutations")
-                .cloned()
-                .map(serde_json::from_value)
-                .transpose()?
-                .unwrap_or_default(),
+            graph: params.graph,
+            initiative: params.initiative,
+            apply_plan,
         })
     }
 
@@ -4387,6 +4447,94 @@ fn max_cursor(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     }
 }
 
+fn factory_matches_repo(filter: &FactoryEventFilter, identity: &str, path: &str) -> bool {
+    filter
+        .repo
+        .as_deref()
+        .is_none_or(|repo| repo == identity || repo == path)
+}
+
+fn factory_matches_agent(filter: &FactoryEventFilter, agent: &crate::agents::AgentRecord) -> bool {
+    factory_matches_repo(filter, &agent.repo_name, &agent.repo_root.to_string_lossy())
+        && filter
+            .coordinator
+            .as_deref()
+            .is_none_or(|coordinator| agent.coordinator.as_deref() == Some(coordinator))
+}
+
+fn factory_matches_workflow(
+    filter: &FactoryEventFilter,
+    workflow: &crate::workflow_exec::Instance,
+) -> bool {
+    factory_matches_repo(filter, &workflow.repo, &workflow.repo)
+        && filter
+            .coordinator
+            .as_deref()
+            .is_none_or(|coordinator| workflow.coordinator.as_deref() == Some(coordinator))
+}
+
+fn factory_matches_proposal(filter: &FactoryEventFilter, proposal: &ActionProposal) -> bool {
+    factory_matches_repo(
+        filter,
+        &proposal.scope.repo.identity,
+        &proposal.scope.repo.path,
+    ) && filter.coordinator.as_deref().is_none_or(|coordinator| {
+        matches!(
+            &proposal.action,
+            FactoryAction::WorkflowRun(action) if action.coordinator.as_deref() == Some(coordinator)
+        )
+    })
+}
+
+fn factory_action_coordinator(action: &FactoryAction) -> Option<&str> {
+    match action {
+        FactoryAction::WorkflowRun(action) => action.coordinator.as_deref(),
+        FactoryAction::TicketGraphApply(_) => None,
+    }
+}
+
+fn factory_matches_grant(
+    filter: &FactoryEventFilter,
+    grant: &ApprovalGrant,
+    proposals: &[ActionProposal],
+) -> bool {
+    factory_matches_repo(filter, &grant.scope.repo.identity, &grant.scope.repo.path)
+        && filter.coordinator.as_deref().is_none_or(|coordinator| {
+            proposals
+                .iter()
+                .find(|proposal| proposal.id == grant.proposal_id)
+                .is_some_and(|proposal| factory_matches_proposal(filter, proposal))
+                || grant.requester == coordinator
+        })
+}
+
+fn factory_filtered_budget(
+    mut budget: Value,
+    filter: &FactoryEventFilter,
+    workflows: &[crate::workflow_exec::Instance],
+) -> Value {
+    if let Some(repo) = filter.repo.as_deref() {
+        if let Some(repos) = budget.get_mut("repos").and_then(Value::as_array_mut) {
+            repos.retain(|entry| entry.get("repo").and_then(Value::as_str) == Some(repo));
+        }
+    }
+    if filter.repo.is_some() || filter.coordinator.is_some() {
+        let allowed: HashSet<_> = workflows
+            .iter()
+            .map(|workflow| workflow.id.as_str())
+            .collect();
+        if let Some(instances) = budget.get_mut("instances").and_then(Value::as_array_mut) {
+            instances.retain(|entry| {
+                entry
+                    .get("instance")
+                    .and_then(Value::as_str)
+                    .is_some_and(|instance| allowed.contains(instance))
+            });
+        }
+    }
+    budget
+}
+
 fn filter_is_valid(filter: &CoordinatorFilter) -> bool {
     filter.instance.is_some()
         || filter.coordinator.is_some()
@@ -4493,6 +4641,14 @@ struct FactoryProposeParams {
     action: Value,
     #[serde(default)]
     ttl_seconds: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TicketGraphApplyParams {
+    repo: String,
+    graph: TicketGraph,
+    initiative: InitiativeContract,
 }
 
 #[derive(Deserialize)]

@@ -48,6 +48,10 @@ impl FactoryEventFilter {
 
     pub fn matches(&self, event: &FactoryEvent) -> bool {
         self.repo.as_deref().is_none_or(|repo| event.repo == repo)
+            && self.coordinator.as_deref().is_none_or(|coordinator| {
+                event.payload.get("coordinator").and_then(Value::as_str) == Some(coordinator)
+                    || event.subject.get("coordinator").and_then(Value::as_str) == Some(coordinator)
+            })
             && (self.kinds.is_empty() || self.kinds.iter().any(|kind| kind == &event.kind))
     }
 }

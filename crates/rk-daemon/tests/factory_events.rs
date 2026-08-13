@@ -104,6 +104,13 @@ async fn propose_approve_execute(client: &mut Client) -> Value {
     })).await.unwrap()
 }
 
+async fn propose_for(client: &mut Client, repo: &str, coordinator: &str, task: &str) -> Value {
+    client.call("factory.propose_action", json!({
+        "kind":"workflow.run",
+        "action":{"name":"factory-test","repo":repo, "params":{"taskId":task}, "coordinator":coordinator}
+    })).await.unwrap()
+}
+
 #[tokio::test]
 async fn test_factory_snapshot_contains_agents_workflows_tickets_inbox_budget_approvals_and_resync()
 {
@@ -126,6 +133,60 @@ async fn test_factory_snapshot_contains_agents_workflows_tickets_inbox_budget_ap
             "workflows"
         ]
     );
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn test_factory_snapshot_filters_repo_and_coordinator_across_sections() {
+    let (_home, _repo, _layout, handle, mut client) = setup().await;
+    let proposal = propose_for(&mut client, "repo-a", "coord-a", "one").await;
+    let proposal_id = proposal["proposal"]["id"].as_str().unwrap().to_string();
+    let digest = proposal["proposal"]["digest"].as_str().unwrap().to_string();
+    client
+        .call(
+            "factory.approve_action",
+            json!({"proposal_id": proposal_id, "digest": digest}),
+        )
+        .await
+        .unwrap();
+    client.call("factory.execute_action", json!({
+        "proposal_id": proposal_id,
+        "digest": digest,
+        "action":{"name":"factory-test","repo":"repo-a", "params":{"taskId":"one"}, "coordinator":"coord-a"}
+    })).await.unwrap();
+
+    let repo_other = client
+        .call("factory.snapshot", json!({"repo":"other"}))
+        .await
+        .unwrap();
+    let snap = &repo_other["snapshot"];
+    assert!(snap["agents"].as_array().unwrap().is_empty());
+    assert!(snap["workflows"].as_array().unwrap().is_empty());
+    assert!(snap["tickets"].as_array().unwrap().is_empty());
+    assert!(snap["approvals"]["proposals"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(snap["approvals"]["grants"].as_array().unwrap().is_empty());
+    assert!(snap["budget"]["repos"].as_array().unwrap().is_empty());
+    assert!(snap["budget"]["instances"].as_array().unwrap().is_empty());
+
+    let coord_other = client
+        .call(
+            "factory.snapshot",
+            json!({"repo":"repo-a", "coordinator":"coord-b"}),
+        )
+        .await
+        .unwrap();
+    let snap = &coord_other["snapshot"];
+    assert!(snap["agents"].as_array().unwrap().is_empty());
+    assert!(snap["workflows"].as_array().unwrap().is_empty());
+    assert!(snap["approvals"]["proposals"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(snap["approvals"]["grants"].as_array().unwrap().is_empty());
     client.call("stop", json!({})).await.unwrap();
     handle.await.unwrap().unwrap();
 }
@@ -251,6 +312,37 @@ async fn test_snapshot_and_replay_are_read_only() {
 }
 
 #[tokio::test]
+async fn test_factory_read_only_methods_permit_authenticated_agent_but_actions_do_not() {
+    let (_home, _repo, layout, handle, mut client) = setup().await;
+    propose_for(&mut client, "repo-a", "coord-a", "one").await;
+    let mut agent = Client::connect_as(&layout, "rat-a").await.unwrap();
+    agent
+        .call("factory.snapshot", json!({"repo":"repo-a"}))
+        .await
+        .unwrap();
+    agent
+        .call(
+            "factory.events.replay",
+            json!({"repo":"repo-a", "limit":20}),
+        )
+        .await
+        .unwrap();
+    let (initial, _stream) = agent
+        .call_then_stream("factory.events.watch", json!({"repo":"repo-a"}))
+        .await
+        .unwrap();
+    assert!(initial["events"].is_array());
+    let mut agent = Client::connect_as(&layout, "rat-a").await.unwrap();
+    let denied = agent
+        .call("factory.propose_action", json!({"kind":"workflow.run","action":{"name":"factory-test","repo":"repo-a", "params":{"taskId":"blocked"}}}))
+        .await
+        .unwrap_err();
+    assert!(denied.to_string().contains("not authorized"));
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn test_replay_uses_sentinel_boundary_when_truncated() {
     let (_home, _repo, _layout, handle, mut client) = setup().await;
     for task in ["one", "two", "three"] {
@@ -294,6 +386,38 @@ async fn test_watch_skips_events_at_or_before_replay_boundary() {
         .unwrap()
         .unwrap();
     assert!(note["params"]["cursor"].as_u64().unwrap() > boundary);
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn test_watch_durable_catchup_after_truncated_boundary() {
+    let (_home, _repo, layout, handle, mut client) = setup().await;
+    for task in ["one", "two", "three"] {
+        propose_for(&mut client, "repo-a", "coord-a", task).await;
+    }
+    let replay = client
+        .call("factory.events.replay", json!({"repo":"repo-a", "limit":1}))
+        .await
+        .unwrap();
+    assert_eq!(replay["truncated"], true);
+    let boundary = replay["boundary"].as_u64().unwrap();
+    propose_for(&mut client, "repo-a", "coord-a", "durable-after-boundary").await;
+
+    let watcher = connect(&layout).await;
+    let (initial, _stream) = watcher
+        .call_then_stream(
+            "factory.events.watch",
+            json!({"repo":"repo-a", "after": boundary, "limit":1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(initial["events"].as_array().unwrap().len(), 1);
+    assert!(initial["events"][0]["cursor"].as_u64().unwrap() > boundary);
+    assert_eq!(
+        initial["events"][0]["payload"]["proposal_id"].is_string(),
+        true
+    );
     client.call("stop", json!({})).await.unwrap();
     handle.await.unwrap().unwrap();
 }
