@@ -38,6 +38,8 @@ python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py triage --repo r
 
 The helper never auto-starts the daemon: strict `rk --json daemon status` must pass before observation. Native typed automation uses `rk --json factory ...` or `rk-mcp`; exact digest approval is daemon-enforced for that factory path, but legacy `workflow.run` is not globally gated. See [docs/factory-foreman.md](docs/factory-foreman.md) for authority, CLI/MCP schemas, snapshot/replay/watch semantics, renderer usage, recovery, and limitations.
 
+The **product-to-code lifecycle** (`rk product-to-code ...`) turns a product initiative into implemented, independently verified code through offline, contract-validated artifacts and two canonical typed factory actions: `ticket_graph.apply` (mint tickets from a validated graph) and `product_to_code.dispatch` (launch `implement-featureset` for unblocked minted tickets). The CLI only proposes; the daemon applies after authenticated operator approval with status, digest, and CAS checks. See [docs/product-to-code.md](docs/product-to-code.md).
+
 ## Five-minute tour
 
 ```bash

@@ -328,6 +328,32 @@ The 2026-08-13 local acceptance run wrote its JSON artifact under `$JCODE_SCRATC
 
 Unknown findings in that report need future classifiers once the failure patterns are understood.
 
+## Product-to-code lifecycle
+
+The product-to-code lifecycle turns a product initiative into implemented,
+independently verified code through offline, contract-validated artifacts and
+daemon-executed, operator-approved actions. It reuses the same Phase 2 canonical
+approval boundary documented above: the CLI only proposes typed actions, and the
+daemon alone applies them after an authenticated operator approval with status,
+digest, and CAS checks. See [product-to-code.md](./product-to-code.md) for the
+full lifecycle, commands, contracts, and safety boundaries.
+
+The two mutating steps are both canonical typed factory actions:
+
+- `ticket_graph.apply` mints `TKT-...` tickets and dependency edges from a
+  validated ticket graph, recording the graph-node-id to minted-ticket-id
+  mapping under the consumed approval.
+- `product_to_code.dispatch` launches `implement-featureset` workflow runs for
+  the unblocked minted tickets of a previously approved graph apply. Graph nodes
+  without current generic impact evidence are reported as blocked, never
+  dispatched, and never leak a minted ticket id.
+
+Both actions are validated, approved, and executed exclusively through
+`factory.propose_action`, `factory.approve_action`, and
+`factory.execute_action`. There is no local approve, apply, or dispatch
+shortcut, and RK performs no runtime call to Jcode, browser automation, or
+GitNexus during the lifecycle.
+
 ## Phase 2 limitations
 
 - The five-tool MCP surface and typed CLI mutation documented here support only the initial `workflow.run` proposal, approval, and execution flow. This is not a claim that every mutation in Rat Kingdom is typed or gated this way.
