@@ -189,6 +189,36 @@ Approval identity is proposal-digest checked in the helper, while the fact that 
 
 The helper never executes `workflow run`, `spawn`, `dismiss`, `approve`, `reject`, `revert`, ticket mutations, or tuple writes during snapshot, triage, proposal rendering, or proposal validation.
 
+## Pure Python dashboard renderer
+
+The repository-owned dashboard is a deterministic Markdown renderer over saved typed factory data. First acquire a `factory.snapshot` response and a `factory.events.replay` response through an authorized typed CLI or MCP read path and save each response as JSON. Then run:
+
+```bash
+python3 .jcode/skills/factory-foreman/dashboard/render_factory_dashboard.py \
+  --snapshot "$JCODE_SCRATCH_DIR/factory-snapshot.json" \
+  --events "$JCODE_SCRATCH_DIR/factory-events.json" \
+  --output "$JCODE_SCRATCH_DIR/factory-dashboard.md"
+```
+
+Inputs and output:
+
+- `--snapshot PATH` reads one snapshot JSON document. The renderer presents connection state, approvals, workflow runs, agents, tickets, inbox, budget, degraded sources, and `repo_resync` fields when supplied.
+- `--events PATH` reads one event replay JSON document. The renderer presents recent events together with replay cursor, truncation, and boundary information when supplied.
+- `--output PATH` writes the rendered Markdown file. Parent directories and input artifacts are prepared by the caller.
+
+The Markdown view includes `Factory Dashboard`, `Connection State`, `Resync State`, `Approvals`, `Workflow Runs`, `Agents`, `Tickets`, `Inbox`, `Budget`, `Recent Events`, and `Degraded Data`. It keeps partial-history and health conditions visible: a truncated replay shows its boundary, a running repository resync is labelled `RESYNCING`, and stale or failed sources are labelled `DEGRADED`.
+
+### Renderer boundary
+
+The renderer uses the Python standard library only and is deliberately not an integration client:
+
+- It does not connect to or start the Rat Kingdom daemon.
+- It does not invoke the `rk` CLI.
+- It does not invoke `rk-mcp`, host an MCP server, or expose MCP tools.
+- It does not fetch live state, approve proposals, execute commands, or mutate Rat Kingdom state.
+
+CLI and MCP are upstream options for producing the input files. The renderer only reads those files and writes Markdown. The output can be displayed in a Jcode side panel, but the renderer and side panel are not a control plane or source of truth. Proposal rows remain proposals until authoritative daemon snapshot data says they are approved, and display of an approval or digest never grants execution authority.
+
 ## Monitoring after approved dispatch
 
 After an approved and validated workflow dispatch, monitor the returned workflow ID with:

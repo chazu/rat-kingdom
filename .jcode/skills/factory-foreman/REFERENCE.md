@@ -64,6 +64,35 @@ Triage categories emitted by the helper include:
 
 A failed observation remains in top-level `observations` and nested `snapshot.observations` with `ok: false` and an `error`. Report that degradation before drawing conclusions.
 
+## Dashboard renderer input and output
+
+The repository-owned dashboard renderer consumes JSON artifacts that have already been obtained from typed factory read interfaces:
+
+- `--snapshot PATH`: one JSON document from `factory.snapshot`, containing the current connection state and factory projection such as approvals, workflow runs, agents, tickets, inbox, budget, degraded sources, and repository resync state when present.
+- `--events PATH`: one JSON document from `factory.events.replay`, containing replay metadata such as cursor or boundary cursor, `truncated`, and the recent event list.
+- `--output PATH`: the Markdown file to create or replace.
+
+Run it from the repository root:
+
+```bash
+python3 .jcode/skills/factory-foreman/dashboard/render_factory_dashboard.py \
+  --snapshot "$JCODE_SCRATCH_DIR/factory-snapshot.json" \
+  --events "$JCODE_SCRATCH_DIR/factory-events.json" \
+  --output "$JCODE_SCRATCH_DIR/factory-dashboard.md"
+```
+
+The output is deterministic Markdown with sections for connection and resync state, approvals, workflow runs, agents, tickets, inbox, budget, recent events, and degraded data. Replay truncation and its boundary must remain visible so a reader does not mistake a partial replay for complete history. A running resync is rendered as resyncing, while stale or failed inputs remain visibly degraded.
+
+The renderer uses only the Python standard library. Its boundary is intentionally strict:
+
+- no daemon connection or daemon startup;
+- no `rk` CLI subprocesses;
+- no `rk-mcp` subprocesses or MCP server/tool behavior;
+- no proposal approval, workflow execution, or other mutation;
+- no authority beyond the contents of the supplied files.
+
+MCP and CLI are upstream ways to acquire typed JSON, not dependencies called by the renderer. A Jcode side panel may display the generated Markdown, but neither the renderer nor the side panel is a source of truth or an execution boundary. Daemon state remains authoritative, including whether a proposal is actually approved.
+
 ## Approval examples
 
 Valid later-user approvals include:

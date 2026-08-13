@@ -25,6 +25,21 @@ Never execute a mutating Rat Kingdom command unless a later user message explici
 
 See [REFERENCE.md](REFERENCE.md) for categories, schemas, approval examples, and recovery behavior.
 
+## Dashboard rendering
+
+When typed factory snapshot and event replay JSON are available, prefer them as the dashboard inputs and render the repository-owned Markdown view with:
+
+```bash
+python3 .jcode/skills/factory-foreman/dashboard/render_factory_dashboard.py \
+  --snapshot <factory-snapshot.json> \
+  --events <factory-events-replay.json> \
+  --output <factory-dashboard.md>
+```
+
+The renderer is a pure Python, standard-library presentation step. It reads the two existing JSON files and writes deterministic Markdown to `--output`. It does not start or contact the Rat Kingdom daemon, invoke `rk`, invoke `rk-mcp`, expose an MCP tool, or dispatch any action. Obtain snapshot and replay data separately through an authorized typed MCP or CLI read path, then pass the saved files to the renderer.
+
+Opening the generated Markdown in a Jcode side panel is optional. The file is a status view, not a control plane. Approval labels, proposal digests, replay boundaries, degraded sources, and resync state are display data only and confer no execution authority.
+
 ## Workflow
 
 1. Resolve the repository name without guessing when ambiguous. If the requested repo is unclear, ask for the repo before running repo-scoped commands.
