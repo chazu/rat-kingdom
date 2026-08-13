@@ -531,12 +531,20 @@ fn reject_secret_like(kind: &'static str, key: &str) -> Result<(), SignalValidat
         ));
     }
 
-    let normalized = percent_decode_ascii_fixed_point(key);
-    if normalized != lower && contains_secret_word(&normalized) {
-        return Err(SignalValidationError::SecretLikeField(
-            kind,
-            "<redacted>".into(),
-        ));
+    match percent_decode_ascii_fixed_point(key) {
+        Ok(normalized) if normalized != lower && contains_secret_word(&normalized) => {
+            return Err(SignalValidationError::SecretLikeField(
+                kind,
+                "<redacted>".into(),
+            ));
+        }
+        Err(()) => {
+            return Err(SignalValidationError::SecretLikeField(
+                kind,
+                "<redacted>".into(),
+            ));
+        }
+        _ => {}
     }
 
     Ok(())
@@ -572,7 +580,10 @@ fn contains_secret_word(value: &str) -> bool {
 }
 
 fn url_contains_secret_like_parts(value: &str) -> bool {
-    let normalized = percent_decode_ascii_fixed_point(value);
+    let normalized = match percent_decode_ascii_fixed_point(value) {
+        Ok(normalized) => normalized,
+        Err(()) => return true,
+    };
     url_contains_userinfo(value)
         || url_contains_userinfo(&normalized)
         || url_contains_sensitive_query_name(value)
@@ -597,7 +608,10 @@ fn url_contains_sensitive_query_name(value: &str) -> bool {
     let query = query.split('#').next().unwrap_or_default();
     query.split('&').any(|part| {
         let name = part.split(['=', ';']).next().unwrap_or_default();
-        let name = percent_decode_ascii_fixed_point(name);
+        let name = match percent_decode_ascii_fixed_point(name) {
+            Ok(name) => name,
+            Err(()) => return true,
+        };
         let name = name.split(['=', ';']).next().unwrap_or_default();
         is_sensitive_parameter_name(name)
     })
@@ -627,20 +641,24 @@ fn is_sensitive_parameter_name(name: &str) -> bool {
     )
 }
 
-fn percent_decode_ascii_fixed_point(value: &str) -> String {
+fn percent_decode_ascii_fixed_point(value: &str) -> Result<String, ()> {
     const MAX_PASSES: usize = 8;
     let mut current = value.to_ascii_lowercase();
     for _ in 0..MAX_PASSES {
-        let next = percent_decode_ascii_once_bounded(&current);
+        let next = percent_decode_ascii_once_bounded(&current)?;
         if next == current {
-            return next;
+            return Ok(next);
         }
         current = next;
     }
-    current
+    if percent_decode_ascii_once_bounded(&current)? == current {
+        Ok(current)
+    } else {
+        Err(())
+    }
 }
 
-fn percent_decode_ascii_once_bounded(value: &str) -> String {
+fn percent_decode_ascii_once_bounded(value: &str) -> Result<String, ()> {
     const MAX_NORMALIZED_BYTES: usize = 4096;
 
     let bytes = value.as_bytes();
@@ -661,7 +679,11 @@ fn percent_decode_ascii_once_bounded(value: &str) -> String {
         index += 1;
     }
 
-    normalized
+    if index == bytes.len() {
+        Ok(normalized)
+    } else {
+        Err(())
+    }
 }
 
 fn hex_value(byte: u8) -> Option<u8> {

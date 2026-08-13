@@ -162,6 +162,64 @@ fn test_url_refs_reject_repeatedly_encoded_sensitive_query_keys() {
     }
 }
 
+fn repeat_percent_encode(mut value: String, passes: usize) -> String {
+    for _ in 0..passes {
+        value = value
+            .bytes()
+            .map(|byte| format!("%{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join("");
+    }
+    value
+}
+
+#[test]
+fn test_url_refs_reject_sensitive_query_keys_encoded_at_decode_limit() {
+    let encoded_token = repeat_percent_encode("token".into(), 8);
+    let mut envelope = base_envelope(SignalKind::CiFailed);
+    envelope.refs = vec![SignalRef {
+        label: "build".into(),
+        url: format!("https://example.invalid/build?{encoded_token}=super-secret-value"),
+    }];
+
+    assert_invalid(&envelope);
+}
+
+#[test]
+fn test_url_refs_reject_sensitive_query_keys_encoded_beyond_decode_limit() {
+    let encoded_token = repeat_percent_encode("token".into(), 9);
+    let mut envelope = base_envelope(SignalKind::CiFailed);
+    envelope.refs = vec![SignalRef {
+        label: "build".into(),
+        url: format!("https://example.invalid/build?{encoded_token}=super-secret-value"),
+    }];
+
+    let err = envelope.validate(&SignalLimits::default()).unwrap_err();
+    let rendered = err.to_string();
+    assert!(rendered.contains("ref"));
+    assert!(!rendered.contains(&encoded_token));
+    assert!(!rendered.contains("super-secret-value"));
+    assert!(rendered.contains("<redacted>"));
+}
+
+#[test]
+fn test_url_refs_reject_overly_long_encoded_input_instead_of_partially_decoding() {
+    let encoded_token = repeat_percent_encode("token".into(), 8);
+    let long_encoded = format!("{}{}", "%41".repeat(4096), encoded_token);
+    let mut envelope = base_envelope(SignalKind::CiFailed);
+    envelope.refs = vec![SignalRef {
+        label: "build".into(),
+        url: format!("https://example.invalid/build?{long_encoded}=super-secret-value"),
+    }];
+
+    let err = envelope.validate(&SignalLimits::default()).unwrap_err();
+    let rendered = err.to_string();
+    assert!(rendered.contains("ref"));
+    assert!(!rendered.contains(&long_encoded));
+    assert!(!rendered.contains("super-secret-value"));
+    assert!(rendered.contains("<redacted>"));
+}
+
 #[test]
 fn test_url_ref_errors_do_not_echo_secret_bearing_urls_or_values() {
     let secret_url = "https://example.invalid/build?token=super-secret-value";
