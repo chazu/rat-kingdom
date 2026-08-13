@@ -2,6 +2,7 @@ use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -260,6 +261,63 @@ async fn test_factory_events_watch_streams_native_ndjson() {
     assert_eq!(event["kind"], "approval.changed");
     assert_eq!(event["repo"], "fixture");
     handle.abort();
+}
+
+#[test]
+fn test_factory_events_watch_surfaces_resync_ndjson_on_stdout() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    let socket = layout.socket_path();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        let request: Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["method"], "factory.events.watch");
+        use std::io::Write;
+        writeln!(
+            stream,
+            "{}",
+            json!({"id": request["id"], "result": {"schema": 1, "events": [], "boundary": 299, "truncated": true}})
+        )
+        .unwrap();
+        writeln!(
+            stream,
+            "{}",
+            json!({"method":"factory.resync", "params":{"truncated": true, "resync_required": true, "boundary": 300}})
+        )
+        .unwrap();
+        writeln!(
+            stream,
+            "{}",
+            json!({"method":"lagged", "params":{"missed": 7}})
+        )
+        .unwrap();
+    });
+
+    let output = run_rk(
+        &layout,
+        &["--json", "factory", "events", "watch", "--after", "42"],
+    );
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "stdout should contain only NDJSON resync");
+    let resync: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(resync["resync_required"], true);
+    assert_eq!(resync["boundary"], 300);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("factory events lagged: missed 7"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

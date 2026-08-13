@@ -1,6 +1,5 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use futures::StreamExt;
 use rk_core::paths::Layout;
 use rk_daemon::Client;
 use serde_json::{Map, Value, json};
@@ -170,6 +169,12 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
                             "(factory events lagged: missed {})",
                             note["params"]["missed"]
                         );
+                    } else if note["method"].as_str() == Some("factory.resync") {
+                        if json_output {
+                            println!("{}", note["params"]);
+                        } else {
+                            print_resync(&note["params"]);
+                        }
                     }
                 }
             }
@@ -308,6 +313,13 @@ fn print_event(event: &Value) {
         event["kind"].as_str().unwrap_or("?"),
         event["repo"].as_str().unwrap_or("?"),
         event["summary"].as_str().unwrap_or("")
+    );
+}
+
+fn print_resync(params: &Value) {
+    println!(
+        "factory events resync required: boundary={}",
+        params["boundary"].as_u64().unwrap_or(0)
     );
 }
 
