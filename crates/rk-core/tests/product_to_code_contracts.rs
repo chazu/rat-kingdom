@@ -4,6 +4,7 @@ use rk_core::product_to_code::contracts::{
 };
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 fn fixture(name: &str) -> String {
     fs::read_to_string(format!(
@@ -11,6 +12,30 @@ fn fixture(name: &str) -> String {
         env!("CARGO_MANIFEST_DIR")
     ))
     .expect("fixture exists")
+}
+
+fn fixture_path(name: &str) -> String {
+    format!(
+        "{}/tests/fixtures/product_to_code/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+fn contract_path(name: &str) -> String {
+    format!("{}/contracts/product_to_code/{name}", env!("CARGO_MANIFEST_DIR"))
+}
+
+fn cue_vet_architecture_research_fixture(name: &str) -> Option<std::process::Output> {
+    Command::new("cue")
+        .args([
+            "vet",
+            "-d",
+            "#ArchitectureResearchArtifact",
+            &fixture_path(name),
+            &contract_path("architecture_research.cue"),
+        ])
+        .output()
+        .ok()
 }
 
 #[test]
@@ -43,22 +68,64 @@ fn test_architecture_research_artifact_requires_decisions_and_open_questions() {
 }
 
 #[test]
-fn test_architecture_research_artifact_requires_decisions_constraints_or_risks_not_decisions_only()
-{
+fn test_architecture_research_cue_accepts_positive_fixture() {
+    let Some(output) = cue_vet_architecture_research_fixture("cue/architecture_research_positive.json") else {
+        return;
+    };
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_architecture_research_cue_rejects_missing_substance_and_repo_escape_paths() {
+    for name in [
+        "cue/architecture_research_empty_substance_negative.json",
+        "cue/architecture_research_repo_escape_negative.json",
+    ] {
+        let Some(output) = cue_vet_architecture_research_fixture(name) else {
+            return;
+        };
+
+        assert!(
+            !output.status.success(),
+            "{name} unexpectedly passed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn test_architecture_research_artifact_requires_decisions_constraints_and_risks() {
     let mut artifact: ArchitectureResearchArtifact = serde_json::from_str(&fixture(
         "architecture_research_invalid_empty_decisions.json",
     ))
     .unwrap();
-    artifact.architecture_decisions.clear();
+    artifact.architecture_decisions = vec!["Keep contracts offline".to_string()];
     artifact.constraints = vec!["Must stay offline".to_string()];
-    artifact.risks.clear();
+    artifact.risks = vec!["May miss concurrent WIP".to_string()];
     artifact.open_questions = vec!["Should graph ordering be exported?".to_string()];
 
     artifact.validate().unwrap();
 
+    artifact.architecture_decisions.clear();
+    let err = artifact.validate().unwrap_err().to_string();
+    assert!(err.contains("architecture_decisions"));
+
+    artifact.architecture_decisions = vec!["Keep contracts offline".to_string()];
     artifact.constraints.clear();
-    artifact.risks = vec!["May miss concurrent WIP".to_string()];
-    artifact.validate().unwrap();
+    let err = artifact.validate().unwrap_err().to_string();
+    assert!(err.contains("constraints"));
+
+    artifact.constraints = vec!["Must stay offline".to_string()];
+    artifact.risks.clear();
+    let err = artifact.validate().unwrap_err().to_string();
+    assert!(err.contains("risks"));
 }
 
 #[test]
@@ -435,9 +502,9 @@ fn test_architecture_research_validate_for_initiative_rejects_invalid_initiative
         initiative_id: "INIT-product-to-code".to_string(),
         researched_files: vec!["crates/rk-core/src/product_to_code/contracts.rs".to_string()],
         domain_terms: vec![],
-        architecture_decisions: vec![],
+        architecture_decisions: vec!["Keep contracts offline".to_string()],
         constraints: vec!["Must stay offline".to_string()],
-        risks: vec![],
+        risks: vec!["Incomplete evidence can mislead planning".to_string()],
         open_questions: vec![],
         open_questions_exhausted: true,
         recommended_ticket_graph_path: Some("docs/tickets/product-to-code.json".to_string()),

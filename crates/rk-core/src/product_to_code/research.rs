@@ -74,23 +74,25 @@ pub fn research_validation_errors(artifact: &ArchitectureResearchArtifact) -> Ve
             ));
         }
     }
-    if artifact.architecture_decisions.is_empty()
-        && artifact.constraints.is_empty()
-        && artifact.risks.is_empty()
-    {
-        errors.push(
-            "architecture_decisions, constraints, or risks must contain at least one architecture substance item"
-                .to_string(),
-        );
-    }
-    push_non_empty_items(&mut errors, "domain_terms", &artifact.domain_terms);
-    push_non_empty_items(
+    push_non_empty_string_vec(
         &mut errors,
+        "architecture_decisions must contain at least one architecture decision",
         "architecture_decisions",
         &artifact.architecture_decisions,
     );
-    push_non_empty_items(&mut errors, "constraints", &artifact.constraints);
-    push_non_empty_items(&mut errors, "risks", &artifact.risks);
+    push_non_empty_string_vec(
+        &mut errors,
+        "constraints must contain at least one architecture constraint",
+        "constraints",
+        &artifact.constraints,
+    );
+    push_non_empty_string_vec(
+        &mut errors,
+        "risks must contain at least one architecture risk",
+        "risks",
+        &artifact.risks,
+    );
+    push_non_empty_items(&mut errors, "domain_terms", &artifact.domain_terms);
     if artifact.open_questions.is_empty() && !artifact.open_questions_exhausted {
         errors.push(
             "open_questions must contain at least one question unless open_questions_exhausted is true"

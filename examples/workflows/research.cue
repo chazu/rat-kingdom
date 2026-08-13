@@ -24,7 +24,7 @@ workflow: {
 	params: {
 		question: {type: "string", required: true}
 		// InitiativeContract JSON path, relative to the repo root.
-		initiative: {type: "string", required: true}
+		initiative: {type: "string", required: false, default: "docs/product-to-code/initiative.json"}
 		// ArchitectureResearchArtifact JSON output path, relative to the repo root.
 		artifact: {type: "string", required: false, default: "docs/research/architecture-research.json"}
 		// Rendered Markdown output path, relative to the repo root.
@@ -75,6 +75,13 @@ workflow: {
 		{type: "wait", timeout: "30m"},
 		// The harness result must not be an error.
 		{type: "evaluate", expect: {is_error: false}},
+		// Engine-executed validation gate after the rat has produced the artifact.
+		{
+			type: "run"
+			command: "rk --json product-to-code research validate --artifact \(_input.artifact) --initiative \(_input.initiative)"
+			expectExit: 0
+			timeout: "2m"
+		},
 		// Merge the research artifact and document into the base branch and clean up.
 		{type: "dismiss"},
 	]
