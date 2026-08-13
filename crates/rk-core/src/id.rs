@@ -3,8 +3,10 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::fmt;
-use ulid::Ulid;
+use std::{fmt, sync::Mutex};
+use ulid::{Generator, Ulid};
+
+static RECORD_ID_GENERATOR: Mutex<Generator> = Mutex::new(Generator::new());
 
 /// A unique, lexicographically sortable identifier for a record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -13,7 +15,14 @@ pub struct RecordId(Ulid);
 
 impl RecordId {
     pub fn new() -> Self {
-        Self(Ulid::new())
+        let mut generator = RECORD_ID_GENERATOR
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self(
+            generator
+                .generate()
+                .expect("RecordId monotonic random component exhausted"),
+        )
     }
 
     pub fn timestamp_ms(&self) -> u64 {
@@ -82,6 +91,15 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let b = RecordId::new();
         assert!(a < b);
+    }
+
+    #[test]
+    fn record_ids_are_strictly_monotonic_without_clock_delay() {
+        let ids = (0..1_000).map(|_| RecordId::new()).collect::<Vec<_>>();
+        assert!(
+            ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "cursor-safe ids must preserve mint order within one millisecond"
+        );
     }
 
     #[test]
