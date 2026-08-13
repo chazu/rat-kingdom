@@ -68,5 +68,20 @@ libc = "0.2"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
+[profile.dev]
+# Agent swarms rebuild this workspace frequently. Full debuginfo and incremental
+# object caches multiplied target/debug past 100 GiB, so keep useful line tables
+# without retaining a separate incremental graph for every edit.
+debug = "line-tables-only"
+incremental = false
+split-debuginfo = "off"
+
+[profile.test]
+# Test binaries are the largest source of stale hashed artifacts during parallel
+# agent work. Match the lean development profile while preserving backtrace lines.
+debug = "line-tables-only"
+incremental = false
+split-debuginfo = "off"
+
 [profile.release]
 lto = "thin"

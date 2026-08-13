@@ -1,6 +1,11 @@
 [tools]
 rust = "1.95.0"
 
+[env]
+# Reinforce the Cargo profile setting for every repository task and any nested
+# command invoked by mise.
+CARGO_INCREMENTAL = "0"
+
 [tasks.build]
 description = "Build an optimized release build of rk"
 run = "cargo build --release -p rk-cli"
