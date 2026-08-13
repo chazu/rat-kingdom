@@ -169,20 +169,27 @@ async fn clearing_agent_env_does_not_grant_operator_authority() {
     let worktree = spawned["agent"]["worktree"].as_str().unwrap();
     let result_path = Path::new(worktree).join("self-elevation-result");
 
+    let expected_result = ["monitor:blocked", "approve:blocked", "execute:blocked"];
+    let mut result = String::new();
     for _ in 0..100 {
-        if result_path.exists() {
+        result = std::fs::read_to_string(&result_path).unwrap_or_default();
+        if result.lines().count() >= expected_result.len() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let result = std::fs::read_to_string(&result_path)
-        .unwrap_or_else(|error| panic!("probe did not publish {}: {error}", result_path.display()));
-    let probe_output =
-        std::fs::read_to_string(Path::new(worktree).join("self-elevation-output")).unwrap();
+    let probe_output = std::fs::read_to_string(Path::new(worktree).join("self-elevation-output"))
+        .unwrap_or_else(|error| format!("<failed to read probe output: {error}>"));
+    if result.is_empty() {
+        panic!(
+            "probe did not publish {}: {probe_output}",
+            result_path.display()
+        );
+    }
     assert_eq!(
         result.lines().collect::<Vec<_>>(),
-        ["monitor:blocked", "approve:blocked", "execute:blocked"],
+        expected_result,
         "a supervised harness cleared RK_AGENT/RK_AUTH_TOKEN and gained operator authority: \
          {probe_output}"
     );
