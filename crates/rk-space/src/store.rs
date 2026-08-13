@@ -239,6 +239,7 @@ fn migrate(conn: &mut Connection, sequence_schema_preexisting: bool) -> rk_core:
     }
     backfill_tuple_sequences(&tx, sequence_schema_preexisting)?;
     backfill_tuple_persistence_events(&tx)?;
+    validate_sequence_journal(&tx)?;
     backfill_legacy_deployment_ordering(&tx)?;
     tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_tuples_strength
@@ -282,6 +283,18 @@ fn migrate(conn: &mut Connection, sequence_schema_preexisting: bool) -> rk_core:
                     NEW.instance, NEW.lifecycle, NEW.payload, NEW.created_at,
                     NEW.expires_at, NEW.strength
                FROM tuple_sequence_state WHERE singleton = 1;
+         END;
+         DROP TRIGGER IF EXISTS tuple_persistence_events_reject_update;
+         CREATE TRIGGER tuple_persistence_events_reject_update
+         BEFORE UPDATE ON tuple_persistence_events
+         BEGIN
+             SELECT RAISE(ABORT, 'tuple persistence journal is immutable');
+         END;
+         DROP TRIGGER IF EXISTS tuple_persistence_events_reject_delete;
+         CREATE TRIGGER tuple_persistence_events_reject_delete
+         BEFORE DELETE ON tuple_persistence_events
+         BEGIN
+             SELECT RAISE(ABORT, 'tuple persistence journal is immutable');
          END;",
     )
     .map_err(sql_err)?;
@@ -376,6 +389,41 @@ fn backfill_tuple_persistence_events(conn: &Connection) -> rk_core::Result<()> {
     )
     .map(|_| ())
     .map_err(sql_err)
+}
+
+fn validate_sequence_journal(conn: &Connection) -> rk_core::Result<i64> {
+    let (last, legacy, event_count, first_event, last_event): (i64, i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT state.last_sequence,
+                    state.legacy_backfill_sequence,
+                    (SELECT COUNT(*) FROM tuple_persistence_events),
+                    COALESCE((SELECT MIN(commit_sequence) FROM tuple_persistence_events), 0),
+                    COALESCE((SELECT MAX(commit_sequence) FROM tuple_persistence_events), 0)
+               FROM tuple_sequence_state AS state
+              WHERE state.singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .map_err(sql_err)?;
+    let contiguous = if last == 0 {
+        event_count == 0 && first_event == 0 && last_event == 0
+    } else {
+        event_count == last && first_event == 1 && last_event == last
+    };
+    if last < 0 || legacy < 0 || legacy > last || !contiguous {
+        return Err(Error::Other(
+            "tuple persistence sequence state disagrees with immutable journal".into(),
+        ));
+    }
+    Ok(last)
 }
 
 fn backfill_legacy_deployment_ordering(conn: &Connection) -> rk_core::Result<()> {
@@ -752,14 +800,7 @@ impl Store {
     }
 
     pub fn latest_persistence_sequence(&self) -> rk_core::Result<u64> {
-        let sequence = self
-            .conn
-            .query_row(
-                "SELECT last_sequence FROM tuple_sequence_state WHERE singleton = 1",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(sql_err)?;
+        let sequence = validate_sequence_journal(&self.conn)?;
         u64::try_from(sequence)
             .map_err(|_| Error::Other("invalid negative tuple persistence sequence".into()))
     }
@@ -770,6 +811,11 @@ impl Store {
             .map_err(|_| Error::Other("tuple persistence cursor exceeds SQLite range".into()))?;
         let boundary_sql = i64::try_from(boundary)
             .map_err(|_| Error::Other("tuple persistence boundary exceeds SQLite range".into()))?;
+        if after > boundary_sql {
+            return Err(Error::Other(
+                "tuple persistence cursor is ahead of the captured boundary".into(),
+            ));
+        }
         let mut statement = self
             .conn
             .prepare(
@@ -787,6 +833,31 @@ impl Store {
             .map(|row| row.map_err(sql_err))
             .collect::<rk_core::Result<Vec<_>>>()?;
         Ok(PersistenceDelta { boundary, tuples })
+    }
+
+    pub fn has_persistence_event(&self, id: RecordId) -> rk_core::Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM tuple_persistence_events WHERE id = ?1
+                 )",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)
+    }
+
+    pub fn has_persistence_event_matching(&self, pattern: &Pattern) -> rk_core::Result<bool> {
+        let mut sql = String::from(
+            "SELECT EXISTS(
+                 SELECT 1 FROM tuple_persistence_events WHERE 1=1",
+        );
+        let mut args = Vec::new();
+        append_pattern_filters(&mut sql, &mut args, pattern, false);
+        sql.push(')');
+        self.conn
+            .query_row(&sql, params_from_iter(args.iter()), |row| row.get(0))
+            .map_err(sql_err)
     }
 
     pub fn legacy_persistence_sequence(&self, _id: RecordId) -> rk_core::Result<Option<u64>> {

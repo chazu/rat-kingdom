@@ -243,6 +243,55 @@ fn persistence_delta_rejects_cursor_above_sqlite_integer_range() {
 }
 
 #[test]
+fn persistence_delta_rejects_cursor_above_captured_boundary() {
+    let space = Space::open_in_memory().unwrap();
+    space
+        .out(fact(RecordId::floor_at(Utc::now()), "one-event"))
+        .unwrap();
+    let boundary = space.latest_persistence_sequence().unwrap();
+
+    assert!(space.persistence_delta(Some(boundary + 1)).is_err());
+}
+
+#[test]
+fn persistence_delta_rejects_state_below_retained_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state-behind-journal.db");
+    let space = Space::open(&db).unwrap();
+    let tuple = fact(RecordId::floor_at(Utc::now()), "journal-high-water");
+    space.out(tuple.clone()).unwrap();
+    assert!(space.delete(tuple.id).unwrap());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE tuple_sequence_state SET last_sequence = 0 WHERE singleton = 1",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(space.persistence_delta(None).is_err());
+}
+
+#[test]
+fn persistence_delta_rejects_a_missing_retained_journal_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("journal-gap.db");
+    let space = Space::open(&db).unwrap();
+    space
+        .out(fact(RecordId::floor_at(Utc::now()), "must-remain"))
+        .unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS tuple_persistence_events_reject_delete;
+         DELETE FROM tuple_persistence_events;",
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(space.persistence_delta(None).is_err());
+}
+
+#[test]
 fn negative_sequence_state_is_reported_as_corruption() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("negative-state.db");

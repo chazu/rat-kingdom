@@ -124,7 +124,9 @@ impl Syncer {
     /// correct fix for resurrection in all three cases (the log has no TTL, so a
     /// locally-expired tuple with a surviving `Out` would otherwise be re-added
     /// every cycle). Only a survivor still alive in the log is ever turned into
-    /// a Take, so an already-consumed tuple is never re-emitted.
+    /// a Take, so an already-consumed tuple is never re-emitted. The immutable
+    /// local persistence journal is the durable proof that a remote tuple was
+    /// once imported, so losing the presence snapshot cannot resurrect it.
     pub fn run_cycle(&self, space: &Space) -> rk_core::Result<CycleStats> {
         let _cycle = self.cycle_lock.lock().unwrap_or_else(|p| p.into_inner());
         let cursor = self.load_cursor(space)?.unwrap_or(0);
@@ -179,6 +181,7 @@ impl Syncer {
                 && tuple.identity == "castle_presence";
             let observed_locally = prev_known.contains(id)
                 || persisted_in_delta.contains(id)
+                || space.has_persistence_event(*id)?
                 || (tuple.instance == self.castle && !synthetic_castle_presence);
             if !observed_locally {
                 continue;
@@ -593,6 +596,45 @@ mod tests {
             1,
             "the persistence journal must prove the imported tuple existed before the blocked take consumed it"
         );
+    }
+
+    #[tokio::test]
+    async fn remote_delete_after_cursor_advance_survives_presence_loss() {
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare"]).unwrap();
+        let url = remote.path().to_string_lossy().to_string();
+        let home_a = tempfile::tempdir().unwrap();
+        let home_b = tempfile::tempdir().unwrap();
+        let layout_a = Layout::at(home_a.path());
+        let layout_b = Layout::at(home_b.path());
+        layout_a.ensure().unwrap();
+        layout_b.ensure().unwrap();
+        let space_a = Space::open_in_memory().unwrap();
+        let space_b = Space::open_in_memory().unwrap();
+        let syncer_a = Syncer::new(&layout_a, "castle-a", Some(&url)).unwrap();
+        let syncer_b = Syncer::new(&layout_b, "castle-b", Some(&url)).unwrap();
+        let tuple = Tuple::new(
+            Category::Fact,
+            "repo",
+            "delete-after-cursor",
+            "castle-a",
+            json!({}),
+        );
+        let id = tuple.id;
+        space_a.out(tuple).unwrap();
+        syncer_a.run_cycle(&space_a).unwrap();
+        syncer_b.run_cycle(&space_b).unwrap();
+        syncer_b.run_cycle(&space_b).unwrap();
+        assert!(space_b.delete(id).unwrap());
+        std::fs::remove_file(home_b.path().join("sync-presence")).ok();
+
+        let stats = syncer_b.run_cycle(&space_b).unwrap();
+        assert_eq!(stats.takes, 1);
+        assert_eq!(stats.imported, 0, "the remote Out must not resurrect");
+        assert!(space_b
+            .scan(&Pattern::category(Category::Fact).identity("delete-after-cursor"))
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

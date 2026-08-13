@@ -187,15 +187,28 @@ impl Space {
         self.lock().store.latest_persistence_sequence()
     }
 
-    /// Return current tuples persisted after `after`, ordered by SQLite commit
-    /// sequence, plus the captured durable boundary for at-least-once consumers.
+    /// Return immutable tuple persistence events after `after`, ordered by SQLite
+    /// commit sequence, plus the captured durable boundary for at-least-once
+    /// consumers. A later take or delete does not remove the event snapshot.
     pub fn persistence_delta(&self, after: Option<u64>) -> rk_core::Result<PersistenceDelta> {
         self.lock().store.persistence_delta(after)
     }
 
-    /// Convert a legacy ULID cursor against only the deterministic migration
-    /// baseline. Post-migration low-ULID writes are deliberately excluded so
-    /// they remain visible to the new persistence cursor.
+    /// Whether this local store ever persisted the tuple id, even if the live row
+    /// was later consumed or deleted.
+    pub fn has_persistence_event(&self, id: rk_core::id::RecordId) -> rk_core::Result<bool> {
+        self.lock().store.has_persistence_event(id)
+    }
+
+    /// Whether the immutable local persistence journal has ever contained a
+    /// tuple matching `pattern`.
+    pub fn has_persistence_event_matching(&self, pattern: &Pattern) -> rk_core::Result<bool> {
+        self.lock().store.has_persistence_event_matching(pattern)
+    }
+
+    /// Convert a legacy ULID cursor to a safe historical replay boundary. ULID
+    /// ordering cannot reveal delayed lower-ID rows the old cursor skipped, so
+    /// conversion returns sequence zero and relies on consumer idempotency.
     pub fn legacy_persistence_sequence(
         &self,
         id: rk_core::id::RecordId,

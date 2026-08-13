@@ -8,9 +8,9 @@
 //! The live feed ([`Space::subscribe`]) is a lossy broadcast: it drops events
 //! for laggy consumers. A trigger must never miss an event, so the feed is used
 //! only as a *wake signal*. The source of truth is a durable SQLite persistence
-//! sequence: each cycle reads tuples committed after the saved boundary, fires
-//! matching triggers, then advances only after the batch succeeds. This is the
-//! same cursor discipline the multiplayer sync loop uses.
+//! sequence: each cycle reads immutable tuple events committed after the saved
+//! boundary, fires matching triggers, then advances only after the batch
+//! succeeds. This is the same cursor discipline the multiplayer sync loop uses.
 //!
 //! # Idempotency and re-entrancy
 //!
@@ -35,6 +35,7 @@ use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, SYSTEM_SCOPE};
 use rk_space::Space;
 use rk_workflow::Trigger;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -835,7 +836,13 @@ impl Reactor {
         let params = template_params(&trigger.params, tuple);
 
         // The workflow runs in the background; run() returns the instance now.
-        let instance = self.engine.run(&trigger.run, &repo_path, params)?;
+        let instance = self.engine.run_owned_with_id(
+            stable_workflow_instance_id(&key),
+            &trigger.run,
+            &repo_path,
+            params,
+            None,
+        )?;
         info!(
             trigger = %trigger.name,
             workflow = %trigger.run,
@@ -1508,7 +1515,7 @@ impl Reactor {
             .scope(SYSTEM_SCOPE)
             .identity(MARKER_IDENTITY);
         p.payload_search = Some(format!("\"key\":\"{key}\""));
-        Ok(!self.space.scan(&p)?.is_empty())
+        self.space.has_persistence_event_matching(&p)
     }
 
     fn mark_fired(
@@ -1531,9 +1538,9 @@ impl Reactor {
                 "instance": instance,
             }),
         );
-        // Ephemeral with a TTL: the marker only needs to outlive any redelivery,
-        // then self-collects. (Ephemeral tuples do not replicate — dedup is
-        // per-castle, which is correct: each castle runs its own reactor.)
+        // The live marker is ephemeral and self-collects, but its immutable local
+        // persistence event remains the permanent dedup ledger. Ephemeral tuples
+        // do not replicate, so dedup stays per-castle as intended.
         marker.lifecycle = Lifecycle::Ephemeral;
         if self.config.marker_ttl_secs > 0 {
             let ttl_secs = i64::try_from(self.config.marker_ttl_secs.min(MAX_MARKER_TTL_SECS))
@@ -1589,6 +1596,11 @@ impl Reactor {
         std::fs::write(&self.cursor_file, sequence.to_string())?;
         Ok(())
     }
+}
+
+fn stable_workflow_instance_id(key: &str) -> String {
+    let digest = Sha256::digest(key.as_bytes());
+    format!("reactor-{}", hex::encode(&digest[..16]))
 }
 
 /// Stamp each candidate trigger file with `(mtime, len)` for change detection.

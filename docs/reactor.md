@@ -134,9 +134,13 @@ Dispatch is at-least-once: a crash between firing and persisting the cursor
 re-runs from the last saved cursor. To make that safe, every fired
 `(trigger, tuple)` writes a durable **idempotency marker** (a system-scoped
 ephemeral event keyed on `<trigger>@<tuple-id>`). `already_fired` short-circuits
-a repeat, so a redelivery — a crash, or even a full cursor loss — never
-double-fires. Markers carry a TTL (`[reactor].marker_ttl_secs`, default one
-week) and self-collect; they only need to outlast any plausible redelivery.
+a repeat by consulting the immutable persistence journal, so a redelivery — a
+crash, marker expiry, or even a full cursor loss — never double-fires. The live
+marker still carries a TTL (`[reactor].marker_ttl_secs`, default one week) and
+self-collects, while its journal snapshot remains the permanent local dispatch
+ledger. Workflow launches also use a deterministic instance ID derived from the
+same `(trigger, tuple)` key, closing the crash window between instance persistence
+and marker persistence.
 
 ## Re-entrancy and storm control
 

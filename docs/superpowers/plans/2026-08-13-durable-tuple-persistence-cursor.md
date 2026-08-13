@@ -108,7 +108,7 @@ Run the two exact tests. Expected: the delayed/restarted lower-ID tuple is skipp
 
 - [ ] **Step 4: Replace reactor ULID cursor use**
 
-Baseline with `latest_persistence_sequence`. Load decimal cursor files directly. For legacy ULID files, call `legacy_persistence_sequence`. Process `persistence_delta(cursor).tuples`, and save the returned boundary only when no retryable failure occurred.
+Baseline with `latest_persistence_sequence`. Load decimal cursor files directly. For legacy ULID files, call `legacy_persistence_sequence`. Process `persistence_delta(cursor).tuples`, and save the returned boundary only when no retryable failure occurred. Consult immutable journaled marker events for permanent deduplication and launch workflows with a deterministic `(trigger, tuple)` instance ID so a crash between launch and live-marker persistence cannot duplicate an instance.
 
 - [ ] **Step 5: Remove the temporary millisecond sleep**
 

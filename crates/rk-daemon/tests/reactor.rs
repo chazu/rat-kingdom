@@ -15,6 +15,7 @@ use rk_daemon::tickets::{NewTicket, Tickets};
 use rk_daemon::workflow_exec::WorkflowEngine;
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -91,6 +92,14 @@ fn build_reactor_with_space(
     config: ReactorConfig,
     space: rk_space::Space,
 ) -> Arc<Reactor> {
+    build_reactor_and_engine_with_space(layout, config, space).0
+}
+
+fn build_reactor_and_engine_with_space(
+    layout: &Layout,
+    config: ReactorConfig,
+    space: rk_space::Space,
+) -> (Arc<Reactor>, Arc<WorkflowEngine>) {
     let tickets = Arc::new(Tickets::new(space.clone(), "test-castle".into()));
     let supervisor = Arc::new(
         Supervisor::new(
@@ -118,14 +127,15 @@ fn build_reactor_with_space(
         Vec::new(),
         vec!["main".into(), "master".into()],
     ));
-    Arc::new(Reactor::new(
+    let reactor = Arc::new(Reactor::new(
         space,
-        engine,
+        engine.clone(),
         tickets,
         Some(supervisor),
         layout.clone(),
         config,
-    ))
+    ));
+    (reactor, engine)
 }
 
 fn write_trigger(layout: &Layout) {
@@ -198,6 +208,11 @@ fn create_legacy_database(path: &Path, tuples: &[&Tuple]) {
         )
         .unwrap();
     }
+}
+
+fn stable_reactor_instance_id(trigger: &str, tuple: RecordId) -> String {
+    let digest = Sha256::digest(format!("{trigger}@{tuple}").as_bytes());
+    format!("reactor-{}", hex::encode(&digest[..16]))
 }
 
 /// Full path: the live daemon's reactor loop wakes off the feed and fires the
@@ -434,6 +449,80 @@ async fn legacy_ulid_cursor_replays_migrated_history_and_rewrites_decimal() {
     );
     let rewritten = std::fs::read_to_string(home.path().join("reactor-cursor")).unwrap();
     assert_eq!(rewritten.trim().parse::<u64>().unwrap(), 2);
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+#[tokio::test]
+async fn expired_live_marker_remains_deduplicated_by_the_persistence_journal() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    write_trigger(&layout);
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let config = ReactorConfig {
+        marker_ttl_secs: 1,
+        ..ReactorConfig::default()
+    };
+    let reactor = build_reactor_with_space(&layout, config, space.clone());
+    space.out(ping()).unwrap();
+    assert_eq!(reactor.run_cycle().unwrap(), 1);
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    space.gc_expired(0.0).unwrap();
+    assert!(space
+        .scan(&Pattern::category(Category::Event).identity("reactor_fired"))
+        .unwrap()
+        .is_empty());
+    std::fs::remove_file(home.path().join("reactor-cursor")).unwrap();
+
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        0,
+        "expired live markers must remain permanent in the persistence journal"
+    );
+    assert_eq!(reactor.engine_instance_count(), 1);
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+#[tokio::test]
+async fn existing_stable_reactor_instance_prevents_duplicate_launch_without_marker() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    write_trigger(&layout);
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let (reactor, engine) = build_reactor_and_engine_with_space(
+        &layout,
+        ReactorConfig::default(),
+        space.clone(),
+    );
+    let tuple = ping();
+    let instance_id = stable_reactor_instance_id("ping-drain", tuple.id);
+    engine
+        .run_owned_with_id(
+            instance_id,
+            "react-work",
+            &repo.path().to_string_lossy(),
+            Default::default(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(reactor.engine_instance_count(), 1);
+    space.out(tuple).unwrap();
+
+    reactor.run_cycle().unwrap();
+    assert_eq!(
+        reactor.engine_instance_count(),
+        1,
+        "replaying after a marker-write crash must resolve to the same workflow instance"
+    );
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
