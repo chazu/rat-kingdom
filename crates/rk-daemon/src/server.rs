@@ -3,9 +3,10 @@
 //! server-push event stream.
 
 use crate::coordinator::CoordinatorFilter;
+use crate::factory_events::FactoryEventFilter;
 use crate::proto::{codes, Request, Response};
 use chrono::{DateTime, Utc};
-use rk_core::action::{ApprovalStatus, WorkflowRunAction};
+use rk_core::action::{ApprovalStatus, FactoryAction, TicketGraphApplyAction, WorkflowRunAction};
 use rk_core::id::RecordId;
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, SYSTEM_SCOPE};
@@ -847,6 +848,17 @@ impl Daemon {
                     write_json_line(&mut write, &response).await?;
                     return self.stream_coordinator(write, filter, boundary, rx).await;
                 }
+                Outcome::FactoryEventsWatch {
+                    response,
+                    filter,
+                    boundary,
+                    rx,
+                } => {
+                    write_json_line(&mut write, &response).await?;
+                    return self
+                        .stream_factory_events(write, filter, boundary, rx)
+                        .await;
+                }
                 Outcome::LogFollow {
                     response,
                     agent,
@@ -917,6 +929,9 @@ impl Daemon {
                 | "factory.propose_action"
                 | "factory.approve_action"
                 | "factory.execute_action"
+                | "factory.snapshot"
+                | "factory.events.replay"
+                | "factory.events.watch"
                 | "workflow.approve"
                 | "workflow.archive"
                 | "workflow.unarchive"
@@ -1054,6 +1069,114 @@ impl Daemon {
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
             }
+        }
+    }
+
+    async fn stream_factory_events(
+        &self,
+        mut write: tokio::net::unix::OwnedWriteHalf,
+        filter: FactoryEventFilter,
+        boundary: Option<u64>,
+        mut rx: broadcast::Receiver<CoordinatorEvent>,
+    ) -> std::io::Result<()> {
+        let mut cursor = boundary;
+        loop {
+            match rx.recv().await {
+                Ok(coordinator_event)
+                    if cursor.is_none_or(|seen| coordinator_event.cursor > seen) =>
+                {
+                    if let Some(event) = crate::factory_events::project(coordinator_event) {
+                        if filter.matches(&event) {
+                            cursor = Some(event.cursor);
+                            write_json_line(
+                                &mut write,
+                                &json!({"method": "factory.event", "params": event}),
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    write_json_line(
+                        &mut write,
+                        &json!({"method": "lagged", "params": {"missed": missed, "resync_required": true}}),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+            }
+        }
+    }
+
+    fn factory_snapshot(&self, filter: &FactoryEventFilter) -> rk_core::Result<Value> {
+        let coord = CoordinatorFilter {
+            repo: filter.repo.clone(),
+            coordinator: filter.coordinator.clone(),
+            ..Default::default()
+        };
+        let agents = json!(if filter.include_archived {
+            self.supervisor.list_all()
+        } else {
+            self.supervisor.list()
+        });
+        let workflows = json!(if filter.include_archived {
+            self.engine().list_all()
+        } else {
+            self.engine().list()
+        });
+        let tickets = self
+            .tickets
+            .list(filter.repo.clone(), None, None)
+            .map(|tickets| json!(tickets))
+            .unwrap_or_else(|_| json!([]));
+        let approvals = json!({
+            "proposals": self.action_approvals.list()?,
+            "grants": self.action_approvals.list_grants()?,
+        });
+        let snapshot = crate::factory_events::snapshot_value(
+            agents,
+            workflows,
+            tickets,
+            json!([]),
+            self.supervisor.fleet_rollup(),
+            approvals,
+            json!({"cursor": self.latest_event_cursor(), "required": false}),
+        );
+        Ok(
+            json!({"schema": crate::factory_events::SCHEMA, "snapshot": snapshot, "cursor": self.latest_event_cursor(), "coordinator": coord.coordinator}),
+        )
+    }
+
+    fn factory_events_replay(&self, filter: &FactoryEventFilter) -> rk_core::Result<Value> {
+        let scanned = self
+            .space
+            .coordinator_events_after(filter.after, filter.limit().saturating_add(1))?;
+        Ok(serde_json::to_value(crate::factory_events::replay(
+            scanned, filter,
+        ))?)
+    }
+
+    fn prepare_factory_events_watch(
+        &self,
+        id: String,
+        filter: FactoryEventFilter,
+    ) -> rk_core::Result<Outcome> {
+        let rx = self.space.subscribe_coordinator();
+        let replay = self.factory_events_replay(&filter)?;
+        let boundary = replay["boundary"].as_u64().or(filter.after);
+        Ok(Outcome::FactoryEventsWatch {
+            response: Response::ok(id, replay),
+            filter,
+            boundary,
+            rx,
+        })
+    }
+
+    fn emit_factory_event(&self, tuple: Tuple) {
+        if let Err(error) = self.space.out_coordinator(tuple) {
+            warn!(%error, "failed to emit factory event");
         }
     }
 
@@ -1405,6 +1528,27 @@ impl Daemon {
             "factory.propose_action" => reply(self.handle_factory_propose_action(req)),
             "factory.approve_action" => reply(self.handle_factory_approve_action(req)),
             "factory.execute_action" => reply(self.handle_factory_execute_action(req).await),
+            "factory.snapshot" => match parse_params::<FactoryEventFilter>(&req.params) {
+                Ok(filter) => match self.factory_snapshot(&filter) {
+                    Ok(snapshot) => reply(Response::ok(id, snapshot)),
+                    Err(e) => reply(Response::err(id, codes::INTERNAL, e.to_string())),
+                },
+                Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+            },
+            "factory.events.replay" => match parse_params::<FactoryEventFilter>(&req.params) {
+                Ok(filter) => match self.factory_events_replay(&filter) {
+                    Ok(replay) => reply(Response::ok(id, replay)),
+                    Err(e) => reply(Response::err(id, codes::INTERNAL, e.to_string())),
+                },
+                Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+            },
+            "factory.events.watch" => match parse_params::<FactoryEventFilter>(&req.params) {
+                Ok(filter) => match self.prepare_factory_events_watch(id, filter) {
+                    Ok(outcome) => outcome,
+                    Err(e) => reply(Response::err(req.id, codes::INTERNAL, e.to_string())),
+                },
+                Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+            },
             "workflow.list" => {
                 let params: WorkflowListParams = match parse_params(&req.params) {
                     Ok(p) => p,
@@ -3221,21 +3365,39 @@ impl Daemon {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
-        if params.kind != "workflow.run" {
-            return Response::err(req.id, codes::BAD_PARAMS, "unsupported action kind");
-        }
-        let action = match self.resolve_workflow_action(params.action) {
-            Ok(action) => action,
-            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        let factory_action = match params.kind.as_str() {
+            "workflow.run" => match serde_json::from_value(params.action)
+                .map_err(|e| rk_core::Error::other(e.to_string()))
+                .and_then(|action| self.resolve_workflow_action(action))
+            {
+                Ok(action) => FactoryAction::WorkflowRun(action),
+                Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+            },
+            "ticket_graph.apply" => match self.resolve_ticket_graph_apply_action(params.action) {
+                Ok(action) => FactoryAction::TicketGraphApply(action),
+                Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+            },
+            _ => return Response::err(req.id, codes::BAD_PARAMS, "unsupported action kind"),
         };
         match self
             .action_approvals
-            .propose(&req.caller, action, params.ttl_seconds)
+            .propose_action(&req.caller, factory_action, params.ttl_seconds)
         {
-            Ok(proposal) => Response::ok(
-                req.id,
-                json!({"proposal": proposal, "digest": proposal.digest}),
-            ),
+            Ok(proposal) => {
+                self.emit_factory_event(crate::factory_events::event_tuple(
+                    &proposal.scope.repo.identity,
+                    &req.caller,
+                    "approval.changed",
+                    "factory.propose_action",
+                    json!({"proposal_id": proposal.id}),
+                    "factory action approval proposed",
+                    json!({"proposal_id": proposal.id, "digest": proposal.digest, "status": proposal.status}),
+                ));
+                Response::ok(
+                    req.id,
+                    json!({"proposal": proposal, "digest": proposal.digest}),
+                )
+            }
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
     }
@@ -3249,7 +3411,18 @@ impl Daemon {
             .action_approvals
             .approve(&params.proposal_id, &params.digest, &req.caller)
         {
-            Ok(approval) => Response::ok(req.id, json!({"approval": approval})),
+            Ok(approval) => {
+                self.emit_factory_event(crate::factory_events::event_tuple(
+                    &approval.scope.repo.identity,
+                    &req.caller,
+                    "approval.changed",
+                    "factory.approve_action",
+                    json!({"proposal_id": approval.proposal_id}),
+                    "workflow run approval approved",
+                    json!({"proposal_id": approval.proposal_id, "digest": approval.digest, "status": approval.status}),
+                ));
+                Response::ok(req.id, json!({"approval": approval}))
+            }
             Err(e) => Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
         }
     }
@@ -3309,6 +3482,24 @@ impl Daemon {
                     Ok(approval) => approval,
                     Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
                 };
+                self.emit_factory_event(crate::factory_events::event_tuple(
+                    &approval.scope.repo.identity,
+                    &req.caller,
+                    "workflow.changed",
+                    "workflow.run",
+                    json!({"id": instance.id, "workflow": instance.workflow}),
+                    "workflow run started",
+                    json!({"id": instance.id, "status": instance.status, "proposal_id": params.proposal_id}),
+                ));
+                self.emit_factory_event(crate::factory_events::event_tuple(
+                    &approval.scope.repo.identity,
+                    &req.caller,
+                    "approval.changed",
+                    "factory.execute_action",
+                    json!({"proposal_id": approval.proposal_id, "instance_id": instance.id}),
+                    "workflow run approval consumed",
+                    json!({"proposal_id": approval.proposal_id, "digest": approval.digest, "status": approval.status, "instance_id": instance.id}),
+                ));
                 Response::ok(req.id, json!({"instance": instance, "approval": approval}))
             }
             Ok(Err(e)) => {
@@ -3356,6 +3547,53 @@ impl Daemon {
             repo_path: canonical_path.display().to_string(),
             params: params.params.into_iter().collect::<BTreeMap<_, _>>(),
             coordinator: params.coordinator,
+        })
+    }
+
+    fn resolve_ticket_graph_apply_action(
+        &self,
+        params: serde_json::Value,
+    ) -> rk_core::Result<TicketGraphApplyAction> {
+        let repo = params
+            .get("repo")
+            .and_then(Value::as_str)
+            .ok_or_else(|| rk_core::Error::other("ticket_graph.apply repo is required"))?;
+        let submitted = std::path::PathBuf::from(repo);
+        let canonical_submitted = if submitted.exists() {
+            submitted.canonicalize()?
+        } else {
+            submitted
+        };
+        let repos = self
+            .repos
+            .lock()
+            .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
+        let record = repos
+            .get(repo)
+            .cloned()
+            .or_else(|| repos.get_by_path(&canonical_submitted).cloned())
+            .ok_or_else(|| {
+                rk_core::Error::other(format!("repository is not registered: {repo}"))
+            })?;
+        let canonical_path = record.path.canonicalize().unwrap_or(record.path.clone());
+        Ok(TicketGraphApplyAction {
+            repo: record.name.clone(),
+            repo_identity: record.name,
+            repo_path: canonical_path.display().to_string(),
+            graph: params.get("graph").cloned().unwrap_or(Value::Null),
+            initiative: params.get("initiative").cloned().unwrap_or(Value::Null),
+            topological_order: params
+                .get("topological_order")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
+            mutations: params
+                .get("mutations")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
         })
     }
 
@@ -4079,6 +4317,12 @@ enum Outcome {
         boundary: Option<u64>,
         rx: broadcast::Receiver<CoordinatorEvent>,
     },
+    FactoryEventsWatch {
+        response: Response,
+        filter: FactoryEventFilter,
+        boundary: Option<u64>,
+        rx: broadcast::Receiver<CoordinatorEvent>,
+    },
     /// Reply with the backlog, then stream that agent's new log entries live.
     LogFollow {
         response: Response,
@@ -4157,7 +4401,7 @@ struct ScanParams {
 #[derive(Deserialize)]
 struct FactoryProposeParams {
     kind: String,
-    action: WorkflowRunParams,
+    action: Value,
     #[serde(default)]
     ttl_seconds: Option<i64>,
 }

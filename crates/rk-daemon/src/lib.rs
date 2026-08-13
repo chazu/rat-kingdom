@@ -8,6 +8,7 @@ pub mod client;
 pub mod coordinator;
 pub mod cron;
 pub mod drain;
+pub mod factory_events;
 pub mod inbox;
 pub mod onboarding;
 pub mod onboarding_activation;

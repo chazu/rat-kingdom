@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, path::Path, sync::Mutex};
 
 use chrono::{Duration, Utc};
 use rk_core::action::{
-    action_digest, ActionDigestPayload, ActionKind, ActionProposal, ActionRisk, ActionScope,
-    ApprovalGrant, ApprovalStatus, FactoryAction, RepoScope, WorkflowRunAction,
+    action_digest, ActionDigestPayload, ActionProposal, ActionScope, ApprovalGrant, ApprovalStatus,
+    FactoryAction, RepoScope, WorkflowRunAction,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,26 +39,22 @@ impl ActionApprovalStore {
         })
     }
 
-    pub fn propose(
+    pub fn propose_action(
         &self,
         requester: &str,
-        action: WorkflowRunAction,
+        factory_action: FactoryAction,
         ttl_seconds: Option<i64>,
     ) -> rk_core::Result<ActionProposal> {
         let now = Utc::now();
         let scope = ActionScope {
-            repo: RepoScope {
-                identity: action.repo_identity.clone(),
-                path: action.repo_path.clone(),
-            },
+            repo: factory_action.repo_scope(),
         };
-        let factory_action = FactoryAction::WorkflowRun(action);
         let mut proposal = ActionProposal {
             schema: 1,
             id: format!("act-{}", now.timestamp_nanos_opt().unwrap_or_default()),
             digest: String::new(),
-            kind: ActionKind::WorkflowRun,
-            risk: ActionRisk::Mutation,
+            kind: factory_action.kind(),
+            risk: factory_action.risk(),
             scope,
             requester: requester.to_string(),
             action: factory_action,
@@ -73,6 +69,15 @@ impl ActionApprovalStore {
         data.proposals.insert(proposal.id.clone(), proposal.clone());
         self.persist(&data)?;
         Ok(proposal)
+    }
+
+    pub fn propose(
+        &self,
+        requester: &str,
+        action: WorkflowRunAction,
+        ttl_seconds: Option<i64>,
+    ) -> rk_core::Result<ActionProposal> {
+        self.propose_action(requester, FactoryAction::WorkflowRun(action), ttl_seconds)
     }
 
     pub fn approve(
