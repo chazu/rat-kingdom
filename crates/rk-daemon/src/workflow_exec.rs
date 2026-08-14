@@ -2351,6 +2351,18 @@ impl WorkflowEngine {
             // Kill the suite if the timeout below drops the wait future, so a
             // hung check leaves no orphan behind.
             .kill_on_drop(true);
+        // Named checks routinely shell back into `rk` (escalation needs, rework
+        // tickets), but the child inherits the DAEMON's environment — and the
+        // daemon's PATH is whatever its first auto-starting client happened to
+        // carry. Put the daemon's own binary directory first so a check always
+        // resolves the same `rk` the daemon is running, regardless of who
+        // started the daemon.
+        if let Some(path) = check_child_path(
+            std::env::current_exe().ok(),
+            std::env::var_os("PATH"),
+        ) {
+            child_command.env("PATH", path);
+        }
         if resolved.environment_policy == rk_workflow::CheckEnvironmentPolicy::StripRkSpawn {
             for name in [
                 "RK_AGENT",
@@ -2438,8 +2450,13 @@ impl WorkflowEngine {
         // sneaks a too-slow check past a declared exit gate.
         if let Some(expected) = resolved.expect_exit {
             if exit != expected {
+                // Carry the check's own words into the instance error. Without
+                // this, a failing escalation check (e.g. `jq: command not
+                // found` feeding an empty payload into `rk out`) surfaces only
+                // its command text and exit code, masking the actual cause.
                 return Err(rk_core::Error::other(format!(
-                    "run step: `{command}` exited {exit}, expected {expected}"
+                    "run step: `{command}` exited {exit}, expected {expected}{}",
+                    check_failure_detail(&stdout, &stderr)
                 )));
             }
         }
@@ -3284,6 +3301,48 @@ fn valid_check_env_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+/// PATH for a run-step child: the daemon executable's directory first, then
+/// the daemon's inherited PATH. `None` only when the exe location is unknown
+/// and there is no inherited PATH to preserve.
+fn check_child_path(
+    exe: Option<std::path::PathBuf>,
+    inherited: Option<std::ffi::OsString>,
+) -> Option<std::ffi::OsString> {
+    let exe_dir = exe.and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+    let mut parts: Vec<std::path::PathBuf> = exe_dir.into_iter().collect();
+    if let Some(inherited) = &inherited {
+        parts.extend(std::env::split_paths(inherited));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    std::env::join_paths(parts).ok().or(inherited)
+}
+
+/// Bounded stdout/stderr tails for a failed check's instance error, so the
+/// operator sees what the check said, not just that it said no.
+fn check_failure_detail(stdout: &str, stderr: &str) -> String {
+    fn tail(text: &str, limit: usize) -> &str {
+        let trimmed = text.trim();
+        let start = trimmed
+            .char_indices()
+            .rev()
+            .take(limit)
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        &trimmed[start..]
+    }
+    let mut detail = String::new();
+    for (label, text) in [("stderr", stderr), ("stdout", stdout)] {
+        let tail = tail(text, 400);
+        if !tail.is_empty() {
+            detail.push_str(&format!("; {label}: {tail}"));
+        }
+    }
+    detail
+}
+
 /// Replace `{{ctx.*}}` placeholders in workflow strings at execution time.
 fn interpolate(text: &str, ctx: &WorkflowContext) -> String {
     let previous = ctx
@@ -3814,6 +3873,56 @@ mod tests {
             interpolate(text, &ctx),
             "Review rat/whisker/t1 by Whisker: looks good"
         );
+    }
+
+    /// The steward escalation checks (`rk out need`, `rk ticket new`) run in
+    /// the daemon's inherited environment, which may not contain the rk binary
+    /// directory at all — the daemon is auto-started by whatever client first
+    /// connects. The child PATH must therefore always lead with the daemon's
+    /// own executable directory so checks resolve the daemon's rk.
+    #[test]
+    fn check_child_path_leads_with_the_daemon_exe_dir() {
+        let path = check_child_path(
+            Some("/opt/rk/bin/rk".into()),
+            Some(std::ffi::OsString::from("/usr/bin:/bin")),
+        )
+        .unwrap();
+        let parts: Vec<_> = std::env::split_paths(&path).collect();
+        assert_eq!(
+            parts,
+            vec![
+                std::path::PathBuf::from("/opt/rk/bin"),
+                "/usr/bin".into(),
+                "/bin".into()
+            ]
+        );
+
+        // No exe location: preserve the inherited PATH untouched.
+        let inherited = std::ffi::OsString::from("/usr/bin");
+        assert_eq!(
+            check_child_path(None, Some(inherited.clone())),
+            Some(inherited)
+        );
+        // Nothing known at all: leave the child env alone.
+        assert_eq!(check_child_path(None, None), None);
+    }
+
+    /// A failing check's error must carry the check's own words — an exit code
+    /// alone masked `jq: command not found` behind "exited 1, expected 0" for
+    /// every steward escalation failure.
+    #[test]
+    fn check_failure_detail_surfaces_bounded_output() {
+        let detail = check_failure_detail("payload rejected", "sh: jq: command not found\n");
+        assert_eq!(
+            detail,
+            "; stderr: sh: jq: command not found; stdout: payload rejected"
+        );
+        assert_eq!(check_failure_detail("", ""), "");
+        // Long output is tail-bounded, keeping the end where errors live.
+        let long = format!("{}THE END", "x".repeat(2000));
+        let detail = check_failure_detail("", &long);
+        assert!(detail.len() < 450, "detail stays bounded: {}", detail.len());
+        assert!(detail.ends_with("THE END"));
     }
 
     #[test]

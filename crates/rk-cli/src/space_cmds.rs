@@ -23,6 +23,11 @@ pub struct OutArgs {
     /// JSON payload.
     #[arg(long, default_value = "null")]
     pub payload: String,
+    /// Add one string field to the payload object as KEY=VALUE (repeatable).
+    /// Fields are applied on top of --payload and need no JSON quoting, so
+    /// shell callers (workflow checks, hooks) can build payloads without jq.
+    #[arg(long, value_name = "KEY=VALUE")]
+    pub field: Vec<String>,
     /// Backlink this artifact to the obstacle/need id it resolves. The reactor
     /// then retires that wall and lays a decaying (topic -> this artifact) trail
     /// so the next rat hitting the same wall is steered here (stigmergy P8).
@@ -301,9 +306,38 @@ fn stamp_author(payload: &mut Value, agent: Option<String>) {
     obj.entry("agent").or_insert_with(|| json!(agent));
 }
 
+/// Apply `--field KEY=VALUE` entries on top of a parsed `--payload` value.
+///
+/// A `null` payload becomes an object so `--field` works without `--payload`;
+/// a non-object payload cannot carry fields and is an explicit error rather
+/// than a silent drop. Values are always JSON strings — serde does the
+/// escaping the shell caller would otherwise need jq for.
+fn apply_fields(payload: &mut Value, fields: &[String]) -> Result<()> {
+    if fields.is_empty() {
+        return Ok(());
+    }
+    if payload.is_null() {
+        *payload = json!({});
+    }
+    let Some(obj) = payload.as_object_mut() else {
+        bail!("--field requires an object --payload (or none)");
+    };
+    for field in fields {
+        let Some((key, value)) = field.split_once('=') else {
+            bail!("--field must be KEY=VALUE, got '{field}'");
+        };
+        if key.is_empty() {
+            bail!("--field key must not be empty in '{field}'");
+        }
+        obj.insert(key.to_string(), json!(value));
+    }
+    Ok(())
+}
+
 pub async fn out(layout: &Layout, args: OutArgs, as_json: bool) -> Result<()> {
     let mut payload: Value =
         serde_json::from_str(&args.payload).context("--payload must be valid JSON")?;
+    apply_fields(&mut payload, &args.field)?;
     // --resolves rides in the payload as a backlink the reactor keys on. It only
     // has meaning on an artifact, but we attach it structurally rather than
     // second-guess the category here — the reactor reacts to artifacts alone.
@@ -731,6 +765,42 @@ async fn write_sugar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--field` exists so shell callers (workflow checks especially) can
+    /// build valid payloads without jq on PATH — the steward escalation
+    /// checks silently wrote empty payloads when jq was missing from the
+    /// daemon's inherited environment. Escaping belongs to serde, not sh.
+    #[test]
+    fn fields_build_a_payload_without_jq() {
+        let mut payload = json!(null);
+        apply_fields(
+            &mut payload,
+            &[
+                "agent=steward".into(),
+                "task=TKT-1".into(),
+                r#"text=quote " and \ survive"#.into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(payload["agent"], "steward");
+        assert_eq!(payload["task"], "TKT-1");
+        assert_eq!(payload["text"], "quote \" and \\ survive");
+    }
+
+    #[test]
+    fn fields_layer_on_top_of_payload_and_reject_non_objects() {
+        let mut payload = json!({"agent": "steward", "kept": true});
+        apply_fields(&mut payload, &["agent=other".into(), "k=v=with=equals".into()]).unwrap();
+        assert_eq!(payload["agent"], "other");
+        assert_eq!(payload["kept"], true);
+        assert_eq!(payload["k"], "v=with=equals");
+
+        let mut not_object = json!("scalar");
+        assert!(apply_fields(&mut not_object, &["a=b".into()]).is_err());
+        let mut ok = json!({});
+        assert!(apply_fields(&mut ok, &["missing-separator".into()]).is_err());
+        assert!(apply_fields(&mut ok, &["=empty-key".into()]).is_err());
+    }
 
     #[test]
     fn durations_parse() {
