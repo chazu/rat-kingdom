@@ -666,7 +666,10 @@ async fn test_factory_execute_prints_instance_json_on_success() {
     assert_eq!(executed["instance"]["workflow"], "noop");
     assert_eq!(
         executed["instance"]["repo"],
-        repo.path().to_string_lossy().as_ref()
+        std::fs::canonicalize(repo.path())
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
     );
     assert_eq!(executed["approval"]["status"], "consumed");
     handle.abort();
