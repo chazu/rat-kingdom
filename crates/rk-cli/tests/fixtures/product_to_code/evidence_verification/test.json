@@ -1,0 +1,8 @@
+{
+  "id": "EV-test",
+  "kind": "test_run",
+  "producer": {"kind": "external-tool", "name": "cargo"},
+  "summary": "Focused tests passed",
+  "artifact_paths": ["artifacts/test.log"],
+  "payload": {"acceptance_criterion_ids": ["AC-2"], "command": "cargo test"}
+}

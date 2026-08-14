@@ -1,0 +1,12 @@
+{
+  "id": "VERIFY-product-to-code",
+  "initiative_id": "INIT-product-to-code",
+  "entries": [
+    {
+      "acceptance_criterion_id": "AC-1",
+      "status": "verified",
+      "evidence_ids": ["EVID-test-run"],
+      "notes": "All checks passed"
+    }
+  ]
+}

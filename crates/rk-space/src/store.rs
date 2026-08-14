@@ -9,10 +9,23 @@
 
 use chrono::{DateTime, Utc};
 use rk_core::id::RecordId;
+use rk_core::sdlc::{
+    ConfiguredSourceName, SemanticStateDigest, SignalEnvelope, SignalPayload, SignalReceipt,
+    SignalSourcePrincipal,
+};
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
 use rk_core::Error;
-use rusqlite::{params_from_iter, Connection, OptionalExtension, Row};
-use std::path::Path;
+use rusqlite::{
+    params_from_iter, Connection, ErrorCode, OptionalExtension, Row, Transaction,
+    TransactionBehavior,
+};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::{
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
 
 pub(crate) struct Store {
     conn: Connection,
@@ -21,6 +34,7 @@ pub(crate) struct Store {
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tuples (
     id         TEXT PRIMARY KEY,
+    commit_sequence INTEGER,
     category   TEXT NOT NULL,
     scope      TEXT NOT NULL,
     identity   TEXT NOT NULL,
@@ -35,6 +49,34 @@ CREATE INDEX IF NOT EXISTS idx_tuples_prefix
     ON tuples (category, scope, identity, instance);
 CREATE INDEX IF NOT EXISTS idx_tuples_expiry
     ON tuples (expires_at) WHERE expires_at IS NOT NULL;
+CREATE TABLE IF NOT EXISTS tuple_sequence_state (
+    singleton                    INTEGER PRIMARY KEY CHECK (singleton = 1),
+    last_sequence                INTEGER NOT NULL
+                                 CHECK (typeof(last_sequence) = 'integer'
+                                        AND last_sequence >= 0),
+    legacy_backfill_sequence     INTEGER NOT NULL
+                                 CHECK (typeof(legacy_backfill_sequence) = 'integer'
+                                        AND legacy_backfill_sequence >= 0),
+    journal_floor_sequence       INTEGER NOT NULL DEFAULT 0
+                                 CHECK (typeof(journal_floor_sequence) = 'integer'
+                                        AND journal_floor_sequence >= 0)
+);
+CREATE TABLE IF NOT EXISTS tuple_persistence_events (
+    commit_sequence INTEGER PRIMARY KEY,
+    id              TEXT NOT NULL,
+    category        TEXT NOT NULL,
+    scope           TEXT NOT NULL,
+    identity        TEXT NOT NULL,
+    instance        TEXT NOT NULL,
+    lifecycle       TEXT NOT NULL,
+    payload         TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    expires_at      TEXT,
+    strength        REAL
+);
+CREATE TABLE IF NOT EXISTS rk_store_migrations (
+    version TEXT PRIMARY KEY
+);
 CREATE TABLE IF NOT EXISTS coordinator_events (
     sequence   INTEGER PRIMARY KEY AUTOINCREMENT,
     tuple_id   TEXT NOT NULL UNIQUE,
@@ -42,15 +84,124 @@ CREATE TABLE IF NOT EXISTS coordinator_events (
 );
 CREATE INDEX IF NOT EXISTS idx_coordinator_events_sequence
     ON coordinator_events (sequence);
+CREATE TABLE IF NOT EXISTS sdlc_receipts (
+    source                  TEXT NOT NULL,
+    delivery_id             TEXT NOT NULL,
+    receipt_json            TEXT NOT NULL,
+    PRIMARY KEY (source, delivery_id)
+);
+CREATE TABLE IF NOT EXISTS sdlc_current_state (
+    source                  TEXT NOT NULL,
+    scope                   TEXT NOT NULL,
+    subject                 TEXT NOT NULL,
+    semantic_state_digest   TEXT NOT NULL,
+    first_delivery_id       TEXT NOT NULL,
+    last_delivery_id        TEXT NOT NULL,
+    first_seen_at           TEXT NOT NULL,
+    last_seen_at            TEXT NOT NULL,
+    current_occurred_at     TEXT,
+    current_observed_at     TEXT,
+    fact_tuple_id           TEXT NOT NULL UNIQUE,
+    PRIMARY KEY (source, scope, subject)
+);
+CREATE TABLE IF NOT EXISTS sdlc_transitions (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    source                  TEXT NOT NULL,
+    scope                   TEXT NOT NULL,
+    subject                 TEXT NOT NULL,
+    delivery_id             TEXT NOT NULL,
+    previous_digest         TEXT,
+    current_digest          TEXT NOT NULL,
+    transition_tuple_id     TEXT NOT NULL UNIQUE,
+    created_at              TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sdlc_current_selector
+    ON sdlc_current_state (source, scope, subject);
+CREATE INDEX IF NOT EXISTS idx_sdlc_transitions_key
+    ON sdlc_transitions (source, scope, subject);
 ";
+
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const SQLITE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+fn enable_wal(conn: &Connection) -> rk_core::Result<()> {
+    let deadline = Instant::now() + SQLITE_BUSY_TIMEOUT;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+                ) && Instant::now() < deadline =>
+            {
+                thread::sleep(SQLITE_BUSY_RETRY_DELAY);
+            }
+            Err(error) => return Err(sql_err(error)),
+        }
+    }
+}
+
+pub(crate) struct AcceptedSdlcSignal {
+    pub receipt: SignalReceipt,
+    pub projected_tuples: Vec<Tuple>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdlcTransitionRecord {
+    pub source: String,
+    pub scope: String,
+    pub subject: String,
+    pub delivery_id: String,
+    pub previous_digest: Option<String>,
+    pub current_digest: String,
+    pub transition_tuple_id: String,
+    pub created_at: String,
+}
+
+/// Current tuples persisted after a durable SQLite sequence boundary.
+///
+/// `boundary` is captured before the rows are read. Consumers may advance to it
+/// after processing succeeds even when some rows were deleted concurrently,
+/// because later inserts always receive a strictly larger sequence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PersistenceDelta {
+    pub boundary: u64,
+    pub tuples: Vec<Tuple>,
+}
+
+#[derive(Debug, Clone)]
+struct SdlcKey {
+    scope: String,
+    subject: String,
+    family: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct CurrentSdlcState {
+    digest: String,
+    first_delivery_id: String,
+    first_seen_at: String,
+    fact_tuple_id: String,
+    current_occurred_at: Option<String>,
+    current_observed_at: Option<String>,
+}
 
 /// Bring an older DB up to the current schema. `CREATE TABLE IF NOT EXISTS`
 /// leaves an already-created table untouched, so a DB from before `strength`
 /// existed needs an explicit `ALTER`. The duplicate-column error on an
 /// up-to-date DB is the one expected exception; every other migration error is
 /// returned so the daemon cannot operate against a partially upgraded store.
-fn migrate(conn: &Connection) -> rk_core::Result<()> {
-    let strength_exists: bool = conn
+fn migrate(
+    conn: &mut Connection,
+    sequence_schema_preexisting: bool,
+    journal_trusted: bool,
+) -> rk_core::Result<()> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sql_err)?;
+    tx.execute_batch(SCHEMA).map_err(sql_err)?;
+    let strength_exists: bool = tx
         .query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM pragma_table_info('tuples') WHERE name = 'strength'
@@ -60,34 +211,468 @@ fn migrate(conn: &Connection) -> rk_core::Result<()> {
         )
         .map_err(sql_err)?;
     if !strength_exists {
-        conn.execute("ALTER TABLE tuples ADD COLUMN strength REAL", [])
+        tx.execute("ALTER TABLE tuples ADD COLUMN strength REAL", [])
             .map_err(sql_err)?;
     }
-    conn.execute_batch(
+    let commit_sequence_exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('tuples') WHERE name = 'commit_sequence'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_err)?;
+    if !commit_sequence_exists {
+        tx.execute(
+            "ALTER TABLE tuples ADD COLUMN commit_sequence INTEGER",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    let journal_floor_exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('tuple_sequence_state')
+                  WHERE name = 'journal_floor_sequence'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_err)?;
+    if !journal_floor_exists {
+        tx.execute(
+            "ALTER TABLE tuple_sequence_state
+             ADD COLUMN journal_floor_sequence INTEGER NOT NULL DEFAULT 0
+             CHECK (typeof(journal_floor_sequence) = 'integer'
+                    AND journal_floor_sequence >= 0)",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    for column in ["current_occurred_at", "current_observed_at"] {
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('sdlc_current_state') WHERE name = ?1
+                 )",
+                [column],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        if !exists {
+            tx.execute(
+                &format!("ALTER TABLE sdlc_current_state ADD COLUMN {column} TEXT"),
+                [],
+            )
+            .map_err(sql_err)?;
+        }
+    }
+    backfill_tuple_sequences(&tx, sequence_schema_preexisting)?;
+    if journal_trusted {
+        validate_sequence_journal(&tx)?;
+    } else {
+        backfill_tuple_persistence_events(&tx)?;
+        if sequence_schema_preexisting
+            && !journal_floor_exists
+            && !journal_is_fully_backfilled(&tx)?
+        {
+            tx.execute(
+                "UPDATE tuple_sequence_state
+                    SET journal_floor_sequence = last_sequence
+                  WHERE singleton = 1",
+                [],
+            )
+            .map_err(sql_err)?;
+        }
+        validate_sequence_journal(&tx)?;
+    }
+    backfill_legacy_deployment_ordering(&tx)?;
+    tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_tuples_strength
-             ON tuples (strength) WHERE strength IS NOT NULL;",
+             ON tuples (strength) WHERE strength IS NOT NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_tuples_commit_sequence
+             ON tuples (commit_sequence) WHERE commit_sequence IS NOT NULL;
+         DROP TRIGGER IF EXISTS tuples_reject_explicit_commit_sequence;
+         CREATE TRIGGER tuples_reject_explicit_commit_sequence
+         BEFORE INSERT ON tuples
+         FOR EACH ROW WHEN NEW.commit_sequence IS NOT NULL
+         BEGIN
+             SELECT RAISE(ABORT, 'tuple commit sequence is database-assigned');
+         END;
+         DROP TRIGGER IF EXISTS tuples_assign_commit_sequence;
+         CREATE TRIGGER tuples_assign_commit_sequence
+         AFTER INSERT ON tuples
+         FOR EACH ROW WHEN NEW.commit_sequence IS NULL
+         BEGIN
+             SELECT CASE WHEN NOT EXISTS (
+                 SELECT 1 FROM tuple_sequence_state
+                  WHERE singleton = 1
+                    AND typeof(last_sequence) = 'integer'
+                    AND last_sequence >= 0
+                    AND last_sequence < 9223372036854775807
+                    AND typeof(legacy_backfill_sequence) = 'integer'
+                    AND legacy_backfill_sequence >= 0
+                    AND legacy_backfill_sequence <= last_sequence
+                    AND typeof(journal_floor_sequence) = 'integer'
+                    AND journal_floor_sequence >= 0
+                    AND journal_floor_sequence <= last_sequence
+             ) THEN RAISE(ABORT, 'invalid tuple persistence sequence state') END;
+             UPDATE tuple_sequence_state
+                SET last_sequence = last_sequence + 1
+              WHERE singleton = 1;
+             UPDATE tuples
+                SET commit_sequence = (
+                    SELECT last_sequence FROM tuple_sequence_state WHERE singleton = 1
+                )
+              WHERE id = NEW.id;
+             INSERT INTO tuple_persistence_events
+                 (commit_sequence, id, category, scope, identity, instance,
+                  lifecycle, payload, created_at, expires_at, strength)
+             SELECT last_sequence, NEW.id, NEW.category, NEW.scope, NEW.identity,
+                    NEW.instance, NEW.lifecycle, NEW.payload, NEW.created_at,
+                    NEW.expires_at, NEW.strength
+               FROM tuple_sequence_state WHERE singleton = 1;
+         END;
+         DROP TRIGGER IF EXISTS tuple_persistence_events_reject_replace;
+         DROP TRIGGER IF EXISTS tuple_persistence_events_ignore_duplicate;
+         CREATE TRIGGER tuple_persistence_events_ignore_duplicate
+         BEFORE INSERT ON tuple_persistence_events
+         FOR EACH ROW WHEN EXISTS (
+             SELECT 1 FROM tuple_persistence_events
+              WHERE commit_sequence = NEW.commit_sequence
+         )
+         BEGIN
+             SELECT RAISE(IGNORE);
+         END;
+         DROP TRIGGER IF EXISTS tuple_persistence_events_reject_update;
+         CREATE TRIGGER tuple_persistence_events_reject_update
+         BEFORE UPDATE ON tuple_persistence_events
+         BEGIN
+             SELECT RAISE(ABORT, 'tuple persistence journal is immutable');
+         END;
+         DROP TRIGGER IF EXISTS tuple_persistence_events_reject_delete;
+         CREATE TRIGGER tuple_persistence_events_reject_delete
+         BEFORE DELETE ON tuple_persistence_events
+         BEGIN
+             SELECT RAISE(ABORT, 'tuple persistence journal is immutable');
+         END;
+         INSERT OR IGNORE INTO rk_store_migrations (version)
+         VALUES ('tuple_persistence_journal_v1');",
+    )
+    .map_err(sql_err)?;
+    tx.commit().map_err(sql_err)
+}
+
+fn journal_is_fully_backfilled(conn: &Connection) -> rk_core::Result<bool> {
+    let (last, count, first, final_sequence): (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT state.last_sequence,
+                    (SELECT COUNT(*) FROM tuple_persistence_events),
+                    COALESCE((SELECT MIN(commit_sequence)
+                                FROM tuple_persistence_events), 0),
+                    COALESCE((SELECT MAX(commit_sequence)
+                                FROM tuple_persistence_events), 0)
+               FROM tuple_sequence_state AS state
+              WHERE state.singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(sql_err)?;
+    Ok(if last == 0 {
+        count == 0 && first == 0 && final_sequence == 0
+    } else {
+        last > 0 && count == last && first == 1 && final_sequence == last
+    })
+}
+
+fn backfill_tuple_sequences(
+    conn: &Connection,
+    sequence_schema_preexisting: bool,
+) -> rk_core::Result<()> {
+    let existing_state: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT last_sequence, legacy_backfill_sequence
+             FROM tuple_sequence_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_err)?;
+    let assigned_max: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(commit_sequence), 0) FROM tuples",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_err)?;
+    if sequence_schema_preexisting && existing_state.is_none() {
+        return Err(Error::Other(
+            "missing tuple persistence sequence state in migrated database".into(),
+        ));
+    }
+    if let Some((last, legacy)) = existing_state {
+        if last < 0 || legacy < 0 || legacy > last || last < assigned_max {
+            return Err(Error::Other(
+                "invalid tuple persistence sequence state".into(),
+            ));
+        }
+    }
+    let mut next = existing_state.map(|(last, _)| last).unwrap_or(0);
+    let missing_ids = {
+        let mut statement = conn
+            .prepare("SELECT id FROM tuples WHERE commit_sequence IS NULL ORDER BY id ASC")
+            .map_err(sql_err)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sql_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sql_err)?
+    };
+    for id in missing_ids {
+        next = next
+            .checked_add(1)
+            .ok_or_else(|| Error::Other("tuple persistence sequence overflow".into()))?;
+        conn.execute(
+            "UPDATE tuples SET commit_sequence = ?2 WHERE id = ?1",
+            rusqlite::params![id, next],
+        )
+        .map_err(sql_err)?;
+    }
+    match existing_state {
+        Some((_, legacy_backfill_sequence)) => conn
+            .execute(
+                "UPDATE tuple_sequence_state SET last_sequence = ?1,
+                                                   legacy_backfill_sequence = ?2
+                 WHERE singleton = 1",
+                rusqlite::params![next, legacy_backfill_sequence],
+            )
+            .map(|_| ())
+            .map_err(sql_err),
+        None => conn
+            .execute(
+                "INSERT INTO tuple_sequence_state
+                 (singleton, last_sequence, legacy_backfill_sequence,
+                  journal_floor_sequence)
+                 VALUES (1, ?1, ?1, 0)",
+                [next],
+            )
+            .map(|_| ())
+            .map_err(sql_err),
+    }
+}
+
+fn backfill_tuple_persistence_events(conn: &Connection) -> rk_core::Result<()> {
+    conn.execute(
+        "INSERT INTO tuple_persistence_events
+         (commit_sequence, id, category, scope, identity, instance, lifecycle,
+          payload, created_at, expires_at, strength)
+         SELECT commit_sequence, id, category, scope, identity, instance,
+                lifecycle, payload, created_at, expires_at, strength
+           FROM tuples AS tuple
+          WHERE commit_sequence IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM tuple_persistence_events AS event
+                 WHERE event.commit_sequence = tuple.commit_sequence
+            )
+          ORDER BY commit_sequence ASC",
+        [],
+    )
+    .map(|_| ())
+    .map_err(sql_err)
+}
+
+fn validate_sequence_journal(conn: &Connection) -> rk_core::Result<i64> {
+    let (last, legacy, floor, suffix_count, first_suffix, last_suffix, invalid_count):
+        (i64, i64, i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT state.last_sequence,
+                        state.legacy_backfill_sequence,
+                        state.journal_floor_sequence,
+                        (SELECT COUNT(*) FROM tuple_persistence_events
+                          WHERE commit_sequence > state.journal_floor_sequence),
+                        COALESCE((SELECT MIN(commit_sequence)
+                                    FROM tuple_persistence_events
+                                   WHERE commit_sequence > state.journal_floor_sequence), 0),
+                        COALESCE((SELECT MAX(commit_sequence)
+                                    FROM tuple_persistence_events
+                                   WHERE commit_sequence > state.journal_floor_sequence), 0),
+                        (SELECT COUNT(*) FROM tuple_persistence_events
+                          WHERE commit_sequence < 1
+                             OR commit_sequence > state.last_sequence)
+                   FROM tuple_sequence_state AS state
+                  WHERE state.singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .map_err(sql_err)?;
+    let suffix_contiguous = if last == floor {
+        suffix_count == 0 && first_suffix == 0 && last_suffix == 0
+    } else if last > floor {
+        suffix_count == last - floor
+            && first_suffix == floor + 1
+            && last_suffix == last
+    } else {
+        false
+    };
+    if last < 0
+        || legacy < 0
+        || legacy > last
+        || floor < 0
+        || floor > last
+        || invalid_count != 0
+        || !suffix_contiguous
+    {
+        return Err(Error::Other(
+            "tuple persistence sequence state disagrees with immutable journal".into(),
+        ));
+    }
+    Ok(last)
+}
+
+fn backfill_legacy_deployment_ordering(conn: &Connection) -> rk_core::Result<()> {
+    let rows = {
+        let mut statement = conn
+            .prepare(
+                "SELECT state.source, state.subject, tuples.payload
+                 FROM sdlc_current_state AS state
+                 JOIN tuples ON tuples.id = state.fact_tuple_id
+                 WHERE state.scope = 'deployment'
+                   AND (state.current_occurred_at IS NULL
+                        OR state.current_observed_at IS NULL)",
+            )
+            .map_err(sql_err)?;
+        let mapped = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(sql_err)?;
+        mapped.collect::<Result<Vec<_>, _>>().map_err(sql_err)?
+    };
+
+    for (source, subject, payload_json) in rows {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_json) else {
+            continue;
+        };
+        let occurred_at = valid_rfc3339_field(&payload, "occurred_at");
+        let observed_at = valid_rfc3339_field(&payload, "observed_at");
+        if occurred_at.is_none() && observed_at.is_none() {
+            continue;
+        }
+        conn.execute(
+            "UPDATE sdlc_current_state
+             SET current_occurred_at = COALESCE(current_occurred_at, ?1),
+                 current_observed_at = COALESCE(current_observed_at, ?2)
+             WHERE source = ?3 AND scope = 'deployment' AND subject = ?4",
+            rusqlite::params![occurred_at, observed_at, source, subject],
+        )
+        .map_err(sql_err)?;
+    }
+    Ok(())
+}
+
+fn valid_rfc3339_field(payload: &serde_json::Value, field: &str) -> Option<String> {
+    let value = payload.get(field)?.as_str()?;
+    DateTime::parse_from_rfc3339(value).ok()?;
+    Some(value.to_string())
+}
+
+fn journal_marker_exists(conn: &Connection) -> rk_core::Result<bool> {
+    let marker_table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                  WHERE type = 'table' AND name = 'rk_store_migrations'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_err)?;
+    if !marker_table_exists {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM rk_store_migrations
+              WHERE version = 'tuple_persistence_journal_v1'
+         )",
+        [],
+        |row| row.get(0),
     )
     .map_err(sql_err)
 }
 
 impl Store {
     pub fn open(path: &Path) -> rk_core::Result<Self> {
-        let conn = Connection::open(path).map_err(sql_err)?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(sql_err)?;
-        conn.pragma_update(None, "busy_timeout", 5000)
-            .map_err(sql_err)?;
+        let mut conn = Connection::open(path).map_err(sql_err)?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT).map_err(sql_err)?;
+        enable_wal(&conn)?;
         register_functions(&conn).map_err(sql_err)?;
-        conn.execute_batch(SCHEMA).map_err(sql_err)?;
-        migrate(&conn)?;
+        let sequence_schema_preexisting = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('tuples')
+                      WHERE name = 'commit_sequence'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        let journal_guards_preexisting = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master
+                      WHERE type = 'trigger'
+                        AND name = 'tuple_persistence_events_reject_update'
+                 ) OR EXISTS(
+                     SELECT 1 FROM sqlite_master
+                      WHERE type = 'trigger'
+                        AND name = 'tuple_persistence_events_reject_delete'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        let journal_floor_preexisting: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('tuple_sequence_state')
+                      WHERE name = 'journal_floor_sequence'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        let journal_marker_preexisting = journal_marker_exists(&conn)?;
+        migrate(
+            &mut conn,
+            sequence_schema_preexisting,
+            journal_guards_preexisting
+                || journal_floor_preexisting
+                || journal_marker_preexisting,
+        )?;
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> rk_core::Result<Self> {
-        let conn = Connection::open_in_memory().map_err(sql_err)?;
+        let mut conn = Connection::open_in_memory().map_err(sql_err)?;
         register_functions(&conn).map_err(sql_err)?;
-        conn.execute_batch(SCHEMA).map_err(sql_err)?;
-        migrate(&conn)?;
+        let sequence_schema_preexisting = false;
+        let journal_trusted = false;
+        migrate(&mut conn, sequence_schema_preexisting, journal_trusted)?;
         Ok(Self { conn })
     }
 
@@ -114,6 +699,345 @@ impl Store {
         Ok(())
     }
 
+    pub fn accept_sdlc_signal(
+        &mut self,
+        envelope: &SignalEnvelope,
+        principal: &SignalSourcePrincipal,
+        rollback_injection: bool,
+    ) -> rk_core::Result<AcceptedSdlcSignal> {
+        envelope
+            .validate(&Default::default())
+            .map_err(|error| Error::InvalidTuple(error.to_string()))?;
+        reject_sdlc_storage_secret_like(&envelope.summary)?;
+        let expected = SignalSourcePrincipal::for_source(&envelope.source);
+        if principal.as_str() != expected.as_str() {
+            return Err(Error::InvalidTuple(
+                "principal does not match signal source".into(),
+            ));
+        }
+
+        let digest = SemanticStateDigest::for_envelope(envelope)
+            .map_err(|error| Error::InvalidTuple(error.to_string()))?;
+        let key = sdlc_key(envelope);
+        let source = envelope.source.as_str().to_string();
+        let event_tuple = sdlc_event_tuple(envelope, principal, &key);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+
+        if let Some(receipt) = sdlc_receipt_tx(&tx, &source, &envelope.delivery_id)? {
+            return Ok(AcceptedSdlcSignal {
+                receipt,
+                projected_tuples: vec![],
+            });
+        }
+
+        let accepted_at = Utc::now();
+
+        let current = tx
+            .query_row(
+                "SELECT semantic_state_digest, first_delivery_id, first_seen_at, fact_tuple_id,
+                        current_occurred_at, current_observed_at
+                 FROM sdlc_current_state
+                 WHERE source = ?1 AND scope = ?2 AND subject = ?3",
+                rusqlite::params![source, key.scope, key.subject],
+                |row| {
+                    Ok(CurrentSdlcState {
+                        digest: row.get(0)?,
+                        first_delivery_id: row.get(1)?,
+                        first_seen_at: row.get(2)?,
+                        fact_tuple_id: row.get(3)?,
+                        current_occurred_at: row.get(4)?,
+                        current_observed_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sql_err)?;
+
+        let advances_current = current
+            .as_ref()
+            .map(|current| occurrence_advances_current(envelope, &key, current))
+            .unwrap_or(true);
+
+        let fact_id = current
+            .as_ref()
+            .map(|current| current.fact_tuple_id.clone())
+            .unwrap_or_else(|| {
+                stable_record_id(&["sdlc", "fact", &source, &key.scope, &key.subject]).to_string()
+            });
+        let first_delivery_id = current
+            .as_ref()
+            .map(|current| current.first_delivery_id.clone())
+            .unwrap_or_else(|| envelope.delivery_id.clone());
+        let first_seen_at = current
+            .as_ref()
+            .map(|current| current.first_seen_at.clone())
+            .unwrap_or_else(|| accepted_at.to_rfc3339());
+        let transition_emitted = advances_current
+            && current
+                .as_ref()
+                .map(|current| current.digest != digest.as_str())
+                .unwrap_or(true);
+        let receipt_id = format!("sdlc:receipt:{source}:{}", envelope.delivery_id);
+        let fact_tuple = sdlc_fact_tuple(
+            &fact_id,
+            envelope,
+            principal,
+            &key,
+            digest.as_str(),
+            &first_delivery_id,
+            &first_seen_at,
+            &receipt_id,
+            accepted_at,
+        );
+
+        insert_tuple_tx(&tx, &event_tuple)?;
+        let mut projected_tuples = vec![event_tuple.clone()];
+        if advances_current {
+            if current.is_some() {
+                tx.execute(
+                    "UPDATE tuples SET payload = ?2, created_at = ?3 WHERE id = ?1",
+                    rusqlite::params![
+                        fact_id,
+                        fact_tuple.payload.to_string(),
+                        accepted_at.to_rfc3339()
+                    ],
+                )
+                .map_err(sql_err)?;
+            } else {
+                insert_tuple_tx(&tx, &fact_tuple)?;
+            }
+            projected_tuples.push(fact_tuple.clone());
+
+            tx.execute(
+                "INSERT INTO sdlc_current_state
+                 (source, scope, subject, semantic_state_digest, first_delivery_id, last_delivery_id,
+                  first_seen_at, last_seen_at, current_occurred_at, current_observed_at, fact_tuple_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(source, scope, subject) DO UPDATE SET
+                   semantic_state_digest = excluded.semantic_state_digest,
+                   last_delivery_id = excluded.last_delivery_id,
+                   last_seen_at = excluded.last_seen_at,
+                   current_occurred_at = excluded.current_occurred_at,
+                   current_observed_at = excluded.current_observed_at",
+                rusqlite::params![
+                    source,
+                    key.scope,
+                    key.subject,
+                    digest.as_str(),
+                    first_delivery_id,
+                    envelope.delivery_id,
+                    first_seen_at,
+                    accepted_at.to_rfc3339(),
+                    envelope.occurred_at.to_rfc3339(),
+                    envelope.observed_at.to_rfc3339(),
+                    fact_id
+                ],
+            )
+            .map_err(sql_err)?;
+        }
+
+        let transition_tuple_id = if transition_emitted {
+            let transition = sdlc_transition_tuple(
+                envelope,
+                principal,
+                &key,
+                current.as_ref().map(|current| current.digest.as_str()),
+                digest.as_str(),
+            );
+            insert_tuple_tx(&tx, &transition)?;
+            tx.execute(
+                "INSERT INTO sdlc_transitions
+                 (source, scope, subject, delivery_id, previous_digest, current_digest, transition_tuple_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![source, key.scope, key.subject, envelope.delivery_id, current.as_ref().map(|current| current.digest.as_str()), digest.as_str(), transition.id.to_string(), accepted_at.to_rfc3339()],
+            ).map_err(sql_err)?;
+            projected_tuples.push(transition.clone());
+            Some(transition.id.to_string())
+        } else {
+            None
+        };
+
+        let receipt = SignalReceipt::accepted(
+            receipt_id,
+            principal.clone(),
+            envelope.delivery_id.clone(),
+            accepted_at,
+            digest,
+            event_tuple.id.to_string(),
+            if advances_current {
+                vec![fact_id.clone()]
+            } else {
+                vec![]
+            },
+            transition_emitted,
+        );
+        let receipt_json =
+            serde_json::to_string(&receipt).map_err(|error| Error::Other(error.to_string()))?;
+        tx.execute(
+            "INSERT INTO sdlc_receipts (source, delivery_id, receipt_json) VALUES (?1, ?2, ?3)",
+            rusqlite::params![source, envelope.delivery_id, receipt_json],
+        )
+        .map_err(sql_err)?;
+
+        if rollback_injection {
+            return Err(Error::Other("injected sdlc rollback".into()));
+        }
+        tx.commit().map_err(sql_err)?;
+        let _ = transition_tuple_id;
+        Ok(AcceptedSdlcSignal {
+            receipt,
+            projected_tuples,
+        })
+    }
+
+    pub fn sdlc_receipt(
+        &self,
+        source: &ConfiguredSourceName,
+        delivery_id: &str,
+    ) -> rk_core::Result<Option<SignalReceipt>> {
+        self.conn
+            .query_row(
+                "SELECT receipt_json FROM sdlc_receipts WHERE source = ?1 AND delivery_id = ?2",
+                rusqlite::params![source.as_str(), delivery_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql_err)?
+            .map(|json| stored_sdlc_receipt(&json))
+            .transpose()
+    }
+
+    pub fn sdlc_transition(
+        &self,
+        transition_tuple_id: &str,
+    ) -> rk_core::Result<Option<SdlcTransitionRecord>> {
+        self.conn
+            .query_row(
+                "SELECT source, scope, subject, delivery_id, previous_digest,
+                        current_digest, transition_tuple_id, created_at
+                 FROM sdlc_transitions WHERE transition_tuple_id = ?1",
+                [transition_tuple_id],
+                |row| {
+                    Ok(SdlcTransitionRecord {
+                        source: row.get(0)?,
+                        scope: row.get(1)?,
+                        subject: row.get(2)?,
+                        delivery_id: row.get(3)?,
+                        previous_digest: row.get(4)?,
+                        current_digest: row.get(5)?,
+                        transition_tuple_id: row.get(6)?,
+                        created_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sql_err)
+    }
+
+    pub fn current_sdlc_facts(
+        &self,
+        source: Option<&str>,
+        scope: Option<&str>,
+        subject: Option<&str>,
+    ) -> rk_core::Result<Vec<Tuple>> {
+        let mut sql = String::from(
+            "SELECT t.id, t.category, t.scope, t.identity, t.instance, t.lifecycle, t.payload, t.created_at, t.expires_at, t.strength
+             FROM sdlc_current_state s JOIN tuples t ON t.id = s.fact_tuple_id WHERE 1=1",
+        );
+        let mut args = Vec::new();
+        if let Some(value) = source {
+            sql.push_str(" AND s.source = ?");
+            args.push(value.to_string());
+        }
+        if let Some(value) = scope {
+            sql.push_str(" AND s.scope = ?");
+            args.push(value.to_string());
+        }
+        if let Some(value) = subject {
+            sql.push_str(" AND s.subject = ?");
+            args.push(value.to_string());
+        }
+        sql.push_str(" ORDER BY s.source, s.scope, s.subject");
+        let mut stmt = self.conn.prepare(&sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params_from_iter(args.iter()), row_to_tuple)
+            .map_err(sql_err)?;
+        rows.map(|row| row.map_err(sql_err)).collect()
+    }
+
+    pub fn latest_persistence_sequence(&self) -> rk_core::Result<u64> {
+        let sequence = validate_sequence_journal(&self.conn)?;
+        u64::try_from(sequence)
+            .map_err(|_| Error::Other("invalid negative tuple persistence sequence".into()))
+    }
+
+    pub fn persistence_delta(&self, after: Option<u64>) -> rk_core::Result<PersistenceDelta> {
+        let boundary = self.latest_persistence_sequence()?;
+        let after = i64::try_from(after.unwrap_or(0))
+            .map_err(|_| Error::Other("tuple persistence cursor exceeds SQLite range".into()))?;
+        let boundary_sql = i64::try_from(boundary)
+            .map_err(|_| Error::Other("tuple persistence boundary exceeds SQLite range".into()))?;
+        if after > boundary_sql {
+            return Err(Error::Other(
+                "tuple persistence cursor is ahead of the captured boundary".into(),
+            ));
+        }
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT id, category, scope, identity, instance, lifecycle, payload,
+                        created_at, expires_at, strength
+                 FROM tuple_persistence_events
+                 WHERE commit_sequence > ?1 AND commit_sequence <= ?2
+                 ORDER BY commit_sequence ASC",
+            )
+            .map_err(sql_err)?;
+        let rows = statement
+            .query_map([after, boundary_sql], row_to_tuple)
+            .map_err(sql_err)?;
+        let tuples = rows
+            .map(|row| row.map_err(sql_err))
+            .collect::<rk_core::Result<Vec<_>>>()?;
+        Ok(PersistenceDelta { boundary, tuples })
+    }
+
+    pub fn has_persistence_event(&self, id: RecordId) -> rk_core::Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM tuple_persistence_events WHERE id = ?1
+                 )",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)
+    }
+
+    pub fn has_persistence_event_matching(&self, pattern: &Pattern) -> rk_core::Result<bool> {
+        let mut sql = String::from(
+            "SELECT EXISTS(
+                 SELECT 1 FROM tuple_persistence_events WHERE 1=1",
+        );
+        let mut args = Vec::new();
+        append_pattern_filters(&mut sql, &mut args, pattern, false);
+        sql.push(')');
+        self.conn
+            .query_row(&sql, params_from_iter(args.iter()), |row| row.get(0))
+            .map_err(sql_err)
+    }
+
+    pub fn legacy_persistence_sequence(&self, _id: RecordId) -> rk_core::Result<Option<u64>> {
+        self.latest_persistence_sequence()?;
+        // ULID ordering could already have skipped a delayed lower-ID write before
+        // this migration. The only lossless conversion is an at-least-once replay
+        // of the deterministic historical baseline. Reactor markers and sync tuple
+        // identity make that replay idempotent.
+        Ok(Some(0))
+    }
+
     /// Persist a protected coordinator event and its journal row atomically.
     /// The SQLite sequence is the coordinator cursor: unlike a ULID it is
     /// assigned in commit order and remains stable across restart.
@@ -137,7 +1061,8 @@ impl Store {
             ],
         )
         .map_err(sql_err)?;
-        let tuple_json = serde_json::to_string(tuple).map_err(|error| Error::Other(error.to_string()))?;
+        let tuple_json =
+            serde_json::to_string(tuple).map_err(|error| Error::Other(error.to_string()))?;
         tx.execute(
             "INSERT INTO coordinator_events (tuple_id, tuple_json) VALUES (?1, ?2)",
             rusqlite::params![tuple.id.to_string(), tuple_json],
@@ -183,11 +1108,9 @@ impl Store {
 
     pub fn coordinator_latest_sequence(&self) -> rk_core::Result<Option<u64>> {
         self.conn
-            .query_row(
-                "SELECT MAX(sequence) FROM coordinator_events",
-                [],
-                |row| row.get::<_, Option<i64>>(0),
-            )
+            .query_row("SELECT MAX(sequence) FROM coordinator_events", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
             .map(|sequence| sequence.map(|value| value as u64))
             .map_err(sql_err)
     }
@@ -493,16 +1416,14 @@ fn register_functions(conn: &Connection) -> rusqlite::Result<()> {
                 .get::<String>(3)?
                 .parse()
                 .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-            let category = category.parse::<Category>().map_err(|e| {
-                rusqlite::Error::UserFunctionError(Box::new(e))
-            })?;
+            let category = category
+                .parse::<Category>()
+                .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
             let created_at = DateTime::parse_from_rfc3339(&created_at)
                 .map(|t| t.with_timezone(&Utc))
                 .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
-            let age_secs = now_ms
-                .saturating_sub(created_at.timestamp_millis())
-                .max(0) as f64
-                / 1000.0;
+            let age_secs =
+                now_ms.saturating_sub(created_at.timestamp_millis()).max(0) as f64 / 1000.0;
             let recency = 0.5f64.powf(age_secs / HOT_HALF_LIFE_SECS);
             Ok(category.weight() * recency * strength.unwrap_or(rk_core::tuple::FULL_STRENGTH))
         },
@@ -525,6 +1446,319 @@ fn hot_score(tuple: &Tuple, now: DateTime<Utc>) -> f64 {
     let recency = 0.5f64.powf(age_secs / HOT_HALF_LIFE_SECS);
     let strength = tuple.strength.unwrap_or(rk_core::tuple::FULL_STRENGTH);
     tuple.category.weight() * recency * strength
+}
+
+fn insert_tuple_tx(tx: &Transaction<'_>, tuple: &Tuple) -> rk_core::Result<()> {
+    tx.execute(
+        "INSERT INTO tuples
+         (id, category, scope, identity, instance, lifecycle, payload, created_at, expires_at, strength)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            tuple.id.to_string(),
+            tuple.category.as_str(),
+            tuple.scope,
+            tuple.identity,
+            tuple.instance,
+            lifecycle_str(tuple.lifecycle),
+            tuple.payload.to_string(),
+            tuple.created_at.to_rfc3339(),
+            tuple.expires_at.map(|t| t.to_rfc3339()),
+            tuple.strength,
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn sdlc_key(envelope: &SignalEnvelope) -> SdlcKey {
+    match &envelope.payload {
+        SignalPayload::Ci(_) => SdlcKey {
+            scope: "ci".into(),
+            subject: format!(
+                "{}:{}:{}:{}:{}",
+                envelope.correlation.repo.as_deref().unwrap_or_default(),
+                envelope.correlation.branch.as_deref().unwrap_or_default(),
+                envelope.correlation.workflow.as_deref().unwrap_or_default(),
+                envelope.correlation.job.as_deref().unwrap_or_default(),
+                envelope
+                    .correlation
+                    .commit_sha
+                    .as_deref()
+                    .unwrap_or_default()
+            ),
+            family: "ci",
+        },
+        SignalPayload::Deployment(payload) => SdlcKey {
+            scope: "deployment".into(),
+            subject: format!("{}:{}", payload.environment, payload.service),
+            family: "deployment",
+        },
+        SignalPayload::ProductionAlert(payload) => SdlcKey {
+            scope: "production_alert".into(),
+            subject: format!(
+                "{}:{}:{}",
+                payload.environment, payload.service, payload.alert_key
+            ),
+            family: "production_alert",
+        },
+    }
+}
+
+fn occurrence_advances_current(
+    envelope: &SignalEnvelope,
+    key: &SdlcKey,
+    current: &CurrentSdlcState,
+) -> bool {
+    if key.family != "deployment" {
+        return true;
+    }
+
+    let Some(current_occurred_at) = current
+        .current_occurred_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+    else {
+        return false;
+    };
+    let incoming_occurred_at = envelope.occurred_at.fixed_offset();
+    if incoming_occurred_at != current_occurred_at {
+        return incoming_occurred_at > current_occurred_at;
+    }
+
+    let Some(current_observed_at) = current
+        .current_observed_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+    else {
+        return false;
+    };
+    envelope.observed_at.fixed_offset() > current_observed_at
+}
+
+fn sdlc_event_tuple(
+    envelope: &SignalEnvelope,
+    principal: &SignalSourcePrincipal,
+    key: &SdlcKey,
+) -> Tuple {
+    let mut tuple = Tuple::new(
+        Category::Event,
+        key.scope.clone(),
+        format!(
+            "sdlc:event:{}:{}",
+            envelope.source.as_str(),
+            envelope.delivery_id
+        ),
+        principal.as_str(),
+        json!({"source": envelope.source.as_str(), "delivery_id": envelope.delivery_id, "family": key.family, "subject": key.subject, "kind": envelope.kind, "summary": envelope.summary, "occurred_at": envelope.occurred_at, "observed_at": envelope.observed_at, "correlation": envelope.correlation, "refs": envelope.refs, "attributes": envelope.attributes, "payload": envelope.payload}),
+    );
+    tuple.id = stable_record_id(&[
+        "sdlc",
+        "event",
+        envelope.source.as_str(),
+        &envelope.delivery_id,
+    ]);
+    tuple.created_at = envelope.observed_at;
+    tuple
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sdlc_fact_tuple(
+    id: &str,
+    envelope: &SignalEnvelope,
+    principal: &SignalSourcePrincipal,
+    key: &SdlcKey,
+    digest: &str,
+    first_delivery_id: &str,
+    first_seen_at: &str,
+    receipt_id: &str,
+    accepted_at: DateTime<Utc>,
+) -> Tuple {
+    let current = match &envelope.payload {
+        SignalPayload::Ci(payload) => {
+            json!({"status": payload.status, "conclusion": payload.conclusion, "commit_sha": envelope.correlation.commit_sha})
+        }
+        SignalPayload::Deployment(payload) => {
+            json!({
+                "environment": payload.environment,
+                "service": payload.service,
+                "version": payload.version,
+                "commit_sha": envelope.correlation.commit_sha,
+                "repo": envelope.correlation.repo,
+                "branch": envelope.correlation.branch,
+            })
+        }
+        SignalPayload::ProductionAlert(payload) => {
+            json!({"environment": payload.environment, "service": payload.service, "alert_key": payload.alert_key, "state": payload.state, "severity": payload.severity})
+        }
+    };
+    let mut tuple = Tuple::new(
+        Category::Fact,
+        key.scope.clone(),
+        format!("sdlc:current:{}:{}", envelope.source.as_str(), key.subject),
+        principal.as_str(),
+        json!({
+            "source": envelope.source.as_str(),
+            "family": key.family,
+            "subject": key.subject,
+            "semantic_state_digest": digest,
+            "receipt_id": receipt_id,
+            "first_delivery_id": first_delivery_id,
+            "last_delivery_id": envelope.delivery_id,
+            "first_seen_at": first_seen_at,
+            "last_seen_at": accepted_at,
+            "occurred_at": envelope.occurred_at.to_rfc3339(),
+            "observed_at": envelope.observed_at.to_rfc3339(),
+            "refs": envelope.refs,
+            "current": current,
+        }),
+    )
+    .with_lifecycle(Lifecycle::Furniture);
+    tuple.id = id.parse().unwrap_or_else(|_| RecordId::new());
+    tuple.created_at = accepted_at;
+    tuple
+}
+
+fn sdlc_transition_tuple(
+    envelope: &SignalEnvelope,
+    principal: &SignalSourcePrincipal,
+    key: &SdlcKey,
+    previous_digest: Option<&str>,
+    current_digest: &str,
+) -> Tuple {
+    let mut tuple = Tuple::new(
+        Category::Event,
+        key.scope.clone(),
+        format!(
+            "sdlc:transition:{}:{}:{}",
+            envelope.source.as_str(),
+            key.scope,
+            key.subject
+        ),
+        principal.as_str(),
+        json!({"source": envelope.source.as_str(), "delivery_id": envelope.delivery_id, "family": key.family, "subject": key.subject, "previous_digest": previous_digest, "current_digest": current_digest}),
+    );
+    tuple.id = stable_record_id(&[
+        "sdlc",
+        "transition",
+        envelope.source.as_str(),
+        &key.scope,
+        &key.subject,
+        &envelope.delivery_id,
+        current_digest,
+    ]);
+    tuple.created_at = envelope.observed_at;
+    tuple
+}
+
+fn stable_record_id(parts: &[&str]) -> RecordId {
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut hasher = Sha256::new();
+    hasher.update(b"rk-stable-record-id-v1");
+    for part in parts {
+        hasher.update([0]);
+        hasher.update(part.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut value = [0u8; 16];
+    value.copy_from_slice(&digest[..16]);
+    value[0] &= 0x7f;
+    let mut n = u128::from_be_bytes(value);
+    let mut out = [b'0'; 26];
+    for ch in out.iter_mut().rev() {
+        *ch = ALPHABET[(n & 31) as usize];
+        n >>= 5;
+    }
+    std::str::from_utf8(&out)
+        .expect("stable ULID alphabet is UTF-8")
+        .parse()
+        .expect("stable id encoder emits valid ULIDs")
+}
+
+fn reject_sdlc_storage_secret_like(value: &str) -> rk_core::Result<()> {
+    let lower = value.to_ascii_lowercase();
+    let secret_words = [
+        "secret",
+        "token",
+        "bearer",
+        "api_key",
+        "apikey",
+        "raw",
+        "telemetry",
+    ];
+    if secret_words.iter().any(|word| lower.contains(word)) {
+        Err(Error::InvalidTuple(
+            "secret-like SDLC summary rejected".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn sdlc_receipt_tx(
+    tx: &Transaction<'_>,
+    source: &str,
+    delivery_id: &str,
+) -> rk_core::Result<Option<SignalReceipt>> {
+    tx.query_row(
+        "SELECT receipt_json FROM sdlc_receipts WHERE source = ?1 AND delivery_id = ?2",
+        rusqlite::params![source, delivery_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(sql_err)?
+    .map(|json| stored_sdlc_receipt(&json))
+    .transpose()
+}
+
+fn stored_sdlc_receipt(json: &str) -> rk_core::Result<SignalReceipt> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    let get_str = |field: &'static str| -> rk_core::Result<String> {
+        value
+            .get(field)
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| Error::InvalidTuple(format!("stored receipt missing {field}")))
+    };
+    let source_name =
+        ConfiguredSourceName::new(get_str("source")?.strip_prefix("source:").ok_or_else(|| {
+            Error::InvalidTuple("stored receipt source is not source principal".into())
+        })?)
+        .map_err(|error| Error::InvalidTuple(error.to_string()))?;
+    let source = SignalSourcePrincipal::for_source(&source_name);
+    let accepted_at = DateTime::parse_from_rfc3339(&get_str("accepted_at")?)
+        .map(|time| time.with_timezone(&Utc))
+        .map_err(|error| Error::InvalidTuple(error.to_string()))?;
+    let semantic_state_digest =
+        serde_json::from_value(value.get("semantic_state_digest").cloned().ok_or_else(|| {
+            Error::InvalidTuple("stored receipt missing semantic_state_digest".into())
+        })?)?;
+    let projected_fact_ids = value
+        .get("projected_fact_ids")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| Error::InvalidTuple("stored receipt missing projected_fact_ids".into()))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| Error::InvalidTuple("stored receipt fact id is not a string".into()))
+        })
+        .collect::<rk_core::Result<Vec<_>>>()?;
+    Ok(SignalReceipt::accepted(
+        get_str("receipt_id")?,
+        source,
+        get_str("delivery_id")?,
+        accepted_at,
+        semantic_state_digest,
+        get_str("projected_event_id")?,
+        projected_fact_ids,
+        value
+            .get("transition_emitted")
+            .and_then(|value| value.as_bool())
+            .ok_or_else(|| {
+                Error::InvalidTuple("stored receipt missing transition_emitted".into())
+            })?,
+    ))
 }
 
 fn lifecycle_str(l: Lifecycle) -> &'static str {
@@ -614,13 +1848,23 @@ mod tests {
         store.insert(&tuple("a", json!({}))).unwrap(); // Event
         store.insert(&tuple("b", json!({}))).unwrap(); // Event
         store
-            .insert(&Tuple::new(Category::Obstacle, "repo", "c", "rat", json!({})))
+            .insert(&Tuple::new(
+                Category::Obstacle,
+                "repo",
+                "c",
+                "rat",
+                json!({}),
+            ))
             .unwrap();
         store
             .insert(&Tuple::new(Category::Need, "repo", "d", "rat", json!({})))
             .unwrap();
 
-        assert_eq!(store.count_in_categories(&[]).unwrap(), 0, "empty set is zero");
+        assert_eq!(
+            store.count_in_categories(&[]).unwrap(),
+            0,
+            "empty set is zero"
+        );
         assert_eq!(store.count_in_categories(&[Category::Event]).unwrap(), 2);
         assert_eq!(
             store
@@ -864,9 +2108,7 @@ mod tests {
             store.insert(t).unwrap();
         }
 
-        let ranked = store
-            .query_ranked(&Pattern::default(), now, None)
-            .unwrap();
+        let ranked = store.query_ranked(&Pattern::default(), now, None).unwrap();
         let order: Vec<&str> = ranked.iter().map(|t| t.identity.as_str()).collect();
         // Fact outweighs the fresh claim; the stale faint claim sinks last.
         assert_eq!(order, vec!["hot-fact", "fresh", "stale"]);

@@ -1,0 +1,5 @@
+[build]
+# Keep direct `cargo` invocations disk-safe too. Do not create per-agent target
+# directories. Cargo's normal shared `target/` cache is the single build cache.
+incremental = false
+jobs = 4

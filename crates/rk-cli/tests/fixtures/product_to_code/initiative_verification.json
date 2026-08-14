@@ -1,0 +1,10 @@
+{
+  "id": "INIT-verification",
+  "title": "Independent verification",
+  "scope": "product-to-code",
+  "browser_acceptance_applicable": false,
+  "acceptance_criteria": [
+    {"id": "AC-1", "text": "Browser flow works", "browser_acceptance_applicable": true},
+    {"id": "AC-2", "text": "Tests and review pass", "browser_acceptance_applicable": false}
+  ]
+}

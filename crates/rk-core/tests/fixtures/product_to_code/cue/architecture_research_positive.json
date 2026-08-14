@@ -1,0 +1,10 @@
+{
+  "id": "ARCH-product-to-code",
+  "initiative_id": "INIT-product-to-code",
+  "researched_files": ["crates/rk-core/src/product_to_code/contracts.rs"],
+  "architecture_decisions": ["Keep contracts offline and tool agnostic"],
+  "constraints": ["Research validation stays local and deterministic"],
+  "risks": ["Loose schemas can allow unsafe paths into generated plans"],
+  "open_questions": ["Should ticket graph export include ordering metadata?"],
+  "recommended_ticket_graph_path": "docs/product-to-code/tickets.json"
+}

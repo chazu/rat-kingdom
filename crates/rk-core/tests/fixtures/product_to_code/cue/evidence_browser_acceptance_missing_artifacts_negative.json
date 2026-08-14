@@ -1,0 +1,13 @@
+{
+  "id": "EVID-browser",
+  "kind": "browser_acceptance",
+  "producer": { "kind": "manual", "name": "qa" },
+  "summary": "browser scenario passed",
+  "artifact_paths": [],
+  "payload": {
+    "url": "http://localhost:3000/product-to-code",
+    "scenario": "review generated ticket graph",
+    "steps": ["open generated graph"],
+    "observations": ["criteria are mapped"]
+  }
+}

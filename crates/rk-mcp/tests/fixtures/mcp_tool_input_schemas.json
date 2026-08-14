@@ -1,0 +1,205 @@
+[
+  [
+    "factory_snapshot",
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": 1,
+          "description": "MCP argument schema version"
+        },
+        "repo": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repository name"
+        }
+      },
+      "required": [
+        "schema",
+        "repo"
+      ]
+    }
+  ],
+  [
+    "factory_events_replay",
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": 1,
+          "description": "MCP argument schema version"
+        },
+        "repo": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repository name"
+        },
+        "after": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Exclusive event cursor to resume after"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "description": "Maximum events to return"
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional event kind filters"
+        }
+      },
+      "required": [
+        "schema",
+        "repo",
+        "limit"
+      ]
+    }
+  ],
+  [
+    "propose_workflow_run",
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": 1,
+          "description": "MCP argument schema version"
+        },
+        "workflow": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Workflow name"
+        },
+        "repo": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repository name"
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Workflow input parameters"
+        },
+        "coordinator": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional coordinator session identity"
+        },
+        "ttl": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional proposal TTL in seconds"
+        }
+      },
+      "required": [
+        "schema",
+        "workflow",
+        "repo"
+      ]
+    }
+  ],
+  [
+    "approve_action",
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": 1,
+          "description": "MCP argument schema version"
+        },
+        "proposal_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Proposal id"
+        },
+        "digest": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Expected proposal digest"
+        }
+      },
+      "required": [
+        "schema",
+        "proposal_id",
+        "digest"
+      ]
+    }
+  ],
+  [
+    "execute_approved_workflow_run",
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": 1,
+          "description": "MCP argument schema version"
+        },
+        "proposal_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Proposal id"
+        },
+        "digest": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Approved proposal digest"
+        },
+        "action": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "schema": {
+              "const": 1,
+              "description": "MCP argument schema version"
+            },
+            "workflow": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Workflow name"
+            },
+            "repo": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Repository name"
+            },
+            "params": {
+              "type": "object",
+              "additionalProperties": true,
+              "description": "Workflow input parameters"
+            },
+            "coordinator": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Optional coordinator session identity"
+            },
+            "ttl": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Optional proposal TTL in seconds"
+            }
+          },
+          "required": [
+            "schema",
+            "workflow",
+            "repo"
+          ]
+        }
+      },
+      "required": [
+        "schema",
+        "proposal_id",
+        "digest",
+        "action"
+      ]
+    }
+  ]
+]

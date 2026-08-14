@@ -1,0 +1,10 @@
+{
+  "id": "INIT-product-to-code",
+  "title": "Product to code contracts",
+  "scope": "offline-contracts",
+  "browser_acceptance_applicable": false,
+  "acceptance_criteria": [
+    {"id": "AC-1", "text": "Validate graph", "browser_acceptance_applicable": false},
+    {"id": "AC-2", "text": "Apply graph", "browser_acceptance_applicable": false}
+  ]
+}

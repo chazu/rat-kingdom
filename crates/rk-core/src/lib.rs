@@ -1,12 +1,16 @@
 //! Core types for rat-kingdom: tuple model, ids, errors, config, and path layout.
 
+pub mod action;
 pub mod config;
 pub mod error;
+pub mod factory;
 pub mod id;
 pub mod identity;
 pub mod names;
 pub mod paths;
 pub mod prime;
+pub mod product_to_code;
+pub mod sdlc;
 pub mod tuple;
 
 pub use error::{Error, Result};

@@ -1,0 +1,18 @@
+{
+  "id": "VR-product-to-code",
+  "initiative_id": "INIT-product-to-code",
+  "entries": [
+    {
+      "acceptance_criterion_id": "AC-1",
+      "status": "passed",
+      "evidence_ids": ["EVID-test-run"],
+      "notes": "Serde round-trip passed"
+    },
+    {
+      "acceptance_criterion_id": "AC-2",
+      "status": "passed",
+      "evidence_ids": ["EVID-impact", "EVID-review"],
+      "notes": "Evidence is generic and offline"
+    }
+  ]
+}

@@ -3,15 +3,26 @@
 //! server-push event stream.
 
 use crate::coordinator::CoordinatorFilter;
+use crate::factory_events::FactoryEventFilter;
+use crate::ingest_auth::{IngestEventParams, IngestStateParams, SourcePrincipal};
 use crate::proto::{codes, Request, Response};
 use chrono::{DateTime, Utc};
+use rk_core::action::{
+    ActionProposal, ApprovalGrant, ApprovalStatus, FactoryAction, ProductToCodeBlockedNode,
+    ProductToCodeDispatchAction, ProductToCodeDispatchExecutionResult,
+    ProductToCodeDispatchedWorkflow, ProductToCodeWorkflowDispatch, TicketGraphApplyAction,
+    TicketGraphAppliedEdge, TicketGraphApplyExecutionResult, TicketGraphApplyPreconditions,
+    WorkflowRunAction,
+};
 use rk_core::id::RecordId;
 use rk_core::paths::Layout;
+use rk_core::sdlc::SignalSourcePrincipal;
+use rk_core::product_to_code::contracts::{InitiativeContract, TicketGraph};
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, SYSTEM_SCOPE};
 use rk_space::{CoordinatorEvent, Space};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -41,6 +52,36 @@ const OPERATOR_ACTOR: &str = "operator";
 
 type FactVoteKey = (String, String, String);
 type FactVoteState = (DateTime<Utc>, RecordId, String);
+type RequestClock = fn() -> DateTime<Utc>;
+
+fn ingest_state_filter(params: &IngestStateParams) -> (Option<String>, Option<String>) {
+    if let Some(alert_key) = &params.alert_key {
+        return (
+            Some("production_alert".into()),
+            Some(format!(
+                "{}:{}:{}",
+                params.environment.as_deref().unwrap_or_default(),
+                params.service.as_deref().unwrap_or_default(),
+                alert_key
+            )),
+        );
+    }
+    if params.environment.is_some() || params.service.is_some() {
+        return (
+            Some("deployment".into()),
+            Some(format!(
+                "{}:{}",
+                params.environment.as_deref().unwrap_or_default(),
+                params.service.as_deref().unwrap_or_default()
+            )),
+        );
+    }
+    if let Some(repo) = &params.repo {
+        let _ = repo;
+        return (Some("ci".into()), None);
+    }
+    (None, None)
+}
 
 /// Who may close a ballot: its proposer, or the operator (TKT-184).
 ///
@@ -83,6 +124,7 @@ pub struct Daemon {
     review_sweep_config: rk_core::config::ReviewSweepConfig,
     drain_config: rk_core::config::DrainConfig,
     evaporation_decay: f64,
+    ingest_config: rk_core::config::IngestConfig,
     global_agents: std::collections::HashMap<String, rk_workflow::AgentProfile>,
     tier_routing: rk_workflow::TierRouting,
     default_harness: String,
@@ -103,12 +145,18 @@ pub struct Daemon {
     /// persistence supplies restart safety; this lock prevents concurrent
     /// operator retries in one daemon from racing the same worktree.
     onboarding_apply_lock: tokio::sync::Mutex<()>,
+    /// Serializes one daemon's approved ticket-graph execution. Durable
+    /// checkpoints and idempotent ticket coalesce keys provide restart safety;
+    /// this lock prevents concurrent operator retries racing those checkpoints.
+    ticket_graph_apply_lock: tokio::sync::Mutex<()>,
+    action_approvals: crate::action_approval::ActionApprovalStore,
     tickets: Arc<crate::tickets::Tickets>,
     coordinator_sessions: std::sync::Mutex<crate::coordinator::CoordinatorSessions>,
     /// Serializes read/append cycles for one agent's effective fact vote.
     fact_vote_lock: std::sync::Mutex<()>,
     started: Instant,
     shutdown_tx: watch::Sender<bool>,
+    request_clock: RequestClock,
 }
 
 #[derive(Debug, Default)]
@@ -191,6 +239,7 @@ impl Daemon {
         daemon.review_sweep_config = config.review_sweep.clone();
         daemon.drain_config = config.drain.clone();
         daemon.evaporation_decay = config.evaporation.decay;
+        daemon.ingest_config = config.ingest.clone();
         daemon.require_named_checks = config.policy.require_named_checks;
         daemon.require_approval_for_landing = config.policy.require_approval_for_landing;
         daemon.automated_landing_workflows = config.policy.automated_landing_workflows.clone();
@@ -273,6 +322,11 @@ impl Daemon {
         self.review_sweep_config = cfg;
     }
 
+    #[doc(hidden)]
+    pub fn set_request_clock_for_tests(&mut self, clock: fn() -> DateTime<Utc>) {
+        self.request_clock = clock;
+    }
+
     fn with_space(
         layout: Layout,
         castle: String,
@@ -327,6 +381,9 @@ impl Daemon {
             std::sync::Mutex::new(crate::coordinator::CoordinatorSessions::load(
                 &layout.home().join("coordinator-sessions.json"),
             )?);
+        let action_approvals = crate::action_approval::ActionApprovalStore::load(
+            layout.home().join("factory-actions.json"),
+        )?;
         Ok(Self {
             layout,
             space,
@@ -343,6 +400,7 @@ impl Daemon {
             review_sweep_config: rk_core::config::ReviewSweepConfig::default(),
             drain_config: rk_core::config::DrainConfig::default(),
             evaporation_decay: rk_core::config::EvaporationConfig::default().decay,
+            ingest_config: rk_core::config::IngestConfig::default(),
             global_agents: Default::default(),
             tier_routing: Default::default(),
             default_harness,
@@ -358,11 +416,14 @@ impl Daemon {
             repos,
             onboarding_sessions,
             onboarding_apply_lock: tokio::sync::Mutex::new(()),
+            ticket_graph_apply_lock: tokio::sync::Mutex::new(()),
+            action_approvals,
             tickets,
             coordinator_sessions,
             fact_vote_lock: std::sync::Mutex::new(()),
             started: Instant::now(),
             shutdown_tx,
+            request_clock: Utc::now,
         })
     }
 
@@ -419,6 +480,12 @@ impl Daemon {
 
         let daemon = Arc::new(self);
         let mut shutdown_rx = daemon.shutdown_tx.subscribe();
+
+        // Restore every durable workflow id before any reactor or scheduler task
+        // can dispatch. Resume execution only after those consumers are listening
+        // so completion events remain observable without opening a duplicate-ID
+        // launch window during startup.
+        let resumable_workflows = daemon.engine().rehydrate();
 
         // GC loop: decay pheromone trails and collect faded/expired tuples —
         // escalation/analytics live elsewhere.
@@ -687,13 +754,9 @@ impl Daemon {
             });
         }
 
-        // Rehydrate persisted workflow instances (TKT-52): restore status/list
-        // history and RESUME any that were mid-run when the daemon last stopped
-        // — a crash/restart no longer silently drops in-flight instances
-        // (parked gates, fan-outs awaiting wait_all). Runs after the socket bind
-        // (shared state is safe to touch) and after the reactor/scheduler are up
-        // so a resumed instance's completion event is observed by them.
-        daemon.engine().rehydrate();
+        // The maps were rehydrated before dispatch loops started. Now that
+        // reactor/scheduler consumers are listening, resume in-flight instances.
+        daemon.engine().resume_rehydrated(resumable_workflows);
 
         loop {
             tokio::select! {
@@ -841,6 +904,17 @@ impl Daemon {
                     write_json_line(&mut write, &response).await?;
                     return self.stream_coordinator(write, filter, boundary, rx).await;
                 }
+                Outcome::FactoryEventsWatch {
+                    response,
+                    filter,
+                    boundary,
+                    rx,
+                } => {
+                    write_json_line(&mut write, &response).await?;
+                    return self
+                        .stream_factory_events(write, filter, boundary, rx)
+                        .await;
+                }
                 Outcome::LogFollow {
                     response,
                     agent,
@@ -854,6 +928,13 @@ impl Daemon {
     }
 
     fn authorized(&self, req: &Request, origin: &PeerOrigin) -> bool {
+        if req
+            .caller
+            .starts_with(crate::ingest_auth::SOURCE_CALLER_PREFIX)
+        {
+            return self.ingest_principal(req).is_some()
+                && matches!(req.method.as_str(), "ingest.event" | "ingest.state");
+        }
         let operator = req.caller == "operator" || req.caller.is_empty();
         // The bearer root token alone is not operator authority. A local
         // connection must have a kernel-observed pid, and a connection rooted
@@ -908,6 +989,9 @@ impl Daemon {
                 | "repo.onboard.status"
                 | "repo.onboard.report"
                 | "workflow.run"
+                | "factory.propose_action"
+                | "factory.approve_action"
+                | "factory.execute_action"
                 | "workflow.approve"
                 | "workflow.archive"
                 | "workflow.unarchive"
@@ -976,11 +1060,26 @@ impl Daemon {
     }
 
     fn authenticated(&self, req: &Request) -> bool {
+        if req
+            .caller
+            .starts_with(crate::ingest_auth::SOURCE_CALLER_PREFIX)
+        {
+            return self.ingest_principal(req).is_some();
+        }
         if req.caller == "operator" || req.caller.is_empty() {
             req.auth == self.auth_token
         } else {
             req.auth == rk_core::paths::derive_agent_token(&self.auth_token, &req.caller)
         }
+    }
+
+    fn ingest_principal(&self, req: &Request) -> Option<SourcePrincipal> {
+        SourcePrincipal::from_request(
+            &self.ingest_config,
+            &self.auth_token,
+            &req.caller,
+            &req.auth,
+        )
     }
 
     /// Push matching tuples as notification lines until the client goes away.
@@ -1045,6 +1144,266 @@ impl Daemon {
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
             }
+        }
+    }
+
+    async fn stream_factory_events(
+        &self,
+        mut write: tokio::net::unix::OwnedWriteHalf,
+        filter: FactoryEventFilter,
+        boundary: Option<u64>,
+        mut rx: broadcast::Receiver<CoordinatorEvent>,
+    ) -> std::io::Result<()> {
+        let mut cursor = boundary;
+        cursor = self
+            .write_factory_durable_catchup(&mut write, &filter, cursor)
+            .await?;
+        loop {
+            match rx.recv().await {
+                Ok(coordinator_event)
+                    if cursor.is_none_or(|seen| coordinator_event.cursor > seen) =>
+                {
+                    if let Some(event) = crate::factory_events::project(coordinator_event) {
+                        if filter.matches(&event) {
+                            cursor = Some(event.cursor);
+                            write_json_line(
+                                &mut write,
+                                &json!({"method": "factory.event", "params": event}),
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    let before = cursor;
+                    cursor = self
+                        .write_factory_durable_catchup(&mut write, &filter, cursor)
+                        .await?;
+                    write_json_line(
+                        &mut write,
+                        &json!({"method": "lagged", "params": {"missed": missed, "resync_required": before == cursor, "cursor": cursor}}),
+                    )
+                    .await?;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+            }
+        }
+    }
+
+    async fn write_factory_durable_catchup(
+        &self,
+        write: &mut tokio::net::unix::OwnedWriteHalf,
+        filter: &FactoryEventFilter,
+        cursor: Option<u64>,
+    ) -> std::io::Result<Option<u64>> {
+        let mut catchup_filter = filter.clone();
+        catchup_filter.after = cursor;
+        let scanned = self
+            .space
+            .coordinator_events_after(cursor, catchup_filter.limit().saturating_add(1))
+            .map_err(std::io::Error::other)?;
+        let replay = crate::factory_events::replay(scanned, &catchup_filter);
+        for event in replay.events {
+            write_json_line(write, &json!({"method": "factory.event", "params": event})).await?;
+        }
+        if replay.truncated {
+            write_json_line(
+                write,
+                &json!({"method":"factory.resync", "params":{"truncated": true, "resync_required": true, "boundary": replay.boundary}}),
+            )
+            .await?;
+        }
+        Ok(max_cursor(cursor, replay.boundary))
+    }
+
+    /// Collect the owned, read-only structured records the Phase 5 analytics
+    /// adapter normalizes. This clones agent/workflow records out of their
+    /// stores and hands the adapter no mutation-capable handles: the adapter
+    /// cannot reach the registry, engine, tickets, approvals, queue, or
+    /// dispatch. Repo and since/until windowing is applied here so the pure
+    /// adapter only sees in-scope records.
+    fn factory_analytics_inputs(
+        &self,
+        req: &crate::factory_analytics::FactoryAnalyticsRequest,
+    ) -> crate::factory_analytics::AnalyticsInputs {
+        let repo = req.repo.clone().unwrap_or_default();
+        let in_window = |ms: i64| -> bool {
+            req.since.is_none_or(|since| ms >= since)
+                && req.until.is_none_or(|until| ms <= until)
+        };
+        // Always read active + archived immutable snapshots. The pure fact/
+        // scorecard layer applies include_archived to metric numerators while
+        // retaining archived source counts and archived-only availability.
+        let mut runtime_unavailable = Vec::new();
+        let mut read_warnings = Vec::new();
+        let agents = self
+            .supervisor
+            .list_all()
+            .into_iter()
+            .filter(|agent| req.repo.as_deref().is_none_or(|r| agent.repo_name == r))
+            .filter(|agent| in_window(agent.updated_at.timestamp_millis()))
+            .collect();
+        let instances = self
+            .engine()
+            .list_all()
+            .into_iter()
+            .filter(|instance| req.repo.as_deref().is_none_or(|r| instance.repo == r))
+            .filter(|instance| {
+                let observed_at = instance.completed_at.unwrap_or(instance.started_at).timestamp_millis();
+                in_window(observed_at)
+            })
+            .collect();
+        let tickets = match self.tickets.list(req.repo.clone(), None, None) {
+            Ok(tickets) => tickets
+                .into_iter()
+                .filter(|ticket| in_window(ticket.created_at.timestamp_millis()))
+                .collect(),
+            Err(error) => {
+                runtime_unavailable.push(rk_core::factory::outcome_facts::OutcomeEvidenceKind::RecurrenceKey);
+                read_warnings.push(format!("source_family_read_failed: RecurrenceKey unavailable: {error}"));
+                Vec::new()
+            }
+        };
+        let approval_grants = match self.action_approvals.list_grants() {
+            Ok(grants) => grants
+                .into_iter()
+                .filter(|grant| req.repo.as_deref().is_none_or(|repo| grant.scope.repo.identity == repo))
+                .filter(|grant| in_window(grant.approved_at.timestamp_millis()))
+                .collect(),
+            Err(error) => {
+                runtime_unavailable.push(rk_core::factory::outcome_facts::OutcomeEvidenceKind::HumanGateDecision);
+                read_warnings.push(format!("source_family_read_failed: HumanGateDecision unavailable: {error}"));
+                Vec::new()
+            }
+        };
+        let sdlc_ci_facts = match self.space.scan(&Pattern::category(Category::Event).scope("ci")) {
+            Ok(events) => events
+                .into_iter()
+                .filter(|event| {
+                    req.repo.as_deref().is_none_or(|repo| {
+                        event
+                            .payload
+                            .get("subject")
+                            .and_then(Value::as_str)
+                            .is_some_and(|subject| subject.starts_with(&format!("{repo}:")))
+                    })
+                })
+                .filter(|event| {
+                    let observed_at = event
+                        .payload
+                        .get("observed_at")
+                        .and_then(Value::as_str)
+                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.timestamp_millis())
+                        .unwrap_or_else(|| event.created_at.timestamp_millis());
+                    in_window(observed_at)
+                })
+                .collect(),
+            Err(error) => {
+                runtime_unavailable.push(rk_core::factory::outcome_facts::OutcomeEvidenceKind::Phase4CiSignal);
+                read_warnings.push(format!("source_family_read_failed: Phase4CiSignal unavailable: {error}"));
+                Vec::new()
+            }
+        };
+        crate::factory_analytics::AnalyticsInputs {
+            repo,
+            agents,
+            instances,
+            tickets,
+            approval_grants,
+            sdlc_ci_facts,
+            runtime_unavailable,
+            read_warnings,
+        }
+    }
+
+    fn factory_snapshot(&self, filter: &FactoryEventFilter) -> rk_core::Result<Value> {
+        let coord = CoordinatorFilter {
+            repo: filter.repo.clone(),
+            coordinator: filter.coordinator.clone(),
+            ..Default::default()
+        };
+        let agents: Vec<_> = if filter.include_archived {
+            self.supervisor.list_all()
+        } else {
+            self.supervisor.list()
+        }
+        .into_iter()
+        .filter(|agent| factory_matches_agent(filter, agent))
+        .collect();
+        let workflows: Vec<_> = if filter.include_archived {
+            self.engine().list_all()
+        } else {
+            self.engine().list()
+        }
+        .into_iter()
+        .filter(|workflow| factory_matches_workflow(filter, workflow))
+        .collect();
+        let tickets = self
+            .tickets
+            .list(filter.repo.clone(), None, None)
+            .map(|tickets| json!(tickets))
+            .unwrap_or_else(|_| json!([]));
+        let all_proposals = self.action_approvals.list()?;
+        let proposals: Vec<_> = all_proposals
+            .iter()
+            .filter(|proposal| factory_matches_proposal(filter, proposal))
+            .cloned()
+            .collect();
+        let grants: Vec<_> = self
+            .action_approvals
+            .list_grants()?
+            .into_iter()
+            .filter(|grant| factory_matches_grant(filter, grant, &all_proposals))
+            .collect();
+        let approvals = json!({
+            "proposals": proposals,
+            "grants": grants,
+        });
+        let budget = factory_filtered_budget(self.supervisor.fleet_rollup(), filter, &workflows);
+        let snapshot = crate::factory_events::snapshot_value(
+            json!(agents),
+            json!(workflows),
+            tickets,
+            json!([]),
+            budget,
+            approvals,
+            json!({"cursor": self.latest_event_cursor(), "required": false}),
+        );
+        Ok(
+            json!({"schema": crate::factory_events::SCHEMA, "snapshot": snapshot, "cursor": self.latest_event_cursor(), "coordinator": coord.coordinator}),
+        )
+    }
+
+    fn factory_events_replay(&self, filter: &FactoryEventFilter) -> rk_core::Result<Value> {
+        let scanned = self
+            .space
+            .coordinator_events_after(filter.after, filter.limit().saturating_add(1))?;
+        Ok(serde_json::to_value(crate::factory_events::replay(
+            scanned, filter,
+        ))?)
+    }
+
+    fn prepare_factory_events_watch(
+        &self,
+        id: String,
+        filter: FactoryEventFilter,
+    ) -> rk_core::Result<Outcome> {
+        let rx = self.space.subscribe_coordinator();
+        let replay = self.factory_events_replay(&filter)?;
+        let boundary = replay["boundary"].as_u64().or(filter.after);
+        Ok(Outcome::FactoryEventsWatch {
+            response: Response::ok(id, replay),
+            filter,
+            boundary,
+            rx,
+        })
+    }
+
+    fn emit_factory_event(&self, tuple: Tuple) {
+        if let Err(error) = self.space.out_coordinator(tuple) {
+            warn!(%error, "failed to emit factory event");
         }
     }
 
@@ -1231,6 +1590,8 @@ impl Daemon {
                 reply(resp)
             }
             "space.out" => reply(self.handle_out(req)),
+            "ingest.event" => reply(self.handle_ingest_event(req)),
+            "ingest.state" => reply(self.handle_ingest_state(req)),
             "space.withdraw" => reply(self.handle_withdraw(req)),
             "fact.vote" => reply(self.handle_fact_vote(req)),
             "space.scan" => reply(self.handle_scan(req)),
@@ -1393,6 +1754,64 @@ impl Daemon {
                 )
             }
             "workflow.run" => reply(self.handle_workflow_run(req).await),
+            "factory.propose_action" => reply(self.handle_factory_propose_action(req)),
+            "factory.approve_action" => reply(self.handle_factory_approve_action(req)),
+            "factory.execute_action" => reply(self.handle_factory_execute_action(req).await),
+            "factory.snapshot" => match parse_params::<FactoryEventFilter>(&req.params) {
+                Ok(filter) => match self.factory_snapshot(&filter) {
+                    Ok(snapshot) => reply(Response::ok(id, snapshot)),
+                    Err(e) => reply(Response::err(id, codes::INTERNAL, e.to_string())),
+                },
+                Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+            },
+            "factory.events.replay" => match parse_params::<FactoryEventFilter>(&req.params) {
+                Ok(filter) => match self.factory_events_replay(&filter) {
+                    Ok(replay) => reply(Response::ok(id, replay)),
+                    Err(e) => reply(Response::err(id, codes::INTERNAL, e.to_string())),
+                },
+                Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+            },
+            "factory.events.watch" => match parse_params::<FactoryEventFilter>(&req.params) {
+                Ok(filter) => match self.prepare_factory_events_watch(id, filter) {
+                    Ok(outcome) => outcome,
+                    Err(e) => reply(Response::err(req.id, codes::INTERNAL, e.to_string())),
+                },
+                Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+            },
+            "factory.scorecards" => {
+                match parse_params::<crate::factory_analytics::FactoryAnalyticsRequest>(&req.params)
+                {
+                    Ok(analytics) => match analytics.validate() {
+                        Ok(()) => reply(Response::ok(
+                            id,
+                            crate::factory_analytics::scorecards_response(
+                                &self.factory_analytics_inputs(&analytics),
+                                &analytics,
+                                (self.request_clock)(),
+                            ),
+                        )),
+                        Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+                    },
+                    Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+                }
+            }
+            "factory.recommend" => {
+                match parse_params::<crate::factory_analytics::FactoryAnalyticsRequest>(&req.params)
+                {
+                    Ok(analytics) => match analytics.validate() {
+                        Ok(()) => reply(Response::ok(
+                            id,
+                            crate::factory_analytics::recommend_response(
+                                &self.factory_analytics_inputs(&analytics),
+                                &analytics,
+                                (self.request_clock)(),
+                            ),
+                        )),
+                        Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+                    },
+                    Err(e) => reply(Response::err(id, codes::BAD_PARAMS, e)),
+                }
+            }
             "workflow.list" => {
                 let params: WorkflowListParams = match parse_params(&req.params) {
                     Ok(p) => p,
@@ -1955,10 +2374,7 @@ impl Daemon {
             match tokio::task::spawn_blocking(move || {
                 let (policy, digest) =
                     rk_workflow::load_repository_policy_with_digest(&policy_file_for_load)?;
-                Ok::<_, rk_core::Error>(crate::repos::ActivatedRepositoryPolicy {
-                    digest,
-                    policy,
-                })
+                Ok::<_, rk_core::Error>(crate::repos::ActivatedRepositoryPolicy { digest, policy })
             })
             .await
             {
@@ -2009,9 +2425,7 @@ impl Daemon {
                     rk_workflow::DeliveryMode::Pr => rk_core::config::MergeMode::Pr,
                     rk_workflow::DeliveryMode::Merge
                     | rk_workflow::DeliveryMode::MergePush
-                    | rk_workflow::DeliveryMode::PushBranch => {
-                        rk_core::config::MergeMode::Direct
-                    }
+                    | rk_workflow::DeliveryMode::PushBranch => rk_core::config::MergeMode::Direct,
                 })
                 .or(params.merge_mode)
                 .unwrap_or(self.default_merge_mode),
@@ -2668,10 +3082,7 @@ impl Daemon {
             let activated = tokio::task::spawn_blocking(move || {
                 let (policy, digest) =
                     rk_workflow::load_repository_policy_with_digest(&policy_file_for_load)?;
-                Ok::<_, rk_core::Error>(crate::repos::ActivatedRepositoryPolicy {
-                    digest,
-                    policy,
-                })
+                Ok::<_, rk_core::Error>(crate::repos::ActivatedRepositoryPolicy { digest, policy })
             })
             .await;
             let activated = match activated {
@@ -2681,17 +3092,21 @@ impl Daemon {
                         "activated repository policy digest drifted: expected {}, found {}",
                         contract.target_digest, activated.digest
                     );
-                    let _ = self.onboarding_sessions.lock().ok().and_then(|mut sessions| {
-                        sessions
-                            .fail_activation(
-                                &params.session,
-                                &params.proposal,
-                                &params.digest,
-                                &contract.operation_id,
-                                detail.clone(),
-                            )
-                            .ok()
-                    });
+                    let _ = self
+                        .onboarding_sessions
+                        .lock()
+                        .ok()
+                        .and_then(|mut sessions| {
+                            sessions
+                                .fail_activation(
+                                    &params.session,
+                                    &params.proposal,
+                                    &params.digest,
+                                    &contract.operation_id,
+                                    detail.clone(),
+                                )
+                                .ok()
+                        });
                     return Response::err(req.id, codes::BAD_PARAMS, detail);
                 }
                 Ok(Err(error)) => {
@@ -3206,6 +3621,888 @@ impl Daemon {
             Ok(Err(e)) => Response::err(req.id, codes::INTERNAL, e.to_string()),
             Err(e) => Response::err(req.id, codes::INTERNAL, format!("respawn task failed: {e}")),
         }
+    }
+
+    fn handle_factory_propose_action(&self, req: Request) -> Response {
+        let params: FactoryProposeParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let factory_action = match params.kind.as_str() {
+            "workflow.run" => match serde_json::from_value(params.action)
+                .map_err(|e| rk_core::Error::other(e.to_string()))
+                .and_then(|action| self.resolve_workflow_action(action))
+            {
+                Ok(action) => FactoryAction::WorkflowRun(action),
+                Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+            },
+            "ticket_graph.apply" => match self.resolve_ticket_graph_apply_action(params.action) {
+                Ok(action) => FactoryAction::TicketGraphApply(action),
+                Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+            },
+            "product_to_code.dispatch" => {
+                match self.resolve_product_to_code_dispatch_action(params.action) {
+                    Ok(action) => FactoryAction::ProductToCodeDispatch(action),
+                    Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+                }
+            }
+            _ => return Response::err(req.id, codes::BAD_PARAMS, "unsupported action kind"),
+        };
+        match self
+            .action_approvals
+            .propose_action(&req.caller, factory_action, params.ttl_seconds)
+        {
+            Ok(proposal) => {
+                self.emit_factory_event(crate::factory_events::event_tuple(
+                    &proposal.scope.repo.identity,
+                    &req.caller,
+                    "approval.changed",
+                    "factory.propose_action",
+                    json!({"proposal_id": proposal.id}),
+                    "factory action approval proposed",
+                    json!({"proposal_id": proposal.id, "digest": proposal.digest, "status": proposal.status, "coordinator": factory_action_coordinator(&proposal.action)}),
+                ));
+                Response::ok(
+                    req.id,
+                    json!({"proposal": proposal, "digest": proposal.digest}),
+                )
+            }
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    fn handle_factory_approve_action(&self, req: Request) -> Response {
+        let params: FactoryApproveParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        match self
+            .action_approvals
+            .approve(&params.proposal_id, &params.digest, &req.caller)
+        {
+            Ok(approval) => {
+                let coordinator = self.action_approvals.list().ok().and_then(|proposals| {
+                    proposals
+                        .into_iter()
+                        .find(|proposal| proposal.id == approval.proposal_id)
+                        .and_then(|proposal| {
+                            factory_action_coordinator(&proposal.action).map(str::to_string)
+                        })
+                });
+                self.emit_factory_event(crate::factory_events::event_tuple(
+                    &approval.scope.repo.identity,
+                    &req.caller,
+                    "approval.changed",
+                    "factory.approve_action",
+                    json!({"proposal_id": approval.proposal_id}),
+                    "workflow run approval approved",
+                    json!({"proposal_id": approval.proposal_id, "digest": approval.digest, "status": approval.status, "coordinator": coordinator}),
+                ));
+                Response::ok(req.id, json!({"approval": approval}))
+            }
+            Err(e) => Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        }
+    }
+
+    async fn handle_factory_execute_action(&self, req: Request) -> Response {
+        let params: FactoryExecuteParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        match params.kind.as_deref().unwrap_or("workflow.run") {
+            "ticket_graph.apply" => {
+                return self.handle_ticket_graph_apply_execute(req, params).await;
+            }
+            "product_to_code.dispatch" => {
+                return self
+                    .handle_product_to_code_dispatch_execute(req, params)
+                    .await;
+            }
+            "workflow.run" => {}
+            _ => return Response::err(req.id, codes::BAD_PARAMS, "unsupported action kind"),
+        }
+        let workflow_params: WorkflowRunParams = match serde_json::from_value(params.action) {
+            Ok(action) => action,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        };
+        let action = match self.resolve_workflow_action(workflow_params) {
+            Ok(action) => action,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        };
+        let grant = match self.action_approvals.begin_execute(
+            &params.proposal_id,
+            &params.digest,
+            &req.caller,
+            &action,
+        ) {
+            Ok(grant) => grant,
+            Err(e) => return Response::err(req.id, codes::FORBIDDEN, e.to_string()),
+        };
+        if let Some(instance_id) = grant.instance_id.as_deref() {
+            if let Some(instance) = self.engine().status_any(instance_id) {
+                return Response::ok(req.id, json!({"instance": instance, "approval": grant}));
+            }
+        }
+        if grant.status == ApprovalStatus::Consumed {
+            return Response::err(req.id, codes::FORBIDDEN, "approval already consumed");
+        }
+        let Some(instance_id) = grant.instance_id.clone() else {
+            return Response::err(
+                req.id,
+                codes::INTERNAL,
+                "approval missing bound instance id",
+            );
+        };
+        let engine = self.engine();
+        let handle = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
+            let _entered = handle.enter();
+            engine.run_owned_with_id(
+                instance_id,
+                &action.name,
+                &action.repo_path,
+                action.params.into_iter().collect(),
+                action.coordinator,
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(instance)) => {
+                let approval = match self
+                    .action_approvals
+                    .finish_success(&params.proposal_id, &instance.id)
+                {
+                    Ok(approval) => approval,
+                    Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+                };
+                let coordinator = instance.coordinator.clone();
+                self.emit_factory_event(crate::factory_events::event_tuple(
+                    &approval.scope.repo.identity,
+                    &req.caller,
+                    "workflow.changed",
+                    "workflow.run",
+                    json!({"id": instance.id, "workflow": instance.workflow, "coordinator": instance.coordinator}),
+                    "workflow run started",
+                    json!({"id": instance.id, "status": instance.status, "proposal_id": params.proposal_id, "coordinator": instance.coordinator}),
+                ));
+                self.emit_factory_event(crate::factory_events::event_tuple(
+                    &approval.scope.repo.identity,
+                    &req.caller,
+                    "approval.changed",
+                    "factory.execute_action",
+                    json!({"proposal_id": approval.proposal_id, "instance_id": instance.id, "coordinator": coordinator}),
+                    "workflow run approval consumed",
+                    json!({"proposal_id": approval.proposal_id, "digest": approval.digest, "status": approval.status, "instance_id": instance.id, "coordinator": coordinator}),
+                ));
+                Response::ok(req.id, json!({"instance": instance, "approval": approval}))
+            }
+            Ok(Err(e)) => {
+                let _ = self
+                    .action_approvals
+                    .finish_failed(&params.proposal_id, &e.to_string());
+                Response::err(req.id, codes::INTERNAL, e.to_string())
+            }
+            Err(e) => {
+                let msg = format!("workflow task failed: {e}");
+                let _ = self
+                    .action_approvals
+                    .finish_failed(&params.proposal_id, &msg);
+                Response::err(req.id, codes::INTERNAL, msg)
+            }
+        }
+    }
+
+    async fn handle_ticket_graph_apply_execute(
+        &self,
+        req: Request,
+        params: FactoryExecuteParams,
+    ) -> Response {
+        let submitted = match self.resolve_ticket_graph_apply_action(params.action) {
+            Ok(action) => action,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        };
+        let proposal = match self.action_approvals.proposal(&params.proposal_id) {
+            Ok(Some(proposal)) => proposal,
+            Ok(None) => return Response::err(req.id, codes::FORBIDDEN, "unknown proposal"),
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        let stored = match proposal.action.clone() {
+            FactoryAction::TicketGraphApply(action) => action,
+            _ => {
+                return Response::err(req.id, codes::FORBIDDEN, "proposal action kind mismatch");
+            }
+        };
+        let submitted_action = FactoryAction::TicketGraphApply(submitted.clone());
+        if submitted.repo != stored.repo
+            || submitted.repo_identity != stored.repo_identity
+            || submitted.repo_path != stored.repo_path
+            || submitted.graph != stored.graph
+            || submitted.initiative != stored.initiative
+            || submitted.apply_plan != stored.apply_plan
+        {
+            let recomputed = crate::action_approval::recompute_proposal_digest(
+                &proposal,
+                &submitted_action,
+            )
+            .unwrap_or_else(|error| format!("<error:{error}>"));
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                format!(
+                    "action digest mismatch: expected={} provided={} recomputed={recomputed}",
+                    proposal.digest, params.digest
+                ),
+            );
+        }
+
+        let factory_action = FactoryAction::TicketGraphApply(stored.clone());
+        let grant = match self.action_approvals.begin_execute_action(
+            &params.proposal_id,
+            &params.digest,
+            &req.caller,
+            &factory_action,
+        ) {
+            Ok(grant) => grant,
+            Err(e) => return Response::err(req.id, codes::FORBIDDEN, e.to_string()),
+        };
+        let Some(execution_id) = grant.execution_id.clone() else {
+            return Response::err(req.id, codes::INTERNAL, "approval missing execution id");
+        };
+        let _guard = self.ticket_graph_apply_lock.lock().await;
+        let ticket_guard = self.tickets.mutation_guard().await;
+        let existing = match self.action_approvals.ticket_graph_result(&params.proposal_id) {
+            Ok(result) => result,
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        if let Some(mut result) = existing.clone().filter(|result| result.status == "completed") {
+            let (reconciled, approval) = match self
+                .action_approvals
+                .finish_ticket_graph_success(&params.proposal_id, result.clone())
+            {
+                Ok(value) => value,
+                Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+            };
+            result = reconciled;
+            result.idempotent_replay = true;
+            return Response::ok(req.id, json!({"result": result, "approval": approval}));
+        }
+        let actual_preconditions = match self.ticket_graph_live_preconditions(
+            &stored,
+            &ticket_guard,
+            &execution_id,
+        ) {
+            Ok(preconditions) => preconditions,
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        if actual_preconditions != stored.preconditions {
+            let message = format!(
+                "ticket graph CAS mismatch: expected repo_head={} ticket_store_digest={}, actual repo_head={} ticket_store_digest={}",
+                stored.preconditions.repo_head,
+                stored.preconditions.ticket_store_digest,
+                actual_preconditions.repo_head,
+                actual_preconditions.ticket_store_digest,
+            );
+            let _ = self
+                .action_approvals
+                .finish_failed(&params.proposal_id, &message);
+            return Response::err(req.id, codes::FORBIDDEN, message);
+        }
+        let mut result = existing.unwrap_or_else(|| TicketGraphApplyExecutionResult {
+            execution_id: execution_id.clone(),
+            graph_id: stored.graph.id.clone(),
+            graph_node_to_ticket_id: BTreeMap::new(),
+            created_ticket_ids: Vec::new(),
+            created_dependency_edges: Vec::new(),
+            idempotent_replay: false,
+            status: "executing".into(),
+        });
+        if result.graph_node_to_ticket_id.is_empty() {
+            result = match self
+                .action_approvals
+                .checkpoint_ticket_graph_result(&params.proposal_id, result)
+            {
+                Ok(result) => result,
+                Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+            };
+        }
+
+        let applied = self
+            .apply_ticket_graph(&params.proposal_id, &stored, &ticket_guard, result)
+            .await;
+        match applied {
+            Ok(mut result) => {
+                result.status = "completed".into();
+                let (result, approval) = match self
+                    .action_approvals
+                    .finish_ticket_graph_success(&params.proposal_id, result)
+                {
+                    Ok(value) => value,
+                    Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+                };
+                self.emit_factory_event(crate::factory_events::event_tuple(
+                    &stored.repo_identity,
+                    &req.caller,
+                    "ticket.changed",
+                    "ticket_graph.apply",
+                    json!({"graph_id": stored.graph.id, "execution_id": execution_id}),
+                    "approved ticket graph applied",
+                    json!({"proposal_id": params.proposal_id, "status": result.status, "created_ticket_ids": result.created_ticket_ids}),
+                ));
+                Response::ok(req.id, json!({"result": result, "approval": approval}))
+            }
+            Err(e) => {
+                let _ = self
+                    .action_approvals
+                    .finish_failed(&params.proposal_id, &e.to_string());
+                Response::err(req.id, codes::INTERNAL, e.to_string())
+            }
+        }
+    }
+
+    fn ticket_graph_live_preconditions(
+        &self,
+        action: &TicketGraphApplyAction,
+        ticket_guard: &crate::tickets::TicketMutationGuard<'_>,
+        execution_id: &str,
+    ) -> rk_core::Result<TicketGraphApplyPreconditions> {
+        let created_by = format!("factory:{execution_id}");
+        Ok(TicketGraphApplyPreconditions {
+            repo_head: repository_head(std::path::Path::new(&action.repo_path))?,
+            ticket_store_digest: self.tickets.snapshot_digest_excluding_created_by(
+                ticket_guard,
+                &action.repo_identity,
+                &created_by,
+            )?,
+        })
+    }
+
+    async fn apply_ticket_graph(
+        &self,
+        proposal_id: &str,
+        action: &TicketGraphApplyAction,
+        ticket_guard: &crate::tickets::TicketMutationGuard<'_>,
+        mut result: TicketGraphApplyExecutionResult,
+    ) -> rk_core::Result<TicketGraphApplyExecutionResult> {
+        for node_id in &action.apply_plan.topological_order {
+            if result.graph_node_to_ticket_id.contains_key(node_id) {
+                continue;
+            }
+            let create = action
+                .apply_plan
+                .creates
+                .iter()
+                .find(|create| create.stable_graph_node_id == *node_id)
+                .ok_or_else(|| {
+                    rk_core::Error::other(format!(
+                        "ticket graph apply plan missing create for {node_id}"
+                    ))
+                })?;
+            let labels = std::iter::once("product-to-code".to_string())
+                .chain(std::iter::once(format!("graph:{}", action.graph.id)))
+                .chain(std::iter::once(format!("node:{node_id}")))
+                .chain(
+                    create
+                        .acceptance_criterion_ids
+                        .iter()
+                        .map(|criterion| format!("criterion:{criterion}")),
+                )
+                .collect();
+            let (ticket, _created) = self.tickets.create_idempotent_locked(
+                ticket_guard,
+                crate::tickets::NewTicket {
+                    title: create.title.clone(),
+                    body: Some(create.description.clone()),
+                    scope: action.repo_identity.clone(),
+                    parent: None,
+                    priority: "normal".into(),
+                    labels,
+                    depends_on: Vec::new(),
+                    created_by: Some(format!("factory:{}", result.execution_id)),
+                    coalesce_key: Some(format!(
+                        "factory:ticket-graph:{}:{node_id}",
+                        result.execution_id
+                    )),
+                },
+            )?;
+            result
+                .graph_node_to_ticket_id
+                .insert(node_id.clone(), ticket.identity.clone());
+            if !result.created_ticket_ids.contains(&ticket.identity) {
+                result.created_ticket_ids.push(ticket.identity);
+            }
+            result = self
+                .action_approvals
+                .checkpoint_ticket_graph_result(proposal_id, result)?;
+        }
+
+        for dependency in &action.apply_plan.dependencies {
+            let blocked_ticket_id = result
+                .graph_node_to_ticket_id
+                .get(&dependency.blocked_graph_node_id)
+                .cloned()
+                .ok_or_else(|| rk_core::Error::other("missing blocked ticket mapping"))?;
+            let dependency_ticket_id = result
+                .graph_node_to_ticket_id
+                .get(&dependency.dependency_graph_node_id)
+                .cloned()
+                .ok_or_else(|| rk_core::Error::other("missing dependency ticket mapping"))?;
+            let edge = TicketGraphAppliedEdge {
+                blocked_ticket_id: blocked_ticket_id.clone(),
+                dependency_ticket_id: dependency_ticket_id.clone(),
+            };
+            if result.created_dependency_edges.contains(&edge) {
+                continue;
+            }
+            self.tickets
+                .add_dep_locked(ticket_guard, &blocked_ticket_id, &dependency_ticket_id)
+                .await?;
+            result.created_dependency_edges.push(edge);
+            result = self
+                .action_approvals
+                .checkpoint_ticket_graph_result(proposal_id, result)?;
+        }
+        Ok(result)
+    }
+
+    fn resolve_workflow_action(
+        &self,
+        params: WorkflowRunParams,
+    ) -> rk_core::Result<WorkflowRunAction> {
+        let submitted = std::path::PathBuf::from(&params.repo);
+        let canonical_submitted = if submitted.exists() {
+            submitted.canonicalize()?
+        } else {
+            submitted
+        };
+        let repos = self
+            .repos
+            .lock()
+            .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
+        let record = repos
+            .get(&params.repo)
+            .cloned()
+            .or_else(|| repos.get_by_path(&canonical_submitted).cloned())
+            .ok_or_else(|| {
+                rk_core::Error::other(format!("repository is not registered: {}", params.repo))
+            })?;
+        let canonical_path = record.path.canonicalize().unwrap_or(record.path.clone());
+        Ok(WorkflowRunAction {
+            name: params.name,
+            repo: record.name.clone(),
+            repo_identity: record.name,
+            repo_path: canonical_path.display().to_string(),
+            params: params.params.into_iter().collect::<BTreeMap<_, _>>(),
+            coordinator: params.coordinator,
+        })
+    }
+
+    fn resolve_ticket_graph_apply_action(
+        &self,
+        params: serde_json::Value,
+    ) -> rk_core::Result<TicketGraphApplyAction> {
+        let params: TicketGraphApplyParams = serde_json::from_value(params).map_err(|e| {
+            rk_core::Error::other(format!("invalid ticket_graph.apply action: {e}"))
+        })?;
+        params.initiative.validate()?;
+        let repo = params.repo.as_str();
+        let submitted = std::path::PathBuf::from(repo);
+        let canonical_submitted = if submitted.exists() {
+            submitted.canonicalize()?
+        } else {
+            submitted
+        };
+        let repos = self
+            .repos
+            .lock()
+            .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
+        let record = repos
+            .get(repo)
+            .cloned()
+            .or_else(|| repos.get_by_path(&canonical_submitted).cloned())
+            .ok_or_else(|| {
+                rk_core::Error::other(format!("repository is not registered: {repo}"))
+            })?;
+        let canonical_path = record.path.canonicalize().unwrap_or(record.path.clone());
+        let apply_plan = params
+            .graph
+            .apply_plan_for_initiative(&record.name, &params.initiative)?;
+        drop(repos);
+        let preconditions = TicketGraphApplyPreconditions {
+            repo_head: repository_head(&canonical_path)?,
+            ticket_store_digest: self.tickets.snapshot_digest(&record.name)?,
+        };
+        Ok(TicketGraphApplyAction {
+            repo: record.name.clone(),
+            repo_identity: record.name,
+            repo_path: canonical_path.display().to_string(),
+            graph: params.graph,
+            initiative: params.initiative,
+            apply_plan,
+            preconditions,
+        })
+    }
+
+    /// Resolve a submitted `product_to_code.dispatch` payload into the
+    /// canonical typed action. The action references the prior approved
+    /// `ticket_graph.apply` execution and resolves every dispatch's graph node
+    /// id through that execution's minted graph-node-id -> TKT-id mapping.
+    /// Blocked nodes are carried separately and are never dispatched.
+    fn resolve_product_to_code_dispatch_action(
+        &self,
+        params: serde_json::Value,
+    ) -> rk_core::Result<ProductToCodeDispatchAction> {
+        let params: ProductToCodeDispatchParams = serde_json::from_value(params).map_err(|e| {
+            rk_core::Error::other(format!("invalid product_to_code.dispatch action: {e}"))
+        })?;
+        params.initiative.validate()?;
+        if params.graph.id != params.graph_id {
+            return Err(rk_core::Error::other(format!(
+                "submitted graph revision {} does not match graph_id {}",
+                params.graph.id, params.graph_id
+            )));
+        }
+        let graph_report = params
+            .graph
+            .validation_report_for_initiative(&params.initiative);
+        if !graph_report.valid {
+            return Err(rk_core::Error::other(format!(
+                "submitted graph revision is invalid: {}",
+                graph_report.errors.join("; ")
+            )));
+        }
+        let repo = params.repo.as_str();
+        let submitted = std::path::PathBuf::from(repo);
+        let canonical_submitted = if submitted.exists() {
+            submitted.canonicalize()?
+        } else {
+            submitted
+        };
+        let repos = self
+            .repos
+            .lock()
+            .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
+        let record = repos
+            .get(repo)
+            .cloned()
+            .or_else(|| repos.get_by_path(&canonical_submitted).cloned())
+            .ok_or_else(|| {
+                rk_core::Error::other(format!("repository is not registered: {repo}"))
+            })?;
+        drop(repos);
+        let canonical_path = record.path.canonicalize().unwrap_or(record.path.clone());
+
+        // The dispatch is bound to one prior approved graph apply execution.
+        let apply_proposal = self
+            .action_approvals
+            .proposal(&params.graph_apply_proposal_id)?
+            .ok_or_else(|| {
+                rk_core::Error::other(format!(
+                    "unknown graph apply proposal {}",
+                    params.graph_apply_proposal_id
+                ))
+            })?;
+        let FactoryAction::TicketGraphApply(apply_action) = &apply_proposal.action else {
+            return Err(rk_core::Error::other(format!(
+                "proposal {} is not a ticket graph apply",
+                params.graph_apply_proposal_id
+            )));
+        };
+        let apply_repo_path = std::path::PathBuf::from(&apply_action.repo_path)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(&apply_action.repo_path));
+        if apply_action.repo_identity != record.name || apply_repo_path != canonical_path {
+            return Err(rk_core::Error::other(format!(
+                "graph apply proposal {} belongs to a different repository",
+                params.graph_apply_proposal_id
+            )));
+        }
+        if apply_action.graph.id != params.graph_id {
+            return Err(rk_core::Error::other(format!(
+                "graph apply proposal {} applied graph {}, not {}",
+                params.graph_apply_proposal_id, apply_action.graph.id, params.graph_id
+            )));
+        }
+        if apply_action.initiative != params.initiative {
+            return Err(rk_core::Error::other(format!(
+                "graph apply proposal {} initiative revision does not match the submitted initiative",
+                params.graph_apply_proposal_id
+            )));
+        }
+        if apply_action.graph != params.graph {
+            return Err(rk_core::Error::other(format!(
+                "graph apply proposal {} graph revision does not match the submitted graph",
+                params.graph_apply_proposal_id
+            )));
+        }
+        let apply_result = self
+            .action_approvals
+            .ticket_graph_result(&params.graph_apply_proposal_id)?
+            .filter(|result| result.status == "completed")
+            .ok_or_else(|| {
+                rk_core::Error::other(format!(
+                    "graph apply proposal {} has no completed execution; approve and execute the graph apply first",
+                    params.graph_apply_proposal_id
+                ))
+            })?;
+
+        let graph = &apply_action.graph;
+        let mut dispatches = Vec::new();
+        for request in &params.dispatches {
+            let ticket_id = apply_result
+                .graph_node_to_ticket_id
+                .get(&request.graph_node_id)
+                .cloned()
+                .ok_or_else(|| {
+                    rk_core::Error::other(format!(
+                        "graph node {} has no minted ticket in graph apply execution {}",
+                        request.graph_node_id, apply_result.execution_id
+                    ))
+                })?;
+            let description = graph
+                .nodes
+                .iter()
+                .find(|node| node.id == request.graph_node_id)
+                .map(|node| node.description.clone())
+                .unwrap_or_else(|| request.task_description.clone());
+            let mut workflow_params = BTreeMap::new();
+            workflow_params.insert("taskId".to_string(), json!(ticket_id));
+            workflow_params.insert("taskDescription".to_string(), json!(description));
+            dispatches.push(ProductToCodeWorkflowDispatch {
+                graph_node_id: request.graph_node_id.clone(),
+                ticket_id,
+                workflow: "implement-featureset".to_string(),
+                params: workflow_params,
+            });
+        }
+        for blocked in &params.blocked {
+            if !apply_result
+                .graph_node_to_ticket_id
+                .contains_key(&blocked.graph_node_id)
+            {
+                return Err(rk_core::Error::other(format!(
+                    "blocked graph node {} is not part of graph apply execution {}",
+                    blocked.graph_node_id, apply_result.execution_id
+                )));
+            }
+            if dispatches
+                .iter()
+                .any(|dispatch| dispatch.graph_node_id == blocked.graph_node_id)
+            {
+                return Err(rk_core::Error::other(format!(
+                    "graph node {} cannot be both dispatched and blocked",
+                    blocked.graph_node_id
+                )));
+            }
+        }
+        let preconditions = TicketGraphApplyPreconditions {
+            repo_head: repository_head(&canonical_path)?,
+            ticket_store_digest: self.tickets.snapshot_digest(&record.name)?,
+        };
+        Ok(ProductToCodeDispatchAction {
+            repo: record.name.clone(),
+            repo_identity: record.name,
+            repo_path: canonical_path.display().to_string(),
+            initiative: params.initiative,
+            graph_id: params.graph_id,
+            graph_apply_proposal_id: params.graph_apply_proposal_id,
+            graph_apply_execution_id: apply_result.execution_id,
+            graph_node_to_ticket_id: apply_result.graph_node_to_ticket_id,
+            dispatches,
+            blocked: params.blocked,
+            preconditions,
+        })
+    }
+
+    /// Execute an approved `product_to_code.dispatch`. Reuses the Phase 2
+    /// canonical proposal validator (`begin_execute_action` +
+    /// `recompute_proposal_digest`) for status/digest binding, rechecks CAS
+    /// preconditions, and dispatches `implement-featureset` workflow runs for
+    /// unblocked minted tickets only.
+    async fn handle_product_to_code_dispatch_execute(
+        &self,
+        req: Request,
+        params: FactoryExecuteParams,
+    ) -> Response {
+        let submitted = match self.resolve_product_to_code_dispatch_action(params.action) {
+            Ok(action) => action,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        };
+        let proposal = match self.action_approvals.proposal(&params.proposal_id) {
+            Ok(Some(proposal)) => proposal,
+            Ok(None) => return Response::err(req.id, codes::FORBIDDEN, "unknown proposal"),
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        let stored = match proposal.action.clone() {
+            FactoryAction::ProductToCodeDispatch(action) => action,
+            _ => {
+                return Response::err(req.id, codes::FORBIDDEN, "proposal action kind mismatch");
+            }
+        };
+        let submitted_action = FactoryAction::ProductToCodeDispatch(submitted.clone());
+        if submitted.repo != stored.repo
+            || submitted.repo_identity != stored.repo_identity
+            || submitted.repo_path != stored.repo_path
+            || submitted.initiative != stored.initiative
+            || submitted.graph_id != stored.graph_id
+            || submitted.graph_apply_proposal_id != stored.graph_apply_proposal_id
+            || submitted.graph_apply_execution_id != stored.graph_apply_execution_id
+            || submitted.graph_node_to_ticket_id != stored.graph_node_to_ticket_id
+            || submitted.dispatches != stored.dispatches
+            || submitted.blocked != stored.blocked
+        {
+            let recomputed =
+                crate::action_approval::recompute_proposal_digest(&proposal, &submitted_action)
+                    .unwrap_or_else(|error| format!("<error:{error}>"));
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                format!(
+                    "action digest mismatch: expected={} provided={} recomputed={recomputed}",
+                    proposal.digest, params.digest
+                ),
+            );
+        }
+
+        let factory_action = FactoryAction::ProductToCodeDispatch(stored.clone());
+        let grant = match self.action_approvals.begin_execute_action(
+            &params.proposal_id,
+            &params.digest,
+            &req.caller,
+            &factory_action,
+        ) {
+            Ok(grant) => grant,
+            Err(e) => return Response::err(req.id, codes::FORBIDDEN, e.to_string()),
+        };
+        let Some(execution_id) = grant.execution_id.clone() else {
+            return Response::err(req.id, codes::INTERNAL, "approval missing execution id");
+        };
+        let _guard = self.ticket_graph_apply_lock.lock().await;
+        let existing = match self.action_approvals.product_to_code_result(&params.proposal_id) {
+            Ok(result) => result,
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        if let Some(mut result) = existing.clone().filter(|result| result.status == "completed") {
+            let (reconciled, approval) = match self
+                .action_approvals
+                .finish_product_to_code_success(&params.proposal_id, result.clone())
+            {
+                Ok(value) => value,
+                Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+            };
+            result = reconciled;
+            result.idempotent_replay = true;
+            return Response::ok(req.id, json!({"result": result, "approval": approval}));
+        }
+        let actual_preconditions = TicketGraphApplyPreconditions {
+            repo_head: match repository_head(std::path::Path::new(&stored.repo_path)) {
+                Ok(head) => head,
+                Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+            },
+            ticket_store_digest: match self.tickets.snapshot_digest(&stored.repo_identity) {
+                Ok(digest) => digest,
+                Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+            },
+        };
+        if actual_preconditions != stored.preconditions {
+            let message = format!(
+                "product_to_code dispatch CAS mismatch: expected repo_head={} ticket_store_digest={}, actual repo_head={} ticket_store_digest={}",
+                stored.preconditions.repo_head,
+                stored.preconditions.ticket_store_digest,
+                actual_preconditions.repo_head,
+                actual_preconditions.ticket_store_digest,
+            );
+            let _ = self
+                .action_approvals
+                .finish_failed(&params.proposal_id, &message);
+            return Response::err(req.id, codes::FORBIDDEN, message);
+        }
+        let mut result = existing.unwrap_or_else(|| ProductToCodeDispatchExecutionResult {
+            execution_id: execution_id.clone(),
+            graph_id: stored.graph_id.clone(),
+            dispatched: Vec::new(),
+            blocked: stored.blocked.clone(),
+            idempotent_replay: false,
+            status: "executing".into(),
+        });
+        result = match self
+            .action_approvals
+            .checkpoint_product_to_code_result(&params.proposal_id, result)
+        {
+            Ok(result) => result,
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+
+        let engine = self.engine();
+        for dispatch in &stored.dispatches {
+            if result
+                .dispatched
+                .iter()
+                .any(|done| done.ticket_id == dispatch.ticket_id)
+            {
+                continue;
+            }
+            let instance_id = product_to_code_instance_id(&execution_id, &dispatch.ticket_id);
+            let engine = Arc::clone(&engine);
+            let workflow = dispatch.workflow.clone();
+            let repo_path = stored.repo_path.clone();
+            let workflow_params: HashMap<String, Value> =
+                dispatch.params.clone().into_iter().collect();
+            let handle = tokio::runtime::Handle::current();
+            let launch_id = instance_id.clone();
+            let launched = tokio::task::spawn_blocking(move || {
+                let _entered = handle.enter();
+                engine.run_owned_with_id(launch_id, &workflow, &repo_path, workflow_params, None)
+            })
+            .await;
+            let instance = match launched {
+                Ok(Ok(instance)) => instance,
+                Ok(Err(e)) => {
+                    let _ = self
+                        .action_approvals
+                        .finish_failed(&params.proposal_id, &e.to_string());
+                    return Response::err(req.id, codes::INTERNAL, e.to_string());
+                }
+                Err(e) => {
+                    let msg = format!("workflow dispatch task failed: {e}");
+                    let _ = self
+                        .action_approvals
+                        .finish_failed(&params.proposal_id, &msg);
+                    return Response::err(req.id, codes::INTERNAL, msg);
+                }
+            };
+            result.dispatched.push(ProductToCodeDispatchedWorkflow {
+                graph_node_id: dispatch.graph_node_id.clone(),
+                ticket_id: dispatch.ticket_id.clone(),
+                workflow: dispatch.workflow.clone(),
+                instance_id: instance.id,
+            });
+            result = match self
+                .action_approvals
+                .checkpoint_product_to_code_result(&params.proposal_id, result)
+            {
+                Ok(result) => result,
+                Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+            };
+        }
+
+        result.status = "completed".into();
+        let (result, approval) = match self
+            .action_approvals
+            .finish_product_to_code_success(&params.proposal_id, result)
+        {
+            Ok(value) => value,
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        self.emit_factory_event(crate::factory_events::event_tuple(
+            &stored.repo_identity,
+            &req.caller,
+            "workflow.changed",
+            "product_to_code.dispatch",
+            json!({"graph_id": stored.graph_id, "execution_id": execution_id}),
+            "approved product-to-code dispatch executed",
+            json!({"proposal_id": params.proposal_id, "status": result.status, "dispatched": result.dispatched, "blocked": result.blocked}),
+        ));
+        Response::ok(req.id, json!({"result": result, "approval": approval}))
     }
 
     async fn handle_workflow_run(&self, req: Request) -> Response {
@@ -3776,6 +5073,71 @@ impl Daemon {
         }
     }
 
+    fn handle_ingest_event(&self, req: Request) -> Response {
+        let Some(principal) = self.ingest_principal(&req) else {
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                "unknown or disabled ingest source",
+            );
+        };
+        let params: IngestEventParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        match crate::ingest_auth::validate_event(&principal, &params) {
+            Ok(()) => {}
+            Err(error) => return Response::err(req.id, codes::FORBIDDEN, error),
+        }
+        let source = match principal.configured_source() {
+            Ok(source) => source,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+        };
+        let receipt = match self.space.accept_sdlc_signal(
+            params.envelope,
+            SignalSourcePrincipal::for_source(&source),
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+        };
+        Response::ok(req.id, json!({"accepted": true, "receipt": receipt}))
+    }
+
+    fn handle_ingest_state(&self, req: Request) -> Response {
+        let Some(principal) = self.ingest_principal(&req) else {
+            return Response::err(
+                req.id,
+                codes::FORBIDDEN,
+                "unknown or disabled ingest source",
+            );
+        };
+        let params: IngestStateParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let requested = params.limit.unwrap_or(principal.max_state_limit());
+        if requested > principal.max_state_limit() {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                format!("limit exceeds source cap {}", principal.max_state_limit()),
+            );
+        }
+        let source = Some(principal.name.as_str());
+        let (scope, subject) = ingest_state_filter(&params);
+        match self.space.current_sdlc_facts(source, scope.as_deref(), subject.as_deref()) {
+            Ok(mut facts) => {
+                if let Some(repo) = params.repo.as_deref() {
+                    let prefix = format!("{repo}:");
+                    facts.retain(|fact| fact.payload.get("subject").and_then(Value::as_str).is_some_and(|s| s.starts_with(&prefix)));
+                }
+                facts.truncate(requested);
+                Response::ok(req.id, json!({"facts": facts, "truncated": false}))
+            }
+            Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
+        }
+    }
+
     async fn handle_blocking(&self, req: Request, destructive: bool) -> Response {
         let params: BlockingParams = match parse_params(&req.params) {
             Ok(p) => p,
@@ -3909,6 +5271,94 @@ fn max_cursor(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     }
 }
 
+fn factory_matches_repo(filter: &FactoryEventFilter, identity: &str, path: &str) -> bool {
+    filter
+        .repo
+        .as_deref()
+        .is_none_or(|repo| repo == identity || repo == path)
+}
+
+fn factory_matches_agent(filter: &FactoryEventFilter, agent: &crate::agents::AgentRecord) -> bool {
+    factory_matches_repo(filter, &agent.repo_name, &agent.repo_root.to_string_lossy())
+        && filter
+            .coordinator
+            .as_deref()
+            .is_none_or(|coordinator| agent.coordinator.as_deref() == Some(coordinator))
+}
+
+fn factory_matches_workflow(
+    filter: &FactoryEventFilter,
+    workflow: &crate::workflow_exec::Instance,
+) -> bool {
+    factory_matches_repo(filter, &workflow.repo, &workflow.repo)
+        && filter
+            .coordinator
+            .as_deref()
+            .is_none_or(|coordinator| workflow.coordinator.as_deref() == Some(coordinator))
+}
+
+fn factory_matches_proposal(filter: &FactoryEventFilter, proposal: &ActionProposal) -> bool {
+    factory_matches_repo(
+        filter,
+        &proposal.scope.repo.identity,
+        &proposal.scope.repo.path,
+    ) && filter.coordinator.as_deref().is_none_or(|coordinator| {
+        matches!(
+            &proposal.action,
+            FactoryAction::WorkflowRun(action) if action.coordinator.as_deref() == Some(coordinator)
+        )
+    })
+}
+
+fn factory_action_coordinator(action: &FactoryAction) -> Option<&str> {
+    match action {
+        FactoryAction::WorkflowRun(action) => action.coordinator.as_deref(),
+        FactoryAction::TicketGraphApply(_) | FactoryAction::ProductToCodeDispatch(_) => None,
+    }
+}
+
+fn factory_matches_grant(
+    filter: &FactoryEventFilter,
+    grant: &ApprovalGrant,
+    proposals: &[ActionProposal],
+) -> bool {
+    factory_matches_repo(filter, &grant.scope.repo.identity, &grant.scope.repo.path)
+        && filter.coordinator.as_deref().is_none_or(|coordinator| {
+            proposals
+                .iter()
+                .find(|proposal| proposal.id == grant.proposal_id)
+                .is_some_and(|proposal| factory_matches_proposal(filter, proposal))
+                || grant.requester == coordinator
+        })
+}
+
+fn factory_filtered_budget(
+    mut budget: Value,
+    filter: &FactoryEventFilter,
+    workflows: &[crate::workflow_exec::Instance],
+) -> Value {
+    if let Some(repo) = filter.repo.as_deref() {
+        if let Some(repos) = budget.get_mut("repos").and_then(Value::as_array_mut) {
+            repos.retain(|entry| entry.get("repo").and_then(Value::as_str) == Some(repo));
+        }
+    }
+    if filter.repo.is_some() || filter.coordinator.is_some() {
+        let allowed: HashSet<_> = workflows
+            .iter()
+            .map(|workflow| workflow.id.as_str())
+            .collect();
+        if let Some(instances) = budget.get_mut("instances").and_then(Value::as_array_mut) {
+            instances.retain(|entry| {
+                entry
+                    .get("instance")
+                    .and_then(Value::as_str)
+                    .is_some_and(|instance| allowed.contains(instance))
+            });
+        }
+    }
+    budget
+}
+
 fn filter_is_valid(filter: &CoordinatorFilter) -> bool {
     filter.instance.is_some()
         || filter.coordinator.is_some()
@@ -3925,6 +5375,12 @@ enum Outcome {
     CoordinatorWatch {
         response: Response,
         filter: CoordinatorFilter,
+        boundary: Option<u64>,
+        rx: broadcast::Receiver<CoordinatorEvent>,
+    },
+    FactoryEventsWatch {
+        response: Response,
+        filter: FactoryEventFilter,
         boundary: Option<u64>,
         rx: broadcast::Receiver<CoordinatorEvent>,
     },
@@ -4001,6 +5457,74 @@ struct ScanParams {
     hot: bool,
     #[serde(default)]
     top: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct FactoryProposeParams {
+    kind: String,
+    action: Value,
+    #[serde(default)]
+    ttl_seconds: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TicketGraphApplyParams {
+    repo: String,
+    graph: TicketGraph,
+    initiative: InitiativeContract,
+}
+
+/// Submitted (pre-canonical) `product_to_code.dispatch` payload. Dispatch and
+/// blocked entries reference stable graph node ids; the daemon resolves minted
+/// TKT ids from the referenced approved graph apply execution.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProductToCodeDispatchParams {
+    repo: String,
+    initiative: InitiativeContract,
+    graph: TicketGraph,
+    graph_id: String,
+    graph_apply_proposal_id: String,
+    dispatches: Vec<ProductToCodeDispatchRequest>,
+    #[serde(default)]
+    blocked: Vec<ProductToCodeBlockedNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProductToCodeDispatchRequest {
+    graph_node_id: String,
+    #[serde(default)]
+    task_description: String,
+}
+
+/// Deterministic per-ticket workflow instance id so concurrent execute retries
+/// of one approved dispatch stay single-flight per ticket.
+fn product_to_code_instance_id(execution_id: &str, ticket_id: &str) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"rk.product_to_code.dispatch.instance.v1\0");
+    hasher.update(execution_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(ticket_id.as_bytes());
+    let hex = hex::encode(hasher.finalize());
+    format!("wf-{}", &hex[..32])
+}
+
+#[derive(Deserialize)]
+struct FactoryApproveParams {
+    proposal_id: String,
+    digest: String,
+}
+
+#[derive(Deserialize)]
+struct FactoryExecuteParams {
+    proposal_id: String,
+    digest: String,
+    #[serde(default)]
+    kind: Option<String>,
+    action: Value,
 }
 
 #[derive(Deserialize)]
@@ -4140,6 +5664,27 @@ struct BlockingParams {
     pattern: PatternParams,
     #[serde(default)]
     timeout_ms: Option<u64>,
+}
+
+fn repository_head(path: &std::path::Path) -> rk_core::Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "HEAD"])
+        .env("LC_ALL", "C")
+        .output()?;
+    if !output.status.success() {
+        return Err(rk_core::Error::other(format!(
+            "cannot resolve repository HEAD for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if head.is_empty() {
+        return Err(rk_core::Error::other("repository HEAD is empty"));
+    }
+    Ok(head)
 }
 
 /// Read a repo's configured URL for `remote` by shelling to git, so the host

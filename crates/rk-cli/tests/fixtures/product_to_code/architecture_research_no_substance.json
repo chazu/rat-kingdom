@@ -1,0 +1,24 @@
+{
+  "id": "ARCH-product-to-code-research",
+  "initiative_id": "INIT-product-to-code",
+  "researched_files": [
+    "crates/rk-core/src/product_to_code/contracts.rs",
+    "examples/workflows/research.cue"
+  ],
+  "domain_terms": [
+    "initiative",
+    "architecture research artifact",
+    "ticket graph"
+  ],
+  "architecture_decisions": [],
+  "constraints": [],
+  "risks": [],
+  "open_questions": [
+    "Should future workflows add CUE schema validation in addition to Rust validation?"
+  ],
+  "open_questions_exhausted": false,
+  "recommended_ticket_graph_path": "docs/product-to-code/ticket-graph.json",
+  "evidence_ids": [
+    "EVID-research-note"
+  ]
+}

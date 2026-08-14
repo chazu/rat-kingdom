@@ -1,0 +1,8 @@
+{
+  "id": "VR-unknown-evidence",
+  "initiative_id": "INIT-verification",
+  "entries": [
+    {"acceptance_criterion_id": "AC-1", "status": "satisfied", "evidence_ids": ["EV-browser"]},
+    {"acceptance_criterion_id": "AC-2", "status": "satisfied", "evidence_ids": ["EV-unknown"]}
+  ]
+}

@@ -11,6 +11,7 @@ members = [
     "crates/rk-mux",
     "crates/rk-daemon",
     "crates/rk-cli",
+    "crates/rk-mcp",
 ]
 
 [workspace.package]
@@ -30,8 +31,10 @@ rk-sync = { path = "crates/rk-sync" }
 rk-workflow = { path = "crates/rk-workflow" }
 rk-mux = { path = "crates/rk-mux" }
 rk-daemon = { path = "crates/rk-daemon" }
+rk-mcp = { path = "crates/rk-mcp" }
 
 anyhow = "1"
+futures = "0.3"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -64,6 +67,21 @@ libc = "0.2"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+[profile.dev]
+# Agent swarms rebuild this workspace frequently. Full debuginfo and incremental
+# object caches multiplied target/debug past 100 GiB, so keep useful line tables
+# without retaining a separate incremental graph for every edit.
+debug = "line-tables-only"
+incremental = false
+split-debuginfo = "off"
+
+[profile.test]
+# Test binaries are the largest source of stale hashed artifacts during parallel
+# agent work. Match the lean development profile while preserving backtrace lines.
+debug = "line-tables-only"
+incremental = false
+split-debuginfo = "off"
 
 [profile.release]
 lto = "thin"

@@ -820,6 +820,7 @@ mod tests {
             workflow: "gated-merge".into(),
             repo: "/home/x/dev/repo".into(),
             coordinator: None,
+            schedule: None,
             status,
             revision: 0,
             current_step: 2,

@@ -1,0 +1,10 @@
+{
+  "id": "ARCH-product-to-code",
+  "initiative_id": "INIT-product-to-code",
+  "researched_files": ["crates/rk-core/src/product_to_code/contracts.rs"],
+  "architecture_decisions": [],
+  "constraints": [],
+  "risks": [],
+  "open_questions": ["Should ticket graph export include ordering metadata?"],
+  "recommended_ticket_graph_path": null
+}

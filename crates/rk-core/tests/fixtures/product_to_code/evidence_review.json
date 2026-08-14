@@ -1,0 +1,16 @@
+{
+  "id": "EVID-review",
+  "kind": "code_review",
+  "producer": {
+    "kind": "external-tool",
+    "name": "independent reviewer",
+    "version": null,
+    "invocation": null
+  },
+  "summary": "Independent review found contracts remain offline and tool agnostic",
+  "artifact_paths": ["artifacts/review/product-to-code-review.md"],
+  "payload": {
+    "status": "approved",
+    "scope": "product-to-code contracts"
+  }
+}

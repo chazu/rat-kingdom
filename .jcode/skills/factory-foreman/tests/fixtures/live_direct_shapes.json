@@ -1,0 +1,48 @@
+{
+  "agents": [
+    {
+      "name": "agent-historical",
+      "state": "idle",
+      "result": "historical text says permission denied but this agent is not failed"
+    }
+  ],
+  "cost": {
+    "instances": [
+      {"instance": "inst-budget-live", "spent_usd": 8.5},
+      {"instance": "inst-other", "spent_usd": 99.0}
+    ]
+  },
+  "inbox": [
+    {
+      "kind": "agent-orphaned",
+      "subject": "agent-live-orphan",
+      "detail": "agent detached from active workflow"
+    }
+  ],
+  "tickets": [
+    {
+      "id": "ticket-old",
+      "payload": "historical stale base and permission denied text from old ticket"
+    }
+  ],
+  "workflows": [
+    {
+      "id": "inst-empty-live",
+      "instance_max_usd": 10.0,
+      "status": "failed",
+      "context": {
+        "previous_result": {
+          "declared_done": false,
+          "result": "",
+          "usage": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0},
+          "cost_usd": 0.0
+        }
+      }
+    },
+    {
+      "id": "inst-budget-live",
+      "instance_max_usd": 10.0,
+      "status": "running"
+    }
+  ]
+}

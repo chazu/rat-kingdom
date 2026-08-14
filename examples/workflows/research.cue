@@ -1,19 +1,33 @@
-// research: one rat investigates a question, writes its findings to a Markdown
-// document, commits it to its worktree, and reports done. The document is
-// merged into the base branch on success.
+// research: one rat investigates a question, writes a structured architecture
+// research artifact plus Markdown rendering, validates the artifact locally,
+// commits both deliverables, and reports done. The documents are merged into
+// the base branch on success.
 //
 //   rk workflow run research \
 //     --param question="How does the tuplespace handle concurrent writers?" \
+//     --param initiative=docs/product-to-code/initiative.json \
+//     --param artifact=docs/research/tuplespace-concurrency.json \
 //     --param outfile=docs/research/tuplespace-concurrency.md
 //
 // Copy to ~/.rat-kingdom/workflows/ (global) or <repo>/.rk/workflows/.
+_input: {
+	question:   string | *"research question"
+	initiative: string | *"docs/product-to-code/initiative.json"
+	artifact:   string | *"docs/research/architecture-research.json"
+	outfile:    string | *"docs/research/findings.md"
+}
+
 workflow: {
 	name:        "research"
-	description: "one rat researches a question, writes+commits a document, reports done"
+	description: "one rat researches a question, writes+validates ArchitectureResearchArtifact JSON, renders Markdown, reports done"
 
 	params: {
 		question: {type: "string", required: true}
-		// Where the rat writes its findings, relative to the repo root.
+		// InitiativeContract JSON path, relative to the repo root.
+		initiative: {type: "string", required: false, default: "docs/product-to-code/initiative.json"}
+		// ArchitectureResearchArtifact JSON output path, relative to the repo root.
+		artifact: {type: "string", required: false, default: "docs/research/architecture-research.json"}
+		// Rendered Markdown output path, relative to the repo root.
 		outfile: {type: "string", required: false, default: "docs/research/findings.md"}
 	}
 
@@ -28,29 +42,47 @@ workflow: {
 			task: {
 				title: "research"
 				description: """
-					Research and answer the following question, then write your
-					findings as a well-structured Markdown document.
+					Research and answer the following question, then write a structured
+					ArchitectureResearchArtifact JSON file and deterministic Markdown rendering.
 
 					Question:
 					\(_input.question)
 
-					Deliverable:
-					- Write the document to \(_input.outfile) (create parent dirs
-					  as needed). Include the question, a direct answer, the
-					  evidence/reasoning behind it, and any open questions.
-					- Do not modify unrelated files — this is a research task,
-					  not a code change.
-					- Commit the document to your worktree:
-					    git add \(_input.outfile)
-					    git commit -m "research: \(_input.question)"
-					- Then report that you are done.
+					Required structured artifact:
+					- Write ArchitectureResearchArtifact JSON to \(_input.artifact).
+					- The artifact must reference initiative_id from \(_input.initiative).
+					- Include at least one concrete repo-relative researched_files path.
+					- Include architecture substance in architecture_decisions, constraints, or risks.
+					- Include open_questions or set open_questions_exhausted: true.
+					- Include recommended_ticket_graph_path when a ticket graph is ready or null otherwise.
+
+					Validation command, required before reporting completion:
+					  rk --json product-to-code research validate --artifact \(_input.artifact) --initiative \(_input.initiative)
+
+					Rendered Markdown:
+					  rk product-to-code research render --artifact \(_input.artifact) --format markdown > \(_input.outfile)
+
+					Do not modify unrelated files. This is a local research task, not a daemon mutation.
+
+					Commit only the artifact and rendered document:
+					  git add \(_input.artifact) \(_input.outfile)
+					  git commit -m "research: \(_input.question)"
+
+					Then report that you are done.
 					"""
 			}
 		},
 		{type: "wait", timeout: "30m"},
 		// The harness result must not be an error.
 		{type: "evaluate", expect: {is_error: false}},
-		// Merge the research document into the base branch and clean up.
+		// Engine-executed validation gate after the rat has produced the artifact.
+		{
+			type: "run"
+			command: "rk --json product-to-code research validate --artifact \(_input.artifact) --initiative \(_input.initiative)"
+			expectExit: 0
+			timeout: "2m"
+		},
+		// Merge the research artifact and document into the base branch and clean up.
 		{type: "dismiss"},
 	]
 }

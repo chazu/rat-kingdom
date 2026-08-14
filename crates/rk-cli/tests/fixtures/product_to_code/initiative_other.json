@@ -1,0 +1,1 @@
+{"id":"INIT-other","title":"Other initiative","scope":"offline-contracts","browser_acceptance_applicable":false,"acceptance_criteria":[{"id":"AC-2","text":"Offline evidence remains tool agnostic"}]}

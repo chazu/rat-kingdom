@@ -1,0 +1,23 @@
+[package]
+name = "rk-mcp"
+description = "rat-kingdom MCP stdio bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rk-core.workspace = true
+rk-daemon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+rk-daemon = { path = "../rk-daemon", features = ["test-fixtures"] }
+tempfile = "3"
+
+[lints]
+workspace = true

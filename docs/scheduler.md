@@ -75,7 +75,13 @@ Macros: `@yearly`/`@annually`, `@monthly`, `@weekly`, `@daily`/`@midnight`,
   next boot, not a replay of every minute in the gap.
 - **Single-flight.** Each schedule is guarded by a lock keyed on its `name`: if
   its previous run's workflow instance is still `Running`, the next fire is
-  skipped. A slow nightly drain therefore never stacks a second copy on itself.
+  skipped. Scheduled workflow snapshots persist that schedule name, so after a
+  restart the scheduler can rebuild the exact per-schedule guard from rehydrated
+  `Running` instances. Legacy snapshots without a schedule name use exact
+  repository, invoked workflow definition, and parameter identity as a
+  conservative fallback. Nested child instances are excluded from that fallback.
+  A slow nightly drain therefore never stacks a second copy on itself, even
+  across a daemon restart.
 
 Overnight cost is otherwise bounded by the fleet/repo budget caps
 (`rk_ledger::FleetBudget`), which refuse new dispatch once a cap is hit — the

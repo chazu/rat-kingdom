@@ -1,0 +1,129 @@
+{
+  "schema": "factory-foreman.snapshot.v1",
+  "generated_at": "1970-01-01T00:00:00Z",
+  "repo": "demo",
+  "healthy": false,
+  "observations": {
+    "agents": {
+      "ok": true,
+      "command": "agents",
+      "data": {
+        "agents": [
+          {"name": "agent-empty", "state": "done"},
+          {"name": "agent-rk", "state": "failed"},
+          {"name": "agent-check", "state": "failed"},
+          {"name": "agent-timeout", "state": "failed"},
+          {"name": "agent-orphan", "state": "orphaned"},
+          {"name": "agent-budget", "state": "running"},
+          {"name": "agent-unknown", "state": "failed"}
+        ]
+      }
+    },
+    "inbox": {
+      "ok": true,
+      "command": "inbox",
+      "data": {
+        "messages": [
+          {
+            "case": "missing-rk-command",
+            "kind": "workflow-failed",
+            "workflow_instance": "inst-rk",
+            "agent": "agent-rk",
+            "detail": "shell: rk: command not found"
+          },
+          {
+            "case": "orphaned-agent",
+            "kind": "agent-orphaned",
+            "workflow_instance": "inst-orphan",
+            "agent": "agent-orphan",
+            "detail": "agent lost its workflow lease"
+          },
+          {
+            "case": "unknown-failure",
+            "kind": "workflow-failed",
+            "workflow_instance": "inst-unknown",
+            "agent": "agent-unknown",
+            "detail": "frobnicator returned a new opaque status"
+          }
+        ]
+      }
+    },
+    "workflows": {
+      "ok": true,
+      "command": "workflows",
+      "data": {
+        "workflows": [
+          {
+            "case": "empty-undeclared-harness-result",
+            "kind": "workflow-failed",
+            "id": "wf-empty",
+            "workflow_instance": "inst-empty",
+            "agent": "agent-empty",
+            "harness_result": {
+              "declared_done": false,
+              "result": "",
+              "usage": {"input_tokens": 0, "output_tokens": 0}
+            },
+            "detail": ""
+          },
+          {
+            "case": "named-check-failure",
+            "kind": "workflow-failed",
+            "workflow_instance": "inst-check",
+            "agent": "agent-check",
+            "run_steps": [
+              {"name": "cargo test", "exit_code": 101, "detail": "test failure"}
+            ]
+          },
+          {
+            "case": "timeout",
+            "kind": "workflow-failed",
+            "workflow_instance": "inst-timeout",
+            "agent": "agent-timeout",
+            "timed_out": true,
+            "run_steps": [{"name": "cargo test", "exit_code": 124}],
+            "detail": "cargo test timed out with exit 124"
+          },
+          {
+            "case": "budget-pressure",
+            "kind": "workflow-running",
+            "workflow_instance": "inst-budget",
+            "agent": "agent-budget",
+            "spend_usd": 8.0,
+            "instance_max_usd": 10.0
+          },
+          {
+            "case": "named-check-with-permission-text",
+            "kind": "workflow-failed",
+            "workflow_instance": "inst-check-permission",
+            "agent": "agent-check-permission",
+            "run_steps": [
+              {"name": "cargo clippy", "exit_code": 101, "detail": "permission denied while reading fixture"}
+            ],
+            "detail": "permission denied while reading fixture"
+          },
+          {
+            "case": "timeout-token-not-timeout",
+            "kind": "workflow-failed",
+            "workflow_instance": "inst-timeout-token",
+            "agent": "agent-timeout-token",
+            "run_steps": [
+              {"name": "timeout_tests", "exit_code": 1, "detail": "unit test failed"}
+            ],
+            "detail": "timeout_tests failed"
+          },
+          {
+            "case": "fleet-budget-alias-not-instance",
+            "kind": "workflow-running",
+            "workflow_instance": "inst-fleet-budget",
+            "agent": "agent-fleet-budget",
+            "spend_usd": 8.0,
+            "budget_usd": 10.0
+          }
+        ]
+      }
+    },
+    "cost": {"ok": true, "command": "cost", "data": {"total_usd": 42.0}}
+  },
+  "errors": []
+}

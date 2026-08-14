@@ -103,12 +103,30 @@ it drops events for any consumer that lags. A trigger must never miss an event,
 so the feed is used **only as a wake signal**. The source of truth is a durable
 cursor over the store:
 
-1. Each cycle scans the store for tuples with `id` greater than the saved cursor
-   (ULIDs sort by creation time), in order.
+1. Each cycle captures the store's current persistence-sequence boundary, then
+   scans the append-only tuple persistence journal for events whose
+   `commit_sequence` is greater than the saved cursor and no greater than that
+   boundary, in persistence order. The journal keeps the tuple snapshot even if
+   a take, delete, or expiry removes the live row before the reactor scans it.
+   SQLite assigns the sequence and journal row inside the tuple's write
+   transaction, so delayed writers, concurrent connections, daemon restarts, and
+   wall-clock rollback cannot place a committed tuple behind the cursor.
 2. Every new tuple is matched against all loaded triggers and any matches are
    dispatched.
-3. The cursor advances to the newest scanned id and is persisted to
-   `~/.rat-kingdom/reactor-cursor`.
+3. The cursor advances to the captured boundary and is persisted as a decimal
+   sequence in `~/.rat-kingdom/reactor-cursor`. A legacy ULID cursor cannot prove
+   which delayed lower-ID writes the old ordering skipped, so migration safely
+   replays the deterministic historical baseline from sequence zero. Durable
+   reactor markers make that one-time at-least-once replay idempotent.
+
+For an existing pre-journal database, migration preserves the sequence
+high-water mark even when older live rows have already been deleted. Surviving
+rows receive a deterministic `id ASC` baseline. The unrecoverable deleted prefix
+is recorded by `journal_floor_sequence`, and every event after that floor must
+form a complete, immutable, contiguous journal suffix. A durable migration
+marker distinguishes a legitimate legacy upgrade from a damaged current
+journal, so reopening never repairs trusted history from mutable live rows or
+silently rewinds the cursor.
 
 This is the same cursor discipline the multiplayer sync loop uses. A dropped
 feed event changes nothing: the next scan — woken by the interval tick if
@@ -125,9 +143,42 @@ Dispatch is at-least-once: a crash between firing and persisting the cursor
 re-runs from the last saved cursor. To make that safe, every fired
 `(trigger, tuple)` writes a durable **idempotency marker** (a system-scoped
 ephemeral event keyed on `<trigger>@<tuple-id>`). `already_fired` short-circuits
-a repeat, so a redelivery — a crash, or even a full cursor loss — never
-double-fires. Markers carry a TTL (`[reactor].marker_ttl_secs`, default one
-week) and self-collect; they only need to outlast any plausible redelivery.
+a repeat by consulting the immutable persistence journal, so a redelivery — a
+crash, marker expiry, or even a full cursor loss — never double-fires. The live
+marker still carries a TTL (`[reactor].marker_ttl_secs`, default one week) and
+self-collects, while its journal snapshot remains the permanent local dispatch
+ledger. Workflow launches also use a deterministic instance ID derived from the
+same `(trigger, tuple)` key, closing the crash window between instance persistence
+and marker persistence. Initial instance state is written through a synced
+temporary file, atomically renamed, and followed by a parent-directory sync on
+Unix before execution starts. On daemon restart, all live and archived workflow
+IDs are loaded before reactor or scheduler dispatch tasks start. Only after
+those consumers are listening are persisted `Running` instances resumed. An
+archived stable ID is therefore still occupied and cannot be relaunched by a
+replayed tuple.
+
+Nested `sub_workflow` steps persist the active child ID in the parent before the
+child snapshot is created. A restart therefore recreates a not-yet-installed
+child or rejoins the exact persisted child and its step cursor, rather than
+minting a replacement. A direct child result, cleared child link, and parent
+resume cursor are committed in one parent snapshot. Inside `when` or `repeat`,
+the joined result may be needed by later nested steps, so it is persisted first
+while the child link remains occupied; the link is cleared only when the
+enclosing top-level cursor commits. A crash therefore cannot acknowledge a child
+and then rerun it under a new ID. More than one nested child execution inside one
+top-level step is refused fail-closed because there is no independently durable
+nested-step cursor. A parent accepts a joined child only after the child's
+terminal snapshot is durable; if that write fails, the parent fails with the
+child link still occupied. Legacy `Running` children without that parent link
+fail closed with their matching parent instead of risking duplicate side effects.
+If recording that recovery state fails, the in-memory instance is still marked
+non-resumable and reports that its fail-closed status was not durably recorded.
+Archive and unarchive transitions reserve stable IDs atomically across the live
+and archived registries. Archive snapshot writes, live removals, and map movement
+are serialized under that reservation, so overlapping prune requests cannot
+roll back one another's committed copy. Snapshot removals are followed by a
+parent-directory sync, and a failed transition restores a durable recovery copy
+before returning an error.
 
 ## Re-entrancy and storm control
 
@@ -155,10 +206,11 @@ forever. Three guards, defence-in-depth:
 A wake must stay cheap even under a sustained write burst, when the feed wakes
 the reactor on nearly every tuple. Three things keep a cycle bounded:
 
-1. **Bounded firing scan.** The delta scan is `id > cursor` resolved from the
-   `id` PRIMARY KEY index (`Pattern::after`), not a full-table read filtered down
-   in Rust. A wake materialises only the tuples added since the cursor, however
-   large the store.
+1. **Bounded firing scan.** The delta scan is
+   `commit_sequence > cursor AND commit_sequence <= boundary`, resolved from the
+   journal's persistence-sequence primary key rather than a full-table read
+   filtered down in Rust. A wake materialises only the tuple events committed
+   since the cursor, however large the live store or historical journal.
 2. **Cached trigger parse.** Trigger files are parsed with `cue` (a subprocess
    per file). The parse is cached and reused until a file's `(mtime, len)` stamp
    changes, so a steady-state burst reparses nothing — the `cue` shell-outs, the
@@ -172,11 +224,10 @@ the reactor on nearly every tuple. Three things keep a cycle bounded:
    Convention / open ticket, not the cursor), but only when their relevant
    category population changed since the previous cycle. The gate is an exact SQL
    `COUNT` over `Endorsement`/`Suggestion` (promotion) and `Obstacle`/`Need`
-   (coalescence) — cheap (no row materialisation) and, unlike a cursor delta,
-   immune to the same-millisecond ULID ordering that could otherwise drop a
-   just-added tuple from the change signal. A wake carrying only unrelated writes
-   (claims, facts, harness results) does no whole-store scan at all. The first
-   cycle after start always recomputes, to catch up on any pre-existing backlog.
+   (coalescence) — cheap (no row materialisation) and independent of tuple ID or
+   cursor ordering. A wake carrying only unrelated writes (claims, facts, harness
+   results) does no whole-store scan at all. The first cycle after start always
+   recomputes, to catch up on any pre-existing backlog.
 
 ## First-boot backlog
 

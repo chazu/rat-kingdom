@@ -5,15 +5,17 @@
 //! and pin down idempotency, re-entrancy, and the per-trigger rate cap.
 
 use rk_core::config::ReactorConfig;
+use rk_core::id::RecordId;
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Pattern, Tuple, FULL_STRENGTH};
 use rk_daemon::reactor::{Reactor, REACTOR_INSTANCE};
 use rk_daemon::repos::{RepoRecord, RepoRegistry};
 use rk_daemon::supervisor::Supervisor;
 use rk_daemon::tickets::{NewTicket, Tickets};
-use rk_daemon::workflow_exec::WorkflowEngine;
+use rk_daemon::workflow_exec::{Selection, WorkflowEngine};
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -90,6 +92,14 @@ fn build_reactor_with_space(
     config: ReactorConfig,
     space: rk_space::Space,
 ) -> Arc<Reactor> {
+    build_reactor_and_engine_with_space(layout, config, space).0
+}
+
+fn build_reactor_and_engine_with_space(
+    layout: &Layout,
+    config: ReactorConfig,
+    space: rk_space::Space,
+) -> (Arc<Reactor>, Arc<WorkflowEngine>) {
     let tickets = Arc::new(Tickets::new(space.clone(), "test-castle".into()));
     let supervisor = Arc::new(
         Supervisor::new(
@@ -117,14 +127,15 @@ fn build_reactor_with_space(
         Vec::new(),
         vec!["main".into(), "master".into()],
     ));
-    Arc::new(Reactor::new(
+    let reactor = Arc::new(Reactor::new(
         space,
-        engine,
+        engine.clone(),
         tickets,
         Some(supervisor),
         layout.clone(),
         config,
-    ))
+    ));
+    (reactor, engine)
 }
 
 fn write_trigger(layout: &Layout) {
@@ -160,6 +171,48 @@ fn ping() -> Tuple {
         "Whisker",
         json!({"n": 1}),
     )
+}
+
+fn create_legacy_database(path: &Path, tuples: &[&Tuple]) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE tuples (
+            id TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            identity TEXT NOT NULL,
+            instance TEXT NOT NULL,
+            lifecycle TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT,
+            strength REAL
+        );",
+    )
+    .unwrap();
+    for tuple in tuples {
+        conn.execute(
+            "INSERT INTO tuples
+             (id, category, scope, identity, instance, lifecycle, payload,
+              created_at, expires_at, strength)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'session', ?6, ?7, NULL, NULL)",
+            rusqlite::params![
+                tuple.id.to_string(),
+                tuple.category.as_str(),
+                tuple.scope,
+                tuple.identity,
+                tuple.instance,
+                tuple.payload.to_string(),
+                tuple.created_at.to_rfc3339(),
+            ],
+        )
+        .unwrap();
+    }
+}
+
+fn stable_reactor_instance_id(trigger: &str, tuple: RecordId) -> String {
+    let digest = Sha256::digest(format!("{trigger}@{tuple}").as_bytes());
+    format!("reactor-{}", hex::encode(&digest[..16]))
 }
 
 /// Full path: the live daemon's reactor loop wakes off the feed and fires the
@@ -248,6 +301,326 @@ async fn dispatch_is_idempotent_under_feed_loss_and_cursor_reset() {
     // Exactly one workflow instance was ever created.
     assert_eq!(reactor.engine_instance_count(), 1);
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+#[tokio::test]
+async fn delayed_lower_record_id_is_processed_after_cursor_advance() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    write_trigger(&layout);
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+    let now = chrono::Utc::now();
+    let mut delayed = ping();
+    delayed.id = RecordId::floor_at(now);
+    let mut boundary = Tuple::new(
+        Category::Event,
+        "myrepo",
+        "boundary",
+        "Whisker",
+        json!({}),
+    );
+    boundary.id = RecordId::floor_at(now + chrono::Duration::days(1));
+
+    space.out(boundary).unwrap();
+    assert_eq!(reactor.run_cycle().unwrap(), 0);
+    space.out(delayed).unwrap();
+
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        1,
+        "persistence order must replay a delayed tuple below the prior ULID cursor"
+    );
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+#[tokio::test]
+async fn restart_after_future_record_id_processes_normal_write() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    write_trigger(&layout);
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+
+    let now = chrono::Utc::now();
+    {
+        let space = rk_space::Space::open(&layout.db_path()).unwrap();
+        let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+        let mut future = Tuple::new(
+            Category::Event,
+            "myrepo",
+            "future-boundary",
+            "Whisker",
+            json!({}),
+        );
+        future.id = RecordId::floor_at(now + chrono::Duration::days(1));
+        space.out(future).unwrap();
+        reactor.initialize_cursor().unwrap();
+    }
+
+    let reopened = rk_space::Space::open(&layout.db_path()).unwrap();
+    let restarted = build_reactor_with_space(
+        &layout,
+        ReactorConfig::default(),
+        reopened.clone(),
+    );
+    let mut normal = ping();
+    normal.id = RecordId::floor_at(now);
+    reopened.out(normal).unwrap();
+
+    assert_eq!(
+        restarted.run_cycle().unwrap(),
+        1,
+        "a persisted sequence must survive restart and wall-clock rollback"
+    );
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+#[tokio::test]
+async fn deleted_tuple_is_still_dispatched_from_the_persistence_journal() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    write_trigger(&layout);
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+    let tuple = ping();
+    let id = tuple.id;
+    space.out(tuple).unwrap();
+    assert!(space.delete(id).unwrap());
+
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        1,
+        "a take or delete before the scan must not erase the persisted insertion event"
+    );
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+#[tokio::test]
+async fn legacy_ulid_cursor_replays_migrated_history_and_rewrites_decimal() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    write_trigger(&layout);
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+
+    let now = chrono::Utc::now();
+    let mut delayed = ping();
+    delayed.id = RecordId::floor_at(now);
+    let mut old_boundary = Tuple::new(
+        Category::Event,
+        "myrepo",
+        "old-boundary",
+        "Whisker",
+        json!({}),
+    );
+    old_boundary.id = RecordId::floor_at(now + chrono::Duration::days(1));
+    create_legacy_database(&layout.db_path(), &[&old_boundary, &delayed]);
+    std::fs::write(
+        home.path().join("reactor-cursor"),
+        old_boundary.id.to_string(),
+    )
+    .unwrap();
+
+    let space = rk_space::Space::open(&layout.db_path()).unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space);
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        1,
+        "legacy conversion must replay a delayed low-ID historical tuple"
+    );
+    let rewritten = std::fs::read_to_string(home.path().join("reactor-cursor")).unwrap();
+    assert_eq!(rewritten.trim().parse::<u64>().unwrap(), 2);
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+#[tokio::test]
+async fn expired_live_marker_remains_deduplicated_by_the_persistence_journal() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    write_trigger(&layout);
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let config = ReactorConfig {
+        marker_ttl_secs: 1,
+        ..ReactorConfig::default()
+    };
+    let reactor = build_reactor_with_space(&layout, config, space.clone());
+    space.out(ping()).unwrap();
+    assert_eq!(reactor.run_cycle().unwrap(), 1);
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    space.gc_expired(0.0).unwrap();
+    assert!(space
+        .scan(&Pattern::category(Category::Event).identity("reactor_fired"))
+        .unwrap()
+        .is_empty());
+    std::fs::remove_file(home.path().join("reactor-cursor")).unwrap();
+
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        0,
+        "expired live markers must remain permanent in the persistence journal"
+    );
+    assert_eq!(reactor.engine_instance_count(), 1);
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+#[tokio::test]
+async fn existing_stable_reactor_instance_prevents_duplicate_launch_without_marker() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    write_trigger(&layout);
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let (reactor, engine) = build_reactor_and_engine_with_space(
+        &layout,
+        ReactorConfig::default(),
+        space.clone(),
+    );
+    let tuple = ping();
+    let instance_id = stable_reactor_instance_id("ping-drain", tuple.id);
+    engine
+        .run_owned_with_id(
+            instance_id,
+            "react-work",
+            &repo.path().to_string_lossy(),
+            Default::default(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(reactor.engine_instance_count(), 1);
+    space.out(tuple).unwrap();
+
+    reactor.run_cycle().unwrap();
+    assert_eq!(
+        reactor.engine_instance_count(),
+        1,
+        "replaying after a marker-write crash must resolve to the same workflow instance"
+    );
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+#[tokio::test]
+async fn workflow_launch_fails_when_initial_instance_cannot_be_persisted() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let (_, engine) = build_reactor_and_engine_with_space(
+        &layout,
+        ReactorConfig::default(),
+        space,
+    );
+    std::fs::write(layout.home().join("workflow-instances"), "not a directory").unwrap();
+
+    let result = engine.run_owned_with_id(
+        "must-be-durable".into(),
+        "react-work",
+        &repo.path().to_string_lossy(),
+        Default::default(),
+        None,
+    );
+
+    assert!(result.is_err(), "a workflow must not launch without durable instance state");
+    assert!(engine.status("must-be-durable").is_none());
+}
+
+#[tokio::test]
+async fn archived_stable_instance_id_prevents_relaunch() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    std::fs::write(
+        repo.path().join(".rk/workflows/react-work.cue"),
+        r#"workflow: {
+            name: "react-work"
+            steps: [
+                {type: "run", command: "true"},
+                {type: "run", command: "true"},
+            ]
+        }"#,
+    )
+    .unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    let (_, engine) = build_reactor_and_engine_with_space(
+        &layout,
+        ReactorConfig::default(),
+        rk_space::Space::open_in_memory().unwrap(),
+    );
+    let id = "stable-archived".to_string();
+    engine
+        .run_owned_with_id(
+            id.clone(),
+            "react-work",
+            &repo.path().to_string_lossy(),
+            Default::default(),
+            None,
+        )
+        .unwrap();
+    for _ in 0..50 {
+        if engine
+            .status(&id)
+            .is_some_and(|instance| instance.status != rk_daemon::workflow_exec::InstanceStatus::Running)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    engine.archive(&Selection::Ids(vec![id.clone()])).unwrap();
+
+    let replay = engine
+        .run_owned_with_id(
+            id.clone(),
+            "react-work",
+            &repo.path().to_string_lossy(),
+            Default::default(),
+            None,
+        )
+        .unwrap();
+
+    assert!(replay.archived_at.is_some());
+    assert!(engine.status(&id).is_none());
+    assert_eq!(engine.list_archived().len(), 1);
+}
+
+#[test]
+fn daemon_rehydrates_workflows_before_starting_dispatch_loops() {
+    let source = include_str!("../src/server.rs");
+    let rehydrate = source.find("daemon.engine().rehydrate();").unwrap();
+    let reactor = source.find("// Reactor loop:").unwrap();
+    let scheduler = source.find("// Scheduler loop:").unwrap();
+
+    assert!(rehydrate < reactor);
+    assert!(rehydrate < scheduler);
 }
 
 /// A matching tuple must remain deliverable when its target repo is briefly

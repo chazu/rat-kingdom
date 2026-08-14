@@ -17,6 +17,7 @@ rk-daemon.workspace = true
 rk-mux.workspace = true
 
 anyhow.workspace = true
+futures.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

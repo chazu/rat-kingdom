@@ -85,6 +85,39 @@ fn all_shipped_examples_load() {
 }
 
 #[test]
+fn research_example_loads_and_runs_engine_validation_after_artifact_production() {
+    use rk_workflow::Step;
+
+    let inputs = HashMap::from([(
+        "question".to_string(),
+        json!("How does the tuplespace handle concurrent writers?"),
+    )]);
+    let workflow = rk_workflow::load(&examples_dir().join("research.cue"), &inputs).unwrap();
+
+    let wait_at = workflow
+        .steps
+        .iter()
+        .position(|step| matches!(step, Step::Wait(_)))
+        .expect("research waits for artifact production");
+    let validation_at = workflow
+        .steps
+        .iter()
+        .position(|step| {
+            matches!(
+                step,
+                Step::Run(run)
+                    if run.command.as_deref().is_some_and(|cmd| cmd.contains("product-to-code research validate"))
+                        && run.expect_exit == Some(0)
+            )
+        })
+        .expect("research workflow has an engine-executed validation run");
+    assert!(
+        wait_at < validation_at,
+        "validation must run after the producing agent finishes"
+    );
+}
+
+#[test]
 fn shipped_example_triggers_load() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")

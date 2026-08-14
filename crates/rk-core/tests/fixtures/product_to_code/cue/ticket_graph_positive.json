@@ -1,0 +1,13 @@
+{
+  "id": "GRAPH-product-to-code",
+  "initiative_id": "INIT-product-to-code",
+  "nodes": [
+    {
+      "id": "TKT-contracts",
+      "title": "Define contracts",
+      "description": "Add offline product-to-code contract schemas",
+      "acceptance_criterion_ids": ["AC-1"]
+    }
+  ],
+  "edges": []
+}

@@ -1,0 +1,11 @@
+{
+  "id": "VR-complete",
+  "initiative_id": "INIT-verification",
+  "verifier": "independent-rat",
+  "scope": "delivery",
+  "recommendation": "deliver",
+  "entries": [
+    {"acceptance_criterion_id": "AC-1", "status": "satisfied", "evidence_ids": ["EV-browser"], "notes": "browser evidence observed"},
+    {"acceptance_criterion_id": "AC-2", "status": "satisfied", "evidence_ids": ["EV-test"], "notes": "tests observed"}
+  ]
+}

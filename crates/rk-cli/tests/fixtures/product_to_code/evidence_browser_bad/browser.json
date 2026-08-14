@@ -1,0 +1,1 @@
+{"id":"EV-browser-bad","kind":"browser_acceptance","producer":{"kind":"external-tool","name":"offline-browser-note"},"summary":"Invalid browser evidence","artifact_paths":[],"payload":{"scenario":"","steps":["open page"],"observations":[],"acceptance_criterion_ids":["AC-1"]}}

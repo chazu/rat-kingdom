@@ -1,0 +1,10 @@
+{
+  "id": "INIT-product-to-code",
+  "title": "Product to code contracts",
+  "scope": "offline-contracts",
+  "browser_acceptance_applicable": true,
+  "acceptance_criteria": [
+    {"id": "AC-1", "text": "Contracts round-trip through serde_json"},
+    {"id": "AC-2", "text": "Offline evidence remains tool agnostic"}
+  ]
+}

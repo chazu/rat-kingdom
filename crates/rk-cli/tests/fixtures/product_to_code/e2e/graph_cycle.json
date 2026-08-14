@@ -1,0 +1,12 @@
+{
+  "id": "GRAPH-product-to-code",
+  "initiative_id": "INIT-product-to-code",
+  "nodes": [
+    {"id": "NODE-contracts", "title": "Add offline contracts", "description": "Create serde and CUE contracts", "acceptance_criterion_ids": ["AC-1"]},
+    {"id": "NODE-tests", "title": "Verify tool-agnostic evidence", "description": "Test generic evidence payloads", "acceptance_criterion_ids": ["AC-2"]}
+  ],
+  "edges": [
+    {"from": "NODE-contracts", "to": "NODE-tests", "relationship": "depends_on"},
+    {"from": "NODE-tests", "to": "NODE-contracts", "relationship": "depends_on"}
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "id": "EVID-browser",
+  "kind": "browser_acceptance",
+  "producer": {
+    "kind": "external-tool",
+    "name": "offline acceptance recorder",
+    "version": null,
+    "invocation": null
+  },
+  "summary": "Browser acceptance evidence captured as offline artifact metadata",
+  "artifact_paths": ["artifacts/browser/product-to-code.png"],
+  "payload": {
+    "url": "http://localhost:3000/product-to-code",
+    "scenario": "review generated ticket graph",
+    "steps": ["Open product-to-code page", "Inspect ticket graph"],
+    "observations": ["Ticket graph rendered with two tickets"]
+  }
+}

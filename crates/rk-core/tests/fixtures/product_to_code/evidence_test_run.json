@@ -1,0 +1,16 @@
+{
+  "id": "EVID-test-run",
+  "kind": "test_run",
+  "producer": {
+    "kind": "external-tool",
+    "name": "cargo test",
+    "version": null,
+    "invocation": "cargo test -p rk-core --test product_to_code_contracts"
+  },
+  "summary": "Focused product-to-code contract tests passed",
+  "artifact_paths": ["artifacts/tests/product-to-code-contracts.txt"],
+  "payload": {
+    "command": "cargo test -p rk-core --test product_to_code_contracts",
+    "result": "passed"
+  }
+}

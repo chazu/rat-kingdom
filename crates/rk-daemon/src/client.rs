@@ -1,8 +1,9 @@
 //! Client side: connect to the daemon socket, lazily spawning the server if it
 //! isn't running (the tmux/herdr model — no separate install step).
 
-use crate::proto::{Request, Response};
+use crate::proto::{Request, Response, RpcError};
 use rk_core::paths::Layout;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -14,6 +15,29 @@ pub struct Client {
     next_id: u64,
     auth_token: String,
     caller: String,
+}
+
+#[derive(Debug)]
+pub enum ClientRpcError {
+    Rpc(RpcError),
+    Transport(rk_core::Error),
+}
+
+impl std::fmt::Display for ClientRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rpc(err) => write!(f, "{}: {}", err.code, err.message),
+            Self::Transport(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for ClientRpcError {}
+
+impl From<rk_core::Error> for ClientRpcError {
+    fn from(value: rk_core::Error) -> Self {
+        Self::Transport(value)
+    }
 }
 
 /// The caller name a connection carries when no agent identity applies.
@@ -160,10 +184,26 @@ impl Client {
         params: Value,
     ) -> rk_core::Result<(Value, WatchStream)> {
         let reply = self.call(method, params).await?;
-        Ok((reply, WatchStream { stream: self.stream }))
+        Ok((
+            reply,
+            WatchStream {
+                stream: self.stream,
+            },
+        ))
     }
 
     pub async fn call(&mut self, method: &str, params: Value) -> rk_core::Result<Value> {
+        let resp = self.call_raw(method, params).await?;
+        if let Some(err) = resp.error {
+            return Err(rk_core::Error::Protocol(format!(
+                "{}: {}",
+                err.code, err.message
+            )));
+        }
+        Ok(resp.result.unwrap_or(Value::Null))
+    }
+
+    pub async fn call_raw(&mut self, method: &str, params: Value) -> rk_core::Result<Response> {
         self.next_id += 1;
         let req = Request {
             id: self.next_id.to_string(),
@@ -181,14 +221,20 @@ impl Client {
         if n == 0 {
             return Err(rk_core::Error::Protocol("daemon closed connection".into()));
         }
-        let resp: Response = serde_json::from_str(&buf)?;
+        Ok(serde_json::from_str(&buf)?)
+    }
+
+    pub async fn call_typed<T: DeserializeOwned>(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<T, ClientRpcError> {
+        let resp = self.call_raw(method, params).await?;
         if let Some(err) = resp.error {
-            return Err(rk_core::Error::Protocol(format!(
-                "{}: {}",
-                err.code, err.message
-            )));
+            return Err(ClientRpcError::Rpc(err));
         }
-        Ok(resp.result.unwrap_or(Value::Null))
+        let value = resp.result.unwrap_or(Value::Null);
+        serde_json::from_value(value).map_err(|err| rk_core::Error::from(err).into())
     }
 }
 
@@ -242,9 +288,7 @@ mod tests {
     /// These exercise identity resolution through an injected lookup rather
     /// than `std::env::set_var`, which is process-global and races cargo's
     /// threaded test runner.
-    fn env_of(
-        pairs: Vec<(&'static str, &'static str)>,
-    ) -> impl Fn(&str) -> Option<String> {
+    fn env_of(pairs: Vec<(&'static str, &'static str)>) -> impl Fn(&str) -> Option<String> {
         move |key| {
             pairs
                 .iter()

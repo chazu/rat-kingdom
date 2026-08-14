@@ -1,0 +1,1 @@
+{"id":"EV-test-run","kind":"test_run","producer":{"kind":"external-tool","name":"cargo"},"summary":"Tests passed","artifact_paths":["artifacts/test.log"],"payload":{"command":"cargo test"}}

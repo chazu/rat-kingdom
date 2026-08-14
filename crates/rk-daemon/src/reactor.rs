@@ -7,10 +7,10 @@
 //!
 //! The live feed ([`Space::subscribe`]) is a lossy broadcast: it drops events
 //! for laggy consumers. A trigger must never miss an event, so the feed is used
-//! only as a *wake signal*. The source of truth is a durable cursor over the
-//! store: each cycle scans tuples with `id` greater than the last processed id
-//! (ULIDs sort by creation time), fires matching triggers, then advances the
-//! cursor. This is the same cursor discipline the multiplayer sync loop uses.
+//! only as a *wake signal*. The source of truth is a durable SQLite persistence
+//! sequence: each cycle reads immutable tuple events committed after the saved
+//! boundary, fires matching triggers, then advances only after the batch
+//! succeeds. This is the same cursor discipline the multiplayer sync loop uses.
 //!
 //! # Idempotency and re-entrancy
 //!
@@ -30,10 +30,12 @@ use crate::workflow_exec::WorkflowEngine;
 use rk_core::config::ReactorConfig;
 use rk_core::id::RecordId;
 use rk_core::paths::Layout;
+use rk_core::sdlc::{alert_diagnostic_text_is_unsafe, ConfiguredSourceName, SignalSourcePrincipal};
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, SYSTEM_SCOPE};
 use rk_space::Space;
 use rk_workflow::Trigger;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -84,6 +86,21 @@ type FileStamp = (PathBuf, Option<String>, Option<SystemTime>, Option<u64>);
 struct TriggerCache {
     stamps: Vec<FileStamp>,
     triggers: Vec<Loaded>,
+}
+
+struct AlertDiagnosisContext {
+    state: String,
+    environment: String,
+    service: String,
+    alert: Value,
+    refs: Value,
+    attributes: Value,
+}
+
+struct AlertOccurrence {
+    tuple: Tuple,
+    receipt_id: String,
+    semantic_state_digest: String,
 }
 
 pub struct Reactor {
@@ -143,20 +160,19 @@ impl Reactor {
         if self.cursor_file.exists() {
             return Ok(());
         }
-        let all = self.space.scan(&Pattern::default())?;
-        if let Some(max) = all.iter().map(|t| t.id).max() {
-            self.save_cursor(max)?;
+        let boundary = self.space.latest_persistence_sequence()?;
+        if boundary > 0 {
+            self.save_cursor(boundary)?;
         }
         Ok(())
     }
 
-    /// Process every tuple newer than the cursor: match it against all loaded
-    /// triggers and fire the workflows. Returns how many workflows were fired.
+    /// Process every tuple persisted after the durable SQLite cursor: match it
+    /// against all loaded triggers and fire the workflows. Returns how many
+    /// workflows were fired.
     pub fn run_cycle(&self) -> rk_core::Result<usize> {
-        let cursor = self.load_cursor();
-        // Bounded delta: only tuples newer than the cursor, resolved from the id
-        // PRIMARY KEY index — no full-table scan + Rust-side `id <= cursor` skip.
-        let delta = self.space.scan(&Pattern::default().after(cursor))?;
+        let cursor = self.load_cursor()?.unwrap_or(0);
+        let delta = self.space.persistence_delta(Some(cursor))?;
         // Load the registry, then the triggers (cache-gated, so a `cue` shell-out
         // runs only when a trigger file changed), AFTER the delta scan. Loading
         // them no earlier than the scan closes the window where a repo / trigger
@@ -166,15 +182,8 @@ impl Reactor {
         let triggers = self.cached_triggers(&registry);
 
         let mut fired = 0usize;
-        let mut max_id = cursor;
         let mut retryable_failure = false;
-        for tuple in &delta {
-            // Advance the cursor past every delta tuple, including the reactor's
-            // own markers, so they are seen once and never re-scanned.
-            max_id = Some(match max_id {
-                Some(m) => m.max(tuple.id),
-                None => tuple.id,
-            });
+        for tuple in &delta.tuples {
             if tuple.instance == REACTOR_INSTANCE {
                 continue;
             }
@@ -185,13 +194,27 @@ impl Reactor {
             if let Err(e) = self.notify_escalation(tuple) {
                 warn!(tuple = %tuple.id, error = %e, "reactor escalation notify failed");
             }
-            for loaded in &triggers {
-                match self.try_fire(loaded, tuple, &registry) {
-                    Ok(true) => fired += 1,
-                    Ok(false) => {}
-                    Err(e) => {
-                        retryable_failure = true;
-                        warn!(trigger = %loaded.trigger.name, error = %e, "reactor dispatch failed")
+            if let Err(e) = self.react_to_sdlc_ci_transition(tuple) {
+                retryable_failure = true;
+                warn!(tuple = %tuple.id, error = %e, "reactor SDLC CI reaction failed");
+            }
+            if let Err(e) = self.react_to_sdlc_alert_transition(tuple) {
+                retryable_failure = true;
+                warn!(tuple = %tuple.id, error = %e, "reactor SDLC alert reaction failed");
+            }
+            // Deployment and production-alert tuples are observation-only. Alert
+            // transitions may create the built-in diagnostic context above, but
+            // repo-configured triggers may never turn either signal family into
+            // workflow dispatch or production mutation.
+            if !is_observational_sdlc_tuple(tuple) {
+                for loaded in &triggers {
+                    match self.try_fire(loaded, tuple, &registry) {
+                        Ok(true) => fired += 1,
+                        Ok(false) => {}
+                        Err(e) => {
+                            retryable_failure = true;
+                            warn!(trigger = %loaded.trigger.name, error = %e, "reactor dispatch failed")
+                        }
                     }
                 }
             }
@@ -210,13 +233,12 @@ impl Reactor {
                 warn!(tuple = %tuple.id, error = %e, "reactor resolution-backlink failed");
             }
         }
-        if !retryable_failure {
-            if let Some(m) = max_id {
-                if cursor.map(|c| m > c).unwrap_or(true) {
-                    self.save_cursor(m)?;
-                }
-            }
+        if !retryable_failure && delta.boundary > cursor {
+            self.save_cursor(delta.boundary)?;
         }
+
+        fired += self.react_to_sdlc_ci_transition_backlog()?;
+        fired += self.react_to_sdlc_alert_transition_backlog()?;
 
         // Whole-store recomputes (quorum promotion, obstacle coalescence). Their
         // INPUT is deliberately the whole store, not the cursor delta: a
@@ -225,9 +247,8 @@ impl Reactor {
         // / open ticket, not the cursor. But re-scanning + materialising the whole
         // store on EVERY wake is the cost TKT-29 targets. Gate WHETHER to
         // recompute on whether the relevant category population *changed* since
-        // last cycle — an exact SQL COUNT (no row materialisation, and immune to
-        // the same-millisecond ULID ordering that makes a cursor delta an
-        // unreliable change signal, unlike the firing loop which tolerates it).
+        // last cycle — an exact SQL COUNT (no row materialisation and independent
+        // of the persistence cursor, whose SQLite sequence is exact).
         // A promotion / coalescence can only newly qualify when an endorsement /
         // obstacle is ADDED, which moves the count; a burst of unrelated writes
         // leaves it unchanged, so the full scan is skipped. The first cycle
@@ -815,7 +836,13 @@ impl Reactor {
         let params = template_params(&trigger.params, tuple);
 
         // The workflow runs in the background; run() returns the instance now.
-        let instance = self.engine.run(&trigger.run, &repo_path, params)?;
+        let instance = self.engine.run_owned_with_id(
+            stable_workflow_instance_id(&key),
+            &trigger.run,
+            &repo_path,
+            params,
+            None,
+        )?;
         info!(
             trigger = %trigger.name,
             workflow = %trigger.run,
@@ -866,6 +893,510 @@ impl Reactor {
         self.mark_notified(&key, tuple)?;
         info!(tuple = %tuple.id, task, "reactor pushed steward escalation notification");
         Ok(true)
+    }
+
+    /// Built-in SDLC CI reaction. Storage emits exactly one transition tuple per
+    /// semantic state change, so reactions are based on those durable transition
+    /// outputs rather than occurrence counts. A failed current state produces one
+    /// diagnostic need. A recovered current state acknowledges only if this
+    /// subject previously had a diagnostic, making standalone recovery inert.
+    fn react_to_sdlc_ci_transition(&self, tuple: &Tuple) -> rk_core::Result<bool> {
+        if tuple.category != Category::Event || tuple.scope != "ci" {
+            return Ok(false);
+        }
+        if tuple.payload.get("family").and_then(Value::as_str) != Some("ci") {
+            return Ok(false);
+        }
+        if !tuple.identity.starts_with("sdlc:transition:") {
+            return Ok(false);
+        }
+        let key = format!("sdlc-ci@{}", tuple.id);
+        if self.already_fired(&key)? {
+            return Ok(false);
+        }
+        let Some(subject) = tuple.payload.get("subject").and_then(Value::as_str) else {
+            return Ok(false);
+        };
+        let source = tuple
+            .payload
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let Some(current) = self.current_ci_fact(source, subject)? else {
+            return Ok(false);
+        };
+        let status = current
+            .payload
+            .get("current")
+            .and_then(|v| v.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        if ci_status_failed(status) {
+            self.write_ci_diagnostic(&key, tuple, &current)?;
+            return Ok(true);
+        }
+        if ci_status_recovered(status) && self.has_ci_diagnostic(subject)? {
+            self.write_ci_recovery(&key, tuple, &current)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn react_to_sdlc_ci_transition_backlog(&self) -> rk_core::Result<usize> {
+        let transitions = self.space.scan(&Pattern::category(Category::Event).scope("ci"))?;
+        let mut fired = 0;
+        for tuple in transitions
+            .iter()
+            .filter(|tuple| tuple.identity.starts_with("sdlc:transition:"))
+        {
+            if self.react_to_sdlc_ci_transition(tuple)? {
+                fired += 1;
+            }
+        }
+        Ok(fired)
+    }
+
+    /// Built-in production-alert reaction. It emits a permanent, read-only
+    /// diagnosis context for each transition into `firing`. It never dispatches
+    /// a workflow, carries no executable/action fields, and uses the exact
+    /// occurrence event named by the transition so a rapid later resolution
+    /// cannot erase the evidence that originally fired.
+    fn react_to_sdlc_alert_transition(&self, tuple: &Tuple) -> rk_core::Result<bool> {
+        if !is_production_alert_transition(tuple) {
+            return Ok(false);
+        }
+        let transition_id = tuple.id.to_string();
+        let Some(transition) = self.space.get_sdlc_transition(&transition_id)? else {
+            return Ok(false);
+        };
+        let payload_source = tuple.payload.get("source").and_then(Value::as_str);
+        let payload_delivery = tuple.payload.get("delivery_id").and_then(Value::as_str);
+        let payload_subject = tuple.payload.get("subject").and_then(Value::as_str);
+        let payload_previous = tuple.payload.get("previous_digest").and_then(Value::as_str);
+        let payload_current = tuple.payload.get("current_digest").and_then(Value::as_str);
+        let Ok(transition_source) = ConfiguredSourceName::new(&transition.source) else {
+            return Ok(false);
+        };
+        let expected_principal = SignalSourcePrincipal::for_source(&transition_source);
+        if transition.transition_tuple_id != transition_id
+            || transition.scope != tuple.scope
+            || tuple.instance != expected_principal.as_str()
+            || tuple.identity
+                != format!(
+                    "sdlc:transition:{}:{}:{}",
+                    transition.source, transition.scope, transition.subject
+                )
+            || payload_source != Some(transition.source.as_str())
+            || payload_delivery != Some(transition.delivery_id.as_str())
+            || payload_subject != Some(transition.subject.as_str())
+            || payload_previous != transition.previous_digest.as_deref()
+            || payload_current != Some(transition.current_digest.as_str())
+        {
+            return Ok(false);
+        }
+        let key = format!("sdlc-alert@{}", tuple.id);
+        if self.has_alert_processed(tuple.id)? {
+            return Ok(false);
+        }
+        if self.has_alert_diagnosis(tuple.id)? {
+            self.mark_sdlc_alert_reacted(&key, tuple, "diagnostic")?;
+            return Ok(false);
+        }
+        if self.already_fired(&key)? {
+            self.mark_sdlc_alert_reacted(&key, tuple, "legacy-marker")?;
+            return Ok(false);
+        }
+        let source = transition.source.as_str();
+        let delivery_id = transition.delivery_id.as_str();
+        let Some(occurrence) = self.alert_occurrence(source, delivery_id)? else {
+            return Ok(false);
+        };
+        if occurrence.semantic_state_digest != transition.current_digest {
+            return Ok(false);
+        }
+        let occurrence_subject = occurrence
+            .tuple
+            .payload
+            .get("subject")
+            .and_then(Value::as_str);
+        let transition_subject = tuple.payload.get("subject").and_then(Value::as_str);
+        if occurrence_subject.is_none() || occurrence_subject != transition_subject {
+            self.mark_sdlc_alert_reacted(&key, tuple, "rejected")?;
+            return Ok(false);
+        }
+        let Some(context) = alert_diagnosis_context(&occurrence.tuple) else {
+            self.mark_sdlc_alert_reacted(&key, tuple, "rejected")?;
+            return Ok(false);
+        };
+        if context.state == "resolved" {
+            self.mark_sdlc_alert_reacted(&key, tuple, "resolved")?;
+            return Ok(false);
+        }
+        if context.state != "firing" {
+            self.mark_sdlc_alert_reacted(&key, tuple, "ignored")?;
+            return Ok(false);
+        }
+
+        let subject = tuple
+            .payload
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let current = self.current_alert_fact(source, subject)?;
+        let provenance = self.deployment_provenance(&context.environment, &context.service)?;
+        self.write_alert_diagnosis(
+            &key,
+            tuple,
+            &occurrence.tuple,
+            &occurrence.receipt_id,
+            current.as_ref(),
+            context,
+            provenance,
+        )?;
+        Ok(true)
+    }
+
+    fn react_to_sdlc_alert_transition_backlog(&self) -> rk_core::Result<usize> {
+        let transitions = self
+            .space
+            .scan(&Pattern::category(Category::Event).scope("production_alert"))?;
+        let mut fired = 0;
+        for tuple in transitions
+            .iter()
+            .filter(|tuple| is_production_alert_transition(tuple))
+        {
+            if self.react_to_sdlc_alert_transition(tuple)? {
+                fired += 1;
+            }
+        }
+        Ok(fired)
+    }
+
+    fn alert_occurrence(
+        &self,
+        source: &str,
+        delivery_id: &str,
+    ) -> rk_core::Result<Option<AlertOccurrence>> {
+        let Ok(source_name) = ConfiguredSourceName::new(source) else {
+            return Ok(None);
+        };
+        let Some(receipt) = self.space.get_sdlc_receipt(&source_name, delivery_id)? else {
+            return Ok(None);
+        };
+        let expected_principal = SignalSourcePrincipal::for_source(&source_name);
+        if receipt.source.as_str() != expected_principal.as_str()
+            || receipt.delivery_id != delivery_id
+        {
+            return Ok(None);
+        }
+        let Ok(event_id) = receipt.projected_event_id.parse::<RecordId>() else {
+            return Ok(None);
+        };
+        let Some(tuple) = self.space.get(event_id)? else {
+            return Ok(None);
+        };
+        if tuple.category != Category::Event
+            || tuple.scope != "production_alert"
+            || tuple.instance != expected_principal.as_str()
+            || tuple.identity != format!("sdlc:event:{source}:{delivery_id}")
+            || tuple.payload.get("source").and_then(Value::as_str) != Some(source)
+            || tuple.payload.get("delivery_id").and_then(Value::as_str) != Some(delivery_id)
+            || tuple.payload.get("family").and_then(Value::as_str) != Some("production_alert")
+        {
+            return Ok(None);
+        }
+        Ok(Some(AlertOccurrence {
+            tuple,
+            receipt_id: receipt.receipt_id,
+            semantic_state_digest: receipt.semantic_state_digest.as_str().to_string(),
+        }))
+    }
+
+    fn current_alert_fact(&self, source: &str, subject: &str) -> rk_core::Result<Option<Tuple>> {
+        Ok(self
+            .space
+            .current_sdlc_facts(Some(source), Some("production_alert"), Some(subject))?
+            .into_iter()
+            .next())
+    }
+
+    fn deployment_provenance(&self, environment: &str, service: &str) -> rk_core::Result<Value> {
+        let subject = format!("{environment}:{service}");
+        let mut facts = self
+            .space
+            .current_sdlc_facts(None, Some("deployment"), Some(&subject))?;
+        facts.sort_by(|left, right| {
+            left.payload
+                .get("source")
+                .and_then(Value::as_str)
+                .cmp(&right.payload.get("source").and_then(Value::as_str))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let candidates = facts
+            .iter()
+            .map(|fact| {
+                let current = fact.payload.get("current").cloned().unwrap_or(Value::Null);
+                json!({
+                    "fact_id": fact.id.to_string(),
+                    "source": fact.payload.get("source"),
+                    "receipt_id": fact.payload.get("receipt_id"),
+                    "artifact_revision": safe_diagnostic_metadata(current.get("version")),
+                    "commit_sha": safe_diagnostic_metadata(current.get("commit_sha")),
+                    "repo": safe_diagnostic_metadata(current.get("repo")),
+                    "branch": safe_diagnostic_metadata(current.get("branch")),
+                })
+            })
+            .collect::<Vec<_>>();
+        let status = match candidates.len() {
+            0 => "unknown",
+            1 => "known",
+            _ => "ambiguous",
+        };
+        Ok(json!({"status": status, "candidates": candidates}))
+    }
+
+    fn has_alert_diagnosis(&self, transition_id: RecordId) -> rk_core::Result<bool> {
+        let transition_id = transition_id.to_string();
+        Ok(self
+            .space
+            .scan(&Pattern::category(Category::Need).identity("sdlc_alert_diagnosis"))?
+            .iter()
+            .any(|tuple| {
+                tuple
+                    .payload
+                    .get("transition_tuple")
+                    .and_then(Value::as_str)
+                    == Some(transition_id.as_str())
+            }))
+    }
+
+    fn has_alert_processed(&self, transition_id: RecordId) -> rk_core::Result<bool> {
+        let transition_id = transition_id.to_string();
+        Ok(self
+            .space
+            .scan(
+                &Pattern::category(Category::Fact)
+                    .scope(SYSTEM_SCOPE)
+                    .identity("sdlc_alert_processed"),
+            )?
+            .iter()
+            .any(|tuple| {
+                tuple
+                    .payload
+                    .get("transition_tuple")
+                    .and_then(Value::as_str)
+                    == Some(transition_id.as_str())
+            }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_alert_diagnosis(
+        &self,
+        key: &str,
+        transition: &Tuple,
+        occurrence: &Tuple,
+        receipt_id: &str,
+        current: Option<&Tuple>,
+        context: AlertDiagnosisContext,
+        provenance: Value,
+    ) -> rk_core::Result<()> {
+        let source = transition
+            .payload
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let delivery_id = transition
+            .payload
+            .get("delivery_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let subject = transition
+            .payload
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let mut diagnosis = Tuple::new(
+            Category::Need,
+            "production_alert",
+            "sdlc_alert_diagnosis",
+            REACTOR_INSTANCE,
+            json!({
+                "family": "production_alert",
+                "source": source,
+                "subject": subject,
+                "delivery_id": delivery_id,
+                "receipt_id": receipt_id,
+                "occurrence_event": occurrence.id.to_string(),
+                "transition_tuple": transition.id.to_string(),
+                "current_alert_fact": current.map(|tuple| tuple.id.to_string()),
+                "read_only": true,
+                "diagnostic_only": true,
+                "alert": context.alert,
+                "refs": context.refs,
+                "attributes": context.attributes,
+                "deployment_provenance": provenance,
+            }),
+        );
+        diagnosis.lifecycle = Lifecycle::Furniture;
+        self.space.out(diagnosis)?;
+        self.mark_sdlc_alert_reacted(key, transition, "diagnostic")
+    }
+
+    fn mark_sdlc_alert_reacted(&self, key: &str, tuple: &Tuple, kind: &str) -> rk_core::Result<()> {
+        if !self.has_alert_processed(tuple.id)? {
+            let mut processed = Tuple::new(
+                Category::Fact,
+                SYSTEM_SCOPE,
+                "sdlc_alert_processed",
+                REACTOR_INSTANCE,
+                json!({
+                    "key": key,
+                    "kind": kind,
+                    "transition_tuple": tuple.id.to_string(),
+                }),
+            );
+            processed.lifecycle = Lifecycle::Furniture;
+            self.space.out(processed)?;
+        }
+        if self.already_fired(key)? {
+            return Ok(());
+        }
+        let mut marker = Tuple::new(
+            Category::Event,
+            SYSTEM_SCOPE,
+            MARKER_IDENTITY,
+            REACTOR_INSTANCE,
+            json!({
+                "key": key,
+                "kind": format!("alert-{kind}"),
+                "tuple": tuple.id.to_string(),
+            }),
+        );
+        marker.lifecycle = Lifecycle::Ephemeral;
+        if self.config.marker_ttl_secs > 0 {
+            let ttl_secs = i64::try_from(self.config.marker_ttl_secs.min(MAX_MARKER_TTL_SECS))
+                .expect("MAX_MARKER_TTL_SECS must fit i64");
+            marker.expires_at = Some(
+                chrono::Utc::now() + chrono::Duration::seconds(ttl_secs),
+            );
+        }
+        self.space.out(marker)
+    }
+
+    fn current_ci_fact(&self, source: &str, subject: &str) -> rk_core::Result<Option<Tuple>> {
+        Ok(self
+            .space
+            .scan(&Pattern::category(Category::Fact).scope("ci"))?
+            .into_iter()
+            .find(|tuple| {
+                tuple.identity.starts_with("sdlc:current:")
+                    && tuple.payload.get("source").and_then(Value::as_str) == Some(source)
+                    && tuple.payload.get("family").and_then(Value::as_str) == Some("ci")
+                    && tuple.payload.get("subject").and_then(Value::as_str) == Some(subject)
+            }))
+    }
+
+    fn has_ci_diagnostic(&self, subject: &str) -> rk_core::Result<bool> {
+        Ok(self
+            .space
+            .scan(&Pattern::category(Category::Need).identity("sdlc_ci_diagnostic"))?
+            .iter()
+            .any(|tuple| tuple.payload.get("subject").and_then(Value::as_str) == Some(subject)))
+    }
+
+    fn write_ci_diagnostic(
+        &self,
+        key: &str,
+        transition: &Tuple,
+        current: &Tuple,
+    ) -> rk_core::Result<()> {
+        let subject = transition
+            .payload
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let mut diagnostic = Tuple::new(
+            Category::Need,
+            "ci",
+            "sdlc_ci_diagnostic",
+            REACTOR_INSTANCE,
+            json!({
+                "family": "ci",
+                "subject": subject,
+                "source": transition.payload.get("source"),
+                "delivery_id": transition.payload.get("delivery_id"),
+                "transition_tuple": transition.id.to_string(),
+                "current_fact": current.id.to_string(),
+                "proposal_path": "phase2_advisory_proposal",
+                "phase2": {
+                    "kind": "advisory_proposal",
+                    "requires_approval": true,
+                    "effect": "diagnostic_only"
+                },
+                "diagnostic": {
+                    "summary": "CI transitioned to failed; inspect evidence and propose any fix through the approval boundary",
+                    "current": current.payload.get("current")
+                }
+            }),
+        );
+        diagnostic.lifecycle = Lifecycle::Furniture;
+        self.space.out(diagnostic)?;
+        self.mark_sdlc_ci_reacted(key, transition, "diagnostic")
+    }
+
+    fn write_ci_recovery(
+        &self,
+        key: &str,
+        transition: &Tuple,
+        current: &Tuple,
+    ) -> rk_core::Result<()> {
+        let subject = transition
+            .payload
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let mut recovered = Tuple::new(
+            Category::Fact,
+            "ci",
+            "sdlc_ci_recovered",
+            REACTOR_INSTANCE,
+            json!({
+                "family": "ci",
+                "subject": subject,
+                "source": transition.payload.get("source"),
+                "delivery_id": transition.payload.get("delivery_id"),
+                "transition_tuple": transition.id.to_string(),
+                "current_fact": current.id.to_string(),
+                "current": current.payload.get("current")
+            }),
+        );
+        recovered.lifecycle = Lifecycle::Furniture;
+        self.space.out(recovered)?;
+        self.mark_sdlc_ci_reacted(key, transition, "recovered")
+    }
+
+    fn mark_sdlc_ci_reacted(&self, key: &str, tuple: &Tuple, kind: &str) -> rk_core::Result<()> {
+        let mut marker = Tuple::new(
+            Category::Event,
+            SYSTEM_SCOPE,
+            MARKER_IDENTITY,
+            REACTOR_INSTANCE,
+            json!({
+                "key": key,
+                "kind": kind,
+                "tuple": tuple.id.to_string(),
+            }),
+        );
+        marker.lifecycle = Lifecycle::Ephemeral;
+        if self.config.marker_ttl_secs > 0 {
+            let ttl_secs = i64::try_from(self.config.marker_ttl_secs.min(MAX_MARKER_TTL_SECS))
+                .expect("MAX_MARKER_TTL_SECS must fit i64");
+            marker.expires_at = Some(
+                chrono::Utc::now() + chrono::Duration::seconds(ttl_secs),
+            );
+        }
+        self.space.out(marker)
     }
 
     /// Durable "already notified" marker for the built-in escalation push. It
@@ -984,7 +1515,7 @@ impl Reactor {
             .scope(SYSTEM_SCOPE)
             .identity(MARKER_IDENTITY);
         p.payload_search = Some(format!("\"key\":\"{key}\""));
-        Ok(!self.space.scan(&p)?.is_empty())
+        self.space.has_persistence_event_matching(&p)
     }
 
     fn mark_fired(
@@ -1007,9 +1538,9 @@ impl Reactor {
                 "instance": instance,
             }),
         );
-        // Ephemeral with a TTL: the marker only needs to outlive any redelivery,
-        // then self-collects. (Ephemeral tuples do not replicate — dedup is
-        // per-castle, which is correct: each castle runs its own reactor.)
+        // The live marker is ephemeral and self-collects, but its immutable local
+        // persistence event remains the permanent dedup ledger. Ephemeral tuples
+        // do not replicate, so dedup stays per-castle as intended.
         marker.lifecycle = Lifecycle::Ephemeral;
         if self.config.marker_ttl_secs > 0 {
             let ttl_secs = i64::try_from(self.config.marker_ttl_secs.min(MAX_MARKER_TTL_SECS))
@@ -1047,18 +1578,29 @@ impl Reactor {
         self.engine.list().len()
     }
 
-    fn load_cursor(&self) -> Option<RecordId> {
-        std::fs::read_to_string(&self.cursor_file)
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
+    fn load_cursor(&self) -> rk_core::Result<Option<u64>> {
+        let Ok(raw) = std::fs::read_to_string(&self.cursor_file) else {
+            return Ok(None);
+        };
+        let raw = raw.trim();
+        if let Ok(sequence) = raw.parse::<u64>() {
+            return Ok(Some(sequence));
+        }
+        let Ok(legacy) = raw.parse::<RecordId>() else {
+            return Ok(None);
+        };
+        self.space.legacy_persistence_sequence(legacy)
     }
 
-    fn save_cursor(&self, id: RecordId) -> rk_core::Result<()> {
-        std::fs::write(&self.cursor_file, id.to_string())?;
+    fn save_cursor(&self, sequence: u64) -> rk_core::Result<()> {
+        std::fs::write(&self.cursor_file, sequence.to_string())?;
         Ok(())
     }
+}
+
+fn stable_workflow_instance_id(key: &str) -> String {
+    let digest = Sha256::digest(key.as_bytes());
+    format!("reactor-{}", hex::encode(&digest[..16]))
 }
 
 /// Stamp each candidate trigger file with `(mtime, len)` for change detection.
@@ -1111,6 +1653,148 @@ fn ticket_is_done(t: &Tuple) -> bool {
     matches!(
         t.payload.get("status").and_then(Value::as_str),
         Some("done") | Some("closed")
+    )
+}
+
+fn is_observational_sdlc_tuple(tuple: &Tuple) -> bool {
+    matches!(tuple.scope.as_str(), "deployment" | "production_alert")
+        && (tuple.identity.starts_with("sdlc:")
+            || matches!(
+                tuple.payload.get("family").and_then(Value::as_str),
+                Some("deployment" | "production_alert")
+            ))
+}
+
+fn is_production_alert_transition(tuple: &Tuple) -> bool {
+    tuple.category == Category::Event
+        && is_observational_sdlc_tuple(tuple)
+        && tuple.identity.starts_with("sdlc:transition:")
+}
+
+fn alert_diagnosis_context(occurrence: &Tuple) -> Option<AlertDiagnosisContext> {
+    if occurrence.category != Category::Event || occurrence.scope != "production_alert" {
+        return None;
+    }
+    let root = occurrence.payload.as_object()?;
+    let allowed_root = [
+        "source",
+        "delivery_id",
+        "family",
+        "subject",
+        "kind",
+        "summary",
+        "occurred_at",
+        "observed_at",
+        "correlation",
+        "refs",
+        "attributes",
+        "payload",
+    ];
+    if root.keys().any(|key| !allowed_root.contains(&key.as_str()))
+        || root.get("family").and_then(Value::as_str) != Some("production_alert")
+    {
+        return None;
+    }
+
+    let alert = root.get("payload")?.as_object()?;
+    let allowed_alert = [
+        "type",
+        "environment",
+        "service",
+        "alert_key",
+        "severity",
+        "state",
+    ];
+    if alert
+        .keys()
+        .any(|key| !allowed_alert.contains(&key.as_str()))
+        || alert.get("type").and_then(Value::as_str) != Some("production_alert")
+    {
+        return None;
+    }
+    let state = alert.get("state")?.as_str()?.to_string();
+    let environment = alert.get("environment")?.as_str()?.to_string();
+    let service = alert.get("service")?.as_str()?.to_string();
+    for value in alert.values().filter_map(Value::as_str) {
+        if unsafe_alert_context_text(value) {
+            return None;
+        }
+    }
+
+    let refs = root.get("refs")?.as_array()?;
+    for signal_ref in refs {
+        let signal_ref = signal_ref.as_object()?;
+        if signal_ref.len() != 2
+            || !signal_ref.contains_key("label")
+            || !signal_ref.contains_key("url")
+            || signal_ref.values().any(|value| {
+                value
+                    .as_str()
+                    .map(unsafe_alert_context_text)
+                    .unwrap_or(true)
+            })
+        {
+            return None;
+        }
+    }
+
+    let attributes = root.get("attributes")?.as_object()?;
+    if attributes.iter().any(|(key, value)| {
+        unsafe_alert_context_key(key)
+            || value
+                .as_str()
+                .map(unsafe_alert_context_text)
+                .unwrap_or(true)
+    }) {
+        return None;
+    }
+
+    Some(AlertDiagnosisContext {
+        state,
+        environment,
+        service,
+        alert: json!({
+            "environment": alert.get("environment"),
+            "service": alert.get("service"),
+            "alert_key": alert.get("alert_key"),
+            "severity": alert.get("severity"),
+            "state": alert.get("state"),
+        }),
+        refs: Value::Array(refs.clone()),
+        attributes: Value::Object(attributes.clone()),
+    })
+}
+
+fn unsafe_alert_context_key(value: &str) -> bool {
+    alert_diagnostic_text_is_unsafe(value)
+}
+
+fn unsafe_alert_context_text(value: &str) -> bool {
+    alert_diagnostic_text_is_unsafe(value)
+}
+
+fn safe_diagnostic_metadata(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(text)) if !unsafe_alert_context_text(text) => {
+            Value::String(text.clone())
+        }
+        Some(Value::Null) | None => Value::Null,
+        Some(value) if !value.is_string() => value.clone(),
+        _ => Value::Null,
+    }
+}
+
+fn ci_status_failed(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "fail" | "failed" | "failure"
+    )
+}
+
+fn ci_status_recovered(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "pass" | "passed" | "passing" | "success" | "succeeded" | "recovered"
     )
 }
 
@@ -1367,5 +2051,26 @@ mod tests {
             agent("Orphan", "repoA", Orphaned),
         ];
         assert!(convention_steer_targets(&agents, SYSTEM_SCOPE).is_empty());
+    }
+
+    #[test]
+    fn observational_sdlc_tuples_are_reserved_from_configured_triggers() {
+        let alert = Tuple::new(
+            Category::Event,
+            "production_alert",
+            "sdlc:event:alerts:delivery-1",
+            "source:alerts",
+            json!({"family": "production_alert"}),
+        );
+        let deployment = Tuple::new(
+            Category::Fact,
+            "deployment",
+            "sdlc:current:deploy-agent:prod:api",
+            "source:deploy-agent",
+            json!({"family": "deployment"}),
+        );
+        assert!(is_observational_sdlc_tuple(&alert));
+        assert!(is_observational_sdlc_tuple(&deployment));
+        assert!(!is_observational_sdlc_tuple(&tuple()));
     }
 }

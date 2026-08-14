@@ -1,0 +1,548 @@
+use rk_core::paths::Layout;
+use rk_daemon::proto::{Response as DaemonResponse, RpcError};
+use rk_daemon::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::future::Future;
+use std::pin::Pin;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+
+pub const SCHEMA: u8 = 1;
+
+const TOOLS: &[(&str, &str)] = &[
+    ("factory_snapshot", "Read a finite factory snapshot."),
+    (
+        "factory_events_replay",
+        "Replay a bounded finite factory event page.",
+    ),
+    (
+        "propose_workflow_run",
+        "Propose, but do not execute, a workflow.run action.",
+    ),
+    (
+        "approve_action",
+        "Approve an existing action proposal by digest.",
+    ),
+    (
+        "execute_approved_workflow_run",
+        "Execute an approved workflow.run action by digest.",
+    ),
+];
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JsonRpcRequest {
+    #[serde(default)]
+    pub jsonrpc: Option<String>,
+    pub id: Value,
+    pub method: String,
+    #[serde(default)]
+    pub params: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonRpcMessage {
+    #[serde(default)]
+    jsonrpc: Option<String>,
+    #[serde(default)]
+    id: Option<Value>,
+    method: String,
+    #[serde(default)]
+    params: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolCallParams {
+    name: String,
+    #[serde(default)]
+    arguments: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonRpcResponse {
+    pub jsonrpc: &'static str,
+    pub id: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<JsonRpcError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonRpcError {
+    pub code: i64,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FactorySnapshotRequest {
+    pub schema: u8,
+    pub repo: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FactoryEventsReplayRequest {
+    pub schema: u8,
+    pub repo: String,
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    pub limit: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunRequest {
+    pub schema: u8,
+    pub workflow: String,
+    pub repo: String,
+    #[serde(default)]
+    pub params: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApproveActionRequest {
+    pub schema: u8,
+    pub proposal_id: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecuteApprovedWorkflowRunRequest {
+    pub schema: u8,
+    pub proposal_id: String,
+    pub digest: String,
+    pub action: WorkflowRunRequest,
+}
+
+pub trait DaemonCaller {
+    fn call_raw<'a>(
+        &'a mut self,
+        method: &'a str,
+        params: Value,
+    ) -> Pin<Box<dyn Future<Output = rk_core::Result<DaemonResponse>> + Send + 'a>>;
+}
+
+impl DaemonCaller for Client {
+    fn call_raw<'a>(
+        &'a mut self,
+        method: &'a str,
+        params: Value,
+    ) -> Pin<Box<dyn Future<Output = rk_core::Result<DaemonResponse>> + Send + 'a>> {
+        Box::pin(async move { Client::call_raw(self, method, params).await })
+    }
+}
+
+pub async fn serve_stdio() -> rk_core::Result<()> {
+    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let stdout = tokio::io::stdout();
+    serve(stdin, stdout, || async {
+        let layout = Layout::discover()?;
+        Client::connect(&layout).await
+    })
+    .await
+}
+
+pub async fn serve<R, W, F, Fut, C>(
+    mut input: R,
+    mut output: W,
+    mut connect: F,
+) -> rk_core::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = rk_core::Result<C>>,
+    C: DaemonCaller,
+{
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if input.read_until(b'\n', &mut line).await? == 0 {
+            return Ok(());
+        }
+        let response = match std::str::from_utf8(&line) {
+            Ok(text) => handle_message(text, &mut connect).await,
+            Err(err) => {
+                eprintln!("rk-mcp: invalid UTF-8 request: {err}");
+                Some(JsonRpcResponse::err(
+                    Value::Null,
+                    -32700,
+                    format!("parse error: invalid UTF-8: {err}"),
+                ))
+            }
+        };
+        let Some(response) = response else {
+            continue;
+        };
+        let mut bytes = serde_json::to_vec(&response)?;
+        bytes.push(b'\n');
+        output.write_all(&bytes).await?;
+        output.flush().await?;
+    }
+}
+
+async fn handle_message<F, Fut, C>(text: &str, connect: &mut F) -> Option<JsonRpcResponse>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = rk_core::Result<C>>,
+    C: DaemonCaller,
+{
+    let value = match serde_json::from_str::<Value>(text) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("rk-mcp: parse error: {err}");
+            return Some(JsonRpcResponse::err(
+                Value::Null,
+                -32700,
+                format!("parse error: {err}"),
+            ));
+        }
+    };
+    let msg = match serde_json::from_value::<JsonRpcMessage>(value.clone()) {
+        Ok(msg) => msg,
+        Err(err) => {
+            eprintln!("rk-mcp: invalid request: {err}");
+            return Some(JsonRpcResponse::err(
+                value.get("id").cloned().unwrap_or(Value::Null),
+                -32600,
+                format!("invalid request: {err}"),
+            ));
+        }
+    };
+
+    let Some(id) = msg.id else {
+        if msg.method != "notifications/initialized" {
+            eprintln!("rk-mcp: ignored notification method {}", msg.method);
+        }
+        return None;
+    };
+
+    Some(
+        handle_request(
+            JsonRpcRequest {
+                jsonrpc: msg.jsonrpc,
+                id,
+                method: msg.method,
+                params: msg.params.unwrap_or_else(|| json!({})),
+            },
+            connect,
+        )
+        .await,
+    )
+}
+
+pub async fn handle_request<F, Fut, C>(req: JsonRpcRequest, connect: &mut F) -> JsonRpcResponse
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = rk_core::Result<C>>,
+    C: DaemonCaller,
+{
+    if req.jsonrpc.as_deref() != Some("2.0") {
+        return JsonRpcResponse::err(req.id, -32600, "invalid request");
+    }
+    if !req.params.is_object() {
+        return JsonRpcResponse::err(req.id, -32602, "params must be an object");
+    }
+
+    match req.method.as_str() {
+        "initialize" => JsonRpcResponse::ok(
+            req.id,
+            json!({
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {"name": "rk-mcp", "version": env!("CARGO_PKG_VERSION")},
+                "capabilities": {"tools": {}}
+            }),
+        ),
+        "tools/list" => JsonRpcResponse::ok(req.id, json!({"tools": tools()})),
+        "tools/call" => handle_tool_call(req.id, req.params, connect).await,
+        _ => JsonRpcResponse::err(req.id, -32601, "method not found"),
+    }
+}
+
+async fn handle_tool_call<F, Fut, C>(id: Value, params: Value, connect: &mut F) -> JsonRpcResponse
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = rk_core::Result<C>>,
+    C: DaemonCaller,
+{
+    let tool_params = match serde_json::from_value::<ToolCallParams>(params) {
+        Ok(params) => params,
+        Err(err) => return JsonRpcResponse::err(id, -32602, format!("invalid params: {err}")),
+    };
+    let prepared = match prepare_tool(
+        &tool_params.name,
+        tool_params.arguments.unwrap_or(Value::Null),
+    ) {
+        Ok(prepared) => prepared,
+        Err(err) => return JsonRpcResponse::err(id, -32602, err),
+    };
+    let mut client = match connect().await {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!("rk-mcp: daemon connection failed: {err}");
+            return JsonRpcResponse::err(id, -32000, err.to_string());
+        }
+    };
+    match client.call_raw(&prepared.method, prepared.params).await {
+        Ok(resp) => daemon_to_mcp(id, resp),
+        Err(err) => {
+            eprintln!(
+                "rk-mcp: daemon transport failed for {}: {err}",
+                prepared.method
+            );
+            JsonRpcResponse::err(id, -32000, err.to_string())
+        }
+    }
+}
+
+struct PreparedCall {
+    method: String,
+    params: Value,
+}
+
+fn prepare_tool(name: &str, arguments: Value) -> Result<PreparedCall, String> {
+    if !arguments.is_object() {
+        return Err("arguments must be an object".into());
+    }
+    match name {
+        "factory_snapshot" => {
+            let args: FactorySnapshotRequest = parse_args(arguments)?;
+            ensure_schema(args.schema)?;
+            Ok(PreparedCall {
+                method: "factory.snapshot".into(),
+                params: json!({"repo": args.repo}),
+            })
+        }
+        "factory_events_replay" => {
+            let args: FactoryEventsReplayRequest = parse_args(arguments)?;
+            ensure_schema(args.schema)?;
+            if args.limit == 0 || args.limit > 200 {
+                return Err("limit must be between 1 and 200".into());
+            }
+            let mut params = json!({"repo": args.repo, "limit": args.limit});
+            if !args.kinds.is_empty() {
+                params["kinds"] = json!(args.kinds);
+            }
+            if let Some(after) = args.after {
+                params["after"] = json!(after);
+            }
+            Ok(PreparedCall {
+                method: "factory.events.replay".into(),
+                params,
+            })
+        }
+        "propose_workflow_run" => {
+            let args: WorkflowRunRequest = parse_args(arguments)?;
+            ensure_schema(args.schema)?;
+            Ok(PreparedCall {
+                method: "factory.propose_action".into(),
+                params: propose_params(args),
+            })
+        }
+        "approve_action" => {
+            let args: ApproveActionRequest = parse_args(arguments)?;
+            ensure_schema(args.schema)?;
+            require_digest(&args.digest)?;
+            Ok(PreparedCall {
+                method: "factory.approve_action".into(),
+                params: json!({"proposal_id": args.proposal_id, "digest": args.digest}),
+            })
+        }
+        "execute_approved_workflow_run" => {
+            let args: ExecuteApprovedWorkflowRunRequest = parse_args(arguments)?;
+            ensure_schema(args.schema)?;
+            require_digest(&args.digest)?;
+            ensure_schema(args.action.schema)?;
+            Ok(PreparedCall {
+                method: "factory.execute_action".into(),
+                params: json!({"proposal_id": args.proposal_id, "digest": args.digest, "action": workflow_action(args.action)}),
+            })
+        }
+        _ => Err("unknown tool".into()),
+    }
+}
+
+fn workflow_action(args: WorkflowRunRequest) -> Value {
+    let mut action = json!({"name": args.workflow, "repo": args.repo, "params": args.params});
+    if let Some(coordinator) = args.coordinator {
+        action["coordinator"] = json!(coordinator);
+    }
+    action
+}
+
+fn propose_params(args: WorkflowRunRequest) -> Value {
+    let ttl = args.ttl;
+    let mut params = json!({"kind":"workflow.run", "action": workflow_action(args)});
+    if let Some(ttl) = ttl {
+        params["ttl_seconds"] = json!(ttl);
+    }
+    params
+}
+
+fn parse_args<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, String> {
+    if !value.is_object() {
+        return Err("invalid arguments: arguments must be an object".into());
+    }
+    serde_json::from_value(value).map_err(|err| format!("invalid arguments: {err}"))
+}
+
+fn ensure_schema(schema: u8) -> Result<(), String> {
+    if schema == SCHEMA {
+        Ok(())
+    } else {
+        Err("unsupported schema".into())
+    }
+}
+
+fn require_digest(digest: &str) -> Result<(), String> {
+    if digest.trim().is_empty() {
+        Err("digest is required".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn daemon_to_mcp(id: Value, resp: DaemonResponse) -> JsonRpcResponse {
+    if let Some(error) = resp.error {
+        return daemon_error(id, error);
+    }
+    let text = serde_json::to_string(
+        &json!({"schema": SCHEMA, "daemon": resp.result.unwrap_or(Value::Null)}),
+    )
+    .unwrap();
+    JsonRpcResponse::ok(id, json!({"content": [{"type": "text", "text": text}]}))
+}
+
+fn daemon_error(id: Value, error: RpcError) -> JsonRpcResponse {
+    eprintln!(
+        "rk-mcp: daemon connection failed: {}: {}",
+        error.code, error.message
+    );
+    JsonRpcResponse {
+        jsonrpc: "2.0",
+        id,
+        result: None,
+        error: Some(JsonRpcError {
+            code: -32000,
+            message: error.message,
+            data: Some(json!({"daemon_code": error.code})),
+        }),
+    }
+}
+
+fn tools() -> Vec<Value> {
+    TOOLS
+        .iter()
+        .map(|(name, description)| {
+            json!({
+                "name": name,
+                "description": description,
+                "inputSchema": tool_schema(name)
+            })
+        })
+        .collect()
+}
+
+fn tool_schema(name: &str) -> Value {
+    match name {
+        "factory_snapshot" => object_schema(
+            json!({"schema": schema_property(), "repo": string_property("Repository name")}),
+            vec!["schema", "repo"],
+        ),
+        "factory_events_replay" => object_schema(
+            json!({
+                "schema": schema_property(),
+                "repo": string_property("Repository name"),
+                "after": {"type":"integer", "minimum":0, "description":"Exclusive event cursor to resume after"},
+                "limit": {"type":"integer", "minimum":1, "maximum":200, "description":"Maximum events to return"},
+                "kinds": {"type":"array", "items":{"type":"string"}, "description":"Optional event kind filters"}
+            }),
+            vec!["schema", "repo", "limit"],
+        ),
+        "propose_workflow_run" => object_schema(
+            json!({
+                "schema": schema_property(),
+                "workflow": string_property("Workflow name"),
+                "repo": string_property("Repository name"),
+                "params": {"type":"object", "additionalProperties": true, "description":"Workflow input parameters"},
+                "coordinator": string_property("Optional coordinator session identity"),
+                "ttl": {"type":"integer", "minimum":1, "description":"Optional proposal TTL in seconds"}
+            }),
+            vec!["schema", "workflow", "repo"],
+        ),
+        "approve_action" => object_schema(
+            json!({"schema": schema_property(), "proposal_id": string_property("Proposal id"), "digest": string_property("Expected proposal digest")}),
+            vec!["schema", "proposal_id", "digest"],
+        ),
+        "execute_approved_workflow_run" => object_schema(
+            json!({
+                "schema": schema_property(),
+                "proposal_id": string_property("Proposal id"),
+                "digest": string_property("Approved proposal digest"),
+                "action": object_schema(
+                    json!({
+                        "schema": schema_property(),
+                        "workflow": string_property("Workflow name"),
+                        "repo": string_property("Repository name"),
+                        "params": {"type":"object", "additionalProperties": true, "description":"Workflow input parameters"},
+                        "coordinator": string_property("Optional coordinator session identity"),
+                        "ttl": {"type":"integer", "minimum":1, "description":"Optional proposal TTL in seconds"}
+                    }),
+                    vec!["schema", "workflow", "repo"],
+                )
+            }),
+            vec!["schema", "proposal_id", "digest", "action"],
+        ),
+        _ => object_schema(json!({}), vec![]),
+    }
+}
+
+fn object_schema(properties: Value, required: Vec<&str>) -> Value {
+    json!({"type":"object", "additionalProperties": false, "properties": properties, "required": required})
+}
+
+fn schema_property() -> Value {
+    json!({"const": SCHEMA, "description":"MCP argument schema version"})
+}
+
+fn string_property(description: &str) -> Value {
+    json!({"type":"string", "minLength":1, "description": description})
+}
+
+impl JsonRpcResponse {
+    fn ok(id: Value, result: Value) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    fn err(id: Value, code: i64, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            }),
+        }
+    }
+}

@@ -1,0 +1,1 @@
+{"id":"EV-code-review","kind":"code_review","producer":{"kind":"external-tool","name":"reviewer"},"summary":"Review passed","artifact_paths":["artifacts/review.md"],"payload":{"decision":"approved"}}

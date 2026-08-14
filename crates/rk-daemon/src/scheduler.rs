@@ -47,10 +47,9 @@ pub struct Scheduler {
     layout: Layout,
     config: SchedulerConfig,
     cursor_file: PathBuf,
-    /// Per-schedule single-flight: schedule name -> the instance id of its most
-    /// recent fire. In-memory: a restart legitimately clears it (the old run has
-    /// almost certainly finished or been reaped), and the running-instance check
-    /// is the actual guard.
+    /// Per-schedule cache: schedule name -> the instance id of its most recent
+    /// fire. Durable running instances retain the schedule name, so a restart
+    /// cannot clear the actual per-schedule single-flight guard.
     running: Mutex<HashMap<String, String>>,
 }
 
@@ -149,7 +148,7 @@ impl Scheduler {
     fn try_fire(&self, loaded: &Loaded, registry: &RepoRegistry) -> rk_core::Result<bool> {
         let sched = &loaded.schedule;
 
-        // Single-flight: skip if this schedule's previous run is still active.
+        // Fast path: skip if this process already remembers an active fire.
         if let Some(id) = self.running.lock().unwrap_or_else(|p| p.into_inner()).get(&sched.name) {
             if matches!(
                 self.engine.status(id).map(|i| i.status),
@@ -178,7 +177,30 @@ impl Scheduler {
             .map(|(k, v)| (k.clone(), Value::String(v.clone())))
             .collect();
 
-        let instance = self.engine.run(&sched.run, &repo_path, params)?;
+        // Restart path: the in-memory schedule cache is empty after boot, but the
+        // workflow snapshots have already been rehydrated. Prefer persisted
+        // schedule identity. Legacy snapshots predate that field, so exact work
+        // identity is their conservative compatibility fallback.
+        if let Some(instance) = self.engine.list().into_iter().find(|instance| {
+            instance.status == InstanceStatus::Running
+                && instance.depth == 0
+                && (instance.schedule.as_deref() == Some(sched.name.as_str())
+                    || (instance.schedule.is_none()
+                        && instance.repo == repo_path
+                        && instance.definition == sched.run
+                        && instance.params == params))
+        }) {
+            info!(schedule = %sched.name, instance = %instance.id, "scheduler: durable matching run still active; skipping (single-flight)");
+            self.running
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(sched.name.clone(), instance.id);
+            return Ok(false);
+        }
+
+        let instance = self
+            .engine
+            .run_scheduled(&sched.name, &sched.run, &repo_path, params)?;
         info!(
             schedule = %sched.name,
             workflow = %sched.run,

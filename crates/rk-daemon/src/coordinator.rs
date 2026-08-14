@@ -704,6 +704,7 @@ mod tests {
             workflow: "feature-set".into(),
             repo: "repo".into(),
             coordinator: Some("session-1".into()),
+            schedule: None,
             status: crate::workflow_exec::InstanceStatus::Running,
             revision: 1,
             current_step: 1,
