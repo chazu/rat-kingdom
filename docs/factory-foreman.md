@@ -120,11 +120,13 @@ rk factory install-mcp
 
 The normal install script builds and places the release `rk-mcp` binary beside
 `rk`. `rk factory install-mcp` copies that release binary to the stable sibling
-location when needed and updates only the `rk` entry in `~/.jcode/mcp.json`.
-It preserves other servers, root fields, and unknown fields. An existing `rk`
-entry is treated as user-owned unless it carries the RK installer marker, so
-the command refuses to replace it unless `--force` is supplied. Re-running the
-command is idempotent and does not register anything during ordinary builds.
+location when needed and updates only the `rk` entry under the top-level
+`servers` object in `~/.jcode/mcp.json`. It preserves other servers, root
+fields, and unknown fields, including any legacy `mcpServers` root it finds.
+An existing `rk` entry is treated as user-owned unless it carries the RK
+installer marker, so the command refuses to replace it unless `--force` is
+supplied. Re-running the command is idempotent and does not register anything
+during ordinary builds.
 For automation, `rk --json factory install-mcp` emits a
 `factory.mcp-install.v1` envelope with the binary and configuration paths.
 
