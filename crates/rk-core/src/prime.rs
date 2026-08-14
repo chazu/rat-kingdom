@@ -302,8 +302,10 @@ const FRAGMENT_SINGLE_TASK: &str = "\
 
 You have exactly one task this lifetime: RK_TASK. When it is complete, run
 `rk done \"<one-line summary>\"` and STOP. Do not claim, start, or continue any
-other work, even if you notice claimable tasks or open needs — post a `fact`
-or `need` tuple instead and let the orchestrator route it.
+other work, even if you notice claimable tasks or open needs — file a ticket
+(`rk ticket new`) or post a `need` tuple instead and let the orchestrator route
+it. Do not write a `fact` tuple: agent callers are forbidden from writing it.
+Use `rk out artifact <repo> <name> --payload '{...}'` for a durable finding.
 ";
 
 const FRAGMENT_ONBOARDER: &str = "\
@@ -394,8 +396,9 @@ const FRAGMENT_COMPLETION: &str = "\
    entrypoint exists, report that gap as an obstacle or need instead of guessing.
 4. Never `rk done` on a build you broke. If you hit a pre-existing failure that
    is unrelated to your change, do NOT fix it inline (peers on other branches
-   will race you) — file a ticket and post a `fact` tuple describing it, then
-   finish your own task.
+   will race you) — file a ticket and record it as an artifact
+   (`rk out artifact <repo> preexisting-failure --payload '{...}'`), then finish
+   your own task. Do not retry `rk out fact`: an agent caller receives `forbidden`.
 5. Prove the branch carries the work before you signal. `rk done` is NOT a
    commit: run `git status --porcelain` (must be empty) and
    `git log <base>..HEAD` (must be non-empty). Resolve `<base>` — do not assume
@@ -682,6 +685,32 @@ mod tests {
         let text = render("reviewer", &ctx());
         assert!(text.contains("APPROVE"));
         assert!(!text.contains("only your task"));
+    }
+
+    #[test]
+    fn agent_roles_use_artifact_handoff_for_durable_findings() {
+        for role in ["rat", "reviewer"] {
+            let text = render(role, &ctx());
+            assert!(
+                text.contains("rk out artifact"),
+                "{role} prompt should provide the durable artifact handoff"
+            );
+            assert!(
+                text.contains("agent caller receives `forbidden`"),
+                "{role} prompt should make forbidden fact writes non-retriable"
+            );
+            assert!(
+                !text.contains("post a `fact` tuple"),
+                "{role} prompt still contains the stale fact handoff"
+            );
+            assert!(
+                text.contains("rk need") && text.contains("rk obstacle"),
+                "{role} prompt should preserve live need/obstacle signals"
+            );
+        }
+
+        let rat = render("rat", &ctx());
+        assert!(rat.contains("Do not write a `fact` tuple"));
     }
 
     #[test]

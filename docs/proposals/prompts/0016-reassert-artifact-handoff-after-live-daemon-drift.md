@@ -5,7 +5,10 @@
 `FRAGMENT_COMPLETION` step 4
 **Companion convention:** `hand-off-through-artifact-and-ticket-not-fact`
 **Follow-up:** proposal 0011 / TKT-01KYMQWRSD70DTQCXDYST0Q4FK
-**Status:** proposed (do NOT apply live — this rat only writes proposals)
+**Status:** landed
+
+The prompt-side replacement landed in `crates/rk-core/src/prime.rs`; the
+proposal below records the rationale and exact wording that was applied.
 
 ## The recurring pain
 
