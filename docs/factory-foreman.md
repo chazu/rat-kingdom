@@ -111,6 +111,32 @@ The command installs the package embedded in the current RK release to `~/.jcode
 
 The global skill instructs Jcode to use native typed RK reads first: factory snapshot, bounded event replay, scorecards, and recommendations. It triages fleet and workflow health, names degraded evidence, deduplicates existing tickets, recommends registered workflow definitions, and can prepare an exact typed proposal. It must stop for a later human approval before forwarding that proposal through `factory approve` and `factory execute-action`. Repository resolution, authenticated caller identity, canonical digest verification, approval lifecycle, CAS checks, idempotency, and execution remain daemon responsibilities.
 
+Install and register the local MCP facade explicitly when Jcode's MCP client is available:
+
+```bash
+mise run install
+rk factory install-mcp
+```
+
+The normal install script builds and places the release `rk-mcp` binary beside
+`rk`. `rk factory install-mcp` copies that release binary to the stable sibling
+location when needed and updates only the `rk` entry under the top-level
+`servers` object in `~/.jcode/mcp.json`. It preserves other servers, root
+fields, and unknown fields, including any legacy `mcpServers` root it finds.
+An existing `rk` entry is treated as user-owned unless it carries the RK
+installer marker, so the command refuses to replace it unless `--force` is
+supplied. Re-running the command is idempotent and does not register anything
+during ordinary builds.
+For automation, `rk --json factory install-mcp` emits a
+`factory.mcp-install.v1` envelope with the binary and configuration paths.
+
+When the server is registered and available, the skill prefers the typed MCP
+tools `propose_workflow_run`, `approve_action`, and
+`execute_approved_workflow_run` for the proposal/approval/execution leg. It
+falls back to the equivalent `rk --json factory` shell-outs when MCP is not
+available. The approval boundary remains unchanged: proposal in one turn,
+approval and execution only after a later human turn.
+
 The human-facing dashboard is part of the Rust `rk` binary. From a registered repository, run:
 
 ```bash

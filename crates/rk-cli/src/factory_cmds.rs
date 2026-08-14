@@ -4,13 +4,20 @@ use rk_core::paths::Layout;
 use rk_daemon::Client;
 use serde_json::{json, Map, Value};
 use std::fmt::Write as _;
+use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
+use std::process;
+
+const MCP_MANAGED_MARKER: &str = "x-rat-kingdom-managed";
+const MCP_MANAGED_VALUE: &str = "factory.mcp-install.v1";
 
 #[derive(Subcommand)]
 pub enum FactoryCommand {
     /// Install the bundled Factory Foreman skill into Jcode's global skill directory.
     InstallSkill(FactoryInstallSkillArgs),
+    /// Install the local rk-mcp bridge and register it with Jcode.
+    InstallMcp(FactoryInstallMcpArgs),
     /// Open a Rust-native read-only factory dashboard, auto-starting the daemon.
     Dashboard(FactoryDashboardArgs),
     /// Read the native factory snapshot without starting the daemon.
@@ -41,6 +48,13 @@ pub enum FactoryCommand {
 #[derive(Args)]
 pub struct FactoryInstallSkillArgs {
     /// Replace an installed skill that differs from this RK release.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args)]
+pub struct FactoryInstallMcpArgs {
+    /// Replace an existing Jcode `rk` server entry not marked as RK-managed.
     #[arg(long)]
     pub force: bool,
 }
@@ -279,6 +293,28 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
                 );
             }
         }
+        FactoryCommand::InstallMcp(args) => {
+            let result = install_mcp(args.force)?;
+            if json_output {
+                println!(
+                    "{}",
+                    json!({
+                        "schema": "factory.mcp-install.v1",
+                        "server": "rk",
+                        "disposition": result.disposition,
+                        "binary": result.binary,
+                        "config": result.config,
+                    })
+                );
+            } else {
+                println!(
+                    "{} rk-mcp at {} and registered it in {}",
+                    result.disposition,
+                    result.binary.display(),
+                    result.config.display()
+                );
+            }
+        }
         FactoryCommand::Dashboard(mut args) => {
             if dashboard_output_mode(json_output, io::stdout().is_terminal(), args.plain)
                 == DashboardOutputMode::Interactive
@@ -480,6 +516,226 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
             }
         }
     }
+    Ok(())
+}
+
+struct McpInstallResult {
+    disposition: &'static str,
+    binary: PathBuf,
+    config: PathBuf,
+}
+
+fn install_mcp(force: bool) -> Result<McpInstallResult> {
+    let binary = std::env::current_exe()
+        .context("locate the running rk executable for sibling rk-mcp installation")?
+        .parent()
+        .ok_or_else(|| anyhow!("the running rk executable has no parent directory"))?
+        .join("rk-mcp");
+    let config = dirs::home_dir()
+        .ok_or_else(|| anyhow!("cannot locate Jcode's global MCP configuration"))?
+        .join(".jcode")
+        .join("mcp.json");
+
+    let (mut document, _) = read_mcp_config(&config)?;
+    let (config_changed, entry_existed) = register_mcp(&mut document, &binary, force)?;
+    let source = locate_mcp_source(&binary)?;
+
+    let binary_existed = binary.is_file();
+    let binary_changed = install_mcp_binary(source.as_deref(), &binary)?;
+    if config_changed {
+        write_json_atomically(&config, &document)?;
+    }
+
+    let disposition = if !binary_existed && !entry_existed {
+        "installed"
+    } else if binary_changed || config_changed {
+        "updated"
+    } else {
+        "already_installed"
+    };
+    Ok(McpInstallResult {
+        disposition,
+        binary,
+        config,
+    })
+}
+
+fn read_mcp_config(path: &Path) -> Result<(Value, bool)> {
+    if !path.exists() {
+        return Ok((Value::Object(Map::new()), false));
+    }
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("read Jcode MCP configuration {}", path.display()))?;
+    let document: Value = serde_json::from_str(&text)
+        .with_context(|| format!("parse Jcode MCP configuration {}", path.display()))?;
+    if !document.is_object() {
+        return Err(anyhow!(
+            "Jcode MCP configuration {} must contain a JSON object",
+            path.display()
+        ));
+    }
+    Ok((document, true))
+}
+
+fn register_mcp(document: &mut Value, binary: &Path, force: bool) -> Result<(bool, bool)> {
+    let root = document
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Jcode MCP configuration must contain a JSON object"))?;
+    // Jcode discovers MCP servers under the top-level `servers` object. Keep
+    // any legacy/foreign roots untouched rather than creating a Claude-style
+    // `mcpServers` tree that Jcode will never read.
+    let servers = match root.entry("servers".to_string()) {
+        serde_json::map::Entry::Vacant(entry) => entry.insert(Value::Object(Map::new())),
+        serde_json::map::Entry::Occupied(entry) => entry.into_mut(),
+    };
+    let servers = servers
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Jcode MCP configuration field servers must be an object"))?;
+    let entry_existed = servers.contains_key("rk");
+    let entry = servers
+        .entry("rk".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let owned = entry
+        .as_object()
+        .and_then(|entry| entry.get(MCP_MANAGED_MARKER))
+        .and_then(Value::as_str)
+        == Some(MCP_MANAGED_VALUE);
+    if entry_existed && !owned && !force {
+        return Err(anyhow!(
+            "Jcode MCP configuration already contains an unmanaged `rk` entry; rerun with --force to replace its managed fields"
+        ));
+    }
+
+    let entry = if let Some(entry) = entry.as_object_mut() {
+        entry
+    } else {
+        *entry = Value::Object(Map::new());
+        entry
+            .as_object_mut()
+            .expect("replaced MCP entry is an object")
+    };
+    let previous = entry.clone();
+    entry.insert(
+        "command".into(),
+        Value::String(binary.to_string_lossy().into_owned()),
+    );
+    entry.insert("args".into(), Value::Array(Vec::new()));
+    entry.insert(
+        MCP_MANAGED_MARKER.into(),
+        Value::String(MCP_MANAGED_VALUE.into()),
+    );
+    Ok((previous != entry.clone(), entry_existed))
+}
+
+fn locate_mcp_source(destination: &Path) -> Result<Option<PathBuf>> {
+    if let Ok(source) = std::env::var("RK_MCP_SOURCE") {
+        let source = PathBuf::from(source);
+        if !source.is_file() {
+            return Err(anyhow!(
+                "RK_MCP_SOURCE does not point to a file: {}",
+                source.display()
+            ));
+        }
+        return Ok(Some(source));
+    }
+
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for candidate in [
+        workspace.join("target/release/rk-mcp"),
+        workspace.join("target/debug/rk-mcp"),
+    ] {
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+    }
+    if destination.is_file() {
+        return Ok(Some(destination.to_path_buf()));
+    }
+    Err(anyhow!(
+        "cannot locate the release rk-mcp binary; run `mise run install` first or set RK_MCP_SOURCE for a packaged source"
+    ))
+}
+
+fn install_mcp_binary(source: Option<&Path>, destination: &Path) -> Result<bool> {
+    let Some(source) = source else {
+        return Ok(false);
+    };
+    if source == destination {
+        return Ok(false);
+    }
+    if destination.is_file() && fs::read(source).ok() == fs::read(destination).ok() {
+        return Ok(false);
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        anyhow!(
+            "rk-mcp destination has no parent: {}",
+            destination.display()
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create rk-mcp installation directory {}", parent.display()))?;
+    let staging = parent.join(format!(".rk-mcp.install-{}", process::id()));
+    if staging.exists() {
+        fs::remove_file(&staging)
+            .with_context(|| format!("remove stale rk-mcp staging file {}", staging.display()))?;
+    }
+    fs::copy(source, &staging).with_context(|| {
+        format!(
+            "copy release rk-mcp from {} to {}",
+            source.display(),
+            staging.display()
+        )
+    })?;
+    set_mcp_executable(&staging)?;
+    fs::rename(&staging, destination).with_context(|| {
+        format!(
+            "install staged rk-mcp {} to {}",
+            staging.display(),
+            destination.display()
+        )
+    })?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn set_mcp_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path)
+        .with_context(|| format!("read rk-mcp permissions {}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("mark rk-mcp executable {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_mcp_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn write_json_atomically(path: &Path, document: &Value) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("MCP configuration has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create Jcode configuration directory {}", parent.display()))?;
+    let staging = parent.join(format!(".mcp.json.install-{}", process::id()));
+    if staging.exists() {
+        fs::remove_file(&staging)
+            .with_context(|| format!("remove stale MCP configuration {}", staging.display()))?;
+    }
+    let mut encoded =
+        serde_json::to_vec_pretty(document).context("encode Jcode MCP configuration")?;
+    encoded.push(b'\n');
+    fs::write(&staging, encoded)
+        .with_context(|| format!("write staged MCP configuration {}", staging.display()))?;
+    fs::rename(&staging, path).with_context(|| {
+        format!(
+            "install staged MCP configuration {} to {}",
+            staging.display(),
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
