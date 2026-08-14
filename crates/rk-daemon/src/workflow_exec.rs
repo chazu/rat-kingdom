@@ -2376,6 +2376,21 @@ impl WorkflowEngine {
             ] {
                 child_command.env_remove(name);
             }
+        } else {
+            // The child executes inside the active agent's worktree, and the
+            // server treats a worktree cwd as that agent's authority domain: a
+            // connection from there may claim only that agent as caller. An
+            // escalation check that shells back into `rk` (need rows, rework
+            // tickets) with no identity is therefore FORBIDDEN
+            // deterministically — the silent-escalation defect
+            // (TKT-01M00WPWEFZVPW3YBNX3825MBG). Give the child the same
+            // credential set a harness gets so its writes are authorized and
+            // attributed to the agent whose worktree it runs in.
+            child_command.env("RK_HOME", self.layout.home().display().to_string());
+            child_command.env("RK_AGENT", &agent);
+            if let Ok(token) = self.layout.agent_auth_token(&agent) {
+                child_command.env("RK_AUTH_TOKEN", token);
+            }
         }
         for (name, value) in &run.env {
             if !valid_check_env_name(name) {
@@ -2450,12 +2465,14 @@ impl WorkflowEngine {
         // sneaks a too-slow check past a declared exit gate.
         if let Some(expected) = resolved.expect_exit {
             if exit != expected {
-                // Carry the check's own words into the instance error. Without
-                // this, a failing escalation check (e.g. `jq: command not
-                // found` feeding an empty payload into `rk out`) surfaces only
-                // its command text and exit code, masking the actual cause.
+                // Carry the check's own words into the instance error, and —
+                // when this check is an escalation running right after a failed
+                // gate — LEAD with the gate's result. Without both, a failing
+                // report check (empty payload, forbidden caller) replaces the
+                // reason the workflow actually stopped.
                 return Err(rk_core::Error::other(format!(
-                    "run step: `{command}` exited {exit}, expected {expected}{}",
+                    "{}run step: `{command}` exited {exit}, expected {expected}{}",
+                    prior_gate_failure(ctx.previous_result.as_ref()),
                     check_failure_detail(&stdout, &stderr)
                 )));
             }
@@ -3319,6 +3336,28 @@ fn check_child_path(
     std::env::join_paths(parts).ok().or(inherited)
 }
 
+/// When a run step fails immediately after a failed (or timed-out) run step —
+/// the escalation-check-after-red-gate shape — the instance error must open
+/// with the gate's own result. The escalation's failure is secondary; the gate
+/// verdict is why the workflow stopped.
+fn prior_gate_failure(previous: Option<&Value>) -> String {
+    let Some(previous) = previous else {
+        return String::new();
+    };
+    let verdict = previous["verdict"].as_str().unwrap_or("");
+    if verdict != "fail" && verdict != "timeout" {
+        return String::new();
+    }
+    format!(
+        "gate failed first: verdict {verdict}, exit {}{}; escalation also failed: ",
+        previous["exit"].as_i64().unwrap_or(-1),
+        check_failure_detail(
+            previous["stdout"].as_str().unwrap_or(""),
+            previous["stderr"].as_str().unwrap_or("")
+        )
+    )
+}
+
 /// Bounded stdout/stderr tails for a failed check's instance error, so the
 /// operator sees what the check said, not just that it said no.
 fn check_failure_detail(stdout: &str, stderr: &str) -> String {
@@ -3905,6 +3944,35 @@ mod tests {
         );
         // Nothing known at all: leave the child env alone.
         assert_eq!(check_child_path(None, None), None);
+    }
+
+    /// The escalation-after-red-gate error must LEAD with the gate result and
+    /// contain both failures — a dead report check must never replace the
+    /// reason the workflow stopped.
+    #[test]
+    fn prior_gate_failure_leads_the_composed_error() {
+        let gate = json!({
+            "exit": 1,
+            "verdict": "fail",
+            "stdout": "",
+            "stderr": "test blew up",
+            "timed_out": false,
+        });
+        let prefix = prior_gate_failure(Some(&gate));
+        assert_eq!(
+            prefix,
+            "gate failed first: verdict fail, exit 1; stderr: test blew up; escalation also failed: "
+        );
+        // A timeout is a gate failure too.
+        let timed = json!({"exit": 124, "verdict": "timeout", "stdout": "", "stderr": ""});
+        assert!(prior_gate_failure(Some(&timed)).starts_with("gate failed first: verdict timeout"));
+        // A passing prior step (the REWORK arm's green gate) adds nothing —
+        // the escalation's own failure stands alone.
+        let green = json!({"exit": 0, "verdict": "pass", "stdout": "ok", "stderr": ""});
+        assert_eq!(prior_gate_failure(Some(&green)), "");
+        assert_eq!(prior_gate_failure(None), "");
+        // Non-run prior results (harness output) have no verdict: no prefix.
+        assert_eq!(prior_gate_failure(Some(&json!({"result": "done"}))), "");
     }
 
     /// A failing check's error must carry the check's own words — an exit code
