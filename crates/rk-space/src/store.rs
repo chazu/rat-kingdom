@@ -1635,7 +1635,7 @@ fn sdlc_transition_tuple(
             key.subject
         ),
         principal.as_str(),
-        json!({"source": envelope.source.as_str(), "delivery_id": envelope.delivery_id, "family": key.family, "subject": key.subject, "previous_digest": previous_digest, "current_digest": current_digest}),
+        json!({"source": envelope.source.as_str(), "delivery_id": envelope.delivery_id, "family": key.family, "subject": key.subject, "kind": envelope.kind, "previous_digest": previous_digest, "current_digest": current_digest}),
     );
     tuple.id = stable_record_id(&[
         "sdlc",

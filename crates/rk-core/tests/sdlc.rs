@@ -96,6 +96,13 @@ fn test_signal_envelope_round_trips_known_kinds() {
                 }
                 .into();
             }
+            SignalKind::CiRecovered => {
+                envelope.payload = CiSignal {
+                    status: "success".into(),
+                    conclusion: Some("success".into()),
+                }
+                .into();
+            }
             _ => {}
         }
 
@@ -114,6 +121,14 @@ fn test_correlation_rejects_empty_identity_for_transition_signals() {
     envelope.correlation.job = Some("   ".into());
 
     assert!(envelope.validate(&SignalLimits::default()).is_err());
+}
+
+#[test]
+fn test_ci_recovered_rejects_failure_payload_as_inconsistent() {
+    let envelope = base_envelope(SignalKind::CiRecovered);
+
+    let error = envelope.validate(&SignalLimits::default()).unwrap_err();
+    assert!(error.to_string().contains("kind") && error.to_string().contains("payload"));
 }
 
 #[test]

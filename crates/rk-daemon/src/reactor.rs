@@ -925,22 +925,17 @@ impl Reactor {
         let Some(current) = self.current_ci_fact(source, subject)? else {
             return Ok(false);
         };
-        let status = current
-            .payload
-            .get("current")
-            .and_then(|v| v.get("status"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        if ci_status_failed(status) {
-            self.write_ci_diagnostic(&key, tuple, &current)?;
-            return Ok(true);
+        match tuple.payload.get("kind").and_then(Value::as_str) {
+            Some("ci_failed") => {
+                self.write_ci_diagnostic(&key, tuple, &current)?;
+                Ok(true)
+            }
+            Some("ci_recovered") if self.has_ci_diagnostic(subject)? => {
+                self.write_ci_recovery(&key, tuple, &current)?;
+                Ok(true)
+            }
+            _ => Ok(false),
         }
-        if ci_status_recovered(status) && self.has_ci_diagnostic(subject)? {
-            self.write_ci_recovery(&key, tuple, &current)?;
-            return Ok(true);
-        }
-        Ok(false)
     }
 
     fn react_to_sdlc_ci_transition_backlog(&self) -> rk_core::Result<usize> {
@@ -1782,20 +1777,6 @@ fn safe_diagnostic_metadata(value: Option<&Value>) -> Value {
         Some(value) if !value.is_string() => value.clone(),
         _ => Value::Null,
     }
-}
-
-fn ci_status_failed(status: &str) -> bool {
-    matches!(
-        status.to_ascii_lowercase().as_str(),
-        "fail" | "failed" | "failure"
-    )
-}
-
-fn ci_status_recovered(status: &str) -> bool {
-    matches!(
-        status.to_ascii_lowercase().as_str(),
-        "pass" | "passed" | "passing" | "success" | "succeeded" | "recovered"
-    )
 }
 
 /// Compose the mid-session steer message for a newly promoted convention.

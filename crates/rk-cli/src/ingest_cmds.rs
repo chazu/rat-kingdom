@@ -115,6 +115,11 @@ fn build_ci_envelope(args: &IngestEventArgs) -> Result<SignalEnvelope> {
     }
     let source = ConfiguredSourceName::new(args.source.clone()).map_err(|e| anyhow!(e.to_string()))?;
     let now = Utc::now();
+    let (status, conclusion) = match &kind {
+        SignalKind::CiFailed => ("failed", "failure"),
+        SignalKind::CiRecovered => ("success", "success"),
+        _ => unreachable!("CLI kind parser only permits CI kinds"),
+    };
     let envelope = SignalEnvelope {
         kind,
         source,
@@ -132,7 +137,10 @@ fn build_ci_envelope(args: &IngestEventArgs) -> Result<SignalEnvelope> {
         summary: args.summary.clone().ok_or_else(|| anyhow!("--summary is required"))?,
         refs: Vec::new(),
         attributes,
-        payload: SignalPayload::Ci(CiSignal { status: "failed".into(), conclusion: Some("failure".into()) }),
+        payload: SignalPayload::Ci(CiSignal {
+            status: status.into(),
+            conclusion: Some(conclusion.into()),
+        }),
     };
     envelope.validate(&Default::default()).map_err(|e| anyhow!(e.to_string()))?;
     Ok(envelope)
