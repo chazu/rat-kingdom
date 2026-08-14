@@ -22,15 +22,19 @@ checks: [
 		command: "target=$RK_CHECK_TARGET; files=$(git diff --name-only \"$target\"...HEAD | wc -l | tr -d ' '); lines=$(git diff --numstat \"$target\"...HEAD | awk '{a=$1;b=$2;if(a==\"-\")a=0;if(b==\"-\")b=0;s+=a+b} END{print s+0}'); echo \"diff-scope: $files files / $lines lines vs $target (budget ${RK_CHECK_MAX_DIFF_FILES}f/${RK_CHECK_MAX_DIFF_LINES}l, 0=off)\"; { [ \"$RK_CHECK_MAX_DIFF_FILES\" -eq 0 ] || [ \"$files\" -le \"$RK_CHECK_MAX_DIFF_FILES\" ]; } && { [ \"$RK_CHECK_MAX_DIFF_LINES\" -eq 0 ] || [ \"$lines\" -le \"$RK_CHECK_MAX_DIFF_LINES\" ]; }"
 		timeout: "2m"
 	},
+	// The report checks build their payloads with `rk out --field` rather than
+	// jq: these commands run in the daemon's inherited environment, where jq
+	// once went missing and every gate failure escalated as an empty payload
+	// (exit 1) instead of an inbox row (TKT-01M00WPWEFZVPW3YBNX3825MBG).
 	{
 		name: "steward-report-timeout"
-		command: "text=\"steward: run gate for $RK_CHECK_TASK_ID did not finish within $RK_CHECK_GATE_TIMEOUT on $RK_CHECK_BRANCH — branch held unmerged; raise gateTimeout or select a narrower named check\"; payload=$(jq -nc --arg task \"$RK_CHECK_TASK_ID\" --arg text \"$text\" '{agent:\"steward\",task:$task,text:$text}'); rk out need \"$RK_CHECK_REPO\" steward --payload \"$payload\""
+		command: "rk out need \"$RK_CHECK_REPO\" steward --field agent=steward --field \"task=$RK_CHECK_TASK_ID\" --field \"text=steward: run gate for $RK_CHECK_TASK_ID did not finish within $RK_CHECK_GATE_TIMEOUT on $RK_CHECK_BRANCH — branch held unmerged; raise gateTimeout or select a narrower named check\""
 		expectExit: 0
 		timeout: "2m"
 	},
 	{
 		name: "steward-report-gate-failure"
-		command: "text=\"steward: run gate FAILED for $RK_CHECK_TASK_ID on $RK_CHECK_BRANCH — branch held unmerged; read the suite output with rk workflow status\"; payload=$(jq -nc --arg task \"$RK_CHECK_TASK_ID\" --arg text \"$text\" '{agent:\"steward\",task:$task,text:$text}'); rk out need \"$RK_CHECK_REPO\" steward --payload \"$payload\""
+		command: "rk out need \"$RK_CHECK_REPO\" steward --field agent=steward --field \"task=$RK_CHECK_TASK_ID\" --field \"text=steward: run gate FAILED for $RK_CHECK_TASK_ID on $RK_CHECK_BRANCH — branch held unmerged; read the suite output with rk workflow status\""
 		expectExit: 0
 		timeout: "2m"
 	},
@@ -42,13 +46,13 @@ checks: [
 	},
 	{
 		name: "steward-report-stop"
-		command: "text=\"steward: reviewer returned STOP for $RK_CHECK_TASK_ID on $RK_CHECK_BRANCH — needs a human merge decision; branch held unmerged\"; payload=$(jq -nc --arg task \"$RK_CHECK_TASK_ID\" --arg text \"$text\" '{agent:\"steward\",task:$task,text:$text}'); rk out need \"$RK_CHECK_REPO\" steward --payload \"$payload\""
+		command: "rk out need \"$RK_CHECK_REPO\" steward --field agent=steward --field \"task=$RK_CHECK_TASK_ID\" --field \"text=steward: reviewer returned STOP for $RK_CHECK_TASK_ID on $RK_CHECK_BRANCH — needs a human merge decision; branch held unmerged\""
 		expectExit: 0
 		timeout: "2m"
 	},
 	{
 		name: "steward-report-unknown-verdict"
-		command: "text=\"steward: unrecognized review verdict for $RK_CHECK_TASK_ID on $RK_CHECK_BRANCH — branch held unmerged, needs a human\"; payload=$(jq -nc --arg task \"$RK_CHECK_TASK_ID\" --arg text \"$text\" '{agent:\"steward\",task:$task,text:$text}'); rk out need \"$RK_CHECK_REPO\" steward --payload \"$payload\""
+		command: "rk out need \"$RK_CHECK_REPO\" steward --field agent=steward --field \"task=$RK_CHECK_TASK_ID\" --field \"text=steward: unrecognized review verdict for $RK_CHECK_TASK_ID on $RK_CHECK_BRANCH — branch held unmerged, needs a human\""
 		expectExit: 0
 		timeout: "2m"
 	},
