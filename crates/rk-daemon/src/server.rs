@@ -1318,7 +1318,7 @@ impl Daemon {
         }
     }
 
-    fn factory_snapshot(&self, filter: &FactoryEventFilter) -> rk_core::Result<Value> {
+    async fn factory_snapshot(&self, filter: &FactoryEventFilter) -> rk_core::Result<Value> {
         let coord = CoordinatorFilter {
             repo: filter.repo.clone(),
             coordinator: filter.coordinator.clone(),
@@ -1362,14 +1362,19 @@ impl Daemon {
             "grants": grants,
         });
         let budget = factory_filtered_budget(self.supervisor.fleet_rollup(), filter, &workflows);
+        let inbox = self.inbox_value(filter.repo.clone()).await?;
+        let replay = self.factory_events_replay(filter)?;
         let snapshot = crate::factory_events::snapshot_value(
             json!(agents),
             json!(workflows),
             tickets,
-            json!([]),
+            inbox["items"].clone(),
             budget,
             approvals,
-            json!({"cursor": self.latest_event_cursor(), "required": false}),
+            json!({
+                "cursor": self.latest_event_cursor(),
+                "required": replay["truncated"].as_bool().unwrap_or(false),
+            }),
         );
         Ok(
             json!({"schema": crate::factory_events::SCHEMA, "snapshot": snapshot, "cursor": self.latest_event_cursor(), "coordinator": coord.coordinator}),
@@ -1758,7 +1763,7 @@ impl Daemon {
             "factory.approve_action" => reply(self.handle_factory_approve_action(req)),
             "factory.execute_action" => reply(self.handle_factory_execute_action(req).await),
             "factory.snapshot" => match parse_params::<FactoryEventFilter>(&req.params) {
-                Ok(filter) => match self.factory_snapshot(&filter) {
+                Ok(filter) => match self.factory_snapshot(&filter).await {
                     Ok(snapshot) => reply(Response::ok(id, snapshot)),
                     Err(e) => reply(Response::err(id, codes::INTERNAL, e.to_string())),
                 },
@@ -2014,41 +2019,35 @@ impl Daemon {
         }
     }
 
-    /// Union everything awaiting a human — failed/orphaned agents, failed or
-    /// gate-parked workflow instances, obstacle and need tuples, and open PRs
-    /// awaiting review — into one ranked triage list. Pure read-side
-    /// aggregation; no new storage.
-    async fn handle_inbox(&self, req: Request) -> Response {
-        let params: InboxParams = match parse_params(&req.params) {
-            Ok(params) => params,
-            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
-        };
-        let repo = match params.repo {
-            Some(filter) => {
-                let registry = match self.repos.lock() {
-                    Ok(registry) => registry,
-                    Err(_) => {
-                        return Response::err(
-                            req.id,
-                            codes::INTERNAL,
-                            "repo registry lock poisoned",
-                        );
-                    }
-                };
+    /// Resolve the optional inbox repository filter the same way for every
+    /// read path. Callers may supply either a registered name or its path.
+    fn resolve_inbox_repo(&self, requested: Option<String>) -> rk_core::Result<Option<String>> {
+        requested
+            .map(|filter| {
+                let registry = self
+                    .repos
+                    .lock()
+                    .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
                 let by_name = registry.get(&filter);
                 let by_path = std::fs::canonicalize(&filter)
                     .ok()
                     .and_then(|path| registry.get_by_path(&path));
-                Some(
+                Ok::<_, rk_core::Error>(
                     by_name
                         .or(by_path)
                         .map(|record| record.name.clone())
                         .unwrap_or(filter),
                 )
-            }
-            None => None,
-        };
-        let id = req.id;
+            })
+            .transpose()
+    }
+
+    /// Union everything awaiting a human — failed/orphaned agents, failed or
+    /// gate-parked workflow instances, obstacle and need tuples, and open PRs
+    /// awaiting review — into one ranked triage list. Pure read-side
+    /// aggregation; no new storage.
+    async fn inbox_value(&self, requested_repo: Option<String>) -> rk_core::Result<Value> {
+        let repo = self.resolve_inbox_repo(requested_repo)?;
         let agents = self
             .supervisor
             .list()
@@ -2080,18 +2079,18 @@ impl Daemon {
         };
         let obstacles = match scan(Pattern::category(Category::Obstacle)) {
             Ok(t) => t,
-            Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
+            Err(e) => return Err(e),
         };
         let needs = match scan(Pattern::category(Category::Need)) {
             Ok(t) => t,
-            Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
+            Err(e) => return Err(e),
         };
         // Open PRs/MRs: a PR-mode dismiss/land emits a `pull_request_opened`
         // event, then the run completes — nothing else tracks the pushed branch.
         let pull_requests =
             match scan(Pattern::category(Category::Event).identity("pull_request_opened")) {
                 Ok(t) => t,
-                Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
+                Err(e) => return Err(e),
             };
         // `pull_request_closed` events are emitted by the fetch-driven review
         // sweep (TKT-70): a background pass fetched the forge and saw the branch
@@ -2102,7 +2101,7 @@ impl Daemon {
         let pull_requests_closed =
             match scan(Pattern::category(Category::Event).identity("pull_request_closed")) {
                 Ok(t) => t,
-                Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
+                Err(e) => return Err(e),
             };
         // Every `land` step records its own outcome as a `branch_landed` event.
         // A land that neither merged nor opened a PR left the branch standing
@@ -2113,7 +2112,7 @@ impl Daemon {
         // for every workflow.
         let lands = match scan(Pattern::category(Category::Event).identity("branch_landed")) {
             Ok(t) => t,
-            Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
+            Err(e) => return Err(e),
         };
         // Reduce the land events to the branches that are actually candidate
         // rows BEFORE the git check below. `branch_landed` accumulates one event
@@ -2143,7 +2142,7 @@ impl Daemon {
         ) {
             (Ok(s), Ok(e), Ok(c), Ok(w)) => (s, e, c, w),
             (Err(e), _, _, _) | (_, Err(e), _, _) | (_, _, Err(e), _) | (_, _, _, Err(e)) => {
-                return Response::err(id, codes::INTERNAL, e.to_string());
+                return Err(e);
             }
         };
         // Both branch-shaped rows auto-clear once their branch is merged into
@@ -2157,7 +2156,7 @@ impl Daemon {
         // gap for a forge merge the operator has NOT pulled (TKT-70).
         let cleared = match self.cleared_branches(&[&pull_requests, &lands]).await {
             Ok(cleared) => cleared,
-            Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
+            Err(e) => return Err(e),
         };
         let items = crate::inbox::build(
             &agents,
@@ -2200,7 +2199,18 @@ impl Daemon {
             }
             response_truncated = true;
         }
-        Response::ok(id, json!({"items": items, "truncated": response_truncated}))
+        Ok(json!({"items": items, "truncated": response_truncated}))
+    }
+
+    async fn handle_inbox(&self, req: Request) -> Response {
+        let params: InboxParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        match self.inbox_value(params.repo).await {
+            Ok(value) => Response::ok(req.id, value),
+            Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
+        }
     }
 
     /// (scope, branch) pairs among the given branch-shaped events whose branch
