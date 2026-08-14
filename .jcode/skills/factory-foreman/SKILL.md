@@ -27,6 +27,14 @@ rk --json factory recommend --repo <repo>
 
 The snapshot supplies agents, workflows, tickets, inbox, approvals, budget, and repository health. Replay supplies ordered recent changes and resync state. Scorecards and recommendations are advisory and preserve unavailable evidence as unobserved rather than zero.
 
+When the `rk` MCP server is available to Jcode, prefer its typed tools for the
+proposal and approval-gated mutation leg: `propose_workflow_run`, then, only
+after a later human turn approves the exact proposal, `approve_action` and
+`execute_approved_workflow_run`. Fall back to the equivalent `rk --json
+factory propose-workflow`, `factory approve`, and `factory execute-action`
+shell-outs when the server is unavailable. The MCP tools and CLI commands use
+the same daemon-owned canonical digest and approval boundary.
+
 Never execute a mutating Rat Kingdom command unless a later user message explicitly approves the exact proposal rendered in this conversation. Require daemon-verifiable approval of the exact canonical digest before dispatch. The bundled Python helper is only a legacy fallback for deterministic triage and manual proposal preparation.
 
 See [REFERENCE.md](REFERENCE.md) for categories, schemas, approval examples, and recovery behavior.
@@ -39,7 +47,7 @@ See [REFERENCE.md](REFERENCE.md) for categories, schemas, approval examples, and
 4. Triage stalled or failed workflows, inbox pressure, pending approvals, budget signals, ticket duplication, event lag, and resync requirements.
 5. Read scorecards and recommendations when the user asks about recurring performance or routing problems.
 6. Separate observed evidence from hypotheses and recommend an existing workflow where possible.
-7. Prepare an exact typed proposal when mutation is warranted, then stop for human approval.
+7. Prepare an exact typed proposal when mutation is warranted, using the typed MCP proposal tool when available or the CLI fallback below, then stop for human approval.
 8. After a later approval, forward the saved proposal through the daemon's digest-bound approval and execution path and monitor the resulting workflow.
 9. For product work, use RK's product-to-code contracts to validate initiative, research, ticket graph, impact evidence, dispatch, and independent verification artifacts.
 
@@ -66,9 +74,9 @@ Opening the generated Markdown in a Jcode side panel is optional. The file is a 
 4. Separate observed evidence from hypotheses. Label command output, JSON fields, inbox rows, workflow states, and ticket matches as evidence. Label inferred causes or suggested next actions as hypotheses.
 5. Deduplicate existing tickets before proposing new work. Search or inspect ticket data from triage before recommending another ticket.
 6. Recommend an existing workflow definition where possible. Prefer a workflow already listed by `workflow defs --repo <repo>` over inventing a new shape.
-7. Render and save the exact typed dispatch proposal using `rk --json factory propose-workflow`, including its `proposal_id`, digest, and execution action. Preserve the proposal file exactly.
+7. Render and save the exact typed dispatch proposal using `propose_workflow_run` when the `rk` MCP server is available; otherwise use `rk --json factory propose-workflow`. Include its `proposal_id`, digest, and execution action, and preserve the proposal file or tool result exactly.
 8. Stop and request approval for that exact proposal and digest. Do not continue to approval or dispatch in the same turn.
-9. After a later user message explicitly approves it, use `rk --json factory approve --proposal-file <file>` and `rk --json factory execute-action --proposal-file <file>`. A changed workflow, repo, parameter, coordinator, proposal, or digest requires a new proposal and approval.
+9. After a later user message explicitly approves it, use `approve_action` and `execute_approved_workflow_run` through MCP when available; otherwise use `rk --json factory approve --proposal-file <file>` and `rk --json factory execute-action --proposal-file <file>`. A changed workflow, repo, parameter, coordinator, proposal, or digest requires a new proposal and approval.
 10. Monitor the returned workflow ID with `rk --json workflow status <id>` or `rk --json workflow watch <id>` through completion, failure, or approval wait. workflow watch --json is NDJSON and must not be parsed as one JSON document. Document notable NDJSON events as they arrive.
 
 ## Proposal handling
