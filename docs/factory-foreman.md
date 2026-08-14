@@ -287,7 +287,7 @@ The daemon methods are `factory.scorecards` and `factory.recommend`. They are ad
 
 ### Durable structured outcome source semantics
 
-Scorecards are derived only from durable structured source families that the daemon can read today. Phase 5 currently reconstructs analytic events from typed daemon records, snapshots, and structured SDLC CI event history. It does not have a separate durable analytics journal, and it does not infer outcomes from text. Each derived event carries schema version, deterministic event id, repository, source family, source id/version when available, archive marker and reason when available, observed timestamp when available, explicit dimensions, linked ids, recurrence/coalescing keys when available, and one structured metric payload.
+Scorecards are derived only from durable structured source families that the daemon can read today. Phase 5 currently reconstructs analytic events from typed daemon records, snapshots, structured SDLC CI event history, merge-reverted Fact tuples, and reviewer REWORK Artifact tuples. It does not have a separate durable analytics journal, and it does not infer outcomes from text. Each derived event carries schema version, deterministic event id, repository, source family, source id/version when available, archive marker and reason when available, observed timestamp when available, explicit dimensions, linked ids, recurrence/coalescing keys when available, and one structured metric payload.
 
 The normal event shape is:
 
@@ -328,14 +328,14 @@ The currently available structured families are:
 - `AgentRecord`: durable agent/run records with explicit ids and available dimensions such as model, harness, timestamps, status, and linked workflow data when present.
 - `WorkflowInstance`: durable workflow instances with explicit ids, workflow names, lifecycle timestamps, status, and linked agent data when present.
 - `Phase4CiSignal`: structured SDLC CI event history for a key. Explicit `ci_failed` and `ci_recovered` events are normalized when their tuple identity, scope, family, kind, delivery id, subject, and commit correlation are structured.
+- `StructuredRevert`: durable Fact tuples with category `fact` and identity `merge-reverted-<agent>`. The normalizer uses the tuple id, agent, merge/revert commit fields, and explicit ticket task field; malformed commit fields remain unknown.
+- `StructuredReviewerRework`: durable Artifact tuples with category `artifact`, identity `review`, and structured `recommendation: "REWORK"`. The normalizer uses the tuple id plus explicit agent, workflow-instance/run, and ticket/task fields when present; notes and other prose are ignored.
 - `HumanGateDecision`: structured approval or gate decision facts for human intervention counting.
 - `RecurrenceKey`: structured recurrence or ticket coalescing keys for recurrence counting.
 
 The following structured families are not available to Phase 5 today and must remain `unobserved` until explicit read seams exist:
 
 - Phase 3 contract outcome and verified delivery enumerators for acceptance or landed delivery.
-- Structured reviewer rework transitions.
-- Typed revert history linked to runs, tickets, or landed outcomes.
 - `PricingSnapshot` records for durable model pricing provenance.
 
 Agent cost fields are not sufficient cost provenance by themselves. `AgentRecord` may carry usage or cost-like values, but Phase 5 must not report `cost_micro_usd` unless a durable pricing snapshot or an equally explicit structured cost provenance record is available for that run. No such source is available today, so cost metrics remain unavailable.
@@ -350,10 +350,10 @@ Structured SDLC CI history can report explicit CI failures and explicit recoveri
 | `harness` | Explicit harness field on agent/run/instance data. | Binary path, CLI output, labels, or model route. | Dimension is `unknown` and can still be aggregated. |
 | `model` | Explicit model field on agent/run data. | Prompt text, transcript text, agent label, or inferred provider. | Dimension is `unknown` and can still be aggregated. |
 | `accepted` | Phase 3 verified delivery or land structured outcome enumerator. This source is not available today. | Absence of rework, green CI, closing prose, or issue comments. | Metric unavailable for that run unless explicit outcome exists. |
-| `reworked` | Structured reviewer rework transition. This source is not available today. | Review comment prose, TODO text, or labels. | Metric unavailable for that run. |
+| `reworked` | `StructuredReviewerRework` review Artifact with explicit `recommendation: "REWORK"`. | Review comment prose, TODO text, notes, or labels. | Missing recommendation is ignored; missing links remain unknown. |
 | `ci_failed` | Explicit structured SDLC CI event with kind `ci_failed` for the same structured subject and commit correlation. | Build-log text, terminal text, or later acceptance. | Metric unavailable unless an explicit structured failure event exists. |
 | `ci_recovered` | Explicit structured SDLC CI event with kind `ci_recovered`, counted only when a matching prior explicit `ci_failed` event exists for the same structured subject and commit correlation. | Current green CI alone, build-log text, or later acceptance. | Metric unavailable unless the explicit recovery has matching prior failure evidence. |
-| `reverted` | Typed revert history linked to run, ticket, or landed outcome. This source is not available today. | Commit-message search or prose. | Metric unavailable for that run. |
+| `reverted` | `StructuredRevert` `merge-reverted-*` Fact with structured merge and revert commit fields. | Commit-message search or prose. | Missing commit fields become an unknown event; no synthetic revert is emitted. |
 | `human_interventions` | Explicit `HumanGateDecision`, approval, or gate decision event. | Mentions, comments, delay, or approval prose. | Metric unavailable for that run. |
 | `recurrence` | Explicit non-empty `recurrence_key` or `RecurrenceKey` ticket coalesce key. | Similarity over titles, stack traces, logs, or prose. | Metric unavailable without explicit key. |
 | `cost_micro_usd` | Durable `PricingSnapshot`-backed cost provenance or another explicit durable cost provenance record. No such source is available today. | Estimating from model name alone, current pricing tables, or unproven `AgentRecord` cost-like fields. | Metric unavailable for that run. |

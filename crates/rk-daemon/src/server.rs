@@ -1306,6 +1306,44 @@ impl Daemon {
                 Vec::new()
             }
         };
+        let revert_facts = match self
+            .space
+            .scan(&Pattern::category(Category::Fact).scope(repo.clone()))
+        {
+            Ok(facts) => facts
+                .into_iter()
+                .filter(|fact| fact.identity.starts_with("merge-reverted-"))
+                .filter(|fact| in_window(fact.created_at.timestamp_millis()))
+                .collect(),
+            Err(error) => {
+                runtime_unavailable.push(
+                    rk_core::factory::outcome_facts::OutcomeEvidenceKind::StructuredRevert,
+                );
+                read_warnings.push(format!(
+                    "source_family_read_failed: StructuredRevert unavailable: {error}"
+                ));
+                Vec::new()
+            }
+        };
+        let reviewer_verdicts = match self
+            .space
+            .scan(&Pattern::category(Category::Artifact).scope(repo.clone()))
+        {
+            Ok(artifacts) => artifacts
+                .into_iter()
+                .filter(|artifact| artifact.identity == "review")
+                .filter(|artifact| in_window(artifact.created_at.timestamp_millis()))
+                .collect(),
+            Err(error) => {
+                runtime_unavailable.push(
+                    rk_core::factory::outcome_facts::OutcomeEvidenceKind::StructuredReviewerRework,
+                );
+                read_warnings.push(format!(
+                    "source_family_read_failed: StructuredReviewerRework unavailable: {error}"
+                ));
+                Vec::new()
+            }
+        };
         crate::factory_analytics::AnalyticsInputs {
             repo,
             agents,
@@ -1313,6 +1351,8 @@ impl Daemon {
             tickets,
             approval_grants,
             sdlc_ci_facts,
+            revert_facts,
+            reviewer_verdicts,
             runtime_unavailable,
             read_warnings,
         }
