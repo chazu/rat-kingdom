@@ -30,6 +30,8 @@ a unified diff, a safety argument against the `prime.rs` tests, and any companio
 | 0014 | Define the stale-ticket grooming handoff | `groom-backlog` workflow descriptions | proposed |
 | 0015 | Classify empty undeclared harness results before prompt edits | `prompt-refine` task descriptions | proposed |
 | 0016 | Reassert artifact handoff after live daemon drift | `FRAGMENT_SINGLE_TASK` + `FRAGMENT_COMPLETION` step 4 | landed |
+| 0017 | Deduplicate prompt-refinement proposals before drafting | `prompt-refine` task descriptions | proposed |
+| 0018 | Bound prompt-refinement evidence scans and record incomplete reads | `prompt-refine` task descriptions | proposed |
 
 Proposals 0004 and 0005 are the two halves of one failure (empty branches at the
 implementer/reviewer seam) and were landed together.
