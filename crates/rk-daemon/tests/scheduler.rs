@@ -77,7 +77,7 @@ fn write_global_schedule(layout: &Layout, file: &str, body: &str) {
     std::fs::write(dir.join(file), body).unwrap();
 }
 
-fn build_scheduler(layout: &Layout, config: SchedulerConfig, space: rk_space::Space) -> Arc<Scheduler> {
+fn build_engine(layout: &Layout, space: rk_space::Space) -> Arc<WorkflowEngine> {
     let tickets = Arc::new(Tickets::new(space.clone(), "test-castle".into()));
     let supervisor = Arc::new(
         Supervisor::new(
@@ -91,7 +91,7 @@ fn build_scheduler(layout: &Layout, config: SchedulerConfig, space: rk_space::Sp
         )
         .unwrap(),
     );
-    let engine = Arc::new(WorkflowEngine::new(
+    Arc::new(WorkflowEngine::new(
         layout.clone(),
         supervisor,
         space,
@@ -104,7 +104,11 @@ fn build_scheduler(layout: &Layout, config: SchedulerConfig, space: rk_space::Sp
         false,
         Vec::new(),
         vec!["main".into(), "master".into()],
-    ));
+    ))
+}
+
+fn build_scheduler(layout: &Layout, config: SchedulerConfig, space: rk_space::Space) -> Arc<Scheduler> {
+    let engine = build_engine(layout, space);
     Arc::new(Scheduler::new(engine, layout.clone(), config))
 }
 
@@ -236,6 +240,197 @@ async fn single_flight_skips_while_previous_run_active() {
         "single-flight suppresses the stacked run"
     );
     assert_eq!(scheduler.engine_instance_count(), 1, "no second instance");
+}
+
+#[tokio::test]
+async fn restart_rebuilds_single_flight_from_durable_running_work() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+    write_global_schedule(
+        &layout,
+        "tick.cue",
+        r#"schedules: [{name: "every-min", cron: "* * * * *", run: "sched-work", repo: "myrepo"}]"#,
+    );
+
+    let first = build_scheduler(
+        &layout,
+        SchedulerConfig::default(),
+        rk_space::Space::open_in_memory().unwrap(),
+    );
+    let t = Utc.with_ymd_and_hms(2026, 7, 23, 8, 0, 0).unwrap();
+    assert_eq!(first.run_cycle_at(t).unwrap(), 1);
+
+    let restarted_engine = build_engine(&layout, rk_space::Space::open_in_memory().unwrap());
+    let resumable = restarted_engine.rehydrate();
+    assert_eq!(resumable.len(), 1, "the in-flight schedule must rehydrate");
+    let restarted = Scheduler::new(
+        restarted_engine,
+        layout.clone(),
+        SchedulerConfig::default(),
+    );
+
+    assert_eq!(
+        restarted.run_cycle_at(t + chrono::Duration::minutes(1)).unwrap(),
+        0,
+        "a restart must not stack the same scheduled work while it is still running",
+    );
+    assert_eq!(restarted.engine_instance_count(), 1);
+}
+
+#[tokio::test]
+async fn restart_matches_legacy_schedule_by_definition_alias() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    std::fs::write(
+        repo.path().join(".rk/workflows/nightly-alias.cue"),
+        GATE_WORKFLOW,
+    )
+    .unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+    write_global_schedule(
+        &layout,
+        "tick.cue",
+        r#"schedules: [{name: "every-min", cron: "* * * * *", run: "nightly-alias", repo: "myrepo"}]"#,
+    );
+
+    let first = build_scheduler(
+        &layout,
+        SchedulerConfig::default(),
+        rk_space::Space::open_in_memory().unwrap(),
+    );
+    let t = Utc.with_ymd_and_hms(2026, 7, 23, 8, 0, 0).unwrap();
+    assert_eq!(first.run_cycle_at(t).unwrap(), 1);
+
+    let snapshots = layout.home().join("workflow-instances");
+    let snapshot = std::fs::read_dir(&snapshots)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&snapshot).unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("schedule");
+    std::fs::write(&snapshot, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+    let restarted_engine = build_engine(&layout, rk_space::Space::open_in_memory().unwrap());
+    assert_eq!(restarted_engine.rehydrate().len(), 1);
+    let restarted = Scheduler::new(
+        restarted_engine,
+        layout.clone(),
+        SchedulerConfig::default(),
+    );
+
+    assert_eq!(
+        restarted.run_cycle_at(t + chrono::Duration::minutes(1)).unwrap(),
+        0,
+        "legacy snapshots must match the invoked definition alias, not the workflow's internal name",
+    );
+    assert_eq!(restarted.engine_instance_count(), 1);
+}
+
+#[tokio::test]
+async fn restart_does_not_use_a_linked_nested_child_as_schedule_single_flight() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+    write_global_schedule(
+        &layout,
+        "tick.cue",
+        r#"schedules: [{name: "every-min", cron: "* * * * *", run: "sched-work", repo: "myrepo"}]"#,
+    );
+
+    let first = build_scheduler(
+        &layout,
+        SchedulerConfig::default(),
+        rk_space::Space::open_in_memory().unwrap(),
+    );
+    let t = Utc.with_ymd_and_hms(2026, 7, 23, 8, 0, 0).unwrap();
+    assert_eq!(first.run_cycle_at(t).unwrap(), 1);
+
+    let snapshots = layout.home().join("workflow-instances");
+    let child_path = std::fs::read_dir(&snapshots)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut child: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&child_path).unwrap()).unwrap();
+    let child_id = child["id"].as_str().unwrap().to_string();
+    child.as_object_mut().unwrap().remove("schedule");
+    child["depth"] = serde_json::json!(1);
+    std::fs::write(&child_path, serde_json::to_vec_pretty(&child).unwrap()).unwrap();
+
+    let mut parent = child.clone();
+    parent["id"] = serde_json::json!("legacy-parent");
+    parent["workflow"] = serde_json::json!("parent-workflow");
+    parent["definition"] = serde_json::json!("parent-workflow");
+    parent["definition_digest"] = serde_json::json!("");
+    parent["depth"] = serde_json::json!(0);
+    parent["context"]["active_subworkflow"] = serde_json::json!(child_id);
+    std::fs::write(
+        snapshots.join("legacy-parent.json"),
+        serde_json::to_vec_pretty(&parent).unwrap(),
+    )
+    .unwrap();
+
+    let restarted_engine = build_engine(&layout, rk_space::Space::open_in_memory().unwrap());
+    assert_eq!(restarted_engine.rehydrate().len(), 1);
+    let restarted = Scheduler::new(
+        restarted_engine,
+        layout.clone(),
+        SchedulerConfig::default(),
+    );
+
+    assert_eq!(
+        restarted.run_cycle_at(t + chrono::Duration::minutes(1)).unwrap(),
+        1,
+        "a nested child belongs to its parent, not the top-level schedule guard",
+    );
+    assert_eq!(restarted.engine_instance_count(), 3);
+}
+
+#[tokio::test]
+async fn distinct_schedules_may_run_the_same_work_concurrently() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+    write_global_schedule(
+        &layout,
+        "twins.cue",
+        r#"schedules: [
+            {name: "first", cron: "* * * * *", run: "sched-work", repo: "myrepo"},
+            {name: "second", cron: "* * * * *", run: "sched-work", repo: "myrepo"},
+        ]"#,
+    );
+
+    let scheduler = build_scheduler(
+        &layout,
+        SchedulerConfig::default(),
+        rk_space::Space::open_in_memory().unwrap(),
+    );
+    let t = Utc.with_ymd_and_hms(2026, 7, 23, 8, 0, 0).unwrap();
+
+    assert_eq!(
+        scheduler.run_cycle_at(t).unwrap(),
+        2,
+        "single-flight is per schedule name, not per workflow work key"
+    );
+    assert_eq!(scheduler.engine_instance_count(), 2);
 }
 
 /// A global schedule with no `repo` cannot resolve (no tuple scope to fall back

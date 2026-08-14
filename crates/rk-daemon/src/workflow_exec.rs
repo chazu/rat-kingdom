@@ -18,7 +18,7 @@ use rk_workflow::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -141,6 +141,11 @@ pub struct Instance {
     /// explicitly supplied. Legacy and ad-hoc runs remain unowned.
     #[serde(default)]
     pub coordinator: Option<String>,
+    /// Schedule name that launched this run. `None` for manual, reactor, and
+    /// legacy snapshots. Persisted so per-schedule single-flight survives restart
+    /// without conflating two schedules that intentionally run identical work.
+    #[serde(default)]
+    pub schedule: Option<String>,
     pub status: InstanceStatus,
     /// Monotonic observable-state revision for coordinator consumers. Older
     /// snapshots deserialize as zero and enter the same sequence on their next
@@ -331,6 +336,11 @@ pub struct WorkflowContext {
     /// payload or an arbitrary CUE `when` branch cannot forge it.
     #[serde(default)]
     pub approval_granted: bool,
+    /// Durable child instance owned by the currently executing `sub_workflow`
+    /// step. Written before the child snapshot so a restart can recreate a child
+    /// that was not installed yet, or rejoin the exact child that was.
+    #[serde(default)]
+    pub active_subworkflow: Option<String>,
 }
 
 async fn read_capped<R>(mut reader: R) -> rk_core::Result<Vec<u8>>
@@ -569,6 +579,12 @@ pub struct FannedAgent {
 enum Flow {
     /// Continue with the next step in sequence.
     Next,
+    /// Continue and join a completed sub-workflow result into this step's
+    /// durable completion snapshot.
+    NextWithSubworkflowResult(Value),
+    /// A nested control-flow block joined one child. Its link remains durable
+    /// until the enclosing top-level cursor advances.
+    NextAfterNestedSubworkflow,
     /// Exit the nearest enclosing `repeat` (or end the workflow at top level).
     Break,
 }
@@ -752,6 +768,42 @@ impl WorkflowEngine {
         params: HashMap<String, Value>,
         coordinator: Option<String>,
     ) -> rk_core::Result<Instance> {
+        self.run_owned_with_id_and_schedule(
+            instance_id,
+            name,
+            repo,
+            params,
+            coordinator,
+            None,
+        )
+    }
+
+    pub fn run_scheduled(
+        self: &Arc<Self>,
+        schedule: &str,
+        name: &str,
+        repo: &str,
+        params: HashMap<String, Value>,
+    ) -> rk_core::Result<Instance> {
+        self.run_owned_with_id_and_schedule(
+            prefixed_id("wf"),
+            name,
+            repo,
+            params,
+            None,
+            Some(schedule.to_string()),
+        )
+    }
+
+    fn run_owned_with_id_and_schedule(
+        self: &Arc<Self>,
+        instance_id: String,
+        name: &str,
+        repo: &str,
+        params: HashMap<String, Value>,
+        coordinator: Option<String>,
+        schedule: Option<String>,
+    ) -> rk_core::Result<Instance> {
         let file = self.find_definition(name, repo)?;
         let definition_digest = definition_digest(&file)?;
         let workflow = rk_workflow::load(&file, &params)?;
@@ -763,6 +815,7 @@ impl WorkflowEngine {
             workflow: workflow.name.clone(),
             repo: repo.to_string(),
             coordinator,
+            schedule,
             status: InstanceStatus::Running,
             revision: 0,
             current_step: 0,
@@ -798,25 +851,41 @@ impl WorkflowEngine {
             // The instance record carries the workflow name for the event; read
             // it back rather than threading it through the moved `workflow`.
             let workflow_name = engine.status(&id).map(|i| i.workflow).unwrap_or_default();
-            engine.finalize(&id, &repo, &workflow_name, result);
+            if let Err(error) = engine.finalize(&id, &repo, &workflow_name, result) {
+                warn!(instance = %id, %error, "workflow terminal state was not persisted");
+            }
         });
     }
 
     /// Record an instance's terminal status and broadcast its completion event.
-    fn finalize(&self, id: &str, repo: &str, workflow_name: &str, result: rk_core::Result<()>) {
+    fn finalize(
+        &self,
+        id: &str,
+        repo: &str,
+        workflow_name: &str,
+        result: rk_core::Result<()>,
+    ) -> rk_core::Result<()> {
         let (status, error) = match result {
             Ok(()) => (InstanceStatus::Completed, None),
             Err(e) => (InstanceStatus::Failed, Some(e.to_string())),
         };
-        let updated = self.update_with_reason(id, "terminal", |i| {
+        let transition = self.try_update_with_reason(id, "terminal", |i| {
             i.status = status;
             i.error = error.clone();
             i.completed_at = Some(chrono::Utc::now());
         });
-        if !updated {
-            warn!(instance = %id, "workflow terminal state was not persisted; skipping completion event");
-            return;
+        match &transition {
+            Err(persist_error) => self.fail_recovery_in_memory(
+                id,
+                format!("terminal state persistence failed: {persist_error}"),
+            ),
+            Ok(false) => self.fail_recovery_in_memory(
+                id,
+                "terminal state transition did not update an instance".into(),
+            ),
+            Ok(true) => {}
         }
+        require_persisted_transition(transition, id, "terminal state")?;
         let final_status = if status == InstanceStatus::Completed {
             "workflow_complete"
         } else {
@@ -830,6 +899,7 @@ impl WorkflowEngine {
             "daemon".to_string(),
             json!({"instance": id, "workflow": workflow_name, "error": error}),
         ));
+        Ok(())
     }
 
     /// Load persisted instances into memory on daemon startup (TKT-52).
@@ -843,18 +913,8 @@ impl WorkflowEngine {
     /// after event consumers are listening. Calling this method again replaces
     /// the in-memory snapshots with the same durable state.
     pub fn rehydrate(self: &Arc<Self>) -> Vec<Instance> {
-        let mut resumable = Vec::new();
         for instance in self.read_instance_dir(&self.instances_dir()) {
-            // Only top-level (depth 0) instances resume standalone. A nested
-            // sub-workflow child (depth > 0) is re-driven by its parent's
-            // resumed `sub_workflow` step (which re-runs the interrupted step and
-            // launches a fresh child), so resuming it independently here would
-            // double-run its agents. It is still loaded into memory for history.
-            let running = instance.status == InstanceStatus::Running && instance.depth == 0;
             self.lock().insert(instance.id.clone(), instance.clone());
-            if running {
-                resumable.push(instance);
-            }
         }
         // The pruned side of the store: terminal runs an operator cleared off
         // the board. Loaded for history only, never resumed. An id present in
@@ -866,6 +926,20 @@ impl WorkflowEngine {
             }
             self.lock_archived().insert(instance.id.clone(), instance);
         }
+        let blocked = self.fail_legacy_unlinked_subworkflows();
+        // Only top-level (depth 0) instances resume standalone. A linked nested
+        // child is re-driven by its parent's resumed `sub_workflow` step, which
+        // rejoins the same durable child id. Resuming it here as well would
+        // execute the same interrupted step twice.
+        let resumable: Vec<Instance> = self
+            .lock()
+            .values()
+            .filter(|instance| {
+                instance.status == InstanceStatus::Running && instance.depth == 0
+                    && !blocked.contains(&instance.id)
+            })
+            .cloned()
+            .collect();
         if !resumable.is_empty() {
             info!(
                 count = resumable.len(),
@@ -873,6 +947,92 @@ impl WorkflowEngine {
             );
         }
         resumable
+    }
+
+    /// Snapshots written before `active_subworkflow` cannot prove which parent
+    /// owns a running nested child. Continuing the parent would repeat the step
+    /// and duplicate the child's side effects, while resuming both independently
+    /// would race them. Fail the orphan and every exact current-step parent match
+    /// closed so an operator can inspect and retry deliberately.
+    fn fail_legacy_unlinked_subworkflows(&self) -> HashSet<String> {
+        let snapshots = self.list();
+        let linked: HashSet<&str> = snapshots
+            .iter()
+            .filter(|instance| instance.status == InstanceStatus::Running)
+            .filter_map(|instance| instance.context.active_subworkflow.as_deref())
+            .collect();
+        let orphans: Vec<Instance> = snapshots
+            .iter()
+            .filter(|instance| {
+                instance.depth > 0 && !linked.contains(instance.id.as_str())
+            })
+            .cloned()
+            .collect();
+        let mut blocked = HashSet::new();
+
+        for child in orphans {
+            let parents: Vec<String> = snapshots
+                .iter()
+                .filter(|parent| {
+                    parent.status == InstanceStatus::Running
+                        && parent.depth + 1 == child.depth
+                        && parent.repo == child.repo
+                        && parent.started_at <= child.started_at
+                        && self.current_step_contains_subworkflow(parent, &child.definition)
+                })
+                .map(|parent| parent.id.clone())
+                .collect();
+            let child_id = child.id.clone();
+            for parent_id in parents {
+                blocked.insert(parent_id.clone());
+                if let Err(error) = self.try_update_with_reason(
+                    &parent_id,
+                    "legacy_sub_workflow_ambiguous",
+                    |instance| {
+                        instance.status = InstanceStatus::Failed;
+                        instance.error = Some(format!(
+                            "restart refused to repeat sub_workflow child {child_id} without durable parent linkage"
+                        ));
+                        instance.completed_at = Some(Utc::now());
+                    },
+                ) {
+                    warn!(parent = %parent_id, child = %child_id, %error, "could not persist legacy sub-workflow parent failure; suppressing resume in this process");
+                    self.fail_recovery_in_memory(
+                        &parent_id,
+                        format!("legacy parent failure persistence failed: {error}"),
+                    );
+                }
+            }
+            if child.status == InstanceStatus::Running {
+                if let Err(error) = self.try_update_with_reason(
+                    &child_id,
+                    "legacy_sub_workflow_orphaned",
+                    |instance| {
+                        instance.status = InstanceStatus::Failed;
+                        instance.error = Some(
+                            "restart refused an unlinked legacy sub_workflow child; retry its parent deliberately"
+                                .into(),
+                        );
+                        instance.completed_at = Some(Utc::now());
+                    },
+                ) {
+                    warn!(child = %child_id, %error, "could not persist legacy sub-workflow child failure");
+                    self.fail_recovery_in_memory(
+                        &child_id,
+                        format!("legacy child failure persistence failed: {error}"),
+                    );
+                }
+            }
+        }
+        blocked
+    }
+
+    fn current_step_contains_subworkflow(&self, instance: &Instance, child: &str) -> bool {
+        self.find_definition(&instance.definition, &instance.repo)
+            .and_then(|file| rk_workflow::load(&file, &instance.params))
+            .ok()
+            .and_then(|workflow| workflow.steps.get(instance.current_step).cloned())
+            .is_some_and(|step| step_contains_subworkflow(&step, child))
     }
 
     /// Resume the top-level running snapshots returned by [`rehydrate`](Self::rehydrate).
@@ -974,16 +1134,32 @@ impl WorkflowEngine {
                 // Already completed on a prior run; do not re-execute it.
                 continue;
             }
-            if let Flow::Break = self
+            let flow = self
                 .run_step(id, step, repo, &workflow.agents, &workflow.tiers)
-                .await?
-            {
-                // A top-level break ends the workflow (nothing to loop out of).
-                break;
-            }
+                .await?;
+            let (subworkflow_result, clear_subworkflow) = match flow {
+                Flow::Break => {
+                    // A top-level break ends the workflow (nothing to loop out of).
+                    break;
+                }
+                Flow::Next => (None, false),
+                Flow::NextWithSubworkflowResult(result) => (Some(result), true),
+                Flow::NextAfterNestedSubworkflow => (None, true),
+            };
             // Advance only AFTER the step completes, so a restart resumes at the
             // interrupted step and never re-runs a finished one.
-            self.update_with_reason(id, "step_advanced", |i| i.current_step = index + 1);
+            if !self.update_with_reason(id, "step_advanced", |instance| {
+                complete_top_level_step(
+                    instance,
+                    index,
+                    clear_subworkflow,
+                    subworkflow_result,
+                );
+            }) {
+                return Err(rk_core::Error::other(format!(
+                    "could not durably advance workflow {id} after step {index}"
+                )));
+            }
         }
         Ok(())
     }
@@ -998,12 +1174,38 @@ impl WorkflowEngine {
         tiers: &'a TierRouting,
     ) -> StepFuture<'a> {
         Box::pin(async move {
+            let mut joined_subworkflow = false;
             for step in steps {
-                if let Flow::Break = self.run_step(id, step, repo, agents, tiers).await? {
-                    return Ok(Flow::Break);
+                match self.run_step(id, step, repo, agents, tiers).await? {
+                    Flow::Break => return Ok(Flow::Break),
+                    Flow::Next => {}
+                    Flow::NextWithSubworkflowResult(result) => {
+                        if joined_subworkflow {
+                            return Err(rk_core::Error::other(
+                                "multiple nested sub_workflow executions in one top-level step are refused because they cannot be replayed safely",
+                            ));
+                        }
+                        let result_for_snapshot = result.clone();
+                        self.try_update_with_reason(id, "nested_sub_workflow_joined", |instance| {
+                            join_nested_subworkflow_result(instance, result_for_snapshot);
+                        })?;
+                        joined_subworkflow = true;
+                    }
+                    Flow::NextAfterNestedSubworkflow => {
+                        if joined_subworkflow {
+                            return Err(rk_core::Error::other(
+                                "multiple nested sub_workflow executions in one top-level step are refused because they cannot be replayed safely",
+                            ));
+                        }
+                        joined_subworkflow = true;
+                    }
                 }
             }
-            Ok(Flow::Next)
+            if joined_subworkflow {
+                Ok(Flow::NextAfterNestedSubworkflow)
+            } else {
+                Ok(Flow::Next)
+            }
         })
     }
 
@@ -1288,13 +1490,29 @@ impl WorkflowEngine {
                     return self.run_steps(id, branch, repo, agents, tiers).await;
                 }
                 Step::Repeat(repeat) => {
+                    let mut joined_subworkflow = false;
                     for _ in 0..repeat.max {
-                        if let Flow::Break = self
+                        match self
                             .run_steps(id, &repeat.steps, repo, agents, tiers)
                             .await?
                         {
-                            break;
+                            Flow::Break => break,
+                            Flow::Next => {}
+                            Flow::NextAfterNestedSubworkflow => {
+                                if joined_subworkflow {
+                                    return Err(rk_core::Error::other(
+                                        "repeat attempted more than one nested sub_workflow execution in a top-level step; refusing unsafe replay",
+                                    ));
+                                }
+                                joined_subworkflow = true;
+                            }
+                            Flow::NextWithSubworkflowResult(_) => unreachable!(
+                                "run_steps converts a direct nested sub_workflow result"
+                            ),
                         }
+                    }
+                    if joined_subworkflow {
+                        return Ok(Flow::NextAfterNestedSubworkflow);
                     }
                 }
                 Step::Break => return Ok(Flow::Break),
@@ -1432,10 +1650,7 @@ impl WorkflowEngine {
                 }
                 Step::SubWorkflow(sub) => {
                     let result = self.run_sub_workflow(id, sub, repo, &ctx).await?;
-                    self.update(id, |i| {
-                        i.context.previous_result = Some(result.clone());
-                        i.context.awaited = Vec::new();
-                    });
+                    return Ok(Flow::NextWithSubworkflowResult(result));
                 }
             }
             Ok(Flow::Next)
@@ -1495,11 +1710,27 @@ impl WorkflowEngine {
         let workflow_name = workflow.name.clone();
         let automated_landing_authorized =
             self.is_automated_landing_definition(&file, &workflow_name);
+        let child_id = if let Some(existing) = ctx.active_subworkflow.clone() {
+            existing
+        } else {
+            let child_id = prefixed_id("wf");
+            let linked = self.update_with_reason(parent_id, "sub_workflow_linked", |parent| {
+                parent.context.active_subworkflow = Some(child_id.clone());
+            });
+            if !linked {
+                return Err(rk_core::Error::other(format!(
+                    "could not durably link sub_workflow '{}' to parent {parent_id}",
+                    sub.workflow
+                )));
+            }
+            child_id
+        };
         let child = Instance {
-            id: prefixed_id("wf"),
+            id: child_id.clone(),
             workflow: workflow_name.clone(),
             repo: child_repo.clone(),
             coordinator: self.status(parent_id).and_then(|i| i.coordinator),
+            schedule: None,
             status: InstanceStatus::Running,
             revision: 0,
             current_step: 0,
@@ -1509,23 +1740,72 @@ impl WorkflowEngine {
             awaiting: None,
             instance_max_usd: workflow.budget.map(|b| b.max_usd),
             definition: sub.workflow.clone(),
-            definition_digest,
+            definition_digest: definition_digest.clone(),
             automated_landing_authorized,
-            params,
+            params: params.clone(),
             depth,
             started_at: chrono::Utc::now(),
             completed_at: None,
             archived_at: None,
         };
-        let child_id = child.id.clone();
-        self.store(child)?;
+        if let Some(existing) = self.store_if_absent(child)? {
+            if existing.workflow != workflow_name
+                || existing.repo != child_repo
+                || existing.definition != sub.workflow
+                || existing.definition_digest != definition_digest
+                || existing.params != params
+                || existing.depth != depth
+            {
+                if existing.status == InstanceStatus::Running {
+                    let mismatch = format!(
+                        "linked sub_workflow instance {child_id} does not match '{}'",
+                        sub.workflow
+                    );
+                    if let Err(error) = self.try_update_with_reason(
+                        &child_id,
+                        "sub_workflow_link_mismatch",
+                        |instance| {
+                            instance.status = InstanceStatus::Failed;
+                            instance.error = Some(mismatch.clone());
+                            instance.completed_at = Some(Utc::now());
+                        },
+                    ) {
+                        self.fail_recovery_in_memory(
+                            &child_id,
+                            format!("linked child mismatch persistence failed: {error}"),
+                        );
+                        return Err(rk_core::Error::other(format!(
+                            "linked sub_workflow instance {child_id} does not match '{}'; failed to persist its fail-closed state: {error}",
+                            sub.workflow
+                        )));
+                    }
+                }
+                return Err(rk_core::Error::other(format!(
+                    "linked sub_workflow instance {child_id} does not match '{}'",
+                    sub.workflow
+                )));
+            }
+            match existing.status {
+                InstanceStatus::Completed => {
+                    return Ok(existing.context.previous_result.unwrap_or(Value::Null));
+                }
+                InstanceStatus::Failed => {
+                    return Err(rk_core::Error::other(format!(
+                        "sub_workflow '{}' (instance {child_id}) failed: {}",
+                        sub.workflow,
+                        existing.error.unwrap_or_else(|| "unknown child failure".into())
+                    )));
+                }
+                InstanceStatus::Running => {}
+            }
+        }
         info!(parent = %parent_id, child = %child_id, workflow = %workflow_name, depth, "running sub-workflow inline");
         // Execute the child on this task so the parent step joins on it. finalize
         // records the terminal status and emits the child's own completion event,
         // identical to a top-level run.
         match self.execute(&child_id, workflow, &child_repo).await {
             Ok(()) => {
-                self.finalize(&child_id, &child_repo, &workflow_name, Ok(()));
+                self.finalize(&child_id, &child_repo, &workflow_name, Ok(()))?;
                 // The child's final result is this sub_workflow's return value.
                 Ok(self
                     .status(&child_id)
@@ -1534,12 +1814,17 @@ impl WorkflowEngine {
             }
             Err(e) => {
                 let msg = e.to_string();
-                self.finalize(
+                if let Err(finalize_error) = self.finalize(
                     &child_id,
                     &child_repo,
                     &workflow_name,
                     Err(rk_core::Error::other(msg.clone())),
-                );
+                ) {
+                    return Err(rk_core::Error::other(format!(
+                        "sub_workflow '{}' (instance {child_id}) failed: {msg}; its terminal state also failed to persist: {finalize_error}",
+                        sub.workflow
+                    )));
+                }
                 Err(rk_core::Error::other(format!(
                     "sub_workflow '{}' (instance {child_id}) failed: {msg}",
                     sub.workflow
@@ -2418,14 +2703,66 @@ impl WorkflowEngine {
         let archive_dir = self.archive_dir();
         for instance in &mut moved {
             instance.archived_at = Some(now);
-            self.persist_to(&archive_dir, instance)?;
         }
         let live_dir = self.instances_dir();
-        for instance in &moved {
-            self.lock().remove(&instance.id);
-            self.lock_archived()
-                .insert(instance.id.clone(), instance.clone());
-            let _ = std::fs::remove_file(live_dir.join(format!("{}.json", instance.id)));
+        {
+            // Reserve every stable id and serialize the archive files themselves
+            // across both maps. Otherwise overlapping first-time prune requests
+            // can both observe no archive file; one failed writer may then remove
+            // the other request's committed snapshot during rollback.
+            let mut live = self.lock();
+            let mut archived = self.lock_archived();
+            let mut originals = Vec::with_capacity(moved.len());
+            for instance in &moved {
+                let current = live.get(&instance.id).ok_or_else(|| {
+                    rk_core::Error::other(format!(
+                        "workflow instance {} changed while it was being archived",
+                        instance.id
+                    ))
+                })?;
+                if current.revision != instance.revision
+                    || current.status == InstanceStatus::Running
+                {
+                    return Err(rk_core::Error::other(format!(
+                        "workflow instance {} changed while it was being archived",
+                        instance.id
+                    )));
+                }
+                originals.push(current.clone());
+            }
+
+            // Archive copies are durable before any live snapshot is removed.
+            // Holding both map locks makes this a single-writer transition for
+            // every selected stable id, including the atomic writer's rollback.
+            for instance in &moved {
+                self.persist_to(&archive_dir, instance)?;
+            }
+
+            for original in &originals {
+                let path = live_dir.join(format!("{}.json", original.id));
+                if let Err(remove_error) = remove_snapshot_durably(&path) {
+                    let rollback_errors: Vec<String> = originals
+                        .iter()
+                        .filter_map(|snapshot| {
+                            self.persist_to(&live_dir, snapshot).err().map(|error| {
+                                format!("restore {} failed: {error}", snapshot.id)
+                            })
+                        })
+                        .collect();
+                    return Err(rk_core::Error::other(if rollback_errors.is_empty() {
+                        format!("could not durably remove live workflow snapshot: {remove_error}")
+                    } else {
+                        format!(
+                            "could not durably remove live workflow snapshot: {remove_error}; rollback failed: {}",
+                            rollback_errors.join("; ")
+                        )
+                    }));
+                }
+            }
+            for instance in &moved {
+                live.remove(&instance.id);
+                archived.insert(instance.id.clone(), instance.clone());
+            }
         }
         info!(count = moved.len(), "archived terminal workflow instances");
         Ok(moved)
@@ -2436,22 +2773,41 @@ impl WorkflowEngine {
     /// instance; an id a live instance already holds is a real collision, not a
     /// no-op, and errors.
     pub fn unarchive(&self, id: &str) -> rk_core::Result<Option<Instance>> {
-        if self.lock().contains_key(id) {
+        let mut live = self.lock();
+        let mut archived = self.lock_archived();
+        if live.contains_key(id) {
             return Err(rk_core::Error::other(format!(
                 "cannot unarchive {id}: a live instance already holds that id"
             )));
         }
-        let Some(mut instance) = self.lock_archived().get(id).cloned() else {
+        let Some(mut instance) = archived.get(id).cloned() else {
             return Ok(None);
         };
+        let archived_snapshot = instance.clone();
         instance.archived_at = None;
         // Live file first: a crash before the archive file is removed leaves
         // the instance in both stores, where the live copy wins — never in
         // neither.
-        self.persist_to(&self.instances_dir(), &instance)?;
-        self.lock().insert(id.to_string(), instance.clone());
-        self.lock_archived().remove(id);
-        let _ = std::fs::remove_file(self.archive_dir().join(format!("{id}.json")));
+        let live_dir = self.instances_dir();
+        let archive_dir = self.archive_dir();
+        let live_path = live_dir.join(format!("{id}.json"));
+        let archive_path = archive_dir.join(format!("{id}.json"));
+        self.persist_to(&live_dir, &instance)?;
+        if let Err(remove_error) = remove_snapshot_durably(&archive_path) {
+            if let Err(rollback_error) = self.persist_to(&archive_dir, &archived_snapshot) {
+                return Err(rk_core::Error::other(format!(
+                    "could not durably remove archived workflow snapshot: {remove_error}; rollback failed: {rollback_error}; live recovery copy retained"
+                )));
+            }
+            if let Err(rollback_error) = remove_snapshot_durably(&live_path) {
+                return Err(rk_core::Error::other(format!(
+                    "could not durably remove archived workflow snapshot: {remove_error}; rollback failed: {rollback_error}"
+                )));
+            }
+            return Err(remove_error);
+        }
+        live.insert(id.to_string(), instance.clone());
+        archived.remove(id);
         info!(instance = id, "unarchived workflow instance");
         Ok(Some(instance))
     }
@@ -2527,17 +2883,6 @@ impl WorkflowEngine {
         self.lock().get(id).and_then(|i| i.coordinator.clone())
     }
 
-    fn store(&self, instance: Instance) -> rk_core::Result<()> {
-        let mut instances = self.lock();
-        instances.insert(instance.id.clone(), instance.clone());
-        if let Err(error) = self.persist(&instance) {
-            instances.remove(&instance.id);
-            return Err(error);
-        }
-        self.emit_state_event(&instance, "started");
-        Ok(())
-    }
-
     fn store_if_absent(&self, instance: Instance) -> rk_core::Result<Option<Instance>> {
         let mut instances = self.lock();
         if let Some(existing) = instances.get(&instance.id) {
@@ -2565,24 +2910,44 @@ impl WorkflowEngine {
         reason: &str,
         mutate: F,
     ) -> bool {
+        match self.try_update_with_reason(id, reason, mutate) {
+            Ok(changed) => changed,
+            Err(error) => {
+                warn!(instance = %id, %error, "failed to persist workflow state; skipping coordinator event");
+                false
+            }
+        }
+    }
+
+    fn try_update_with_reason<F: FnOnce(&mut Instance)>(
+        &self,
+        id: &str,
+        reason: &str,
+        mutate: F,
+    ) -> rk_core::Result<bool> {
         let mut instances = self.lock();
         if let Some(instance) = instances.get_mut(id) {
             let before = instance.clone();
             mutate(instance);
             if *instance == before {
-                return false;
+                return Ok(false);
             }
             instance.revision = instance.revision.saturating_add(1);
             let snapshot = instance.clone();
             if let Err(error) = self.persist(&snapshot) {
                 *instance = before;
-                warn!(instance = %id, %error, "failed to persist workflow state; skipping coordinator event");
-                return false;
+                return Err(error);
             }
             self.emit_state_event(&snapshot, reason);
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
+        }
+    }
+
+    fn fail_recovery_in_memory(&self, id: &str, detail: String) {
+        if let Some(instance) = self.lock().get_mut(id) {
+            mark_recovery_failure_in_memory(instance, &detail);
         }
     }
 
@@ -2676,15 +3041,95 @@ impl WorkflowEngine {
     }
 }
 
+fn complete_top_level_step(
+    instance: &mut Instance,
+    index: usize,
+    clear_subworkflow: bool,
+    subworkflow_result: Option<Value>,
+) {
+    instance.current_step = index + 1;
+    if let Some(result) = subworkflow_result {
+        instance.context.previous_result = Some(result);
+        instance.context.awaited = Vec::new();
+    }
+    if clear_subworkflow {
+        instance.context.active_subworkflow = None;
+    }
+}
+
+fn join_nested_subworkflow_result(instance: &mut Instance, result: Value) {
+    instance.context.previous_result = Some(result);
+    instance.context.awaited = Vec::new();
+    // Keep active_subworkflow until the enclosing top-level cursor advances.
+    // That durable link is what lets a restart rejoin the completed child.
+}
+
+fn require_persisted_transition(
+    result: rk_core::Result<bool>,
+    id: &str,
+    transition: &str,
+) -> rk_core::Result<()> {
+    match result {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(rk_core::Error::other(format!(
+            "workflow {id} {transition} was not persisted"
+        ))),
+        Err(error) => Err(rk_core::Error::other(format!(
+            "workflow {id} {transition} was not persisted: {error}"
+        ))),
+    }
+}
+
+fn mark_recovery_failure_in_memory(instance: &mut Instance, detail: &str) {
+    instance.status = InstanceStatus::Failed;
+    instance.error = Some(format!(
+        "fail-closed recovery state was not durably recorded: {detail}"
+    ));
+    instance.completed_at = Some(Utc::now());
+}
+
 /// Replace one workflow snapshot durably.
 ///
 /// The temporary file is synced before rename, then the parent directory is
 /// synced so both file contents and the directory entry survive a crash.
 fn persist_bytes_atomically(path: &Path, data: &[u8]) -> rk_core::Result<()> {
+    persist_bytes_atomically_with_sync(path, data, &mut sync_directory)
+}
+
+fn remove_snapshot_durably(path: &Path) -> rk_core::Result<()> {
+    remove_snapshot_durably_with_sync(path, &mut sync_directory)
+}
+
+fn remove_snapshot_durably_with_sync<F>(path: &Path, sync: &mut F) -> rk_core::Result<()>
+where
+    F: FnMut(&Path) -> rk_core::Result<()>,
+{
     let dir = path
         .parent()
         .ok_or_else(|| rk_core::Error::other("workflow snapshot path has no parent"))?;
+    std::fs::remove_file(path)?;
+    sync(dir)
+}
+
+fn persist_bytes_atomically_with_sync<F>(
+    path: &Path,
+    data: &[u8],
+    sync: &mut F,
+) -> rk_core::Result<()>
+where
+    F: FnMut(&Path) -> rk_core::Result<()>,
+{
+    let dir = path
+        .parent()
+        .ok_or_else(|| rk_core::Error::other("workflow snapshot path has no parent"))?;
+    let dir_was_missing = !dir.exists();
     std::fs::create_dir_all(dir)?;
+    if dir_was_missing {
+        let parent = dir.parent().ok_or_else(|| {
+            rk_core::Error::other("workflow snapshot directory has no parent")
+        })?;
+        sync(parent)?;
+    }
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -2694,6 +3139,10 @@ fn persist_bytes_atomically(path: &Path, data: &[u8]) -> rk_core::Result<()> {
         "{file_name}.tmp-{}-{sequence}",
         std::process::id()
     ));
+    let backup = dir.join(format!(
+        "{file_name}.backup-{}-{sequence}",
+        std::process::id()
+    ));
     let result = (|| -> rk_core::Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
@@ -2701,14 +3150,75 @@ fn persist_bytes_atomically(path: &Path, data: &[u8]) -> rk_core::Result<()> {
             .open(&tmp)?;
         file.write_all(data)?;
         file.sync_all()?;
+        let had_previous = path.exists();
+        if had_previous {
+            std::fs::hard_link(path, &backup)?;
+            sync(dir)?;
+        }
         std::fs::rename(&tmp, path)?;
-        sync_directory(dir)?;
+        if let Err(commit_error) = sync(dir) {
+            let rollback = if had_previous {
+                restore_snapshot_from_backup_with(
+                    path,
+                    &backup,
+                    sync,
+                    &mut |from, to| {
+                        std::fs::rename(from, to).map_err(rk_core::Error::from)
+                    },
+                )
+            } else {
+                std::fs::remove_file(path)
+                    .map_err(rk_core::Error::from)
+                    .and_then(|()| sync(dir))
+            };
+            if let Err(rollback_error) = rollback {
+                return Err(rk_core::Error::other(format!(
+                    "workflow snapshot commit failed: {commit_error}; rollback failed: {rollback_error}; recovery backup retained at {}",
+                    backup.display()
+                )));
+            }
+            if had_previous {
+                let _ = std::fs::remove_file(&backup);
+                let _ = sync(dir);
+            }
+            return Err(commit_error);
+        }
+        if had_previous {
+            let _ = std::fs::remove_file(&backup);
+            let _ = sync(dir);
+        }
         Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+fn restore_snapshot_from_backup_with<F, R>(
+    path: &Path,
+    backup: &Path,
+    sync: &mut F,
+    replace: &mut R,
+) -> rk_core::Result<()>
+where
+    F: FnMut(&Path) -> rk_core::Result<()>,
+    R: FnMut(&Path, &Path) -> rk_core::Result<()>,
+{
+    let dir = path
+        .parent()
+        .ok_or_else(|| rk_core::Error::other("workflow snapshot path has no parent"))?;
+    let backup_name = backup
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| rk_core::Error::other("workflow backup path has no file name"))?;
+    let restore = backup.with_file_name(format!("{backup_name}.restore"));
+    std::fs::hard_link(backup, &restore)?;
+    if let Err(error) = replace(&restore, path) {
+        let _ = std::fs::remove_file(&restore);
+        return Err(error);
+    }
+    sync(dir)
 }
 
 #[cfg(unix)]
@@ -2934,6 +3444,23 @@ fn flatten_step(rows: &mut Vec<TimelineRow>, index: usize, depth: usize, step: &
     }
 }
 
+fn step_contains_subworkflow(step: &Step, child: &str) -> bool {
+    match step {
+        Step::SubWorkflow(sub) => sub.workflow == child,
+        Step::When(when) => when
+            .cases
+            .values()
+            .flat_map(|steps| steps.iter())
+            .chain(when.default.iter())
+            .any(|step| step_contains_subworkflow(step, child)),
+        Step::Repeat(repeat) => repeat
+            .steps
+            .iter()
+            .any(|step| step_contains_subworkflow(step, child)),
+        _ => false,
+    }
+}
+
 /// Short human label for one step, mirroring the CUE field names an operator
 /// wrote in the definition.
 fn step_label(step: &Step) -> String {
@@ -3018,6 +3545,260 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("instance.json")]);
+    }
+
+    #[test]
+    fn failed_directory_sync_after_rename_leaves_no_rehydratable_initial_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rejected.json");
+        let mut syncs = 0;
+
+        let result = persist_bytes_atomically_with_sync(&path, b"running", &mut |_| {
+            syncs += 1;
+            if syncs == 1 {
+                Err(rk_core::Error::other("injected directory sync failure"))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(result.is_err());
+        assert!(
+            !path.exists(),
+            "a caller-rejected initial snapshot must not be resumed after restart"
+        );
+    }
+
+    #[test]
+    fn failed_directory_sync_after_replacement_restores_previous_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.json");
+        std::fs::write(&path, b"previous").unwrap();
+        let mut syncs = 0;
+
+        let result = persist_bytes_atomically_with_sync(&path, b"replacement", &mut |_| {
+            syncs += 1;
+            if syncs == 2 {
+                Err(rk_core::Error::other("injected replacement sync failure"))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
+    }
+
+    #[test]
+    fn failed_rollback_sync_preserves_backup_and_reports_indeterminate_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.json");
+        std::fs::write(&path, b"previous").unwrap();
+        let mut syncs = 0;
+
+        let error = persist_bytes_atomically_with_sync(&path, b"replacement", &mut |_| {
+            syncs += 1;
+            if syncs >= 2 {
+                Err(rk_core::Error::other(format!("injected sync failure {syncs}")))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("rollback"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".backup-")
+            }),
+            "a failed rollback durability sync must retain the old snapshot backup"
+        );
+    }
+
+    #[test]
+    fn snapshot_removal_requires_parent_directory_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.json");
+        std::fs::write(&path, b"snapshot").unwrap();
+        let mut synced = false;
+
+        let error = remove_snapshot_durably_with_sync(&path, &mut |parent| {
+            synced = true;
+            assert_eq!(parent, dir.path());
+            Err(rk_core::Error::other("injected removal sync failure"))
+        })
+        .unwrap_err();
+
+        assert!(synced);
+        assert!(error.to_string().contains("injected removal sync failure"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn subworkflow_completion_advances_cursor_and_clears_link_in_one_snapshot() {
+        let mut instance = Instance {
+            id: "parent".into(),
+            workflow: "parent".into(),
+            repo: "/repo".into(),
+            coordinator: None,
+            schedule: None,
+            status: InstanceStatus::Running,
+            revision: 0,
+            current_step: 0,
+            total_steps: 1,
+            context: WorkflowContext {
+                active_subworkflow: Some("child".into()),
+                ..Default::default()
+            },
+            error: None,
+            awaiting: None,
+            instance_max_usd: None,
+            definition: "parent".into(),
+            definition_digest: String::new(),
+            automated_landing_authorized: false,
+            params: HashMap::new(),
+            depth: 0,
+            started_at: Utc::now(),
+            completed_at: None,
+            archived_at: None,
+        };
+
+        complete_top_level_step(&mut instance, 0, true, Some(json!({"joined": true})));
+
+        assert_eq!(instance.current_step, 1);
+        assert_eq!(instance.context.active_subworkflow, None);
+        assert_eq!(instance.context.previous_result, Some(json!({"joined": true})));
+    }
+
+    #[test]
+    fn nested_subworkflow_result_keeps_link_until_top_level_cursor_advances() {
+        let mut instance = Instance {
+            id: "parent".into(),
+            workflow: "parent".into(),
+            repo: "/repo".into(),
+            coordinator: None,
+            schedule: None,
+            status: InstanceStatus::Running,
+            revision: 0,
+            current_step: 0,
+            total_steps: 1,
+            context: WorkflowContext {
+                active_subworkflow: Some("child".into()),
+                ..Default::default()
+            },
+            error: None,
+            awaiting: None,
+            instance_max_usd: None,
+            definition: "parent".into(),
+            definition_digest: String::new(),
+            automated_landing_authorized: false,
+            params: HashMap::new(),
+            depth: 0,
+            started_at: Utc::now(),
+            completed_at: None,
+            archived_at: None,
+        };
+
+        join_nested_subworkflow_result(&mut instance, json!({"joined": true}));
+        assert_eq!(instance.current_step, 0);
+        assert_eq!(instance.context.active_subworkflow.as_deref(), Some("child"));
+
+        complete_top_level_step(&mut instance, 0, true, None);
+        assert_eq!(instance.current_step, 1);
+        assert_eq!(instance.context.active_subworkflow, None);
+        assert_eq!(instance.context.previous_result, Some(json!({"joined": true})));
+    }
+
+    #[test]
+    fn terminal_persistence_failure_is_returned_to_the_joining_parent() {
+        let error = require_persisted_transition(
+            Err(rk_core::Error::other("injected terminal persistence failure")),
+            "child",
+            "terminal state",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected terminal persistence failure"));
+        assert!(error.to_string().contains("child"));
+    }
+
+    #[test]
+    fn failed_backup_restore_keeps_both_canonical_and_recovery_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instance.json");
+        let backup = dir.path().join("instance.json.backup");
+        std::fs::write(&path, b"replacement").unwrap();
+        std::fs::write(&backup, b"previous").unwrap();
+
+        let error = restore_snapshot_from_backup_with(
+            &path,
+            &backup,
+            &mut |_| Ok(()),
+            &mut |_, _| Err(rk_core::Error::other("injected restore failure")),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected restore failure"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"previous");
+    }
+
+    #[test]
+    fn recovery_persistence_failure_marks_the_in_memory_instance_non_resumable() {
+        let mut instance = Instance {
+            id: "child".into(),
+            workflow: "child".into(),
+            repo: "/repo".into(),
+            coordinator: None,
+            schedule: None,
+            status: InstanceStatus::Running,
+            revision: 0,
+            current_step: 0,
+            total_steps: 1,
+            context: WorkflowContext::default(),
+            error: None,
+            awaiting: None,
+            instance_max_usd: None,
+            definition: "child".into(),
+            definition_digest: String::new(),
+            automated_landing_authorized: false,
+            params: HashMap::new(),
+            depth: 1,
+            started_at: Utc::now(),
+            completed_at: None,
+            archived_at: None,
+        };
+
+        mark_recovery_failure_in_memory(
+            &mut instance,
+            "injected recovery persistence failure",
+        );
+
+        assert_eq!(instance.status, InstanceStatus::Failed);
+        assert!(instance
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("not durably recorded"));
+        assert!(instance.completed_at.is_some());
+    }
+
+    #[test]
+    fn new_snapshot_directory_must_be_synced_before_installing_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new-instances").join("instance.json");
+
+        let result = persist_bytes_atomically_with_sync(&path, b"running", &mut |_| {
+            Err(rk_core::Error::other("injected parent sync failure"))
+        });
+
+        assert!(result.is_err());
+        assert!(!path.exists());
     }
 
     #[test]
@@ -3259,6 +4040,7 @@ mod tests {
             workflow: "steward".into(),
             repo: "/dev/repo".into(),
             coordinator: None,
+            schedule: None,
             status: InstanceStatus::Failed,
             revision: 0,
             current_step: 0,

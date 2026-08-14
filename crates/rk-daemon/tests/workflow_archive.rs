@@ -355,6 +355,47 @@ async fn pruned_instance_stays_pruned_across_a_restart() {
     );
 }
 
+#[tokio::test]
+async fn concurrent_prune_requests_preserve_exactly_one_archived_snapshot() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut launcher = connect(&layout).await;
+    let failed = run(&mut launcher, repo.path(), "flops").await;
+    wait_status(&mut launcher, &failed, "failed").await;
+
+    let mut first = Client::connect_as_operator(&layout).await.unwrap();
+    let mut second = Client::connect_as_operator(&layout).await.unwrap();
+    let (left, right) = tokio::join!(
+        first.call("workflow.archive", json!({"ids": [&failed]})),
+        second.call("workflow.archive", json!({"ids": [&failed]})),
+    );
+
+    assert_eq!(
+        usize::from(left.is_ok()) + usize::from(right.is_ok()),
+        1,
+        "exactly one overlapping prune may own the transition: left={left:?} right={right:?}"
+    );
+    let live_file = home
+        .path()
+        .join("workflow-instances")
+        .join(format!("{failed}.json"));
+    let archived_file = home
+        .path()
+        .join("workflow-instances-archive")
+        .join(format!("{failed}.json"));
+    assert!(!live_file.exists());
+    assert!(archived_file.exists());
+
+    let status = launcher
+        .call("workflow.status", json!({"name": &failed}))
+        .await
+        .unwrap();
+    assert!(status["instance"]["archived_at"].is_string());
+}
+
 /// `rk prune` is the operator's "clear what's settled" gesture; after TKT-177
 /// it clears both halves of the board in one pass, on one window.
 #[tokio::test]

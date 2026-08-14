@@ -605,6 +605,7 @@ mod tests {
             workflow: workflow.into(),
             repo: "rat-kingdom".into(),
             coordinator: None,
+            schedule: None,
             status: InstanceStatus::Completed,
             revision: 0,
             current_step: 1,

@@ -157,6 +157,29 @@ those consumers are listening are persisted `Running` instances resumed. An
 archived stable ID is therefore still occupied and cannot be relaunched by a
 replayed tuple.
 
+Nested `sub_workflow` steps persist the active child ID in the parent before the
+child snapshot is created. A restart therefore recreates a not-yet-installed
+child or rejoins the exact persisted child and its step cursor, rather than
+minting a replacement. A direct child result, cleared child link, and parent
+resume cursor are committed in one parent snapshot. Inside `when` or `repeat`,
+the joined result may be needed by later nested steps, so it is persisted first
+while the child link remains occupied; the link is cleared only when the
+enclosing top-level cursor commits. A crash therefore cannot acknowledge a child
+and then rerun it under a new ID. More than one nested child execution inside one
+top-level step is refused fail-closed because there is no independently durable
+nested-step cursor. A parent accepts a joined child only after the child's
+terminal snapshot is durable; if that write fails, the parent fails with the
+child link still occupied. Legacy `Running` children without that parent link
+fail closed with their matching parent instead of risking duplicate side effects.
+If recording that recovery state fails, the in-memory instance is still marked
+non-resumable and reports that its fail-closed status was not durably recorded.
+Archive and unarchive transitions reserve stable IDs atomically across the live
+and archived registries. Archive snapshot writes, live removals, and map movement
+are serialized under that reservation, so overlapping prune requests cannot
+roll back one another's committed copy. Snapshot removals are followed by a
+parent-directory sync, and a failed transition restores a durable recovery copy
+before returning an error.
+
 ## Re-entrancy and storm control
 
 A workflow whose action writes a tuple that re-fires its own trigger would loop
