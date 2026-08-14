@@ -335,24 +335,15 @@ fn migrate(
                FROM tuple_sequence_state WHERE singleton = 1;
          END;
          DROP TRIGGER IF EXISTS tuple_persistence_events_reject_replace;
-         CREATE TRIGGER tuple_persistence_events_reject_replace
+         DROP TRIGGER IF EXISTS tuple_persistence_events_ignore_duplicate;
+         CREATE TRIGGER tuple_persistence_events_ignore_duplicate
          BEFORE INSERT ON tuple_persistence_events
          FOR EACH ROW WHEN EXISTS (
              SELECT 1 FROM tuple_persistence_events
               WHERE commit_sequence = NEW.commit_sequence
-                AND (id IS NOT NEW.id
-                     OR category IS NOT NEW.category
-                     OR scope IS NOT NEW.scope
-                     OR identity IS NOT NEW.identity
-                     OR instance IS NOT NEW.instance
-                     OR lifecycle IS NOT NEW.lifecycle
-                     OR payload IS NOT NEW.payload
-                     OR created_at IS NOT NEW.created_at
-                     OR expires_at IS NOT NEW.expires_at
-                     OR strength IS NOT NEW.strength)
          )
          BEGIN
-             SELECT RAISE(ABORT, 'tuple persistence journal is immutable');
+             SELECT RAISE(IGNORE);
          END;
          DROP TRIGGER IF EXISTS tuple_persistence_events_reject_update;
          CREATE TRIGGER tuple_persistence_events_reject_update

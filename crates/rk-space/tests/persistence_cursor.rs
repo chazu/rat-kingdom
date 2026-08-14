@@ -433,7 +433,7 @@ fn failed_migration_does_not_leave_journal_schema_residue() {
 }
 
 #[test]
-fn persistence_journal_rejects_insert_or_replace_of_an_existing_sequence() {
+fn persistence_journal_ignores_insert_or_replace_of_an_existing_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("journal-replace.db");
     let space = Space::open(&db).unwrap();
@@ -450,7 +450,7 @@ fn persistence_journal_rejects_insert_or_replace_of_an_existing_sequence() {
         [Utc::now().to_rfc3339()],
     );
 
-    assert!(replacement.is_err(), "REPLACE must not mutate the immutable journal");
+    assert_eq!(replacement.unwrap(), 0, "REPLACE must be reduced to a no-op");
     assert_eq!(space.persistence_delta(None).unwrap().tuples, vec![original]);
 }
 
@@ -481,6 +481,47 @@ fn current_journal_allows_older_insert_or_ignore_backfill_to_be_a_noop() {
     drop(conn);
     let reopened = Space::open(&db).unwrap();
     assert_eq!(reopened.persistence_delta(None).unwrap().tuples, vec![original]);
+}
+
+#[test]
+fn current_journal_allows_older_backfill_after_live_tuple_reinforcement() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("journal-old-backfill-after-reinforce.db");
+    let original = fact(RecordId::floor_at(Utc::now()), "original");
+    {
+        let space = Space::open(&db).unwrap();
+        space.out(original.clone()).unwrap();
+
+        let mut refreshed = original.clone();
+        refreshed.payload = json!({"state": "refreshed"});
+        space.reinforce(refreshed).unwrap();
+    }
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO tuple_persistence_events
+         (commit_sequence, id, category, scope, identity, instance, lifecycle,
+          payload, created_at, expires_at, strength)
+         SELECT commit_sequence, id, category, scope, identity, instance,
+                lifecycle, payload, created_at, expires_at, strength
+           FROM tuples
+          WHERE commit_sequence IS NOT NULL
+          ORDER BY commit_sequence ASC",
+        [],
+    );
+
+    assert_eq!(
+        inserted.unwrap(),
+        0,
+        "an older binary must treat live tuple mutations as an ignored duplicate"
+    );
+    drop(conn);
+    let reopened = Space::open(&db).unwrap();
+    assert_eq!(
+        reopened.persistence_delta(None).unwrap().tuples,
+        vec![original],
+        "the immutable journal must retain the original persisted snapshot"
+    );
 }
 
 #[test]
