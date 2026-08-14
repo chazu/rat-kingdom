@@ -63,7 +63,7 @@ fn install_mcp_copies_binary_preserves_config_and_is_idempotent() {
         &config,
         serde_json::to_vec_pretty(&json!({
             "unknownRoot": {"keep": [1, 2, 3]},
-            "mcpServers": {
+            "servers": {
                 "other": {"command": "other-server", "custom": {"keep": true}}
             }
         }))
@@ -87,21 +87,22 @@ fn install_mcp_copies_binary_preserves_config_and_is_idempotent() {
     let installed: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(installed["unknownRoot"], json!({"keep": [1, 2, 3]}));
     assert_eq!(
-        installed["mcpServers"]["other"],
+        installed["servers"]["other"],
         json!({
             "command": "other-server",
             "custom": {"keep": true}
         })
     );
     assert_eq!(
-        installed["mcpServers"]["rk"]["command"],
+        installed["servers"]["rk"]["command"],
         destination.display().to_string()
     );
-    assert_eq!(installed["mcpServers"]["rk"]["args"], json!([]));
+    assert_eq!(installed["servers"]["rk"]["args"], json!([]));
     assert_eq!(
-        installed["mcpServers"]["rk"]["x-rat-kingdom-managed"],
+        installed["servers"]["rk"]["x-rat-kingdom-managed"],
         "factory.mcp-install.v1"
     );
+    assert!(installed.get("mcpServers").is_none());
 
     let second = json_output(&run(
         &rk,
@@ -123,7 +124,7 @@ fn install_mcp_refuses_foreign_entry_without_force_and_preserves_unknown_fields(
         .status
         .success());
     let mut foreign: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    foreign["mcpServers"]["rk"] = json!({
+    foreign["servers"]["rk"] = json!({
         "command": "human-owned",
         "args": ["--human"],
         "custom": {"preserve": [true, false]}
@@ -145,15 +146,15 @@ fn install_mcp_refuses_foreign_entry_without_force_and_preserves_unknown_fields(
     assert_eq!(forced["disposition"], "updated");
     let replaced: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(
-        replaced["mcpServers"]["rk"]["custom"],
+        replaced["servers"]["rk"]["custom"],
         json!({"preserve": [true, false]})
     );
     assert_eq!(
-        replaced["mcpServers"]["rk"]["command"],
+        replaced["servers"]["rk"]["command"],
         temp.path().join("bin/rk-mcp").display().to_string()
     );
     assert_eq!(
-        replaced["mcpServers"]["rk"]["x-rat-kingdom-managed"],
+        replaced["servers"]["rk"]["x-rat-kingdom-managed"],
         "factory.mcp-install.v1"
     );
 }

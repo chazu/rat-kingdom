@@ -581,13 +581,16 @@ fn register_mcp(document: &mut Value, binary: &Path, force: bool) -> Result<(boo
     let root = document
         .as_object_mut()
         .ok_or_else(|| anyhow!("Jcode MCP configuration must contain a JSON object"))?;
-    let servers = match root.entry("mcpServers".to_string()) {
+    // Jcode discovers MCP servers under the top-level `servers` object. Keep
+    // any legacy/foreign roots untouched rather than creating a Claude-style
+    // `mcpServers` tree that Jcode will never read.
+    let servers = match root.entry("servers".to_string()) {
         serde_json::map::Entry::Vacant(entry) => entry.insert(Value::Object(Map::new())),
         serde_json::map::Entry::Occupied(entry) => entry.into_mut(),
     };
     let servers = servers
         .as_object_mut()
-        .ok_or_else(|| anyhow!("Jcode MCP configuration field mcpServers must be an object"))?;
+        .ok_or_else(|| anyhow!("Jcode MCP configuration field servers must be an object"))?;
     let entry_existed = servers.contains_key("rk");
     let entry = servers
         .entry("rk".to_string())
