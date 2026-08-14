@@ -66,16 +66,16 @@ A failed observation remains in top-level `observations` and nested `snapshot.ob
 
 ## Dashboard renderer input and output
 
-The repository-owned dashboard renderer consumes JSON artifacts that have already been obtained from typed factory read interfaces:
+The bundled legacy dashboard renderer consumes JSON artifacts that have already been obtained from typed factory read interfaces:
 
 - `--snapshot PATH`: one JSON document from `factory.snapshot`, containing the current connection state and factory projection such as approvals, workflow runs, agents, tickets, inbox, budget, degraded sources, and repository resync state when present. The renderer displays the snapshot source so readers can distinguish live data from saved or replayed data.
 - `--events PATH`: one JSON document from `factory.events.replay`, containing replay metadata such as cursor, typed replay `boundary`, `truncated`, and the recent event list. Event rows use typed event `kind`; legacy `boundary_cursor` and `type` aliases are tolerated for old artifacts.
 - `--output PATH`: the Markdown file to create or replace.
 
-Run it from the repository root:
+Run the globally installed copy from any repository:
 
 ```bash
-python3 .jcode/skills/factory-foreman/dashboard/render_factory_dashboard.py \
+python3 ~/.jcode/skills/factory-foreman/dashboard/render_factory_dashboard.py \
   --snapshot "$JCODE_SCRATCH_DIR/factory-snapshot.json" \
   --events "$JCODE_SCRATCH_DIR/factory-events.json" \
   --output "$JCODE_SCRATCH_DIR/factory-dashboard.md"
@@ -97,22 +97,22 @@ MCP and CLI are upstream ways to acquire typed JSON, not dependencies called by 
 
 Valid later-user approvals include:
 
-- `Approve proposal_id abc123 exactly as shown.`
-- `Approve: rk --json workflow run repair --repo rat-kingdom --param ticket=42`
+- `Approve proposal_id abc123 and its displayed digest exactly as shown.`
+- `Approve the exact saved factory proposal in factory-proposal.json.`
 
 Invalid approvals include:
 
 - Approval in the same assistant turn as proposal rendering.
-- `Looks good` without the exact proposal ID or exact command.
-- Approval after any workflow, repo, parameter, coordinator, or argv order changed.
+- `Looks good` without the exact proposal ID and digest.
+- Approval after any workflow, repo, parameter, coordinator, proposal field, or digest changed.
 
-Before execution, run:
+For the legacy Phase 1 fallback, run:
 
 ```bash
-python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py validate-proposal --proposal-file <file> --approved-id <proposal_id>
+python3 ~/.jcode/skills/factory-foreman/scripts/factory_foreman.py validate-proposal --proposal-file <file> --approved-id <proposal_id>
 ```
 
-Then execute only the returned validated `argv` when using the Phase 1 fallback helper path. Typed execution must instead verify daemon-recorded approval of the exact canonical digest before dispatch. Require reapproval for any changed argv.
+The helper output is inspection-only legacy data. Do not execute its returned `argv`. Native execution must use a saved typed factory proposal and daemon-recorded approval of the exact canonical digest. Require a new proposal and approval for any change.
 
 ## Recovery behavior
 

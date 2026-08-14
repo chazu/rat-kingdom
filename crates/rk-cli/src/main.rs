@@ -3,6 +3,7 @@
 mod agent_cmds;
 mod factory_dashboard;
 mod factory_cmds;
+mod factory_skill;
 mod ingest_cmds;
 mod observe;
 mod product_to_code_cmds;

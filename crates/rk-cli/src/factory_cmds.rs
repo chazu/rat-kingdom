@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
 pub enum FactoryCommand {
+    /// Install the bundled Factory Foreman skill into Jcode's global skill directory.
+    InstallSkill(FactoryInstallSkillArgs),
     /// Open a Rust-native read-only factory dashboard, auto-starting the daemon.
     Dashboard(FactoryDashboardArgs),
     /// Read the native factory snapshot without starting the daemon.
@@ -34,6 +36,13 @@ pub enum FactoryCommand {
     /// only; never mutates routing, policy, workflows, tickets, approvals, or
     /// dispatch.
     Recommend(FactoryAnalyticsArgs),
+}
+
+#[derive(Args)]
+pub struct FactoryInstallSkillArgs {
+    /// Replace an installed skill that differs from this RK release.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args)]
@@ -244,6 +253,32 @@ pub struct FactoryAnalyticsArgs {
 
 pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) -> Result<()> {
     match command {
+        FactoryCommand::InstallSkill(args) => {
+            let destination = crate::factory_skill::global_factory_foreman_destination()?;
+            let result =
+                crate::factory_skill::install_factory_foreman_skill(&destination, args.force)?;
+            let disposition = match result.disposition {
+                crate::factory_skill::InstallDisposition::Installed => "installed",
+                crate::factory_skill::InstallDisposition::AlreadyInstalled => "already_installed",
+                crate::factory_skill::InstallDisposition::Updated => "updated",
+            };
+            if json_output {
+                println!(
+                    "{}",
+                    json!({
+                        "schema": "factory.skill-install.v1",
+                        "skill": "factory-foreman",
+                        "disposition": disposition,
+                        "destination": result.destination,
+                    })
+                );
+            } else {
+                println!(
+                    "{disposition} Factory Foreman at {}",
+                    result.destination.display()
+                );
+            }
+        }
         FactoryCommand::Dashboard(mut args) => {
             if dashboard_output_mode(json_output, io::stdout().is_terminal(), args.plain)
                 == DashboardOutputMode::Interactive

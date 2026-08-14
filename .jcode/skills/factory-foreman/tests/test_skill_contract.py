@@ -8,7 +8,7 @@ REFERENCE = SKILL_DIR / "REFERENCE.md"
 
 APPROVAL_SENTENCE = (
     "Never execute a mutating Rat Kingdom command unless a later user message "
-    "explicitly approves the exact command rendered in this conversation."
+    "explicitly approves the exact proposal rendered in this conversation."
 )
 
 TRIGGERS = [
@@ -36,7 +36,7 @@ class FactoryForemanSkillContractTests(unittest.TestCase):
         cls.skill_text = SKILL.read_text(encoding="utf-8")
         cls.reference_text = REFERENCE.read_text(encoding="utf-8")
 
-    def test_skill_has_valid_repository_local_frontmatter(self):
+    def test_skill_has_valid_global_frontmatter(self):
         self.assertTrue(self.skill_text.startswith("---\n"))
         frontmatter = self.skill_text.split("---\n", 2)[1]
         self.assertRegex(frontmatter, r"(?m)^name:\s*factory-foreman\s*$")
@@ -54,12 +54,16 @@ class FactoryForemanSkillContractTests(unittest.TestCase):
         self.assertLess(len(self.skill_text.splitlines()), 500)
 
     def test_default_workflow_is_read_only_and_triage_first(self):
-        self.assertIn(
-            "python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py triage --repo <repo> --format markdown",
-            self.skill_text,
-        )
-        self.assertRegex(self.skill_text.lower(), r"read-only.*default|default.*read-only")
-        self.assertIn("Run read-only triage first", self.skill_text)
+        for command in [
+            "rk --json factory snapshot --repo <repo>",
+            "rk --json factory events replay --repo <repo> --limit 256",
+            "rk --json factory scorecards --repo <repo>",
+            "rk --json factory recommend --repo <repo>",
+        ]:
+            self.assertIn(command, self.skill_text)
+        self.assertIn("native, typed, read-only RK data", self.skill_text)
+        self.assertIn("This is the only default action", self.skill_text)
+        self.assertNotIn("Use this repository-local skill", self.skill_text)
 
     def test_exact_approval_language_is_verbatim(self):
         self.assertIn(APPROVAL_SENTENCE, self.skill_text)
@@ -80,9 +84,10 @@ class FactoryForemanSkillContractTests(unittest.TestCase):
         required = [
             "Stop and request approval",
             "later user message explicitly approves",
-            "validate-proposal",
-            "execute only the validated argv",
-            "requires a new proposal and new approval",
+            "rk --json factory approve --proposal-file <file>",
+            "rk --json factory execute-action --proposal-file <file>",
+            "requires a new proposal and approval",
+            "daemon verifies the canonical digest",
             "workflow watch --json is NDJSON",
         ]
         for phrase in required:

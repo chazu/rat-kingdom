@@ -101,6 +101,16 @@ Watch subscribes before replay, returns the finite replay response, then streams
 
 ## Installation and discovery
 
+Install the Factory Foreman skill globally for Jcode:
+
+```bash
+rk factory install-skill
+```
+
+The command installs the package embedded in the current RK release to `~/.jcode/skills/factory-foreman/`. Jcode can then discover and use it while working in any repository. Re-running the command is idempotent. If the installed package has local modifications or came from another RK release, the installer fails without changing it; use `rk factory install-skill --force` to explicitly replace it. `rk --json factory install-skill` emits a `factory.skill-install.v1` result envelope for automated onboarding.
+
+The global skill instructs Jcode to use native typed RK reads first: factory snapshot, bounded event replay, scorecards, and recommendations. It triages fleet and workflow health, names degraded evidence, deduplicates existing tickets, recommends registered workflow definitions, and can prepare an exact typed proposal. It must stop for a later human approval before forwarding that proposal through `factory approve` and `factory execute-action`. Repository resolution, authenticated caller identity, canonical digest verification, approval lifecycle, CAS checks, idempotency, and execution remain daemon responsibilities.
+
 The human-facing dashboard is part of the Rust `rk` binary. From a registered repository, run:
 
 ```bash
@@ -109,10 +119,10 @@ rk factory dashboard --repo rat-kingdom
 
 No separate daemon-start command is required. The dashboard connects to the daemon or starts it through the same guarded Rust client path used by other operator commands, then stays open and refreshes until you press `q`.
 
-The repository-local Jcode compatibility skill lives at `.jcode/skills/factory-foreman/`. Jcode discovers repository-local skills from that directory when working in this checkout. Its Python helper remains available for legacy deterministic triage and fixture-driven skill tests:
+The source package remains in this repository at `.jcode/skills/factory-foreman/`. The globally installed copy includes its Python helper for legacy deterministic triage:
 
 ```bash
-python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py triage --repo rat-kingdom --format markdown
+python3 ~/.jcode/skills/factory-foreman/scripts/factory_foreman.py triage --repo rat-kingdom --format markdown
 ```
 
 The compatibility helper uses only the Python 3 standard library. Unlike the Rust dashboard, it deliberately never starts the daemon. It first runs strict preflight:
@@ -128,7 +138,7 @@ If preflight fails, the helper stops and does not run observation commands that 
 ### Snapshot
 
 ```bash
-python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py snapshot \
+python3 ~/.jcode/skills/factory-foreman/scripts/factory_foreman.py snapshot \
   --repo rat-kingdom \
   --format json
 ```
@@ -138,7 +148,7 @@ Outputs the read-only snapshot only.
 ### Triage
 
 ```bash
-python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py triage \
+python3 ~/.jcode/skills/factory-foreman/scripts/factory_foreman.py triage \
   --repo rat-kingdom \
   --format json
 ```
@@ -148,7 +158,7 @@ Outputs findings plus the snapshot. Markdown output is available with `--format 
 ### Propose workflow
 
 ```bash
-python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py propose-workflow <workflow> \
+python3 ~/.jcode/skills/factory-foreman/scripts/factory_foreman.py propose-workflow <workflow> \
   --repo rat-kingdom \
   --param KEY=VALUE \
   --coordinator <session-id>
@@ -159,7 +169,7 @@ python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py propose-workflo
 ### Validate proposal
 
 ```bash
-python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py validate-proposal \
+python3 ~/.jcode/skills/factory-foreman/scripts/factory_foreman.py validate-proposal \
   --proposal-file <proposal.json> \
   --approved-id <proposal_id>
 ```
@@ -413,19 +423,19 @@ Factory Foreman classifications are deterministic triage hints, not proven root 
 
 Read-only inspection is allowed by default. Mutations are not.
 
-The skill may prepare dispatch proposals, but it must not execute mutating Rat Kingdom commands until a later user message explicitly approves the exact rendered proposal ID or exact command. An initial request to inspect, triage, fix, or improve the factory is not dispatch approval.
+The skill may prepare typed dispatch proposals, but it must not execute mutating Rat Kingdom commands until a later user message explicitly approves the exact rendered proposal ID and canonical digest. An initial request to inspect, triage, fix, or improve the factory is not dispatch approval.
 
 Exact boundary:
 
-1. Run read-only triage.
+1. Run native read-only triage.
 2. Choose an existing workflow definition when dispatch is appropriate.
-3. Render and save a `propose-workflow` JSON proposal with `proposal_id`, `argv`, and `command`.
-4. Stop and ask for approval of that exact `proposal_id` or exact command. Typed execution must use daemon-verifiable approval of the exact canonical digest.
-5. Only after a later user message approves it, run `validate-proposal` for the Phase 1 fallback helper flow.
-6. Execute only the validated `argv` returned by validation for that fallback flow, or only the daemon-verified digest-approved typed action for typed execution.
-7. If workflow, repo, parameter, coordinator, or argv order changed, render a new proposal and require new approval.
+3. Render and save an `rk --json factory propose-workflow` envelope with `proposal_id`, canonical digest, and typed `execution_action`.
+4. Stop and ask for approval of that exact proposal and digest.
+5. Only after a later user message approves it, forward the saved envelope through `rk --json factory approve --proposal-file` and `rk --json factory execute-action --proposal-file`.
+6. Let the daemon reload the persisted proposal, revalidate authenticated identity and repository scope, recompute the canonical digest, and enforce lifecycle and CAS checks.
+7. If any workflow, repo, parameter, coordinator, proposal field, or digest changed, render a new proposal and require new approval.
 
-Approval identity is proposal-digest checked in the helper for the Phase 1 fallback flow. Typed execution requires daemon-verifiable exact digest approval before dispatch; human approval text and helper validation alone are not sufficient for typed execution.
+The legacy helper may still render or validate historical Phase 1 argv artifacts for inspection, but those argv must not be executed. Native execution requires daemon-verifiable exact digest approval of a saved typed proposal before dispatch.
 
 The helper never executes `workflow run`, `spawn`, `dismiss`, `approve`, `reject`, `revert`, ticket mutations, or tuple writes during snapshot, triage, proposal rendering, or proposal validation.
 
@@ -434,7 +444,7 @@ The helper never executes `workflow run`, `spawn`, `dismiss`, `approve`, `reject
 The old repository-owned Python renderer remains available for offline fixtures, Jcode side-panel integration, and compatibility tests. It is not the normal operator launch path. First acquire a `factory.snapshot` response and a `factory.events.replay` response through an authorized typed CLI or MCP read path and save each response as JSON. Then run:
 
 ```bash
-python3 .jcode/skills/factory-foreman/dashboard/render_factory_dashboard.py \
+python3 ~/.jcode/skills/factory-foreman/dashboard/render_factory_dashboard.py \
   --snapshot "$JCODE_SCRATCH_DIR/factory-snapshot.json" \
   --events "$JCODE_SCRATCH_DIR/factory-events.json" \
   --output "$JCODE_SCRATCH_DIR/factory-dashboard.md"

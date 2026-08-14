@@ -1,6 +1,6 @@
 ---
 name: factory-foreman
-description: Triage Rat Kingdom software factory health, classify failures, and prepare approval-gated dispatch proposals.
+description: Triage Rat Kingdom factory health, inspect fleets and workflows, classify failures, analyze scorecards, and prepare exact approval-gated dispatch proposals. Use when a user mentions RK, Rat Kingdom, fleet health, factory triage, workflow failures, inbox work, dispatch, or product-to-code delivery.
 triggers:
   - Rat Kingdom factory
   - fleet health
@@ -13,24 +13,42 @@ triggers:
 
 # Factory Foreman
 
-Use this repository-local skill when the user asks about the Rat Kingdom factory, fleet health, RK inbox, workflow failures, factory triage, dispatch work, or the software factory.
+Use this globally installed skill from any repository when the user asks about the Rat Kingdom factory, fleet health, RK inbox, workflow failures, factory triage, dispatch work, product-to-code delivery, or factory optimization. The target repository must be registered with the local RK daemon.
 
-Default command, read-only by default:
+Start with native, typed, read-only RK data. Do not open the interactive dashboard from an agent session:
 
 ```bash
-python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py triage --repo <repo> --format markdown
+rk --json daemon status
+rk --json factory snapshot --repo <repo>
+rk --json factory events replay --repo <repo> --limit 256
+rk --json factory scorecards --repo <repo>
+rk --json factory recommend --repo <repo>
 ```
 
-Never execute a mutating Rat Kingdom command unless a later user message explicitly approves the exact command rendered in this conversation. For typed execution paths, require daemon-verifiable approval of the exact canonical digest before dispatch. The Phase 1 helper proposal validation is only a fallback guard for legacy/manual flows, not the authority for typed execution.
+The snapshot supplies agents, workflows, tickets, inbox, approvals, budget, and repository health. Replay supplies ordered recent changes and resync state. Scorecards and recommendations are advisory and preserve unavailable evidence as unobserved rather than zero.
+
+Never execute a mutating Rat Kingdom command unless a later user message explicitly approves the exact proposal rendered in this conversation. Require daemon-verifiable approval of the exact canonical digest before dispatch. The bundled Python helper is only a legacy fallback for deterministic triage and manual proposal preparation.
 
 See [REFERENCE.md](REFERENCE.md) for categories, schemas, approval examples, and recovery behavior.
 
-## Dashboard rendering
+## What this skill does
+
+1. Resolve the requested registered repository without guessing.
+2. Read the native factory snapshot and recent event replay.
+3. Report degraded or unavailable sources before drawing conclusions.
+4. Triage stalled or failed workflows, inbox pressure, pending approvals, budget signals, ticket duplication, event lag, and resync requirements.
+5. Read scorecards and recommendations when the user asks about recurring performance or routing problems.
+6. Separate observed evidence from hypotheses and recommend an existing workflow where possible.
+7. Prepare an exact typed proposal when mutation is warranted, then stop for human approval.
+8. After a later approval, forward the saved proposal through the daemon's digest-bound approval and execution path and monitor the resulting workflow.
+9. For product work, use RK's product-to-code contracts to validate initiative, research, ticket graph, impact evidence, dispatch, and independent verification artifacts.
+
+## Optional legacy rendering
 
 When typed factory snapshot and event replay JSON are available, prefer them as the dashboard inputs and render the repository-owned Markdown view with:
 
 ```bash
-python3 .jcode/skills/factory-foreman/dashboard/render_factory_dashboard.py \
+python3 ~/.jcode/skills/factory-foreman/dashboard/render_factory_dashboard.py \
   --snapshot <factory-snapshot.json> \
   --events <factory-events-replay.json> \
   --output <factory-dashboard.md>
@@ -43,32 +61,32 @@ Opening the generated Markdown in a Jcode side panel is optional. The file is a 
 ## Workflow
 
 1. Resolve the repository name without guessing when ambiguous. If the requested repo is unclear, ask for the repo before running repo-scoped commands.
-2. Run read-only triage first with the default command. This is the only default action.
+2. Run the native read-only snapshot, replay, and relevant analytics commands first. This is the only default action.
 3. Report snapshot degradation before conclusions. If any observation failed, state which command failed and how that limits confidence.
 4. Separate observed evidence from hypotheses. Label command output, JSON fields, inbox rows, workflow states, and ticket matches as evidence. Label inferred causes or suggested next actions as hypotheses.
 5. Deduplicate existing tickets before proposing new work. Search or inspect ticket data from triage before recommending another ticket.
 6. Recommend an existing workflow definition where possible. Prefer a workflow already listed by `workflow defs --repo <repo>` over inventing a new shape.
-7. Render and save the exact dispatch proposal using `propose-workflow`, including its `proposal_id` and `argv`. Preserve the command exactly as displayed in the conversation. Use this Phase 1 helper path only when a daemon-verifiable typed approval flow is unavailable.
-8. Stop and request approval for that exact `proposal_id` and displayed command. For typed execution, require daemon-verifiable approval of the exact canonical digest before dispatch. Do not continue to a mutating dispatch step in the same turn.
-9. After a later user message explicitly approves that proposal ID or exact command, run `validate-proposal` and execute only the validated argv for the fallback helper flow. A changed workflow, repo, parameter, coordinator, or argv order requires a new proposal and new approval.
+7. Render and save the exact typed dispatch proposal using `rk --json factory propose-workflow`, including its `proposal_id`, digest, and execution action. Preserve the proposal file exactly.
+8. Stop and request approval for that exact proposal and digest. Do not continue to approval or dispatch in the same turn.
+9. After a later user message explicitly approves it, use `rk --json factory approve --proposal-file <file>` and `rk --json factory execute-action --proposal-file <file>`. A changed workflow, repo, parameter, coordinator, proposal, or digest requires a new proposal and approval.
 10. Monitor the returned workflow ID with `rk --json workflow status <id>` or `rk --json workflow watch <id>` through completion, failure, or approval wait. workflow watch --json is NDJSON and must not be parsed as one JSON document. Document notable NDJSON events as they arrive.
 
 ## Proposal handling
 
-Render proposals with:
+Render native typed proposals with:
 
 ```bash
-python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py propose-workflow <workflow> --repo <repo> [--param KEY=VALUE] [--coordinator <agent>]
+rk --json factory propose-workflow <workflow> --repo <repo> [--param KEY=VALUE] [--coordinator <agent>] > factory-proposal.json
 ```
 
 Save the exact JSON proposal somewhere durable in the conversation or a task-specific report. The saved data must include:
 
 - `proposal_id`
-- `argv`
-- rendered shell `command`
-- workflow, repo, parameters, and coordinator when present
+- canonical lowercase-hex `digest`
+- typed `execution_action`
+- workflow, daemon-resolved repository scope, parameters, and coordinator when present
 
-Approval is valid only when it arrives in a later user message and names the exact `proposal_id` or exact command already rendered. If validation returns different `argv`, stop and request reapproval.
+Approval is valid only when it arrives in a later user message and names the exact proposal or digest already rendered. The daemon reloads its persisted proposal, recomputes the digest, revalidates scope and caller, and rejects edited, stale, expired, consumed, or mismatched envelopes.
 
 ## Output discipline
 
@@ -84,4 +102,4 @@ Use this structure when reporting triage:
 
 ## Authority boundary
 
-The skill may run read-only Rat Kingdom inspection commands by default. It may prepare dispatch proposals. It has no authority to mutate Rat Kingdom state until a later user message approves the exact proposal or command and the execution path verifies the exact digest. Typed execution requires daemon-verifiable exact digest approval. The Phase 1 helper `validate-proposal` path remains a fallback for legacy/manual dispatch preparation only.
+The skill may run read-only Rat Kingdom inspection commands by default and may prepare dispatch proposals. It has no authority to mutate Rat Kingdom state until a later user message approves the exact proposal and the daemon verifies the canonical digest. RK, not Jcode or the skill, owns repository resolution, authenticated identity, approval lifecycle, compare-and-swap checks, idempotency, and execution.
