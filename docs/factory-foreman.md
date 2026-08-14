@@ -9,12 +9,16 @@ The Python helper remains a compatibility and triage surface. It is not the sour
 The global JSON flag comes before the subcommand:
 
 ```bash
+rk factory dashboard --repo <registered-name-or-path>
+rk --json factory dashboard --repo <registered-name-or-path>
 rk --json factory snapshot --repo <registered-name-or-path>
 rk --json factory events replay --repo <registered-name-or-path> --after <cursor> --limit 256
 rk --json factory events watch --repo <registered-name-or-path> --after <cursor>
 ```
 
-`snapshot` and `events replay` are finite reads and do not auto-start the daemon. `events watch` first emits the replay page as NDJSON event rows, then continues with live projected events. A missing daemon is an error for these read commands. Proposal, approval, and execution commands may connect or start the daemon through the ordinary CLI client behavior.
+`dashboard` is the primary human entry point. It auto-starts the daemon when needed, fetches the native snapshot and recent replay, and renders bounded Markdown tables directly in the terminal. `--row-limit` and `--event-limit` control display size. With global `--json`, it emits a `factory.dashboard.v1` envelope containing the native snapshot and replay responses.
+
+`snapshot` and `events replay` are finite reads and do not auto-start the daemon. `events watch` first emits the replay page as NDJSON event rows, then continues with live projected events. A missing daemon is an error for these lower-level read commands. Proposal, approval, and execution commands may connect or start the daemon through the ordinary CLI client behavior.
 
 The typed mutation sequence is:
 
@@ -95,15 +99,21 @@ Watch subscribes before replay, returns the finite replay response, then streams
 
 ## Installation and discovery
 
-The skill lives in this repository at `.jcode/skills/factory-foreman/`. Jcode discovers repository-local skills from that directory when working in this checkout. Use it for Rat Kingdom factory, fleet health, RK inbox, workflow failures, factory triage, dispatch work, and software factory requests.
+The human-facing dashboard is part of the Rust `rk` binary. From a registered repository, run:
 
-The helper uses Python 3 standard library only:
+```bash
+rk factory dashboard --repo rat-kingdom
+```
+
+No separate daemon-start command is required. The dashboard connects to the daemon or starts it through the same guarded Rust client path used by other operator commands.
+
+The repository-local Jcode compatibility skill lives at `.jcode/skills/factory-foreman/`. Jcode discovers repository-local skills from that directory when working in this checkout. Its Python helper remains available for legacy deterministic triage and fixture-driven skill tests:
 
 ```bash
 python3 .jcode/skills/factory-foreman/scripts/factory_foreman.py triage --repo rat-kingdom --format markdown
 ```
 
-The `rk` executable must already be on `PATH`, and the Rat Kingdom daemon must already be running. The helper first runs strict preflight:
+The compatibility helper uses only the Python 3 standard library. Unlike the Rust dashboard, it deliberately never starts the daemon. It first runs strict preflight:
 
 ```bash
 rk --json daemon status
@@ -417,9 +427,9 @@ Approval identity is proposal-digest checked in the helper for the Phase 1 fallb
 
 The helper never executes `workflow run`, `spawn`, `dismiss`, `approve`, `reject`, `revert`, ticket mutations, or tuple writes during snapshot, triage, proposal rendering, or proposal validation.
 
-## Pure Python dashboard renderer
+## Offline Python compatibility renderer
 
-The repository-owned dashboard is a deterministic Markdown renderer over saved typed factory data. First acquire a `factory.snapshot` response and a `factory.events.replay` response through an authorized typed CLI or MCP read path and save each response as JSON. Then run:
+The old repository-owned Python renderer remains available for offline fixtures, Jcode side-panel integration, and compatibility tests. It is not the normal operator launch path. First acquire a `factory.snapshot` response and a `factory.events.replay` response through an authorized typed CLI or MCP read path and save each response as JSON. Then run:
 
 ```bash
 python3 .jcode/skills/factory-foreman/dashboard/render_factory_dashboard.py \

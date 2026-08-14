@@ -3,10 +3,13 @@ use clap::{Args, Subcommand, ValueEnum};
 use rk_core::paths::Layout;
 use rk_daemon::Client;
 use serde_json::{json, Map, Value};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
 pub enum FactoryCommand {
+    /// Open a Rust-native read-only factory dashboard, auto-starting the daemon.
+    Dashboard(FactoryDashboardArgs),
     /// Read the native factory snapshot without starting the daemon.
     Snapshot(FactorySnapshotArgs),
     /// Read or watch the native factory event feed without starting the daemon.
@@ -30,6 +33,25 @@ pub enum FactoryCommand {
     /// only; never mutates routing, policy, workflows, tickets, approvals, or
     /// dispatch.
     Recommend(FactoryAnalyticsArgs),
+}
+
+#[derive(Args)]
+pub struct FactoryDashboardArgs {
+    /// Registered repository name or path filter.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Stable coordinator-session id filter.
+    #[arg(long)]
+    pub coordinator: Option<String>,
+    /// Include archived records in daemon snapshot views.
+    #[arg(long)]
+    pub include_archived: bool,
+    /// Maximum rows shown in each dashboard table.
+    #[arg(long, default_value_t = 20)]
+    pub row_limit: usize,
+    /// Maximum recent factory events shown.
+    #[arg(long, default_value_t = 20)]
+    pub event_limit: usize,
 }
 
 #[derive(Subcommand)]
@@ -198,6 +220,47 @@ pub struct FactoryAnalyticsArgs {
 
 pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) -> Result<()> {
     match command {
+        FactoryCommand::Dashboard(mut args) => {
+            let mut client = Client::connect_or_spawn(layout).await?;
+            if let Some(repo) = args.repo.as_deref() {
+                args.repo = Some(resolve_dashboard_repo(&mut client, repo).await?);
+            }
+            let mut snapshot = client
+                .call("factory.snapshot", dashboard_snapshot_params(&args))
+                .await?;
+            let cursor = snapshot["cursor"].as_u64().unwrap_or(0);
+            let events = client
+                .call(
+                    "factory.events.replay",
+                    dashboard_replay_params(&args, cursor),
+                )
+                .await?;
+            match client
+                .call("inbox.list", dashboard_inbox_params(&args))
+                .await
+            {
+                Ok(inbox) => merge_dashboard_inbox(&mut snapshot, &inbox),
+                Err(error) => {
+                    snapshot["snapshot"]["inbox_error"] = Value::String(error.to_string());
+                }
+            }
+            if json_output {
+                println!(
+                    "{}",
+                    json!({
+                        "schema": "factory.dashboard.v1",
+                        "repo": args.repo,
+                        "snapshot": snapshot,
+                        "events": events,
+                    })
+                );
+            } else {
+                print!(
+                    "{}",
+                    render_dashboard(&snapshot, &events, args.repo.as_deref(), args.row_limit, args.event_limit)
+                );
+            }
+        }
         FactoryCommand::Snapshot(args) => {
             let mut client = Client::connect(layout).await?;
             let params = snapshot_params(args);
@@ -372,6 +435,264 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
         }
     }
     Ok(())
+}
+
+async fn resolve_dashboard_repo(client: &mut Client, requested: &str) -> Result<String> {
+    let registry = client.call("repo.list", json!({})).await?;
+    let requested_path = std::fs::canonicalize(requested).ok();
+    let resolved = registry["repos"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|repo| {
+            repo["name"].as_str() == Some(requested)
+                || requested_path.as_ref().is_some_and(|requested_path| {
+                    repo["path"]
+                        .as_str()
+                        .map(Path::new)
+                        .is_some_and(|path| path == requested_path)
+                })
+        })
+        .and_then(|repo| repo["name"].as_str())
+        .unwrap_or(requested);
+    Ok(resolved.to_string())
+}
+
+fn merge_dashboard_inbox(envelope: &mut Value, inbox: &Value) {
+    let items = inbox["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
+    envelope["snapshot"]["inbox"] = Value::Array(items);
+    envelope["snapshot"]["inbox_truncated"] =
+        Value::Bool(inbox["truncated"].as_bool().unwrap_or(false));
+}
+
+fn dashboard_inbox_params(args: &FactoryDashboardArgs) -> Value {
+    let mut map = Map::new();
+    insert_some(&mut map, "repo", args.repo.clone());
+    Value::Object(map)
+}
+
+fn dashboard_snapshot_params(args: &FactoryDashboardArgs) -> Value {
+    let mut map = Map::new();
+    insert_some(&mut map, "repo", args.repo.clone());
+    insert_some(&mut map, "coordinator", args.coordinator.clone());
+    if args.include_archived {
+        map.insert("include_archived".into(), Value::Bool(true));
+    }
+    Value::Object(map)
+}
+
+fn dashboard_replay_params(args: &FactoryDashboardArgs, cursor: u64) -> Value {
+    let mut map = Map::new();
+    map.insert("after".into(), json!(cursor.saturating_sub(256)));
+    map.insert("limit".into(), json!(256));
+    insert_some(&mut map, "repo", args.repo.clone());
+    insert_some(&mut map, "coordinator", args.coordinator.clone());
+    Value::Object(map)
+}
+
+fn render_dashboard(
+    envelope: &Value,
+    replay: &Value,
+    repo: Option<&str>,
+    row_limit: usize,
+    event_limit: usize,
+) -> String {
+    let snapshot = &envelope["snapshot"];
+    let mut out = String::new();
+    let repository = repo.unwrap_or("all registered repositories");
+    let cursor = envelope["cursor"].as_u64().unwrap_or(0);
+    let resync = &snapshot["repo_resync"];
+    let resyncing = resync["required"].as_bool().unwrap_or(false);
+
+    writeln!(out, "# Factory Dashboard\n").unwrap();
+    writeln!(out, "- Repository: `{}`", markdown_text(repository)).unwrap();
+    writeln!(out, "- Connection: **CONNECTED**").unwrap();
+    writeln!(out, "- Cursor: `{cursor}`").unwrap();
+    writeln!(
+        out,
+        "- State: **{}**\n",
+        if resyncing { "RESYNC REQUIRED" } else { "OK" }
+    )
+    .unwrap();
+
+    render_approvals(&mut out, &snapshot["approvals"], row_limit);
+    render_rows(
+        &mut out,
+        "Workflow Runs",
+        snapshot["workflows"].as_array(),
+        &["id", "workflow", "status", "repo", "started_at"],
+        row_limit,
+        true,
+    );
+    render_rows(
+        &mut out,
+        "Agents",
+        snapshot["agents"].as_array(),
+        &["name", "state", "task", "repo_name", "updated_at"],
+        row_limit,
+        true,
+    );
+    render_rows(
+        &mut out,
+        "Tickets",
+        snapshot["tickets"].as_array(),
+        &[
+            "identity",
+            "payload.status",
+            "payload.title",
+            "scope",
+            "payload.updated_at",
+        ],
+        row_limit,
+        true,
+    );
+    if let Some(error) = snapshot["inbox_error"].as_str() {
+        writeln!(out, "## Inbox\n").unwrap();
+        writeln!(out, "- Unavailable: {}\n", markdown_text(error)).unwrap();
+    } else {
+        render_rows(
+            &mut out,
+            "Inbox",
+            snapshot["inbox"].as_array(),
+            &["kind", "subject", "scope", "detail", "action"],
+            row_limit,
+            false,
+        );
+    }
+    render_mapping(&mut out, "Budget", &snapshot["budget"]);
+    render_events(&mut out, replay, event_limit);
+    out
+}
+
+fn render_approvals(out: &mut String, approvals: &Value, row_limit: usize) {
+    writeln!(out, "## Approvals\n").unwrap();
+    let proposals = approvals["proposals"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let grants = approvals["grants"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    writeln!(out, "- Proposals: {}", proposals.len()).unwrap();
+    writeln!(out, "- Grants: {}\n", grants.len()).unwrap();
+    if proposals.is_empty() {
+        writeln!(out, "_none_\n").unwrap();
+        return;
+    }
+    writeln!(out, "| id | kind | status | risk | digest | expires at |").unwrap();
+    writeln!(out, "| --- | --- | --- | --- | --- | --- |").unwrap();
+    for proposal in proposals.iter().take(row_limit) {
+        writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} |",
+            cell(&proposal["id"]),
+            cell(&proposal["kind"]),
+            cell(&proposal["status"]),
+            cell(&proposal["risk"]),
+            cell(&proposal["digest"]),
+            cell(&proposal["expires_at"]),
+        )
+        .unwrap();
+    }
+    writeln!(out).unwrap();
+}
+
+fn render_rows(
+    out: &mut String,
+    heading: &str,
+    rows: Option<&Vec<Value>>,
+    columns: &[&str],
+    row_limit: usize,
+    newest_first: bool,
+) {
+    let rows = rows.map(Vec::as_slice).unwrap_or(&[]);
+    writeln!(out, "## {heading}\n").unwrap();
+    writeln!(out, "- Total: {}\n", rows.len()).unwrap();
+    if rows.is_empty() {
+        writeln!(out, "_none_\n").unwrap();
+        return;
+    }
+    let headings = columns
+        .iter()
+        .map(|column| column.rsplit('.').next().unwrap_or(column))
+        .collect::<Vec<_>>();
+    writeln!(out, "| {} |", headings.join(" | ")).unwrap();
+    writeln!(out, "| {} |", vec!["---"; columns.len()].join(" | ")).unwrap();
+    let mut selected = rows.iter().collect::<Vec<_>>();
+    if newest_first {
+        selected.reverse();
+    }
+    for row in selected.into_iter().take(row_limit) {
+        let values = columns
+            .iter()
+            .map(|column| cell(value_at(row, column)))
+            .collect::<Vec<_>>();
+        writeln!(out, "| {} |", values.join(" | ")).unwrap();
+    }
+    writeln!(out).unwrap();
+}
+
+fn value_at<'a>(value: &'a Value, path: &str) -> &'a Value {
+    path.split('.').fold(value, |current, key| &current[key])
+}
+
+fn render_mapping(out: &mut String, heading: &str, value: &Value) {
+    writeln!(out, "## {heading}\n").unwrap();
+    let Some(mapping) = value.as_object() else {
+        writeln!(out, "_none_\n").unwrap();
+        return;
+    };
+    for (key, value) in mapping {
+        writeln!(out, "- {}: {}", key.replace('_', " "), markdown_text(&plain(value))).unwrap();
+    }
+    writeln!(out).unwrap();
+}
+
+fn render_events(out: &mut String, replay: &Value, event_limit: usize) {
+    writeln!(out, "## Recent Events\n").unwrap();
+    if replay["truncated"].as_bool().unwrap_or(false) {
+        writeln!(
+            out,
+            "- Replay truncated at boundary `{}`\n",
+            replay["boundary"].as_u64().unwrap_or(0)
+        )
+        .unwrap();
+    }
+    let events = replay["events"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if events.is_empty() {
+        writeln!(out, "_none_\n").unwrap();
+        return;
+    }
+    writeln!(out, "| cursor | kind | repository | summary |").unwrap();
+    writeln!(out, "| --- | --- | --- | --- |").unwrap();
+    for event in events.iter().rev().take(event_limit) {
+        writeln!(
+            out,
+            "| {} | {} | {} | {} |",
+            cell(&event["cursor"]),
+            cell(&event["kind"]),
+            cell(&event["repo"]),
+            cell(&event["summary"]),
+        )
+        .unwrap();
+    }
+    writeln!(out).unwrap();
+}
+
+fn cell(value: &Value) -> String {
+    markdown_text(&plain(value)).replace('|', "\\|")
+}
+
+fn markdown_text(value: &str) -> String {
+    value.replace(['\n', '\r'], " ")
+}
+
+fn plain(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(value) => value.clone(),
+        other => other.to_string(),
+    }
 }
 
 struct ProposalExecutionEnvelope {
@@ -738,8 +1059,91 @@ fn parse_digest(digest: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::render_recommend_markdown;
+    use super::{render_dashboard, render_recommend_markdown};
     use serde_json::json;
+
+    #[test]
+    fn dashboard_renders_native_ticket_payload_fields() {
+        let snapshot = json!({
+            "cursor": 12,
+            "snapshot": {
+                "agents": [],
+                "workflows": [],
+                "tickets": [{
+                    "identity": "TKT-12",
+                    "scope": "rat-kingdom",
+                    "payload": {
+                        "status": "open",
+                        "title": "Fix the dashboard",
+                        "updated_at": "2026-08-14T01:00:00Z"
+                    }
+                }],
+                "inbox": [],
+                "budget": {},
+                "approvals": {"proposals": [], "grants": []},
+                "repo_resync": {"required": false}
+            }
+        });
+        let replay = json!({"events": [], "truncated": false});
+
+        let markdown = render_dashboard(&snapshot, &replay, Some("rat-kingdom"), 20, 20);
+
+        assert!(markdown.contains("TKT-12"), "{markdown}");
+        assert!(markdown.contains("open"), "{markdown}");
+        assert!(markdown.contains("Fix the dashboard"), "{markdown}");
+        assert!(markdown.contains("2026-08-14T01:00:00Z"), "{markdown}");
+    }
+
+    #[test]
+    fn dashboard_renders_native_workflow_started_at() {
+        let snapshot = json!({
+            "cursor": 12,
+            "snapshot": {
+                "agents": [],
+                "workflows": [{
+                    "id": "wf-12",
+                    "workflow": "repair",
+                    "status": "running",
+                    "repo": "rat-kingdom",
+                    "started_at": "2026-08-14T01:00:00Z"
+                }],
+                "tickets": [],
+                "inbox": [],
+                "budget": {},
+                "approvals": {"proposals": [], "grants": []},
+                "repo_resync": {"required": false}
+            }
+        });
+        let replay = json!({"events": [], "truncated": false});
+
+        let markdown = render_dashboard(&snapshot, &replay, Some("rat-kingdom"), 20, 20);
+
+        assert!(markdown.contains("2026-08-14T01:00:00Z"), "{markdown}");
+    }
+
+    #[test]
+    fn dashboard_preserves_native_inbox_priority_order() {
+        let snapshot = json!({
+            "cursor": 12,
+            "snapshot": {
+                "agents": [],
+                "workflows": [],
+                "tickets": [],
+                "inbox": [
+                    {"kind": "urgent", "subject": "first", "scope": "rat-kingdom", "detail": "high", "action": "rk first"},
+                    {"kind": "passive", "subject": "second", "scope": "rat-kingdom", "detail": "low", "action": "rk second"}
+                ],
+                "budget": {},
+                "approvals": {"proposals": [], "grants": []},
+                "repo_resync": {"required": false}
+            }
+        });
+        let replay = json!({"events": [], "truncated": false});
+
+        let markdown = render_dashboard(&snapshot, &replay, Some("rat-kingdom"), 20, 20);
+
+        assert!(markdown.find("first").unwrap() < markdown.find("second").unwrap(), "{markdown}");
+    }
 
     #[test]
     fn recommend_markdown_filters_suppressed_and_empty_advice_from_active_section() {

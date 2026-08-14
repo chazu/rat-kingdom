@@ -973,6 +973,48 @@ mod tests {
         assert_eq!(items[1]["kind"], "need");
     }
 
+    #[tokio::test]
+    async fn inbox_repo_filter_applies_before_response_truncation() {
+        let (_dir, layout, _handle) = start_daemon().await;
+        let mut client = connect(&layout).await;
+
+        for index in 0..2_049 {
+            client
+                .call(
+                    "space.out",
+                    json!({
+                        "category": "obstacle",
+                        "scope": "other-repo",
+                        "identity": format!("other-{index}"),
+                        "payload": {"text": "higher-priority unrelated row"},
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        client
+            .call(
+                "space.out",
+                json!({
+                    "category": "need",
+                    "scope": "target-repo",
+                    "identity": "target-human-review",
+                    "payload": {"text": "target repository row"},
+                }),
+            )
+            .await
+            .unwrap();
+
+        let inbox = client
+            .call("inbox.list", json!({"repo": "target-repo"}))
+            .await
+            .unwrap();
+        let items = inbox["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["subject"], "target-human-review");
+        assert!(!inbox["truncated"].as_bool().unwrap());
+    }
+
     /// TKT-167: an open ballot reaches the operator over the wire, tallied
     /// against the reactor's own configured quorum. Without this the whole norms
     /// program is invisible — the only endorser who is always reachable never

@@ -1656,7 +1656,7 @@ impl Daemon {
                 reply(self.handle_named(req, |sup, name| sup.unarchive_agent(&name)))
             }
             "budget.rollup" => reply(Response::ok(id, self.supervisor.fleet_rollup())),
-            "inbox.list" => reply(self.handle_inbox(id).await),
+            "inbox.list" => reply(self.handle_inbox(req).await),
             "agent.status" => reply(self.handle_named(req, |sup, name| {
                 sup.status(&name)
                     .map(|r| json!({"agent": r}))
@@ -2018,14 +2018,58 @@ impl Daemon {
     /// gate-parked workflow instances, obstacle and need tuples, and open PRs
     /// awaiting review — into one ranked triage list. Pure read-side
     /// aggregation; no new storage.
-    async fn handle_inbox(&self, id: String) -> Response {
-        let agents = self.supervisor.list();
-        let instances = self.engine().list();
+    async fn handle_inbox(&self, req: Request) -> Response {
+        let params: InboxParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let repo = match params.repo {
+            Some(filter) => {
+                let registry = match self.repos.lock() {
+                    Ok(registry) => registry,
+                    Err(_) => {
+                        return Response::err(
+                            req.id,
+                            codes::INTERNAL,
+                            "repo registry lock poisoned",
+                        );
+                    }
+                };
+                let by_name = registry.get(&filter);
+                let by_path = std::fs::canonicalize(&filter)
+                    .ok()
+                    .and_then(|path| registry.get_by_path(&path));
+                Some(
+                    by_name
+                        .or(by_path)
+                        .map(|record| record.name.clone())
+                        .unwrap_or(filter),
+                )
+            }
+            None => None,
+        };
+        let id = req.id;
+        let agents = self
+            .supervisor
+            .list()
+            .into_iter()
+            .filter(|agent| repo.as_deref().is_none_or(|repo| agent.repo_name == repo))
+            .collect::<Vec<_>>();
+        let instances = self
+            .engine()
+            .list()
+            .into_iter()
+            .filter(|instance| repo.as_deref().is_none_or(|repo| instance.repo == repo))
+            .collect::<Vec<_>>();
         let mut source_truncated = false;
-        let mut scan = |pattern: &Pattern| {
+        let mut scan = |pattern: Pattern| {
+            let pattern = match repo.as_deref() {
+                Some(repo) => pattern.scope(repo),
+                None => pattern,
+            };
             let mut tuples = self
                 .space
-                .scan_newest_limited(pattern, MAX_SCAN_TUPLES.saturating_add(1));
+                .scan_newest_limited(&pattern, MAX_SCAN_TUPLES.saturating_add(1));
             if let Ok(rows) = &mut tuples {
                 if rows.len() > MAX_SCAN_TUPLES {
                     source_truncated = true;
@@ -2034,18 +2078,18 @@ impl Daemon {
             }
             tuples
         };
-        let obstacles = match scan(&Pattern::category(Category::Obstacle)) {
+        let obstacles = match scan(Pattern::category(Category::Obstacle)) {
             Ok(t) => t,
             Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
         };
-        let needs = match scan(&Pattern::category(Category::Need)) {
+        let needs = match scan(Pattern::category(Category::Need)) {
             Ok(t) => t,
             Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
         };
         // Open PRs/MRs: a PR-mode dismiss/land emits a `pull_request_opened`
         // event, then the run completes — nothing else tracks the pushed branch.
         let pull_requests =
-            match scan(&Pattern::category(Category::Event).identity("pull_request_opened")) {
+            match scan(Pattern::category(Category::Event).identity("pull_request_opened")) {
                 Ok(t) => t,
                 Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
             };
@@ -2056,7 +2100,7 @@ impl Daemon {
         // into the same suppression. Reading the events is cheap and stays on
         // the hot path; the fetch that produces them does not.
         let pull_requests_closed =
-            match scan(&Pattern::category(Category::Event).identity("pull_request_closed")) {
+            match scan(Pattern::category(Category::Event).identity("pull_request_closed")) {
                 Ok(t) => t,
                 Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
             };
@@ -2067,7 +2111,7 @@ impl Daemon {
         // carry an `evaluate {expect: {merged: true}}` after its `land`, the
         // drop is silent (TKT-171). `build` asserts the invariant here instead,
         // for every workflow.
-        let lands = match scan(&Pattern::category(Category::Event).identity("branch_landed")) {
+        let lands = match scan(Pattern::category(Category::Event).identity("branch_landed")) {
             Ok(t) => t,
             Err(e) => return Response::err(id, codes::INTERNAL, e.to_string()),
         };
@@ -2090,7 +2134,7 @@ impl Daemon {
         // The three scans are read-side only; `build` does the counting.
         // `Withdrawal` is the fourth: the other settled state, and the only one
         // that retires a row now that a ballot no longer decays (TKT-184).
-        let mut ballot_tuples = |category| scan(&Pattern::category(category));
+        let mut ballot_tuples = |category| scan(Pattern::category(category));
         let (suggestions, endorsements, conventions, withdrawals) = match (
             ballot_tuples(Category::Suggestion),
             ballot_tuples(Category::Endorsement),
@@ -5581,6 +5625,12 @@ struct WorkflowApproveParams {
 #[derive(Deserialize)]
 struct NameParams {
     name: String,
+}
+
+#[derive(Default, Deserialize)]
+struct InboxParams {
+    #[serde(default)]
+    repo: Option<String>,
 }
 
 /// `agent.list` view selector. Defaults keep the reply to the live registry so
