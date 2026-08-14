@@ -5,7 +5,7 @@ use rk_core::sdlc::{
     CiSignal, ConfiguredSourceName, Correlation, SignalEnvelope, SignalKind, SignalPayload,
     SignalSourcePrincipal,
 };
-use rk_core::tuple::{Category, Pattern};
+use rk_core::tuple::{Category, Pattern, Tuple};
 use rk_daemon::reactor::{Reactor, REACTOR_INSTANCE};
 use rk_daemon::supervisor::Supervisor;
 use rk_daemon::tickets::Tickets;
@@ -196,6 +196,59 @@ fn test_ci_recovered_without_prior_failure_does_not_enqueue_diagnostic() {
     run_after(&space, &layout);
 
     assert!(diagnostics(&space).is_empty());
+}
+
+#[test]
+fn test_ci_recovery_kind_acknowledges_even_if_projected_status_is_failed() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let subject = "repo:main:test:unit:abc123";
+
+    space
+        .out(Tuple::new(
+            Category::Fact,
+            "ci",
+            "sdlc:current:local-ci:repo:main:test:unit:abc123",
+            "source:local-ci",
+            serde_json::json!({
+                "source": "local-ci",
+                "family": "ci",
+                "subject": subject,
+                "current": {"status": "failed", "conclusion": "failure"}
+            }),
+        ))
+        .unwrap();
+    space
+        .out(Tuple::new(
+            Category::Need,
+            "ci",
+            "sdlc_ci_diagnostic",
+            REACTOR_INSTANCE,
+            serde_json::json!({"family": "ci", "subject": subject}),
+        ))
+        .unwrap();
+    space
+        .out(Tuple::new(
+            Category::Event,
+            "ci",
+            "sdlc:transition:local-ci:ci:repo:main:test:unit:abc123",
+            "source:local-ci",
+            serde_json::json!({
+                "source": "local-ci",
+                "delivery_id": "recovery-with-failed-status",
+                "family": "ci",
+                "subject": subject,
+                "kind": "ci_recovered"
+            }),
+        ))
+        .unwrap();
+
+    run_after(&space, &layout);
+
+    assert_eq!(diagnostics(&space).len(), 1);
+    assert_eq!(recoveries(&space).len(), 1);
 }
 
 #[test]

@@ -266,6 +266,7 @@ impl SignalEnvelope {
                 if let Some(conclusion) = &payload.conclusion {
                     reject_secret_like("payload", conclusion)?;
                 }
+                validate_ci_kind(&self.kind, payload)?;
             }
             (SignalKind::DeploymentSucceeded, SignalPayload::Deployment(payload)) => {
                 validate_identity("environment", &payload.environment)?;
@@ -311,6 +312,48 @@ impl SignalEnvelope {
         }
         Ok(())
     }
+}
+
+fn validate_ci_kind(kind: &SignalKind, payload: &CiSignal) -> Result<(), SignalValidationError> {
+    let failed = ci_status_or_conclusion_matches(
+        &payload.status,
+        payload.conclusion.as_deref(),
+        ci_failure_value,
+    );
+    let recovered = ci_status_or_conclusion_matches(
+        &payload.status,
+        payload.conclusion.as_deref(),
+        ci_recovery_value,
+    );
+    if matches!(kind, SignalKind::CiFailed) && recovered {
+        return Err(SignalValidationError::CiKindPayloadMismatch);
+    }
+    if matches!(kind, SignalKind::CiRecovered) && failed {
+        return Err(SignalValidationError::CiKindPayloadMismatch);
+    }
+    Ok(())
+}
+
+fn ci_status_or_conclusion_matches(
+    status: &str,
+    conclusion: Option<&str>,
+    predicate: fn(&str) -> bool,
+) -> bool {
+    predicate(status) || conclusion.is_some_and(predicate)
+}
+
+fn ci_failure_value(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "fail" | "failed" | "failure"
+    )
+}
+
+fn ci_recovery_value(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "pass" | "passed" | "passing" | "success" | "succeeded" | "recovered"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,6 +540,8 @@ pub enum SignalValidationError {
     DigestFailed,
     #[error("signal kind does not match payload family")]
     PayloadKindMismatch,
+    #[error("signal kind is inconsistent with CI payload status or conclusion")]
+    CiKindPayloadMismatch,
     #[error("payload field does not match correlation: {0}")]
     PayloadCorrelationMismatch(&'static str),
 }

@@ -29,7 +29,7 @@ fn config() -> Config {
     let mut config = Config::default();
     config.ingest.sources = vec![IngestSourceConfig {
         name: "probe".into(),
-        allowed_kinds: vec!["ci_failed".into()],
+        allowed_kinds: vec!["ci_failed".into(), "ci_recovered".into()],
         ..Default::default()
     }];
     config
@@ -56,6 +56,10 @@ async fn stop(layout: &Layout, handle: tokio::task::JoinHandle<rk_core::Result<(
 }
 
 fn ci_args(delivery_id: &str) -> Vec<&str> {
+    ci_args_for_kind("ci_failed", delivery_id, "ci failed")
+}
+
+fn ci_args_for_kind<'a>(kind: &'a str, delivery_id: &'a str, summary: &'a str) -> Vec<&'a str> {
     vec![
         "--json",
         "ingest",
@@ -63,11 +67,11 @@ fn ci_args(delivery_id: &str) -> Vec<&str> {
         "--source",
         "probe",
         "--kind",
-        "ci_failed",
+        kind,
         "--delivery-id",
         delivery_id,
         "--summary",
-        "ci failed",
+        summary,
         "--repo",
         "repo",
         "--branch",
@@ -81,6 +85,10 @@ fn ci_args(delivery_id: &str) -> Vec<&str> {
     ]
 }
 
+fn ci_recovered_args(delivery_id: &'static str) -> Vec<&'static str> {
+    ci_args_for_kind("ci_recovered", delivery_id, "ci recovered")
+}
+
 #[tokio::test]
 async fn test_ingest_event_cli_builds_canonical_ci_failed_envelope() {
     let (_dir, layout, handle) = start().await;
@@ -89,6 +97,24 @@ async fn test_ingest_event_cli_builds_canonical_ci_failed_envelope() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["accepted"], true);
     assert_eq!(value["receipt"]["delivery_id"], "cli-build-1");
+    stop(&layout, handle).await;
+}
+
+#[tokio::test]
+async fn test_ingest_event_cli_builds_successful_ci_recovered_envelope() {
+    let (_dir, layout, handle) = start().await;
+    let output = rk_async(&layout, ci_recovered_args("cli-recovered-1")).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state = rk_async(&layout, vec!["--json", "ingest", "state", "--source", "probe", "--repo", "repo"]).await;
+    assert!(state.status.success(), "{}", String::from_utf8_lossy(&state.stderr));
+    let value: Value = serde_json::from_slice(&state.stdout).unwrap();
+    assert_eq!(value["facts"][0]["payload"]["current"]["status"], "success");
+    assert_eq!(value["facts"][0]["payload"]["current"]["conclusion"], "success");
     stop(&layout, handle).await;
 }
 
