@@ -4,6 +4,7 @@ use rk_core::paths::Layout;
 use rk_daemon::Client;
 use serde_json::{json, Map, Value};
 use std::fmt::Write as _;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
@@ -46,12 +47,35 @@ pub struct FactoryDashboardArgs {
     /// Include archived records in daemon snapshot views.
     #[arg(long)]
     pub include_archived: bool,
-    /// Maximum rows shown in each dashboard table.
+    /// Maximum rows shown in each plain-text dashboard table.
     #[arg(long, default_value_t = 20)]
     pub row_limit: usize,
-    /// Maximum recent factory events shown.
+    /// Maximum recent factory events shown in plain-text mode.
     #[arg(long, default_value_t = 20)]
     pub event_limit: usize,
+    /// Refresh interval for the interactive dashboard, in seconds.
+    #[arg(long, default_value_t = 2)]
+    pub interval: u64,
+    /// Print one bounded Markdown snapshot instead of opening the terminal UI.
+    #[arg(long)]
+    pub plain: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardOutputMode {
+    Interactive,
+    Plain,
+    Json,
+}
+
+fn dashboard_output_mode(json: bool, terminal: bool, plain: bool) -> DashboardOutputMode {
+    if json {
+        DashboardOutputMode::Json
+    } else if terminal && !plain {
+        DashboardOutputMode::Interactive
+    } else {
+        DashboardOutputMode::Plain
+    }
 }
 
 #[derive(Subcommand)]
@@ -221,29 +245,16 @@ pub struct FactoryAnalyticsArgs {
 pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) -> Result<()> {
     match command {
         FactoryCommand::Dashboard(mut args) => {
+            if dashboard_output_mode(json_output, io::stdout().is_terminal(), args.plain)
+                == DashboardOutputMode::Interactive
+            {
+                return crate::factory_dashboard::open(layout, args).await;
+            }
             let mut client = Client::connect_or_spawn(layout).await?;
             if let Some(repo) = args.repo.as_deref() {
                 args.repo = Some(resolve_dashboard_repo(&mut client, repo).await?);
             }
-            let mut snapshot = client
-                .call("factory.snapshot", dashboard_snapshot_params(&args))
-                .await?;
-            let cursor = snapshot["cursor"].as_u64().unwrap_or(0);
-            let events = client
-                .call(
-                    "factory.events.replay",
-                    dashboard_replay_params(&args, cursor),
-                )
-                .await?;
-            match client
-                .call("inbox.list", dashboard_inbox_params(&args))
-                .await
-            {
-                Ok(inbox) => merge_dashboard_inbox(&mut snapshot, &inbox),
-                Err(error) => {
-                    snapshot["snapshot"]["inbox_error"] = Value::String(error.to_string());
-                }
-            }
+            let (snapshot, events) = fetch_dashboard(&mut client, &args).await?;
             if json_output {
                 println!(
                     "{}",
@@ -437,7 +448,7 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
     Ok(())
 }
 
-async fn resolve_dashboard_repo(client: &mut Client, requested: &str) -> Result<String> {
+pub(crate) async fn resolve_dashboard_repo(client: &mut Client, requested: &str) -> Result<String> {
     let registry = client.call("repo.list", json!({})).await?;
     let requested_path = std::fs::canonicalize(requested).ok();
     let resolved = registry["repos"]
@@ -456,6 +467,32 @@ async fn resolve_dashboard_repo(client: &mut Client, requested: &str) -> Result<
         .and_then(|repo| repo["name"].as_str())
         .unwrap_or(requested);
     Ok(resolved.to_string())
+}
+
+pub(crate) async fn fetch_dashboard(
+    client: &mut Client,
+    args: &FactoryDashboardArgs,
+) -> Result<(Value, Value)> {
+    let mut snapshot = client
+        .call("factory.snapshot", dashboard_snapshot_params(args))
+        .await?;
+    let cursor = snapshot["cursor"].as_u64().unwrap_or(0);
+    let events = client
+        .call(
+            "factory.events.replay",
+            dashboard_replay_params(args, cursor),
+        )
+        .await?;
+    match client
+        .call("inbox.list", dashboard_inbox_params(args))
+        .await
+    {
+        Ok(inbox) => merge_dashboard_inbox(&mut snapshot, &inbox),
+        Err(error) => {
+            snapshot["snapshot"]["inbox_error"] = Value::String(error.to_string());
+        }
+    }
+    Ok((snapshot, events))
 }
 
 fn merge_dashboard_inbox(envelope: &mut Value, inbox: &Value) {
@@ -1059,8 +1096,31 @@ fn parse_digest(digest: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_dashboard, render_recommend_markdown};
+    use super::{
+        DashboardOutputMode, dashboard_output_mode, render_dashboard,
+        render_recommend_markdown,
+    };
     use serde_json::json;
+
+    #[test]
+    fn dashboard_uses_the_interactive_tui_on_a_terminal() {
+        assert_eq!(
+            dashboard_output_mode(false, true, false),
+            DashboardOutputMode::Interactive
+        );
+        assert_eq!(
+            dashboard_output_mode(false, false, false),
+            DashboardOutputMode::Plain
+        );
+        assert_eq!(
+            dashboard_output_mode(false, true, true),
+            DashboardOutputMode::Plain
+        );
+        assert_eq!(
+            dashboard_output_mode(true, true, false),
+            DashboardOutputMode::Json
+        );
+    }
 
     #[test]
     fn dashboard_renders_native_ticket_payload_fields() {

@@ -16,7 +16,9 @@ rk --json factory events replay --repo <registered-name-or-path> --after <cursor
 rk --json factory events watch --repo <registered-name-or-path> --after <cursor>
 ```
 
-`dashboard` is the primary human entry point. It auto-starts the daemon when needed, fetches the native snapshot and recent replay, and renders bounded Markdown tables directly in the terminal. `--row-limit` and `--event-limit` control display size. With global `--json`, it emits a `factory.dashboard.v1` envelope containing the native snapshot and replay responses.
+`dashboard` is the primary human entry point. On a terminal it auto-starts the daemon and opens a live interactive Rust `ratatui` interface. The UI refreshes every two seconds by default and provides overview, agents, workflows, tickets, inbox, approvals, and events panels. Use `tab` or left/right arrows to switch panels, `j`/`k` or up/down to scroll, `r` to refresh immediately, and `q`, `escape`, or `control-c` to quit. `--interval <seconds>` changes the refresh interval.
+
+When stdout is redirected, the command emits one bounded Markdown snapshot instead of terminal control sequences. `--plain` forces that output in a terminal. `--row-limit` and `--event-limit` control the plain display size. With global `--json`, the command emits a `factory.dashboard.v1` envelope containing the native snapshot and replay responses.
 
 `snapshot` and `events replay` are finite reads and do not auto-start the daemon. `events watch` first emits the replay page as NDJSON event rows, then continues with live projected events. A missing daemon is an error for these lower-level read commands. Proposal, approval, and execution commands may connect or start the daemon through the ordinary CLI client behavior.
 
@@ -105,7 +107,7 @@ The human-facing dashboard is part of the Rust `rk` binary. From a registered re
 rk factory dashboard --repo rat-kingdom
 ```
 
-No separate daemon-start command is required. The dashboard connects to the daemon or starts it through the same guarded Rust client path used by other operator commands.
+No separate daemon-start command is required. The dashboard connects to the daemon or starts it through the same guarded Rust client path used by other operator commands, then stays open and refreshes until you press `q`.
 
 The repository-local Jcode compatibility skill lives at `.jcode/skills/factory-foreman/`. Jcode discovers repository-local skills from that directory when working in this checkout. Its Python helper remains available for legacy deterministic triage and fixture-driven skill tests:
 
