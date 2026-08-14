@@ -504,6 +504,45 @@ fn steward_loads_and_routes() {
     assert!(when.default.iter().any(|s| matches!(s, Step::Stop(_))));
 }
 
+#[test]
+fn shipped_land_workflows_gate_failed_delivery() {
+    use rk_workflow::Step;
+
+    let inputs = HashMap::from([
+        ("taskId".to_string(), json!("risky-change")),
+        ("description".to_string(), json!("rework retry logic")),
+    ]);
+
+    let steward = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
+    let Step::When(steward_route) = steward.steps.last().unwrap() else {
+        panic!("steward should end in verdict routing");
+    };
+    let steward_gate = steward_route.cases["APPROVE"]
+        .iter()
+        .find_map(|step| match step {
+            Step::Evaluate(e) if e.expect.get("delivered").is_some() => Some(e),
+            _ => None,
+        })
+        .expect("steward APPROVE must gate the land delivery result");
+    assert_eq!(steward_gate.expect.get("delivered"), Some(&json!(true)));
+    assert!(steward_gate.any_of.is_empty());
+
+    let approval =
+        rk_workflow::load(&examples_dir().join("land-on-approve.cue"), &inputs).unwrap();
+    let Step::When(approval_route) = approval.steps.last().unwrap() else {
+        panic!("land-on-approve should end in approval routing");
+    };
+    let approval_gate = approval_route.cases["true"]
+        .iter()
+        .find_map(|step| match step {
+            Step::Evaluate(e) if e.expect.get("merged").is_some() => Some(e),
+            _ => None,
+        })
+        .expect("land-on-approve APPROVE must gate the land result");
+    assert_eq!(approval_gate.expect.get("merged"), Some(&json!(true)));
+    assert_eq!(approval_gate.any_of, vec![json!({"pr_opened": true})]);
+}
+
 /// TKT-174: EVERY shipped example that routes on a reviewer's verdict must bind
 /// the read to the reviewer that wrote it — swept across the whole example set,
 /// not asserted file by file.

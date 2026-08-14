@@ -2,10 +2,12 @@
 
 Revised `.cue` definitions proposed by the `workflow-review` pass over
 `crates/rk-workflow/src/schema.cue` + every file in `examples/workflows/`.
-These are **proposals** — the shipped files under `examples/workflows/` are left
-untouched. Each revised file carries a `PROPOSAL (rat-29 …)` header block
-explaining the delta and its rationale. All four validate against the embedded
-schema (same `cue export -e workflow` path `rk_workflow::load` uses).
+These are **proposals** except where a proposal is explicitly marked landed.
+The two land-result fixes below are now applied in the shipped files under
+`examples/workflows/`; the remaining proposals are left untouched. Each
+revised file carries a `PROPOSAL (rat-29 …)` header block explaining the delta
+and its rationale. All four validate against the embedded schema (same `cue
+export -e workflow` path `rk_workflow::load` uses).
 
 ## Findings acted on
 
@@ -16,6 +18,11 @@ schema (same `cue export -e workflow` path `rk_workflow::load` uses).
    no operator signal. `schema.cue` #LandStep explicitly prescribes gating with a
    following `evaluate {expect: {merged: true}}`. Both proposals add it (fail
    closed → surfaces the stuck auto-merge in `rk inbox`).
+   **Landed:** `examples/workflows/steward.cue` and
+   `examples/workflows/land-on-approve.cue`. The proposal copies are kept in
+   sync with those shipped definitions so they do not regress later workflow
+   evolution (named checks, diff scope, timeout routing, reviewer/instance
+   bindings, and PR delivery).
    → `docs/proposals/steward.cue`, `docs/proposals/land-on-approve.cue`
 
 2. **No per-instance `budget` cap** on the fan-out / unattended workflows
