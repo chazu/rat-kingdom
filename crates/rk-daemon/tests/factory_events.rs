@@ -115,6 +115,18 @@ async fn propose_for(client: &mut Client, repo: &str, coordinator: &str, task: &
 async fn test_factory_snapshot_contains_agents_workflows_tickets_inbox_budget_approvals_and_resync()
 {
     let (_home, _repo, _layout, handle, mut client) = setup().await;
+    client
+        .call(
+            "space.out",
+            json!({
+                "category": "need",
+                "scope": "repo-a",
+                "identity": "human-review",
+                "payload": {"text": "review the factory snapshot"},
+            }),
+        )
+        .await
+        .unwrap();
     let snapshot = client
         .call("factory.snapshot", json!({"repo":"repo-a"}))
         .await
@@ -132,6 +144,27 @@ async fn test_factory_snapshot_contains_agents_workflows_tickets_inbox_budget_ap
             "tickets",
             "workflows"
         ]
+    );
+    assert_eq!(obj["inbox"][0]["kind"], "need");
+    assert_eq!(obj["inbox"][0]["subject"], "human-review");
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn test_factory_snapshot_marks_repo_resync_when_event_replay_is_truncated() {
+    let (_home, _repo, _layout, handle, mut client) = setup().await;
+    propose_for(&mut client, "repo-a", "coord-a", "one").await;
+    propose_for(&mut client, "repo-a", "coord-a", "two").await;
+
+    let snapshot = client
+        .call("factory.snapshot", json!({"repo":"repo-a", "limit":1}))
+        .await
+        .unwrap();
+    assert_eq!(snapshot["snapshot"]["repo_resync"]["required"], true);
+    assert_eq!(
+        snapshot["snapshot"]["repo_resync"]["cursor"],
+        snapshot["cursor"]
     );
     client.call("stop", json!({})).await.unwrap();
     handle.await.unwrap().unwrap();
