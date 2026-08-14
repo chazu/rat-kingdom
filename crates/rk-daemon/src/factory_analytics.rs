@@ -9,9 +9,8 @@
 //!
 //! Only the structured seams that RK actually exposes today populate metrics.
 //! Source families without a structured RK store (Phase 3 contract/verified
-//! delivery, structured reviewer rework, Phase 4 CI signals, structured revert,
-//! human gate decisions, explicit recurrence keys, and pricing snapshots) are
-//! reported as `unobserved` with `available=false`, never as zero failures.
+//! delivery and pricing snapshots) are reported as `unobserved` with
+//! `available=false`, never as zero failures.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -41,6 +40,8 @@ const AVAILABLE_FAMILIES: &[OutcomeEvidenceKind] = &[
     OutcomeEvidenceKind::AgentRecord,
     OutcomeEvidenceKind::WorkflowInstance,
     OutcomeEvidenceKind::Phase4CiSignal,
+    OutcomeEvidenceKind::StructuredReviewerRework,
+    OutcomeEvidenceKind::StructuredRevert,
     OutcomeEvidenceKind::HumanGateDecision,
     OutcomeEvidenceKind::RecurrenceKey,
 ];
@@ -50,8 +51,6 @@ const AVAILABLE_FAMILIES: &[OutcomeEvidenceKind] = &[
 const UNOBSERVED_FAMILIES: &[OutcomeEvidenceKind] = &[
     OutcomeEvidenceKind::Phase3Contract,
     OutcomeEvidenceKind::Phase3VerifiedDelivery,
-    OutcomeEvidenceKind::StructuredReviewerRework,
-    OutcomeEvidenceKind::StructuredRevert,
     OutcomeEvidenceKind::PricingSnapshot,
 ];
 
@@ -110,6 +109,8 @@ pub struct AnalyticsInputs {
     pub tickets: Vec<Tuple>,
     pub approval_grants: Vec<ApprovalGrant>,
     pub sdlc_ci_facts: Vec<Tuple>,
+    pub revert_facts: Vec<Tuple>,
+    pub reviewer_verdicts: Vec<Tuple>,
     pub runtime_unavailable: Vec<OutcomeEvidenceKind>,
     pub read_warnings: Vec<String>,
 }
@@ -163,6 +164,10 @@ fn normalize_inputs(
             .iter()
             .find(|instance| instance.id == id)
             .map(|instance| instance.workflow.clone())
+    };
+    let agent_of = |agent_id: Option<&str>| -> Option<&AgentRecord> {
+        let agent_id = agent_id?.trim();
+        (!agent_id.is_empty()).then(|| inputs.agents.iter().find(|agent| agent.name == agent_id))?
     };
 
     let mut structured = Vec::new();
@@ -256,6 +261,90 @@ fn normalize_inputs(
             recurrence_key: None,
             coalesce_key: None,
             payload,
+            decoy_prose: String::new(),
+        });
+    }
+
+    // Revert history is a durable Fact tuple emitted by supervisor.revert.
+    // Read only the tuple's typed fields; detail/branch text is deliberately
+    // ignored. A malformed matching fact remains an observed unknown event so
+    // it cannot become a false successful revert or silently disappear.
+    let mut revert_facts = inputs.revert_facts.iter().collect::<Vec<_>>();
+    revert_facts.sort_by_key(|fact| (fact.id, fact.identity.clone()));
+    for fact in revert_facts {
+        if !is_structured_revert_fact(fact) {
+            continue;
+        }
+        let agent_id = structured_string(&fact.payload, "agent")
+            .or_else(|| fact.identity.strip_prefix("merge-reverted-").map(str::to_owned));
+        let agent = agent_of(agent_id.as_deref());
+        let workflow_instance_id = agent.and_then(|agent| agent.workflow_instance.clone());
+        let merge_commit = structured_string(&fact.payload, "merge_commit");
+        let revert_commit = structured_string(&fact.payload, "revert_commit");
+        let payload = if merge_commit.is_some() && revert_commit.is_some() {
+            FactoryMetricPayload::Reverted { reverted: true }
+        } else {
+            FactoryMetricPayload::Unknown
+        };
+        structured.push(StructuredOutcomeInput {
+            repo: inputs.repo.clone(),
+            source_family: OutcomeEvidenceKind::StructuredRevert,
+            source_id: fact.id.to_string(),
+            source_version: revert_commit,
+            archived: false,
+            archive_reason: None,
+            observed_at_ms: fact.created_at.timestamp_millis(),
+            task_class: None,
+            workflow: workflow_of(&workflow_instance_id),
+            harness: agent.map(|agent| agent.harness.clone()),
+            model: agent.and_then(|agent| agent.model.clone()),
+            agent_id,
+            workflow_instance_id,
+            ticket_id: ticket_id_from_payload(&fact.payload),
+            phase3_outcome_id: None,
+            phase4_signal_id: None,
+            recurrence_key: None,
+            coalesce_key: None,
+            payload,
+            decoy_prose: String::new(),
+        });
+    }
+
+    // Reviewer verdicts are durable Artifact tuples. Only an explicit
+    // recommendation of REWORK is a rework transition; notes and other
+    // reviewer prose are not evidence. The tuple id is the durable source id,
+    // keeping multiple verdicts distinct for denominators and source counts.
+    let mut reviewer_verdicts = inputs.reviewer_verdicts.iter().collect::<Vec<_>>();
+    reviewer_verdicts.sort_by_key(|artifact| (artifact.id, artifact.identity.clone()));
+    for artifact in reviewer_verdicts {
+        if !is_structured_rework_artifact(artifact) {
+            continue;
+        }
+        let agent_id = structured_string(&artifact.payload, "agent");
+        let agent = agent_of(agent_id.as_deref());
+        let workflow_instance_id = structured_string(&artifact.payload, "workflow_instance_id")
+            .or_else(|| structured_string(&artifact.payload, "run_id"))
+            .or_else(|| agent.and_then(|agent| agent.workflow_instance.clone()));
+        structured.push(StructuredOutcomeInput {
+            repo: inputs.repo.clone(),
+            source_family: OutcomeEvidenceKind::StructuredReviewerRework,
+            source_id: artifact.id.to_string(),
+            source_version: None,
+            archived: false,
+            archive_reason: None,
+            observed_at_ms: artifact.created_at.timestamp_millis(),
+            task_class: None,
+            workflow: workflow_of(&workflow_instance_id),
+            harness: agent.map(|agent| agent.harness.clone()),
+            model: agent.and_then(|agent| agent.model.clone()),
+            agent_id,
+            workflow_instance_id,
+            ticket_id: ticket_id_from_payload(&artifact.payload),
+            phase3_outcome_id: None,
+            phase4_signal_id: None,
+            recurrence_key: None,
+            coalesce_key: None,
+            payload: FactoryMetricPayload::Reworked { requested: true },
             decoy_prose: String::new(),
         });
     }
@@ -377,6 +466,37 @@ fn is_structured_sdlc_ci_event(tuple: &Tuple) -> bool {
         && tuple.scope == "ci"
         && tuple.payload.get("family").and_then(Value::as_str) == Some("ci")
         && tuple.payload.get("kind").and_then(Value::as_str).is_some()
+}
+
+fn is_structured_revert_fact(tuple: &Tuple) -> bool {
+    tuple.category == rk_core::tuple::Category::Fact
+        && tuple.identity.starts_with("merge-reverted-")
+        && !tuple.identity.trim_start_matches("merge-reverted-").is_empty()
+}
+
+fn is_structured_rework_artifact(tuple: &Tuple) -> bool {
+    tuple.category == rk_core::tuple::Category::Artifact
+        && tuple.identity == "review"
+        && tuple
+            .payload
+            .get("recommendation")
+            .and_then(Value::as_str)
+            .is_some_and(|recommendation| recommendation.eq_ignore_ascii_case("REWORK"))
+}
+
+fn structured_string(payload: &Value, field: &str) -> Option<String> {
+    payload
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn ticket_id_from_payload(payload: &Value) -> Option<String> {
+    structured_string(payload, "ticket_id").or_else(|| {
+        structured_string(payload, "task").filter(|task| task.starts_with("TKT-"))
+    })
 }
 
 fn structured_time_ms(tuple: &Tuple, field: &str) -> i64 {
@@ -637,6 +757,8 @@ mod tests {
             tickets: Vec::new(),
             approval_grants: Vec::new(),
             sdlc_ci_facts: Vec::new(),
+            revert_facts: Vec::new(),
+            reviewer_verdicts: Vec::new(),
             runtime_unavailable: Vec::new(),
             read_warnings: Vec::new(),
         }
@@ -666,6 +788,45 @@ mod tests {
         tuple
     }
 
+    fn revert_fact(identity: &str, complete: bool) -> Tuple {
+        let mut tuple = Tuple::new(
+            rk_core::tuple::Category::Fact,
+            "rat-kingdom",
+            identity,
+            "castle",
+            if complete {
+                json!({
+                    "agent": "rat-1",
+                    "task": "TKT-REVERT",
+                    "merge_commit": "merge-abc",
+                    "revert_commit": "revert-def",
+                    "detail": "not an input"
+                })
+            } else {
+                json!({"agent":"rat-1", "task":"TKT-REVERT", "detail":"missing commits"})
+            },
+        );
+        tuple.created_at = Utc.timestamp_opt(1_040, 0).unwrap();
+        tuple
+    }
+
+    fn rework_artifact() -> Tuple {
+        let mut tuple = Tuple::new(
+            rk_core::tuple::Category::Artifact,
+            "rat-kingdom",
+            "review",
+            "castle",
+            json!({
+                "agent": "rat-1",
+                "task": "TKT-REWORK",
+                "recommendation": "REWORK",
+                "notes": "not an input"
+            }),
+        );
+        tuple.created_at = Utc.timestamp_opt(1_050, 0).unwrap();
+        tuple
+    }
+
     #[test]
     fn normalizes_runs_from_agent_and_instance_without_reading_prose() {
         let (structured, _) = normalize_inputs(&inputs());
@@ -685,6 +846,74 @@ mod tests {
             .all(|s| s.harness.as_deref() == Some("claude")));
         // task_class is never inferred; stays None -> normalizes to unknown.
         assert!(structured.iter().all(|s| s.task_class.is_none()));
+    }
+
+    #[test]
+    fn normalizes_revert_facts_and_rework_artifacts_from_structured_fields() {
+        let mut in_scope = inputs();
+        in_scope.revert_facts = vec![revert_fact("merge-reverted-rat-1", true)];
+        in_scope.reviewer_verdicts = vec![rework_artifact()];
+
+        let (structured, unavailable) = normalize_inputs(&in_scope);
+        assert!(!unavailable.iter().any(|source| {
+            matches!(
+                source.kind,
+                OutcomeEvidenceKind::StructuredRevert
+                    | OutcomeEvidenceKind::StructuredReviewerRework
+            )
+        }));
+        let revert = structured
+            .iter()
+            .find(|event| event.source_family == OutcomeEvidenceKind::StructuredRevert)
+            .unwrap();
+        assert!(matches!(revert.payload, FactoryMetricPayload::Reverted { reverted: true }));
+        assert_eq!(revert.agent_id.as_deref(), Some("rat-1"));
+        assert_eq!(revert.ticket_id.as_deref(), Some("TKT-REVERT"));
+        let rework = structured
+            .iter()
+            .find(|event| event.source_family == OutcomeEvidenceKind::StructuredReviewerRework)
+            .unwrap();
+        assert!(matches!(rework.payload, FactoryMetricPayload::Reworked { requested: true }));
+        assert_eq!(rework.agent_id.as_deref(), Some("rat-1"));
+        assert_eq!(rework.ticket_id.as_deref(), Some("TKT-REWORK"));
+
+        let facts = normalize_facts(&in_scope);
+        assert!(facts.iter().any(|fact| {
+            fact.evidence_kind == OutcomeEvidenceKind::StructuredRevert
+                && fact.status == rk_core::factory::outcome_facts::OutcomeStatus::Reverted
+        }));
+        assert!(facts.iter().any(|fact| {
+            fact.evidence_kind == OutcomeEvidenceKind::StructuredReviewerRework
+                && fact.status == rk_core::factory::outcome_facts::OutcomeStatus::Reworked
+        }));
+    }
+
+    #[test]
+    fn malformed_revert_is_unknown_and_input_order_does_not_change_output() {
+        let mut first = inputs();
+        first.revert_facts = vec![
+            revert_fact("merge-reverted-rat-1", true),
+            revert_fact("merge-reverted-rat-2", false),
+        ];
+        first.reviewer_verdicts = vec![rework_artifact()];
+        let mut second = first.revert_facts.clone();
+        second.reverse();
+        let mut reordered = first.reviewer_verdicts.clone();
+        reordered.reverse();
+        let mut second_inputs = inputs();
+        second_inputs.revert_facts = second;
+        second_inputs.reviewer_verdicts = reordered;
+
+        let facts = normalize_facts(&first);
+        assert!(facts.iter().any(|fact| {
+            fact.evidence_kind == OutcomeEvidenceKind::StructuredRevert
+                && fact.status == rk_core::factory::outcome_facts::OutcomeStatus::Unknown
+        }));
+        let at = Utc.timestamp_opt(2_000, 0).unwrap();
+        assert_eq!(
+            scorecards_response(&first, &FactoryAnalyticsRequest::default(), at),
+            scorecards_response(&second_inputs, &FactoryAnalyticsRequest::default(), at)
+        );
     }
 
     #[test]

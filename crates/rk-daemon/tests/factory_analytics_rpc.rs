@@ -189,6 +189,28 @@ async fn run_factory_workflow(client: &mut Client, task: &str) {
         .unwrap();
 }
 
+async fn settled_agent_name(client: &mut Client) -> String {
+    for _ in 0..100 {
+        if let Some(agent) = client
+            .call("agent.list", json!({"include_archived":true}))
+            .await
+            .unwrap()["agents"]
+            .as_array()
+            .and_then(|agents| agents.first())
+            .filter(|agent| {
+                matches!(
+                    agent["state"].as_str(),
+                    Some("completed") | Some("failed") | Some("dismissed")
+                )
+            })
+        {
+            return agent["name"].as_str().unwrap().to_owned();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("workflow must leave a settled structured agent record");
+}
+
 async fn snapshot_state(client: &mut Client) -> Value {
     client
         .call("factory.snapshot", json!({"repo":"repo-a", "include_archived":true}))
@@ -229,8 +251,8 @@ async fn factory_scorecards_rpc_returns_read_only_envelope_from_structured_sourc
     // These source families have no structured RK store yet and are unobserved.
     assert!(!availability_of(&resp, "Phase3Contract"));
     assert!(!availability_of(&resp, "Phase3VerifiedDelivery"));
-    assert!(!availability_of(&resp, "StructuredReviewerRework"));
-    assert!(!availability_of(&resp, "StructuredRevert"));
+    assert!(availability_of(&resp, "StructuredReviewerRework"));
+    assert!(availability_of(&resp, "StructuredRevert"));
     assert!(!availability_of(&resp, "PricingSnapshot"));
 
     client.call("stop", json!({})).await.unwrap();
@@ -273,19 +295,107 @@ async fn factory_rpcs_report_missing_source_families_as_unobserved_not_zero() {
         .await
         .unwrap();
     let warnings = resp["warnings"].as_array().unwrap();
-    for family in [
-        "Phase3Contract",
-        "Phase3VerifiedDelivery",
-        "StructuredReviewerRework",
-        "StructuredRevert",
-        "PricingSnapshot",
-    ] {
+    for family in ["Phase3Contract", "Phase3VerifiedDelivery", "PricingSnapshot"] {
         assert!(!availability_of(&resp, family), "{family} must be unobserved");
         assert!(
             warnings.iter().any(|w| w.as_str().unwrap().contains(family)),
             "warning must name unobserved family {family}"
         );
     }
+    for family in ["StructuredReviewerRework", "StructuredRevert"] {
+        assert!(availability_of(&resp, family), "{family} has a daemon read seam");
+        assert_eq!(source_count(&resp, family)["event_count"], json!(0));
+        assert!(warnings.iter().all(|w| !w.as_str().unwrap().contains(family)));
+    }
+    client.call("stop", json!({})).await.unwrap();
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn factory_analytics_reads_revert_fact_and_rework_verdict_end_to_end() {
+    let (_home, repo_dir, _layout, handle, space, mut client) = setup_with_space().await;
+    run_factory_workflow(&mut client, "structured-outcomes").await;
+    let agent_name = settled_agent_name(&mut client).await;
+    let repo_scope = repo_dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    space
+        .out(Tuple::new(
+            Category::Fact,
+            &repo_scope,
+            format!("merge-reverted-{agent_name}"),
+            "test-castle",
+            json!({
+                "agent": agent_name,
+                "task": "TKT-REVERT",
+                "merge_commit": "merge-abc",
+                "revert_commit": "revert-def",
+                "detail": "ignored prose"
+            }),
+        ))
+        .unwrap();
+    space
+        .out(Tuple::new(
+            Category::Artifact,
+            &repo_scope,
+            "review",
+            "test-castle",
+            json!({
+                "agent": agent_name,
+                "task": "TKT-REWORK",
+                "recommendation": "REWORK",
+                "notes": "ignored prose"
+            }),
+        ))
+        .unwrap();
+
+    let first = client
+        .call("factory.scorecards", json!({"repo":repo_scope.clone()}))
+        .await
+        .unwrap();
+    let second = client
+        .call("factory.scorecards", json!({"repo":repo_scope.clone()}))
+        .await
+        .unwrap();
+    assert_eq!(first, second, "same daemon state must serialize identically");
+    assert!(availability_of(&first, "StructuredRevert"));
+    assert!(availability_of(&first, "StructuredReviewerRework"));
+    assert_eq!(source_count(&first, "StructuredRevert")["active_source_count"], json!(1));
+    assert_eq!(source_count(&first, "StructuredRevert")["event_count"], json!(1));
+    assert_eq!(source_count(&first, "StructuredReviewerRework")["active_source_count"], json!(1));
+    assert_eq!(source_count(&first, "StructuredReviewerRework")["event_count"], json!(1));
+
+    let row = first["scorecards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| !row["projected"].as_bool().unwrap_or(false))
+        .unwrap();
+    assert_eq!(row["metrics"]["reverted"], json!(1));
+    assert_eq!(row["metrics"]["revert_sample_size"], json!(1));
+    assert_eq!(row["metrics"]["reworked"], json!(1));
+    assert_eq!(row["metrics"]["rework_sample_size"], json!(1));
+
+    let recommend = client
+        .call("factory.recommend", json!({"repo":repo_scope}))
+        .await
+        .unwrap();
+    for rule in ["reverts", "high_rework"] {
+        let recommendation = recommend["recommendations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|recommendation| recommendation["rule"] == json!(rule))
+            .unwrap_or_else(|| panic!("missing recommendation for {rule}"));
+        assert!(recommendation["suppressed"] == json!(true));
+        assert_eq!(recommendation["suppression_reason"], json!("low_sample"));
+        assert_eq!(recommendation["evidence"]["denominator"], json!(1));
+    }
+
     client.call("stop", json!({})).await.unwrap();
     handle.await.unwrap().unwrap();
 }
