@@ -244,7 +244,7 @@ fn counts_only_explicit_run_facts_as_runs_without_triple_counting_agent_metrics(
     assert_eq!(row.metrics.lead_time_sample_size, 1);
     assert_eq!(row.metrics.unknown, 0);
     assert_eq!(row.sample_size, 1);
-    assert!(row.status_counts.get(&OutcomeStatus::Unknown).is_none());
+    assert!(!row.status_counts.contains_key(&OutcomeStatus::Unknown));
 }
 
 #[test]
