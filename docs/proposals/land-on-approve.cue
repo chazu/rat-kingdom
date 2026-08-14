@@ -1,12 +1,10 @@
-// PROPOSAL (rat-29 workflow-review): revised land-on-approve.cue.
-// Change vs shipped: the APPROVE case now gates the `land` RESULT with
-// `evaluate {expect: {merged: true}}`. In the shipped version a human approves,
-// but if the subsequent auto-`land` hits a merge conflict or a moved target it
-// lands a clean {merged: false} (NOT an error, per #LandStep) and the run
-// completes as if the work merged — the operator gets no signal that their
-// approval never took effect. Failing closed on merged:false surfaces the stuck
-// land in `rk inbox` as a failed instance. Schema doc for #LandStep prescribes
-// exactly this gate.
+// PROPOSAL (rat-29 workflow-review, landed): synchronized land-on-approve.cue.
+// The land-result gate is applied in the shipped definition. Direct merges
+// require `merged: true`; PR-mode delivery accepts `pr_opened: true` via
+// `anyOf`. Conflicts and failed pushes match neither success shape, so the
+// approved-but-undelivered branch fails closed and remains visible.
+// This proposal copy is synchronized with the shipped workflow, including its
+// instance-bound approval read.
 //
 // land-on-approve: a rat implements a change on a work branch, a (cheaper)
 // reviewer chained off that branch records a verdict for a human to read, then
@@ -97,13 +95,19 @@ workflow: {
 		// Lift the human's verdict into ctx.var.approved. The gate leaves a
 		// workflow_approval event behind (both for a real decision and the
 		// fail-closed timeout), so this read resolves immediately.
+		//
+		// `fromInstance` binds it to THIS run's decision (TKT-172). Unbound,
+		// (event, <repo>, workflow_approval) is shared by every gated instance
+		// on the repo and the newest decision wins whoever it was meant for —
+		// so a peer's approval could land THIS branch on the target below.
 		{
-			type:     "read"
-			category: "event"
-			identity: "workflow_approval"
-			field:    "approved"
-			into:     "approved"
-			timeout:  "5m"
+			type:         "read"
+			category:     "event"
+			identity:     "workflow_approval"
+			fromInstance: true
+			field:        "approved"
+			into:         "approved"
+			timeout:      "5m"
 		},
 		{
 			type: "when"
@@ -116,11 +120,14 @@ workflow: {
 				"true": [
 					{type: "dismiss", noMerge: true},
 					{type: "land", branch: "{{ctx.activeBranch}}", target: _input.target},
-					// GATE THE LAND RESULT. A conflict or moved target lands as a
-					// clean {merged: false} (not an error); fail closed so an
-					// approved-but-unmerged branch surfaces in rk inbox instead of
-					// the run completing as if the work landed.
-					{type: "evaluate", expect: {merged: true}},
+					// GATE THE LAND RESULT. `land` routes on the repo's merge mode:
+					// a Direct-merge repo reports {merged: true}; a PR-mode repo
+					// pushes the branch and opens a PR, reporting {pr_opened: true}
+					// (never merged) — surfaced to the operator as an awaiting-review
+					// row in rk inbox. BOTH are a clean hand-off, so accept either.
+					// Only a conflict / moved target / push failure (merged:false AND
+					// pr_opened:false) fails closed, holding the branch for rk inbox.
+					{type: "evaluate", expect: {merged: true}, anyOf: [{pr_opened: true}]},
 				]
 				// Rejected (or fail-closed timeout): tear down the worktree but
 				// PRESERVE the branch, unmerged, for a human. The run still
