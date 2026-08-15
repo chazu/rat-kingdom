@@ -144,3 +144,15 @@ debug!(caller = %req.caller, method = %req.method, role = %record.role, "denial 
 
 Run with `RK_LOG=rk_daemon=debug` (not `RUST_LOG` — the daemon's filter env var is
 `RK_LOG`, see `crates/rk-cli/src/main.rs:653-656`).
+
+## Coverage limits
+
+Arm E (invalid role) is **unverified** by this reproduction. Exercising it needs a
+supervised agent record carrying a role that `validate_role` rejects, and the
+disposable castle offers no supported path to mint one: `rk spawn --role` validates
+its input up front, and writing a corrupted record directly into the registry would
+test the corruption tooling, not the denial arm. The arm E debug line above is
+therefore asserted by the landed unit tests in `crates/rk-daemon/src/server.rs`
+(diagnostics slice, TKT-01M01NZBZ336QYF9J404BPQHCD) rather than by a live denial
+here. If a live arm E exercise becomes necessary, the supported route is a
+test-fixture daemon with an injected invalid-role record, not a production castle.
