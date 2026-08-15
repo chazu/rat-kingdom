@@ -182,9 +182,32 @@ pub async fn spawn(layout: &Layout, args: SpawnArgs, as_json: bool) -> Result<()
                 format!("{title}\n\n{body}")
             }
         });
-        // Explicit --repo wins; otherwise take the ticket's scope.
+        // Explicit --repo wins; otherwise take the ticket's scope. A
+        // system-scoped ticket with a repo-scoped parent (e.g. an older
+        // sub-ticket minted before scope inheritance landed) resolves
+        // through the parent instead of erroring.
         let repo_arg = if args.repo == "." {
-            ticket["scope"].as_str().unwrap_or(".").to_string()
+            let ticket_scope = ticket["scope"].as_str().unwrap_or(".").to_string();
+            if ticket_scope == rk_core::tuple::SYSTEM_SCOPE {
+                if let Some(parent_id) = payload["parent"].as_str() {
+                    let parent = client
+                        .call("ticket.get", json!({ "id": parent_id }))
+                        .await?;
+                    match parent["ticket"]["scope"].as_str() {
+                        Some(s) if s != rk_core::tuple::SYSTEM_SCOPE => {
+                            eprintln!(
+                                "note: {ticket_id} is system-scoped; resolving repo through parent {parent_id} ({s})"
+                            );
+                            s.to_string()
+                        }
+                        _ => ticket_scope,
+                    }
+                } else {
+                    ticket_scope
+                }
+            } else {
+                ticket_scope
+            }
         } else {
             args.repo.clone()
         };

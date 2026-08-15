@@ -48,8 +48,11 @@ pub struct NewTicket {
     pub title: String,
     #[serde(default)]
     pub body: Option<String>,
-    #[serde(default = "system_scope")]
-    pub scope: String,
+    /// Explicit scope override. When absent, a sub-ticket (`parent` set)
+    /// inherits its parent's scope; a top-level ticket defaults to
+    /// [`SYSTEM_SCOPE`].
+    #[serde(default)]
+    pub scope: Option<String>,
     #[serde(default)]
     pub parent: Option<String>,
     #[serde(default = "default_priority")]
@@ -138,10 +141,21 @@ impl Tickets {
         _guard: &TicketMutationGuard<'_>,
         t: NewTicket,
     ) -> rk_core::Result<(Tuple, bool)> {
+        // Explicit scope wins. Otherwise a sub-ticket inherits its parent's
+        // scope, so decomposing a repo-scoped ticket doesn't silently drop the
+        // sub-tickets into "system" (which breaks `rk spawn --ticket` and the
+        // steward-on-completion trigger match).
+        let scope = match &t.scope {
+            Some(s) => s.clone(),
+            None => match t.parent.as_deref().map(|p| self.get(p)).transpose()? {
+                Some(Some(parent)) => parent.scope,
+                _ => system_scope(),
+            },
+        };
         if let Some(key) = t.coalesce_key.as_deref() {
             if let Some(existing) = self
                 .space
-                .scan(&Pattern::category(Category::Task).scope(&t.scope))?
+                .scan(&Pattern::category(Category::Task).scope(&scope))?
                 .into_iter()
                 .find(|ticket| {
                     ticket.payload.get("coalesce_key").and_then(Value::as_str) == Some(key)
@@ -177,7 +191,7 @@ impl Tickets {
         if let Some(key) = t.coalesce_key {
             payload["coalesce_key"] = json!(key);
         }
-        let tuple = Tuple::new(Category::Task, t.scope, id, self.castle.clone(), payload)
+        let tuple = Tuple::new(Category::Task, scope, id, self.castle.clone(), payload)
             .with_lifecycle(Lifecycle::Session);
         self.space.out(tuple.clone())?;
         Ok((tuple, true))
@@ -635,7 +649,7 @@ mod tests {
         NewTicket {
             title: title.into(),
             body: None,
-            scope: scope.into(),
+            scope: Some(scope.into()),
             parent: parent.map(Into::into),
             priority: default_priority(),
             labels: vec![],
@@ -653,6 +667,45 @@ mod tests {
         assert!(a.identity.starts_with(ID_PREFIX));
         assert!(b.identity.starts_with(ID_PREFIX));
         assert_ne!(a.identity, b.identity);
+    }
+
+    #[tokio::test]
+    async fn sub_ticket_inherits_parent_scope_when_scope_omitted() {
+        let t = tickets();
+        let parent = t.create(new("root", "myrepo", None)).await.unwrap();
+        let mut sub = new("sub", "myrepo", Some(&parent.identity));
+        sub.scope = None; // as if --repo was never passed
+        let sub = t.create(sub).await.unwrap();
+        assert_eq!(sub.scope, "myrepo");
+    }
+
+    #[tokio::test]
+    async fn sub_ticket_explicit_scope_overrides_parent() {
+        let t = tickets();
+        let parent = t.create(new("root", "myrepo", None)).await.unwrap();
+        let sub = t
+            .create(new("sub", "otherrepo", Some(&parent.identity)))
+            .await
+            .unwrap();
+        assert_eq!(sub.scope, "otherrepo");
+    }
+
+    #[tokio::test]
+    async fn top_level_ticket_defaults_to_system_scope_when_omitted() {
+        let t = tickets();
+        let mut top = new("top", "myrepo", None);
+        top.scope = None;
+        let top = t.create(top).await.unwrap();
+        assert_eq!(top.scope, system_scope());
+    }
+
+    #[tokio::test]
+    async fn sub_ticket_falls_back_to_system_when_parent_missing() {
+        let t = tickets();
+        let mut sub = new("sub", "myrepo", Some("TKT-does-not-exist"));
+        sub.scope = None;
+        let sub = t.create(sub).await.unwrap();
+        assert_eq!(sub.scope, system_scope());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -4148,7 +4148,7 @@ impl Daemon {
                 crate::tickets::NewTicket {
                     title: create.title.clone(),
                     body: Some(create.description.clone()),
-                    scope: action.repo_identity.clone(),
+                    scope: Some(action.repo_identity.clone()),
                     parent: None,
                     priority: "normal".into(),
                     labels,

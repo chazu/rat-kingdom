@@ -153,7 +153,7 @@ fn new_ticket(title: &str, scope: &str) -> NewTicket {
     NewTicket {
         title: title.into(),
         body: None,
-        scope: scope.into(),
+        scope: Some(scope.into()),
         parent: None,
         priority: "normal".into(),
         labels: vec![],
@@ -952,6 +952,58 @@ async fn steward_trigger_fires_on_rat_completion_not_reviewer() {
         reactor.run_cycle().unwrap(),
         1,
         "a rat completion fires the steward exactly once"
+    );
+    assert_eq!(reactor.engine_instance_count(), 1);
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+/// A rat dispatched from a ticket that is scope "system" (e.g. a sub-ticket
+/// minted before parent-scope inheritance landed, or a cross-repo ticket
+/// resolved through its parent) still emits its `harness_result` scoped to
+/// the real repo it ran in — `route_completion` scopes the event on
+/// `record.repo_name`, the resolved filesystem repo, never the ticket's own
+/// scope field. So the shipped trigger's `repo: "{{tuple.scope}}"`
+/// interpolation must resolve to that real repo, not "system".
+#[tokio::test]
+async fn steward_trigger_resolves_real_repo_for_system_scoped_ticket_completion() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+
+    // The shipped trigger shape (examples/triggers.cue steward-on-completion):
+    // no top-level `repo:` override, so try_fire's fallback chain resolves the
+    // target repo straight from the matched tuple's own scope.
+    let dir = layout.triggers_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("steward.cue"),
+        r#"triggers: [{name: "steward-on-completion", match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}, run: "react-work", params: {repo: "{{tuple.scope}}"}}]"#,
+    )
+    .unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+
+    // Simulate the completion of a rat that was dispatched from a
+    // system-scoped ticket but actually ran in "myrepo": the event is scoped
+    // to the real repo, per route_completion's use of record.repo_name.
+    space
+        .out(Tuple::new(
+            Category::Event,
+            "myrepo",
+            "harness_result",
+            "test-castle",
+            json!({"agent": "rat-1", "role": "rat", "branch": "rat/x/work"}),
+        ))
+        .unwrap();
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        1,
+        "steward must fire for the rat's real repo even though its ticket was system-scoped"
     );
     assert_eq!(reactor.engine_instance_count(), 1);
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
