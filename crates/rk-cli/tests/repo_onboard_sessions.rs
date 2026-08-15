@@ -338,19 +338,31 @@ echo '{"type":"done","session_id":"jcode-onboarding","text":"jcode assessment co
         .windows(2)
         .any(|pair| { pair == ["--tools", rk_core::JCODE_READ_ONLY_TOOLS] }));
 
-    let results = operator
-        .call(
-            "space.scan",
-            json!({
-                "category": "event",
-                "scope": jcode_repo_name,
-                "identity": "harness_result",
-                "payload_search": format!("\"agent\":\"{jcode_agent}\"")
-            }),
-        )
-        .await
-        .unwrap();
-    let result = &results["tuples"][0]["payload"];
+    // The harness_result event is emitted asynchronously with the agent's
+    // status flip, and route_completion now runs the review-tiering diff
+    // summary (two git subprocesses) before it publishes — a one-shot scan
+    // here raced that emission. Poll briefly: the event is guaranteed, only
+    // its timing is not.
+    let mut result = serde_json::Value::Null;
+    for _ in 0..100 {
+        let results = operator
+            .call(
+                "space.scan",
+                json!({
+                    "category": "event",
+                    "scope": jcode_repo_name,
+                    "identity": "harness_result",
+                    "payload_search": format!("\"agent\":\"{jcode_agent}\"")
+                }),
+            )
+            .await
+            .unwrap();
+        if !results["tuples"][0].is_null() {
+            result = results["tuples"][0]["payload"].clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_eq!(result["is_error"], false);
     assert_eq!(result["declared_done"], true);
 

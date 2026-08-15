@@ -38,6 +38,14 @@ pub struct Repo {
     root: PathBuf,
 }
 
+/// File list and total changed-line count for a diff range. See
+/// [`Repo::diff_stat`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DiffStat {
+    pub files: Vec<String>,
+    pub lines: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeOutcome {
     pub merged: bool,
@@ -152,6 +160,36 @@ impl Repo {
             return true;
         }
         self.is_ancestor(branch, target)
+    }
+
+    /// Resolve `rev` (a branch name, sha, or any revision `git` accepts) to its
+    /// full commit sha.
+    pub fn rev_parse(&self, rev: &str) -> rk_core::Result<String> {
+        Ok(self.git(&["rev-parse", rev])?.trim().to_string())
+    }
+
+    /// File list and total changed-line count for the `base...head` symmetric
+    /// (merge-base) diff — the same range shape the `steward-diff-scope` check
+    /// computes by hand in `.rk/checks.cue`. A binary file reports `-`/`-` in
+    /// `--numstat`; those count as 0 lines, matching that check's `awk` script.
+    pub fn diff_stat(&self, base: &str, head: &str) -> rk_core::Result<DiffStat> {
+        let range = format!("{base}...{head}");
+        let names = self.git(&["diff", "--name-only", &range])?;
+        let files: Vec<String> = names
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        let numstat = self.git(&["diff", "--numstat", &range])?;
+        let mut lines: u64 = 0;
+        for row in numstat.lines() {
+            let mut cols = row.split_whitespace();
+            let added: u64 = cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let removed: u64 = cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            lines += added + removed;
+        }
+        Ok(DiffStat { files, lines })
     }
 
     /// Fetch `remote` and prune deleted remote-tracking branches, bounded by
@@ -1399,5 +1437,50 @@ mod tests {
     fn fetch_prune_requires_a_remote() {
         let (_dir, repo) = scratch_repo();
         assert!(repo.fetch_prune("", Duration::from_secs(5)).is_err());
+    }
+
+    #[test]
+    fn rev_parse_resolves_a_branch_to_its_sha() {
+        let (dir, repo) = scratch_repo();
+        let branch = commit_on_branch(dir.path(), &repo, "gouda", "task-rev");
+        let sha = repo.rev_parse(&branch).unwrap();
+        assert_eq!(sha.len(), 40, "expected a full sha, got {sha:?}");
+        assert_eq!(sha, repo.git(&["rev-parse", &branch]).unwrap().trim());
+    }
+
+    #[test]
+    fn diff_stat_counts_files_and_lines_vs_base() {
+        let (dir, repo) = scratch_repo();
+        let wt = dir.path().join("wt-diffstat");
+        let branch = agent_branch("brie", "task-diffstat");
+        repo.create_worktree(&wt, &branch, "main").unwrap();
+        std::fs::write(wt.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(wt.join("b.txt"), "four\nfive\n").unwrap();
+        run(&wt, &["add", "."]);
+        run(&wt, &["commit", "-m", "add a and b"]);
+
+        let stat = repo.diff_stat("main", &branch).unwrap();
+        assert_eq!(stat.files, vec!["a.txt".to_string(), "b.txt".to_string()]);
+        assert_eq!(stat.lines, 5); // 3 + 2 added lines, nothing removed
+
+        // A no-op branch (tip == base) diffs empty rather than erroring.
+        let stat = repo.diff_stat("main", "main").unwrap();
+        assert!(stat.files.is_empty());
+        assert_eq!(stat.lines, 0);
+    }
+
+    #[test]
+    fn diff_stat_counts_binary_files_as_zero_lines() {
+        let (dir, repo) = scratch_repo();
+        let wt = dir.path().join("wt-diffstat-binary");
+        let branch = agent_branch("edam", "task-diffstat-binary");
+        repo.create_worktree(&wt, &branch, "main").unwrap();
+        std::fs::write(wt.join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
+        run(&wt, &["add", "."]);
+        run(&wt, &["commit", "-m", "add binary blob"]);
+
+        let stat = repo.diff_stat("main", &branch).unwrap();
+        assert_eq!(stat.files, vec!["blob.bin".to_string()]);
+        assert_eq!(stat.lines, 0, "binary files report '-'/'-', not a line count");
     }
 }

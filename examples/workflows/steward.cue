@@ -6,28 +6,53 @@
 // This is not run by hand; it is FIRED by the reactor on every rat completion.
 // Register the `steward-on-completion` trigger (examples/triggers.cue) — it
 // matches `Event/harness_result` with `"role":"rat"` and passes the completed
-// rat's {task, branch, repo} through. The `"role":"rat"` scope is also what
-// breaks re-entrancy: the reviewer this workflow spawns completes as a
-// "reviewer", so its own harness_result never re-fires the steward.
+// rat's {task, branch, repo, diffClass, headSha} through. The `"role":"rat"`
+// scope is also what breaks re-entrancy: both tiers below spawn as role
+// "reviewer", so neither one's own harness_result ever re-fires the steward on
+// the branch it just handled.
 //
-// Flow (all steps already exist — steward is their reactive application):
-//   spawn a cheap reviewer chained onto the completed branch
-//   -> POLICY GATE (#19): refuse to auto-merge diffs touching protected paths
-//   -> DIFF-SCOPE GATE (#20): refuse to auto-merge diffs over a size budget
-//   -> RUN GATE  (#6):    run the repo's real test/lint suite (real teeth),
-//                         routing green / red / too-slow separately (#169)
-//   -> read the reviewer's APPROVE/REWORK/STOP verdict artifact
-//   -> when verdict:
-//        APPROVE -> land the branch straight onto main (#23) — auto-merge
-//        REWORK  -> file a follow-up ticket (durable hand-off), hold the branch
-//        STOP    -> escalate to the operator via a `need` tuple, hold the branch
-//        (other) -> escalate + fail loudly (an unknown verdict is a bug)
+// REVIEW TIERING (TKT-01M036N1RT74H6NPRH5FMM8A6T). `diffClass` — a
+// precomputed classification the daemon stamps on every completion payload —
+// picks one of two tiers at CUE LOAD TIME (a `list.Concat`/`if` selection over
+// `_input.diffClass`, not a runtime `when` step: workflow params are never
+// copied into ctx.vars, so a runtime `when` cannot see `_input` at all):
 //
-// Every gate fails CLOSED: a protected-path violation, an over-budget diff, a
-// red suite, or a suite that never finished all hold the branch unmerged and
-// surface in `rk inbox`. Auto-merge is only ever reached through a clean policy
-// gate, a within-budget diff, a green suite, AND an explicit APPROVE — never on
-// a reviewer's word alone.
+//   REVIEW TIER — diffClass "small"/"large" (and any legacy completion missing
+//   the field, which defaults here to "large", fail-closed toward review):
+//     spawn a cheap reviewer chained onto the completed branch
+//     -> POLICY GATE (#19): refuse to auto-merge diffs touching protected paths
+//     -> DIFF-SCOPE GATE (#20): refuse to auto-merge diffs over a size budget
+//     -> RUN GATE  (#6):    run the repo's real test/lint suite (real teeth),
+//                           routing green / red / too-slow separately (#169)
+//     -> read the reviewer's APPROVE/REWORK/STOP verdict artifact
+//     -> when verdict:
+//          APPROVE -> land the branch straight onto main (#23) — auto-merge
+//          REWORK  -> file a follow-up ticket (durable hand-off), hold branch
+//          STOP    -> escalate to the operator via a `need` tuple, hold branch
+//          (other) -> escalate + fail loudly (an unknown verdict is a bug)
+//
+//   REDUCED TIER — diffClass "doc-only"/"trivial" (TKT-01M0382WS1NNR0W5RA59PPDDYP):
+//     the LLM review turn ($3-8) is skipped, but the gates are NOT — a
+//     workflow `run` step (what runs the protected-paths/diff-scope/verify
+//     gates) only ever executes in an ALREADY-spawned agent's worktree
+//     (`ctx.active_agent`, set only by `spawn`); there is no primitive to
+//     adopt an existing agent's worktree instead. So this tier still spawns —
+//     a near-zero GATE-HOLDER, on the cheapest configured model, whose entire
+//     task is "call `rk done` immediately". Its worktree then hosts the exact
+//     same POLICY/DIFF-SCOPE/RUN gates as the review tier, and once they pass
+//     it lands UNCONDITIONALLY — there is no verdict to route on, because
+//     nothing looked at the diff. Net effect: the $3-8 reasoning turn is
+//     skipped for diffs too small to need it; a ~cent agent shell remains
+//     live until TKT-01M036PSEHTMD3S5D2JFAG7XVY's daemon-native landing
+//     pipeline removes the worktree coupling entirely (tracked there, not
+//     solved here).
+//
+// Every gate fails CLOSED in BOTH tiers: a protected-path violation, an
+// over-budget diff, a red suite, or a suite that never finished all hold the
+// branch unmerged and surface in `rk inbox`. Tiering only ever decides whether
+// an LLM looks at the diff before the gates run — it never weakens a gate, and
+// auto-merge is only ever reached through a clean policy gate, a within-budget
+// diff, and a green suite (plus an explicit APPROVE in the review tier).
 //
 // This file is the SOURCE for every deployed copy. Install it with
 // `rk workflow install examples/workflows/steward.cue` rather than `cp`, and the
@@ -37,7 +62,13 @@
 // read that no repo source could fix.
 //
 // Copy to ~/.rat-kingdom/workflows/ (global) or <repo>/.rk/workflows/, and copy
-// the matching trigger into ~/.rat-kingdom/triggers/ (or <repo>/.rk/).
+// the matching trigger into ~/.rat-kingdom/triggers/ (or <repo>/.rk/). BOTH
+// installed copies need an operator sync after this file changes — the
+// diffClass/headSha templating landed in the repo source, not the deployed one.
+package workflow
+
+import "list"
+
 workflow: {
 	name:        "steward"
 	description: "reactive triage of a completed branch: policy+test gate, verdict -> auto-merge / rework-ticket / escalate"
@@ -46,9 +77,9 @@ workflow: {
 		// Identifies the completed work in ticket/need text. String-interpolated
 		// by the trigger from the completion tuple, so always a string.
 		taskId: {type: "string", required: false, default: "unknown"}
-		// The completed rat's branch — the reviewer chains onto it. Passed
-		// through raw by the trigger; empty only for branchless (attach) rats,
-		// where the reviewer spawn fails closed (surfaces in `rk inbox`).
+		// The completed rat's branch — the reviewer (or gate-holder) chains onto
+		// it. Passed through raw by the trigger; empty only for branchless
+		// (attach) rats, where the spawn fails closed (surfaces in `rk inbox`).
 		branch: {type: "string", required: false, default: ""}
 		// The repo the completion is scoped to. Needed to file the rework ticket
 		// and the escalation need in the right scope.
@@ -89,6 +120,20 @@ workflow: {
 		// entry in `<repo>/.rk/checks.cue` (which carries its own timeout) so
 		// the repo owns both the command and its budget.
 		gateTimeout: {type: "string", required: false, default: "60m"}
+		// REVIEW TIERING (see file header). The completion payload's precomputed
+		// diff classification — "doc-only" | "trivial" | "small" | "large".
+		// "doc-only"/"trivial" take the REDUCED tier (gate-holder, no LLM
+		// review); everything else — including a legacy completion missing the
+		// field, since the reactor omits a null-templated param rather than
+		// passing it through so this default applies (TKT-146/f359a95) — takes
+		// the unchanged review tier. Default "large" is deliberately fail-closed
+		// toward review.
+		diffClass: {type: "string", required: false, default: "large"}
+		// The completed rat's branch-tip SHA, templated by the trigger from the
+		// completion payload. Threaded into the reviewer's task and its verdict
+		// artifact for future commit-keyed verdict caching (Phase 2); empty for
+		// a legacy completion.
+		headSha: {type: "string", required: false, default: ""}
 	}
 
 	agents: {
@@ -96,40 +141,22 @@ workflow: {
 		// policy instead of silently routing this one workflow through Claude.
 		default:  {harness: "codex", model: "gpt-5.6-luna"}
 		reviewer: {harness: "codex", model: "gpt-5.6-luna"}
+		// REDUCED TIER gate-holder (see file header): the cheapest configured
+		// model, since this agent does no reasoning over the diff — its whole
+		// job is to call `rk done` and host the deterministic gates that follow.
+		gateholder: {harness: "claude", model: "haiku"}
 	}
 
-	steps: [
-		// 1. A cheap reviewer chains onto the completed branch (spawn.branch is
-		//    the base), so its worktree carries the completed work and every
-		//    following `run` executes against it.
-		{
-			type:   "spawn"
-			role:   "reviewer"
-			agent:  "reviewer"
-			branch: _input.branch
-			task: {
-				title: "steward-review-" + _input.taskId
-				description: """
-					You are the steward's reviewer on branch {{ctx.activeBranch}},
-					chained off a rat's completed work for: \(_input.taskId)
-
-					Compare with: git log \(_input.target)..HEAD and git diff \(_input.target)...HEAD
-
-					Decide APPROVE (clean, safe to auto-merge), REWORK (fixable issues
-					remain), or STOP (fundamentally wrong / needs a human call). Record
-					the verdict before finishing so the steward can route on it:
-					rk out artifact \(_input.repo) review --payload '{"task": "\(_input.taskId)", "recommendation": "APPROVE|REWORK|STOP", "notes": "..."}'
-					"""
-			}
-		},
-		{type: "wait", timeout: _input.reviewTimeout},
-		// The reviewer session must itself have finished cleanly.
-		{type: "evaluate", expect: {is_error: false}},
-
-		// 2. POLICY GATE (#19). List the files the branch changes vs the merge
-		//    target; if ANY match the protected pattern, exit non-zero. The
-		//    following evaluate turns that into a fail-closed hold — protected
-		//    diffs go to the operator, never to auto-merge.
+	// Shared by BOTH tiers: POLICY GATE (#19), DIFF-SCOPE GATE (#20), and the
+	// RUN GATE (#6) with its three-way (pass/timeout/red) routing (TKT-169) and
+	// characterized-flake retry (TKT-01M02AMKD24WZVVMARJPXKYKSW). Tiering never
+	// weakens these — it only ever decides whether an LLM looks at the diff
+	// BEFORE they run.
+	_gates: [
+		// POLICY GATE (#19). List the files the branch changes vs the merge
+		// target; if ANY match the protected pattern, exit non-zero. The
+		// following evaluate turns that into a fail-closed hold — protected
+		// diffs go to the operator, never to auto-merge.
 		{
 			type: "run"
 			check: "steward-protected-paths"
@@ -141,13 +168,13 @@ workflow: {
 		},
 		{type: "evaluate", expect: {exit: 0}},
 
-		// 2b. DIFF-SCOPE GATE (#20). Count the files the branch changes and the
-		//     added+removed lines vs the merge target, and exit non-zero if EITHER
-		//     exceeds its per-repo budget (0 = that budget off). Binary files (a
-		//     `-` in --numstat) count as 0 lines. The following evaluate turns an
-		//     over-budget diff into a fail-closed hold — a sprawling branch goes
-		//     to the operator (rk inbox), never to auto-merge, no matter how clean
-		//     its verdict.
+		// DIFF-SCOPE GATE (#20). Count the files the branch changes and the
+		// added+removed lines vs the merge target, and exit non-zero if EITHER
+		// exceeds its per-repo budget (0 = that budget off). Binary files (a
+		// `-` in --numstat) count as 0 lines. The following evaluate turns an
+		// over-budget diff into a fail-closed hold — a sprawling branch goes
+		// to the operator (rk inbox), never to auto-merge, no matter how clean
+		// its verdict.
 		{
 			type: "run"
 			check: "steward-diff-scope"
@@ -160,38 +187,38 @@ workflow: {
 		},
 		{type: "evaluate", expect: {exit: 0}},
 
-		// 3. RUN GATE (#6). The repo's real suite, executed in the reviewer's
-		//    worktree — a verdict the harness cannot forge. Nothing below this
-		//    reaches `land` unless the suite came back green.
+		// RUN GATE (#6). The repo's real suite, executed in the active agent's
+		// worktree — a verdict the harness cannot forge. Nothing below this
+		// reaches `land` unless the suite came back green.
 		//
-		//    Unlike the two gates above, this one routes on THREE outcomes
-		//    instead of two (TKT-169). `evaluate {exit: 0}` collapses "the suite
-		//    says no" and "the suite did not finish inside \(_input.gateTimeout)"
-		//    into one bare instance failure, and the second is the common one:
-		//    the steward's re-run is a cold worktree competing with its peers,
-		//    so a suite that is merely slow killed runs whose review had already
-		//    passed, with nothing in `rk inbox` to say why. `onTimeout:
-		//    "continue"` turns the blown budget into a result, and `verdict`
-		//    lifts the three-way answer for the `when` below.
+		// Unlike the two gates above, this one routes on THREE outcomes
+		// instead of two (TKT-169). `evaluate {exit: 0}` collapses "the suite
+		// says no" and "the suite did not finish inside \(_input.gateTimeout)"
+		// into one bare instance failure, and the second is the common one:
+		// the steward's re-run is a cold worktree competing with its peers,
+		// so a suite that is merely slow killed runs whose review had already
+		// passed, with nothing in `rk inbox` to say why. `onTimeout:
+		// "continue"` turns the blown budget into a result, and `verdict`
+		// lifts the three-way answer for the `when` below.
 		//
-		//    Still fail-closed, in both directions: a timeout reports exit 124,
-		//    so it is no more mergeable than a red suite. It just gets a hand-off
-		//    that names the real problem.
+		// Still fail-closed, in both directions: a timeout reports exit 124,
+		// so it is no more mergeable than a red suite. It just gets a hand-off
+		// that names the real problem.
 		//
-		//    retryOnFail: 1 (TKT-01M02AMKD24WZVVMARJPXKYKSW). This specific gate
-		//    is CHARACTERIZED flaky: several stewards fire at once, each running
-		//    a full cold-worktree `mise run verify`, and the fleet machine has
-		//    been observed at a load average an order of magnitude over its core
-		//    count while that happens — timing-sensitive daemon tests miss their
-		//    budget under that contention for reasons having nothing to do with
-		//    the branch under review. One extra attempt (after a short backoff)
-		//    rides out that transient without weakening the gate: a genuinely
-		//    red suite fails the retry too and reaches the same `default` arm
-		//    below, just a few seconds later. Every attempt is recorded — on
-		//    `gate.retries` when it recovers, and in the durable
-		//    `(artifact, <repo>, gate-failure)` tuple the failed final attempt
-		//    writes below — so a retried flake stays visible instead of quietly
-		//    looking like a clean first try.
+		// retryOnFail: 1 (TKT-01M02AMKD24WZVVMARJPXKYKSW). This specific gate
+		// is CHARACTERIZED flaky: several stewards fire at once, each running
+		// a full cold-worktree `mise run verify`, and the fleet machine has
+		// been observed at a load average an order of magnitude over its core
+		// count while that happens — timing-sensitive daemon tests miss their
+		// budget under that contention for reasons having nothing to do with
+		// the branch under review. One extra attempt (after a short backoff)
+		// rides out that transient without weakening the gate: a genuinely
+		// red suite fails the retry too and reaches the same `default` arm
+		// below, just a few seconds later. Every attempt is recorded — on
+		// `gate.retries` when it recovers, and in the durable
+		// `(artifact, <repo>, gate-failure)` tuple the failed final attempt
+		// writes below — so a retried flake stays visible instead of quietly
+		// looking like a clean first try.
 		{
 			type:        "run"
 			check:       _input.check
@@ -205,8 +232,8 @@ workflow: {
 			type: "when"
 			var:  "gate"
 			cases: {
-				// GREEN. Fall through to the verdict read and the routing below
-				// — the only path that can reach `land`.
+				// GREEN. Fall through to whatever follows the gates in this
+				// tier — the only path that can reach `land`.
 				"pass": []
 
 				// TOO SLOW. An infrastructure condition, not a bad branch: the
@@ -216,8 +243,8 @@ workflow: {
 				// here — `break` at top level finishes the instance cleanly.
 				//
 				// The `break` is load-bearing. Without it the `when` falls
-				// through to the verdict read and the APPROVE arm would LAND a
-				// branch whose suite never completed.
+				// through to whatever follows and could land a branch whose
+				// suite never completed.
 				//
 				// Clean completion, not `stop`: a timeout is a capacity signal
 				// the operator tunes, and failing the instance would add a
@@ -259,102 +286,183 @@ workflow: {
 		},
 		// Keep the run gate's exit assertion explicit as a final fail-closed
 		// guard. The timeout and red branches terminate above; only the green
-		// branch reaches this assertion and then the review verdict.
+		// branch reaches this assertion and whatever follows the gates.
 		{type: "evaluate", expect: {exit: 0}},
-
-		// 4. Lift the reviewer's verdict into ctx.var.verdict.
-		//
-		//    `fromAgent` is load-bearing, not decoration (TKT-161). The steward
-		//    is fired PER rat completion, so several instances run against one
-		//    repo at once by design — and they all read
-		//    (artifact, <repo>, review). Without the binding "newest wins"
-		//    hands this steward whichever reviewer finished last, which may be
-		//    a peer instance's, and the APPROVE below lands a branch on a
-		//    stranger's verdict. Bound, the read matches only the tuple the
-		//    reviewer spawned in step 1 wrote (`rk out` stamps every payload
-		//    with its writer's name), and fails CLOSED into `rk inbox` if that
-		//    reviewer recorded nothing — never onto somebody else's word.
-		{
-			type:      "read"
-			category:  "artifact"
-			identity:  "review"
-			fromAgent: true
-			field:     "recommendation"
-			into:      "verdict"
-			timeout:   "5m"
-		},
-
-		// 5. Route on the verdict. Gates already passed, so APPROVE is the ONLY
-		//    path that reaches `land`; everything else holds the branch unmerged.
-		{
-			type: "when"
-			var:  "verdict"
-			cases: {
-				// AUTO-MERGE: tear down the reviewer's worktree (so its branch is
-				// no longer checked out), then land that branch — carrying the
-				// reviewed work — straight onto the target. The run completes.
-				"APPROVE": [
-					{type: "dismiss", noMerge: true},
-					{type: "land", branch: "{{ctx.activeBranch}}", target: _input.target},
-					// GATE THE POLICY RESULT. Every repository delivery mode reports
-					// the same `delivered` truth: local merge, merge+push, branch push,
-					// or PR/MR hand-off. A conflict or push failure stays false and
-					// holds the branch for rk inbox.
-					{type: "evaluate", expect: {delivered: true}},
-				]
-				// REWORK: hand the fixable work back durably as a ticket rather
-				// than looping a rework rat here — the steward stays fast and
-				// single-purpose, and the backlog drain / dispatcher picks it up
-				// (whose completion re-enters the steward: a closed loop, not a
-				// runaway). The branch is HELD (noMerge) so the rework can build
-				// on it. `rk ticket new` runs in the reviewer's worktree.
-				"REWORK": [
-					{
-						type: "run"
-						check: "steward-file-rework-ticket"
-						env: {
-							RK_CHECK_REPO:    _input.repo
-							RK_CHECK_TASK_ID: _input.taskId
-							RK_CHECK_BRANCH:  "{{ctx.activeBranch}}"
-						}
-						timeout: "2m"
-					},
-					{type: "dismiss", noMerge: true},
-				]
-				// ESCALATE: a legitimate human judgment call. Emit a `need` in the
-				// repo scope — `rk inbox` (#12) ranks it into the operator's queue
-				// — and HOLD the branch unmerged for inspection. Clean completion:
-				// a STOP is a normal outcome, not a failure.
-				"STOP": [
-					{
-						type: "run"
-						check: "steward-report-stop"
-						env: {
-							RK_CHECK_REPO:    _input.repo
-							RK_CHECK_TASK_ID: _input.taskId
-							RK_CHECK_BRANCH:  "{{ctx.activeBranch}}"
-						}
-						timeout: "2m"
-					},
-					{type: "dismiss", noMerge: true},
-				]
-			}
-			// An unrecognized verdict is a bug, not a veto: escalate AND fail the
-			// instance loudly (branch held) rather than silently merging.
-			default: [
-				{
-					type: "run"
-					check: "steward-report-unknown-verdict"
-					env: {
-						RK_CHECK_REPO:    _input.repo
-						RK_CHECK_TASK_ID: _input.taskId
-						RK_CHECK_BRANCH:  "{{ctx.activeBranch}}"
-					}
-					timeout: "2m"
-				},
-				{type: "dismiss", noMerge: true},
-				{type: "stop", reason: "unrecognized review verdict for " + _input.taskId},
-			]
-		},
 	]
+
+	// REVIEW TIER (see file header): unchanged from the original steward — a
+	// cheap reviewer's verdict gates the merge decision.
+	_reviewArm: list.Concat([
+		[
+			// A cheap reviewer chains onto the completed branch (spawn.branch is
+			// the base), so its worktree carries the completed work and every
+			// following `run` executes against it.
+			{
+				type:   "spawn"
+				role:   "reviewer"
+				agent:  "reviewer"
+				branch: _input.branch
+				task: {
+					title: "steward-review-" + _input.taskId
+					description: """
+						You are the steward's reviewer on branch {{ctx.activeBranch}}
+						(head \(_input.headSha)), chained off a rat's completed work for:
+						\(_input.taskId)
+
+						Compare with: git log \(_input.target)..HEAD and git diff \(_input.target)...HEAD
+
+						Decide APPROVE (clean, safe to auto-merge), REWORK (fixable issues
+						remain), or STOP (fundamentally wrong / needs a human call). Record
+						the verdict before finishing so the steward can route on it:
+						rk out artifact \(_input.repo) review --payload '{"task": "\(_input.taskId)", "recommendation": "APPROVE|REWORK|STOP", "notes": "...", "head_sha": "\(_input.headSha)"}'
+						"""
+				}
+			},
+			{type: "wait", timeout: _input.reviewTimeout},
+			// The reviewer session must itself have finished cleanly.
+			{type: "evaluate", expect: {is_error: false}},
+		],
+		_gates,
+		[
+			// Lift the reviewer's verdict into ctx.var.verdict.
+			//
+			// `fromAgent` is load-bearing, not decoration (TKT-161). The steward
+			// is fired PER rat completion, so several instances run against one
+			// repo at once by design — and they all read
+			// (artifact, <repo>, review). Without the binding "newest wins"
+			// hands this steward whichever reviewer finished last, which may be
+			// a peer instance's, and the APPROVE below lands a branch on a
+			// stranger's verdict. Bound, the read matches only the tuple the
+			// reviewer spawned above wrote (`rk out` stamps every payload with
+			// its writer's name), and fails CLOSED into `rk inbox` if that
+			// reviewer recorded nothing — never onto somebody else's word.
+			{
+				type:      "read"
+				category:  "artifact"
+				identity:  "review"
+				fromAgent: true
+				field:     "recommendation"
+				into:      "verdict"
+				timeout:   "5m"
+			},
+
+			// Route on the verdict. Gates already passed, so APPROVE is the ONLY
+			// path that reaches `land`; everything else holds the branch unmerged.
+			{
+				type: "when"
+				var:  "verdict"
+				cases: {
+					// AUTO-MERGE: tear down the reviewer's worktree (so its branch is
+					// no longer checked out), then land that branch — carrying the
+					// reviewed work — straight onto the target. The run completes.
+					"APPROVE": [
+						{type: "dismiss", noMerge: true},
+						{type: "land", branch: "{{ctx.activeBranch}}", target: _input.target},
+						// GATE THE POLICY RESULT. Every repository delivery mode reports
+						// the same `delivered` truth: local merge, merge+push, branch push,
+						// or PR/MR hand-off. A conflict or push failure stays false and
+						// holds the branch for rk inbox.
+						{type: "evaluate", expect: {delivered: true}},
+					]
+					// REWORK: hand the fixable work back durably as a ticket rather
+					// than looping a rework rat here — the steward stays fast and
+					// single-purpose, and the backlog drain / dispatcher picks it up
+					// (whose completion re-enters the steward: a closed loop, not a
+					// runaway). The branch is HELD (noMerge) so the rework can build
+					// on it. `rk ticket new` runs in the reviewer's worktree.
+					"REWORK": [
+						{
+							type: "run"
+							check: "steward-file-rework-ticket"
+							env: {
+								RK_CHECK_REPO:    _input.repo
+								RK_CHECK_TASK_ID: _input.taskId
+								RK_CHECK_BRANCH:  "{{ctx.activeBranch}}"
+							}
+							timeout: "2m"
+						},
+						{type: "dismiss", noMerge: true},
+					]
+					// ESCALATE: a legitimate human judgment call. Emit a `need` in the
+					// repo scope — `rk inbox` (#12) ranks it into the operator's queue
+					// — and HOLD the branch unmerged for inspection. Clean completion:
+					// a STOP is a normal outcome, not a failure.
+					"STOP": [
+						{
+							type: "run"
+							check: "steward-report-stop"
+							env: {
+								RK_CHECK_REPO:    _input.repo
+								RK_CHECK_TASK_ID: _input.taskId
+								RK_CHECK_BRANCH:  "{{ctx.activeBranch}}"
+							}
+							timeout: "2m"
+						},
+						{type: "dismiss", noMerge: true},
+					]
+				}
+				// An unrecognized verdict is a bug, not a veto: escalate AND fail the
+				// instance loudly (branch held) rather than silently merging.
+				default: [
+					{
+						type: "run"
+						check: "steward-report-unknown-verdict"
+						env: {
+							RK_CHECK_REPO:    _input.repo
+							RK_CHECK_TASK_ID: _input.taskId
+							RK_CHECK_BRANCH:  "{{ctx.activeBranch}}"
+						}
+						timeout: "2m"
+					},
+					{type: "dismiss", noMerge: true},
+					{type: "stop", reason: "unrecognized review verdict for " + _input.taskId},
+				]
+			},
+		],
+	])
+
+	// REDUCED TIER (see file header — TKT-01M0382WS1NNR0W5RA59PPDDYP /
+	// TKT-01M036PSEHTMD3S5D2JFAG7XVY). Spawns a near-zero gate-holder instead
+	// of a reviewer, runs the SAME gates, then lands unconditionally: there is
+	// no verdict to route on because nothing reviewed the diff.
+	_reducedArm: list.Concat([
+		[
+			{
+				type:   "spawn"
+				role:   "reviewer"
+				agent:  "gateholder"
+				branch: _input.branch
+				task: {
+					title: "steward-gatehold-" + _input.taskId
+					description: """
+						You are a gate-holder, not a reviewer. This diff (branch
+						{{ctx.activeBranch}}, head \(_input.headSha)) was classified
+						"\(_input.diffClass)" for \(_input.taskId), so the steward
+						skipped the LLM review turn for it
+						(TKT-01M036PSEHTMD3S5D2JFAG7XVY). Your worktree exists only to
+						host the deterministic policy/diff-scope/verify gates that
+						follow. Do nothing else: run `rk done` immediately.
+						"""
+				}
+			},
+			{type: "wait", timeout: _input.reviewTimeout},
+			// The gate-holder session must itself have finished cleanly.
+			{type: "evaluate", expect: {is_error: false}},
+		],
+		_gates,
+		[
+			// No verdict to read: the gates are the only gate this tier has.
+			// AUTO-MERGE unconditionally once they pass, same delivery shape
+			// (and the same fail-closed `delivered` guard) as the review tier's
+			// APPROVE arm.
+			{type: "dismiss", noMerge: true},
+			{type: "land", branch: "{{ctx.activeBranch}}", target: _input.target},
+			{type: "evaluate", expect: {delivered: true}},
+		],
+	])
+
+	steps: list.Concat([
+		if _input.diffClass == "doc-only" || _input.diffClass == "trivial" {_reducedArm},
+		if !(_input.diffClass == "doc-only" || _input.diffClass == "trivial") {_reviewArm},
+	])
 }

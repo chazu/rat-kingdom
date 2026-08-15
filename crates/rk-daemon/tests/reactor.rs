@@ -1118,6 +1118,93 @@ async fn non_main_land_target_is_reported_main_is_not() {
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
+/// A trigger param templated from a payload field the matched tuple does not
+/// carry (the "legacy completion" case: an older/differently-shaped
+/// `harness_result`, or — going forward — any completion predating the
+/// `diff_class` enrichment) must still fire, falling back to the target
+/// workflow's own declared default rather than hard-failing on a `Null` param.
+///
+/// Before the null-guard fix, `template_params` passed the absent field
+/// through as a present `Value::Null`, which skips the workflow loader's
+/// default substitution (`!effective.contains_key(name)`) and fails
+/// `coerce_param` for every declared type — so `try_fire` returned `Err`,
+/// `run_cycle` swallowed it as a `retryable_failure` (never advancing the
+/// cursor), and the trigger would fail on this exact same tuple forever.
+#[tokio::test]
+async fn trigger_param_over_an_absent_payload_field_falls_back_to_the_workflow_default() {
+    const WORKFLOW_WITH_DEFAULTED_PARAM: &str = r#"
+        workflow: {
+            name: "react-work-tagged"
+            agents: {default: {harness: "fake"}}
+            params: {
+                tag: {type: "string", required: false, default: "no-tag"}
+            }
+            steps: [
+                {type: "spawn", role: "rat", task: {title: "reacted-\(_input.tag)"}},
+            ]
+        }
+    "#;
+
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    std::fs::write(
+        repo.path().join(".rk/workflows/react-work-tagged.cue"),
+        WORKFLOW_WITH_DEFAULTED_PARAM,
+    )
+    .unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+
+    let dir = layout.triggers_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("tagged.cue"),
+        r#"triggers: [{name: "tagged-on-completion", match: {category: "event", identity: "harness_result"}, run: "react-work-tagged", repo: "myrepo", params: {tag: "{{tuple.payload.tag}}"}}]"#,
+    )
+    .unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+
+    // No "tag" field in this payload at all.
+    space
+        .out(Tuple::new(
+            Category::Event,
+            "myrepo",
+            "harness_result",
+            "test-castle",
+            json!({"agent": "basil-6", "role": "rat"}),
+        ))
+        .unwrap();
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        1,
+        "a null-templated param must not hard-fail the fire"
+    );
+    assert_eq!(reactor.engine_instance_count(), 1);
+
+    // The workflow's own default ("no-tag") took effect, not an empty/null
+    // value. The instance's `spawn` step runs on a background task, so poll
+    // rather than scanning immediately.
+    let mut spawns = Vec::new();
+    for _ in 0..100 {
+        spawns = space
+            .scan(&Pattern::category(Category::Event).identity("agent_spawned"))
+            .unwrap();
+        if !spawns.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(spawns.len(), 1, "the tagged workflow's spawn step never ran");
+    assert_eq!(spawns[0].payload["task"], "reacted-no-tag");
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
 /// Full path over the wire: suggestion + three distinct endorsers land via
 /// `space.out`; the live daemon's reactor loop promotes a convention on its own.
 #[tokio::test]

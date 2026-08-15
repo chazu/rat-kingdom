@@ -1857,10 +1857,24 @@ fn truncate(s: &str, max: usize) -> &str {
 }
 
 /// Template each workflow param from the matched tuple.
+///
+/// A param whose templated value is `Null` (a lone `{{tuple.payload.<key>}}`
+/// placeholder over a key the matched tuple's payload lacks) is DROPPED from
+/// the returned map rather than passed through as `Null`. The workflow loader
+/// only substitutes a declared param's default when the caller omits the key
+/// entirely (`!effective.contains_key(name)`); a present `Null` skips that
+/// substitution and falls straight into `coerce_param`, which rejects `Null`
+/// for every declared type (string/int/number/bool/list) — so an
+/// always-present key would hard-fail the fire for any trigger whose template
+/// references a payload field an older or differently-shaped tuple omits,
+/// exactly the "legacy completion" case a new enriched field must not break.
 fn template_params(params: &HashMap<String, String>, tuple: &Tuple) -> HashMap<String, Value> {
     params
         .iter()
-        .map(|(k, v)| (k.clone(), template_param(v, tuple)))
+        .filter_map(|(k, v)| {
+            let value = template_param(v, tuple);
+            (!value.is_null()).then(|| (k.clone(), value))
+        })
         .collect()
 }
 
@@ -1950,10 +1964,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_payload_key_is_null() {
+    fn missing_payload_key_is_omitted_not_null() {
         let t = tuple();
         let params = template_params(&trigger(&[("x", "{{tuple.payload.absent}}")]).params, &t);
-        assert_eq!(params["x"], Value::Null);
+        // Omitted, not `Value::Null` — a present-but-null param skips the
+        // workflow loader's default substitution and hard-fails `coerce_param`
+        // for every declared type, so a fire over a tuple missing this field
+        // would break instead of falling back to the workflow's own default.
+        assert!(!params.contains_key("x"));
     }
 
     #[test]
