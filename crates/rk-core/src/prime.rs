@@ -78,6 +78,15 @@ auto-fill your identity from the environment):
   extra work: it is a single cheap call, and it is the only way the fleet turns a
   lesson into a rule without a human. Endorse the existing suggestion rather than
   minting a near-duplicate.
+- A coordination call failing at entry — `rk scan`, `rk endorse`, `rk suggest`,
+  or `rk fact vote` returning `forbidden` or another error — is a soft
+  failure, not a stop condition: it costs you a vote or a read, not your
+  ability to land. Report it with `rk obstacle \"<text>\"` if that call itself
+  succeeds; if `rk obstacle` also fails, just note the failure in your final
+  summary. Either way, proceed with your ticketed work — do not abort the
+  dispatch over it. This is separate from the LAND-proving check in the
+  completion protocol (can you commit, can you reach the tuplespace at all),
+  which is still a genuine stop.
 - Before editing an area, `rk scan claim <repo>` and `rk scan artifact <repo>`
   to see what peers are touching, and steer clear of their files. On entry,
   mark your area with `rk claim <area>` (a path or glob) so peers avoid it.
@@ -379,7 +388,11 @@ const FRAGMENT_COMPLETION: &str = "\
    tuplespace, so you cannot even report what you found. A denied tool at
    minute 1 costs nothing. The same denial discovered at minute 25 has cost a
    full lifetime and two finished proposals. Do not assume a denial is
-   transient because your workflow declares broad permissions.
+   transient because your workflow declares broad permissions. This STOP is
+   scoped to the two entry calls above and to git writes; a coordination call
+   failing later on its own (`rk endorse`, `rk scan`, `rk suggest`, `rk fact
+   vote`) is a soft failure, not this stop condition — see Coordination: the
+   tuplespace for how to handle that case.
 2. Commit BEFORE you verify, not after. Your branch is read by other agents
    while you are still working — a reviewer chains off it the moment your
    task is reported done, and an empty branch reads as a lost delivery. Never
@@ -928,6 +941,36 @@ mod tests {
             );
             assert!(text.contains("STOP\n   IMMEDIATELY"), "{role}");
             assert!(text.contains("rk scan fact system"), "{role}");
+        }
+    }
+
+    #[test]
+    fn entry_coordination_failures_are_non_fatal() {
+        // Django-4 (codex) hit `forbidden` on its entry-time `rk endorse` and,
+        // reading the LAND-proving STOP as covering every `rk` call, aborted the
+        // whole dispatch without committing anything — a soft coordination
+        // failure escalated into a fully wasted lifetime. A missed vote is not
+        // the same failure class as "I cannot commit or reach the tuplespace at
+        // all"; only the latter should stop a rat.
+        for role in ["rat", "reviewer"] {
+            let text = render(role, &ctx());
+            assert!(
+                text.contains("is a soft\n  failure, not a stop condition"),
+                "{role}: coordination section should say entry coordination \
+                 failures are non-fatal"
+            );
+            assert!(
+                text.contains("proceed with your ticketed work"),
+                "{role}: coordination section should instruct the rat to \
+                 continue its task despite a failed endorse/scan/suggest/vote"
+            );
+            // The LAND-proving STOP must say it does NOT cover these calls, or
+            // the two instructions contradict each other.
+            let land_at = text.find("Prove you can LAND").expect("entry tool check");
+            let scope_at = text
+                .find("This STOP is\n   scoped to the two entry calls above")
+                .expect("LAND-proving STOP should state its own scope");
+            assert!(scope_at > land_at, "{role}: scope note should follow the STOP it qualifies");
         }
     }
 
