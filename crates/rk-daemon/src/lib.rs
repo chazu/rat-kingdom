@@ -452,6 +452,149 @@ mod tests {
         assert!(!layout.socket_path().exists());
     }
 
+    mod agent_list_frame_limits {
+        //! TKT-01M036PSJCD31YBV7KZTKKQG19: `agent.list` with `include_archived`
+        //! serializes the union of two views that are each individually kept
+        //! under the frame cap by construction — nothing capped the *combined*
+        //! reply, so a fleet large enough to blow past it made
+        //! `write_json_line` return a bare `io::Error` that `serve_conn`
+        //! propagated straight out, closing the socket with no wire response at
+        //! all (`rk list --all` surfaced as `protocol: daemon closed
+        //! connection`, unusable and undiagnosable). Reproduced here at a much
+        //! smaller scale than the real castle (580 records) by padding each
+        //! record's `stderr_tail`.
+        use super::*;
+        use crate::agents::{AgentRecord, AgentState, Registry};
+        use rk_harness::TokenUsage;
+
+        fn padded(name: &str, state: AgentState, tail_bytes: usize, stale: bool) -> AgentRecord {
+            let now = chrono::Utc::now();
+            AgentRecord {
+                name: name.into(),
+                role: "rat".into(),
+                coordination: None,
+                harness: "fake".into(),
+                permission_mode: None,
+                model: None,
+                repo_root: "/tmp/repo".into(),
+                repo_name: "repo".into(),
+                task: Some("tkt-1".into()),
+                branch: Some(format!("rat/{name}/tkt-1")),
+                worktree: Some(format!("/tmp/wt/{name}").into()),
+                target_branch: "main".into(),
+                parent: None,
+                workflow_instance: None,
+                coordinator: None,
+                session_id: Some("sess".into()),
+                attach_target: None,
+                pid: None,
+                merge_commit: None,
+                state,
+                crashed: false,
+                stderr_tail: Some("x".repeat(tail_bytes)),
+                result: Some("done".into()),
+                progress: None,
+                usage: TokenUsage::default(),
+                cost_usd: 0.01,
+                created_at: now,
+                // Old enough for `Registry::archive` to sweep it up.
+                updated_at: if stale {
+                    now - chrono::TimeDelta::try_hours(2).unwrap()
+                } else {
+                    now
+                },
+                archived_at: None,
+            }
+        }
+
+        /// Each of `rk list` and `rk list --archived` fits under the old 1 MiB
+        /// frame cap on its own; their union does not. Before the fix this was
+        /// exactly the reported repro: `agent.list {include_archived: true}`
+        /// closed the connection instead of replying.
+        #[tokio::test]
+        async fn combined_reply_over_the_old_1mib_cap_still_succeeds() {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = Layout::at(dir.path());
+            let live_count = 20;
+            let archived_count = 20;
+            {
+                let mut reg = Registry::load(&layout.home().join("agents.json")).unwrap();
+                for i in 0..live_count {
+                    reg.insert(padded(&format!("live-{i}"), AgentState::Running, 35_000, false))
+                        .unwrap();
+                }
+                for i in 0..archived_count {
+                    reg.insert(padded(
+                        &format!("done-{i}"),
+                        AgentState::Completed,
+                        35_000,
+                        true,
+                    ))
+                    .unwrap();
+                }
+                reg.archive(chrono::Utc::now() - chrono::TimeDelta::try_hours(1).unwrap())
+                    .unwrap();
+            }
+
+            let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+            let _handle = tokio::spawn(daemon.run());
+            let mut client = connect(&layout).await;
+
+            let live = client.call("agent.list", json!({})).await.unwrap();
+            assert_eq!(live["agents"].as_array().unwrap().len(), live_count);
+
+            let archived = client
+                .call("agent.list", json!({"archived_only": true}))
+                .await
+                .unwrap();
+            assert_eq!(archived["agents"].as_array().unwrap().len(), archived_count);
+
+            let all = client
+                .call("agent.list", json!({"include_archived": true}))
+                .await
+                .expect("agent.list --all must not close the connection");
+            assert_eq!(
+                all["agents"].as_array().unwrap().len(),
+                live_count + archived_count
+            );
+        }
+
+        /// Even beyond the raised response cap, an oversized reply must come
+        /// back as a clean `frame_too_large` error the client can report, not
+        /// a dropped connection.
+        #[tokio::test]
+        async fn reply_over_the_new_cap_errors_cleanly_instead_of_closing() {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = Layout::at(dir.path());
+            {
+                let mut reg = Registry::load(&layout.home().join("agents.json")).unwrap();
+                // 6 * 4 MiB well clears the 16 MiB response cap.
+                for i in 0..6 {
+                    reg.insert(padded(
+                        &format!("live-{i}"),
+                        AgentState::Running,
+                        4 * 1024 * 1024,
+                        false,
+                    ))
+                    .unwrap();
+                }
+            }
+
+            let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+            let _handle = tokio::spawn(daemon.run());
+            let mut client = connect(&layout).await;
+
+            let resp = client
+                .call_raw("agent.list", json!({}))
+                .await
+                .expect("daemon must not close the connection on an oversized reply");
+            let err = resp
+                .error
+                .expect("an oversized reply must come back as an error, not succeed");
+            assert_eq!(err.code, crate::proto::codes::FRAME_TOO_LARGE);
+        }
+    }
+
     #[tokio::test]
     async fn agent_rpc_is_authenticated_and_instance_scoped() {
         let (_dir, layout, handle) = start_daemon().await;
