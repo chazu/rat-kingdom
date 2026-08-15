@@ -613,7 +613,7 @@ impl Reactor {
         let new = NewTicket {
             title: format!("Coalesced obstacle: {}", truncate(sample, 80)),
             body: Some(body),
-            scope: scope.to_string(),
+            scope: Some(scope.to_string()),
             parent: None,
             priority: "normal".to_string(),
             labels: vec!["obstacle-coalesce".to_string()],

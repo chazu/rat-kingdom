@@ -14,8 +14,10 @@ pub struct NewArgs {
     #[arg(long)]
     pub body: Option<String>,
     /// Repo scope (a registered repo name) or "system" for cross-repo work.
-    #[arg(long, default_value = "system")]
-    pub repo: String,
+    /// Defaults to "system", unless --parent is set, in which case the
+    /// sub-ticket inherits the parent ticket's scope.
+    #[arg(long)]
+    pub repo: Option<String>,
     /// Parent ticket id — creates a sub-ticket (decomposition).
     #[arg(long)]
     pub parent: Option<String>,
@@ -71,10 +73,12 @@ pub async fn new(layout: &Layout, args: NewArgs, as_json: bool) -> Result<()> {
     let mut client = Client::connect_or_spawn(layout).await?;
     let mut params = json!({
         "title": args.title,
-        "scope": args.repo,
         "labels": args.labels,
         "depends_on": args.depends_on,
     });
+    if let Some(repo) = args.repo {
+        params["scope"] = json!(repo);
+    }
     if let Some(body) = args.body {
         params["body"] = json!(body);
     }
