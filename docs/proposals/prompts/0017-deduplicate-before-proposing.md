@@ -71,6 +71,21 @@ execution, ticket state, tuple authorization, or convention promotion. It
 prevents duplicate durable work while preserving a path for a genuinely new
 root cause or a materially new delta to extend an earlier proposal.
 
+## Deduplication record for this delivery
+
+The requested root cause and target were already covered before this delivery
+started. The existing identifiers are:
+
+- proposal ledger entry and proposal file: `0017`
+  (`docs/proposals/prompts/README.md` and this file);
+- ticket: `TKT-01KZZ4DEG5948CT2AXBGN7BDBD`;
+- delivery commit: `a74be09` (`docs: propose safer prompt-refinement mining`).
+
+Because those records cover the same root cause and target, this delivery does
+not create a second proposal, ticket, or convention ballot. Future refinement
+runs should record these identifiers in their handoff artifact and continue
+mining; only a materially new delta should extend proposal 0017.
+
 When landed, add a focused definition assertion for both copies. It should
 check that they name the proposal ledger, open-ticket lookup, artifact lookup,
 root-cause matching, and the no-duplicate rule. It should not require a
