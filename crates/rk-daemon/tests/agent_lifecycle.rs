@@ -122,6 +122,18 @@ async fn spawn_complete_route_dismiss_merge() {
         .await
         .unwrap();
     assert_eq!(events["tuples"].as_array().unwrap().len(), 1);
+    let payload = &events["tuples"][0]["payload"];
+    // Review-tiering fields (TKT-01M036N1RT74H6NPRH5FMM8A6T): head_sha is the
+    // branch tip the fake rat produced; the one-file, one-line commit
+    // classifies as trivial.
+    let branch = payload["branch"].as_str().unwrap().to_string();
+    let expected_sha = git_out(repo_dir.path(), &["rev-parse", &branch])
+        .trim()
+        .to_string();
+    assert_eq!(payload["head_sha"], expected_sha);
+    assert_eq!(payload["diff_files"], 1);
+    assert_eq!(payload["diff_lines"], 1);
+    assert_eq!(payload["diff_class"], "trivial");
     let parent_msg = client
         .call(
             "space.scan",

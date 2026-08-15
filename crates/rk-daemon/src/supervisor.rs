@@ -24,6 +24,61 @@ use tracing::{info, warn};
 
 const MIN_PROGRESS_INTERVAL: chrono::Duration = chrono::Duration::seconds(5);
 
+// Review-tiering diff_class thresholds (Phase 0 of the steward remediation).
+// The steward trigger reads `diff_class` off the completion payload to decide
+// whether a diff is worth an LLM reviewer's judgment at all; these bounds are
+// deliberately conservative — a diff outside them defaults toward "large",
+// never away from it, so a threshold bug can only ADD a review, never skip
+// one it shouldn't.
+const DIFF_TRIVIAL_MAX_FILES: usize = 2;
+const DIFF_TRIVIAL_MAX_LINES: u64 = 40;
+const DIFF_SMALL_MAX_FILES: usize = 10;
+const DIFF_SMALL_MAX_LINES: u64 = 400;
+
+/// The completion-payload fields a reactive steward tiers its review on: the
+/// branch tip this generation produced, its size vs. the recorded target, and
+/// a precomputed bucket. See [`Supervisor::diff_summary`].
+struct DiffSummary {
+    head_sha: String,
+    diff_files: usize,
+    diff_lines: u64,
+    diff_class: &'static str,
+}
+
+impl DiffSummary {
+    /// The fail-closed default: no sha, no stats, and `"large"` — the same
+    /// tier a real oversized diff gets, so an unreadable repo or a branchless
+    /// completion routes through the full reviewer flow rather than skipping
+    /// it.
+    fn fallback() -> Self {
+        Self {
+            head_sha: String::new(),
+            diff_files: 0,
+            diff_lines: 0,
+            diff_class: "large",
+        }
+    }
+}
+
+/// Bucket a diff by size and shape. `doc-only` requires at least one changed
+/// file (an empty diff is `trivial`, not `doc-only`) with every path either a
+/// markdown file or under a `docs/` directory at any depth.
+fn classify_diff(files: &[String], lines: u64) -> &'static str {
+    if !files.is_empty() && files.iter().all(|f| is_doc_path(f)) {
+        "doc-only"
+    } else if files.len() <= DIFF_TRIVIAL_MAX_FILES && lines <= DIFF_TRIVIAL_MAX_LINES {
+        "trivial"
+    } else if files.len() <= DIFF_SMALL_MAX_FILES && lines <= DIFF_SMALL_MAX_LINES {
+        "small"
+    } else {
+        "large"
+    }
+}
+
+fn is_doc_path(path: &str) -> bool {
+    path.ends_with(".md") || path.split('/').any(|segment| segment == "docs")
+}
+
 #[derive(Debug, Default)]
 struct BranchDelivery {
     target: String,
@@ -2362,12 +2417,49 @@ impl Supervisor {
         self.lock_completions().remove(name);
     }
 
+    /// Diff summary for the completion payload (Phase 0 review tiering): the
+    /// branch tip this generation produced, its size vs. the recorded target,
+    /// and the precomputed `diff_class` bucket a reactor trigger gates a
+    /// reviewer spawn on.
+    ///
+    /// Computed with a direct, synchronous `git` call rather than routed
+    /// through `blocking_io`/`spawn_blocking` — the same tradeoff
+    /// [`Self::branch_already_merged`] already makes for a cheap read on this
+    /// path. Any failure (unresolvable repo, branch gone, bad rev) fails
+    /// closed to [`DiffSummary::fallback`]: a bug here can only ADD a
+    /// reviewer spawn downstream, never skip one.
+    fn diff_summary(&self, record: &AgentRecord) -> DiffSummary {
+        let fallback = DiffSummary::fallback();
+        let Some(branch) = record.branch.as_deref() else {
+            return fallback;
+        };
+        let Ok(repo) = Repo::discover(&record.repo_root) else {
+            return fallback;
+        };
+        let Ok(head_sha) = repo.rev_parse(branch) else {
+            return fallback;
+        };
+        let Ok(stat) = repo.diff_stat(&record.target_branch, branch) else {
+            return DiffSummary {
+                head_sha,
+                ..fallback
+            };
+        };
+        DiffSummary {
+            head_sha,
+            diff_files: stat.files.len(),
+            diff_lines: stat.lines,
+            diff_class: classify_diff(&stat.files, stat.lines),
+        }
+    }
+
     /// Route a completion up the spawn tree: the structural parent gets a
     /// directed message; the repo scope gets the event either way.
     ///
     /// Reached exactly once per agent generation — see
     /// [`Self::claim_completion`] for what "once" means and why it matters.
     fn route_completion(&self, record: &AgentRecord, is_error: bool, declared_done: bool) {
+        let diff = self.diff_summary(record);
         self.emit_event(
             &record.repo_name,
             "harness_result",
@@ -2387,6 +2479,15 @@ impl Supervisor {
                 "target": record.target_branch,
                 "parent": record.parent,
                 "is_error": is_error,
+                // Review-tiering inputs (Phase 0, TKT-01M036N1RT74H6NPRH5FMM8A6T):
+                // the branch tip this generation produced and a precomputed size
+                // bucket, so a reactor trigger can decide whether the diff is
+                // worth an LLM reviewer's judgment without needing an agent
+                // worktree of its own first. See `diff_summary`.
+                "head_sha": diff.head_sha,
+                "diff_files": diff.diff_files,
+                "diff_lines": diff.diff_lines,
+                "diff_class": diff.diff_class,
                 // Whether the agent itself declared the task finished (`rk done`)
                 // in this generation, as opposed to merely stopping — killed by
                 // the budget hard-stop, swept, or exiting mid-task (TKT-173).
@@ -4142,6 +4243,79 @@ mod respawn_tests {
 
         // (e) No branch recorded => not merged (fail-safe, respawn preflight handles it).
         assert!(!sup.branch_already_merged(&record(p, None)));
+    }
+
+    #[test]
+    fn classify_diff_buckets_by_size_and_shape() {
+        assert_eq!(classify_diff(&[], 0), "trivial", "an empty diff is trivial, not doc-only");
+        assert_eq!(
+            classify_diff(&["README.md".into(), "docs/guide.md".into()], 500),
+            "doc-only",
+            "doc-only overrides size: every path is markdown or under docs/"
+        );
+        assert_eq!(
+            classify_diff(&["README.md".into(), "src/lib.rs".into()], 5),
+            "trivial",
+            "a mixed diff is not doc-only even when tiny"
+        );
+        assert_eq!(classify_diff(&["a".into(), "b".into()], 40), "trivial");
+        assert_eq!(
+            classify_diff(&["a".into(), "b".into(), "c".into()], 40),
+            "small",
+            "3 files exceeds the trivial file cap even under the line cap"
+        );
+        assert_eq!(classify_diff(&["a".into()], 41), "small", "41 lines exceeds the trivial line cap");
+        assert_eq!(
+            classify_diff(&vec!["f".to_string(); 10], 400),
+            "small",
+            "at the small boundary"
+        );
+        assert_eq!(
+            classify_diff(&vec!["f".to_string(); 11], 400),
+            "large",
+            "11 files exceeds the small file cap"
+        );
+        assert_eq!(classify_diff(&["a".into()], 401), "large", "401 lines exceeds the small line cap");
+    }
+
+    #[test]
+    fn diff_summary_classifies_a_real_branch() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let p = repo.path();
+
+        git(p, &["checkout", "-b", "trivial", "main"]);
+        std::fs::write(p.join("g"), "one line\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "small change"]);
+        git(p, &["checkout", "main"]);
+
+        let expected_sha = Repo::discover(p).unwrap().rev_parse("trivial").unwrap();
+        let summary = sup.diff_summary(&record(p, Some("trivial")));
+        assert_eq!(summary.head_sha, expected_sha);
+        assert_eq!(summary.diff_files, 1);
+        assert_eq!(summary.diff_lines, 1);
+        assert_eq!(summary.diff_class, "trivial");
+    }
+
+    #[test]
+    fn diff_summary_fails_closed_to_large_when_unresolvable() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+        let p = repo.path();
+
+        // No branch recorded at all (e.g. an attach-mode completion).
+        let summary = sup.diff_summary(&record(p, None));
+        assert_eq!(summary.diff_class, "large");
+        assert_eq!(summary.head_sha, "");
+
+        // A branch that no longer exists.
+        let summary = sup.diff_summary(&record(p, Some("ghost")));
+        assert_eq!(summary.diff_class, "large");
     }
 
     /// Backoff + cap: immediate first attempt, exponential wait between retries,
