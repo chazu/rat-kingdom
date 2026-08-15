@@ -664,12 +664,13 @@ async fn test_factory_execute_prints_instance_json_on_success() {
     ));
 
     assert_eq!(executed["instance"]["workflow"], "noop");
+    // Registered repositories are canonicalized by the daemon. On macOS,
+    // tempfile paths can be spelled `/var/...` while the canonical path is
+    // `/private/var/...`.
+    let expected_repo = std::fs::canonicalize(repo.path()).unwrap();
     assert_eq!(
         executed["instance"]["repo"],
-        std::fs::canonicalize(repo.path())
-            .unwrap()
-            .to_string_lossy()
-            .as_ref()
+        expected_repo.to_string_lossy().as_ref()
     );
     assert_eq!(executed["approval"]["status"], "consumed");
     handle.abort();
