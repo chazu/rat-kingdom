@@ -1851,6 +1851,169 @@ async fn max_in_flight_queues_a_burst_and_drains_it_as_slots_free() {
     );
 }
 
+/// `drain_queued_fires` must consult the SAME rolling rate cap an immediate
+/// fire does (rework 2 of TKT-01M036NWE1EW5B1PWSHK0MKX8E): a burst held
+/// behind `maxInFlight` must not drain past `maxFires` in one window the
+/// moment slots start freeing. `maxFires: 2` alongside `maxInFlight: 1` means
+/// exactly 2 of the 5 queued tuples ever fire — one immediately, one drained
+/// — and the remaining 3 stay queued for good within this test's wide window.
+#[tokio::test]
+async fn drain_queued_fires_respects_the_rate_cap_not_just_max_in_flight() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    std::fs::write(
+        repo.path().join(".rk/workflows/slow-work.cue"),
+        r#"workflow: { name: "slow-work", steps: [{type: "run", command: "sleep 1"}] }"#,
+    )
+    .unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+
+    let dir = layout.triggers_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("burst.cue"),
+        r#"triggers: [{name: "burst-drain", match: {category: "event", scope: "myrepo", identity: "burst"}, run: "slow-work", maxInFlight: 1, maxFires: 2}]"#,
+    )
+    .unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let config = ReactorConfig {
+        window_secs: 3600, // one wide window for the whole test
+        ..Default::default()
+    };
+    let (reactor, engine) = build_reactor_and_engine_with_space(&layout, config, space.clone());
+
+    for i in 0..5 {
+        space
+            .out(Tuple::new(
+                Category::Event,
+                "myrepo",
+                "burst",
+                "Whisker",
+                json!({"i": i}),
+            ))
+            .unwrap();
+    }
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        1,
+        "only 1 dispatches immediately at the maxInFlight cap of 1"
+    );
+
+    // Drive cycles by hand well past the point both fires would complete
+    // (2 * 1s sleep) plus headroom, and past the point 5 would complete if
+    // the rate cap were not honoured while draining.
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reactor.run_cycle().unwrap();
+        if engine.list().len() >= 3 {
+            break; // would only happen if the rate cap failed to hold
+        }
+    }
+
+    assert_eq!(
+        engine.list().len(),
+        2,
+        "maxFires of 2 must bound total dispatches even though maxInFlight kept freeing slots"
+    );
+    let queued = space
+        .scan(&Pattern::category(Category::Event).identity("reactor_queued_fire"))
+        .unwrap();
+    assert_eq!(
+        queued.len(),
+        3,
+        "the remaining 3 stay queued once the rate cap is hit, not silently dropped"
+    );
+}
+
+/// A `RecordId`'s same-millisecond suffix is random, so sorting the queue by
+/// `t.id` (the pre-fix behaviour) does not reliably preserve enqueue order.
+/// This enqueues enough tuples in rapid succession that several land in the
+/// same millisecond in an in-memory space, then asserts `drain_queued_fires`
+/// dispatches them in the exact order they were queued — which only the
+/// durable `seq` field (rework 2 of TKT-01M036NWE1EW5B1PWSHK0MKX8E) can
+/// guarantee.
+#[tokio::test]
+async fn queued_fires_dispatch_in_enqueue_order_not_record_id_order() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    std::fs::write(
+        repo.path().join(".rk/workflows/fifo-work.cue"),
+        r#"workflow: { name: "fifo-work", steps: [{type: "run", command: "sleep 0.05"}] }"#,
+    )
+    .unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+
+    let dir = layout.triggers_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("fifo.cue"),
+        r#"triggers: [{name: "fifo-drain", match: {category: "event", scope: "myrepo", identity: "fifo"}, run: "fifo-work", maxInFlight: 1}]"#,
+    )
+    .unwrap();
+
+    const N: usize = 25;
+    let space = rk_space::Space::open_in_memory().unwrap();
+    // This test is about ORDER, not the rate cap — raise `max_fires` above N
+    // so the default cap of 20 (ReactorConfig::default) cannot itself stall
+    // the drain before all N have had a chance to dispatch.
+    let config = ReactorConfig {
+        window_secs: 3600,
+        max_fires: N as u32 + 10,
+        ..Default::default()
+    };
+    let (reactor, engine) = build_reactor_and_engine_with_space(&layout, config, space.clone());
+
+    let mut expected_ids = Vec::with_capacity(N);
+    for i in 0..N {
+        let t = Tuple::new(
+            Category::Event,
+            "myrepo",
+            "fifo",
+            "Whisker",
+            json!({"i": i}),
+        );
+        expected_ids.push(stable_reactor_instance_id("fifo-drain", t.id));
+        space.out(t).unwrap();
+    }
+
+    // maxInFlight of 1 forces strict serialization: the just-launched instance
+    // has not finished by the time drain_queued_fires rechecks the live count
+    // within the same synchronous call, so at most one new dispatch appears
+    // per `run_cycle`.
+    let mut dispatch_order = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        reactor.run_cycle().unwrap();
+        for inst in engine.list() {
+            if seen.insert(inst.id.clone()) {
+                dispatch_order.push(inst.id.clone());
+            }
+        }
+        if dispatch_order.len() == N {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        dispatch_order.len(),
+        N,
+        "all queued fires must eventually dispatch"
+    );
+    assert_eq!(
+        dispatch_order, expected_ids,
+        "queued fires must dispatch in enqueue order, not RecordId order"
+    );
+}
+
 /// A permanently-failing fire (here: a workflow's missing required param) must
 /// not pin the reactor's global cursor forever. After `MAX_FIRE_ATTEMPTS`
 /// cycles the reactor gives up on that `(trigger, tuple)` for good, and the

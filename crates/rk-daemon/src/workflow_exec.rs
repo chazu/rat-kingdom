@@ -67,7 +67,7 @@ const FLEET_CAPACITY_POLL: Duration = Duration::from_millis(250);
 /// slot at the moment `Supervisor::spawn` atomically checked (as opposed to a
 /// genuine spawn failure) — a `Step::Spawn` retries on this rather than
 /// failing the step.
-fn is_fleet_wip_refusal(error: &rk_core::Error) -> bool {
+pub(crate) fn is_fleet_wip_refusal(error: &rk_core::Error) -> bool {
     matches!(error, rk_core::Error::Other(msg) if msg == FLEET_WIP_CAP_REFUSED)
 }
 
@@ -2070,30 +2070,42 @@ impl WorkflowEngine {
                 .description
                 .as_ref()
                 .map(|d| interpolate_item(d, &item, &ctx));
-            let record = self
-                .spawn_agent(SpawnParams {
-                    repo: repo.to_string(),
-                    task: title,
-                    prompt,
-                    role: fe.role.clone(),
-                    harness: Some(resolved.harness),
-                    parent: None,
-                    // Each rat gets its own branch off the base; fan-out never
-                    // chains onto ctx.active_branch (that would serialize them).
-                    base: fe.branch.clone(),
-                    model: resolved.model,
-                    permission_mode: resolved.permission_mode,
-                    attach: false,
-                    workflow_instance: Some(id.to_string()),
-                    coordinator: self.coordinator(id),
-                    instance_max_usd: instance_cap,
-                    coordination: None,
-                // `for_each` fan-out predates the fleet-WIP admission control
-                // and is not gated by it (0): unlike the single `spawn` step,
-                // this loop has no wait/retry around a refusal, so wiring it
-                // to the same cap is a separate change, not this fix's scope.
-                }, 0)
-                .await?;
+            let params = SpawnParams {
+                repo: repo.to_string(),
+                task: title,
+                prompt,
+                role: fe.role.clone(),
+                harness: Some(resolved.harness),
+                parent: None,
+                // Each rat gets its own branch off the base; fan-out never
+                // chains onto ctx.active_branch (that would serialize them).
+                base: fe.branch.clone(),
+                model: resolved.model,
+                permission_mode: resolved.permission_mode,
+                attach: false,
+                workflow_instance: Some(id.to_string()),
+                coordinator: self.coordinator(id),
+                instance_max_usd: instance_cap,
+                coordination: None,
+            };
+            // Route through the same fleet-WIP admission/retry path as
+            // `Step::Spawn` (TKT-01M036NWE1EW5B1PWSHK0MKX8E rework 2): a
+            // refusal here retries under poll rather than erroring the whole
+            // fan-out, and the ticket claimed above simply sits `in_progress`
+            // across the wait — it is not released and cannot be double-claimed
+            // by a concurrent drain in the meantime.
+            self.await_fleet_capacity(id).await;
+            let record = loop {
+                match self.spawn_agent(params.clone(), self.fleet_wip_cap).await {
+                    Ok(record) => break record,
+                    Err(e) if is_fleet_wip_refusal(&e) => {
+                        self.update(id, |i| i.awaiting = Some("fleet_wip".to_string()));
+                        tokio::time::sleep(FLEET_CAPACITY_POLL).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            self.update(id, |i| i.awaiting = None);
             fanned.push(FannedAgent {
                 agent: record.name.clone(),
                 branch: record.branch.clone(),

@@ -129,6 +129,13 @@ pub struct Reactor {
     layout: Layout,
     config: ReactorConfig,
     cursor_file: PathBuf,
+    /// Durable counter backing [`next_queue_seq`](Self::next_queue_seq): unlike
+    /// a queued fire's `RecordId`, whose same-millisecond suffix is random,
+    /// this assigns strictly increasing enqueue order so `drain_queued_fires`
+    /// can guarantee FIFO. Persisted (not in-memory like `fires`) because the
+    /// queue itself is durable `Furniture` that can outlive a restart.
+    queue_seq_file: PathBuf,
+    queue_seq: Mutex<Option<u64>>,
     /// Per-trigger fire timestamps for the rolling rate cap. In-memory: a storm
     /// is a live-daemon phenomenon, and a restart legitimately resets the window.
     fires: Mutex<HashMap<String, Vec<Instant>>>,
@@ -155,6 +162,7 @@ impl Reactor {
         config: ReactorConfig,
     ) -> Self {
         let cursor_file = layout.home().join("reactor-cursor");
+        let queue_seq_file = layout.home().join("reactor-queue-seq");
         Self {
             space,
             engine,
@@ -163,6 +171,8 @@ impl Reactor {
             layout,
             config,
             cursor_file,
+            queue_seq_file,
+            queue_seq: Mutex::new(None),
             fires: Mutex::new(HashMap::new()),
             trigger_cache: Mutex::new(None),
             last_pops: Mutex::new(None),
@@ -927,6 +937,7 @@ impl Reactor {
         params: &HashMap<String, Value>,
         tuple_id: &str,
     ) -> rk_core::Result<()> {
+        let seq = self.next_queue_seq()?;
         let queued = Tuple::new(
             Category::Event,
             SYSTEM_SCOPE,
@@ -940,6 +951,7 @@ impl Reactor {
                 "repo_path": repo_path,
                 "params": params,
                 "tuple": tuple_id,
+                "seq": seq,
             }),
         )
         .with_lifecycle(Lifecycle::Furniture);
@@ -965,6 +977,14 @@ impl Reactor {
                 if self.engine.live_count_for_trigger(&trigger.name) >= cap {
                     break;
                 }
+                // The rolling rate cap applies to draining exactly as it does
+                // to an immediate fire (`try_fire`'s own `rate_limited` check):
+                // without this, a backlog built up while `maxInFlight` held
+                // could drain past `maxFires` in one window the moment a slot
+                // frees. Stop here and let the remainder wait for next cycle.
+                if self.rate_limited(trigger) {
+                    break;
+                }
                 let mut pending = match self.space.scan(
                     &Pattern::category(Category::Event)
                         .scope(SYSTEM_SCOPE)
@@ -979,7 +999,16 @@ impl Reactor {
                 pending.retain(|t| {
                     t.payload.get("trigger").and_then(Value::as_str) == Some(trigger.name.as_str())
                 });
-                pending.sort_by_key(|t| t.id);
+                // Order by the durable enqueue sequence, not `t.id`: a
+                // `RecordId`'s same-millisecond suffix is random, so two fires
+                // queued in the same millisecond would otherwise dispatch in
+                // an arbitrary order. Entries queued before this sequence
+                // existed default to 0 and naturally sort first, ahead of any
+                // freshly-numbered entry.
+                pending.sort_by_key(|t| {
+                    let seq = t.payload.get("seq").and_then(Value::as_u64).unwrap_or(0);
+                    (seq, t.id)
+                });
                 let Some(next) = pending.into_iter().next() else {
                     break;
                 };
@@ -1946,6 +1975,26 @@ impl Reactor {
     fn save_cursor(&self, sequence: u64) -> rk_core::Result<()> {
         std::fs::write(&self.cursor_file, sequence.to_string())?;
         Ok(())
+    }
+
+    /// Next value in the durable enqueue-order counter (see `queue_seq_file`
+    /// on the struct). Loaded from disk lazily on first use per process, then
+    /// cached and persisted forward on every call so a restart resumes above
+    /// the highest sequence ever assigned rather than reusing a low value that
+    /// would sort ahead of older, still-pending queue entries.
+    fn next_queue_seq(&self) -> rk_core::Result<u64> {
+        let mut cached = self.queue_seq.lock().unwrap_or_else(|p| p.into_inner());
+        let current = match *cached {
+            Some(v) => v,
+            None => std::fs::read_to_string(&self.queue_seq_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0),
+        };
+        let next = current + 1;
+        std::fs::write(&self.queue_seq_file, next.to_string())?;
+        *cached = Some(next);
+        Ok(next)
     }
 }
 

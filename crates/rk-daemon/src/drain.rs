@@ -46,6 +46,7 @@
 use crate::repos::RepoRegistry;
 use crate::supervisor::{SpawnParams, Supervisor};
 use crate::tickets::Tickets;
+use crate::workflow_exec::is_fleet_wip_refusal;
 use chrono::{DateTime, Utc};
 use rk_core::config::DrainConfig;
 use rk_core::paths::Layout;
@@ -239,12 +240,28 @@ impl Drain {
                     // same repo respects its per-repo cap within this cycle.
                     *live_by_repo.entry(ticket.scope.clone()).or_insert(0) += 1;
                 }
+                Err(e) if is_fleet_wip_refusal(&e) => {
+                    // Transient: the fleet-WIP ceiling had no free slot at the
+                    // moment `Supervisor::spawn` atomically checked (our own
+                    // `slots`/`held` count above is only a cycle-start
+                    // estimate, raced by a concurrent admitter). The ticket is
+                    // ready work, not broken work — reopening it (rather than
+                    // leaving it stranded `in_progress` forever) lets the next
+                    // cycle, or another admitter with a free slot, pick it back
+                    // up instead of losing it silently.
+                    if let Err(reopen_err) = self.tickets.reopen(&ticket.identity, "open").await {
+                        warn!(ticket = %ticket.identity, error = %reopen_err, "drain: failed to reopen ticket after fleet-wip refusal; ticket left in_progress");
+                    }
+                    info!(ticket = %ticket.identity, "drain spawn refused by fleet-wip cap; ticket reopened, stopping cycle");
+                    break;
+                }
                 Err(e) => {
-                    // The authoritative in-spawn budget guard (or a transient git
-                    // failure) refused this dispatch after we claimed the ticket.
-                    // Leave it `in_progress` (parity with fan-out's documented
-                    // claimed-then-refused semantics) and stop this cycle: a hit
-                    // cap will refuse every remaining candidate too.
+                    // The authoritative in-spawn budget guard (or a non-transient
+                    // failure like an unresolvable repo/harness) refused this
+                    // dispatch after we claimed the ticket. Leave it `in_progress`
+                    // — retrying it automatically could spin on a config error —
+                    // and stop this cycle: a hit cap will refuse every remaining
+                    // candidate too.
                     warn!(ticket = %ticket.identity, error = %e, "drain spawn refused; stopping cycle");
                     break;
                 }
