@@ -37,6 +37,17 @@ The other recent failures are deliberately not folded into this proposal:
 - The live obstacle and need scans were empty. The merge collision is the
   concrete recurring signal from the drain itself.
 
+## Current recurrence
+
+The same boundary recurred in nightly instance `wf-8twfp9c411` on
+2026-08-15. `Scamper-5` completed its ticket, but the `dismiss_all` hand-off
+failed while merging `rat/scamper-5/tkt-01m00ss4wefy0bbt9tzh3mf9gj` because
+`crates/rk-cli/tests/workflow_run_approval.rs` conflicted with another drain
+branch (`agent_dismissed` event `01M01QDR0D380ZKQTYHDQZ90S6`). This is the same
+parallel-drain ownership failure, with a newly observed shared test path; it
+does not justify a second proposal or convention ballot. The existing ticket
+`TKT-01KZ3ZA4NM3DGKPEG28VMZANPD` remains the hand-off for the prompt change.
+
 ## Root cause in the prompt
 
 The current coordination fragment says to scan peer claims and artifacts,
