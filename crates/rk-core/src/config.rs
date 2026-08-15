@@ -288,6 +288,17 @@ pub struct SupervisorConfig {
     /// A live rat whose last event (usage/started) is older than this is STUCK.
     /// Zero disables stuck detection. Kept generous: a soft steer fires first,
     /// so a legitimately-slow silent step (compile/test) is nudged, not killed.
+    ///
+    /// INVARIANT (order-your-timers-below-workflow-waits): must stay
+    /// comfortably below any workflow's `wait` timeout that blocks on this
+    /// rat's completion — e.g. the steward workflow's `reviewTimeout`
+    /// (examples/workflows/steward.cue, default 15m). If this value is >= that
+    /// timeout, the workflow gives up and hard-fails the wait before the sweep
+    /// has even flagged the rat as stuck, so the soft steer below never gets a
+    /// chance to nudge it back to a clean `rk done`. See
+    /// [`STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS`] and
+    /// `SupervisorConfig::review_timeout_warning`, which checks this
+    /// invariant at daemon startup.
     pub stuck_after_secs: u64,
     /// Sustained burn (USD/minute across sweeps) above this is RUNNING AWAY.
     /// Zero disables burn detection (off by default — it needs per-harness and
@@ -318,13 +329,50 @@ impl Default for SupervisorConfig {
         Self {
             enabled: true,
             interval_secs: 60,
-            stuck_after_secs: 900,
+            // 10m: comfortably below STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS (15m) —
+            // see the invariant on `stuck_after_secs` above.
+            stuck_after_secs: 600,
             burn_usd_per_min: 0.0,
             kill_grace_secs: 600,
             respawn_enabled: false,
             respawn_max_attempts: 3,
             respawn_backoff_secs: 60,
         }
+    }
+}
+
+/// The steward workflow's shipped default `reviewTimeout`
+/// (examples/workflows/steward.cue: `reviewTimeout: {..., default: "15m"}`).
+/// Duplicated here (rather than parsed from the `.cue` source) because
+/// rk-core does not depend on rk-workflow/CUE — kept in sync by hand, cross-
+/// referenced from both sides. See the invariant on
+/// [`SupervisorConfig::stuck_after_secs`] and `SupervisorConfig::review_timeout_warning`.
+pub const STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 15 * 60;
+
+impl SupervisorConfig {
+    /// Structural check for the order-your-timers-below-workflow-waits
+    /// invariant: a stuck rat must be flagged (and soft-steered) well before
+    /// a workflow's `wait` on that rat's completion gives up, or the steer
+    /// never gets a chance to work. Returns a warning message when
+    /// `stuck_after_secs` is not safely below the steward's shipped
+    /// `reviewTimeout` default; `None` when stuck detection is off (0) or the
+    /// ordering is safe.
+    pub fn review_timeout_warning(&self) -> Option<String> {
+        if self.stuck_after_secs == 0 {
+            return None;
+        }
+        if self.stuck_after_secs >= STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS {
+            return Some(format!(
+                "supervisor.stuck_after_secs ({}s) >= the steward workflow's shipped \
+                 reviewTimeout default ({}s): a waiting steward review will hard-fail \
+                 before the stuck sweep ever flags the rat, so its soft steer never gets \
+                 a chance to help. Lower supervisor.stuck_after_secs or raise the \
+                 deployed steward's reviewTimeout so the sweep gets a real intervention \
+                 window.",
+                self.stuck_after_secs, STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS
+            ));
+        }
+        None
     }
 }
 
@@ -617,6 +665,43 @@ mod tests {
         assert_eq!(cfg, Config::default());
         assert_eq!(cfg.harness.default, "claude");
         assert_eq!(cfg.policy.automated_landing_workflows, ["steward"]);
+    }
+
+    #[test]
+    fn default_stuck_after_secs_stays_below_shipped_review_timeout() {
+        // The coincidence this guards: both timers defaulted to 900s (15m),
+        // so a stuck reviewer's soft steer never got a window to run before
+        // the steward's own wait gave up.
+        let cfg = SupervisorConfig::default();
+        assert!(
+            cfg.stuck_after_secs < STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS,
+            "stuck_after_secs ({}) must stay below the steward's shipped \
+             reviewTimeout ({}) so the sweep gets an intervention window",
+            cfg.stuck_after_secs,
+            STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS
+        );
+        assert!(cfg.review_timeout_warning().is_none());
+    }
+
+    #[test]
+    fn review_timeout_warning_fires_when_stuck_after_secs_catches_up() {
+        let mut cfg = SupervisorConfig {
+            stuck_after_secs: STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS,
+            ..SupervisorConfig::default()
+        };
+        assert!(cfg.review_timeout_warning().is_some());
+
+        cfg.stuck_after_secs = STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS + 1;
+        assert!(cfg.review_timeout_warning().is_some());
+    }
+
+    #[test]
+    fn review_timeout_warning_silent_when_stuck_detection_disabled() {
+        let cfg = SupervisorConfig {
+            stuck_after_secs: 0,
+            ..SupervisorConfig::default()
+        };
+        assert!(cfg.review_timeout_warning().is_none());
     }
 
     #[test]

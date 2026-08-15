@@ -236,6 +236,9 @@ impl Daemon {
         daemon.reactor_config = config.reactor.clone();
         daemon.scheduler_config = config.scheduler.clone();
         daemon.sweep_config = config.supervisor.clone();
+        if let Some(msg) = daemon.sweep_config.review_timeout_warning() {
+            warn!(%msg, "supervisor config: stuck-sweep/review-timeout ordering invariant violated");
+        }
         daemon.review_sweep_config = config.review_sweep.clone();
         daemon.drain_config = config.drain.clone();
         daemon.evaporation_decay = config.evaporation.decay;

@@ -105,6 +105,17 @@ workflow: {
 		// tune per repo. A hold is not a reject: the operator merges by hand.
 		maxDiffFiles: {type: "int", required: false, default: 50}
 		maxDiffLines: {type: "int", required: false, default: 2000}
+		// INVARIANT (order-your-timers-below-workflow-waits): must stay
+		// comfortably ABOVE the daemon's `supervisor.stuck_after_secs` (default
+		// 10m, crates/rk-core/src/config.rs — see the doc comment on
+		// `SupervisorConfig::stuck_after_secs`, which cross-references this
+		// field). If a wait here times out at or before the sweep flags the
+		// reviewer as stuck, the review hard-fails before the sweep's soft
+		// steer ("still working? wrap up") ever gets a chance to nudge it back
+		// to a clean `rk done` — the sweep and this wait raced by coincidence
+		// once when both were 15m. `SupervisorConfig::review_timeout_warning`
+		// checks this pairing (against this shipped default) at daemon
+		// startup; re-check it by hand if you tune this value per repo.
 		reviewTimeout: {type: "string", required: false, default: "15m"}
 		// RUN-GATE BUDGET (TKT-169). The steward re-runs `check` in the
 		// reviewer's OWN worktree, which is a cold checkout: no warm build
