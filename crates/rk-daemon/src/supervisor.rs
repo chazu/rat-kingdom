@@ -1487,17 +1487,32 @@ impl Supervisor {
     /// as a "Standing conventions" section (stigmergy P6) so a quorum-promoted
     /// norm actually changes what the rat does. Scan/parse failures degrade to
     /// no conventions — priming must never fail on a convention read.
+    ///
+    /// Conventions carrying the same name (the text before the first `:`) are
+    /// SUPERSEDED newest-wins within a scope. Convention tuples are Furniture:
+    /// they cannot be edited or destructively taken, so refreshing a stale norm
+    /// works by minting a newer tuple under the same name (quorum re-promotion
+    /// or an operator refresh). Without this, a refreshed norm would inject
+    /// BOTH texts and hand every rat a contradiction — exactly the drift that
+    /// let `prove-your-tools-on-entry` keep ordering entry STOPs after the
+    /// shipped prompt policy moved on (docs/proposals/prompts/0019).
     fn scan_conventions(&self, repo: &str) -> Vec<String> {
         let mut texts = Vec::new();
         for scope in [SYSTEM_SCOPE, repo] {
             let pattern = Pattern::category(Category::Convention).scope(scope);
             match self.space.scan(&pattern) {
                 Ok(tuples) => {
-                    for t in tuples {
-                        if let Some(text) = t.payload.get("text").and_then(|v| v.as_str()) {
-                            texts.push(text.to_string());
-                        }
-                    }
+                    texts.extend(supersede_conventions_newest_wins(
+                        tuples
+                            .iter()
+                            .filter_map(|t| {
+                                t.payload
+                                    .get("text")
+                                    .and_then(|v| v.as_str())
+                                    .map(|text| (t.id.to_string(), text.to_string()))
+                            })
+                            .collect(),
+                    ));
                 }
                 Err(e) => warn!(error = %e, scope, "failed to scan conventions for priming"),
             }
@@ -3706,6 +3721,86 @@ fn process_info(pid: u32) -> Option<ProcessInfo> {
         process_group: (process_group > 0).then_some(process_group as u32),
         cwd: None,
     })
+}
+
+/// Newest-wins supersession for convention texts within one scope. `entries`
+/// are `(tuple_id, text)` pairs; tuple ids are ULIDs, so lexicographic order
+/// is creation order. The name key is the text up to the first `:` (trimmed);
+/// a text without a name prefix stands alone under its full text. Output keeps
+/// first-seen name order so prompt rendering stays stable across refreshes.
+fn supersede_conventions_newest_wins(entries: Vec<(String, String)>) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut best: HashMap<String, (String, String)> = HashMap::new();
+    for (id, text) in entries {
+        let key = text
+            .split_once(':')
+            .map(|(name, _)| name.trim().to_string())
+            .unwrap_or_else(|| text.clone());
+        match best.get(&key) {
+            Some((existing_id, _)) if *existing_id >= id => {}
+            existing => {
+                if existing.is_none() {
+                    order.push(key.clone());
+                }
+                best.insert(key, (id, text));
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|key| best.remove(&key).map(|(_, text)| text))
+        .collect()
+}
+
+#[cfg(test)]
+mod convention_supersession_tests {
+    use super::supersede_conventions_newest_wins;
+
+    /// A refreshed norm must replace its predecessor in the injected prompt,
+    /// never coexist with it: Furniture convention tuples cannot be edited or
+    /// taken, so a stale `prove-your-tools-on-entry` alongside its refresh
+    /// would hand every rat two contradictory entry instructions.
+    #[test]
+    fn newer_same_name_convention_supersedes_older() {
+        let injected = supersede_conventions_newest_wins(vec![
+            (
+                "01KYQRN6MWP7Q5CP7CD4891PYB".into(),
+                "prove-your-tools-on-entry: STOP immediately".into(),
+            ),
+            (
+                "01M02ZZZZZZZZZZZZZZZZZZZZZ".into(),
+                "prove-your-tools-on-entry: report and proceed".into(),
+            ),
+            ("01KY00000000000000000000AA".into(), "unrelated: keep me".into()),
+        ]);
+        assert_eq!(
+            injected,
+            vec![
+                "prove-your-tools-on-entry: report and proceed".to_string(),
+                "unrelated: keep me".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn order_is_stable_and_unnamed_texts_stand_alone() {
+        let injected = supersede_conventions_newest_wins(vec![
+            ("01A".into(), "no name prefix here".into()),
+            ("01B".into(), "b-norm: first".into()),
+            // Arrival order does not matter — ids decide.
+            ("01C".into(), "b-norm: second".into()),
+            ("01B2".into(), "no name prefix here".into()),
+            ("01D".into(), "another bare text".into()),
+        ]);
+        assert_eq!(
+            injected,
+            vec![
+                "no name prefix here".to_string(),
+                "b-norm: second".to_string(),
+                "another bare text".to_string(),
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
