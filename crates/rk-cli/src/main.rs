@@ -887,13 +887,27 @@ async fn main() -> Result<()> {
                                 Some(_) => format!("{}*", i["status"].as_str().unwrap_or("?")),
                                 None => i["status"].as_str().unwrap_or("?").to_string(),
                             };
+                            // A `target` param other than "main" means this
+                            // instance is landing somewhere non-default — most
+                            // commonly a steward inheriting a chained/rework
+                            // rat's own --base (docs/reactor.md, "Land target
+                            // inheritance"). Flag it so it isn't mistaken for a
+                            // run headed to main.
+                            let target = i["params"]["target"].as_str();
+                            let target_suffix = match target {
+                                Some(t) if !t.is_empty() && t != "main" => {
+                                    format!(" target={t}")
+                                }
+                                _ => String::new(),
+                            };
                             println!(
-                                "{:14} {:12} {:10} step {}/{}",
+                                "{:14} {:12} {:10} step {}/{}{}",
                                 i["id"].as_str().unwrap_or("?"),
                                 i["workflow"].as_str().unwrap_or("?"),
                                 status,
                                 i["current_step"],
                                 i["total_steps"],
+                                target_suffix,
                             );
                         }
                         if instances.iter().any(|i| !i["archived_at"].is_null()) {

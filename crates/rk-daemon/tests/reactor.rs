@@ -957,6 +957,96 @@ async fn steward_trigger_fires_on_rat_completion_not_reviewer() {
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
+/// A completion tuple carrying a non-`main` `target` (the shipped steward
+/// trigger pins `target: "{{tuple.payload.target}}"`, so a rework/chained rat's
+/// own `--base` flows straight through) must produce a visible
+/// `reactor_non_main_land_target` event — the land target is otherwise
+/// indistinguishable from an ordinary run to `main` in `rk workflow list`. A
+/// completion whose target IS `main` must not produce that event at all.
+#[tokio::test]
+async fn non_main_land_target_is_reported_main_is_not() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+
+    // Same shape as the shipped steward trigger: `target` is pinned straight
+    // from the completion tuple's payload, not the workflow's own default.
+    let dir = layout.triggers_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("steward.cue"),
+        r#"triggers: [{name: "steward-on-completion", match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}, run: "react-work", repo: "myrepo", params: {target: "{{tuple.payload.target}}", branch: "{{tuple.payload.branch}}"}}]"#,
+    )
+    .unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+
+    // A rework rat completed chained onto a feature branch: its own `--base`
+    // (not "main") is what the completed rat's harness_result carries as
+    // `target` (supervisor.rs `record.target_branch`).
+    space
+        .out(Tuple::new(
+            Category::Event,
+            "myrepo",
+            "harness_result",
+            "test-castle",
+            json!({
+                "agent": "basil-4",
+                "role": "rat",
+                "branch": "rat/basil-4/rework",
+                "target": "rat/camembert-4/tkt-9",
+            }),
+        ))
+        .unwrap();
+    assert_eq!(reactor.run_cycle().unwrap(), 1);
+
+    let events = space
+        .scan(&Pattern::category(Category::Event).identity("reactor_non_main_land_target"))
+        .unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "a non-main target must produce exactly one visibility event"
+    );
+    assert_eq!(events[0].scope, "myrepo");
+    assert_eq!(events[0].instance, "reactor");
+    assert_eq!(events[0].payload["target"], "rat/camembert-4/tkt-9");
+    assert_eq!(events[0].payload["branch"], "rat/basil-4/rework");
+    assert_eq!(events[0].payload["trigger"], "steward-on-completion");
+
+    // An ordinary completion landing on "main" must NOT produce the event.
+    space
+        .out(Tuple::new(
+            Category::Event,
+            "myrepo",
+            "harness_result",
+            "test-castle",
+            json!({
+                "agent": "basil-5",
+                "role": "rat",
+                "branch": "rat/basil-5/work",
+                "target": "main",
+            }),
+        ))
+        .unwrap();
+    assert_eq!(reactor.run_cycle().unwrap(), 1);
+    let events = space
+        .scan(&Pattern::category(Category::Event).identity("reactor_non_main_land_target"))
+        .unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "a target of \"main\" must not add a second visibility event"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
 /// Full path over the wire: suggestion + three distinct endorsers land via
 /// `space.out`; the live daemon's reactor loop promotes a convention on its own.
 #[tokio::test]
