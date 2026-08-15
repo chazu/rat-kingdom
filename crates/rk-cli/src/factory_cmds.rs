@@ -844,7 +844,7 @@ fn render_dashboard(
     writeln!(
         out,
         "- State: **{}**\n",
-        if resyncing { "RESYNC REQUIRED" } else { "OK" }
+        if resyncing { "RESYNCING" } else { "OK" }
     )
     .unwrap();
 
@@ -1494,6 +1494,33 @@ mod tests {
         let markdown = render_dashboard(&snapshot, &replay, Some("rat-kingdom"), 20, 20);
 
         assert!(markdown.find("first").unwrap() < markdown.find("second").unwrap(), "{markdown}");
+    }
+
+    #[test]
+    fn dashboard_renders_resyncing_only_for_an_active_repo_resync() {
+        let snapshot = |required| {
+            json!({
+                "cursor": 12,
+                "snapshot": {
+                    "agents": [],
+                    "workflows": [],
+                    "tickets": [],
+                    "inbox": [],
+                    "budget": {},
+                    "approvals": {"proposals": [], "grants": []},
+                    "repo_resync": {"required": required}
+                }
+            })
+        };
+        let replay = json!({"events": [], "truncated": false});
+
+        let idle = render_dashboard(&snapshot(false), &replay, Some("rat-kingdom"), 20, 20);
+        assert!(idle.contains("- State: **OK**"), "{idle}");
+        assert!(!idle.contains("RESYNCING"), "{idle}");
+
+        let active = render_dashboard(&snapshot(true), &replay, Some("rat-kingdom"), 20, 20);
+        assert!(active.contains("- State: **RESYNCING**"), "{active}");
+        assert!(!active.contains("RESYNC REQUIRED"), "{active}");
     }
 
     #[test]

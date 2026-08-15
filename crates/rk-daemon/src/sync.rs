@@ -14,6 +14,7 @@ use rk_space::Space;
 use rk_sync::{NotesSync, SyncOp};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -25,6 +26,15 @@ pub struct Syncer {
     castle: String,
     remote_configured: bool,
     cycle_lock: Mutex<()>,
+    running: AtomicBool,
+}
+
+struct RunningGuard<'a>(&'a AtomicBool);
+
+impl Drop for RunningGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -102,6 +112,7 @@ impl Syncer {
             castle: castle.to_string(),
             remote_configured,
             cycle_lock: Mutex::new(()),
+            running: AtomicBool::new(false),
         })
     }
 
@@ -129,6 +140,8 @@ impl Syncer {
     /// once imported, so losing the presence snapshot cannot resurrect it.
     pub fn run_cycle(&self, space: &Space) -> rk_core::Result<CycleStats> {
         let _cycle = self.cycle_lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.running.store(true, Ordering::Release);
+        let _running = RunningGuard(&self.running);
         let cursor = self.load_cursor(space)?.unwrap_or(0);
         let delta = space.persistence_delta(Some(cursor))?;
         let all = space.scan(&Pattern::default())?;
@@ -290,6 +303,18 @@ impl Syncer {
     /// from its Ed25519 public key.
     pub fn actor(&self) -> &str {
         self.notes.actor()
+    }
+
+    /// Whether a repository sync cycle is currently holding the cycle lock.
+    /// Snapshot readers use this to report active repository resync without
+    /// confusing a consumer's bounded event replay with daemon state.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_running_for_test(&self, running: bool) {
+        self.running.store(running, Ordering::Release);
     }
 
     fn load_cursor(&self, space: &Space) -> rk_core::Result<Option<u64>> {

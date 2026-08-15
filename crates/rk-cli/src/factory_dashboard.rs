@@ -232,7 +232,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let state = if let Some(error) = &app.refresh_error {
         Span::styled(format!("REFRESH ERROR: {error}"), Style::default().fg(Color::Red))
     } else if resync {
-        Span::styled("RESYNC REQUIRED", Style::default().fg(Color::Yellow))
+        Span::styled("RESYNCING", Style::default().fg(Color::Yellow))
     } else {
         Span::styled("LIVE", Style::default().fg(Color::Green))
     };

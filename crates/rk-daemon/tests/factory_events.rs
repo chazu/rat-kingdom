@@ -152,20 +152,28 @@ async fn test_factory_snapshot_contains_agents_workflows_tickets_inbox_budget_ap
 }
 
 #[tokio::test]
-async fn test_factory_snapshot_marks_repo_resync_when_event_replay_is_truncated() {
+async fn test_factory_snapshot_idle_with_long_history_does_not_require_repo_resync() {
     let (_home, _repo, _layout, handle, mut client) = setup().await;
-    propose_for(&mut client, "repo-a", "coord-a", "one").await;
-    propose_for(&mut client, "repo-a", "coord-a", "two").await;
+    for sequence in 0..=rk_daemon::factory_events::MAX_LIMIT {
+        propose_for(
+            &mut client,
+            "repo-a",
+            "coord-a",
+            &format!("history-{sequence}"),
+        )
+        .await;
+    }
 
     let snapshot = client
-        .call("factory.snapshot", json!({"repo":"repo-a", "limit":1}))
+        .call("factory.snapshot", json!({"repo":"repo-a"}))
         .await
         .unwrap();
-    assert_eq!(snapshot["snapshot"]["repo_resync"]["required"], true);
-    assert_eq!(
-        snapshot["snapshot"]["repo_resync"]["cursor"],
-        snapshot["cursor"]
-    );
+    let replay = client
+        .call("factory.events.replay", json!({"repo":"repo-a"}))
+        .await
+        .unwrap();
+    assert_eq!(replay["truncated"], true);
+    assert_eq!(snapshot["snapshot"]["repo_resync"]["required"], false);
     client.call("stop", json!({})).await.unwrap();
     handle.await.unwrap().unwrap();
 }
