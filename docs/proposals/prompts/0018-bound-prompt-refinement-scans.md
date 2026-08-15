@@ -32,29 +32,59 @@ The task names `workflow_failed` but omits the CLI's bounded search controls
 connection failure. It therefore conflates “the command returned some tuples”
 with “the relevant failure corpus was read.”
 
+## Bounded query plan
+
+The landed prompt should prescribe a fixed order of bounded, non-blocking
+queries. Scope and rank first; use identities only after the first result set
+has supplied a candidate failure or run id:
+
+```text
+rk scan obstacle $RK_REPO --hot --top 25
+rk scan need $RK_REPO --hot --top 25
+rk scan fact system --hot --top 25
+rk scan event $RK_REPO --search workflow_failed --hot --top 50
+rk scan artifact $RK_REPO --search <run-id> --hot --top 10
+rk scan fact $RK_REPO --search <run-id> --hot --top 10
+rk scan event $RK_REPO --search <run-id> --hot --top 10
+```
+
+The first three queries establish the scope-first context. The bounded
+`workflow_failed` query supplies candidates; the durable artifact/fact
+lookups then narrow evidence by candidate id before the final event lookup.
+When no run id is available, retain the category-level bound and record that
+the narrowing step was unavailable rather than widening the scan.
+
+For every query, the handoff artifact should record
+`category`, `scope`, `search` (or `none`), `hot`, `top`, result count, and
+`complete`. A truncation notice or closed connection sets `complete: false`
+and includes the command/error; it is a read-boundary ticket or obstacle, not
+evidence of an exhaustive corpus.
+
 ## Proposed diff
 
 ```diff
 --- a/examples/workflows/prompt-refine.cue
 +++ b/examples/workflows/prompt-refine.cue
 @@
-                    Cross-reference with recent workflow_failed events.
-+                   Use bounded, reproducible queries: start with the repo scope and
-+                   `rk scan event $RK_REPO --search workflow_failed --hot --top 50`,
-+                   then follow the returned instance/run ids with narrower
-+                   `--search` queries. Use `--top` for artifact and fact lookups too;
-+                   do not treat an unbounded scan, a truncation notice, or a closed
-+                   connection as an exhaustive read. Record the query scope and
-+                   limits in the handoff artifact; if a required scan remains
-+                   incomplete, file a ticket/obstacle for the read boundary and do
-+                   not claim that the feed was fully mined.
-                    Where a recurring failure traces to a weak role prompt or a missing
+                   Cross-reference with recent workflow_failed events.
++                    Start with bounded, scope-first `--hot --top` scans of repo
++                    obstacles/needs and system facts. Search event for
++                    `workflow_failed` with `--search workflow_failed --hot --top 50`,
++                    then narrow by each returned run id through bounded artifact
++                    and fact searches before a final event lookup. Record
++                    category, scope, search, hot, top, result count, and complete
++                    for every query. An unbounded scan, truncation notice, or
++                    closed connection is an incomplete read: record the command
++                    and error, file a ticket/obstacle for the read boundary, and
++                    do not claim that the feed was fully mined.
+                   Where a recurring failure traces to a weak role prompt or a missing
 ```
 
 Apply the same clarification to the identical task description in
-`examples/workflows/nightly-self-improve.cue`. The query example is guidance,
-not a claim that 50 is a universal corpus size; the rat may choose a smaller
-or larger bound and must record it.
+`examples/workflows/nightly-self-improve.cue`. The values above are the
+proposal's recorded default limits, not a claim that 50 is a universal corpus
+size; a rat may choose a smaller bound, but must record any changed limit and
+the resulting completeness state.
 
 ## Why this is safe
 
