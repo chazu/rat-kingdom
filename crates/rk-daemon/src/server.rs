@@ -928,12 +928,40 @@ impl Daemon {
     }
 
     fn authorized(&self, req: &Request, origin: &PeerOrigin) -> bool {
+        let (allowed, reason) = self.authorize_reasoned(req, origin);
+        if !allowed {
+            // Server-side only: the wire response stays the generic
+            // "forbidden: <caller> is not authorized for <method>" message
+            // (see the dispatch loop above), so this does not hand a
+            // misconfigured or malicious caller a signal about which check
+            // rejected it. TKT-01M01EYN0132N30BWP8BXHXDR6: every arm used to
+            // collapse into that one generic message, which made diagnosing
+            // caller-side credential loss (e.g. a sandboxed harness stripping
+            // RK_AUTH_TOKEN) guesswork from the daemon side.
+            debug!(
+                caller = %req.caller,
+                method = %req.method,
+                reason,
+                "authorization denied"
+            );
+        }
+        allowed
+    }
+
+    /// Same decision as `authorized`, paired with a short, non-sensitive tag
+    /// naming which check failed (never a token or credential value).
+    fn authorize_reasoned(&self, req: &Request, origin: &PeerOrigin) -> (bool, &'static str) {
         if req
             .caller
             .starts_with(crate::ingest_auth::SOURCE_CALLER_PREFIX)
         {
-            return self.ingest_principal(req).is_some()
-                && matches!(req.method.as_str(), "ingest.event" | "ingest.state");
+            return if self.ingest_principal(req).is_some()
+                && matches!(req.method.as_str(), "ingest.event" | "ingest.state")
+            {
+                (true, "")
+            } else {
+                (false, "ingest_principal_or_method")
+            };
         }
         let operator = req.caller == "operator" || req.caller.is_empty();
         // The bearer root token alone is not operator authority. A local
@@ -942,26 +970,30 @@ impl Daemon {
         // closes both `env -u RK_AGENT -u RK_AUTH_TOKEN rk ...` and
         // cross-agent token derivation from the same-user root credential.
         if !origin.pid_observed && operator {
-            return false;
+            return (false, "operator_without_observed_pid");
         }
         if !origin.supervised_agents.is_empty()
             && (origin.supervised_agents.len() != 1
                 || !origin.supervised_agents.contains(&req.caller))
         {
-            return false;
+            return (false, "supervised_agents_mismatch");
         }
         if operator {
-            return true;
+            return (true, "");
         }
         if req.auth != rk_core::paths::derive_agent_token(&self.auth_token, &req.caller) {
-            return false;
+            return (false, "token_mismatch");
         }
         if let Some(record) = self.supervisor.status(&req.caller) {
             if record.role == crate::onboarding_sessions::ONBOARDER_ROLE {
-                return self.onboarder_authorized(req);
+                return if self.onboarder_authorized(req) {
+                    (true, "")
+                } else {
+                    (false, "onboarder_method_not_allowed")
+                };
             }
             if crate::supervisor::validate_role(&record.role).is_err() {
-                return false;
+                return (false, "invalid_role");
             }
         }
         if !matches!(
@@ -1005,13 +1037,13 @@ impl Daemon {
                 | "ticket.update"
                 | "ticket.dep"
         ) {
-            return true;
+            return (true, "");
         }
 
         // A foreman gets only the child-management subset. Each target is
         // checked again at dispatch time against the structural parent edge;
         // this broad authorization is only the first gate.
-        self.supervisor.is_foreman(&req.caller)
+        let foreman_allowed = self.supervisor.is_foreman(&req.caller)
             && matches!(
                 req.method.as_str(),
                 "agent.spawn"
@@ -1019,7 +1051,15 @@ impl Daemon {
                     | "agent.dismiss"
                     | "agent.interrupt"
                     | "agent.steer"
-            )
+            );
+        (
+            foreman_allowed,
+            if foreman_allowed {
+                ""
+            } else {
+                "operator_only_method"
+            },
+        )
     }
 
     /// Enforced capability profile for the onboarding role. This is
@@ -6344,6 +6384,92 @@ mod display_alias_tests {
                 r.actor
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod authorize_reasoned_tests {
+    //! TKT-01M01EYN0132N30BWP8BXHXDR6: `authorized()` used to collapse every
+    //! rejection into one generic bool, so a caller-side credential problem
+    //! (e.g. a sandboxed harness losing RK_AUTH_TOKEN) was indistinguishable
+    //! server-side from a role or supervision mismatch. These pin the reason
+    //! tag for each arm so a future refactor can't silently re-collapse them.
+    use super::*;
+    use rk_core::config::Config;
+
+    fn test_daemon() -> (tempfile::TempDir, Daemon) {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        let daemon = Daemon::new(layout, &Config::default()).unwrap();
+        (dir, daemon)
+    }
+
+    fn req(caller: &str, method: &str, auth: &str) -> Request {
+        Request {
+            id: "1".into(),
+            method: method.into(),
+            auth: auth.into(),
+            caller: caller.into(),
+            params: Value::Null,
+        }
+    }
+
+    #[test]
+    fn wrong_token_is_tagged_token_mismatch() {
+        let (_dir, daemon) = test_daemon();
+        let request = req("some-rat", "space.scan", "not-the-real-token");
+        let origin = PeerOrigin {
+            pid_observed: true,
+            supervised_agents: Default::default(),
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &origin);
+        assert!(!allowed);
+        assert_eq!(reason, "token_mismatch");
+    }
+
+    #[test]
+    fn operator_claim_without_observed_pid_is_tagged() {
+        let (_dir, daemon) = test_daemon();
+        let request = req("operator", "space.scan", "");
+        let origin = PeerOrigin {
+            pid_observed: false,
+            supervised_agents: Default::default(),
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &origin);
+        assert!(!allowed);
+        assert_eq!(reason, "operator_without_observed_pid");
+    }
+
+    #[test]
+    fn caller_outside_the_supervised_set_is_tagged() {
+        let (_dir, daemon) = test_daemon();
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "some-rat");
+        let request = req("some-rat", "space.scan", &token);
+        let mut supervised = std::collections::HashSet::new();
+        supervised.insert("a-different-rat".to_string());
+        let origin = PeerOrigin {
+            pid_observed: true,
+            supervised_agents: supervised,
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &origin);
+        assert!(!allowed);
+        assert_eq!(reason, "supervised_agents_mismatch");
+    }
+
+    #[test]
+    fn correct_credentials_are_allowed_with_no_reason() {
+        let (_dir, daemon) = test_daemon();
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "some-rat");
+        let request = req("some-rat", "space.scan", &token);
+        let mut supervised = std::collections::HashSet::new();
+        supervised.insert("some-rat".to_string());
+        let origin = PeerOrigin {
+            pid_observed: true,
+            supervised_agents: supervised,
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &origin);
+        assert!(allowed);
+        assert_eq!(reason, "");
     }
 }
 
