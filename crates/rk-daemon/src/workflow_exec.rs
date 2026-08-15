@@ -127,6 +127,30 @@ const TIMEOUT_EXIT: i64 = 124;
 /// a build-lock hold), not to be tuned per workflow.
 const RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
+/// Hard cap on `retryOnFail` — mirrors `#RunStep.retryOnFail` in schema.cue
+/// (`int & >=0 & <=20`). Enforced again here, independent of the schema
+/// bound, so `resolved.retry_on_fail + 1` can never approach u32::MAX
+/// (TKT-01M02QT9KTDY2CN6YJEVP3VCF8): unbounded, that addition panics on
+/// overflow in debug and, wrapped in release, would settle the attempt loop
+/// with zero real attempts.
+const MAX_RETRY_ON_FAIL: u32 = 20;
+
+/// Daemon-side counterpart of the schema.cue `retryOnFail` bound. A raw
+/// negative value never reaches here — `u32` deserialization already refuses
+/// it when a workflow definition is loaded — but an over-cap value up to
+/// `u32::MAX` is a valid `u32` and would otherwise reach
+/// `resolved.retry_on_fail + 1` unbounded. Kept as a free function (no
+/// `&self`) so it is unit-testable without standing up a full
+/// `WorkflowEngine`.
+fn validate_retry_on_fail(value: u32) -> rk_core::Result<()> {
+    if value > MAX_RETRY_ON_FAIL {
+        return Err(rk_core::Error::other(format!(
+            "run step: retryOnFail {value} exceeds cap {MAX_RETRY_ON_FAIL}"
+        )));
+    }
+    Ok(())
+}
+
 /// Bound on the stdout/stderr tail kept in a durable `gate-failure` artifact.
 /// Generous enough to usually catch a cargo test summary's `failures:` list,
 /// bounded so a runaway suite cannot blow up the tuplespace.
@@ -140,8 +164,11 @@ enum RunOutcome {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     },
-    /// The wall-clock bound elapsed and the child was killed. Only ever returned
-    /// under [`OnTimeout::Continue`]; under `Fail` a timeout is an `Err`.
+    /// The wall-clock bound elapsed and the child was killed. Returned
+    /// regardless of [`OnTimeout`] policy — `collect_child_output` only
+    /// collects the outcome; `run_command` is what turns a `Fail`-policy
+    /// timeout into an `Err`, and only after recording gate-failure evidence
+    /// (TKT-01M02QT9KTDY2CN6YJEVP3VCF8).
     TimedOut,
 }
 
@@ -385,8 +412,6 @@ async fn collect_child_output(
     mut child: tokio::process::Child,
     timeout: Duration,
     command: &str,
-    timeout_text: &str,
-    on_timeout: OnTimeout,
 ) -> rk_core::Result<RunOutcome> {
     let stdout = child
         .stdout
@@ -489,9 +514,12 @@ async fn collect_child_output(
                 }
             }
             _ = &mut sleep => {
-                // The child dies here regardless of `on_timeout`: aborting the
-                // wait task drops the `kill_on_drop` child. The only choice is
-                // whether the caller learns about it as an error or a result.
+                // The child dies here unconditionally: aborting the wait task
+                // drops the `kill_on_drop` child. What an `OnTimeout::Fail`
+                // policy does with this — error out, but only after the
+                // caller has had the chance to persist gate-failure evidence —
+                // is the caller's decision, not this function's; it just
+                // reports the outcome (TKT-01M02QT9KTDY2CN6YJEVP3VCF8).
                 if status.is_none() {
                     abort_task(&mut wait_task).await;
                 }
@@ -501,12 +529,7 @@ async fn collect_child_output(
                 if stderr.is_none() {
                     abort_task(&mut stderr_task).await;
                 }
-                return match on_timeout {
-                    OnTimeout::Fail => Err(rk_core::Error::other(format!(
-                        "run step: `{command}` timed out after {timeout_text}"
-                    ))),
-                    OnTimeout::Continue => Ok(RunOutcome::TimedOut),
-                };
+                return Ok(RunOutcome::TimedOut);
             }
         }
     }
@@ -2365,18 +2388,23 @@ impl WorkflowEngine {
         // characterized as flaky for reasons outside the code under test
         // (TKT-01M02AMKD24WZVVMARJPXKYKSW). 0 retries is the historical
         // behaviour: exactly one attempt, no backoff, no history recorded.
-        let attempts = resolved.retry_on_fail + 1;
+        // `resolve_run` already rejects `retry_on_fail > MAX_RETRY_ON_FAIL`, so
+        // this can never actually saturate; `saturating_add` is a second,
+        // independent guarantee that this never panics or wraps even if that
+        // guard is ever loosened.
+        let attempts = resolved.retry_on_fail.saturating_add(1);
         let mut history: Vec<Value> = Vec::new();
         let mut settled: Option<(i64, String, String, bool, &'static str)> = None;
         for attempt in 1..=attempts {
             let outcome = self
                 .spawn_check_child(&command, &dir, &resolved, &agent, run, ctx, timeout)
                 .await?;
-            // A `TimedOut` outcome only reaches here under `onTimeout:
-            // "continue"`; otherwise the timeout already returned an error
-            // above. The captured output is genuinely gone in that case (the
-            // reader tasks are aborted with the child), so stderr carries the
-            // explanation instead of a lie about what the suite printed.
+            // A `TimedOut` outcome reaches here under either `onTimeout`
+            // policy now — `collect_child_output` only reports it, it does not
+            // decide the policy (TKT-01M02QT9KTDY2CN6YJEVP3VCF8). The captured
+            // output is genuinely gone (the reader tasks are aborted with the
+            // child), so stderr carries the explanation instead of a lie about
+            // what the suite printed.
             let (exit, stdout, stderr, timed_out) = match outcome {
                 RunOutcome::Completed {
                     status,
@@ -2408,6 +2436,21 @@ impl WorkflowEngine {
             } else {
                 "fail"
             };
+            // The default `onTimeout: "fail"` policy ends the run immediately
+            // on a timeout — no retry, matching the historical behaviour —
+            // but must still leave the same durable evidence a fail or
+            // retry-exhausted verdict does below. Before this, a timeout on
+            // this (default) path returned an `Err` straight out of
+            // `spawn_check_child` and was never seen here, so
+            // `record_gate_failure` never ran for it
+            // (TKT-01M02QT9KTDY2CN6YJEVP3VCF8).
+            if timed_out && resolved.on_timeout == OnTimeout::Fail {
+                self.record_gate_failure(
+                    id, repo, &agent, &command, exit, verdict, timed_out, &stdout, &stderr,
+                    &history,
+                );
+                return Err(rk_core::Error::other(stderr));
+            }
             if verdict == "pass" || attempt == attempts {
                 settled = Some((exit, stdout, stderr, timed_out, verdict));
                 break;
@@ -2549,14 +2592,7 @@ impl WorkflowEngine {
             rk_core::Error::other(format!("run step: failed to spawn `{command}`: {e}"))
         })?;
 
-        collect_child_output(
-            child,
-            timeout,
-            command,
-            &resolved.timeout,
-            resolved.on_timeout,
-        )
-        .await
+        collect_child_output(child, timeout, command).await
     }
 
     /// Persist a bounded, durable `(artifact, <repo>, gate-failure)` tuple for
@@ -2660,6 +2696,10 @@ impl WorkflowEngine {
         // a blown budget MEANS is the workflow's routing decision, and the
         // routing (`into`/`when`) lives in the workflow too.
         let on_timeout = OnTimeout::parse(&run.on_timeout)?;
+        // Defense-in-depth alongside the schema.cue bound (`retryOnFail: int &
+        // >=0 & <=20`): fail closed rather than let an over-cap value reach
+        // `resolved.retry_on_fail + 1` unbounded (TKT-01M02QT9KTDY2CN6YJEVP3VCF8).
+        validate_retry_on_fail(run.retry_on_fail)?;
         match (&run.command, &run.check) {
             (Some(_), Some(_)) => Err(rk_core::Error::other(
                 "run step: set exactly one of `command` or `check`, not both",
@@ -4365,6 +4405,24 @@ test a::flaky ... FAILED
         assert!(parse_duration("m").is_err());
     }
 
+    // TKT-01M02QT9KTDY2CN6YJEVP3VCF8: `retry_on_fail` is a `u32`, so a
+    // negative-in-source value never reaches this check — it is already
+    // refused by deserialization before a `RunStep` exists. This guard is
+    // for the range deserialization does NOT cover: an in-bounds-for-u32,
+    // over-cap value (including u32::MAX), which would otherwise reach
+    // `resolved.retry_on_fail + 1` in `run_command` unbounded.
+    #[test]
+    fn validate_retry_on_fail_accepts_zero_and_cap() {
+        assert!(validate_retry_on_fail(0).is_ok());
+        assert!(validate_retry_on_fail(MAX_RETRY_ON_FAIL).is_ok());
+    }
+
+    #[test]
+    fn validate_retry_on_fail_rejects_over_cap() {
+        assert!(validate_retry_on_fail(MAX_RETRY_ON_FAIL + 1).is_err());
+        assert!(validate_retry_on_fail(u32::MAX).is_err());
+    }
+
     fn params(pairs: &[(&str, &str)]) -> HashMap<String, Value> {
         pairs
             .iter()
@@ -4501,15 +4559,9 @@ test a::flaky ... FAILED
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let error = collect_child_output(
-            child,
-            Duration::from_secs(2),
-            "yes noisy",
-            "2s",
-            OnTimeout::Fail,
-        )
-        .await
-        .unwrap_err();
+        let error = collect_child_output(child, Duration::from_secs(2), "yes noisy")
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("output exceeds"));
     }
 

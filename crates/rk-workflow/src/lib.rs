@@ -1888,6 +1888,49 @@ workflow: {
         assert!(err.to_string().contains("cue export failed"), "{err}");
     }
 
+    /// TKT-01M02QT9KTDY2CN6YJEVP3VCF8: an oversized `retryOnFail` must be
+    /// rejected at the schema boundary, not reach `resolved.retry_on_fail + 1`
+    /// unbounded in the daemon.
+    #[test]
+    fn retry_on_fail_over_cap_is_rejected() {
+        let bad = r#"
+workflow: {
+    name: "flaky"
+    steps: [{type: "run", command: "cargo test", retryOnFail: 21}]
+}
+"#;
+        let err = load_str(bad, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("cue export failed"), "{err}");
+    }
+
+    /// TKT-01M02QT9KTDY2CN6YJEVP3VCF8: a negative `retryOnFail` must be
+    /// rejected at the schema boundary too, not just by `u32` deserialization
+    /// (which would otherwise be the only thing standing between an authored
+    /// negative and undefined behaviour further down the pipeline).
+    #[test]
+    fn retry_on_fail_negative_is_rejected() {
+        let bad = r#"
+workflow: {
+    name: "flaky"
+    steps: [{type: "run", command: "cargo test", retryOnFail: -1}]
+}
+"#;
+        let err = load_str(bad, &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("cue export failed"), "{err}");
+    }
+
+    #[test]
+    fn retry_on_fail_at_cap_is_accepted() {
+        let source = r#"
+workflow: {
+    name: "flaky"
+    steps: [{type: "run", command: "cargo test", retryOnFail: 20}]
+}
+"#;
+        let wf = load_str(source, &HashMap::new()).unwrap();
+        assert!(matches!(&wf.steps[0], Step::Run(r) if r.retry_on_fail == 20));
+    }
+
     #[test]
     fn unify_concrete_accepts_and_rejects() {
         assert!(unify_concrete(

@@ -822,3 +822,116 @@ async fn run_step_retry_on_fail_recovers_and_records_the_retry() {
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
+
+// spawn → wait → run (sleeps past its 1s timeout, default onTimeout: "fail")
+// → dismiss (never reached).
+const RUN_TIMEOUT_DEFAULT_FAIL_WORKFLOW: &str = r#"
+workflow: {
+    name: "run-timeout-default-fail"
+    params: {taskId: {type: "string", required: true}}
+    agents: {default: {harness: "fake", model: "sonnet"}}
+    steps: [
+        {type: "spawn", role: "rat", task: {title: _input.taskId, description: "do " + _input.taskId}},
+        {type: "wait", timeout: "30s"},
+        {
+            type: "run"
+            command: "sleep 5"
+            timeout: "1s"
+        },
+        {type: "dismiss"},
+    ]
+}
+"#;
+
+/// TKT-01M02QT9KTDY2CN6YJEVP3VCF8: a `run` step that blows its timeout under
+/// the default `onTimeout: "fail"` policy must leave the same durable
+/// gate-failure evidence a non-timeout fail does — not just the composed
+/// instance error. Before this fix, `collect_child_output` returned the
+/// timeout as an `Err` straight out of `spawn_check_child`, before
+/// `run_command`'s loop (where `record_gate_failure` lives) ever saw it, so
+/// this exact path left no artifact.
+#[tokio::test]
+async fn run_step_default_timeout_persists_a_durable_gate_failure_artifact() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    git(repo_dir.path(), &["init", "-b", "main"]);
+    git(repo_dir.path(), &["config", "user.email", "r@x"]);
+    git(repo_dir.path(), &["config", "user.name", "R"]);
+    std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
+    git(repo_dir.path(), &["add", "."]);
+    git(repo_dir.path(), &["commit", "-m", "init"]);
+
+    let wf_dir = repo_dir.path().join(".rk").join("workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(
+        wf_dir.join("run-timeout-default-fail.cue"),
+        RUN_TIMEOUT_DEFAULT_FAIL_WORKFLOW,
+    )
+    .unwrap();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
+    std::env::set_var("RK_MODEL_MARKER", "unset");
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let started = client
+        .call(
+            "workflow.run",
+            json!({
+                "name": "run-timeout-default-fail",
+                "repo": repo_dir.path().to_string_lossy(),
+                "params": {"taskId": "run-timeout-default-fail-1"},
+            }),
+        )
+        .await
+        .unwrap();
+    let id = started["instance"]["id"].as_str().unwrap().to_string();
+
+    let mut failed = false;
+    let mut last_status = json!(null);
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = client
+            .call("workflow.status", json!({"name": id}))
+            .await
+            .unwrap();
+        last_status = status.clone();
+        if status["instance"]["status"].as_str().unwrap_or("") == "failed" {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed, "timed-out run gate did not fail closed: {last_status}");
+    let err = last_status["instance"]["error"].as_str().unwrap_or("");
+    assert!(err.contains("timed out"), "unexpected error: {err}");
+
+    let scanned = client
+        .call("space.scan", json!({"category": "artifact"}))
+        .await
+        .unwrap();
+    let gate_failures: Vec<&Value> = scanned["tuples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["identity"].as_str() == Some("gate-failure"))
+        .filter(|t| t["payload"]["instance"].as_str() == Some(id.as_str()))
+        .collect();
+    assert_eq!(
+        gate_failures.len(),
+        1,
+        "expected exactly one gate-failure artifact for this instance: {scanned}"
+    );
+    let payload = &gate_failures[0]["payload"];
+    assert_eq!(payload["verdict"].as_str(), Some("timeout"));
+    assert_eq!(payload["timed_out"].as_bool(), Some(true));
+    assert_eq!(payload["exit"].as_i64(), Some(124));
+    assert!(payload["stderr_tail"]
+        .as_str()
+        .unwrap()
+        .contains("timed out"));
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}

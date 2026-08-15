@@ -410,7 +410,14 @@ workflow: #Workflow
 	// final result, and the durable gate-failure artifact (written on the final
 	// non-"pass" verdict, if any) carries the same history, so a retried flake
 	// stays visible instead of quietly disappearing on the second try.
-	retryOnFail: int | *0
+	//
+	// Bounded to <=20 (the `repeat` max cap analog): unbounded lets a
+	// mis-authored value (or one interpolated from an untrusted `_input`) push
+	// `retryOnFail + 1` toward u32::MAX, which panics on overflow in debug and
+	// would otherwise reach the attempt loop with zero real attempts
+	// (TKT-01M02QT9KTDY2CN6YJEVP3VCF8). The daemon enforces the same cap again
+	// on the resolved value — this is defense-in-depth, not the only gate.
+	retryOnFail: int & >=0 & <=20 | *0
 }
 
 // Merge a NAMED branch into a NAMED target directly — "land" the work. Where
