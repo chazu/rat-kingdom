@@ -79,6 +79,9 @@ struct ResolvedRun {
     timeout: String,
     on_timeout: OnTimeout,
     environment_policy: rk_workflow::CheckEnvironmentPolicy,
+    /// Extra attempts on a non-"pass" verdict. Step-only, like `on_timeout` —
+    /// never inherited from a named check.
+    retry_on_fail: u32,
 }
 
 /// What a blown `run` wall-clock bound does to the instance (TKT-169).
@@ -118,6 +121,16 @@ impl OnTimeout {
 /// exit 124 on its own, which is exactly why the result also carries the
 /// unambiguous `timed_out` / `verdict` fields for routing.
 const TIMEOUT_EXIT: i64 = 124;
+
+/// Pause between a failed attempt and a `retryOnFail` retry. Fixed rather than
+/// configurable: this exists to ride out a transient condition (machine load,
+/// a build-lock hold), not to be tuned per workflow.
+const RETRY_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Bound on the stdout/stderr tail kept in a durable `gate-failure` artifact.
+/// Generous enough to usually catch a cargo test summary's `failures:` list,
+/// bounded so a runaway suite cannot blow up the tuplespace.
+const GATE_EVIDENCE_LIMIT: usize = 8000;
 
 /// The outcome of running a `run` step's command to completion or to its bound.
 #[derive(Debug)]
@@ -1561,7 +1574,7 @@ impl WorkflowEngine {
                     });
                 }
                 Step::Run(run) => {
-                    let result = self.run_command(&ctx, run, repo).await?;
+                    let result = self.run_command(id, &ctx, run, repo).await?;
                     // Optionally lift a field of the result into a ctx var so a
                     // following `when` can ROUTE on how the check went, not just
                     // fail on it (TKT-169). Same (field, into) semantics as a
@@ -2316,6 +2329,7 @@ impl WorkflowEngine {
     /// rather than letting a red — or hung — suite slip through.
     async fn run_command(
         &self,
+        id: &str,
         ctx: &WorkflowContext,
         run: &RunStep,
         repo: &str,
@@ -2339,12 +2353,148 @@ impl WorkflowEngine {
         let dir = resolve_worktree_cwd(&worktree, resolved.cwd.as_deref(), ctx)?;
         let command = interpolate(&resolved.command, ctx);
         let timeout = parse_duration(&resolved.timeout)?;
+        for name in run.env.keys() {
+            if !valid_check_env_name(name) {
+                return Err(rk_core::Error::other(format!(
+                    "run step: environment name '{name}' is not allowed; use RK_CHECK_*"
+                )));
+            }
+        }
 
+        // Extra attempts on a non-"pass" verdict, for a check already
+        // characterized as flaky for reasons outside the code under test
+        // (TKT-01M02AMKD24WZVVMARJPXKYKSW). 0 retries is the historical
+        // behaviour: exactly one attempt, no backoff, no history recorded.
+        let attempts = resolved.retry_on_fail + 1;
+        let mut history: Vec<Value> = Vec::new();
+        let mut settled: Option<(i64, String, String, bool, &'static str)> = None;
+        for attempt in 1..=attempts {
+            let outcome = self
+                .spawn_check_child(&command, &dir, &resolved, &agent, run, ctx, timeout)
+                .await?;
+            // A `TimedOut` outcome only reaches here under `onTimeout:
+            // "continue"`; otherwise the timeout already returned an error
+            // above. The captured output is genuinely gone in that case (the
+            // reader tasks are aborted with the child), so stderr carries the
+            // explanation instead of a lie about what the suite printed.
+            let (exit, stdout, stderr, timed_out) = match outcome {
+                RunOutcome::Completed {
+                    status,
+                    stdout,
+                    stderr,
+                } => (
+                    status.code().unwrap_or(-1) as i64,
+                    String::from_utf8_lossy(&stdout).into_owned(),
+                    String::from_utf8_lossy(&stderr).into_owned(),
+                    false,
+                ),
+                RunOutcome::TimedOut => (
+                    TIMEOUT_EXIT,
+                    String::new(),
+                    format!(
+                        "run step: `{command}` timed out after {} and was killed",
+                        resolved.timeout
+                    ),
+                    true,
+                ),
+            };
+            // The routable three-way summary. `exit` alone cannot express it:
+            // a suite may exit 124 on its own, and "did not finish" calls for
+            // a different hand-off than "finished and said no".
+            let verdict: &'static str = if timed_out {
+                "timeout"
+            } else if exit == 0 {
+                "pass"
+            } else {
+                "fail"
+            };
+            if verdict == "pass" || attempt == attempts {
+                settled = Some((exit, stdout, stderr, timed_out, verdict));
+                break;
+            }
+            info!(
+                agent = %agent, exit, timed_out, verdict, attempt, attempts,
+                command = %command, "run step attempt failed, retrying"
+            );
+            history.push(json!({
+                "attempt": attempt,
+                "exit": exit,
+                "verdict": verdict,
+                "timed_out": timed_out,
+            }));
+            tokio::time::sleep(RETRY_BACKOFF).await;
+        }
+        // `attempts >= 1`, and `settled` is always set on the final iteration
+        // (attempt == attempts), so the loop never exits without it.
+        let (exit, stdout, stderr, timed_out, verdict) =
+            settled.expect("run step: attempt loop always settles by the final attempt");
+        info!(agent = %agent, exit, timed_out, verdict, command = %command, retries = history.len(), "run step completed");
+        let mut result = json!({
+            "exit": exit,
+            "stdout": stdout,
+            "stderr": stderr,
+            "timed_out": timed_out,
+            "verdict": verdict,
+        });
+
+        if !history.is_empty() {
+            result["retries"] = json!(history);
+        }
+
+        // A non-"pass" verdict is a gate that said no (or never finished).
+        // Persist a durable, bounded record of what it said BEFORE a following
+        // step overwrites ctx.previous_result — otherwise the only trace left
+        // once the workflow routes past this step is a composed one-line
+        // instance error (TKT-01M02AMKD24WZVVMARJPXKYKSW).
+        if verdict != "pass" {
+            self.record_gate_failure(
+                id, repo, &agent, &command, exit, verdict, timed_out, &stdout, &stderr, &history,
+            );
+        }
+
+        // Inline fail-closed gate: when the step (or named check) declares the
+        // expected exit, enforce it here so `run` can gate on its own without a
+        // trailing evaluate. When unset, the exit is left for a following
+        // evaluate/when. A timed-out command reports 124, so this rejects it
+        // exactly as it rejects a red suite — `onTimeout: "continue"` never
+        // sneaks a too-slow check past a declared exit gate.
+        if let Some(expected) = resolved.expect_exit {
+            if exit != expected {
+                // Carry the check's own words into the instance error, and —
+                // when this check is an escalation running right after a failed
+                // gate — LEAD with the gate's result. Without both, a failing
+                // report check (empty payload, forbidden caller) replaces the
+                // reason the workflow actually stopped.
+                return Err(rk_core::Error::other(format!(
+                    "{}run step: `{command}` exited {exit}, expected {expected}{}",
+                    prior_gate_failure(ctx.previous_result.as_ref()),
+                    check_failure_detail(&stdout, &stderr)
+                )));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Build and run one attempt of a `run` step's child process, returning its
+    /// captured outcome. Split out of [`run_command`](Self::run_command) so a
+    /// retry can spawn a fresh `Command`/`Child` per attempt — both are
+    /// single-use.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_check_child(
+        &self,
+        command: &str,
+        dir: &Path,
+        resolved: &ResolvedRun,
+        agent: &str,
+        run: &RunStep,
+        ctx: &WorkflowContext,
+        timeout: Duration,
+    ) -> rk_core::Result<RunOutcome> {
         let mut child_command = tokio::process::Command::new("sh");
         child_command
             .arg("-c")
-            .arg(&command)
-            .current_dir(&dir)
+            .arg(command)
+            .current_dir(dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -2387,97 +2537,70 @@ impl WorkflowEngine {
             // credential set a harness gets so its writes are authorized and
             // attributed to the agent whose worktree it runs in.
             child_command.env("RK_HOME", self.layout.home().display().to_string());
-            child_command.env("RK_AGENT", &agent);
-            if let Ok(token) = self.layout.agent_auth_token(&agent) {
+            child_command.env("RK_AGENT", agent);
+            if let Ok(token) = self.layout.agent_auth_token(agent) {
                 child_command.env("RK_AUTH_TOKEN", token);
             }
         }
         for (name, value) in &run.env {
-            if !valid_check_env_name(name) {
-                return Err(rk_core::Error::other(format!(
-                    "run step: environment name '{name}' is not allowed; use RK_CHECK_*"
-                )));
-            }
             child_command.env(name, interpolate(value, ctx));
         }
         let child = child_command.spawn().map_err(|e| {
             rk_core::Error::other(format!("run step: failed to spawn `{command}`: {e}"))
         })?;
 
-        let outcome = collect_child_output(
+        collect_child_output(
             child,
             timeout,
-            &command,
+            command,
             &resolved.timeout,
             resolved.on_timeout,
         )
-        .await?;
-        // A `TimedOut` outcome only reaches here under `onTimeout: "continue"`;
-        // otherwise the timeout already returned an error above. The captured
-        // output is genuinely gone in that case (the reader tasks are aborted
-        // with the child), so stderr carries the explanation instead of a lie
-        // about what the suite printed.
-        let (exit, stdout, stderr, timed_out) = match outcome {
-            RunOutcome::Completed {
-                status,
-                stdout,
-                stderr,
-            } => (
-                status.code().unwrap_or(-1) as i64,
-                String::from_utf8_lossy(&stdout).into_owned(),
-                String::from_utf8_lossy(&stderr).into_owned(),
-                false,
-            ),
-            RunOutcome::TimedOut => (
-                TIMEOUT_EXIT,
-                String::new(),
-                format!(
-                    "run step: `{command}` timed out after {} and was killed",
-                    resolved.timeout
-                ),
-                true,
-            ),
-        };
-        // The routable three-way summary. `exit` alone cannot express it: a
-        // suite may exit 124 on its own, and "did not finish" calls for a
-        // different hand-off than "finished and said no".
-        let verdict = if timed_out {
-            "timeout"
-        } else if exit == 0 {
-            "pass"
-        } else {
-            "fail"
-        };
-        info!(agent = %agent, exit, timed_out, verdict, command = %command, "run step completed");
-        let result = json!({
-            "exit": exit,
-            "stdout": stdout,
-            "stderr": stderr,
-            "timed_out": timed_out,
-            "verdict": verdict,
-        });
+        .await
+    }
 
-        // Inline fail-closed gate: when the step (or named check) declares the
-        // expected exit, enforce it here so `run` can gate on its own without a
-        // trailing evaluate. When unset, the exit is left for a following
-        // evaluate/when. A timed-out command reports 124, so this rejects it
-        // exactly as it rejects a red suite — `onTimeout: "continue"` never
-        // sneaks a too-slow check past a declared exit gate.
-        if let Some(expected) = resolved.expect_exit {
-            if exit != expected {
-                // Carry the check's own words into the instance error, and —
-                // when this check is an escalation running right after a failed
-                // gate — LEAD with the gate's result. Without both, a failing
-                // report check (empty payload, forbidden caller) replaces the
-                // reason the workflow actually stopped.
-                return Err(rk_core::Error::other(format!(
-                    "{}run step: `{command}` exited {exit}, expected {expected}{}",
-                    prior_gate_failure(ctx.previous_result.as_ref()),
-                    check_failure_detail(&stdout, &stderr)
-                )));
-            }
-        }
-        Ok(result)
+    /// Persist a bounded, durable `(artifact, <repo>, gate-failure)` tuple for
+    /// a failed (or timed-out) `run` step. Without this, the only trace of a
+    /// gate's own verdict is `ctx.previous_result`, which the very next `run`
+    /// step (an escalation check, a `steward-report-gate-failure`) overwrites
+    /// — so once the workflow routes past this step, everything but a
+    /// composed one-line instance error is gone (TKT-01M02AMKD24WZVVMARJPXKYKSW).
+    /// Called unconditionally for a non-"pass" verdict, independent of whether
+    /// this step also fails the instance via `expectExit`.
+    #[allow(clippy::too_many_arguments)]
+    fn record_gate_failure(
+        &self,
+        id: &str,
+        repo: &str,
+        agent: &str,
+        command: &str,
+        exit: i64,
+        verdict: &str,
+        timed_out: bool,
+        stdout: &str,
+        stderr: &str,
+        history: &[Value],
+    ) {
+        let failing_tests = extract_failing_tests(stdout);
+        let payload = json!({
+            "instance": id,
+            "agent": agent,
+            "command": command,
+            "exit": exit,
+            "verdict": verdict,
+            "timed_out": timed_out,
+            "stdout_tail": bounded_tail(stdout, GATE_EVIDENCE_LIMIT),
+            "stderr_tail": bounded_tail(stderr, GATE_EVIDENCE_LIMIT),
+            "failing_tests": failing_tests,
+            "retries": history,
+        });
+        let _ = self.space.out(rk_core::tuple::Tuple::new(
+            Category::Artifact,
+            repo_name_of(repo),
+            "gate-failure",
+            "daemon",
+            payload,
+        ));
     }
 
     fn require_allowed_target(
@@ -2558,6 +2681,7 @@ impl WorkflowEngine {
                     timeout: run.timeout.clone(),
                     on_timeout,
                     environment_policy: rk_workflow::CheckEnvironmentPolicy::Inherit,
+                    retry_on_fail: run.retry_on_fail,
                 })
             }
             (None, Some(name)) => {
@@ -2581,6 +2705,7 @@ impl WorkflowEngine {
                     timeout,
                     on_timeout,
                     environment_policy: check.environment_policy,
+                    retry_on_fail: run.retry_on_fail,
                 })
             }
         }
@@ -3358,28 +3483,70 @@ fn prior_gate_failure(previous: Option<&Value>) -> String {
     )
 }
 
+/// The last `limit` characters of `text`, trimmed. Shared by the instance-error
+/// composer ([`check_failure_detail`], 400 chars) and the durable gate-failure
+/// artifact ([`record_gate_failure`](WorkflowEngine::record_gate_failure),
+/// [`GATE_EVIDENCE_LIMIT`]) — the artifact keeps a longer tail because it is
+/// the only copy that outlives the next workflow step.
+fn bounded_tail(text: &str, limit: usize) -> String {
+    let trimmed = text.trim();
+    let start = trimmed
+        .char_indices()
+        .rev()
+        .take(limit)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    trimmed[start..].to_string()
+}
+
 /// Bounded stdout/stderr tails for a failed check's instance error, so the
 /// operator sees what the check said, not just that it said no.
 fn check_failure_detail(stdout: &str, stderr: &str) -> String {
-    fn tail(text: &str, limit: usize) -> &str {
-        let trimmed = text.trim();
-        let start = trimmed
-            .char_indices()
-            .rev()
-            .take(limit)
-            .last()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        &trimmed[start..]
-    }
     let mut detail = String::new();
     for (label, text) in [("stderr", stderr), ("stdout", stdout)] {
-        let tail = tail(text, 400);
+        let tail = bounded_tail(text, 400);
         if !tail.is_empty() {
             detail.push_str(&format!("; {label}: {tail}"));
         }
     }
     detail
+}
+
+/// Pull failing test names out of a `cargo test` (or compatible) stdout, so a
+/// durable gate-failure artifact names what broke instead of just recording
+/// that something did. Matches the one line format both the per-binary
+/// `failures:` summary and the individual `---- name stdout ----` headers
+/// disagree on but every runner prints consistently: `test <name> ... FAILED`.
+/// Deliberately NOT parsed from the `failures:` summary block — with
+/// `cargo test --workspace` running many binaries, several such blocks can
+/// appear and only the last is anywhere near the tail of a bounded capture, so
+/// scanning every `... FAILED` line is the only method robust to truncation.
+/// Bounded and deduplicated, order preserved; a suite with more than
+/// `MAX_FAILING_TESTS` distinct failures is summarized rather than listed in
+/// full — the point is to name the failures a human or a peer rat acts on
+/// first, not to reproduce the whole log.
+const MAX_FAILING_TESTS: usize = 50;
+
+fn extract_failing_tests(stdout: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("test ") else {
+            continue;
+        };
+        let Some(name) = rest.strip_suffix(" ... FAILED") else {
+            continue;
+        };
+        if seen.insert(name.to_string()) {
+            names.push(name.to_string());
+            if names.len() >= MAX_FAILING_TESTS {
+                break;
+            }
+        }
+    }
+    names
 }
 
 /// Replace `{{ctx.*}}` placeholders in workflow strings at execution time.
@@ -3991,6 +4158,64 @@ mod tests {
         let detail = check_failure_detail("", &long);
         assert!(detail.len() < 450, "detail stays bounded: {}", detail.len());
         assert!(detail.ends_with("THE END"));
+    }
+
+    /// A `cargo test --workspace` failure names its failing tests via
+    /// `test <name> ... FAILED` lines, possibly repeated across several
+    /// per-binary `failures:` summaries. The gate-failure artifact must
+    /// recover every distinct name, deduplicated, in first-seen order.
+    #[test]
+    fn extract_failing_tests_finds_cargo_style_failures() {
+        let stdout = "\
+running 3 tests
+test workflow_run::cue_workflow_runs_end_to_end_with_agent_resolution ... FAILED
+test workflow_run::run_step_green_check_gates_and_merges ... FAILED
+test workflow_run::run_step_red_check_fails_closed_and_holds_branch ... ok
+
+failures:
+    workflow_run::cue_workflow_runs_end_to_end_with_agent_resolution
+    workflow_run::run_step_green_check_gates_and_merges
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out
+";
+        let names = extract_failing_tests(stdout);
+        assert_eq!(
+            names,
+            vec![
+                "workflow_run::cue_workflow_runs_end_to_end_with_agent_resolution",
+                "workflow_run::run_step_green_check_gates_and_merges",
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_failing_tests_ignores_passing_tests_and_dedupes() {
+        let stdout = "\
+test a::ok_test ... ok
+test a::flaky ... FAILED
+test a::flaky ... FAILED
+";
+        assert_eq!(extract_failing_tests(stdout), vec!["a::flaky"]);
+        assert_eq!(extract_failing_tests(""), Vec::<String>::new());
+        assert_eq!(extract_failing_tests("no test lines here at all"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn extract_failing_tests_is_bounded() {
+        let stdout: String = (0..MAX_FAILING_TESTS + 20)
+            .map(|i| format!("test suite::t{i} ... FAILED\n"))
+            .collect();
+        assert_eq!(extract_failing_tests(&stdout).len(), MAX_FAILING_TESTS);
+    }
+
+    #[test]
+    fn bounded_tail_keeps_the_end_and_respects_char_boundaries() {
+        assert_eq!(bounded_tail("hello", 100), "hello");
+        assert_eq!(bounded_tail("  padded  ", 100), "padded");
+        let long = format!("{}END", "x".repeat(5000));
+        let tail = bounded_tail(&long, GATE_EVIDENCE_LIMIT);
+        assert!(tail.ends_with("END"));
+        assert!(tail.chars().count() <= GATE_EVIDENCE_LIMIT);
     }
 
     #[test]

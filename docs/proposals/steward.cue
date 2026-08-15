@@ -185,13 +185,29 @@ workflow: {
 		//    Still fail-closed, in both directions: a timeout reports exit 124,
 		//    so it is no more mergeable than a red suite. It just gets a hand-off
 		//    that names the real problem.
+		//
+		//    retryOnFail: 1 (TKT-01M02AMKD24WZVVMARJPXKYKSW). This specific gate
+		//    is CHARACTERIZED flaky: several stewards fire at once, each running
+		//    a full cold-worktree `mise run verify`, and the fleet machine has
+		//    been observed at a load average an order of magnitude over its core
+		//    count while that happens — timing-sensitive daemon tests miss their
+		//    budget under that contention for reasons having nothing to do with
+		//    the branch under review. One extra attempt (after a short backoff)
+		//    rides out that transient without weakening the gate: a genuinely
+		//    red suite fails the retry too and reaches the same `default` arm
+		//    below, just a few seconds later. Every attempt is recorded — on
+		//    `gate.retries` when it recovers, and in the durable
+		//    `(artifact, <repo>, gate-failure)` tuple the failed final attempt
+		//    writes below — so a retried flake stays visible instead of quietly
+		//    looking like a clean first try.
 		{
-			type:      "run"
-			check:     _input.check
-			timeout:   _input.gateTimeout
-			onTimeout: "continue"
-			field:     "verdict"
-			into:      "gate"
+			type:        "run"
+			check:       _input.check
+			timeout:     _input.gateTimeout
+			onTimeout:   "continue"
+			retryOnFail: 1
+			field:       "verdict"
+			into:        "gate"
 		},
 		{
 			type: "when"

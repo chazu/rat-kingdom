@@ -397,6 +397,20 @@ workflow: #Workflow
 	// make, since a suite may legitimately exit 124 on its own.
 	field?: string
 	into?:  string
+
+	// Automatic retries for a CHARACTERIZED-flaky check: on a non-"pass" verdict
+	// (fail or timeout), re-run the same command up to this many additional
+	// times before giving up, with a short backoff between attempts. 0 (default)
+	// is off — the historical behaviour, and still the right default for a check
+	// that is red because the code under test is actually broken; a retry there
+	// only delays the same fail-closed outcome. Set this only on a check already
+	// known to flake for reasons outside the code being checked (e.g. machine
+	// load from concurrent fleet builds) — never as a first response to a single
+	// red run. Every attempt's {verdict, exit} is recorded in `retries` on the
+	// final result, and the durable gate-failure artifact (written on the final
+	// non-"pass" verdict, if any) carries the same history, so a retried flake
+	// stays visible instead of quietly disappearing on the second try.
+	retryOnFail: int | *0
 }
 
 // Merge a NAMED branch into a NAMED target directly — "land" the work. Where

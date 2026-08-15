@@ -667,6 +667,13 @@ pub struct RunStep {
     /// exists only to lift; a `run` lifts only when asked.
     #[serde(default)]
     pub into: Option<String>,
+    /// Extra attempts on a non-"pass" verdict, for a check already characterized
+    /// as flaky for reasons outside the code under test (machine load, not a red
+    /// suite). 0 (default) preserves prior behaviour. Deliberately step-only,
+    /// like [`RunStep::on_timeout`]: retry policy is a workflow routing
+    /// decision, not a property of the command itself.
+    #[serde(default, rename = "retryOnFail")]
+    pub retry_on_fail: u32,
 }
 
 fn default_run_timeout() -> String {
