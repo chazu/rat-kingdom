@@ -211,11 +211,21 @@ pub(crate) mod runner {
     //! per-adapter parser, forward steer messages to stdin, deliver signals.
 
     use super::*;
+    use std::collections::VecDeque;
     use std::process::Stdio;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command;
+    use tokio::sync::mpsc::error::TrySendError;
     use tracing::{debug, warn};
+
+    /// Cap on the stderr drain's local fallback buffer: once the shared event
+    /// channel is full, further lines land here (dropping the oldest) instead
+    /// of blocking on it. Only a bounded tail can ever matter downstream
+    /// (`append_stderr_tail` keeps a bounded suffix anyway), so this trades
+    /// unreachable-in-practice middle lines for the guarantee that draining
+    /// the child's stderr pipe never stalls.
+    const STDERR_BACKLOG_CAP: usize = 256;
 
     pub struct Wiring {
         pub command: Command,
@@ -266,19 +276,34 @@ pub(crate) mod runner {
         // back up the child's stderr pipe and stall it. The handle is joined
         // (below, bounded) before `Exited` is published, so a silent
         // zero-token death never races its own explanation onto the wire.
+        //
+        // Forwarding is non-blocking (`try_send`): the loop must keep calling
+        // `next_line` regardless of channel state, because *that* read is what
+        // drains the OS pipe and keeps the child's own `write(2)` from
+        // blocking. A full channel spills into a small bounded local backlog
+        // (dropping the oldest line, not the newest) instead, flushed once the
+        // pipe hits EOF — by then the child is gone, so a blocking flush can
+        // no longer stall it.
         let stderr_task = stderr.map(|stderr| {
             let stderr_tx = event_tx.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
+                let mut backlog: VecDeque<String> = VecDeque::new();
                 loop {
                     match lines.next_line().await {
                         Ok(Some(line)) => {
-                            if stderr_tx
-                                .send(HarnessEvent::Stderr { text: line })
-                                .await
-                                .is_err()
-                            {
-                                break;
+                            match stderr_tx.try_send(HarnessEvent::Stderr { text: line }) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(HarnessEvent::Stderr { text })) => {
+                                    if backlog.len() == STDERR_BACKLOG_CAP {
+                                        backlog.pop_front();
+                                    }
+                                    backlog.push_back(text);
+                                }
+                                Err(TrySendError::Full(_)) => unreachable!(
+                                    "try_send is only ever called with HarnessEvent::Stderr here"
+                                ),
+                                Err(TrySendError::Closed(_)) => break,
                             }
                         }
                         Ok(None) => break, // EOF
@@ -286,6 +311,14 @@ pub(crate) mod runner {
                             warn!(error = %e, "stderr read failed");
                             break;
                         }
+                    }
+                }
+                // The child's stderr is gone (EOF or read error) by now, so a
+                // blocking send here cannot stall it — only best-effort delivery
+                // of whatever the fast path couldn't keep up with.
+                for text in backlog {
+                    if stderr_tx.send(HarnessEvent::Stderr { text }).await.is_err() {
+                        break;
                     }
                 }
             })

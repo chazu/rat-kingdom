@@ -1137,6 +1137,11 @@ impl Supervisor {
                 // record, so a workflow waiting on it stops treating it as
                 // abandoned (TKT-147).
                 r.crashed = false;
+                // The prior generation's stderr tail describes a run that is
+                // now gone; a retry that fails silently, with no stderr of its
+                // own, must not publish that stale diagnosis as if it were
+                // current.
+                r.stderr_tail = None;
             })?
             .ok_or_else(|| rk_core::Error::other("record vanished"))?;
         self.lock_controls()
@@ -1228,6 +1233,9 @@ impl Supervisor {
                 current.attach_target = Some(target.clone());
                 current.result = None;
                 current.crashed = false;
+                // See the ordinary respawn path above: a stale stderr tail
+                // from the previous generation must not survive a retry.
+                current.stderr_tail = None;
             })?
             .ok_or_else(|| rk_core::Error::other("record vanished"))?;
 

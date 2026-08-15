@@ -57,6 +57,18 @@ case "$RK_TASK" in
     echo 'giving up after 3 attempts' >&2
     exit 1
     ;;
+  respawn-stale-tail)
+    # The worktree persists across a respawn, so a marker file there tells
+    # apart the first attempt (which fails loudly) from the respawned second
+    # attempt (which fails silently, with no stderr of its own).
+    MARKER="$PWD/.rk-test-respawn-marker"
+    if [ -f "$MARKER" ]; then
+      exit 1
+    fi
+    touch "$MARKER"
+    echo 'boom on first attempt' >&2
+    exit 1
+    ;;
   *)
     # Any other RK_TASK is treated as a marker-death run (see
     # `stderr_ordering_never_races_exited`): the marker IS the task name,
@@ -108,16 +120,18 @@ async fn stderr_lines_are_tagged_in_the_agent_log() {
     }
     assert!(completed, "agent never completed");
 
+    // Real environments can emit incidental harness stderr (e.g. a shell
+    // locale warning) ahead of the fixture's own line, so locate the fixture
+    // entry by content instead of assuming it is the first `stderr` entry.
     let log = client
         .call("agent.log", json!({"name": name}))
         .await
         .unwrap();
     let entries = log["entries"].as_array().unwrap();
-    let stderr_entry = entries
+    entries
         .iter()
-        .find(|e| e["kind"] == "stderr")
-        .expect("a stderr-kind entry should be in the transcript");
-    assert_eq!(stderr_entry["text"], "warming up model cache");
+        .find(|e| e["kind"] == "stderr" && e["text"] == "warming up model cache")
+        .expect("a stderr-kind entry carrying our fixture line should be in the transcript");
 }
 
 /// Writes only to stderr and exits nonzero — no `Started`/`Completed` ever
@@ -264,4 +278,88 @@ async fn stderr_ordering_never_races_exited() {
             "{name}: published result missing its own marker, got: {result:?}"
         );
     }
+}
+
+/// A respawn resumes the SAME generation's record, so without an explicit
+/// clear its `stderr_tail` field carries over from the interrupted attempt.
+/// If the retry then dies with no stderr of its own, the published failure
+/// must not look like it still carries the FIRST attempt's diagnosis.
+#[tokio::test]
+async fn respawn_clears_the_previous_generations_stderr_tail() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let spawned = client
+        .call(
+            "agent.spawn",
+            json!({
+                "repo": repo_dir.path().to_string_lossy(),
+                "task": "respawn-stale-tail",
+                "harness": "fake",
+            }),
+        )
+        .await
+        .unwrap();
+    let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+
+    let mut status = json!({});
+    let mut failed = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        status = client
+            .call("agent.status", json!({"name": name}))
+            .await
+            .unwrap();
+        if status["agent"]["state"] == "failed" {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed, "first attempt never reached the failed state");
+    assert!(
+        status["agent"]["stderr_tail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("boom on first attempt"),
+        "first attempt should have captured its own stderr: {status:?}"
+    );
+
+    client
+        .call("agent.respawn", json!({"name": name}))
+        .await
+        .unwrap();
+
+    let mut status = json!({});
+    let mut failed = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        status = client
+            .call("agent.status", json!({"name": name}))
+            .await
+            .unwrap();
+        if status["agent"]["state"] == "failed" {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed, "respawned attempt never reached the failed state");
+
+    let tail = status["agent"]["stderr_tail"].as_str().unwrap_or("");
+    assert!(
+        !tail.contains("boom on first attempt"),
+        "respawn published the PREVIOUS attempt's stderr tail as if it were \
+         current: {tail:?}"
+    );
+    assert!(
+        tail.is_empty(),
+        "the silent retry produced no stderr of its own, so the tail should \
+         be empty/absent, got: {tail:?}"
+    );
 }
