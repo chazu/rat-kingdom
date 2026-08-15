@@ -754,6 +754,21 @@ workflow: {
   `examples/checks.cue` as well as their `verify` check.
   The same registry is surfaced as optional guidance in spawned worker prompts;
   it does not replace the workflow gate. See `examples/workflows/named-check-merge.cue`.
+- **Run-step evidence and retries (TKT-01M02AMKD24WZVVMARJPXKYKSW)**: a `run`
+  step whose verdict is not `"pass"` (a red check or a timeout) writes a
+  durable, bounded `(artifact, <repo>, gate-failure)` tuple — `{instance,
+  agent, command, exit, verdict, timed_out, stdout_tail, stderr_tail,
+  failing_tests, retries}` — before the next step can overwrite
+  `ctx.previousResult`. `failing_tests` is parsed from `test <name> ...
+  FAILED` lines, so `rk scan artifact <repo>` (or `rk inbox`) names what broke
+  instead of only recording that the gate said no. A step may also set
+  `retryOnFail: <n>` (default 0) for a check already characterized as flaky
+  for reasons outside the code under test — machine load from several
+  fleet-wide builds running at once is the shipped steward's case. A retry
+  does not weaken the gate: a genuinely red suite fails every attempt and
+  still holds the branch, just a few seconds later, and every attempt is
+  recorded (`retries` on the result, or in the gate-failure artifact on the
+  final non-`"pass"` verdict) so a recovered flake stays visible.
 
 ## Reactor (triggers)
 
