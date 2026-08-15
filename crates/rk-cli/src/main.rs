@@ -887,19 +887,7 @@ async fn main() -> Result<()> {
                                 Some(_) => format!("{}*", i["status"].as_str().unwrap_or("?")),
                                 None => i["status"].as_str().unwrap_or("?").to_string(),
                             };
-                            // A `target` param other than "main" means this
-                            // instance is landing somewhere non-default — most
-                            // commonly a steward inheriting a chained/rework
-                            // rat's own --base (docs/reactor.md, "Land target
-                            // inheritance"). Flag it so it isn't mistaken for a
-                            // run headed to main.
-                            let target = i["params"]["target"].as_str();
-                            let target_suffix = match target {
-                                Some(t) if !t.is_empty() && t != "main" => {
-                                    format!(" target={t}")
-                                }
-                                _ => String::new(),
-                            };
+                            let target_suffix = workflow_target_suffix(i);
                             println!(
                                 "{:14} {:12} {:10} step {}/{}{}",
                                 i["id"].as_str().unwrap_or("?"),
@@ -1200,4 +1188,42 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Rendered suffix for `rk workflow list`: a `target` param other than "main"
+/// means this instance is landing somewhere non-default — most commonly a
+/// steward inheriting a chained/rework rat's own `--base` (docs/reactor.md,
+/// "Land target inheritance"). Flag it so it isn't mistaken for a run headed
+/// to main.
+fn workflow_target_suffix(instance: &serde_json::Value) -> String {
+    match instance["params"]["target"].as_str() {
+        Some(t) if !t.is_empty() && t != "main" => format!(" target={t}"),
+        _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod workflow_display_tests {
+    use super::workflow_target_suffix;
+    use serde_json::json;
+
+    /// The non-main land target must be VISIBLE in `rk workflow list` — the
+    /// steward trigger inherits a chained rat's base as its land target, and
+    /// without this suffix such an instance reads identically to one landing
+    /// on main (TKT-01M01DM0VXPD7VV09GX02YMEA1).
+    #[test]
+    fn non_main_target_renders_and_main_stays_silent() {
+        let inherited = json!({"params": {"target": "rat/camembert-4/tkt-9"}});
+        assert_eq!(
+            workflow_target_suffix(&inherited),
+            " target=rat/camembert-4/tkt-9"
+        );
+        for silent in [
+            json!({"params": {"target": "main"}}),
+            json!({"params": {"target": ""}}),
+            json!({"params": {}}),
+        ] {
+            assert_eq!(workflow_target_suffix(&silent), "");
+        }
+    }
 }

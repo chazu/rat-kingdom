@@ -984,7 +984,8 @@ async fn non_main_land_target_is_reported_main_is_not() {
     .unwrap();
 
     let space = rk_space::Space::open_in_memory().unwrap();
-    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+    let (reactor, engine) =
+        build_reactor_and_engine_with_space(&layout, ReactorConfig::default(), space.clone());
 
     // A rework rat completed chained onto a feature branch: its own `--base`
     // (not "main") is what the completed rat's harness_result carries as
@@ -1004,6 +1005,24 @@ async fn non_main_land_target_is_reported_main_is_not() {
         ))
         .unwrap();
     assert_eq!(reactor.run_cycle().unwrap(), 1);
+
+    // The launched instance itself must RECORD the inherited target — the
+    // visibility event alone is not the recorded steward state. This is what
+    // `rk workflow status`/`list` read (list renders " target=<branch>" from
+    // exactly this params field; see rk-cli workflow_target_suffix tests).
+    let instances = engine.list();
+    assert_eq!(instances.len(), 1, "trigger must launch exactly one instance");
+    assert_eq!(instances[0].workflow, "react-work");
+    assert_eq!(
+        instances[0].params.get("target"),
+        Some(&json!("rat/camembert-4/tkt-9")),
+        "instance must persist the inherited non-main land target"
+    );
+    assert_eq!(
+        instances[0].params.get("branch"),
+        Some(&json!("rat/basil-4/rework")),
+        "instance must persist the reviewed branch"
+    );
 
     let events = space
         .scan(&Pattern::category(Category::Event).identity("reactor_non_main_land_target"))
