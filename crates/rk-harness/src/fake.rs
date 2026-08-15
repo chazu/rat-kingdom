@@ -140,4 +140,39 @@ mod tests {
         }
         assert!(saw_exit);
     }
+
+    /// A starved/misconfigured harness that writes nothing to stdout (no
+    /// `Started`/`Completed` — exactly the silent zero-token death this exists
+    /// to diagnose) still surfaces what it said on stderr.
+    #[tokio::test]
+    async fn stderr_lines_are_captured_as_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "RK_FAKE_HARNESS_CMD".to_string(),
+            "echo 'rate limited, retrying' >&2; echo 'boom, auth expired' >&2".to_string(),
+        );
+        let mut session = FakeHarness
+            .launch(&LaunchSpec {
+                cwd: dir.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let mut stderr_lines = Vec::new();
+        let mut exited = false;
+        while let Some(event) = session.events.recv().await {
+            match event {
+                HarnessEvent::Stderr { text } => stderr_lines.push(text),
+                HarnessEvent::Exited { .. } => exited = true,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            stderr_lines,
+            vec!["rate limited, retrying", "boom, auth expired"]
+        );
+        assert!(exited);
+    }
 }

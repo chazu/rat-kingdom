@@ -45,6 +45,11 @@ pub enum HarnessEvent {
     AssistantText { text: String },
     /// The agent invoked a tool.
     ToolUse { name: String },
+    /// A line the harness child wrote to stderr. Most harnesses put nothing
+    /// here, but a starved/misconfigured one (rate limit, queueing, auth
+    /// refresh, model unavailable) may produce zero protocol output and die
+    /// silently — stderr is the only trace of why.
+    Stderr { text: String },
     /// Token usage for one API call (ledger feed).
     Usage { usage: TokenUsage },
     /// The harness is retrying an API error.
@@ -231,7 +236,7 @@ pub(crate) mod runner {
             .command
             .stdin(stdin_mode)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             // Each harness child gets its OWN process group: some harnesses
             // (codex) signal their process group on cleanup, which must never
             // reach the daemon; and our signals should hit the child's whole
@@ -245,6 +250,7 @@ pub(crate) mod runner {
             .stdout
             .take()
             .ok_or_else(|| rk_core::Error::other("child stdout unavailable"))?;
+        let stderr = child.stderr.take();
         let mut stdin = child.stdin.take();
 
         let (event_tx, events) = mpsc::channel::<HarnessEvent>(256);
@@ -253,6 +259,34 @@ pub(crate) mod runner {
 
         let parse = wiring.parse;
         let steer_line = wiring.steer_line;
+
+        // Drained on its own task, mirroring stdout: stderr is diagnostic
+        // exhaust, not protocol, so a slow/absent reader of `events` must never
+        // back up the child's stderr pipe and stall it.
+        if let Some(stderr) = stderr {
+            let stderr_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(line)) => {
+                            if stderr_tx
+                                .send(HarnessEvent::Stderr { text: line })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(None) => break, // EOF
+                        Err(e) => {
+                            warn!(error = %e, "stderr read failed");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();

@@ -246,6 +246,7 @@ fn terminal_record(name: &str, created_at: DateTime<Utc>) -> AgentRecord {
         result: None,
         progress: None,
         crashed: false,
+        stderr_tail: None,
         usage: Default::default(),
         cost_usd: 0.0,
         created_at,
