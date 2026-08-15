@@ -41,6 +41,16 @@ use rk_core::tuple::{DEFAULT_TRAIL_TTL, MAX_TRAIL_TTL};
 const MAX_BLOCK: Duration = Duration::from_secs(3600);
 const DEFAULT_BLOCK: Duration = Duration::from_secs(5);
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// Ceiling for an RPC *response*, separate from [`MAX_FRAME_BYTES`] (which
+/// guards inbound request lines). A response is daemon-authored, not
+/// client-supplied, so it gets more headroom than the request-side DoS guard
+/// — but it still needs a ceiling: an unbounded aggregation endpoint
+/// (`agent.list` with `include_archived` grows with the whole fleet's
+/// lifetime history) can otherwise serialize a reply bigger than
+/// `write_json_line` will accept, which used to surface as a bare `io::Error`
+/// that dropped the connection with no wire response at all (`protocol:
+/// daemon closed connection` client-side, no diagnosis possible).
+const MAX_RESPONSE_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SCAN_TUPLES: usize = 10_000;
 /// Inbox is an aggregation endpoint, so cap both its source histories and its
 /// final response. Newest-first source scans preserve the current state of
@@ -889,10 +899,10 @@ impl Daemon {
             };
             match outcome {
                 Outcome::Reply(response) => {
-                    write_json_line(&mut write, &response).await?;
+                    write_response(&mut write, &response).await?;
                 }
                 Outcome::Watch { response, pattern } => {
-                    write_json_line(&mut write, &response).await?;
+                    write_response(&mut write, &response).await?;
                     return self.stream_watch(write, pattern).await;
                 }
                 Outcome::CoordinatorWatch {
@@ -901,7 +911,7 @@ impl Daemon {
                     boundary,
                     rx,
                 } => {
-                    write_json_line(&mut write, &response).await?;
+                    write_response(&mut write, &response).await?;
                     return self.stream_coordinator(write, filter, boundary, rx).await;
                 }
                 Outcome::FactoryEventsWatch {
@@ -910,7 +920,7 @@ impl Daemon {
                     boundary,
                     rx,
                 } => {
-                    write_json_line(&mut write, &response).await?;
+                    write_response(&mut write, &response).await?;
                     return self
                         .stream_factory_events(write, filter, boundary, rx)
                         .await;
@@ -920,7 +930,7 @@ impl Daemon {
                     agent,
                     generation,
                 } => {
-                    write_json_line(&mut write, &response).await?;
+                    write_response(&mut write, &response).await?;
                     return self.stream_log(write, agent, generation).await;
                 }
             }
@@ -5980,6 +5990,33 @@ where
             std::io::ErrorKind::InvalidData,
             "response exceeds 1 MiB",
         ));
+    }
+    out.push(b'\n');
+    write.write_all(&out).await
+}
+
+/// Write an RPC reply, downgrading to a `frame_too_large` error (still
+/// carrying the request's `id`) instead of silently dropping the connection
+/// when the reply itself is oversized. See [`MAX_RESPONSE_FRAME_BYTES`].
+async fn write_response<W>(write: &mut W, response: &Response) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut out = serde_json::to_vec(response)?;
+    // NOTE: deliberately does not delegate to `write_json_line` for the
+    // in-bounds case — that function enforces the older, smaller
+    // `MAX_FRAME_BYTES` (the request-side cap), which would silently claw
+    // back the headroom this function exists to grant.
+    if out.len() > MAX_RESPONSE_FRAME_BYTES {
+        let fallback = Response::err(
+            response.id.clone(),
+            codes::FRAME_TOO_LARGE,
+            format!(
+                "response too large ({} bytes, limit {MAX_RESPONSE_FRAME_BYTES}); narrow the request (e.g. drop --all/--archived, or filter by repo)",
+                out.len()
+            ),
+        );
+        out = serde_json::to_vec(&fallback)?;
     }
     out.push(b'\n');
     write.write_all(&out).await
