@@ -257,11 +257,10 @@ mod tests {
         assert_eq!(exited_code, Some(Some(7)));
         assert_eq!(last_stderr.as_deref(), Some("stderr line 4999 padded xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
     }
-}
 
-/// Minimal single-quoting for embedding a path in the fake harness's bash
-/// one-liner (test-only; paths here are always `tempfile::tempdir()` output).
-#[cfg(test)]
-fn shell_escape(path: &std::path::Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+    /// Minimal single-quoting for embedding a path in the fake harness's bash
+    /// one-liner (paths here are always `tempfile::tempdir()` output).
+    fn shell_escape(path: &std::path::Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+    }
 }
