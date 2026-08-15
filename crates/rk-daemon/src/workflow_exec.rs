@@ -162,7 +162,9 @@ enum RunOutcome {
     Completed {
         status: std::process::ExitStatus,
         stdout: Vec<u8>,
+        stdout_truncated: bool,
         stderr: Vec<u8>,
+        stderr_truncated: bool,
     },
     /// The wall-clock bound elapsed and the child was killed. Returned
     /// regardless of [`OnTimeout`] policy — `collect_child_output` only
@@ -383,23 +385,42 @@ pub struct WorkflowContext {
     pub active_subworkflow: Option<String>,
 }
 
-async fn read_capped<R>(mut reader: R) -> rk_core::Result<Vec<u8>>
+/// A gate child's captured stream: bytes bounded to [`MAX_RUN_OUTPUT_BYTES`],
+/// keeping the TAIL of the stream (where a suite's failure summary lives)
+/// rather than the head, plus whether the raw stream actually exceeded that
+/// bound.
+struct CappedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+/// Stream a child's output to completion, never erroring on volume alone —
+/// only a genuine read failure returns `Err`. A chatty-but-otherwise-healthy
+/// suite must still run to its real exit code and route/retry normally
+/// (gate-children-truncate-not-kill): exceeding the cap used to abort the
+/// read (and, via the caller's `?`, the whole instance) instead of just
+/// bounding what is kept.
+async fn read_capped<R>(mut reader: R) -> rk_core::Result<CappedOutput>
 where
     R: AsyncRead + Unpin,
 {
     let mut output = Vec::new();
+    let mut truncated = false;
     let mut chunk = [0_u8; 8192];
     loop {
         let read = reader.read(&mut chunk).await?;
         if read == 0 {
-            return Ok(output);
-        }
-        if output.len().saturating_add(read) > MAX_RUN_OUTPUT_BYTES {
-            return Err(rk_core::Error::other(format!(
-                "run step output exceeds {MAX_RUN_OUTPUT_BYTES} bytes"
-            )));
+            return Ok(CappedOutput {
+                bytes: output,
+                truncated,
+            });
         }
         output.extend_from_slice(&chunk[..read]);
+        if output.len() > MAX_RUN_OUTPUT_BYTES {
+            truncated = true;
+            let excess = output.len() - MAX_RUN_OUTPUT_BYTES;
+            output.drain(..excess);
+        }
     }
 }
 
@@ -408,11 +429,42 @@ async fn abort_task<T>(task: &mut JoinHandle<T>) {
     let _ = task.await;
 }
 
+/// Guarantees a gate child's WHOLE process group dies, not just the `sh -c`
+/// wrapper `kill_on_drop` reaches. `spawn_check_child` puts the child in its
+/// own group via `.process_group(0)` (mirroring rk-harness's launcher); this
+/// guard sends the negative-pid signal that actually reaches everything in
+/// it. Disarmed only on the clean-completion path — every other exit from
+/// `collect_child_output` (reader/wait join failure, timeout, or this
+/// function's future simply being dropped out from under it) drops the guard
+/// still armed and kills whatever the check left running, so a `mise`/
+/// `cargo`/`rustc` grandchild can no longer outlive its `sh -c` parent.
+struct ProcessGroupGuard(Option<u32>);
+
+impl ProcessGroupGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            // SAFETY: plain kill(2) on a process group we created ourselves
+            // via `.process_group(0)` — the negative pid targets the group,
+            // not the single process.
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+    }
+}
+
 async fn collect_child_output(
     mut child: tokio::process::Child,
     timeout: Duration,
     command: &str,
 ) -> rk_core::Result<RunOutcome> {
+    let mut group_guard = ProcessGroupGuard(child.id());
     let stdout = child
         .stdout
         .take()
@@ -423,8 +475,9 @@ async fn collect_child_output(
         .ok_or_else(|| rk_core::Error::other("run step: child stderr was not piped"))?;
 
     // Put the child in a task whose cancellation/drop semantics own the
-    // process. Reader overflow, join failure, and timeout all abort this task,
-    // dropping the kill_on_drop child and preventing orphaned checks.
+    // immediate process. Join failure and timeout both abort this task,
+    // dropping the kill_on_drop child; `group_guard` above is what reaches
+    // any grandchildren it left behind.
     let mut wait_task = tokio::spawn(async move { child.wait().await });
     let mut stdout_task = tokio::spawn(read_capped(stdout));
     let mut stderr_task = tokio::spawn(read_capped(stderr));
@@ -534,10 +587,18 @@ async fn collect_child_output(
         }
     }
 
+    // The child exited on its own — the group is (or will imminently be)
+    // empty either way, and killing it here would race a legitimately
+    // finished process; nothing left for `group_guard` to clean up.
+    group_guard.disarm();
+    let stdout = stdout.expect("stdout completed with all child tasks");
+    let stderr = stderr.expect("stderr completed with all child tasks");
     Ok(RunOutcome::Completed {
         status: status.expect("status completed with all child tasks"),
-        stdout: stdout.expect("stdout completed with all child tasks"),
-        stderr: stderr.expect("stderr completed with all child tasks"),
+        stdout: stdout.bytes,
+        stdout_truncated: stdout.truncated,
+        stderr: stderr.bytes,
+        stderr_truncated: stderr.truncated,
     })
 }
 
@@ -2394,7 +2455,7 @@ impl WorkflowEngine {
         // guard is ever loosened.
         let attempts = resolved.retry_on_fail.saturating_add(1);
         let mut history: Vec<Value> = Vec::new();
-        let mut settled: Option<(i64, String, String, bool, &'static str)> = None;
+        let mut settled: Option<(i64, String, bool, String, bool, bool, &'static str)> = None;
         for attempt in 1..=attempts {
             let outcome = self
                 .spawn_check_child(&command, &dir, &resolved, &agent, run, ctx, timeout)
@@ -2405,27 +2466,34 @@ impl WorkflowEngine {
             // output is genuinely gone (the reader tasks are aborted with the
             // child), so stderr carries the explanation instead of a lie about
             // what the suite printed.
-            let (exit, stdout, stderr, timed_out) = match outcome {
-                RunOutcome::Completed {
-                    status,
-                    stdout,
-                    stderr,
-                } => (
-                    status.code().unwrap_or(-1) as i64,
-                    String::from_utf8_lossy(&stdout).into_owned(),
-                    String::from_utf8_lossy(&stderr).into_owned(),
-                    false,
-                ),
-                RunOutcome::TimedOut => (
-                    TIMEOUT_EXIT,
-                    String::new(),
-                    format!(
-                        "run step: `{command}` timed out after {} and was killed",
-                        resolved.timeout
+            let (exit, stdout, stdout_truncated, stderr, stderr_truncated, timed_out) =
+                match outcome {
+                    RunOutcome::Completed {
+                        status,
+                        stdout,
+                        stdout_truncated,
+                        stderr,
+                        stderr_truncated,
+                    } => (
+                        status.code().unwrap_or(-1) as i64,
+                        String::from_utf8_lossy(&stdout).into_owned(),
+                        stdout_truncated,
+                        String::from_utf8_lossy(&stderr).into_owned(),
+                        stderr_truncated,
+                        false,
                     ),
-                    true,
-                ),
-            };
+                    RunOutcome::TimedOut => (
+                        TIMEOUT_EXIT,
+                        String::new(),
+                        false,
+                        format!(
+                            "run step: `{command}` timed out after {} and was killed",
+                            resolved.timeout
+                        ),
+                        false,
+                        true,
+                    ),
+                };
             // The routable three-way summary. `exit` alone cannot express it:
             // a suite may exit 124 on its own, and "did not finish" calls for
             // a different hand-off than "finished and said no".
@@ -2446,13 +2514,21 @@ impl WorkflowEngine {
             // (TKT-01M02QT9KTDY2CN6YJEVP3VCF8).
             if timed_out && resolved.on_timeout == OnTimeout::Fail {
                 self.record_gate_failure(
-                    id, repo, &agent, &command, exit, verdict, timed_out, &stdout, &stderr,
-                    &history,
+                    id, repo, &agent, &command, exit, verdict, timed_out, &stdout,
+                    stdout_truncated, &stderr, stderr_truncated, &history,
                 );
                 return Err(rk_core::Error::other(stderr));
             }
             if verdict == "pass" || attempt == attempts {
-                settled = Some((exit, stdout, stderr, timed_out, verdict));
+                settled = Some((
+                    exit,
+                    stdout,
+                    stdout_truncated,
+                    stderr,
+                    stderr_truncated,
+                    timed_out,
+                    verdict,
+                ));
                 break;
             }
             info!(
@@ -2469,13 +2545,15 @@ impl WorkflowEngine {
         }
         // `attempts >= 1`, and `settled` is always set on the final iteration
         // (attempt == attempts), so the loop never exits without it.
-        let (exit, stdout, stderr, timed_out, verdict) =
+        let (exit, stdout, stdout_truncated, stderr, stderr_truncated, timed_out, verdict) =
             settled.expect("run step: attempt loop always settles by the final attempt");
         info!(agent = %agent, exit, timed_out, verdict, command = %command, retries = history.len(), "run step completed");
         let mut result = json!({
             "exit": exit,
             "stdout": stdout,
+            "stdout_truncated": stdout_truncated,
             "stderr": stderr,
+            "stderr_truncated": stderr_truncated,
             "timed_out": timed_out,
             "verdict": verdict,
         });
@@ -2491,7 +2569,8 @@ impl WorkflowEngine {
         // instance error (TKT-01M02AMKD24WZVVMARJPXKYKSW).
         if verdict != "pass" {
             self.record_gate_failure(
-                id, repo, &agent, &command, exit, verdict, timed_out, &stdout, &stderr, &history,
+                id, repo, &agent, &command, exit, verdict, timed_out, &stdout, stdout_truncated,
+                &stderr, stderr_truncated, &history,
             );
         }
 
@@ -2543,7 +2622,12 @@ impl WorkflowEngine {
             .stderr(std::process::Stdio::piped())
             // Kill the suite if the timeout below drops the wait future, so a
             // hung check leaves no orphan behind.
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            // Its own process group (mirroring rk-harness's launcher): lets
+            // `ProcessGroupGuard` in `collect_child_output` reach every
+            // descendant this check spawns (mise/cargo/rustc under `sh -c`),
+            // not just the `sh` wrapper `kill_on_drop` kills on its own.
+            .process_group(0);
         // Named checks routinely shell back into `rk` (escalation needs, rework
         // tickets), but the child inherits the DAEMON's environment — and the
         // daemon's PATH is whatever its first auto-starting client happened to
@@ -2614,7 +2698,9 @@ impl WorkflowEngine {
         verdict: &str,
         timed_out: bool,
         stdout: &str,
+        stdout_truncated: bool,
         stderr: &str,
+        stderr_truncated: bool,
         history: &[Value],
     ) {
         let failing_tests = extract_failing_tests(stdout);
@@ -2626,7 +2712,9 @@ impl WorkflowEngine {
             "verdict": verdict,
             "timed_out": timed_out,
             "stdout_tail": bounded_tail(stdout, GATE_EVIDENCE_LIMIT),
+            "stdout_truncated": stdout_truncated,
             "stderr_tail": bounded_tail(stderr, GATE_EVIDENCE_LIMIT),
+            "stderr_truncated": stderr_truncated,
             "failing_tests": failing_tests,
             "retries": history,
         });
@@ -4550,19 +4638,67 @@ test a::flaky ... FAILED
     }
 
     #[tokio::test]
-    async fn run_output_cap_kills_a_noisy_child() {
+    async fn run_output_cap_truncates_but_does_not_kill_a_noisy_child() {
+        // Emits well over MAX_RUN_OUTPUT_BYTES then exits cleanly on its own —
+        // the cap must bound what is kept, not turn a healthy, verbose,
+        // exit-0 suite into an instance failure.
+        let command = "yes noisy | head -c 300000";
         let child = tokio::process::Command::new("sh")
             .arg("-c")
-            .arg("yes noisy")
+            .arg(command)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let error = collect_child_output(child, Duration::from_secs(2), "yes noisy")
+        let outcome = collect_child_output(child, Duration::from_secs(10), command)
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("output exceeds"));
+            .unwrap();
+        match outcome {
+            RunOutcome::Completed {
+                status,
+                stdout,
+                stdout_truncated,
+                ..
+            } => {
+                assert!(status.success(), "expected the pipeline to exit 0");
+                assert!(stdout_truncated, "300000 bytes must trip the cap");
+                assert!(stdout.len() <= MAX_RUN_OUTPUT_BYTES);
+            }
+            RunOutcome::TimedOut => panic!("output volume alone must never time out the run"),
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_the_whole_process_group_not_just_the_wrapper() {
+        // `kill_on_drop` alone only reaches the `sh -c` wrapper's own pid; a
+        // grandchild it backgrounds (mise/cargo/rustc in the real case) is
+        // untouched unless the whole process group is signalled.
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("grandchild.pid");
+        let command = format!("sleep 600 & echo $! > {}; wait", pid_file.display());
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(&command)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let child = cmd.spawn().unwrap();
+
+        let outcome = collect_child_output(child, Duration::from_millis(300), &command)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RunOutcome::TimedOut));
+
+        // Give the group-kill signal a moment to land, then confirm the
+        // backgrounded grandchild is actually dead, not merely orphaned.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let pid_text = std::fs::read_to_string(&pid_file).unwrap();
+        let grandchild_pid: i32 = pid_text.trim().parse().unwrap();
+        // SAFETY: signal 0 only probes liveness/permission; it affects nothing.
+        let alive = unsafe { libc::kill(grandchild_pid, 0) == 0 };
+        assert!(!alive, "grandchild `sleep` survived the gate timeout");
     }
 
     #[test]
