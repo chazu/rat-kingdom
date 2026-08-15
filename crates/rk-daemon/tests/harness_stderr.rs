@@ -57,6 +57,15 @@ case "$RK_TASK" in
     echo 'giving up after 3 attempts' >&2
     exit 1
     ;;
+  *)
+    # Any other RK_TASK is treated as a marker-death run (see
+    # `stderr_ordering_never_races_exited`): the marker IS the task name,
+    # written to stderr with nothing else around it and no delay before the
+    # process exits, to press hardest on the window between the stderr drain
+    # task and the Exited publish.
+    echo "$RK_TASK" >&2
+    exit 1
+    ;;
 esac
 "#;
 
@@ -181,4 +190,78 @@ async fn silent_death_folds_stderr_into_the_published_result() {
         .as_str()
         .unwrap()
         .contains("giving up after 3 attempts"));
+}
+
+/// The stderr drain runs on its own tokio task, independent of the one that
+/// waits on the child and publishes `Exited` (rk-harness `runner::launch`).
+/// Without joining the drain before publishing, the final stderr line and
+/// `Exited` race onto the shared event channel in either order — so a run
+/// that happened to get lucky could still publish a failure missing its own
+/// last (and here, only) line of explanation. A single run of this scenario
+/// could pass by luck even on a build with the race still present, so it
+/// repeats across several concurrently-spawned agents, each with its own
+/// distinctive marker, to turn a coin-flip into a reliable regression check.
+#[tokio::test]
+async fn stderr_ordering_never_races_exited() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    const RUNS: usize = 12;
+    let mut names = Vec::with_capacity(RUNS);
+    for i in 0..RUNS {
+        // The marker line the fake harness writes to stderr immediately
+        // before exiting IS the task name (see the `FAKE` script's default
+        // case), so each concurrently-spawned agent has its own distinctive
+        // last word to look for.
+        let marker = format!("marker-death-{i}");
+        let spawned = client
+            .call(
+                "agent.spawn",
+                json!({
+                    "repo": repo_dir.path().to_string_lossy(),
+                    "task": marker,
+                    "harness": "fake",
+                }),
+            )
+            .await
+            .unwrap();
+        names.push(spawned["agent"]["name"].as_str().unwrap().to_string());
+    }
+
+    for (i, name) in names.iter().enumerate() {
+        let marker = format!("marker-death-{i}");
+        let mut status = json!({});
+        let mut failed = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            status = client
+                .call("agent.status", json!({"name": name}))
+                .await
+                .unwrap();
+            if status["agent"]["state"] == "failed" {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "{name} never reached the failed terminal state");
+
+        let tail = status["agent"]["stderr_tail"].as_str().unwrap_or("");
+        assert!(
+            tail.contains(&marker),
+            "{name}: stderr_tail missing its own marker — the final stderr \
+             line lost the race against Exited. tail was: {tail:?}"
+        );
+        let result = status["agent"]["result"].as_str().unwrap_or("");
+        assert!(
+            result.contains(&marker),
+            "{name}: published result missing its own marker, got: {result:?}"
+        );
+    }
 }

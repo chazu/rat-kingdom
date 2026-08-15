@@ -74,27 +74,40 @@ async fn supervisor_persists_transcript_and_log_serves_it() {
     }
     assert!(completed, "agent never completed");
 
-    // The transcript captured both the prose chunk and the tool call.
+    // The transcript captured both the prose chunk and the tool call. Real
+    // environments can emit incidental harness stderr (e.g. a shell locale
+    // warning) that the fixture script never asked for, and it is not
+    // guaranteed to land before or after the fixture's own lines — so locate
+    // the fixture's entries by content/tag instead of assuming a fixed
+    // position or count.
     let log = client
         .call("agent.log", json!({"name": name}))
         .await
         .unwrap();
     let entries = log["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 2, "text + tool call persisted");
-    assert_eq!(entries[0]["kind"], "text");
-    assert_eq!(entries[0]["text"], "planning the gnaw");
-    assert_eq!(entries[1]["kind"], "tool");
-    assert_eq!(entries[1]["name"], "Bash");
-    assert!(entries[0]["ts"].is_string(), "each entry is timestamped");
+    let non_stderr: Vec<_> = entries.iter().filter(|e| e["kind"] != "stderr").collect();
+    assert_eq!(
+        non_stderr.len(),
+        2,
+        "text + tool call persisted (ignoring incidental stderr): {entries:?}"
+    );
+    assert_eq!(non_stderr[0]["kind"], "text");
+    assert_eq!(non_stderr[0]["text"], "planning the gnaw");
+    assert_eq!(non_stderr[1]["kind"], "tool");
+    assert_eq!(non_stderr[1]["name"], "Bash");
+    assert!(non_stderr[0]["ts"].is_string(), "each entry is timestamped");
 
-    // `tail` bounds the result to the most-recent entries.
+    // `tail` bounds the result to the most-recent entries: verify it returns
+    // exactly the true last entry, whatever kind that happens to be, rather
+    // than assuming it is the fixture's tool call (incidental stderr could
+    // legitimately be the last line captured).
     let tailed = client
         .call("agent.log", json!({"name": name, "tail": 1}))
         .await
         .unwrap();
     let tail = tailed["entries"].as_array().unwrap();
     assert_eq!(tail.len(), 1);
-    assert_eq!(tail[0]["kind"], "tool");
+    assert_eq!(&tail[0], entries.last().unwrap(), "tail returns the true last entry");
 
     // An unknown agent is an empty transcript, not an error.
     let empty = client

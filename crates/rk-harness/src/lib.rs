@@ -212,6 +212,7 @@ pub(crate) mod runner {
 
     use super::*;
     use std::process::Stdio;
+    use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command;
     use tracing::{debug, warn};
@@ -262,8 +263,10 @@ pub(crate) mod runner {
 
         // Drained on its own task, mirroring stdout: stderr is diagnostic
         // exhaust, not protocol, so a slow/absent reader of `events` must never
-        // back up the child's stderr pipe and stall it.
-        if let Some(stderr) = stderr {
+        // back up the child's stderr pipe and stall it. The handle is joined
+        // (below, bounded) before `Exited` is published, so a silent
+        // zero-token death never races its own explanation onto the wire.
+        let stderr_task = stderr.map(|stderr| {
             let stderr_tx = event_tx.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
@@ -285,8 +288,8 @@ pub(crate) mod runner {
                         }
                     }
                 }
-            });
-        }
+            })
+        });
 
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
@@ -333,6 +336,21 @@ pub(crate) mod runner {
                     None
                 }
             };
+            // Join the stderr drain before publishing `Exited`: it sends on a
+            // clone of the same channel from an independent task, so without
+            // this the final stderr line(s) can race `Exited` onto the wire
+            // out of order — exactly defeating a silent zero-token death's
+            // one trace of why. Bounded because an orphaned grandchild can
+            // hold the pipe open past the parent's own exit; best effort past
+            // the bound beats hanging the whole session on it.
+            if let Some(stderr_task) = stderr_task {
+                if tokio::time::timeout(Duration::from_millis(500), stderr_task)
+                    .await
+                    .is_err()
+                {
+                    warn!("stderr drain still running past exit; publishing without full tail");
+                }
+            }
             debug!(?code, "harness child exited");
             let _ = event_tx.send(HarnessEvent::Exited { code }).await;
         });
