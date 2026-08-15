@@ -258,7 +258,9 @@ On **every rat completion** (`Event/harness_result`, emitted by
 4. runs the repo's **real test/lint gate** (`run` step — teeth the harness
    cannot forge);
 5. `read`s the reviewer's `APPROVE`/`REWORK`/`STOP` verdict artifact and routes:
-   - `APPROVE` → `land` the branch straight onto `main` (auto-merge);
+   - `APPROVE` → `land` the branch onto its **land target** (auto-merge —
+     usually `main`; see [Land target inheritance](#land-target-inheritance)
+     below for when it is not);
    - `REWORK` → file a follow-up ticket, hold the branch;
    - `STOP` / unknown → escalate via a `need` tuple (ranked into `rk inbox`
      *and* pushed to the operator's desktop by the [escalation-notify
@@ -268,6 +270,45 @@ Every gate **fails closed**: a protected-path hit, an over-budget diff, or a red
 suite fails the instance so the branch is never merged and the failure surfaces
 in `rk inbox`. Auto-merge is only ever reached through a clean policy gate, a
 within-budget diff, a green suite, *and* an explicit `APPROVE`.
+
+### Land target inheritance
+
+`steward.cue` declares `target` with `default: "main"`, but the shipped
+`steward-on-completion` trigger does not rely on that default — it pins
+`target: "{{tuple.payload.target}}"`, reading the value straight off the
+completed rat's own `harness_result`. That payload field is
+`record.target_branch` (`supervisor.rs`): the completed rat's own `--base` when
+one was given at spawn, else the repo's configured delivery target. So the
+steward's land target silently **inherits the completed rat's base branch**,
+not a fixed `main`.
+
+This is deliberate for chained work: a rework rat spawned with
+`--base rat/feature/original-branch` (or a workflow step chained onto a prior
+step's branch) wants ITS steward to review-and-land onto that same feature
+branch, not skip past it to `main` — the feature branch is then stewarded to
+`main` as a whole once complete. Pinning `target` to a fixed value in the
+trigger would break that ergonomics.
+
+The tradeoff is that the land target is otherwise invisible: a completed
+steward reads the same in `rk workflow list` whether it landed on `main` or on
+someone's feature branch, and an operator can easily assume "steward finished"
+means "reached main". Two things make a non-`main` target visible instead of
+silent:
+
+- **`rk workflow list`** appends `target=<branch>` to any instance whose
+  `params.target` is set and is not `"main"`.
+- **`reactor_non_main_land_target` event.** Whenever `try_fire` fires a
+  trigger whose interpolated params carry a `target` other than `"main"` (not
+  only the steward — any trigger that passes a `target` param through), the
+  reactor writes a repo-scoped `Event` — `{trigger, workflow, instance, target,
+  branch}` — authored by the reserved `reactor` instance, and logs a `warn`.
+  Read the live set with `rk scan event <repo>`.
+
+If you want base-chained completions reviewed but held for an explicit
+decision instead of auto-landed, override `target` in a repo-local copy of the
+trigger (pin it to `"main"` or the repo's configured delivery target) rather
+than editing the shared global one — that changes the tradeoff for every
+chained/rework rat in the repo, including the ones the ergonomics exists for.
 
 **Re-entrancy — match scoping.** The steward is the worked example of the fourth
 re-entrancy technique: its trigger's `match.search` is `"role":"rat"`, so it
@@ -489,10 +530,11 @@ notify_escalations = true # desktop-push a steward escalation via herdr; false =
   `rk_workflow::load_triggers`.
 - Reactor: `crates/rk-daemon/src/reactor.rs` (`Reactor::run_cycle`, plus the
   built-ins `Reactor::promote_conventions`, `Reactor::coalesce_obstacles`,
-  `Reactor::notify_escalation`, and the resolution backlinks
-  `Reactor::link_resolution` / `Reactor::steer_from_resolution`),
-  spawned as a loop next to the GC and sync loops in
-  `crates/rk-daemon/src/server.rs`.
+  `Reactor::notify_escalation`, `Reactor::note_non_main_land_target` (the
+  [land target inheritance](#land-target-inheritance) visibility event), and
+  the resolution backlinks `Reactor::link_resolution` /
+  `Reactor::steer_from_resolution`), spawned as a loop next to the GC and sync
+  loops in `crates/rk-daemon/src/server.rs`.
 - Suggest/endorse + `--resolves` sugar: `crates/rk-cli/src/space_cmds.rs`
   (`suggest`, `endorse`, `out`).
 - Config: `rk_core::config::ReactorConfig`.

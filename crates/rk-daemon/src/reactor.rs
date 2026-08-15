@@ -840,7 +840,7 @@ impl Reactor {
             stable_workflow_instance_id(&key),
             &trigger.run,
             &repo_path,
-            params,
+            params.clone(),
             None,
         )?;
         info!(
@@ -850,9 +850,57 @@ impl Reactor {
             tuple = %tuple.id,
             "reactor fired workflow"
         );
+        self.note_non_main_land_target(trigger, &repo_name, &instance.id, &params);
         self.mark_fired(&key, trigger, tuple, &instance.id)?;
         self.record_fire(&trigger.name);
         Ok(true)
+    }
+
+    /// A fired trigger whose interpolated params carry a `target` other than
+    /// `"main"` is about to land wherever that value points instead of the
+    /// conventional default — most commonly a steward chained onto a
+    /// rework/workflow rat's own `--base`, inherited via
+    /// `{{tuple.payload.target}}` (see docs/reactor.md, "Land target
+    /// inheritance"). That is sometimes exactly the intended rework-chain
+    /// ergonomics, but it is otherwise invisible: an operator scanning
+    /// `rk workflow list`/`rk inbox` has no way to tell a completed steward
+    /// landed on main from one that landed on a feature branch. Emit a
+    /// repo-scoped event so it surfaces instead of hiding behind a green run.
+    fn note_non_main_land_target(
+        &self,
+        trigger: &Trigger,
+        repo_name: &str,
+        instance_id: &str,
+        params: &HashMap<String, Value>,
+    ) {
+        let Some(target) = params.get("target").and_then(Value::as_str) else {
+            return;
+        };
+        if target.is_empty() || target == "main" {
+            return;
+        }
+        let branch = params.get("branch").and_then(Value::as_str).unwrap_or("");
+        warn!(
+            trigger = %trigger.name,
+            workflow = %trigger.run,
+            instance = %instance_id,
+            target,
+            branch,
+            "reactor fired workflow with a non-main land target"
+        );
+        let _ = self.space.out(Tuple::new(
+            Category::Event,
+            repo_name,
+            "reactor_non_main_land_target",
+            REACTOR_INSTANCE,
+            json!({
+                "trigger": trigger.name,
+                "workflow": trigger.run,
+                "instance": instance_id,
+                "target": target,
+                "branch": branch,
+            }),
+        ));
     }
 
     /// Built-in reaction: push a desktop notification when the steward
