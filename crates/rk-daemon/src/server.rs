@@ -1403,7 +1403,6 @@ impl Daemon {
         });
         let budget = factory_filtered_budget(self.supervisor.fleet_rollup(), filter, &workflows);
         let inbox = self.inbox_value(filter.repo.clone()).await?;
-        let replay = self.factory_events_replay(filter)?;
         let snapshot = crate::factory_events::snapshot_value(
             json!(agents),
             json!(workflows),
@@ -1413,7 +1412,10 @@ impl Daemon {
             approvals,
             json!({
                 "cursor": self.latest_event_cursor(),
-                "required": replay["truncated"].as_bool().unwrap_or(false),
+                "required": self
+                    .syncer
+                    .as_ref()
+                    .is_some_and(|syncer| syncer.is_running()),
             }),
         );
         Ok(
@@ -6342,5 +6344,29 @@ mod display_alias_tests {
                 r.actor
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod factory_snapshot_resync_tests {
+    use super::*;
+    use crate::factory_events::FactoryEventFilter;
+    use rk_core::config::Config;
+
+    #[tokio::test]
+    async fn factory_snapshot_reports_active_repo_resync() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        let mut config = Config::default();
+        config.sync.enabled = true;
+        let daemon = Daemon::new(layout, &config).unwrap();
+        let syncer = daemon.syncer.as_ref().unwrap().clone();
+        syncer.set_running_for_test(true);
+
+        let snapshot = daemon
+            .factory_snapshot(&FactoryEventFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(snapshot["snapshot"]["repo_resync"]["required"], true);
     }
 }
