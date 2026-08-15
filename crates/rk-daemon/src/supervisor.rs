@@ -1032,6 +1032,7 @@ impl Supervisor {
                     .await
                 {
                     Ok(Some(tuple)) => {
+                        let diff = supervisor.diff_summary_for(&agent);
                         let updated = supervisor.lock_registry().update(&agent, |r| {
                             r.state = AgentState::Completed;
                             r.result = tuple.payload["summary"]
@@ -1040,7 +1041,7 @@ impl Supervisor {
                                 .or(Some("done".into()));
                         });
                         if let Ok(Some(record)) = updated {
-                            supervisor.route_completion(&record, false, true);
+                            supervisor.route_completion(&record, false, true, diff);
                             rk_mux::HerdrMux::notify(
                                 &format!("{agent} finished"),
                                 record.result.as_deref().unwrap_or(""),
@@ -1360,6 +1361,7 @@ impl Supervisor {
                 cost_usd,
                 session_id,
             } => {
+                let diff = self.diff_summary_for(name);
                 let updated = self.lock_registry().update(name, |r| {
                     r.state = if is_error {
                         AgentState::Failed
@@ -1386,7 +1388,7 @@ impl Supervisor {
                     );
                     if claim.publish {
                         info!(agent = name, is_error, "agent completed");
-                        self.route_completion(&record, is_error, claim.declared_done);
+                        self.route_completion(&record, is_error, claim.declared_done, diff);
                     } else {
                         info!(
                             agent = name,
@@ -1397,6 +1399,7 @@ impl Supervisor {
                 }
             }
             HarnessEvent::Exited { code } => {
+                let diff = self.diff_summary_for(name);
                 self.lock_controls().remove(name);
                 let updated = self.lock_registry().update(name, |r| {
                     r.pid = None;
@@ -1463,7 +1466,7 @@ impl Supervisor {
                             "agent ended without ever running `rk done`; publishing its last \
                              turn result as a failure"
                         );
-                        self.route_completion(&record, true, false);
+                        self.route_completion(&record, true, false, diff);
                     }
                 }
             }
@@ -2453,13 +2456,35 @@ impl Supervisor {
         }
     }
 
+    /// The diff summary for a completion, computed BEFORE the registry state
+    /// flips to a terminal state. Ordering matters: consumers (tests, tooling,
+    /// the reactor) observe `state == completed` via RPC and then expect the
+    /// `harness_result` event to already be visible, so the git subprocesses
+    /// behind [`Self::diff_summary`] must run before the flip, not between
+    /// the flip and the emit — that gap is a race two integration tests
+    /// caught on this branch's first gate runs.
+    fn diff_summary_for(&self, name: &str) -> DiffSummary {
+        let record = self.lock_registry().get(name).cloned();
+        match record {
+            Some(record) => self.diff_summary(&record),
+            None => DiffSummary::fallback(),
+        }
+    }
+
     /// Route a completion up the spawn tree: the structural parent gets a
     /// directed message; the repo scope gets the event either way.
     ///
     /// Reached exactly once per agent generation — see
     /// [`Self::claim_completion`] for what "once" means and why it matters.
-    fn route_completion(&self, record: &AgentRecord, is_error: bool, declared_done: bool) {
-        let diff = self.diff_summary(record);
+    /// `diff` is precomputed via [`Self::diff_summary_for`] before the caller
+    /// flips the agent's registry state — see that method for why.
+    fn route_completion(
+        &self,
+        record: &AgentRecord,
+        is_error: bool,
+        declared_done: bool,
+        diff: DiffSummary,
+    ) {
         self.emit_event(
             &record.repo_name,
             "harness_result",
