@@ -289,21 +289,43 @@ pub(crate) mod runner {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 let mut backlog: VecDeque<String> = VecDeque::new();
-                loop {
+                'read: loop {
                     match lines.next_line().await {
                         Ok(Some(line)) => {
-                            match stderr_tx.try_send(HarnessEvent::Stderr { text: line }) {
-                                Ok(()) => {}
-                                Err(TrySendError::Full(HarnessEvent::Stderr { text })) => {
-                                    if backlog.len() == STDERR_BACKLOG_CAP {
-                                        backlog.pop_front();
+                            // FIFO: older spilled lines go first. Drain the
+                            // backlog head opportunistically, and while ANY
+                            // backlog remains the new line queues behind it —
+                            // sending a newer line into a recovered channel
+                            // slot would publish stderr out of order.
+                            while let Some(text) = backlog.pop_front() {
+                                match stderr_tx.try_send(HarnessEvent::Stderr { text }) {
+                                    Ok(()) => {}
+                                    Err(TrySendError::Full(HarnessEvent::Stderr { text })) => {
+                                        backlog.push_front(text);
+                                        break;
                                     }
-                                    backlog.push_back(text);
+                                    Err(TrySendError::Full(_)) => unreachable!(
+                                        "try_send is only ever called with HarnessEvent::Stderr here"
+                                    ),
+                                    Err(TrySendError::Closed(_)) => break 'read,
                                 }
-                                Err(TrySendError::Full(_)) => unreachable!(
-                                    "try_send is only ever called with HarnessEvent::Stderr here"
-                                ),
-                                Err(TrySendError::Closed(_)) => break,
+                            }
+                            if backlog.is_empty() {
+                                match stderr_tx.try_send(HarnessEvent::Stderr { text: line }) {
+                                    Ok(()) => {}
+                                    Err(TrySendError::Full(HarnessEvent::Stderr { text })) => {
+                                        backlog.push_back(text);
+                                    }
+                                    Err(TrySendError::Full(_)) => unreachable!(
+                                        "try_send is only ever called with HarnessEvent::Stderr here"
+                                    ),
+                                    Err(TrySendError::Closed(_)) => break 'read,
+                                }
+                            } else {
+                                if backlog.len() == STDERR_BACKLOG_CAP {
+                                    backlog.pop_front();
+                                }
+                                backlog.push_back(line);
                             }
                         }
                         Ok(None) => break, // EOF
