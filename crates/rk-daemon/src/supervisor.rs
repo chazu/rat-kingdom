@@ -277,6 +277,7 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
         merge_commit: None,
         state: AgentState::Spawning,
         crashed: false,
+        stderr_tail: None,
         result: None,
         progress: None,
         usage: TokenUsage::default(),
@@ -1192,6 +1193,11 @@ impl Supervisor {
                 // record, so a workflow waiting on it stops treating it as
                 // abandoned (TKT-147).
                 r.crashed = false;
+                // The prior generation's stderr tail describes a run that is
+                // now gone; a retry that fails silently, with no stderr of its
+                // own, must not publish that stale diagnosis as if it were
+                // current.
+                r.stderr_tail = None;
             })?
             .ok_or_else(|| rk_core::Error::other("record vanished"))?;
         self.lock_controls()
@@ -1283,6 +1289,9 @@ impl Supervisor {
                 current.attach_target = Some(target.clone());
                 current.result = None;
                 current.crashed = false;
+                // See the ordinary respawn path above: a stale stderr tail
+                // from the previous generation must not survive a retry.
+                current.stderr_tail = None;
             })?
             .ok_or_else(|| rk_core::Error::other("record vanished"))?;
 
@@ -1413,8 +1422,17 @@ impl Supervisor {
                         // workflow `wait`/`evaluate` has to be able to tell a
                         // rat that produced nothing from one that ran (TKT-147).
                         r.crashed = true;
-                        r.result =
-                            Some(format!("process exited (code {code:?}) without completing"));
+                        let base = format!("process exited (code {code:?}) without completing");
+                        // A starved/misconfigured harness (rate limit, queueing,
+                        // auth refresh, model unavailable) can produce zero
+                        // protocol output and die silently — stderr is the only
+                        // trace of why, so fold its tail into the published
+                        // result rather than leaving this message as the whole
+                        // story wherever `result` is read (inbox, harness_result).
+                        r.result = Some(match r.stderr_snippet() {
+                            Some(snippet) => format!("{base} — stderr: {snippet}"),
+                            None => base,
+                        });
                     }
                 });
                 // The process is gone, so no further turn can follow: a turn
@@ -1489,6 +1507,16 @@ impl Supervisor {
                     generation,
                     crate::agent_log::LogEvent::Retry { attempt, error },
                 );
+            }
+            HarnessEvent::Stderr { text } => {
+                self.log.append(
+                    name,
+                    generation,
+                    crate::agent_log::LogEvent::Stderr { text: text.clone() },
+                );
+                let _ = self.lock_registry().update(name, |r| {
+                    crate::agents::append_stderr_tail(&mut r.stderr_tail, &text);
+                });
             }
         }
     }
@@ -4204,6 +4232,7 @@ mod respawn_tests {
             merge_commit: None,
             state: AgentState::Failed,
             crashed: false,
+            stderr_tail: None,
             result: None,
             progress: None,
             usage: TokenUsage::default(),

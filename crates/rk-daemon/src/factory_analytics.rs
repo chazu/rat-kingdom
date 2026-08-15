@@ -709,6 +709,7 @@ mod tests {
             merge_commit: None,
             state: AgentState::Completed,
             crashed: false,
+            stderr_tail: None,
             result: Some("did the work".into()),
             progress: None,
             usage: Default::default(),

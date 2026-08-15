@@ -94,6 +94,11 @@ pub struct AgentRecord {
     /// [`crashed_without_reporting`]: AgentRecord::crashed_without_reporting
     #[serde(default)]
     pub crashed: bool,
+    /// Bounded tail of this generation's harness stderr (see
+    /// [`append_stderr_tail`]), kept alongside the record so a silent
+    /// zero-token death still leaves a trace of why once the process is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_tail: Option<String>,
     pub result: Option<String>,
     /// Latest semantic checkpoint for this generation, if the agent has
     /// reported one. Stored with the registry so snapshots survive restart.
@@ -144,12 +149,56 @@ impl AgentRecord {
                 && self.usage.total() == 0)
     }
 
+    /// A one-line snippet of [`stderr_tail`](Self::stderr_tail) — its last
+    /// non-empty line, capped so it stays legible folded into a `result`
+    /// string or an inbox row rather than reproducing the whole tail there.
+    /// `None` if nothing was ever captured.
+    pub fn stderr_snippet(&self) -> Option<String> {
+        const MAX_SNIPPET: usize = 200;
+        let tail = self.stderr_tail.as_deref()?;
+        let line = tail.lines().rev().find(|l| !l.trim().is_empty())?;
+        Some(match line.char_indices().nth(MAX_SNIPPET) {
+            Some((idx, _)) => format!("{}…", &line[..idx]),
+            None => line.to_string(),
+        })
+    }
+
     /// Identity of one *generation* of a name. Names are not recycled (see
     /// [`Registry::reserve_name`]), so this exists for the one case that can
     /// still put two rows under one name: the archive/persist crash window,
     /// where `created_at` tells the archived copy from the live one.
     fn generation(&self) -> (&str, DateTime<Utc>) {
         (self.name.as_str(), self.created_at)
+    }
+}
+
+/// Cap on [`AgentRecord::stderr_tail`]: a chatty or looping harness must never
+/// grow the record without bound, so only the most recent slice survives.
+const STDERR_TAIL_CAP_BYTES: usize = 64 * 1024;
+
+/// Append one stderr line to a bounded tail, keeping only the most recent
+/// [`STDERR_TAIL_CAP_BYTES`] and snapping forward to the next line boundary so
+/// the kept text never opens mid-line — same discipline as
+/// [`agent_log::trim_to_tail`](crate::agent_log), applied in memory instead of
+/// on disk.
+pub fn append_stderr_tail(tail: &mut Option<String>, line: &str) {
+    let buf = tail.get_or_insert_with(String::new);
+    if !buf.is_empty() {
+        buf.push('\n');
+    }
+    buf.push_str(line);
+    if buf.len() > STDERR_TAIL_CAP_BYTES {
+        // `buf.len() - CAP` is a raw byte offset that can land mid-character;
+        // walk forward to the next valid boundary before slicing.
+        let mut start = buf.len() - STDERR_TAIL_CAP_BYTES;
+        while !buf.is_char_boundary(start) {
+            start += 1;
+        }
+        let boundary = buf[start..]
+            .find('\n')
+            .map(|i| start + i + 1)
+            .unwrap_or(start);
+        buf.replace_range(..boundary, "");
     }
 }
 
@@ -563,6 +612,7 @@ mod tests {
             merge_commit: None,
             state,
             crashed: false,
+            stderr_tail: None,
             result: None,
             progress: None,
             usage: TokenUsage::default(),
@@ -624,6 +674,52 @@ mod tests {
         assert!(!ran("Remy", AgentState::Dismissed).crashed_without_reporting());
         // Nor a live one that simply has not reported yet.
         assert!(!record("Twitch", AgentState::Running).crashed_without_reporting());
+    }
+
+    #[test]
+    fn stderr_tail_keeps_only_the_most_recent_lines() {
+        let mut tail = None;
+        // Push well past the 64 KiB cap with distinguishable lines (~10 bytes
+        // each including the separator, so 10,000 lines is comfortably over).
+        for i in 0..10_000 {
+            append_stderr_tail(&mut tail, &format!("line {i}"));
+        }
+        let tail = tail.unwrap();
+        assert!(
+            tail.len() <= STDERR_TAIL_CAP_BYTES,
+            "tail should be capped, got {} bytes",
+            tail.len()
+        );
+        assert!(tail.ends_with("line 9999"), "newest line survives");
+        assert!(!tail.contains("line 0\n"), "oldest lines are dropped");
+        // Never opens mid-line: the first surviving line is whole.
+        assert!(!tail.starts_with("ine "), "trim snapped to a line boundary");
+    }
+
+    #[test]
+    fn stderr_tail_truncation_never_splits_a_multibyte_codepoint() {
+        let mut tail = None;
+        // Multi-byte filler so a naive byte-offset cap would panic mid-char.
+        let filler = "日本語のログ行です".repeat(50);
+        for _ in 0..50 {
+            append_stderr_tail(&mut tail, &filler);
+        }
+        // No panic is the assertion; a valid `String` proves the boundary held.
+        assert!(tail.unwrap().len() <= STDERR_TAIL_CAP_BYTES + filler.len());
+    }
+
+    #[test]
+    fn stderr_snippet_is_the_last_nonblank_line_capped_and_ellipsized() {
+        let mut r = record("Pip", AgentState::Failed);
+        assert!(r.stderr_snippet().is_none(), "nothing captured yet");
+
+        r.stderr_tail = Some("first error\nsecond, worse error\n\n".into());
+        assert_eq!(r.stderr_snippet().as_deref(), Some("second, worse error"));
+
+        r.stderr_tail = Some("x".repeat(500));
+        let snippet = r.stderr_snippet().unwrap();
+        assert!(snippet.ends_with('…'));
+        assert_eq!(snippet.chars().count(), 201, "200 chars plus the ellipsis");
     }
 
     #[test]

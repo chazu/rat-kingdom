@@ -650,6 +650,10 @@ fn print_log_entry(entry: &Value, as_json: bool) {
             entry["attempt"].as_u64().unwrap_or(0),
             entry["error"].as_str().unwrap_or("")
         ),
+        Some("stderr") => println!(
+            "{ts}  harness-stderr  {}",
+            entry["text"].as_str().unwrap_or("")
+        ),
         _ => println!("{ts}  {entry}"),
     }
 }

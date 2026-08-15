@@ -230,6 +230,13 @@ fn post_process(mut session: HarnessSession) -> HarnessSession {
                         break;
                     }
                 }
+                HarnessEvent::Stderr { text } => {
+                    if flush_text(&tx, &mut pending_text).await.is_err()
+                        || tx.send(HarnessEvent::Stderr { text }).await.is_err()
+                    {
+                        break;
+                    }
+                }
                 HarnessEvent::Exited { code } => {
                     if flush_text(&tx, &mut pending_text).await.is_err() {
                         break;

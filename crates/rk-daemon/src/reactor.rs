@@ -2047,6 +2047,7 @@ mod tests {
             merge_commit: None,
             state,
             crashed: false,
+            stderr_tail: None,
             result: None,
             progress: None,
             usage: Default::default(),

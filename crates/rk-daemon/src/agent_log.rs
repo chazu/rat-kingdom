@@ -1,7 +1,7 @@
 //! Per-agent event log: a bounded JSONL transcript of what a rat actually did
-//! (assistant prose, tool calls, retries), so the operator can watch a run
-//! without `--attach`ing. `handle_event` used to drop these events on the
-//! floor; here they become a durable timeline instead.
+//! (assistant prose, tool calls, retries, harness stderr), so the operator can
+//! watch a run without `--attach`ing. `handle_event` used to drop these events
+//! on the floor; here they become a durable timeline instead.
 //!
 //! Files live at `<home>/agent-logs/<agent>.<generation>.jsonl`, are byte-capped
 //! ring buffers (a runaway rat cannot fill the disk), and stay strictly local —
@@ -51,7 +51,7 @@ pub struct LogEntry {
     pub event: LogEvent,
 }
 
-/// The subset of `HarnessEvent` worth persisting as a timeline — the three the
+/// The subset of `HarnessEvent` worth persisting as a timeline — the four the
 /// supervisor otherwise discards.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -62,6 +62,10 @@ pub enum LogEvent {
     Tool { name: String },
     /// The harness retried an API error.
     Retry { attempt: u64, error: String },
+    /// A line the harness child wrote to stderr — the only trace left of a
+    /// run that produced zero protocol output (rate limit, queueing, auth
+    /// refresh, model unavailable) before dying.
+    Stderr { text: String },
 }
 
 /// A broadcast record tagging an entry with the generation that wrote it, so
@@ -526,6 +530,25 @@ mod tests {
         write_legacy(tmp.path(), "Ghost", &[(at(10), "a"), (at(20), "b")]);
         let entries = log.read(&Generation::unrecorded("Ghost"), None);
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn stderr_lines_roundtrip_tagged_as_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = log_at(tmp.path());
+        let gen = at(1000);
+        log.append(
+            "cinder",
+            gen,
+            LogEvent::Stderr {
+                text: "rate limited, retrying in 30s".into(),
+            },
+        );
+        let entries = log.read(&only("cinder", gen), None);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            matches!(&entries[0].event, LogEvent::Stderr { text } if text == "rate limited, retrying in 30s")
+        );
     }
 
     /// The upgrade boundary: a rat mid-run when the daemon gained generation
