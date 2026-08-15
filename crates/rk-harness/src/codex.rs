@@ -18,6 +18,16 @@ use tokio::sync::mpsc;
 
 pub struct CodexHarness;
 
+/// Codex's `shell_environment_policy` filters which env vars reach commands
+/// the agent's shell tool executes, independent of `--sandbox`/
+/// `--dangerously-bypass-approvals-and-sandbox`. Left at its default, it
+/// drops `RK_AGENT`/`RK_HOME`/`RK_AUTH_TOKEN`, so `rk` calls the agent makes
+/// from inside the sandbox lose the daemon credentials the harness set on
+/// the codex process itself and fail authentication.
+fn env_policy_args() -> Vec<String> {
+    vec!["-c".into(), "shell_environment_policy.inherit=all".into()]
+}
+
 fn permission_args(permission_mode: Option<&str>) -> Vec<String> {
     match permission_mode {
         Some("read-only") => vec!["--sandbox".into(), "read-only".into()],
@@ -57,6 +67,7 @@ impl Harness for CodexHarness {
             cmd.args(["resume", session]);
         }
         cmd.args(["--json", "--skip-git-repo-check"]);
+        cmd.args(env_policy_args());
         cmd.args(permission_args(spec.permission_mode.as_deref()));
         if let Some(model) = &spec.model {
             cmd.args(["-m", model]);
@@ -206,6 +217,14 @@ pub(crate) fn parse_event_line(line: &str) -> Vec<HarnessEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_policy_preserves_rat_credentials_for_sandboxed_shell_commands() {
+        assert_eq!(
+            env_policy_args(),
+            vec!["-c", "shell_environment_policy.inherit=all"]
+        );
+    }
 
     #[test]
     fn autonomous_modes_bypass_codex_approvals_and_sandbox() {
