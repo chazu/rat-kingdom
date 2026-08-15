@@ -12,7 +12,7 @@ use rk_daemon::reactor::{Reactor, REACTOR_INSTANCE};
 use rk_daemon::repos::{RepoRecord, RepoRegistry};
 use rk_daemon::supervisor::Supervisor;
 use rk_daemon::tickets::{NewTicket, Tickets};
-use rk_daemon::workflow_exec::{Selection, WorkflowEngine};
+use rk_daemon::workflow_exec::{InstanceStatus, Selection, WorkflowEngine};
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -126,6 +126,7 @@ fn build_reactor_and_engine_with_space(
         false,
         Vec::new(),
         vec!["main".into(), "master".into()],
+        0,
     ));
     let reactor = Arc::new(Reactor::new(
         space,
@@ -1763,4 +1764,249 @@ async fn fresh_obstacle_on_resolved_topic_steers_and_reinforces() {
         .filter(|m| m.payload["type"] == json!("resolution_steer"))
         .count();
     assert_eq!(steers, 1, "one steer per obstacle, even after cursor reset");
+}
+
+// --- Admission control (maxInFlight) --------------------------------------
+
+/// A burst of 5 completions against a `maxInFlight: 2` trigger dispatches
+/// exactly 2 immediately and durably queues the rest — never drops them —
+/// draining the queue automatically as running instances complete.
+#[tokio::test]
+async fn max_in_flight_queues_a_burst_and_drains_it_as_slots_free() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    std::fs::write(
+        repo.path().join(".rk/workflows/slow-work.cue"),
+        r#"workflow: { name: "slow-work", steps: [{type: "run", command: "sleep 1"}] }"#,
+    )
+    .unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+
+    let dir = layout.triggers_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("burst.cue"),
+        r#"triggers: [{name: "burst-drain", match: {category: "event", scope: "myrepo", identity: "burst"}, run: "slow-work", maxInFlight: 2}]"#,
+    )
+    .unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let (reactor, engine) =
+        build_reactor_and_engine_with_space(&layout, ReactorConfig::default(), space.clone());
+
+    for i in 0..5 {
+        space
+            .out(Tuple::new(
+                Category::Event,
+                "myrepo",
+                "burst",
+                "Whisker",
+                json!({"i": i}),
+            ))
+            .unwrap();
+    }
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        2,
+        "only 2 dispatch immediately at the cap"
+    );
+    assert_eq!(
+        engine
+            .list()
+            .iter()
+            .filter(|i| i.status == InstanceStatus::Running)
+            .count(),
+        2,
+        "exactly 2 instances running"
+    );
+    let queued = space
+        .scan(&Pattern::category(Category::Event).identity("reactor_queued_fire"))
+        .unwrap();
+    assert_eq!(queued.len(), 3, "the remaining 3 are durably queued, not dropped");
+
+    // Drive the reactor by hand (simulated feed loss) as slots free.
+    let mut ran = 0;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reactor.run_cycle().unwrap();
+        ran = engine.list().len();
+        let queue_now = space
+            .scan(&Pattern::category(Category::Event).identity("reactor_queued_fire"))
+            .unwrap()
+            .len();
+        if ran == 5 && queue_now == 0 {
+            break;
+        }
+    }
+    assert_eq!(ran, 5, "all 5 eventually ran");
+    assert!(
+        space
+            .scan(&Pattern::category(Category::Event).identity("reactor_queued_fire"))
+            .unwrap()
+            .is_empty(),
+        "the queue drains to empty"
+    );
+}
+
+/// A permanently-failing fire (here: a workflow's missing required param) must
+/// not pin the reactor's global cursor forever. After `MAX_FIRE_ATTEMPTS`
+/// cycles the reactor gives up on that `(trigger, tuple)` for good, and the
+/// cursor advances past it instead of re-scanning a growing backlog forever.
+#[tokio::test]
+async fn permanently_failing_fire_gives_up_and_unpins_the_cursor() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    std::fs::write(
+        repo.path().join(".rk/workflows/needs-param.cue"),
+        r#"workflow: {
+            name: "needs-param"
+            params: { must: {type: "string", required: true} }
+            steps: [{type: "run", command: "true"}]
+        }"#,
+    )
+    .unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+
+    let dir = layout.triggers_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("needy.cue"),
+        r#"triggers: [{name: "needy-drain", match: {category: "event", scope: "myrepo", identity: "needy"}, run: "needs-param", params: {must: "{{tuple.payload.absent}}"}}]"#,
+    )
+    .unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+    space
+        .out(Tuple::new(
+            Category::Event,
+            "myrepo",
+            "needy",
+            "Whisker",
+            json!({}),
+        ))
+        .unwrap();
+
+    // Bounded retries: the cursor stays pinned while attempts are exhausted.
+    for attempt in 1..5 {
+        assert_eq!(reactor.run_cycle().unwrap(), 0, "attempt {attempt} must not fire");
+        assert!(
+            !home.path().join("reactor-cursor").exists(),
+            "attempt {attempt}: still retrying, cursor must stay pinned"
+        );
+    }
+    // The final attempt gives up: no fire, but the cursor now advances.
+    assert_eq!(reactor.run_cycle().unwrap(), 0);
+    assert!(
+        home.path().join("reactor-cursor").exists(),
+        "after MAX_FIRE_ATTEMPTS the reactor must give up and unpin the cursor"
+    );
+    let gave_up = space
+        .scan(&Pattern::category(Category::Obstacle).identity("reactor_fire_gave_up"))
+        .unwrap();
+    assert_eq!(gave_up.len(), 1);
+
+    // A later, unrelated tuple on a healthy trigger still dispatches normally.
+    write_trigger(&layout);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    space.out(ping()).unwrap();
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        1,
+        "a later unrelated trigger must still dispatch after the give-up"
+    );
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+/// The durable queue behind a trigger's `maxInFlight` cap survives a daemon
+/// restart: reopening the space and rebuilding the reactor/engine from the
+/// same durable layout still sees the queued fire and dispatches it once its
+/// slot is free.
+#[tokio::test]
+async fn queued_fire_survives_daemon_restart() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    std::fs::write(
+        repo.path().join(".rk/workflows/quick-work.cue"),
+        r#"workflow: { name: "quick-work", steps: [{type: "run", command: "true"}] }"#,
+    )
+    .unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+
+    let dir = layout.triggers_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("burst.cue"),
+        r#"triggers: [{name: "burst-drain", match: {category: "event", scope: "myrepo", identity: "burst"}, run: "quick-work", maxInFlight: 1}]"#,
+    )
+    .unwrap();
+
+    {
+        let space = rk_space::Space::open(&layout.db_path()).unwrap();
+        let (reactor, engine) =
+            build_reactor_and_engine_with_space(&layout, ReactorConfig::default(), space.clone());
+        space
+            .out(Tuple::new(Category::Event, "myrepo", "burst", "Whisker", json!({"i": 0})))
+            .unwrap();
+        space
+            .out(Tuple::new(Category::Event, "myrepo", "burst", "Whisker", json!({"i": 1})))
+            .unwrap();
+        assert_eq!(reactor.run_cycle().unwrap(), 1, "only one dispatches at the cap of 1");
+        // Wait for the single dispatched instance to settle before "restart",
+        // so no background execution task outlives this scope.
+        for _ in 0..100 {
+            if engine
+                .list()
+                .iter()
+                .all(|i| i.status != InstanceStatus::Running)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(engine.list().len(), 1);
+        let queued = space
+            .scan(&Pattern::category(Category::Event).identity("reactor_queued_fire"))
+            .unwrap();
+        assert_eq!(queued.len(), 1, "the second is durably queued before restart");
+    }
+
+    // "Restart": reopen the space and rebuild the reactor/engine from the same
+    // durable layout, exactly as the daemon does on boot.
+    let reopened = rk_space::Space::open(&layout.db_path()).unwrap();
+    let (reactor, engine) =
+        build_reactor_and_engine_with_space(&layout, ReactorConfig::default(), reopened.clone());
+    engine.rehydrate();
+    assert_eq!(
+        reopened
+            .scan(&Pattern::category(Category::Event).identity("reactor_queued_fire"))
+            .unwrap()
+            .len(),
+        1,
+        "the queue entry survived the restart"
+    );
+    assert_eq!(engine.list().len(), 1, "the completed instance rehydrated too");
+
+    assert_eq!(
+        reactor.run_cycle().unwrap(),
+        1,
+        "the queued fire dispatches once rehydrated state shows a free slot"
+    );
+    assert_eq!(engine.list().len(), 2);
+    assert!(
+        reopened
+            .scan(&Pattern::category(Category::Event).identity("reactor_queued_fire"))
+            .unwrap()
+            .is_empty(),
+        "the queue is empty after the restart-drained dispatch"
+    );
 }

@@ -743,6 +743,7 @@ mod tests {
             started_at: Utc.timestamp_opt(1_000, 0).unwrap(),
             completed_at: Some(Utc.timestamp_opt(1_030, 0).unwrap()),
             archived_at: None,
+            trigger: None,
         }
     }
 

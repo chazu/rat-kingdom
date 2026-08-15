@@ -722,6 +722,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             completed_at: None,
             archived_at: None,
+            trigger: None,
         };
         let blocked = AgentProgress {
             summary: "waiting on API decision".into(),

@@ -56,6 +56,12 @@ const MAX_SUBWORKFLOW_DEPTH: usize = 8;
 /// the tuplespace for the whole slice, so this is a wake-up cadence, not a spin
 /// — one indexed query and one registry lookup every few seconds per open wait.
 const LIVENESS_POLL: Duration = Duration::from_secs(5);
+/// Poll cadence for [`WorkflowEngine::await_fleet_capacity`]. Deliberately
+/// much shorter than [`LIVENESS_POLL`]: a fleet slot is an in-memory count
+/// (one cheap registry scan), not a tuplespace read, and a `spawn` step should
+/// notice a freed slot promptly rather than sit out most of a 5s window after
+/// it opens.
+const FLEET_CAPACITY_POLL: Duration = Duration::from_millis(250);
 
 static PERSIST_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -244,6 +250,13 @@ pub struct Instance {
     /// the "is this row archived?" flag every view keys on.
     #[serde(default)]
     pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The `#Trigger` name that launched this instance, when it was launched by
+    /// the reactor. `None` for manual, scheduled, and legacy runs. This is what
+    /// [`WorkflowEngine::live_count_for_trigger`] counts against a trigger's
+    /// `maxInFlight` cap — admission control the reactor enforces per trigger,
+    /// not per workflow definition (two triggers can share one `run`).
+    #[serde(default)]
+    pub trigger: Option<String>,
 }
 
 impl Instance {
@@ -706,6 +719,13 @@ pub struct WorkflowEngine {
     require_approval_for_landing: bool,
     automated_landing_workflows: Vec<String>,
     allowed_target_branches: Vec<String>,
+    /// Fleet-wide concurrent-agent ceiling shared with the continuous-drain
+    /// autoscaler (`[drain] max_wip`): a `spawn` step waits for a free slot
+    /// under the same cap a drain refill respects, so workflow-spawned agents
+    /// (e.g. steward reviewers) cannot unboundedly outrun it. Zero (the
+    /// default, and drain's own "disabled" value) means no ceiling — matches
+    /// pre-admission-control behaviour.
+    fleet_wip_cap: usize,
     instances: Mutex<HashMap<String, Instance>>,
     /// Pruned terminal instances, kept for history. Held apart from `instances`
     /// rather than flagged inside it so every existing reader — `list`, the
@@ -733,6 +753,7 @@ impl WorkflowEngine {
         require_approval_for_landing: bool,
         automated_landing_workflows: Vec<String>,
         allowed_target_branches: Vec<String>,
+        fleet_wip_cap: usize,
     ) -> Self {
         Self {
             layout,
@@ -747,6 +768,7 @@ impl WorkflowEngine {
             require_approval_for_landing,
             automated_landing_workflows,
             allowed_target_branches,
+            fleet_wip_cap,
             instances: Mutex::new(HashMap::new()),
             archived: Mutex::new(HashMap::new()),
         }
@@ -872,6 +894,30 @@ impl WorkflowEngine {
             params,
             coordinator,
             None,
+            None,
+        )
+    }
+
+    /// Launch a workflow the reactor fired from `trigger`, tagging the instance
+    /// so [`live_count_for_trigger`](Self::live_count_for_trigger) can enforce
+    /// that trigger's `maxInFlight` admission cap. Otherwise identical to
+    /// [`run_owned_with_id`](Self::run_owned_with_id).
+    pub fn run_owned_with_id_from_trigger(
+        self: &Arc<Self>,
+        instance_id: String,
+        trigger: &str,
+        name: &str,
+        repo: &str,
+        params: HashMap<String, Value>,
+    ) -> rk_core::Result<Instance> {
+        self.run_owned_with_id_and_schedule(
+            instance_id,
+            name,
+            repo,
+            params,
+            None,
+            None,
+            Some(trigger.to_string()),
         )
     }
 
@@ -889,9 +935,11 @@ impl WorkflowEngine {
             params,
             None,
             Some(schedule.to_string()),
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_owned_with_id_and_schedule(
         self: &Arc<Self>,
         instance_id: String,
@@ -900,6 +948,7 @@ impl WorkflowEngine {
         params: HashMap<String, Value>,
         coordinator: Option<String>,
         schedule: Option<String>,
+        trigger: Option<String>,
     ) -> rk_core::Result<Instance> {
         let file = self.find_definition(name, repo)?;
         let definition_digest = definition_digest(&file)?;
@@ -929,6 +978,7 @@ impl WorkflowEngine {
             started_at: chrono::Utc::now(),
             completed_at: None,
             archived_at: None,
+            trigger,
         };
         if let Some(existing) = self.store_if_absent(instance.clone())? {
             return Ok(existing);
@@ -1320,6 +1370,7 @@ impl WorkflowEngine {
             let ctx = self.context(id);
             match step {
                 Step::Spawn(spawn) => {
+                    self.await_fleet_capacity(id).await;
                     let resolved =
                         resolve(spawn, agents, &self.global_agents, &self.default_harness)?;
                     let title = interpolate(&spawn.task.title, &ctx);
@@ -1844,6 +1895,7 @@ impl WorkflowEngine {
             started_at: chrono::Utc::now(),
             completed_at: None,
             archived_at: None,
+            trigger: None,
         };
         if let Some(existing) = self.store_if_absent(child)? {
             if existing.workflow != workflow_name
@@ -2890,6 +2942,18 @@ impl WorkflowEngine {
         all
     }
 
+    /// How many `Running` instances a `#Trigger` named `trigger` currently has
+    /// in flight — the count the reactor checks against that trigger's
+    /// `maxInFlight` cap. Reads the live (rehydrated-on-restart) instance
+    /// store directly, so it is correct immediately after a daemon restart
+    /// without depending on the reactor's own ephemeral fire markers.
+    pub fn live_count_for_trigger(&self, trigger: &str) -> usize {
+        self.lock()
+            .values()
+            .filter(|i| i.status == InstanceStatus::Running && i.trigger.as_deref() == Some(trigger))
+            .count()
+    }
+
     /// Pruned instances only, oldest first.
     pub fn list_archived(&self) -> Vec<Instance> {
         let mut all: Vec<Instance> = self.lock_archived().values().cloned().collect();
@@ -3158,6 +3222,38 @@ impl WorkflowEngine {
         params: SpawnParams,
     ) -> rk_core::Result<crate::agents::AgentRecord> {
         self.supervisor.spawn_async(params).await
+    }
+
+    /// Every live agent fleet-wide, regardless of what spawned it — the same
+    /// tally [`Drain::run_cycle_at`](crate::drain::Drain::run_cycle_at) counts
+    /// against `[drain] max_wip`. Sharing this count is what makes the fleet
+    /// WIP ceiling bidirectional: a drain refill already skips spawning once
+    /// workflow-spawned agents fill the cap, and a workflow `spawn` step now
+    /// waits its turn under the exact same number instead of dispatching
+    /// unbounded.
+    fn live_fleet_count(&self) -> usize {
+        self.supervisor
+            .list()
+            .iter()
+            .filter(|r| r.state.is_live())
+            .count()
+    }
+
+    /// Block a `spawn` step until the fleet-wide WIP ceiling has a free slot.
+    /// `fleet_wip_cap == 0` (the default, and drain's own "disabled" value)
+    /// means no ceiling — returns immediately, matching pre-admission-control
+    /// behaviour. Polls rather than occupying a thread: this instance's
+    /// execution runs in its own task, so a wait here never blocks any other
+    /// instance's steps or the daemon's RPC loop.
+    async fn await_fleet_capacity(&self, id: &str) {
+        if self.fleet_wip_cap == 0 || self.live_fleet_count() < self.fleet_wip_cap {
+            return;
+        }
+        self.update(id, |i| i.awaiting = Some("fleet_wip".to_string()));
+        while self.live_fleet_count() >= self.fleet_wip_cap {
+            tokio::time::sleep(FLEET_CAPACITY_POLL).await;
+        }
+        self.update(id, |i| i.awaiting = None);
     }
 
     /// This instance's per-run budget cap (from the workflow's `budget:`), used
@@ -4059,6 +4155,7 @@ mod tests {
             started_at: Utc::now(),
             completed_at: None,
             archived_at: None,
+            trigger: None,
         };
 
         complete_top_level_step(&mut instance, 0, true, Some(json!({"joined": true})));
@@ -4095,6 +4192,7 @@ mod tests {
             started_at: Utc::now(),
             completed_at: None,
             archived_at: None,
+            trigger: None,
         };
 
         join_nested_subworkflow_result(&mut instance, json!({"joined": true}));
@@ -4165,6 +4263,7 @@ mod tests {
             started_at: Utc::now(),
             completed_at: None,
             archived_at: None,
+            trigger: None,
         };
 
         mark_recovery_failure_in_memory(
@@ -4605,6 +4704,7 @@ test a::flaky ... FAILED
             started_at: Utc::now(),
             completed_at: None,
             archived_at: None,
+            trigger: None,
         };
         let original = before.work_key();
         before.definition_digest = "bbbb".into();

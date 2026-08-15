@@ -842,6 +842,7 @@ mod tests {
             started_at: Utc::now(),
             completed_at: None,
             archived_at: None,
+            trigger: None,
         }
     }
 

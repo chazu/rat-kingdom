@@ -1101,6 +1101,11 @@ pub struct Trigger {
     /// default.
     #[serde(default, rename = "maxFires")]
     pub max_fires: Option<u32>,
+    /// Cap on this trigger's concurrently in-flight (Running) workflow
+    /// instances. Beyond the cap a match is durably queued rather than
+    /// dropped or dispatched unbounded; unset means no cap.
+    #[serde(default, rename = "maxInFlight")]
+    pub max_in_flight: Option<u32>,
 }
 
 /// The tuple predicate half of a [`Trigger`]. Every set field must match (AND);
@@ -2035,6 +2040,24 @@ triggers: [
     #[test]
     fn trigger_maxfires_over_cap_is_a_cue_error() {
         let bad = r#"triggers: [{name: "x", match: {category: "need"}, run: "w", maxFires: 101}]"#;
+        let err = load_triggers_str(bad).unwrap_err();
+        assert!(err.to_string().contains("cue export failed"), "{err}");
+    }
+
+    #[test]
+    fn trigger_max_in_flight_parses_and_defaults_to_none() {
+        let source = r#"triggers: [
+            {name: "capped", match: {category: "need"}, run: "w", maxInFlight: 2},
+            {name: "uncapped", match: {category: "need"}, run: "w"},
+        ]"#;
+        let triggers = load_triggers_str(source).unwrap();
+        assert_eq!(triggers[0].max_in_flight, Some(2));
+        assert_eq!(triggers[1].max_in_flight, None);
+    }
+
+    #[test]
+    fn trigger_max_in_flight_over_cap_is_a_cue_error() {
+        let bad = r#"triggers: [{name: "x", match: {category: "need"}, run: "w", maxInFlight: 101}]"#;
         let err = load_triggers_str(bad).unwrap_err();
         assert!(err.to_string().contains("cue export failed"), "{err}");
     }

@@ -839,6 +839,12 @@ impl Daemon {
                 self.require_approval_for_landing,
                 self.automated_landing_workflows.clone(),
                 self.allowed_target_branches.clone(),
+                // Shared with the continuous-drain autoscaler regardless of
+                // whether its own refill loop is enabled: `max_wip` is the
+                // fleet-wide concurrency ceiling either way, and 0 (the
+                // default) keeps workflow spawns uncapped exactly as before
+                // this admission control existed.
+                self.drain_config.max_wip,
             ))
         }))
     }
