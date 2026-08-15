@@ -236,6 +236,15 @@ pub struct Registry {
     ///
     /// [`insert`]: Registry::insert
     reserved: HashSet<String>,
+    /// Outstanding fleet-WIP admission reservations taken by
+    /// [`try_reserve_wip`](Registry::try_reserve_wip) and not yet resolved by
+    /// [`release_wip`](Registry::release_wip). Closes the same kind of window
+    /// `reserved` closes for names, but for the fleet-wide concurrency
+    /// ceiling: two callers (a drain refill and a workflow `spawn` step, or
+    /// two of either) that each read the live count before either's spawn
+    /// lands in the registry must not both admit against the same free slot.
+    /// In-memory only, same rationale as `reserved`.
+    wip_reservations: usize,
 }
 
 impl Registry {
@@ -259,6 +268,7 @@ impl Registry {
             agents,
             archived,
             reserved: HashSet::new(),
+            wip_reservations: 0,
         })
     }
 
@@ -301,6 +311,48 @@ impl Registry {
     /// when a spawn fails before the record is inserted.
     pub fn release_name(&mut self, name: &str) {
         self.reserved.remove(name);
+    }
+
+    /// Live rows plus outstanding fleet-WIP reservations — what
+    /// [`try_reserve_wip`](Registry::try_reserve_wip) checks a cap against.
+    pub fn live_or_reserved_wip(&self) -> usize {
+        self.agents.values().filter(|r| r.state.is_live()).count() + self.wip_reservations
+    }
+
+    /// Atomically check the fleet-WIP ceiling and reserve one slot in the
+    /// same critical section — this method is always called with the
+    /// registry lock held (a caller reaches it only through
+    /// [`Supervisor::spawn`](crate::supervisor::Supervisor::spawn)), so two
+    /// concurrent admitters can never both observe the same free slot before
+    /// either's spawn becomes a live row.
+    ///
+    /// `cap == 0` means this caller does not enforce a ceiling (manual/
+    /// operator spawns, sub-spawns) — always admits, and reserves nothing.
+    /// Every path that calls this with `cap != 0` and gets back `true` must
+    /// eventually call [`release_wip`](Registry::release_wip) with the same
+    /// `cap` exactly once: either explicitly on a failure path, or
+    /// immediately once the spawn's registry row goes live (from then on the
+    /// live row itself carries the count, matching how `insert` also frees a
+    /// name reservation).
+    pub fn try_reserve_wip(&mut self, cap: usize) -> bool {
+        if cap == 0 {
+            return true;
+        }
+        if self.live_or_reserved_wip() >= cap {
+            return false;
+        }
+        self.wip_reservations += 1;
+        true
+    }
+
+    /// Release a reservation taken by [`try_reserve_wip`](Registry::try_reserve_wip).
+    /// `cap` must match the value passed to the paired `try_reserve_wip` call
+    /// (`cap == 0` reserved nothing, so releases nothing).
+    pub fn release_wip(&mut self, cap: usize) {
+        if cap == 0 {
+            return;
+        }
+        self.wip_reservations = self.wip_reservations.saturating_sub(1);
     }
 
     /// Mark all live agents orphaned (called once at daemon startup).

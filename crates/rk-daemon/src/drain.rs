@@ -112,6 +112,14 @@ impl Drain {
         // concurrency, so an operator spawn or a workflow fan-out counts against
         // it too. The per-repo tally seeds the cross-repo partition (each repo's
         // slots are its cap minus what it already holds).
+        //
+        // This snapshot (and the `slots` countdown below) is a cheap estimate
+        // to size this cycle's candidate loop, NOT the authoritative gate: a
+        // workflow `spawn` step can admit against the same fleet cap between
+        // this read and this cycle's `spawn_async` calls below, which is why
+        // each of those calls re-checks atomically against the live registry
+        // lock (`Registry::try_reserve_wip`) and a refusal there stops the
+        // cycle regardless of what `slots` still says.
         let mut live = 0usize;
         let mut live_by_repo: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
@@ -213,7 +221,16 @@ impl Drain {
                 coordinator: None,
                 instance_max_usd: None,
             };
-            match self.supervisor.spawn_async(params).await {
+            // `max_wip` is passed through so the supervisor atomically admits
+            // this spawn against the SAME fleet-wide ceiling a workflow
+            // `spawn` step checks — the `live`/`slots` count above is only a
+            // cheap cycle-start estimate; this is the authoritative check
+            // (TOCTOU-safe: check-and-reserve happen under one registry lock,
+            // see `Registry::try_reserve_wip`). A refusal here means a
+            // concurrent admitter (a workflow spawn, or another drain cycle)
+            // claimed the slot after our estimate, and is handled the same as
+            // any other spawn refusal below: stop this cycle.
+            match self.supervisor.spawn_async(params, max_wip).await {
                 Ok(record) => {
                     info!(ticket = %ticket.identity, agent = %record.name, "drain dispatched ready ticket");
                     spawned += 1;

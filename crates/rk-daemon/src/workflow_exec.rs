@@ -3,7 +3,7 @@
 //! instances, context threading, and step semantics.
 
 use crate::agents::AgentState;
-use crate::supervisor::{SpawnParams, Supervisor};
+use crate::supervisor::{SpawnParams, Supervisor, FLEET_WIP_CAP_REFUSED};
 use crate::tickets::Tickets;
 use chrono::{DateTime, Utc};
 use rk_core::id::prefixed_id;
@@ -62,6 +62,14 @@ const LIVENESS_POLL: Duration = Duration::from_secs(5);
 /// notice a freed slot promptly rather than sit out most of a 5s window after
 /// it opens.
 const FLEET_CAPACITY_POLL: Duration = Duration::from_millis(250);
+
+/// Whether a spawn attempt failed because the fleet-WIP ceiling had no free
+/// slot at the moment `Supervisor::spawn` atomically checked (as opposed to a
+/// genuine spawn failure) — a `Step::Spawn` retries on this rather than
+/// failing the step.
+fn is_fleet_wip_refusal(error: &rk_core::Error) -> bool {
+    matches!(error, rk_core::Error::Other(msg) if msg == FLEET_WIP_CAP_REFUSED)
+}
 
 static PERSIST_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -1370,6 +1378,12 @@ impl WorkflowEngine {
             let ctx = self.context(id);
             match step {
                 Step::Spawn(spawn) => {
+                    // Best-effort pre-wait: cheap and avoids constructing spawn
+                    // params / paying repo discovery just to be refused, but it is
+                    // NOT the authoritative gate — `spawn_agent` re-checks
+                    // atomically against the live registry, and the loop below
+                    // retries if a concurrent admitter (a drain refill, or another
+                    // workflow spawn step) wins the race for the slot this saw free.
                     self.await_fleet_capacity(id).await;
                     let resolved =
                         resolve(spawn, agents, &self.global_agents, &self.default_harness)?;
@@ -1379,25 +1393,34 @@ impl WorkflowEngine {
                         .description
                         .as_ref()
                         .map(|d| interpolate(d, &ctx));
-                    let record = self
-                        .spawn_agent(SpawnParams {
-                            repo: repo.to_string(),
-                            task: title,
-                            prompt,
-                            role: spawn.role.clone(),
-                            coordination: spawn.coordination.clone(),
-                            harness: Some(resolved.harness),
-                            parent: None,
-                            base: spawn.branch.clone().or(ctx.active_branch.clone()),
-                            model: resolved.model,
-                            permission_mode: resolved.permission_mode,
-                            attach: false,
-                            workflow_instance: Some(id.to_string()),
-                            coordinator: self.coordinator(id),
-                            instance_max_usd: self.instance_budget(id),
-                        })
-                        .await?;
+                    let params = SpawnParams {
+                        repo: repo.to_string(),
+                        task: title,
+                        prompt,
+                        role: spawn.role.clone(),
+                        coordination: spawn.coordination.clone(),
+                        harness: Some(resolved.harness),
+                        parent: None,
+                        base: spawn.branch.clone().or(ctx.active_branch.clone()),
+                        model: resolved.model,
+                        permission_mode: resolved.permission_mode,
+                        attach: false,
+                        workflow_instance: Some(id.to_string()),
+                        coordinator: self.coordinator(id),
+                        instance_max_usd: self.instance_budget(id),
+                    };
+                    let record = loop {
+                        match self.spawn_agent(params.clone(), self.fleet_wip_cap).await {
+                            Ok(record) => break record,
+                            Err(e) if is_fleet_wip_refusal(&e) => {
+                                self.update(id, |i| i.awaiting = Some("fleet_wip".to_string()));
+                                tokio::time::sleep(FLEET_CAPACITY_POLL).await;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    };
                     self.update(id, |i| {
+                        i.awaiting = None;
                         i.context.active_agent = Some(record.name.clone());
                         i.context.active_branch = record.branch.clone();
                     });
@@ -2065,7 +2088,11 @@ impl WorkflowEngine {
                     coordinator: self.coordinator(id),
                     instance_max_usd: instance_cap,
                     coordination: None,
-                })
+                // `for_each` fan-out predates the fleet-WIP admission control
+                // and is not gated by it (0): unlike the single `spawn` step,
+                // this loop has no wait/retry around a refusal, so wiring it
+                // to the same cap is a separate change, not this fix's scope.
+                }, 0)
                 .await?;
             fanned.push(FannedAgent {
                 agent: record.name.clone(),
@@ -3217,11 +3244,19 @@ impl WorkflowEngine {
             .unwrap_or_default()
     }
 
+    /// `fleet_wip_cap` is the ceiling this spawn must be atomically admitted
+    /// against (0 = none, used by `for_each` fan-out — see its call site).
+    /// The caller must be prepared to retry on
+    /// [`is_fleet_wip_refusal`]: a refusal means the fleet was already full
+    /// at the moment [`Supervisor::spawn`](crate::supervisor::Supervisor::spawn)
+    /// checked, atomically with reserving the slot — not that this step
+    /// failed.
     async fn spawn_agent(
         &self,
         params: SpawnParams,
+        fleet_wip_cap: usize,
     ) -> rk_core::Result<crate::agents::AgentRecord> {
-        self.supervisor.spawn_async(params).await
+        self.supervisor.spawn_async(params, fleet_wip_cap).await
     }
 
     /// Every live agent fleet-wide, regardless of what spawned it — the same
@@ -3231,6 +3266,12 @@ impl WorkflowEngine {
     /// workflow-spawned agents fill the cap, and a workflow `spawn` step now
     /// waits its turn under the exact same number instead of dispatching
     /// unbounded.
+    ///
+    /// This is a snapshot, not a reservation — used only to decide whether
+    /// [`await_fleet_capacity`](Self::await_fleet_capacity) should short-circuit
+    /// or start polling. The authoritative, TOCTOU-safe check is
+    /// `Registry::try_reserve_wip`, taken atomically inside
+    /// [`Supervisor::spawn`](crate::supervisor::Supervisor::spawn).
     fn live_fleet_count(&self) -> usize {
         self.supervisor
             .list()
@@ -3239,12 +3280,19 @@ impl WorkflowEngine {
             .count()
     }
 
-    /// Block a `spawn` step until the fleet-wide WIP ceiling has a free slot.
-    /// `fleet_wip_cap == 0` (the default, and drain's own "disabled" value)
-    /// means no ceiling — returns immediately, matching pre-admission-control
-    /// behaviour. Polls rather than occupying a thread: this instance's
-    /// execution runs in its own task, so a wait here never blocks any other
-    /// instance's steps or the daemon's RPC loop.
+    /// Best-effort wait for the fleet-wide WIP ceiling to look free before a
+    /// `spawn` step even tries — cheap, and avoids paying for spawn-param
+    /// construction and repo discovery just to be refused. `fleet_wip_cap ==
+    /// 0` (the default, and drain's own "disabled" value) means no ceiling —
+    /// returns immediately, matching pre-admission-control behaviour. Polls
+    /// rather than occupying a thread: this instance's execution runs in its
+    /// own task, so a wait here never blocks any other instance's steps or
+    /// the daemon's RPC loop.
+    ///
+    /// NOT authoritative: this snapshot can go stale between here and the
+    /// actual spawn attempt (another admitter can claim the slot in between),
+    /// which is why the spawn call itself re-checks atomically and the caller
+    /// loops on [`is_fleet_wip_refusal`] rather than trusting this alone.
     async fn await_fleet_capacity(&self, id: &str) {
         if self.fleet_wip_cap == 0 || self.live_fleet_count() < self.fleet_wip_cap {
             return;

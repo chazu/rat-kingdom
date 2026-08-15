@@ -3518,7 +3518,7 @@ impl Daemon {
                 workflow_instance: None,
                 coordinator: None,
                 instance_max_usd: None,
-            })
+            }, 0)
             .await
     }
 
@@ -3721,7 +3721,10 @@ impl Daemon {
                 params.instance_max_usd = self.engine().instance_budget(instance);
             }
         }
-        match self.supervisor.spawn_async(params).await {
+        // Manual/foreman-driven spawns are not subject to the fleet-WIP
+        // ceiling (0 = no cap enforced by this call) — only the drain
+        // autoscaler and workflow `spawn` steps admit against it.
+        match self.supervisor.spawn_async(params, 0).await {
             Ok(record) => Response::ok(req.id, json!({"agent": record})),
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
@@ -6337,7 +6340,7 @@ mod default_agent_profile_tests {
                 workflow_instance: None,
                 coordinator: None,
                 instance_max_usd: None,
-            })
+            }, 0)
             .await
             .unwrap();
 
