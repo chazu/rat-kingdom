@@ -108,11 +108,16 @@ independent instruction. This proposal edits `prime.rs` directly (the shipped
 fragment), per the standard proposal-then-land process for prompt fragments.
 
 The convention tuple itself cannot be edited by a rat (agent callers cannot
-write `convention`/`fact` tuples — see proposal 0011) and conventions have no
-retract path. It is now stale relative to the landed prompt text in the same
-way past superseded conventions have gone stale after their seeding proposal
-was refined further. Filed as a ticket rather than fixed inline, per
-`preexisting-failure-is-a-ticket-not-an-inline-fix` — refreshing a live
-convention's text requires a new `rk suggest` + fleet quorum, which is
-future work for whichever rat picks up that ticket, not a blocking part of
-this change.
+write `convention`/`fact` tuples — see proposal 0011), conventions have no
+retract path, and Furniture tuples are excluded from destructive `rk in`.
+Review (Patter-5) correctly refused to land the fragment change while the
+binding injected convention still ordered the old STOP, so this change also
+resolves the drift at the injection source: `scan_conventions`
+(crates/rk-daemon/src/supervisor.rs) now supersedes conventions newest-wins
+by name (the text before the first `:`), unit-tested in
+`convention_supersession_tests`. Refreshing a stale norm is therefore a
+supported operation — mint a newer tuple under the same name via quorum
+re-promotion or an operator refresh — and the operator has minted the
+scoped successor: git-write/toolchain denial at entry still STOPs (the
+Parmesan-2 lesson stands), while a denied rk COORDINATION call is reported
+via `rk obstacle` (or the final summary) and the ticketed work proceeds.
