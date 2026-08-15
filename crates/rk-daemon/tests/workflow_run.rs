@@ -12,6 +12,12 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+// These tests configure the fake harness through a process-global environment
+// variable. Keep the variable stable until the daemon and its child harness
+// have finished; otherwise a sibling test can remove/replace it between
+// workflow.run and the spawn step, silently selecting the wrong fixture.
+static HARNESS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .arg("-C")
@@ -69,6 +75,7 @@ workflow: {
 
 #[tokio::test]
 async fn cue_workflow_runs_end_to_end_with_agent_resolution() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     git(repo_dir.path(), &["init", "-b", "main"]);
@@ -211,6 +218,7 @@ workflow: {
 /// the branch merges. This is the safety-valve happy path.
 #[tokio::test]
 async fn approval_gate_blocks_until_approved_then_merges() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     git(repo_dir.path(), &["init", "-b", "main"]);
@@ -308,6 +316,7 @@ async fn approval_gate_blocks_until_approved_then_merges() {
 /// left unmerged (fail-closed veto).
 #[tokio::test]
 async fn approval_gate_rejection_leaves_branch_unmerged() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     git(repo_dir.path(), &["init", "-b", "main"]);
@@ -421,6 +430,7 @@ workflow: {
 /// deterministic quality gate's happy path — the suite is green, so it lands.
 #[tokio::test]
 async fn run_step_green_check_gates_and_merges() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     git(repo_dir.path(), &["init", "-b", "main"]);
@@ -507,6 +517,7 @@ workflow: {
 /// "the suite is red, so it does not land."
 #[tokio::test]
 async fn run_step_red_check_fails_closed_and_holds_branch() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     git(repo_dir.path(), &["init", "-b", "main"]);
