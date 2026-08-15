@@ -61,9 +61,17 @@ triggers: [
 	// an errored rat's branch is still triaged, and its broken work is caught by
 	// the run gate and held unmerged, not merged.)
 	//
+	// REVIEW TIERING (TKT-01M036N1RT74H6NPRH5FMM8A6T): diffClass/headSha are
+	// templated raw from the daemon-computed completion payload; steward.cue's
+	// declared param defaults ("large" / "") cover a legacy completion missing
+	// either field — safe since the reactor omits a null-templated param rather
+	// than passing it through, so the workflow's own default applies instead of
+	// hard-failing the fire (TKT-146/f359a95).
+	//
 	// NOTE: installing this makes ALL rat completions auto-merge on a clean
-	// verdict. Do not also run an approval-gated workflow (land-on-approve) over
-	// the same completions, or the two race for the branch.
+	// verdict (or, for a doc-only/trivial diff, on the gates alone — see
+	// steward.cue). Do not also run an approval-gated workflow (land-on-approve)
+	// over the same completions, or the two race for the branch.
 	{
 		name:  "steward-on-completion"
 		match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}
@@ -77,6 +85,11 @@ triggers: [
 			target: "{{tuple.payload.target}}"
 			// The repo the completion is scoped to.
 			repo: "{{tuple.scope}}"
+			// Precomputed diff classification driving review tiering (see above).
+			diffClass: "{{tuple.payload.diff_class}}"
+			// The completed rat's branch-tip SHA, threaded into the reviewer's
+			// task/verdict artifact for future commit-keyed verdict caching.
+			headSha: "{{tuple.payload.head_sha}}"
 		}
 		// A completion storm must not spawn a steward storm; each fire is still
 		// idempotent per completion tuple, this caps the rolling window.

@@ -504,6 +504,141 @@ fn steward_loads_and_routes() {
     assert!(when.default.iter().any(|s| matches!(s, Step::Stop(_))));
 }
 
+/// Review tiering (TKT-01M036N1RT74H6NPRH5FMM8A6T): a diffClass of
+/// "doc-only" (or "trivial") takes the REDUCED tier — a gate-holder spawn
+/// instead of a reviewer, no verdict read/routing, and an unconditional land
+/// once the shared gates pass.
+#[test]
+fn steward_reduced_tier_skips_reviewer_and_lands_unconditionally() {
+    use rk_workflow::Step;
+
+    let inputs = HashMap::from([
+        ("taskId".to_string(), json!("fix-typo")),
+        ("diffClass".to_string(), json!("doc-only")),
+    ]);
+    let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
+
+    let Step::Spawn(spawn) = &workflow.steps[0] else {
+        panic!("reduced tier must still start with a spawn (only a spawned agent's worktree can host the gates)");
+    };
+    assert_eq!(
+        spawn.agent.as_deref(),
+        Some("gateholder"),
+        "the reduced tier must spawn the gate-holder profile, not the reviewer"
+    );
+    assert!(
+        spawn.branch.is_some(),
+        "the gate-holder must chain onto the completed branch, same as the reviewer"
+    );
+
+    // The same deterministic gates still run — tiering only skips the LLM
+    // review, never the gates.
+    let runs: Vec<&rk_workflow::RunStep> = workflow
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Run(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert!(runs
+        .iter()
+        .any(|r| r.check.as_deref() == Some("steward-protected-paths")));
+    assert!(runs
+        .iter()
+        .any(|r| r.check.as_deref() == Some("steward-diff-scope")));
+    assert!(runs.iter().any(|r| r.check.as_deref() == Some("verify")));
+
+    // No verdict to read or route on — nothing reviewed the diff.
+    assert!(
+        !workflow.steps.iter().any(|s| matches!(s, Step::Read(_))),
+        "the reduced tier must not read a review verdict"
+    );
+    assert!(
+        !workflow.steps.iter().any(|s| matches!(s, Step::When(w) if w.var == "verdict")),
+        "the reduced tier must not route on a review verdict"
+    );
+
+    // Land is unconditional (not nested inside a verdict `when`) and still
+    // gates the delivery result.
+    let land = workflow
+        .steps
+        .iter()
+        .rev()
+        .find_map(|s| match s {
+            Step::Land(l) => Some(l),
+            _ => None,
+        })
+        .expect("reduced tier must land the branch");
+    assert_eq!(land.target, "main");
+    let evaluate_after_land = workflow
+        .steps
+        .iter()
+        .rev()
+        .find_map(|s| match s {
+            Step::Evaluate(e) if e.expect.get("delivered").is_some() => Some(e),
+            _ => None,
+        })
+        .expect("land must be gated by a delivered:true evaluate");
+    assert_eq!(evaluate_after_land.expect.get("delivered"), Some(&json!(true)));
+}
+
+/// A completion payload with no diffClass at all (a legacy completion) must
+/// default to "large" and take the unchanged review tier — fail-closed
+/// toward review, not toward skipping it.
+#[test]
+fn steward_missing_diff_class_defaults_to_review_tier() {
+    use rk_workflow::Step;
+
+    let inputs = HashMap::from([("taskId".to_string(), json!("fix-login"))]);
+    let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
+
+    let Step::Spawn(spawn) = &workflow.steps[0] else {
+        panic!("missing diffClass must still start with the reviewer spawn");
+    };
+    assert_eq!(spawn.role, "reviewer");
+    assert_eq!(
+        spawn.agent.as_deref(),
+        Some("reviewer"),
+        "a missing diffClass must default to \"large\" and take the review tier"
+    );
+    assert!(
+        workflow.steps.iter().any(|s| matches!(s, Step::Read(_))),
+        "the review tier must still read a verdict"
+    );
+}
+
+/// Provenance for the future commit-keyed verdict cache (Phase 2): the
+/// reviewer's task carries the branch-tip SHA, and it is instructed to record
+/// head_sha in its verdict artifact.
+#[test]
+fn steward_review_tier_threads_head_sha_into_reviewer_task_and_artifact() {
+    use rk_workflow::Step;
+
+    let inputs = HashMap::from([
+        ("taskId".to_string(), json!("fix-login")),
+        ("headSha".to_string(), json!("deadbeef123")),
+    ]);
+    let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
+
+    let Step::Spawn(spawn) = &workflow.steps[0] else {
+        panic!("steward must start by spawning the reviewer");
+    };
+    let description = spawn
+        .task
+        .description
+        .as_deref()
+        .expect("reviewer task must carry a description");
+    assert!(
+        description.contains("deadbeef123"),
+        "the reviewer's task must be told the branch-tip SHA it is reviewing"
+    );
+    assert!(
+        description.contains("\"head_sha\": \"deadbeef123\""),
+        "the reviewer must be instructed to record head_sha in its verdict artifact: {description}"
+    );
+}
+
 #[test]
 fn shipped_land_workflows_gate_failed_delivery() {
     use rk_workflow::Step;
