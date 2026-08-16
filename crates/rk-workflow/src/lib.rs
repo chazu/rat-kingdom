@@ -78,6 +78,47 @@ impl Default for DeliveryPolicy {
     }
 }
 
+/// Per-repository landing-pipeline gate policy: the protected-path and
+/// diff-scope guardrails plus the review-tier wall-clock budgets that
+/// `examples/workflows/steward.cue`'s mega-workflow used to expose as
+/// workflow params (`protectedPaths`, `maxDiffFiles`, `maxDiffLines`,
+/// `gateTimeout`, `reviewTimeout`) before Phase 4 of the steward remediation
+/// moved gate execution into the daemon-native `LandingPipeline`
+/// (`crates/rk-daemon/src/landing.rs`). Same names, same defaults — now
+/// versioned and digest-activated like [`DeliveryPolicy`] instead of hardcoded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandingPolicy {
+    /// POLICY GUARDRAIL: an ERE matched against changed file paths, run
+    /// through the repo's `steward-protected-paths` named check.
+    #[serde(default = "default_protected_paths", rename = "protectedPaths")]
+    pub protected_paths: String,
+    /// DIFF-SCOPE GUARDRAIL: 0 disables the budget. Run through the repo's
+    /// `steward-diff-scope` named check.
+    #[serde(default = "default_max_diff_files", rename = "maxDiffFiles")]
+    pub max_diff_files: u64,
+    #[serde(default = "default_max_diff_lines", rename = "maxDiffLines")]
+    pub max_diff_lines: u64,
+    /// Wall-clock bound for the repo's real `verify` check, e.g. `"60m"`.
+    #[serde(default = "default_gate_timeout", rename = "gateTimeout")]
+    pub gate_timeout: String,
+    /// Wall-clock bound the landing pipeline parks on a review verdict
+    /// before treating the candidate as a STOP-equivalent hold, e.g. `"15m"`.
+    #[serde(default = "default_review_timeout", rename = "reviewTimeout")]
+    pub review_timeout: String,
+}
+
+impl Default for LandingPolicy {
+    fn default() -> Self {
+        Self {
+            protected_paths: default_protected_paths(),
+            max_diff_files: default_max_diff_files(),
+            max_diff_lines: default_max_diff_lines(),
+            gate_timeout: default_gate_timeout(),
+            review_timeout: default_review_timeout(),
+        }
+    }
+}
+
 /// Versioned repository behavior activated into the daemon's repo registry.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryPolicy {
@@ -85,6 +126,8 @@ pub struct RepositoryPolicy {
     pub work: WorkPolicy,
     #[serde(default)]
     pub delivery: DeliveryPolicy,
+    #[serde(default)]
+    pub landing: LandingPolicy,
 }
 
 impl RepositoryPolicy {
@@ -194,6 +237,26 @@ fn default_remote() -> String {
 
 fn default_remote_branch() -> String {
     "{{branch}}".into()
+}
+
+fn default_protected_paths() -> String {
+    r"(^|/)(\.github|\.rk|migrations)/".into()
+}
+
+fn default_max_diff_files() -> u64 {
+    50
+}
+
+fn default_max_diff_lines() -> u64 {
+    2000
+}
+
+fn default_gate_timeout() -> String {
+    "60m".into()
+}
+
+fn default_review_timeout() -> String {
+    "15m".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -902,6 +965,38 @@ fn validate_repository_policy(policy: &RepositoryPolicy) -> rk_core::Result<()> 
             "repo.delivery.remote must not begin with '-'",
         ));
     }
+    if policy.landing.protected_paths.trim().is_empty() {
+        return Err(rk_core::Error::other(
+            "repo.landing.protectedPaths must be a non-empty pattern",
+        ));
+    }
+    validate_duration_str("repo.landing.gateTimeout", &policy.landing.gate_timeout)?;
+    validate_duration_str("repo.landing.reviewTimeout", &policy.landing.review_timeout)?;
+    Ok(())
+}
+
+/// Validates a `s`/`m`/`h`-suffixed (or bare-seconds) duration string at
+/// policy-activation time, so a typo like `"60mm"` fails the versioned
+/// `.rk/repo.cue` before it is ever activated rather than at the first
+/// landing attempt. Mirrors the parsing rules of
+/// `crates/rk-daemon/src/workflow_exec.rs`'s `parse_duration`, which is what
+/// actually consumes this string at runtime — kept in sync by hand since
+/// rk-workflow does not depend on rk-daemon.
+fn validate_duration_str(name: &str, value: &str) -> rk_core::Result<()> {
+    let trimmed = value.trim();
+    let invalid = || {
+        rk_core::Error::other(format!(
+            "{name} must be a duration like \"60m\", \"90s\", or \"1h\" (got {value:?})"
+        ))
+    };
+    let digits = match trimmed.chars().last() {
+        Some('s') | Some('m') | Some('h') => &trimmed[..trimmed.len() - 1],
+        _ => trimmed,
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    digits.parse::<u64>().map_err(|_| invalid())?;
     Ok(())
 }
 
@@ -2252,6 +2347,35 @@ checks: [
     fn repository_policy_defaults_preserve_existing_behavior() {
         let policy = load_repository_policy_str("repo: {}").unwrap();
         assert_eq!(policy, RepositoryPolicy::default());
+        assert_eq!(policy.landing.protected_paths, default_protected_paths());
+        assert_eq!(policy.landing.max_diff_files, 50);
+        assert_eq!(policy.landing.max_diff_lines, 2000);
+        assert_eq!(policy.landing.gate_timeout, "60m");
+        assert_eq!(policy.landing.review_timeout, "15m");
+    }
+
+    #[test]
+    fn repository_policy_loads_versioned_landing_gate_policy() {
+        let policy = load_repository_policy_str(
+            r#"
+            repo: {
+                landing: {
+                    protectedPaths: "(^|/)vendor/"
+                    maxDiffFiles:   10
+                    maxDiffLines:   200
+                    gateTimeout:    "30m"
+                    reviewTimeout:  "5m"
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(policy.landing.protected_paths, "(^|/)vendor/");
+        assert_eq!(policy.landing.max_diff_files, 10);
+        assert_eq!(policy.landing.max_diff_lines, 200);
+        assert_eq!(policy.landing.gate_timeout, "30m");
+        assert_eq!(policy.landing.review_timeout, "5m");
     }
 
     #[test]
@@ -2263,6 +2387,9 @@ checks: [
             r#"repo: {work: {branch: "rat//{{agent}}"}}"#,
             r#"repo: {delivery: {target: "bad..target"}}"#,
             r#"repo: {delivery: {remote: "--upload-pack=oops"}}"#,
+            r#"repo: {landing: {protectedPaths: ""}}"#,
+            r#"repo: {landing: {gateTimeout: "60mm"}}"#,
+            r#"repo: {landing: {reviewTimeout: "soon"}}"#,
         ] {
             assert!(load_repository_policy_str(source).is_err(), "{source}");
         }

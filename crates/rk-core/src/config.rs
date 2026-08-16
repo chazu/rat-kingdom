@@ -291,8 +291,10 @@ pub struct SupervisorConfig {
     ///
     /// INVARIANT (order-your-timers-below-workflow-waits): must stay
     /// comfortably below any workflow's `wait` timeout that blocks on this
-    /// rat's completion — e.g. the steward workflow's `reviewTimeout`
-    /// (examples/workflows/steward.cue, default 15m). If this value is >= that
+    /// rat's completion — e.g. the review-only steward's `reviewTimeout`
+    /// (examples/workflows/steward-review.cue, default 15m — same default the
+    /// daemon-native landing pipeline's `GateConfig`/`RepositoryPolicy.landing`
+    /// use, crates/rk-daemon/src/landing.rs). If this value is >= that
     /// timeout, the workflow gives up and hard-fails the wait before the sweep
     /// has even flagged the rat as stuck, so the soft steer below never gets a
     /// chance to nudge it back to a clean `rk done`. See
@@ -341,11 +343,13 @@ impl Default for SupervisorConfig {
     }
 }
 
-/// The steward workflow's shipped default `reviewTimeout`
-/// (examples/workflows/steward.cue: `reviewTimeout: {..., default: "15m"}`).
-/// Duplicated here (rather than parsed from the `.cue` source) because
-/// rk-core does not depend on rk-workflow/CUE — kept in sync by hand, cross-
-/// referenced from both sides. See the invariant on
+/// The review-only steward's shipped default `reviewTimeout`
+/// (examples/workflows/steward-review.cue: `reviewTimeout: {..., default: "15m"}`
+/// — the same default `rk_workflow::LandingPolicy::review_timeout` and
+/// `crates/rk-daemon/src/landing.rs`'s `GateConfig` use for the daemon-native
+/// landing pipeline). Duplicated here (rather than parsed from the `.cue`
+/// source) because rk-core does not depend on rk-workflow/CUE — kept in sync
+/// by hand, cross-referenced from both sides. See the invariant on
 /// [`SupervisorConfig::stuck_after_secs`] and `SupervisorConfig::review_timeout_warning`.
 pub const STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 15 * 60;
 
@@ -532,6 +536,16 @@ pub struct PolicyConfig {
     /// gate. The executor binds this authority to a definition loaded directly
     /// from the operator-owned global workflow directory; a repo-local file
     /// with the same name cannot inherit it.
+    ///
+    /// NARROWED SCOPE since the daemon-native landing pipeline (Phase 3/4 of
+    /// the steward remediation, `crates/rk-daemon/src/landing.rs`): the
+    /// primary unattended-landing path no longer goes through a workflow
+    /// `land` step at all — `LandingPipeline` calls `Supervisor::land`
+    /// directly on an APPROVE/gates-passed decision, so this list is never
+    /// consulted for it. This knob now exists only for an operator-authored
+    /// CUSTOM workflow that still uses an explicit `land` step (e.g. a
+    /// bespoke `curator` workflow); it is not, and no longer needs to be, the
+    /// fleet's primary landing authority.
     pub automated_landing_workflows: Vec<String>,
     /// Fleet-wide default merge mode for a repo registered without an explicit
     /// `rk repo add --merge-mode`. A repo's own `RepoRecord.merge_mode` overrides

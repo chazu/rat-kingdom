@@ -1,9 +1,26 @@
+// STATUS (Phase 4 of the steward remediation, TKT-01M036PSF2WV7NHZE00G2EFCVK):
+// NO LONGER LIVE. The operator cut over to the daemon-native landing pipeline
+// on 2026-08-16 (docs/proposals/daemon-native-landing-pipeline.md §6) — the
+// live `steward-landing-on-completion` trigger (action: land) replaced
+// `steward-on-completion`, so nothing fires this workflow by name anymore.
+// Its gate/routing logic (`_gates`, `_routeVerdict`, tiering) is superseded by
+// `crates/rk-daemon/src/landing.rs`; its one still-needed piece — spawning a
+// reviewer and waiting for it — lives on as `examples/workflows/steward-review.cue`,
+// invoked programmatically by `LandingPipeline::request_review`. This file
+// remains only as the pre-cutover reference implementation, load-bearing for
+// its own schema/routing tests (`crates/rk-workflow/tests/examples.rs`,
+// `crates/rk-daemon/tests/workflow_verdict_cache.rs`) and
+// `examples/triggers.cue`'s `steward-on-completion` entry. Deleting all of
+// that together is tracked separately: TKT-01M048ASYM00N37EBK1VM7FH5H,
+// "Remove obsolete steward CUE gate definitions after pipeline cutover".
+//
 // steward: reactive, unattended triage of a completed rat's branch — the
 // biggest single reduction in per-task operator attention. It automates the
 // most-repeated operator decision, "is this branch good to merge?", and asks a
 // human ONLY for the genuine judgment calls.
 //
-// This is not run by hand; it is FIRED by the reactor on every rat completion.
+// This is not run by hand; it was FIRED by the reactor on every rat completion
+// before the cutover above.
 // Register the `steward-on-completion` trigger (examples/triggers.cue) — it
 // matches `Event/harness_result` with `"role":"rat"` and passes the completed
 // rat's {task, branch, repo, diffClass, headSha} through. The `"role":"rat"`

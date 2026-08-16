@@ -8,6 +8,7 @@ repo: #RepositoryPolicy
 #RepositoryPolicy: {
 	work: #WorkPolicy | *{}
 	delivery: #DeliveryPolicy | *{}
+	landing: #LandingPolicy | *{}
 }
 
 #WorkPolicy: {
@@ -26,4 +27,24 @@ repo: #RepositoryPolicy
 	// Supported placeholders: {{branch}}, {{target}}, and {{repo}}.
 	remoteBranch: string | *"{{branch}}"
 	deleteSource: bool | *true
+}
+
+// Landing-pipeline gate policy (Phase 4 of the steward remediation): the
+// same protectedPaths/maxDiffFiles/maxDiffLines/gateTimeout/reviewTimeout
+// knobs `examples/workflows/steward.cue`'s mega-workflow used to expose as
+// workflow params, now owned by the daemon-native LandingPipeline
+// (crates/rk-daemon/src/landing.rs) instead of CUE.
+#LandingPolicy: {
+	// POLICY GUARDRAIL (#19): an ERE matched against changed file paths, run
+	// through the repo's `steward-protected-paths` named check.
+	protectedPaths: string | *"(^|/)(\\.github|\\.rk|migrations)/"
+	// DIFF-SCOPE GUARDRAIL (#20): 0 disables the budget. Run through the
+	// repo's `steward-diff-scope` named check.
+	maxDiffFiles: int | *50
+	maxDiffLines: int | *2000
+	// Wall-clock bound for the repo's real `verify` check.
+	gateTimeout: string | *"60m"
+	// Wall-clock bound the landing pipeline parks on a review verdict before
+	// treating the candidate as a STOP-equivalent hold.
+	reviewTimeout: string | *"15m"
 }
