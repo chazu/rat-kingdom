@@ -2259,6 +2259,28 @@ async fn drain_rate_cap_writes_a_durable_deferred_trace() {
         .get("trigger")
         .and_then(|v| v.as_str())
         == Some("burst-drain")));
+    // Every trace names a CONCRETE tuple, never a placeholder: the admission
+    // trace carries the fired tuple's id, and the drain-deferral trace carries
+    // the queued fire's ORIGINAL tuple id (from the queue entry payload) so
+    // the misfire diagnosis can walk from a completion straight to why it
+    // waited.
+    for t in &deferred {
+        let named = t.payload.get("tuple").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            !named.is_empty() && named != "queue-drain" && named != "unknown",
+            "deferral trace must name the affected tuple, got: {named:?}"
+        );
+    }
+    // At least one admission-time deferral (maxInFlight) must state the cap
+    // reason explicitly.
+    assert!(
+        deferred.iter().any(|t| t
+            .payload
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .is_some_and(|r| r.contains("maxInFlight"))),
+        "admission deferral must carry the maxInFlight reason"
+    );
 }
 
 /// The durable queue behind a trigger's `maxInFlight` cap survives a daemon

@@ -884,7 +884,15 @@ impl Reactor {
             if self.engine.live_count_for_trigger(&trigger.name) >= cap as usize {
                 self.enqueue_fire(&key, trigger, &repo_name, &repo_path, &params, &tuple_id)?;
                 self.mark_fired(&key, trigger, tuple, "queued")?;
-                info!(trigger = %trigger.name, tuple = %tuple_id, cap, "reactor queued fire: trigger at maxInFlight");
+                // The durable trace names the CONCRETE tuple and the admission
+                // reason — a generic queued-fire record made this deferral
+                // class invisible to the misfire diagnosis this trace exists
+                // for (trace_fire_deferred logs the same line at info).
+                self.trace_fire_deferred(
+                    &trigger.name,
+                    &tuple_id,
+                    &format!("queued at admission: trigger at maxInFlight cap {cap}"),
+                );
                 return Ok(false);
             }
         }
@@ -977,19 +985,6 @@ impl Reactor {
                 if self.engine.live_count_for_trigger(&trigger.name) >= cap {
                     break;
                 }
-                // The rolling rate cap applies to draining exactly as it does
-                // to an immediate fire (`try_fire`'s own `rate_limited` check):
-                // without this, a backlog built up while `maxInFlight` held
-                // could drain past `maxFires` in one window the moment a slot
-                // frees. Stop here and let the remainder wait for next cycle.
-                if self.rate_limited(trigger) {
-                    self.trace_fire_deferred(
-                        &trigger.name,
-                        "queue-drain",
-                        "rate cap reached while draining queued fires; remainder deferred to next cycle",
-                    );
-                    break;
-                }
                 let mut pending = match self.space.scan(
                     &Pattern::category(Category::Event)
                         .scope(SYSTEM_SCOPE)
@@ -1017,6 +1012,27 @@ impl Reactor {
                 let Some(next) = pending.into_iter().next() else {
                     break;
                 };
+                // The rolling rate cap applies to draining exactly as it does
+                // to an immediate fire (`try_fire`'s own `rate_limited` check):
+                // without this, a backlog built up while `maxInFlight` held
+                // could drain past `maxFires` in one window the moment a slot
+                // frees. Checked AFTER selecting the head entry so the durable
+                // trace names the concrete queued fire being deferred, not a
+                // placeholder — the misfire diagnosis reads these traces.
+                if self.rate_limited(trigger) {
+                    let deferred = next
+                        .payload
+                        .get("tuple")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    self.trace_fire_deferred(
+                        &trigger.name,
+                        &deferred,
+                        "rate cap reached while draining queued fires; remainder deferred to next cycle",
+                    );
+                    break;
+                }
                 match self.dispatch_queued(trigger, &next) {
                     Ok(true) => dispatched += 1,
                     // Gave up on this one (see dispatch_queued); loop again so
