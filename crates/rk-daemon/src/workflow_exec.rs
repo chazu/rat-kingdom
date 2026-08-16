@@ -4014,7 +4014,10 @@ fn repo_name_of(repo: &str) -> String {
         .unwrap_or_else(|| "repo".into())
 }
 
-fn parse_duration(s: &str) -> rk_core::Result<Duration> {
+/// Crate-scoped alongside [`WorkflowEngine::run_check_in`]: the T2 landing
+/// pipeline resolves a named check's `timeout` string into a bound itself,
+/// the same way a `run` step does.
+pub(crate) fn parse_duration(s: &str) -> rk_core::Result<Duration> {
     let s = s.trim();
     let invalid = || rk_core::Error::other(format!("invalid duration: {s}"));
     // Split on the last *char*, not the last byte: a multibyte suffix (e.g.
