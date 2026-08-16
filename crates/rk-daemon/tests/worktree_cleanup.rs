@@ -1,0 +1,380 @@
+//! TKT-01M04N6W4X47KMXDA6MH0WPH8H end to end: guaranteed worktree cleanup on
+//! instance terminalization, the orphan-sweep safety checks, and the
+//! disk-pressure spawn guard.
+//!
+//! Root cause of the 2026-08-16 incident: steward/workflow failure paths skip
+//! their own `dismiss` step, so a terminal agent's worktree (and its
+//! multi-GB cargo `target/`) can persist indefinitely — 104 of them, 298 GB,
+//! drove the disk to 97% full and the daemon started failing writes. These
+//! tests pin the contract of the fix: a terminalizing workflow instance
+//! reclaims every spawned agent's worktree even when the workflow's own CUE
+//! never ran a `dismiss` step; an unattended reclaim never force-deletes a
+//! worktree with uncommitted changes; the periodic sweep actually runs
+//! unattended; and a spawn is refused (with an inbox obstacle) once free disk
+//! drops below the configured floor.
+
+use rk_core::paths::Layout;
+use rk_daemon::{Client, Daemon};
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn scratch_repo(dir: &Path) {
+    git(dir, &["init", "-b", "main"]);
+    git(dir, &["config", "user.email", "rat@example.com"]);
+    git(dir, &["config", "user.name", "Rat"]);
+    std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-m", "init"]);
+}
+
+async fn connect(layout: &Layout) -> Client {
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if let Ok(c) = Client::connect_as_operator(layout).await {
+            return c;
+        }
+    }
+    panic!("daemon did not come up");
+}
+
+/// One process-global fake harness for the whole binary (mirrors
+/// agent_archive.rs / fleet_budget.rs — `RK_FAKE_HARNESS_CMD` is a process
+/// env var, so parallel tests in this binary setting different scripts would
+/// race, TKT-88). Branches on `$RK_TASK`:
+///
+/// - `dirty-*`: writes an UNCOMMITTED file, then reports success. The branch
+///   never diverges from base (trivially "merged"), but the worktree itself
+///   carries uncommitted changes — the case `reap_git`'s dirty-check exists
+///   for.
+/// - `noop-*`: does nothing (no writes, no commits) — a branch identical to
+///   base, so it is both trivially merged AND clean.
+/// - anything else: commits real work, then reports success — ordinary
+///   "finished but never dismissed" leftovers.
+const FAKE: &str = r#"
+read -r _prompt
+case "$RK_TASK" in
+  dirty-*)
+    echo "uncommitted" > dirty.txt
+    echo '{"type":"system","subtype":"init","session_id":"fake-dirty"}'
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"left dirty","session_id":"fake-dirty","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+    ;;
+  noop-*)
+    echo '{"type":"system","subtype":"init","session_id":"fake-noop"}'
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"nothing to do","session_id":"fake-noop","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+    ;;
+  *)
+    echo "gnawed by $RK_AGENT for task $RK_TASK" > gnawed.txt
+    git add gnawed.txt >/dev/null 2>&1
+    git -c user.email=rat@x -c user.name=Rat commit -q -m "rat work: $RK_TASK"
+    echo '{"type":"system","subtype":"init","session_id":"fake-work"}'
+    echo '{"type":"result","subtype":"success","is_error":false,"result":"committed gnawed.txt","session_id":"fake-work","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+    ;;
+esac
+"#;
+
+async fn spawn(client: &mut Client, repo: &Path, task: &str, extra: Value) -> String {
+    let mut params = json!({
+        "repo": repo.to_string_lossy(),
+        "task": task,
+        "harness": "fake",
+    });
+    let map = params.as_object_mut().unwrap();
+    for (k, v) in extra.as_object().cloned().unwrap_or_default() {
+        map.insert(k, v);
+    }
+    let spawned = client.call("agent.spawn", params).await.unwrap();
+    spawned["agent"]["name"].as_str().unwrap().to_string()
+}
+
+async fn wait_for_state(client: &mut Client, name: &str, want: &str) {
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = client
+            .call("agent.status", json!({"name": name}))
+            .await
+            .unwrap();
+        if status["agent"]["state"] == want {
+            return;
+        }
+    }
+    panic!("{name} never reached state {want}");
+}
+
+async fn list(client: &mut Client, params: Value) -> Vec<Value> {
+    client.call("agent.list", params).await.unwrap()["agents"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// A workflow that spawns one rat, waits, and checks the result — but,
+/// unlike `solo-task.cue`, deliberately has NO `dismiss` step. This is the
+/// exact shape of the root-cause failure mode: a workflow whose own CUE never
+/// reaches cleanup.
+const NO_DISMISS: &str = r#"
+workflow: {
+    name: "no-dismiss"
+    steps: [
+        {type: "spawn", role: "rat", task: {title: "finalize-sweep-1"}, harness: "fake"},
+        {type: "wait", timeout: "30s"},
+        {type: "evaluate", expect: {is_error: false}},
+    ]
+}
+"#;
+
+fn init_workflow_repo() -> tempfile::TempDir {
+    let repo = tempfile::tempdir().unwrap();
+    scratch_repo(repo.path());
+    let wf_dir = repo.path().join(".rk").join("workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(wf_dir.join("no-dismiss.cue"), NO_DISMISS).unwrap();
+    repo
+}
+
+async fn run_workflow(client: &mut Client, repo: &Path, name: &str) -> String {
+    let started = client
+        .call(
+            "workflow.run",
+            json!({"name": name, "repo": repo.to_string_lossy(), "params": {}}),
+        )
+        .await
+        .unwrap();
+    started["instance"]["id"].as_str().unwrap().to_string()
+}
+
+/// Wait for the instance to reach EITHER terminal status. The guaranteed-
+/// cleanup sweep runs on both (`finalize` fires for `Completed` and `Failed`
+/// alike), and whether this particular fixture's `evaluate` step is satisfied
+/// is not the point of this test — only that the instance terminalizes
+/// without ever running a `dismiss` step.
+async fn wait_workflow_terminal(client: &mut Client, id: &str) -> String {
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = client
+            .call("workflow.status", json!({"name": id}))
+            .await
+            .unwrap();
+        let s = status["instance"]["status"].as_str().unwrap_or("").to_string();
+        if s == "completed" || s == "failed" {
+            return s;
+        }
+    }
+    panic!("instance {id} never reached a terminal status");
+}
+
+/// TKT item 1 (GUARANTEED CLEANUP): a workflow instance that completes
+/// without ever running a `dismiss`/`dismiss_all` step must still leave its
+/// spawned agent dismissed and its worktree reclaimed — the finalize-time
+/// safety net, not the per-arm CUE step.
+#[tokio::test]
+async fn finalize_dismisses_agents_the_workflow_never_dismissed() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = init_workflow_repo();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let instance = run_workflow(&mut client, repo_dir.path(), "no-dismiss").await;
+    wait_workflow_terminal(&mut client, &instance).await;
+
+    // The spawned agent's worktree must be reclaimed even though the
+    // workflow's own steps never dismissed it. Poll: finalize persists the
+    // instance's terminal status BEFORE running the cleanup sweep, so
+    // `workflow.status` can read "completed" a moment before the sweep
+    // actually finishes dismissing the agent.
+    let mut worktree: Option<PathBuf> = None;
+    let mut final_state: Option<String> = None;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let agents = list(&mut client, json!({})).await;
+        let Some(rec) = agents
+            .iter()
+            .find(|a| a["workflow_instance"] == instance)
+        else {
+            continue;
+        };
+        worktree = rec["worktree"].as_str().map(PathBuf::from);
+        final_state = rec["state"].as_str().map(str::to_string);
+        if final_state.as_deref() == Some("dismissed") {
+            break;
+        }
+    }
+    assert_eq!(
+        final_state.as_deref(),
+        Some("dismissed"),
+        "finalize's cleanup sweep must dismiss an agent its workflow never dismissed"
+    );
+    let worktree = worktree.expect("agent record carried a worktree path");
+    assert!(
+        !worktree.exists(),
+        "finalize's cleanup sweep must reclaim the worktree: {worktree:?} still exists"
+    );
+}
+
+/// TKT item 2 (ORPHAN SWEEP safety): `agent.archive --reap-git` must never
+/// force-remove a worktree that still carries uncommitted changes, even when
+/// its branch is trivially "merged" (never diverged from base). Uncommitted
+/// edits are not captured by any commit, so a merged branch cannot vouch for
+/// them.
+#[tokio::test]
+async fn reap_git_leaves_a_dirty_worktree_standing() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let name = spawn(&mut client, repo_dir.path(), "dirty-1", json!({})).await;
+    wait_for_state(&mut client, &name, "completed").await;
+
+    let agents = list(&mut client, json!({})).await;
+    let rec = agents.iter().find(|a| a["name"] == name).unwrap();
+    let worktree = PathBuf::from(rec["worktree"].as_str().unwrap());
+    assert!(worktree.exists());
+    assert!(
+        worktree.join("dirty.txt").exists(),
+        "fake harness should have left an uncommitted file"
+    );
+
+    let result = client
+        .call("agent.archive", json!({"all": true, "reap_git": true}))
+        .await
+        .unwrap();
+    assert_eq!(result["count"], 1);
+    let reaped = result["reaped"].as_array().cloned().unwrap_or_default();
+    let row = reaped
+        .iter()
+        .find(|r| r["agent"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("no reap row for {name} in {reaped:?}"));
+    assert_eq!(
+        row["reaped"],
+        json!(false),
+        "a dirty worktree must never be force-removed"
+    );
+    assert!(
+        row["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("uncommitted"),
+        "reason should say why: {}",
+        row["reason"]
+    );
+    assert!(
+        worktree.exists(),
+        "a dirty worktree must be left standing, not force-removed"
+    );
+}
+
+/// TKT item 2 (ORPHAN SWEEP, periodic): the `[worktree_sweep]` daemon loop
+/// actually reclaims a leaked worktree unattended — no `rk prune` call from
+/// the test at all.
+#[tokio::test]
+async fn periodic_sweep_reclaims_a_leaked_worktree() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    let layout = Layout::at(home.path());
+    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
+        enabled: true,
+        interval_secs: 1,
+        after_days: 0,
+    });
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    // A clean, trivially-merged (never diverged from base) leftover — exactly
+    // the leaked-worktree scenario the sweep exists to reclaim.
+    let name = spawn(&mut client, repo_dir.path(), "noop-1", json!({})).await;
+    wait_for_state(&mut client, &name, "completed").await;
+
+    let agents = list(&mut client, json!({})).await;
+    let rec = agents.iter().find(|a| a["name"] == name).unwrap();
+    let worktree = PathBuf::from(rec["worktree"].as_str().unwrap());
+    assert!(worktree.exists());
+
+    // Never dismissed or pruned by the test — only the periodic sweep touches it.
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if !worktree.exists() {
+            return;
+        }
+    }
+    panic!("periodic worktree sweep never reclaimed {worktree:?}");
+}
+
+/// TKT item 3 (DISK PRESSURE GUARD): a spawn is refused before it creates a
+/// new worktree once free disk is below the configured floor, and the
+/// refusal surfaces as an inbox obstacle rather than running the disk to zero
+/// and failing deep inside an io path.
+#[tokio::test]
+async fn spawn_refused_when_disk_floor_breached() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    // An impossible floor: guaranteed to exceed any real disk's free space,
+    // so the refusal is deterministic regardless of the test machine.
+    daemon.set_min_free_disk_gb(1_000_000_000);
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let refused = client
+        .call(
+            "agent.spawn",
+            json!({"repo": repo_dir.path().to_string_lossy(), "task": "disk-1", "harness": "fake"}),
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "spawn should be refused once the disk floor is breached, got {refused:?}"
+    );
+    let msg = format!("{}", refused.unwrap_err());
+    assert!(
+        msg.contains("min_free_gb") || msg.contains("disk"),
+        "error names the disk floor: {msg}"
+    );
+
+    let obstacles = client
+        .call("space.scan", json!({"category": "obstacle"}))
+        .await
+        .unwrap();
+    let kinds: Vec<String> = obstacles["tuples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["payload"]["type"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(
+        kinds.contains(&"disk_pressure".to_string()),
+        "disk-pressure obstacle posted: {kinds:?}"
+    );
+}
