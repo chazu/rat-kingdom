@@ -377,6 +377,24 @@ impl Pattern {
         pattern
     }
 
+    /// The one predicate for "the tuple that names commit `<sha>` in its
+    /// payload" — the exact-tip discriminator behind the steward's
+    /// commit-keyed verdict cache (Phase 2 of the steward remediation).
+    ///
+    /// Unlike [`Pattern::for_agent_since`]/[`Pattern::for_workflow_instance`],
+    /// this is deliberately unscoped by author or run: ANY prior verdict
+    /// artifact for this exact branch tip is a valid cache hit, regardless of
+    /// which reviewer or steward instance produced it. A new commit changes
+    /// `sha`, which invalidates the cache naturally — there is no separate
+    /// eviction to get wrong.
+    pub fn for_commit(category: Category, identity: impl Into<String>, sha: &str) -> Self {
+        let mut pattern = Self::category(category).identity(identity);
+        // serde_json renders a string field exactly like this regardless of key
+        // order, so the substring is a reliable exact-sha test.
+        pattern.payload_search = Some(format!("\"head_sha\":\"{sha}\""));
+        pattern
+    }
+
     /// The single authoritative match predicate. Both the storage query and the
     /// waiter wake path must agree with this exactly.
     pub fn matches(&self, tuple: &Tuple) -> bool {

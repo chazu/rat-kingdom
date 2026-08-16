@@ -550,6 +550,21 @@ pub struct ReadStep {
     /// that does not name this instance times the step out rather than routing.
     #[serde(default, rename = "fromInstance")]
     pub from_instance: bool,
+    /// Bind the read to the tuple whose payload names this exact commit
+    /// (`"head_sha":"<sha>"`) — the steward's commit-keyed verdict cache
+    /// (Phase 2). Unlike [`ReadStep::from_agent`]/[`ReadStep::from_instance`],
+    /// this is deliberately unscoped by author or run: it lifts ANY prior
+    /// verdict for this exact branch tip, so a retry on an unchanged commit
+    /// reuses whichever reviewer already covered it instead of paying for a
+    /// fresh review.
+    ///
+    /// Mutually exclusive with [`ReadStep::search`]/[`ReadStep::from_agent`]/
+    /// [`ReadStep::from_instance`], which own the same single predicate slot.
+    /// The sha itself must be non-empty — set only when a real commit is known
+    /// to key on (guard at CUE load time when it may be absent, the same way
+    /// `steward.cue` gates review tiering on `diffClass`).
+    #[serde(default, rename = "forCommit")]
+    pub for_commit: Option<String>,
     /// JSON payload field to lift; whole payload if unset.
     #[serde(default)]
     pub field: Option<String>,
@@ -557,6 +572,16 @@ pub struct ReadStep {
     pub into: String,
     #[serde(default = "default_read_timeout")]
     pub timeout: String,
+    /// What an unmatched read does when its `timeout` elapses: `"fail"` (the
+    /// default, and the only behaviour before the commit-keyed verdict cache)
+    /// makes it an error that ends the run; `"continue"` lifts `null` into
+    /// `ctx.vars[into]` instead, so a following `when` can route on "no cached
+    /// verdict yet" without failing the instance. Intended for a bounded,
+    /// non-blocking cache probe (a short `timeout`) ahead of the expensive
+    /// path it would otherwise gate — not a replacement for the fail-closed
+    /// default everywhere else a `read` names something that MUST exist.
+    #[serde(default = "default_on_timeout", rename = "onTimeout")]
+    pub on_timeout: String,
 }
 
 fn default_read_timeout() -> String {

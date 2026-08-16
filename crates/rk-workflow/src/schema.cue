@@ -202,8 +202,8 @@ workflow: #Workflow
 	// Scope to match; defaults to this workflow's repo name at runtime.
 	scope?: string
 	// Optional substring the serialized payload must contain. Mutually
-	// exclusive with `fromAgent`/`fromInstance`, which claim the same
-	// predicate slot.
+	// exclusive with `fromAgent`/`fromInstance`/`forCommit`, which claim the
+	// same predicate slot.
 	search?: string
 	// Match only the tuple THIS instance's active agent wrote — its
 	// `"agent":"<name>"` stamp, bounded below by that agent's own generation,
@@ -221,14 +221,34 @@ workflow: #Workflow
 	// where an unbound read lets two parked instances on one repo route on
 	// each other's human decision (approve one, reject the other, and either
 	// the rejected one merges or the approved one is held). Mutually exclusive
-	// with `search`/`fromAgent`. Fails CLOSED: a decision that does not name
-	// this instance times the step out rather than routing.
+	// with `search`/`fromAgent`/`forCommit`. Fails CLOSED: a decision that
+	// does not name this instance times the step out rather than routing.
 	fromInstance?: bool
+	// Match ANY tuple whose payload names this exact commit — a
+	// `"head_sha":"<sha>"` substring — regardless of which agent or instance
+	// wrote it. This is the commit-keyed verdict cache lookup: a review
+	// artifact recorded for a branch tip is reusable by any later steward run
+	// against that same unchanged tip. Unlike `fromAgent`/`fromInstance`, it
+	// is deliberately NOT scoped to this run — the whole point is to find a
+	// PRIOR run's verdict. Mutually exclusive with
+	// `search`/`fromAgent`/`fromInstance`. The sha must be non-empty; guard
+	// the step at CUE load time (an `if` over the param, not a runtime `when`)
+	// when it may be absent, the same way `steward.cue` gates review tiering
+	// on `diffClass`.
+	forCommit?: string
 	// JSON payload field to lift (e.g. "recommendation"); whole payload if unset.
 	field?: string
 	// ctx variable name to store the value under (referenced by `when.var`).
 	into:    string
 	timeout: string | *"5m"
+	// What an unmatched read does once `timeout` elapses. `"fail"` (default)
+	// ends the run — the behaviour of every `read` before the commit-keyed
+	// verdict cache. `"continue"` lifts `null` into `ctx.var.<into>` instead,
+	// so a following `when` can route on "nothing cached yet" rather than
+	// failing the instance. Meant for a short, non-blocking cache probe (a
+	// small `timeout`), not as a general escape hatch for reads that name
+	// something that must exist.
+	onTimeout: *"fail" | "continue"
 }
 
 // Route on a ctx variable set by a prior `read`. Runs the sub-steps of the
