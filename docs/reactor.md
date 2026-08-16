@@ -300,9 +300,11 @@ silent:
 - **`reactor_non_main_land_target` event.** Whenever `try_fire` fires a
   trigger whose interpolated params carry a `target` other than `"main"` (not
   only the steward — any trigger that passes a `target` param through), the
-  reactor writes a repo-scoped `Event` — `{trigger, workflow, instance, target,
-  branch}` — authored by the reserved `reactor` instance, and logs a `warn`.
-  Read the live set with `rk scan event <repo>`.
+  reactor writes a repo-scoped `Event` — `{text, trigger, workflow, instance,
+  target, branch}` — authored by the reserved `reactor` instance, and logs a
+  `warn`. The `text` field is human-readable for inbox/event consumers and
+  names both the reviewed branch and its non-main target. Read the live set
+  with `rk scan event <repo>`.
 
 If you want base-chained completions reviewed but held for an explicit
 decision instead of auto-landed, override `target` in a repo-local copy of the

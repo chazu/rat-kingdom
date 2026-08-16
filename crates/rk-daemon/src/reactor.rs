@@ -1413,6 +1413,17 @@ impl Reactor {
             return;
         }
         let branch = params.get("branch").and_then(Value::as_str).unwrap_or("");
+        let text = if branch.is_empty() {
+            format!(
+                "{} workflow {} will land on non-main target {}",
+                trigger.name, trigger.run, target
+            )
+        } else {
+            format!(
+                "{} workflow {} will land {} on non-main target {}",
+                trigger.name, trigger.run, branch, target
+            )
+        };
         warn!(
             trigger = %trigger.name,
             workflow = %trigger.run,
@@ -1427,6 +1438,7 @@ impl Reactor {
             "reactor_non_main_land_target",
             REACTOR_INSTANCE,
             json!({
+                "text": text,
                 "trigger": trigger.name,
                 "workflow": trigger.run,
                 "instance": instance_id,
