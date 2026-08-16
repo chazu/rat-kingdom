@@ -608,9 +608,13 @@ fn steward_missing_diff_class_defaults_to_review_tier() {
     );
 }
 
-/// Provenance for the future commit-keyed verdict cache (Phase 2): the
-/// reviewer's task carries the branch-tip SHA, and it is instructed to record
-/// head_sha in its verdict artifact.
+/// Provenance for the commit-keyed verdict cache (Phase 2): the reviewer's
+/// task carries the branch-tip SHA, and it is instructed to record head_sha
+/// in its verdict artifact. A non-empty headSha now takes the cached-review
+/// arm, so the reviewer spawn is nested inside its cache-miss (`""`) case
+/// rather than sitting at steps[0] — see
+/// `steward_cached_verdict_probe_is_bound_to_the_exact_commit_and_gates_the_hit_path`
+/// for the shape of the cache probe itself.
 #[test]
 fn steward_review_tier_threads_head_sha_into_reviewer_task_and_artifact() {
     use rk_workflow::Step;
@@ -621,8 +625,12 @@ fn steward_review_tier_threads_head_sha_into_reviewer_task_and_artifact() {
     ]);
     let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
 
-    let Step::Spawn(spawn) = &workflow.steps[0] else {
-        panic!("steward must start by spawning the reviewer");
+    let Step::When(cache_probe_route) = &workflow.steps[1] else {
+        panic!("a non-empty headSha must probe the verdict cache before reviewing");
+    };
+    let cache_miss = &cache_probe_route.cases[""];
+    let Step::Spawn(spawn) = &cache_miss[0] else {
+        panic!("a cache miss must fall through to spawning the reviewer");
     };
     let description = spawn
         .task
@@ -637,6 +645,103 @@ fn steward_review_tier_threads_head_sha_into_reviewer_task_and_artifact() {
         description.contains("\"head_sha\": \"deadbeef123\""),
         "the reviewer must be instructed to record head_sha in its verdict artifact: {description}"
     );
+}
+
+/// The commit-keyed verdict cache probe (Phase 2) itself: bounded,
+/// non-blocking, keyed on the exact commit, and — critically — its cache-HIT
+/// path must never spawn the expensive `reviewer` agent, only the cheap
+/// `gateholder` used elsewhere to host deterministic gates. A hit that spawned
+/// a fresh reviewer anyway would defeat the entire point of the cache.
+#[test]
+fn steward_cached_verdict_probe_is_bound_to_the_exact_commit_and_gates_the_hit_path() {
+    use rk_workflow::Step;
+
+    let inputs = HashMap::from([
+        ("taskId".to_string(), json!("fix-login")),
+        ("headSha".to_string(), json!("deadbeef123")),
+    ]);
+    let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
+
+    let Step::Read(probe) = &workflow.steps[0] else {
+        panic!("steward with a headSha must start with the cache probe read");
+    };
+    assert_eq!(probe.category, "artifact");
+    assert_eq!(probe.identity, "review");
+    assert_eq!(
+        probe.for_commit.as_deref(),
+        Some("deadbeef123"),
+        "the cache probe must be keyed on this exact commit, not fromAgent/fromInstance"
+    );
+    assert!(!probe.from_agent, "forCommit and fromAgent share one predicate slot");
+    assert!(!probe.from_instance, "forCommit and fromInstance share one predicate slot");
+    assert_eq!(probe.field.as_deref(), Some("recommendation"));
+    assert_eq!(probe.into, "cachedVerdict");
+    assert_eq!(
+        probe.on_timeout, "continue",
+        "a cache miss must not fail the instance — it must fall through to a fresh review"
+    );
+
+    let Step::When(route) = &workflow.steps[1] else {
+        panic!("the cache probe must be followed by a when on cachedVerdict");
+    };
+    assert_eq!(route.var, "cachedVerdict");
+
+    // The HIT path (any non-empty cached recommendation) must spawn only the
+    // cheap gate-holder — never a fresh `reviewer` — so a retry cannot shop
+    // for a better opinion than the one already on record.
+    let hit_spawn = route
+        .default
+        .iter()
+        .find_map(|s| match s {
+            Step::Spawn(sp) => Some(sp),
+            _ => None,
+        })
+        .expect("the cache-hit path must still spawn a gate-holder to host the gates");
+    assert_eq!(
+        hit_spawn.agent.as_deref(),
+        Some("gateholder"),
+        "a cache hit must never spawn the expensive reviewer agent"
+    );
+    assert!(
+        !route
+            .default
+            .iter()
+            .any(|s| matches!(s, Step::Spawn(sp) if sp.agent.as_deref() == Some("reviewer"))),
+        "a cache hit must not spawn a fresh reviewer anywhere in its routing"
+    );
+
+    // The MISS path (`""`, what a `null` cached value renders as) falls
+    // through to the ordinary review arm, which does spawn the reviewer.
+    assert!(
+        route.cases[""]
+            .iter()
+            .any(|s| matches!(s, Step::Spawn(sp) if sp.agent.as_deref() == Some("reviewer"))),
+        "a cache miss must still spawn the reviewer, unchanged from before the cache"
+    );
+}
+
+/// An empty headSha (a legacy completion predating Phase 0) cannot key a
+/// cache lookup at all — `forCommit: ""` would false-positive-match any other
+/// legacy artifact missing the field. It must take the plain review arm with
+/// no cache probe, exactly as it did before the cache existed.
+#[test]
+fn steward_empty_head_sha_skips_the_cache_probe_entirely() {
+    use rk_workflow::Step;
+
+    let inputs = HashMap::from([("taskId".to_string(), json!("fix-login"))]);
+    let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
+
+    assert!(
+        !workflow
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::Read(r) if r.for_commit.is_some())),
+        "an empty headSha must never reach a forCommit read"
+    );
+    let Step::Spawn(spawn) = &workflow.steps[0] else {
+        panic!("an empty headSha must start with the plain reviewer spawn, unchanged");
+    };
+    assert_eq!(spawn.agent.as_deref(), Some("reviewer"));
 }
 
 #[test]
@@ -733,6 +838,10 @@ fn every_shipped_verdict_read_is_bound_to_its_reviewer() {
             "question".to_string(),
             json!("How does the tuplespace work?"),
         ),
+        // Set so this sweep also exercises steward's commit-keyed cache probe
+        // (Phase 2) — a `headSha`-less load only ever sees the plain,
+        // `fromAgent`-bound review read.
+        ("headSha".to_string(), json!("cafefeed00")),
     ]);
     let mut total = 0;
     for def in rk_workflow::definitions(&examples_dir()) {
@@ -743,9 +852,10 @@ fn every_shipped_verdict_read_is_bound_to_its_reviewer() {
         verdict_reads(&workflow.steps, &mut reads);
         for read in &reads {
             assert!(
-                read.from_agent,
+                read.from_agent || read.for_commit.is_some(),
                 "{name}: the verdict read into `{}` must be bound to the reviewer that wrote \
-                 it (`fromAgent: true`), or a concurrent instance's verdict can route it",
+                 it (`fromAgent: true`) or to the exact commit it verdicts on (`forCommit`), \
+                 or a concurrent instance's or stale commit's verdict can route it",
                 read.into
             );
         }

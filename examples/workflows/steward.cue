@@ -54,6 +54,23 @@
 // auto-merge is only ever reached through a clean policy gate, a within-budget
 // diff, and a green suite (plus an explicit APPROVE in the review tier).
 //
+// COMMIT-KEYED VERDICT CACHE (Phase 2, TKT-01M036NWEG0H019BJ16G59RZVP), review
+// tier only. A retry against an UNCHANGED branch tip — the reactor refiring,
+// an operator re-running steward by hand after clearing an infra hold, a
+// daemon restart replaying a completion — used to re-spawn and re-pay for a
+// reviewer even though nothing about the diff had changed. Before spawning
+// one, the workflow now probes (bounded, non-blocking: `forCommit`,
+// `onTimeout: "continue"`) whether ANY prior run already recorded a verdict
+// for this EXACT `headSha`. On a hit it does NOT spawn a reviewer — that would
+// let a retry shop for a better opinion, defeating the cache — it spawns only
+// a cheap gate-holder (same shape as the reduced tier) to re-verify the
+// deterministic gates against `target`'s current state, then routes on the
+// cached recommendation through the same `_routeVerdict` logic a fresh review
+// uses. A cached REWORK/STOP is honored exactly like a fresh one. On a miss
+// (nothing cached, or no `headSha` to key on at all) it falls straight through
+// to the unchanged review tier below. Cache invalidation is automatic: a new
+// commit is a new sha, so a real code change is never served a stale verdict.
+//
 // This file is the SOURCE for every deployed copy. Install it with
 // `rk workflow install examples/workflows/steward.cue` rather than `cp`, and the
 // install manifest lets `rk workflow drift` tell you when a deployed steward has
@@ -356,16 +373,27 @@ workflow: {
 				into:      "verdict"
 				timeout:   "5m"
 			},
+		],
+		(_routeVerdict & {Var: "verdict"}).steps,
+	])
 
-			// Route on the verdict. Gates already passed, so APPROVE is the ONLY
-			// path that reaches `land`; everything else holds the branch unmerged.
+	// Route on a verdict already sitting in ctx.var.<Var> — shared by the fresh
+	// review above (`verdict`, read from the reviewer THIS run spawned) and the
+	// commit-keyed cache below (`cachedVerdict`, read from ANY prior run's
+	// artifact for this exact head_sha). Gates already passed either way, so
+	// APPROVE is the ONLY path that reaches `land`; everything else holds the
+	// branch unmerged. Parametrized so a cached REWORK/STOP is routed through
+	// the IDENTICAL steps a fresh one would take — never a second, looser path.
+	_routeVerdict: {
+		Var: string
+		steps: [
 			{
 				type: "when"
-				var:  "verdict"
+				var:  Var
 				cases: {
-					// AUTO-MERGE: tear down the reviewer's worktree (so its branch is
-					// no longer checked out), then land that branch — carrying the
-					// reviewed work — straight onto the target. The run completes.
+					// AUTO-MERGE: tear down the reviewing/gate-holding worktree (so
+					// its branch is no longer checked out), then land that branch —
+					// carrying the reviewed work — straight onto the target.
 					"APPROVE": [
 						{type: "dismiss", noMerge: true},
 						{type: "land", branch: "{{ctx.activeBranch}}", target: _input.target},
@@ -380,7 +408,7 @@ workflow: {
 					// single-purpose, and the backlog drain / dispatcher picks it up
 					// (whose completion re-enters the steward: a closed loop, not a
 					// runaway). The branch is HELD (noMerge) so the rework can build
-					// on it. `rk ticket new` runs in the reviewer's worktree.
+					// on it. `rk ticket new` runs in the reviewing/gate-holding worktree.
 					"REWORK": [
 						{
 							type: "run"
@@ -429,8 +457,82 @@ workflow: {
 					{type: "stop", reason: "unrecognized review verdict for " + _input.taskId},
 				]
 			},
-		],
-	])
+		]
+	}
+
+	// PHASE 2 (commit-keyed verdict cache, TKT-01M036NWEG0H019BJ16G59RZVP):
+	// before paying for a reviewer, ask whether ANY prior run already recorded
+	// a verdict for this EXACT branch tip — a bounded, non-blocking probe
+	// (`forCommit`, `onTimeout: "continue"`), not a wait for one to arrive.
+	//
+	//   HIT  (any recommendation, including REWORK/STOP): do NOT spawn a
+	//        reviewer to shop for a second opinion — that would defeat the
+	//        cache and let a retry launder a bad verdict into a better one.
+	//        Still spawn a cheap gate-holder (same shape as the reduced tier)
+	//        to host the deterministic gates, since `target` may have moved
+	//        since the cached verdict was recorded and a `run`/`land` step
+	//        needs an active agent's worktree regardless — then route on the
+	//        cached recommendation through the SAME `_routeVerdict` a fresh
+	//        review uses. No gate is weakened; only the LLM opinion is reused.
+	//   MISS (`cachedVerdict` lifts as "" — `value_as_key` renders `null` that
+	//        way): fall through to the unchanged `_reviewArm` below.
+	//
+	// Only reachable when `_input.headSha` is non-empty (guarded where this is
+	// selected into `steps`, below) — an empty sha would key on
+	// `"head_sha":""`, matching any OTHER legacy artifact missing the field,
+	// which is exactly the false cache hit the engine's `forCommit` guard
+	// refuses. Cache invalidation is automatic: a new commit is a new sha, so
+	// there is nothing to evict by hand.
+	_cachedReviewArm: [
+		{
+			type:      "read"
+			category:  "artifact"
+			identity:  "review"
+			forCommit: _input.headSha
+			field:     "recommendation"
+			into:      "cachedVerdict"
+			timeout:   "1s"
+			onTimeout: "continue"
+		},
+		{
+			type: "when"
+			var:  "cachedVerdict"
+			cases: {
+				"": _reviewArm
+			}
+			default: list.Concat([
+				[
+					{
+						type:   "spawn"
+						role:   "reviewer"
+						agent:  "gateholder"
+						branch: _input.branch
+						task: {
+							title: "steward-gatehold-cached-" + _input.taskId
+							description: """
+								You are a gate-holder, not a reviewer. A prior review
+								already recorded a verdict for branch
+								{{ctx.activeBranch}} at this EXACT commit (head
+								\(_input.headSha)) for \(_input.taskId), so the steward
+								is reusing that cached verdict instead of paying for a
+								fresh review (commit-keyed verdict cache, Phase 2).
+								Your worktree exists only to host the deterministic
+								policy/diff-scope/verify gates that follow — re-run
+								against the current state of \(_input.target), since it
+								may have moved since the cached verdict was recorded.
+								Do nothing else: run `rk done` immediately.
+								"""
+						}
+					},
+					{type: "wait", timeout: _input.reviewTimeout},
+					// The gate-holder session must itself have finished cleanly.
+					{type: "evaluate", expect: {is_error: false}},
+				],
+				_gates,
+				(_routeVerdict & {Var: "cachedVerdict"}).steps,
+			])
+		},
+	]
 
 	// REDUCED TIER (see file header — TKT-01M0382WS1NNR0W5RA59PPDDYP /
 	// TKT-01M036PSEHTMD3S5D2JFAG7XVY). Spawns a near-zero gate-holder instead
@@ -472,8 +574,13 @@ workflow: {
 		],
 	])
 
+	_needsReview: !(_input.diffClass == "doc-only" || _input.diffClass == "trivial")
+
 	steps: list.Concat([
-		if _input.diffClass == "doc-only" || _input.diffClass == "trivial" {_reducedArm},
-		if !(_input.diffClass == "doc-only" || _input.diffClass == "trivial") {_reviewArm},
+		if !_needsReview {_reducedArm},
+		// PHASE 2: a non-empty headSha can key a cache probe; an empty one
+		// (legacy completion) cannot, so it always takes the full review.
+		if _needsReview && _input.headSha != "" {_cachedReviewArm},
+		if _needsReview && _input.headSha == "" {_reviewArm},
 	])
 }
