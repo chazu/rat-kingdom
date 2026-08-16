@@ -485,8 +485,8 @@ pub(crate) enum LandingOutcome {
     /// (`merged`, `delivered`, ...).
     Landed(Value),
     /// A gate failed or timed out. `run_check_in` already recorded the
-    /// durable `gate-failure` artifact; the branch is simply left unmerged —
-    /// nothing further happens to it here.
+    /// durable `gate-failure` artifact, and a steward `need` row was written
+    /// so the hold is visible in `rk inbox`; the branch is left unmerged.
     GateHeld,
     /// The reviewer (fresh or cached) recommended REWORK: a follow-up ticket
     /// was filed directly (`Tickets::create`, §1.5) and the branch held
@@ -498,6 +498,13 @@ pub(crate) enum LandingOutcome {
     /// human judgment call" treatment (design doc §2.4): a `need` tuple was
     /// written directly (`Space::out`, §1.5) and the branch held unmerged.
     Escalated(Tuple),
+    /// The work key already carried a terminal `landing_processed` marker
+    /// when this entry was processed — the daemon crashed in the window
+    /// between `mark_processed` and the queue-entry removal on a prior run.
+    /// Every terminal side effect (need rows, rework tickets, the land
+    /// itself) already happened then; this run only reconciles the queue.
+    /// Carries the recorded outcome string ("landed", "gate-held", ...).
+    Reconciled(String),
 }
 
 /// Daemon-native consumer: dequeues a candidate, runs its gates in a
@@ -553,7 +560,10 @@ impl LandingPipeline {
     /// Has `entry`'s exact `(repo, branch, head_sha)` already reached a
     /// terminal [`LandingOutcome`]? See [`Self::mark_processed`], the write
     /// side of this marker.
-    fn already_processed(&self, entry: &LandingQueueEntry) -> rk_core::Result<bool> {
+    /// The recorded terminal outcome string for `entry`'s work key, when a
+    /// `landing_processed` marker exists — the read side used both by the
+    /// enqueue dedup and by `process_entry`'s crash-window reconciliation.
+    fn processed_outcome(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<String>> {
         let pattern = Pattern::for_commit(
             Category::Event,
             LANDING_PROCESSED_IDENTITY,
@@ -561,7 +571,16 @@ impl LandingPipeline {
             &entry.head_sha,
         )
         .scope(&entry.repo_name);
-        Ok(!self.space.scan(&pattern)?.is_empty())
+        Ok(self.space.scan(&pattern)?.into_iter().find_map(|t| {
+            t.payload
+                .get("outcome")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }))
+    }
+
+    fn already_processed(&self, entry: &LandingQueueEntry) -> rk_core::Result<bool> {
+        Ok(self.processed_outcome(entry)?.is_some())
     }
 
     /// Durably record that `entry`'s work key reached a terminal outcome —
@@ -580,6 +599,10 @@ impl LandingPipeline {
             LandingOutcome::GateHeld => "gate-held",
             LandingOutcome::ReworkFiled(_) => "rework-filed",
             LandingOutcome::Escalated(_) => "escalated",
+            // A reconciled entry's marker already exists from the run that
+            // performed the side effects; writing a second would corrupt the
+            // one-marker-per-work-key invariant `already_processed` reads.
+            LandingOutcome::Reconciled(_) => return Ok(()),
         };
         let tuple = Tuple::new(
             Category::Event,
@@ -626,7 +649,25 @@ impl LandingPipeline {
     }
 
     async fn process_entry(&self, entry: &LandingQueueEntry) -> rk_core::Result<LandingOutcome> {
+        // Crash-window reconciliation (review round 2): a crash between
+        // `mark_processed` and the caller's queue removal leaves both the
+        // marker and the queue entry. The marker is the truth — never repeat
+        // terminal side effects (needs, rework tickets, the land itself);
+        // just report what already happened so the caller removes the entry.
+        if let Some(prior) = self.processed_outcome(entry)? {
+            return Ok(LandingOutcome::Reconciled(prior));
+        }
         if !self.run_gates(entry).await? {
+            // The durable gate-failure artifact carries the evidence; the
+            // need row is what makes the hold VISIBLE in `rk inbox` — parity
+            // with the CUE steward's escalation contract.
+            self.escalate(
+                entry,
+                format!(
+                    "steward: run gate FAILED for {} on {} — branch held unmerged; read the                      durable gate-failure artifact for the failing tests",
+                    entry.task, entry.branch
+                ),
+            )?;
             let outcome = LandingOutcome::GateHeld;
             self.mark_processed(entry, &outcome)?;
             return Ok(outcome);
@@ -1512,6 +1553,52 @@ workflow: {
         let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
         assert_eq!(outcomes.len(), 1);
         assert!(matches!(outcomes[0], LandingOutcome::GateHeld));
+
+        // The hold is VISIBLE where a human looks: a steward-parity need row
+        // (agent/task/text) exists for the repo — the CUE steward's
+        // escalation contract, kept by the pipeline (review round 2).
+        let needs = space
+            .scan(
+                &Pattern::category(Category::Need)
+                    .scope("code-repo")
+                    .identity(STEWARD_NEED_IDENTITY),
+            )
+            .unwrap();
+        assert_eq!(needs.len(), 1, "gate hold must write exactly one need row");
+        assert_eq!(needs[0].payload["agent"], "steward");
+        assert_eq!(needs[0].payload["task"], "add src");
+        assert!(needs[0].payload["text"]
+            .as_str()
+            .unwrap()
+            .contains("run gate FAILED"));
+
+        // Crash-window reconciliation: the terminal marker exists but suppose
+        // the queue entry survived (daemon died before removal). Re-processing
+        // the same work key must NOT repeat side effects — same single need
+        // row, no second marker — and must report itself as reconciled.
+        let replay = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: rev_parse(repo_dir.path(), "feature"),
+            diff_class: "doc-only".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+        let reconciled = pipeline.process_entry(&replay).await.unwrap();
+        match reconciled {
+            LandingOutcome::Reconciled(prior) => assert_eq!(prior, "gate-held"),
+            other => panic!("expected Reconciled, got {other:?}"),
+        }
+        let needs_after = space
+            .scan(
+                &Pattern::category(Category::Need)
+                    .scope("code-repo")
+                    .identity(STEWARD_NEED_IDENTITY),
+            )
+            .unwrap();
+        assert_eq!(needs_after.len(), 1, "reconciliation must not duplicate the need row");
 
         let failures = space
             .scan(
