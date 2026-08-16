@@ -504,6 +504,48 @@ inbox` identically to today. Operator cutover runbook: disable the `steward-on-c
 trigger's workflow-spawn behavior (or retire it entirely if (a) was chosen), enable the landing
 pipeline, verify `rk workflow drift`-equivalent parity. *Depends on T2, T3.*
 
+**T4 rework — crash-safe transitions, admission proofs, and the cross-key concurrency
+contract.** A review of the first T4 landing caught three gaps, closed as follows:
+
+- `LandingQueue::claim_next`/`set_status` used delete-then-write for their durable status
+  transition, so a daemon crash landing in that gap lost the queue entry outright. Flipped to
+  write-then-delete: the successor tuple is written durably before the predecessor is deleted,
+  so a crash in the gap leaves two tuples sharing one `seq` instead of zero. A new `rev` counter
+  on `LandingQueueEntry`, bumped on every transition, lets `LandingQueue::scan_current` tell the
+  fresh successor from the stale predecessor and self-heal the duplicate on the next read rather
+  than exposing (or losing) the entry. Regression:
+  `crash_between_write_and_delete_survives_the_entry` drives the write and delete halves
+  separately and asserts the entry survives with no orphan left behind.
+- Two proofs promised above were missing. `burst_of_completions_on_one_key_never_runs_gates_
+  concurrently` enqueues several candidates onto the same `(repo, target)` key before draining
+  starts and proves (via a marker file a concurrent run would trip) that they still gate-run one
+  at a time. `escalation_row_matches_the_workflow_driven_steward_shape` proves
+  `LandingPipeline::escalate`'s direct `Space::out` write produces the identical `rk inbox` row
+  `inbox::build` renders from the historical workflow-driven `steward-report-stop`/`-gate-
+  failure`/`-timeout`/`-unknown-verdict` `rk out need` shape.
+- **Cross-key concurrency contract.** `run_cycle` drained every `(repo, target)` key in one
+  sequential `for` loop, awaiting each key's full `drain_key` before starting the next. That
+  contradicted both this doc's own §1.1 (`MergeQueue`'s "different target branches in the same
+  repo merge concurrently") and `run_cycle`'s own doc comment, which already claimed "nothing
+  here serializes two DIFFERENT keys against each other" — and it was a real correctness gap, not
+  just a stale comment: a slow `verify` run on one key (up to `GateConfig::gate_timeout`, 60
+  minutes by default) silently stalled every other repo's/target's landing traffic for the rest
+  of the cycle. Fixed by implementing the promised behavior rather than narrowing the doc to
+  match the bug (the smaller change, since it required no new dependency — `tokio::task::JoinSet`
+  was enough): `run_cycle` now spawns one task per pending key via `Arc<LandingPipeline>` and
+  drains them concurrently, fanning out unboundedly across keys (each key is already a small,
+  naturally-bounded admission unit — there is one only if something is genuinely queued for it).
+  WITHIN a key, admission is unchanged: `drain_key` still claims and finishes one candidate at a
+  time, so a burst on one key still gate-runs serially even though many keys now run side by
+  side (§2.1, §5 open question 3 — still open, and orthogonal to this fix). This changed
+  `run_cycle`'s receiver from `&self` to `self: &Arc<Self>`; the one live call site
+  (`server.rs`'s landing loop) already held an `Arc<LandingPipeline>`, so no behavior changed
+  there. Proof: `distinct_keys_drain_concurrently_within_one_run_cycle` enqueues candidates on
+  two different targets with a `verify` check that blocks on a shared release flag, and asserts
+  both are observed genuinely in flight at once before either is released — verified to fail
+  (timeout) against the prior serial implementation before being confirmed to pass against the
+  fix, so it is a real discriminator and not a tautology.
+
 Natural sequencing: **T1 → T2 → T3 → T4**, each independently landable and testable; T1 has no
 dependency on anything else in this program and could start immediately.
 

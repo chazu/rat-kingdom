@@ -848,25 +848,51 @@ impl LandingPipeline {
 
     /// One polling pass: discover every `(repo_name, target)` key with a
     /// candidate queued (or left `RunningGates`/`AwaitingReview` by a crashed
-    /// prior process — restart-safety, module doc) and drain each
-    /// independently. Distinct keys never interleave with each other's
-    /// ordering (each is drained to empty before the next starts), but
-    /// nothing here serializes two DIFFERENT keys against each other —
-    /// matching the design doc's "different target branches in the same repo
-    /// merge concurrently" granularity.
+    /// prior process — restart-safety, module doc) and drain each key
+    /// CONCURRENTLY, one task per key — matching `MergeQueue`'s own promise
+    /// that different target branches in the same repo merge concurrently
+    /// (design doc §1.1), which this pipeline's admission model (§2.1) never
+    /// narrowed. Fan-out is intentionally unbounded across keys: each key is
+    /// already a natural, small admission unit (there is one only if
+    /// something is genuinely queued for it), unlike WITHIN a key, where
+    /// admission stays strictly single-consumer (§2.1, §5 open question 3) —
+    /// `drain_key` still claims and finishes one candidate at a time for its
+    /// own key, so a burst on ONE key still gate-runs serially even though
+    /// this cycle now runs many keys side by side (see
+    /// `burst_of_completions_on_one_key_never_runs_gates_concurrently` and
+    /// `distinct_keys_drain_concurrently_within_one_run_cycle`). Prior to
+    /// this, `run_cycle` drained keys one at a time in a single `for` loop,
+    /// which meant a slow `verify` run (up to `GateConfig::gate_timeout`,
+    /// 60 minutes by default) on one key silently stalled every other
+    /// repo's/target's landing traffic for the rest of the cycle — a
+    /// correctness gap against the stated concurrency promise, not just a
+    /// stale comment, so it is fixed here rather than merely documented
+    /// (T4 rework; see the design doc's T4 section for the writeup).
     ///
     /// One key's failure does not abort the whole pass — logged and skipped,
     /// left for the next poll cycle to retry (this drives a live daemon
     /// loop, so one repo's transient fault must not stall every other repo's
-    /// landing traffic).
-    pub(crate) async fn run_cycle(&self) -> rk_core::Result<Vec<LandingOutcome>> {
-        let mut outcomes = Vec::new();
+    /// landing traffic). A panicking drain task is treated the same way.
+    pub(crate) async fn run_cycle(self: &Arc<Self>) -> rk_core::Result<Vec<LandingOutcome>> {
+        let mut in_flight = tokio::task::JoinSet::new();
         for (repo_name, target) in self.queue.pending_keys()? {
-            match self.drain_key(&repo_name, &target).await {
-                Ok(o) => outcomes.extend(o),
-                Err(e) => warn!(
+            let pipeline = Arc::clone(self);
+            in_flight.spawn(async move {
+                let result = pipeline.drain_key(&repo_name, &target).await;
+                (repo_name, target, result)
+            });
+        }
+        let mut outcomes = Vec::new();
+        while let Some(joined) = in_flight.join_next().await {
+            match joined {
+                Ok((_, _, Ok(o))) => outcomes.extend(o),
+                Ok((repo_name, target, Err(e))) => warn!(
                     repo = %repo_name, target = %target, error = %e,
                     "landing pipeline: drain_key failed, will retry next cycle"
+                ),
+                Err(join_err) => warn!(
+                    error = %join_err,
+                    "landing pipeline: a key's drain task panicked, will retry next cycle"
                 ),
             }
         }
@@ -1875,7 +1901,7 @@ checks: [
 
         // "After restart": fresh Space handle over the SAME on-disk store.
         let space = Space::open(&layout.db_path()).unwrap();
-        let pipeline = test_pipeline(home.path(), space.clone());
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
         let outcomes = pipeline.run_cycle().await.unwrap();
         assert_eq!(outcomes.len(), 1);
         assert!(
@@ -1981,6 +2007,133 @@ checks: [
             overlap.is_empty(),
             "gate runs overlapped for the same key — admission is not bounded to one at a \
              time: {overlap}"
+        );
+    }
+
+    /// The other half of T4's concurrency contract (design doc §1.1's
+    /// `MergeQueue` promise, restated for `LandingQueue` in `run_cycle`'s doc
+    /// comment): TWO DIFFERENT `(repo, target)` keys must drain concurrently
+    /// within one `run_cycle`, not have one wait out the other's entire gate
+    /// run first. Each key's `verify` check touches its own "reached" marker
+    /// then busy-waits on a shared release flag the test controls — proof by
+    /// direct observation that both are genuinely in flight at once, not
+    /// inferred from timing.
+    #[tokio::test]
+    async fn distinct_keys_drain_concurrently_within_one_run_cycle() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        git(repo_dir.path(), &["branch", "release"]);
+
+        let barrier_dir = tempfile::tempdir().unwrap();
+        let release_flag = barrier_dir.path().join("release");
+        let checks = format!(
+            r#"
+checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "touch \"{barrier}/reached-$$\"; while [ ! -f \"{release}\" ]; do sleep 0.02; done", timeout: "30s"}},
+]
+"#,
+            barrier = barrier_dir.path().display(),
+            release = release_flag.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+
+        git(repo_dir.path(), &["checkout", "-b", "feature-main"]);
+        std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+        std::fs::write(repo_dir.path().join("docs").join("a.md"), "a\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "docs: a"]);
+        let head_main = rev_parse(repo_dir.path(), "feature-main");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        git(repo_dir.path(), &["checkout", "release"]);
+        git(repo_dir.path(), &["checkout", "-b", "feature-release"]);
+        std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+        std::fs::write(repo_dir.path().join("docs").join("b.md"), "b\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "docs: b"]);
+        let head_release = rev_parse(repo_dir.path(), "feature-release");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "code-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature-main".into(),
+                target: "main".into(),
+                head_sha: head_main,
+                diff_class: "doc-only".into(),
+                task: "add a".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "code-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature-release".into(),
+                target: "release".into(),
+                head_sha: head_release,
+                diff_class: "doc-only".into(),
+                task: "add b".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let cycle = tokio::spawn({
+            let pipeline = Arc::clone(&pipeline);
+            async move { pipeline.run_cycle().await }
+        });
+
+        // Wait until BOTH keys' verify gates are genuinely in flight at
+        // once — the direct proof of concurrent draining.
+        let mut waited = 0;
+        loop {
+            let reached = std::fs::read_dir(barrier_dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("reached-"))
+                .count();
+            if reached >= 2 {
+                break;
+            }
+            waited += 1;
+            assert!(
+                waited < 500,
+                "timed out waiting for both keys' gates to be concurrently in flight \
+                 (run_cycle is still serializing distinct keys)"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        std::fs::write(&release_flag, "").unwrap();
+        let outcomes = cycle.await.unwrap().unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o, LandingOutcome::Landed(r) if r["merged"] == true)),
+            "outcomes: {outcomes:?}"
+        );
+
+        let listing = |rev: &str| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(repo_dir.path())
+                .args(["ls-tree", "--name-only", "-r", rev])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        assert!(listing("main").contains("docs/a.md"), "{}", listing("main"));
+        assert!(
+            listing("release").contains("docs/b.md"),
+            "{}",
+            listing("release")
         );
     }
 }
