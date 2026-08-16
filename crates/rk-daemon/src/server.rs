@@ -444,6 +444,10 @@ impl Daemon {
     /// serve until a `stop` request or SIGTERM/SIGINT arrives.
     pub async fn run(self) -> rk_core::Result<()> {
         self.layout.ensure()?;
+        // Singleton gate: must win this before touching the socket or any
+        // other daemon state. Held for the rest of `run()` via this binding;
+        // dropped (lock released) on return, including on crash/kill.
+        let _singleton_lock = acquire_singleton_lock(&self.layout)?;
         let sock = self.layout.socket_path();
 
         if sock.exists() {
@@ -6032,6 +6036,68 @@ where
     }
     out.push(b'\n');
     write.write_all(&out).await
+}
+
+/// Take the exclusive, kernel-held singleton lock for this `RK_HOME` before
+/// touching the socket or any other daemon state.
+///
+/// `flock` is atomic (unlike the connect-then-check-pid probe below, which
+/// has a TOCTOU window between the probe and `bind`) and is released by the
+/// kernel the instant every fd referencing it closes — including on SIGKILL
+/// — so a crashed daemon's lock is never actually "stale" and needs no
+/// separate recovery path: the next daemon simply acquires it. A second LIVE
+/// daemon against the same home gets a clean, immediate refusal naming the
+/// holder's pid instead of contending with the first over the socket file
+/// and the tuplespace WAL (TKT-01M04D394PQ8VS5N3V441D1MDD: multiple
+/// concurrent daemons — stray old builds, a leaked test daemon, imprecise
+/// kills — contending on one RK_HOME wedged the fleet under load).
+///
+/// The returned `File` must be kept alive for the daemon's lifetime; dropping
+/// it (including implicitly, on process exit or crash) releases the lock.
+fn acquire_singleton_lock(layout: &Layout) -> rk_core::Result<std::fs::File> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::io::AsRawFd;
+
+    let path = layout.lockfile_path();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+
+    // SAFETY: `file` owns a valid fd for the duration of this call, and
+    // `flock` only touches the kernel's lock table entry for that fd.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            let mut holder = String::new();
+            let _ = file.read_to_string(&mut holder);
+            let holder = holder.trim();
+            return Err(rk_core::Error::other(if holder.is_empty() {
+                format!(
+                    "another rat-kingdom daemon already holds the lock at {} (holder pid \
+                     unknown) — refusing to start a second daemon against this RK_HOME",
+                    path.display()
+                )
+            } else {
+                format!(
+                    "another rat-kingdom daemon (pid {holder}) already holds the lock at {} \
+                     — refusing to start a second daemon against this RK_HOME",
+                    path.display()
+                )
+            }));
+        }
+        return Err(err.into());
+    }
+
+    // We hold the lock: record our pid so a contender can name us, and a
+    // human can `kill` the right process directly from the refusal message.
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    write!(file, "{}", std::process::id())?;
+    file.flush()?;
+    Ok(file)
 }
 
 fn read_pid(layout: &Layout) -> Option<u32> {
