@@ -1617,6 +1617,85 @@ workflow: {
         no_spawns(&space);
     }
 
+    /// `LandingPipeline::escalate` writes its `need` tuple directly
+    /// (`Space::out`, §1.5 of the design doc) instead of going through a
+    /// shelled-out `rk out need`, but the ROW `rk inbox` renders from it must
+    /// be indistinguishable from the shape a workflow-driven steward's
+    /// `steward-report-stop`/`steward-report-gate-failure`/
+    /// `steward-report-timeout`/`steward-report-unknown-verdict` named checks
+    /// (`.rk/checks.cue`) have always produced: `rk out need <repo> steward
+    /// --field agent=steward --field task=<id> --field text=<text>`. Compares
+    /// `inbox::build`'s output for a hand-built tuple in that exact
+    /// historical shape against the tuple the pipeline actually escalates
+    /// with on a STOP verdict.
+    #[tokio::test]
+    async fn escalation_row_matches_the_workflow_driven_steward_shape() {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+
+        let space = Space::open_in_memory().unwrap();
+        space.out(verdict_tuple(&head_sha, "STOP")).unwrap();
+
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(review_candidate_entry(repo_dir.path(), &head_sha))
+            .unwrap();
+
+        let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let LandingOutcome::Escalated(produced) = &outcomes[0] else {
+            panic!("expected Escalated, got {:?}", outcomes[0]);
+        };
+
+        let main_after = rev_parse(repo_dir.path(), "main");
+        assert_eq!(main_before, main_after, "branch must not have landed");
+
+        let historical = Tuple::new(
+            Category::Need,
+            "code-repo",
+            STEWARD_NEED_IDENTITY,
+            "daemon",
+            json!({
+                "agent": "steward",
+                "task": "add src",
+                "text": "steward: reviewer returned STOP for add src on feature — needs a \
+                         human merge decision; branch held unmerged",
+            }),
+        );
+
+        let empty_branches = crate::inbox::BranchEvents::default();
+        let empty_ballots = crate::inbox::Ballots::default();
+        let historical_rows = crate::inbox::build(
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&historical),
+            &empty_branches,
+            &empty_ballots,
+        );
+        let produced_rows = crate::inbox::build(
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(produced),
+            &empty_branches,
+            &empty_ballots,
+        );
+
+        assert_eq!(historical_rows.len(), 1);
+        assert_eq!(produced_rows.len(), 1);
+        assert_eq!(historical_rows[0].kind, produced_rows[0].kind);
+        assert_eq!(historical_rows[0].urgency, produced_rows[0].urgency);
+        assert_eq!(historical_rows[0].subject, produced_rows[0].subject);
+        assert_eq!(historical_rows[0].scope, produced_rows[0].scope);
+        assert_eq!(historical_rows[0].action, produced_rows[0].action);
+        assert!(
+            produced_rows[0].detail.contains("STOP"),
+            "detail: {}",
+            produced_rows[0].detail
+        );
+    }
+
     #[tokio::test]
     async fn cache_miss_spawns_one_reviewer_and_routes_on_late_verdict() {
         let home = tempfile::tempdir().unwrap();
@@ -1816,6 +1895,92 @@ checks: [
                 .unwrap()
                 .is_empty(),
             "the queue entry must be removed once processing reaches a terminal outcome"
+        );
+    }
+
+    /// T4's admission control (design doc §2.1's "single-consumer per key" +
+    /// the T4 section's own "a burst of completions queues instead of
+    /// thundering"): enqueueing several candidates onto the SAME
+    /// `(repo, target)` key at once — the burst arrives before the consumer
+    /// ever runs — must still gate-run them one at a time, never
+    /// concurrently. Proven with a `verify` check that records whether it
+    /// ever started while a sibling run's marker file was still present,
+    /// which a concurrent (thundering) admission would trip.
+    #[tokio::test]
+    async fn burst_of_completions_on_one_key_never_runs_gates_concurrently() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+
+        // Lives outside the repo/gate worktree entirely, so `reset_gate_
+        // worktree`'s `git clean -fd` between candidates never touches it.
+        let barrier_dir = tempfile::tempdir().unwrap();
+        let marker = barrier_dir.path().join("running");
+        let overlap_log = barrier_dir.path().join("overlap.log");
+        let checks = format!(
+            r#"
+checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "test -f \"{marker}\" && echo overlap >> \"{log}\"; touch \"{marker}\"; sleep 0.1; rm -f \"{marker}\"", timeout: "30s"}},
+]
+"#,
+            marker = marker.display(),
+            log = overlap_log.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+
+        const N: usize = 4;
+        let mut candidates = Vec::new();
+        for i in 0..N {
+            let branch = format!("feature-{i}");
+            git(repo_dir.path(), &["checkout", "-b", &branch]);
+            std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+            std::fs::write(
+                repo_dir.path().join("docs").join(format!("note-{i}.md")),
+                "note\n",
+            )
+            .unwrap();
+            git(repo_dir.path(), &["add", "."]);
+            git(repo_dir.path(), &["commit", "-m", &format!("docs: note {i}")]);
+            let head_sha = rev_parse(repo_dir.path(), &branch);
+            git(repo_dir.path(), &["checkout", "main"]);
+            candidates.push((branch, head_sha));
+        }
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        // Admit the whole burst before draining a single one -- every
+        // candidate is already queued before the consumer starts.
+        for (branch, head_sha) in &candidates {
+            pipeline
+                .enqueue(LandingQueueEntry {
+                    repo_name: "code-repo".into(),
+                    repo_path: repo_dir.path().display().to_string(),
+                    branch: branch.clone(),
+                    target: "main".into(),
+                    head_sha: head_sha.clone(),
+                    diff_class: "doc-only".into(),
+                    task: format!("add {branch}"),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), N);
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o, LandingOutcome::Landed(r) if r["merged"] == true)),
+            "outcomes: {outcomes:?}"
+        );
+
+        let overlap = std::fs::read_to_string(&overlap_log).unwrap_or_default();
+        assert!(
+            overlap.is_empty(),
+            "gate runs overlapped for the same key — admission is not bounded to one at a \
+             time: {overlap}"
         );
     }
 }
