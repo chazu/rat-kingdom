@@ -313,6 +313,54 @@ impl Repo {
         Ok(())
     }
 
+    /// Idempotent: create a detached, daemon-owned worktree at `path` if one
+    /// isn't already registered there. Unlike [`create_worktree`](Repo::create_worktree)
+    /// this never mints a branch — a plain detached checkout, the same *kind*
+    /// as [`advance_via_worktree`](Repo::advance_via_worktree)'s temporary one,
+    /// but meant to be created once and reused across many gate runs via
+    /// [`reset_gate_worktree`](Repo::reset_gate_worktree) instead of being torn
+    /// down after a single call. Detached avoids git's "a branch can't be
+    /// checked out in two worktrees at once" restriction, so this worktree can
+    /// hold a candidate branch's tip while that branch is still checked out
+    /// (non-detached) elsewhere.
+    pub fn ensure_gate_worktree(&self, path: &Path) -> rk_core::Result<()> {
+        if self.is_registered_worktree(path) {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let _metadata = worktree_metadata_guard();
+        self.reap_stale_worktree(path);
+        self.git(&["worktree", "add", "--detach", &path.to_string_lossy(), "HEAD"])?;
+        debug!(?path, "created gate worktree");
+        Ok(())
+    }
+
+    /// Reset an existing gate worktree ([`ensure_gate_worktree`](Repo::ensure_gate_worktree))
+    /// to `sha`'s tree, discarding whatever a prior gate run left behind:
+    /// tracked-file edits (`checkout --force`) and untracked files
+    /// (`clean -fd`). Deliberately `-fd`, not `-fdx`: an ignored build cache
+    /// (e.g. `target/`) staying warm across resets is the entire point of a
+    /// *persistent* worktree, not something a reset should wipe.
+    pub fn reset_gate_worktree(&self, path: &Path, sha: &str) -> rk_core::Result<()> {
+        git_in(path, &["checkout", "--detach", "--force", sha])?;
+        git_in(path, &["clean", "-fd"])?;
+        Ok(())
+    }
+
+    /// Whether `path` is already registered as a worktree of this repo (as
+    /// opposed to a directory that merely exists there, e.g. stale residue).
+    fn is_registered_worktree(&self, path: &Path) -> bool {
+        let Ok(list) = self.git(&["worktree", "list", "--porcelain"]) else {
+            return false;
+        };
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        list.lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .any(|p| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p)) == canon)
+    }
+
     pub fn delete_branch(&self, branch: &str) -> rk_core::Result<()> {
         self.validate_local_branch(branch, "branch to delete")?;
         if PROTECTED_BRANCHES.contains(&branch) {
@@ -1014,6 +1062,77 @@ mod tests {
                 .trim()
                 .is_empty(),
             "operator's working tree should be clean after auto-merge"
+        );
+    }
+
+    #[test]
+    fn ensure_gate_worktree_is_idempotent() {
+        let (dir, repo) = scratch_repo();
+        let gate = dir.path().join("gate-worktrees").join("main");
+
+        repo.ensure_gate_worktree(&gate).unwrap();
+        assert!(gate.join("README.md").exists());
+        let list_before = repo.git(&["worktree", "list", "--porcelain"]).unwrap();
+
+        // A second call finds the worktree already registered and is a no-op —
+        // it must not error, re-add, or otherwise disturb the checkout.
+        repo.ensure_gate_worktree(&gate).unwrap();
+        let list_after = repo.git(&["worktree", "list", "--porcelain"]).unwrap();
+        assert_eq!(list_before, list_after);
+        assert_eq!(
+            list_after.matches(&gate.to_string_lossy().to_string()).count(),
+            1,
+            "worktree must be registered exactly once"
+        );
+    }
+
+    #[test]
+    fn reset_gate_worktree_discards_prior_state_but_keeps_ignored_files() {
+        let (dir, repo) = scratch_repo();
+        // A tracked .gitignore, so `target/` is ignored at every commit below.
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+        run(dir.path(), &["add", ".gitignore"]);
+        run(dir.path(), &["commit", "-m", "add gitignore"]);
+
+        let gate = dir.path().join("gate-worktrees").join("main");
+        repo.ensure_gate_worktree(&gate).unwrap();
+
+        // A second commit on main to reset onto.
+        std::fs::write(dir.path().join("second.txt"), "second\n").unwrap();
+        run(dir.path(), &["add", "second.txt"]);
+        run(dir.path(), &["commit", "-m", "second commit"]);
+        let second_sha = repo.rev_parse("main").unwrap();
+
+        // Simulate a prior gate run's mess: an edit to a tracked file, an
+        // untracked file, and a warm ignored build cache.
+        std::fs::write(gate.join("README.md"), "tampered\n").unwrap();
+        std::fs::write(gate.join("untracked.txt"), "junk\n").unwrap();
+        std::fs::create_dir_all(gate.join("target")).unwrap();
+        std::fs::write(gate.join("target").join("cache"), "warm\n").unwrap();
+
+        repo.reset_gate_worktree(&gate, &second_sha).unwrap();
+
+        assert_eq!(
+            git_in(&gate, &["rev-parse", "HEAD"]).unwrap().trim(),
+            second_sha
+        );
+        assert_eq!(
+            std::fs::read_to_string(gate.join("README.md")).unwrap(),
+            "# scratch\n",
+            "tracked-file edit must be discarded by reset"
+        );
+        assert_eq!(
+            std::fs::read_to_string(gate.join("second.txt")).unwrap(),
+            "second\n"
+        );
+        assert!(
+            !gate.join("untracked.txt").exists(),
+            "untracked file must be discarded by reset"
+        );
+        assert_eq!(
+            std::fs::read_to_string(gate.join("target").join("cache")).unwrap(),
+            "warm\n",
+            "an ignored build cache must survive reset (clean -fd, not -fdx)"
         );
     }
 

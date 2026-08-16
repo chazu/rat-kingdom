@@ -2589,7 +2589,52 @@ impl WorkflowEngine {
                 )));
             }
         }
+        let env: Vec<(String, String)> = run
+            .env
+            .iter()
+            .map(|(name, value)| (name.clone(), interpolate(value, ctx)))
+            .collect();
 
+        self.run_check_in(
+            id,
+            repo,
+            &agent,
+            &dir,
+            &command,
+            &resolved,
+            &env,
+            timeout,
+            ctx.previous_result.as_ref(),
+        )
+        .await
+    }
+
+    /// Run one resolved check to completion in `dir`, with retry/timeout
+    /// policy and durable gate-failure recording — everything downstream of
+    /// "have a directory and a fully-resolved command". Split out of
+    /// [`run_command`](Self::run_command) so this logic no longer requires
+    /// `ctx.active_agent`: `run_command` resolves a directory from the active
+    /// agent's worktree and calls this; a daemon-native caller with its own
+    /// directory (a persistent gate worktree, no agent involved) can call it
+    /// directly. `agent` is carried through only for RK_AGENT env attribution
+    /// (under the `inherit` environment policy) and the `gate-failure`
+    /// artifact's `agent` field — it need not name a live registered agent.
+    /// `previous_result` is only `ctx.previous_result` threaded through so a
+    /// failed `expectExit` can still lead with a prior gate's own verdict; a
+    /// caller with no workflow context at all passes `None`.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_check_in(
+        &self,
+        id: &str,
+        repo: &str,
+        agent: &str,
+        dir: &Path,
+        command: &str,
+        resolved: &ResolvedRun,
+        env: &[(String, String)],
+        timeout: Duration,
+        previous_result: Option<&Value>,
+    ) -> rk_core::Result<Value> {
         // Extra attempts on a non-"pass" verdict, for a check already
         // characterized as flaky for reasons outside the code under test
         // (TKT-01M02AMKD24WZVVMARJPXKYKSW). 0 retries is the historical
@@ -2603,7 +2648,7 @@ impl WorkflowEngine {
         let mut settled: Option<(i64, String, bool, String, bool, bool, &'static str)> = None;
         for attempt in 1..=attempts {
             let outcome = self
-                .spawn_check_child(&command, &dir, &resolved, &agent, run, ctx, timeout)
+                .spawn_check_child(command, dir, resolved, agent, env, timeout)
                 .await?;
             // A `TimedOut` outcome reaches here under either `onTimeout`
             // policy now — `collect_child_output` only reports it, it does not
@@ -2659,7 +2704,7 @@ impl WorkflowEngine {
             // (TKT-01M02QT9KTDY2CN6YJEVP3VCF8).
             if timed_out && resolved.on_timeout == OnTimeout::Fail {
                 self.record_gate_failure(
-                    id, repo, &agent, &command, exit, verdict, timed_out, &stdout,
+                    id, repo, agent, command, exit, verdict, timed_out, &stdout,
                     stdout_truncated, &stderr, stderr_truncated, &history,
                 );
                 return Err(rk_core::Error::other(stderr));
@@ -2714,7 +2759,7 @@ impl WorkflowEngine {
         // instance error (TKT-01M02AMKD24WZVVMARJPXKYKSW).
         if verdict != "pass" {
             self.record_gate_failure(
-                id, repo, &agent, &command, exit, verdict, timed_out, &stdout, stdout_truncated,
+                id, repo, agent, command, exit, verdict, timed_out, &stdout, stdout_truncated,
                 &stderr, stderr_truncated, &history,
             );
         }
@@ -2734,7 +2779,7 @@ impl WorkflowEngine {
                 // reason the workflow actually stopped.
                 return Err(rk_core::Error::other(format!(
                     "{}run step: `{command}` exited {exit}, expected {expected}{}",
-                    prior_gate_failure(ctx.previous_result.as_ref()),
+                    prior_gate_failure(previous_result),
                     check_failure_detail(&stdout, &stderr)
                 )));
             }
@@ -2753,8 +2798,7 @@ impl WorkflowEngine {
         dir: &Path,
         resolved: &ResolvedRun,
         agent: &str,
-        run: &RunStep,
-        ctx: &WorkflowContext,
+        env: &[(String, String)],
         timeout: Duration,
     ) -> rk_core::Result<RunOutcome> {
         let mut child_command = tokio::process::Command::new("sh");
@@ -2814,8 +2858,8 @@ impl WorkflowEngine {
                 child_command.env("RK_AUTH_TOKEN", token);
             }
         }
-        for (name, value) in &run.env {
-            child_command.env(name, interpolate(value, ctx));
+        for (name, value) in env {
+            child_command.env(name, value);
         }
         let child = child_command.spawn().map_err(|e| {
             rk_core::Error::other(format!("run step: failed to spawn `{command}`: {e}"))
@@ -4976,5 +5020,159 @@ test a::flaky ... FAILED
                 (1, 0, "land {{ctx.activeBranch}} → main"),
             ]
         );
+    }
+
+    /// A minimal engine with an in-memory space/registry, enough to exercise
+    /// [`WorkflowEngine::run_check_in`] directly without a live daemon or a
+    /// spawned agent (mirrors `supervisor::respawn_tests::supervisor`).
+    fn test_engine(home: &Path) -> WorkflowEngine {
+        let layout = Layout::at(home);
+        let space = Space::open_in_memory().unwrap();
+        let tickets = Arc::new(Tickets::new(space.clone(), "castle".into()));
+        let supervisor = Arc::new(
+            Supervisor::new(
+                layout.clone(),
+                "castle".into(),
+                "fake".into(),
+                rk_ledger::Budget::default(),
+                rk_ledger::FleetBudget::default(),
+                space.clone(),
+                tickets.clone(),
+            )
+            .unwrap(),
+        );
+        WorkflowEngine::new(
+            layout,
+            supervisor,
+            space,
+            tickets,
+            HashMap::new(),
+            TierRouting::default(),
+            "fake".into(),
+            false,
+            true,
+            false,
+            Vec::new(),
+            Vec::new(),
+            0,
+        )
+    }
+
+    /// T1: `run_check_in` was extracted from `run_command` precisely so a
+    /// caller with its own directory (a future daemon-native gate worktree,
+    /// no agent involved) does not need `ctx.active_agent` at all. Prove the
+    /// extraction preserved behavior exactly by calling it twice with the
+    /// same resolved check and env but two independently-built directories —
+    /// one shaped like today's agent worktree, one a bare directory with no
+    /// agent behind it — and asserting byte-identical outcomes.
+    #[tokio::test]
+    async fn run_check_in_is_identical_via_agent_worktree_and_bare_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+
+        let agent_worktree = tempfile::tempdir().unwrap();
+        std::fs::write(agent_worktree.path().join("marker.txt"), "hello\n").unwrap();
+        let bare_gate_dir = tempfile::tempdir().unwrap();
+        std::fs::write(bare_gate_dir.path().join("marker.txt"), "hello\n").unwrap();
+
+        let resolved = ResolvedRun {
+            command: "cat marker.txt && printf '%s' \"$RK_CHECK_MARK\"".into(),
+            cwd: None,
+            expect_exit: Some(0),
+            timeout: "5s".into(),
+            on_timeout: OnTimeout::Fail,
+            environment_policy: rk_workflow::CheckEnvironmentPolicy::StripRkSpawn,
+            retry_on_fail: 0,
+        };
+        let env = vec![("RK_CHECK_MARK".to_string(), "gate".to_string())];
+        let timeout = Duration::from_secs(5);
+
+        let via_agent_path = engine
+            .run_check_in(
+                "inst-agent",
+                "/repo",
+                "Whisker",
+                agent_worktree.path(),
+                &resolved.command,
+                &resolved,
+                &env,
+                timeout,
+                None,
+            )
+            .await
+            .unwrap();
+        let via_bare_dir = engine
+            .run_check_in(
+                "inst-daemon",
+                "/repo",
+                "daemon",
+                bare_gate_dir.path(),
+                &resolved.command,
+                &resolved,
+                &env,
+                timeout,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(via_agent_path["exit"], json!(0));
+        assert_eq!(via_agent_path["verdict"], json!("pass"));
+        assert_eq!(via_agent_path["stdout"], json!("hello\ngate"));
+        assert_eq!(via_agent_path["exit"], via_bare_dir["exit"]);
+        assert_eq!(via_agent_path["verdict"], via_bare_dir["verdict"]);
+        assert_eq!(via_agent_path["stdout"], via_bare_dir["stdout"]);
+        assert_eq!(
+            via_agent_path["stdout_truncated"],
+            via_bare_dir["stdout_truncated"]
+        );
+    }
+
+    /// The same non-"pass" path (retry exhaustion + `record_gate_failure`)
+    /// runs identically for a bare directory as it does for an agent
+    /// worktree: a failing command still produces a `fail` verdict and an
+    /// `Err` on the declared `expectExit`, with the durable gate-failure
+    /// artifact written regardless of whether an agent was ever involved.
+    #[tokio::test]
+    async fn run_check_in_records_gate_failure_for_a_bare_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        let space = engine.space.clone();
+        let bare_gate_dir = tempfile::tempdir().unwrap();
+
+        let resolved = ResolvedRun {
+            command: "echo boom 1>&2; exit 3".into(),
+            cwd: None,
+            expect_exit: Some(0),
+            timeout: "5s".into(),
+            on_timeout: OnTimeout::Fail,
+            environment_policy: rk_workflow::CheckEnvironmentPolicy::StripRkSpawn,
+            retry_on_fail: 0,
+        };
+        let timeout = Duration::from_secs(5);
+
+        let err = engine
+            .run_check_in(
+                "inst-daemon-fail",
+                "/repo/daemon-gate",
+                "daemon",
+                bare_gate_dir.path(),
+                &resolved.command,
+                &resolved,
+                &[],
+                timeout,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exited 3"));
+
+        let failures = space
+            .scan(&Pattern::category(Category::Artifact).identity("gate-failure"))
+            .unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].payload["agent"], json!("daemon"));
+        assert_eq!(failures[0].payload["verdict"], json!("fail"));
+        assert_eq!(failures[0].payload["exit"], json!(3));
     }
 }
