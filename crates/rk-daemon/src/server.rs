@@ -6074,8 +6074,21 @@ fn acquire_singleton_lock(layout: &Layout) -> rk_core::Result<std::fs::File> {
     if rc != 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            // The holder writes its pid immediately after taking the flock,
+            // but a contender can observe EWOULDBLOCK inside that tiny
+            // window. Re-read briefly so refusals name the holder in
+            // practice; the unknown-holder text below remains the honest
+            // fallback for a holder that dies mid-write.
             let mut holder = String::new();
-            let _ = file.read_to_string(&mut holder);
+            for _ in 0..10 {
+                holder.clear();
+                let _ = file.seek(SeekFrom::Start(0));
+                let _ = file.read_to_string(&mut holder);
+                if !holder.trim().is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
             let holder = holder.trim();
             return Err(rk_core::Error::other(if holder.is_empty() {
                 format!(
@@ -6140,36 +6153,56 @@ mod singleton_lock_tests {
         let layout = Layout::at(dir.path());
         layout.ensure().unwrap();
 
+        // Handshake marker: the child touches this AFTER it holds the lock,
+        // so the parent never has to probe by transiently acquiring (a probe
+        // acquisition could win the race against the child's attempt and
+        // flake the test — the structural race review flagged).
+        let marker = dir.path().join("child-holds-lock");
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             // Child: hold the lock and park until killed. Only sync,
             // fork-safe calls here — no tokio, no destructors on exit.
-            match acquire_singleton_lock(&layout) {
-                Ok(_guard) => loop {
-                    std::thread::sleep(std::time::Duration::from_secs(60));
-                },
-                Err(_) => unsafe { libc::_exit(1) },
+            // Retry the acquisition: the parent process itself briefly held
+            // the lock in earlier test setup on some platforms, and a single
+            // losing attempt must not abort the fixture.
+            for _ in 0..100 {
+                if let Ok(_guard) = acquire_singleton_lock(&layout) {
+                    let _ = std::fs::write(&marker, b"held");
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
+            unsafe { libc::_exit(1) }
         }
 
-        // Parent: poll until the child actually holds the lock.
+        // Parent: wait on the marker — no probe acquisitions.
         let mut child_holds_it = false;
         for _ in 0..500 {
-            if acquire_singleton_lock(&layout).is_err() {
+            if marker.exists() {
                 child_holds_it = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        unsafe {
-            if !child_holds_it {
+        if !child_holds_it {
+            unsafe {
                 libc::kill(pid, libc::SIGKILL);
                 let mut status = 0;
                 libc::waitpid(pid, &mut status, 0);
             }
         }
         assert!(child_holds_it, "child never acquired the lock");
+
+        // While the child demonstrably holds it, a refusal names the child.
+        let err = acquire_singleton_lock(&layout)
+            .expect_err("acquisition must fail while the child holds the lock");
+        assert!(
+            err.to_string().contains(&pid.to_string()),
+            "refusal should name the child holder pid {pid}: {err}"
+        );
 
         unsafe {
             libc::kill(pid, libc::SIGKILL);
