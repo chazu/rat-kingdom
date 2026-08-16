@@ -677,6 +677,10 @@ queue-to-workflow migration).
   gate worktree) is retried every poll cycle indefinitely rather than escalating after N attempts.
 - Gate-worktree disk/lifetime management (§5 item 4) is still open, unchanged by T4.
 
+The operator executed this §6 cutover on 2026-08-16: the `steward-landing-on-completion` trigger
+(`action: land`) replaced `steward-on-completion` in the global triggers directory, scope
+`rat-kingdom`.
+
 ---
 
 *Grounding note:* every file:line citation above was verified by direct agent reads against the
