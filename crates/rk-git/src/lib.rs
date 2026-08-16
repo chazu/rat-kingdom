@@ -324,6 +324,10 @@ impl Repo {
     /// hold a candidate branch's tip while that branch is still checked out
     /// (non-detached) elsewhere.
     pub fn ensure_gate_worktree(&self, path: &Path) -> rk_core::Result<()> {
+        // Fast path only: the authoritative check repeats below UNDER the
+        // metadata lock. Two concurrent ensures could otherwise both observe
+        // absence here, and the second's `reap_stale_worktree` would tear
+        // down the worktree the first had just created.
         if self.is_registered_worktree(path) {
             return Ok(());
         }
@@ -331,6 +335,9 @@ impl Repo {
             std::fs::create_dir_all(parent)?;
         }
         let _metadata = worktree_metadata_guard();
+        if self.is_registered_worktree(path) {
+            return Ok(());
+        }
         self.reap_stale_worktree(path);
         self.git(&["worktree", "add", "--detach", &path.to_string_lossy(), "HEAD"])?;
         debug!(?path, "created gate worktree");
@@ -1083,6 +1090,41 @@ mod tests {
             list_after.matches(&gate.to_string_lossy().to_string()).count(),
             1,
             "worktree must be registered exactly once"
+        );
+    }
+
+    /// Two ensures racing must both succeed and leave exactly one registered,
+    /// intact worktree. The un-locked fast-path check alone let the loser's
+    /// `reap_stale_worktree` tear down the winner's fresh checkout; the
+    /// authoritative recheck under the metadata lock closes that window.
+    #[test]
+    fn concurrent_ensure_gate_worktree_never_reaps_the_winner() {
+        let (dir, repo) = scratch_repo();
+        let gate = dir.path().join("gate-worktrees").join("main");
+        let root = repo.root().to_path_buf();
+
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let root = root.clone();
+                    let gate = gate.clone();
+                    scope.spawn(move || {
+                        let repo = Repo::discover(&root).unwrap();
+                        repo.ensure_gate_worktree(&gate)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+
+        assert!(gate.join("README.md").exists(), "checkout must survive the race");
+        let list = repo.git(&["worktree", "list", "--porcelain"]).unwrap();
+        assert_eq!(
+            list.matches(&gate.to_string_lossy().to_string()).count(),
+            1,
+            "exactly one registration after 4 concurrent ensures"
         );
     }
 

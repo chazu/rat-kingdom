@@ -86,16 +86,19 @@ const INSTANCE_ARCHIVE_DIR: &str = "workflow-instances-archive";
 /// The effective parameters of a `run` step after named-check resolution and
 /// policy enforcement — a raw command or a repo-registered check collapse to the
 /// same shape here.
-struct ResolvedRun {
-    command: String,
-    cwd: Option<String>,
-    expect_exit: Option<i64>,
-    timeout: String,
-    on_timeout: OnTimeout,
-    environment_policy: rk_workflow::CheckEnvironmentPolicy,
+/// Crate-scoped alongside [`WorkflowEngine::run_check_in`]: a daemon-native
+/// caller (the T2 landing pipeline) builds this input shape itself instead of
+/// going through a workflow `run` step.
+pub(crate) struct ResolvedRun {
+    pub(crate) command: String,
+    pub(crate) cwd: Option<String>,
+    pub(crate) expect_exit: Option<i64>,
+    pub(crate) timeout: String,
+    pub(crate) on_timeout: OnTimeout,
+    pub(crate) environment_policy: rk_workflow::CheckEnvironmentPolicy,
     /// Extra attempts on a non-"pass" verdict. Step-only, like `on_timeout` —
     /// never inherited from a named check.
-    retry_on_fail: u32,
+    pub(crate) retry_on_fail: u32,
 }
 
 /// What a blown `run` wall-clock bound does to the instance (TKT-169).
@@ -105,7 +108,7 @@ struct ResolvedRun {
 /// reported as an ERROR (which ends the run where it stands) or as a RESULT the
 /// following steps get to route on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OnTimeout {
+pub(crate) enum OnTimeout {
     /// Fail the instance immediately. The default, and the only behaviour before
     /// TKT-169.
     Fail,
@@ -2622,8 +2625,11 @@ impl WorkflowEngine {
     /// `previous_result` is only `ctx.previous_result` threaded through so a
     /// failed `expectExit` can still lead with a prior gate's own verdict; a
     /// caller with no workflow context at all passes `None`.
+    /// Crate-scoped: the T2 daemon-native landing consumer (another module in
+    /// this crate) calls this directly with its persistent gate worktree; see
+    /// docs/proposals/daemon-native-landing-pipeline.md T1->T2 interface.
     #[allow(clippy::too_many_arguments)]
-    async fn run_check_in(
+    pub(crate) async fn run_check_in(
         &self,
         id: &str,
         repo: &str,
