@@ -316,6 +316,20 @@ impl Repo {
         Ok(())
     }
 
+    /// Discover the [`Repo`] a worktree at `path` belongs to and check whether
+    /// that worktree itself has uncommitted changes (tracked edits or
+    /// untracked files) — a plain `git status --porcelain` run directly
+    /// against `path`, independent of which repo/branch it was forked from.
+    ///
+    /// Used before an unattended reclaim (rk-daemon's `Supervisor::reap_git`)
+    /// force-removes a worktree: a branch being merged only proves its
+    /// COMMITTED history landed, never anything left uncommitted in the
+    /// working tree, so this is the check that stands between an automated
+    /// sweep and silently destroying work no commit ever captured.
+    pub fn worktree_is_dirty(path: &Path) -> rk_core::Result<bool> {
+        Ok(!git_in(path, &["status", "--porcelain"])?.trim().is_empty())
+    }
+
     pub fn prune_worktrees(&self) -> rk_core::Result<()> {
         let _metadata = worktree_metadata_guard();
         self.git(&["worktree", "prune"])?;

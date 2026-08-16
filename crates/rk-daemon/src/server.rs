@@ -132,6 +132,7 @@ pub struct Daemon {
     scheduler_config: rk_core::config::SchedulerConfig,
     sweep_config: rk_core::config::SupervisorConfig,
     review_sweep_config: rk_core::config::ReviewSweepConfig,
+    worktree_sweep_config: rk_core::config::WorktreeSweepConfig,
     drain_config: rk_core::config::DrainConfig,
     evaporation_decay: f64,
     ingest_config: rk_core::config::IngestConfig,
@@ -250,6 +251,8 @@ impl Daemon {
             warn!(%msg, "supervisor config: stuck-sweep/review-timeout ordering invariant violated");
         }
         daemon.review_sweep_config = config.review_sweep.clone();
+        daemon.worktree_sweep_config = config.worktree_sweep.clone();
+        daemon.supervisor.set_min_free_disk_gb(config.disk.min_free_gb);
         daemon.drain_config = config.drain.clone();
         daemon.evaporation_decay = config.evaporation.decay;
         daemon.ingest_config = config.ingest.clone();
@@ -336,6 +339,16 @@ impl Daemon {
     }
 
     #[doc(hidden)]
+    pub fn set_worktree_sweep_config(&mut self, cfg: rk_core::config::WorktreeSweepConfig) {
+        self.worktree_sweep_config = cfg;
+    }
+
+    #[doc(hidden)]
+    pub fn set_min_free_disk_gb(&self, gb: u64) {
+        self.supervisor.set_min_free_disk_gb(gb);
+    }
+
+    #[doc(hidden)]
     pub fn set_request_clock_for_tests(&mut self, clock: fn() -> DateTime<Utc>) {
         self.request_clock = clock;
     }
@@ -411,6 +424,15 @@ impl Daemon {
             scheduler_config: rk_core::config::SchedulerConfig::default(),
             sweep_config: rk_core::config::SupervisorConfig::default(),
             review_sweep_config: rk_core::config::ReviewSweepConfig::default(),
+            // Disabled by default for bare/test constructors (mirrors the
+            // Supervisor-level `min_free_disk_gb` default of 0): only
+            // `Daemon::new`'s config-loading path enables the periodic sweep
+            // and the disk-floor guard, so existing e2e tests built on
+            // `new_in_memory`/`with_space_*` are unaffected.
+            worktree_sweep_config: rk_core::config::WorktreeSweepConfig {
+                enabled: false,
+                ..rk_core::config::WorktreeSweepConfig::default()
+            },
             drain_config: rk_core::config::DrainConfig::default(),
             evaporation_decay: rk_core::config::EvaporationConfig::default().decay,
             ingest_config: rk_core::config::IngestConfig::default(),
@@ -589,6 +611,42 @@ impl Daemon {
                             }
                         }
                         _ = rs_shutdown.changed() => break,
+                    }
+                }
+            });
+        }
+
+        // Periodic worktree-leak sweep (`[worktree_sweep]`, TKT-01M04N6W4X47KMXDA6MH0WPH8H):
+        // the automated, unattended counterpart to `rk prune --reap-git`. A
+        // steward/workflow failure path that skips its own `dismiss` step
+        // leaves a terminal agent's worktree (and its multi-GB cargo
+        // `target/`) on disk indefinitely; this loop reclaims those on a
+        // timer instead of waiting for an operator to run `rk prune` by hand.
+        // Enabled by default (unlike the other sweeps here) because every
+        // removal it performs is already gated safe by `Supervisor::reap_git`
+        // (branch merged-or-gone AND worktree clean, or the worktree is left
+        // standing) — see the 2026-08-16 104-worktree/298GB incident this
+        // closes the gap on.
+        if daemon.worktree_sweep_config.enabled {
+            let daemon_ref = Arc::clone(&daemon);
+            let mut ws_shutdown = daemon.shutdown_tx.subscribe();
+            let interval = Duration::from_secs(daemon.worktree_sweep_config.interval_secs.max(1));
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                // Consume the immediate first tick: give a freshly-terminal
+                // agent a full `after_days` window before the first sweep.
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            let d = Arc::clone(&daemon_ref);
+                            match tokio::task::spawn_blocking(move || d.worktree_sweep_once()).await {
+                                Ok(0) => {}
+                                Ok(n) => info!(reclaimed = n, "worktree sweep reclaimed leaked worktrees"),
+                                Err(e) => warn!(error = %e, "worktree sweep task panicked"),
+                            }
+                        }
+                        _ = ws_shutdown.changed() => break,
                     }
                 }
             });
@@ -2487,6 +2545,35 @@ impl Daemon {
             }
         }
         emitted
+    }
+
+    /// One pass of the periodic worktree-leak sweep (`[worktree_sweep]`):
+    /// archive terminal agent records untouched for at least `after_days` and
+    /// reclaim their git leftovers — worktree and local branch — wherever the
+    /// branch has already landed or is gone. The automated counterpart to `rk
+    /// prune --reap-git`; every removal is still gated by
+    /// [`Supervisor::reap_git`]'s merged-or-gone-AND-clean-worktree checks, so
+    /// this can run unattended without risking anyone's uncommitted or
+    /// unmerged work. Returns the number of worktrees actually reclaimed.
+    ///
+    /// [`Supervisor::reap_git`]: crate::supervisor::Supervisor
+    fn worktree_sweep_once(&self) -> usize {
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::days(self.worktree_sweep_config.after_days as i64);
+        let reap = crate::supervisor::Reap {
+            git: true,
+            logs: false,
+        };
+        match self.supervisor.archive_agents(cutoff, false, reap) {
+            Ok(value) => value["reaped"]
+                .as_array()
+                .map(|rows| rows.iter().filter(|r| r["reaped"] == json!(true)).count())
+                .unwrap_or(0),
+            Err(e) => {
+                warn!(error = %e, "worktree sweep: archive_agents failed");
+                0
+            }
+        }
     }
 
     /// Append an `Event` tuple authored by this castle. Best-effort: a store
