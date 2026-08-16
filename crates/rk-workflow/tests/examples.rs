@@ -152,6 +152,43 @@ fn shipped_example_triggers_load() {
     );
 }
 
+/// P3-T4's alternative completion-feed trigger: an `action: "land"` trigger
+/// needs no `run` (the schema makes it optional for that action), and its
+/// match predicate must stay identical to `steward-on-completion`'s so the
+/// cutover runbook's swap is a like-for-like replacement.
+#[test]
+fn landing_pipeline_trigger_loads_with_no_run_and_matches_steward_completion_shape() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("examples")
+        .join("triggers-landing-pipeline.cue");
+    let triggers = rk_workflow::load_triggers(&file)
+        .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
+    let landing = triggers
+        .iter()
+        .find(|t| t.name == "steward-landing-on-completion")
+        .expect("shipped landing-pipeline trigger");
+    assert_eq!(landing.action, rk_workflow::TriggerAction::Land);
+    assert_eq!(landing.run, "");
+
+    let steward_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("examples")
+        .join("triggers.cue");
+    let steward_triggers = rk_workflow::load_triggers(&steward_file).unwrap();
+    let steward = steward_triggers
+        .iter()
+        .find(|t| t.name == "steward-on-completion")
+        .expect("shipped completion trigger");
+    assert_eq!(
+        landing.matcher, steward.matcher,
+        "the landing-pipeline trigger must match the exact same completions \
+         steward-on-completion does, so the cutover runbook's swap is like-for-like"
+    );
+}
+
 #[test]
 fn nightly_self_improve_chains_groom_drain_refine() {
     use rk_workflow::Step;

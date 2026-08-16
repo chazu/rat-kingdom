@@ -538,6 +538,105 @@ dependency on anything else in this program and could start immediately.
 
 ---
 
+## 6. Operator cutover runbook (T4)
+
+**Status as implemented:** §2.1 option (a) was adopted. `Trigger` gained an `action` field
+(`"workflow"` default, or `"land"` — `crates/rk-workflow/src/lib.rs`, schema in
+`crates/rk-workflow/src/triggers-schema.cue`). An `action: "land"` trigger match is dispatched
+by `Reactor::fire_land_action` (`crates/rk-daemon/src/reactor.rs`) straight into
+`LandingPipeline::enqueue` (`crates/rk-daemon/src/landing.rs`) — no workflow instance, no CUE
+hop — while still reusing the reactor's `(trigger, tuple)` dedup marker, `maxFires` rate cap, and
+cursor-based restart-safety (NOT `maxInFlight`: that admission model is superseded by
+`LandingQueue`'s own single-consumer-per-`(repo,target)` queue downstream). The shipped example
+is `examples/triggers-landing-pipeline.cue` (`steward-landing-on-completion`), a like-for-like
+match-predicate copy of `steward-on-completion` (`examples/triggers.cue`) with
+`action: "land"` instead of `run: "steward"`.
+
+`work_key = (repo, branch, head_sha)` dedup (§2.6): `LandingPipeline::enqueue` probes a durable
+`landing_processed` marker (written by `LandingPipeline::process_entry` on every terminal
+outcome) before writing a new queue tuple, dropping (`Ok(None)`) a redelivered completion for an
+already-fully-processed candidate. Restart-safety for an IN-FLIGHT candidate is a queue-entry
+status field (`queued` / `running_gates` / `awaiting_review`, `LandingEntryStatus`) that survives
+in the durable tuple rather than being deleted at claim time; `LandingQueue::claim_next` treats
+every status as eligible, so a daemon restart's next poll cycle re-discovers and reprocesses
+anything a crashed prior process left mid-flight. A restart-driven re-request for a review in
+flight resolves to the SAME workflow instance (`review_instance_id`, a stable id derived from the
+work key) rather than spawning a second reviewer.
+
+The cutover itself is **NOT automatic** — this section is a manual runbook. The operator performs
+every step below; nothing in this codebase flips `steward-on-completion` off or the landing
+pipeline on by itself.
+
+### 6.1 Preconditions
+
+- T1–T4 are on `main` and the daemon has been rebuilt and restarted (a merged Rust change is not
+  live in a running fleet until `mise run deploy` or equivalent — same caveat as every other
+  daemon-native landing change in this program's history, see `workflow-instance-archive` and
+  `dropped-land-inbox-guard` in fleet memory).
+- The target repo has `.rk/checks.cue` registering `steward-protected-paths`, `steward-diff-scope`,
+  and its real `verify` check — identical to what the workflow-driven steward already requires.
+  `examples/workflows/steward-review.cue` (the shrunk review-only workflow, T3) is installed
+  wherever `steward.cue` is today.
+
+### 6.2 Swap the trigger (per repo, or globally)
+
+1. Locate the live trigger file installing `steward-on-completion` (global
+   `~/.rat-kingdom/triggers/`, or a repo's `.rk/triggers.cue`).
+2. Copy `examples/triggers-landing-pipeline.cue` alongside it under a NEW filename first (do not
+   overwrite yet) — e.g. `steward-landing.cue`.
+3. **Do not run both at once.** `steward-on-completion` and `steward-landing-on-completion` match
+   the identical `harness_result` predicate; loading both trigger files into the same triggers
+   directory double-dispatches every completion (one full workflow spawn, one `LandingQueue`
+   enqueue), racing each other for the same branch. Remove or rename the old trigger file's
+   `steward-on-completion` entry (or the whole file, if it defines nothing else) in the SAME
+   change that adds the new one.
+4. Restart the daemon (or wait for the trigger file's mtime-based reparse, `Reactor`'s
+   `TriggerCache` — see `edited_trigger_file_is_reparsed_not_stale` for the mechanism) so the new
+   trigger set is loaded.
+
+### 6.3 Parity verification before trusting it unattended
+
+There is no automated `rk workflow drift` command as of T4; verify parity by hand:
+
+1. Land ONE low-risk doc-only/trivial change through the new trigger. Confirm via `rk scan event
+   <repo>` (or daemon logs at `debug`) that: a `landing_queue_entry` tuple was written, then
+   removed, and a `landing_processed` marker exists for that `(branch, head_sha)` — and that
+   `git log` on the target shows the merge, with **zero** agent spawns
+   (`rk scan event <repo>` for `agent_spawned` in the relevant window).
+2. Land one change that needs a real review (non-trivial diff, no cache hit). Confirm exactly one
+   `reviewer` spawn occurs, the branch lands on APPROVE, and `rk inbox` shows nothing new (a clean
+   run is invisible, same as today).
+3. Force a REWORK and a STOP verdict (or reuse existing fixtures) and confirm: REWORK files a
+   ticket titled `rework: <task>` and leaves the branch unmerged; STOP writes a `need` tuple with
+   identity `steward` and the branch stays unmerged — both should appear in `rk inbox` in the
+   SAME shape a workflow-driven steward's escalation does today (this was a T4 design constraint,
+   not just a happy accident: `LandingPipeline::escalate`/`file_rework_ticket` reuse the exact
+   tuple shapes `steward-report-stop`/`steward-file-rework-ticket` wrote).
+4. Force a failing gate (e.g. a branch that fails `verify`) and confirm a `gate-failure` artifact
+   is recorded and the branch is held unmerged, matching `record_gate_failure`'s existing shape.
+5. Only once all four are confirmed working on a scratch/low-traffic repo should the swap be
+   repeated for higher-traffic repos.
+
+### 6.4 Rollback
+
+Reverse §6.2: restore the original `steward-on-completion` trigger file and remove/rename the
+`action: "land"` one. Nothing about the swap is destructive to in-flight state — a candidate
+already fully processed (landed/rework-filed/escalated) has no live queue entry to roll back;
+one still mid-flight when the trigger set is swapped back simply stops being drained by the
+landing pipeline's consumer loop (it stays in the durable queue, inert, until either the landing
+trigger is restored or an operator manually inspects/clears it — there is no automatic
+queue-to-workflow migration).
+
+### 6.5 Known gaps (file as follow-up tickets, do not fix inline here)
+
+- No automated drift/parity check (`rk workflow drift`-equivalent) exists yet — §6.3 is manual.
+- `LandingQueue` has no attempt-counter backstop analogous to the reactor's `MAX_FIRE_ATTEMPTS`:
+  a candidate whose processing keeps erroring (not gate-failing — an actual `Err`, e.g. a corrupt
+  gate worktree) is retried every poll cycle indefinitely rather than escalating after N attempts.
+- Gate-worktree disk/lifetime management (§5 item 4) is still open, unchanged by T4.
+
+---
+
 *Grounding note:* every file:line citation above was verified by direct agent reads against the
 tree at this branch's base (see this ticket's dispatch for the parallel research pass); nothing
 here was reconstructed from documentation or memory alone. Line numbers for `MergeQueue`

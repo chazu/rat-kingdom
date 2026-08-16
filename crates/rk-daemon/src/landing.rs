@@ -21,19 +21,45 @@
 //! routing in at that point (see the T2→T3 interface note in the design
 //! doc's §3) without touching anything above it.
 //!
-//! Restart-safety for an in-flight candidate (§2.6 of the design doc — a
-//! queue entry marked `running_gates`/`awaiting_review` surviving a daemon
-//! restart) is explicitly out of scope here: a queued entry is claimed
-//! (deleted from the durable queue) at dequeue time, before its gates run.
-//! That is deliberately simpler than the design doc's eventual shape, and
-//! matches the ticket decomposition — T4 owns restart-safety proof and the
-//! completion-feed cutover.
+//! Restart-safety for an in-flight candidate (§2.6 of the design doc) is
+//! T4's contribution: a claimed candidate is marked `running_gates` (or, once
+//! a review is requested, `awaiting_review`) IN the durable queue tuple
+//! itself rather than deleted — [`LandingQueue::claim_next`] transitions
+//! status instead of removing the entry, and [`LandingQueue::remove`] only
+//! runs once [`LandingPipeline::process_entry`] reaches a terminal outcome.
+//! A restart's [`LandingPipeline::run_cycle`] poll re-discovers any entry
+//! left `running_gates`/`awaiting_review` by a crashed prior process exactly
+//! the same way it discovers a fresh `queued` one — [`LandingQueue::claim_next`]
+//! does not filter on status — and reprocessing is safe because every step
+//! downstream is independently idempotent: gates are a stateless
+//! checkout+shell re-run, [`LandingPipeline::request_review`] resolves to the
+//! SAME workflow instance on a repeat call (a stable id derived from the
+//! candidate's work key, not a fresh random one), and a repeat
+//! `Supervisor::land` on an already-merged branch is a clean CAS no-op
+//! (design doc §1.1). See `crates/rk-daemon/tests/landing_pipeline_e2e.rs`
+//! for the restart-mid-gate and restart-mid-review-wait proofs.
 //!
-//! Nothing outside this module's own tests constructs a [`LandingPipeline`]
-//! yet: wiring one up to a live completion feed is T4's "cutover" (design
-//! doc §4). `#![allow(dead_code)]` below is scoped to that gap, not a
-//! blanket exemption — every item it covers is exercised by this module's
-//! own test suite.
+//! `work_key = (repo, branch, head_sha)` dedup against a redelivered
+//! completion (a reactor retry after a crash, an operator manually
+//! re-triggering) is [`LandingPipeline::enqueue`]'s job: it probes a durable
+//! `landing_processed` marker — written by [`LandingPipeline::process_entry`]
+//! on every terminal outcome — before ever writing a new queue tuple, and
+//! silently drops (`Ok(None)`) a work key already fully handled rather than
+//! re-enqueueing it. `Supervisor::land`'s CAS already makes a literal
+//! double-`land` call harmless; this dedup exists to also skip the
+//! gate-run/review-request work a redelivery would otherwise repeat for no
+//! reason.
+//!
+//! The completion feed itself — how a candidate gets from a rat's
+//! `harness_result` to [`LandingPipeline::enqueue`] — is
+//! `crate::reactor::Reactor`'s `action: "land"` trigger dispatch
+//! (`crates/rk-daemon/src/reactor.rs`, design doc §2.1 option (a)): a
+//! `#Trigger` with `action: "land"` reuses the reactor's existing
+//! `(trigger, tuple)` dedup marker, rate cap, and cursor-based
+//! restart-safety, and calls `LandingPipeline::enqueue` directly instead of
+//! launching a workflow instance. `#![allow(dead_code)]` below covers the
+//! items this module's own tests exercise directly without going through
+//! that live wiring.
 #![allow(dead_code)]
 
 use crate::supervisor::Supervisor;
@@ -54,6 +80,14 @@ use tracing::warn;
 /// repo it belongs to) — the T2 counterpart to the reactor's
 /// `reactor_queued_fire` (`crates/rk-daemon/src/reactor.rs`).
 const LANDING_QUEUE_IDENTITY: &str = "landing_queue_entry";
+
+/// Identity of the durable `work_key = (repo, branch, head_sha)` dedup
+/// marker (`Furniture`, scoped to the repo), written by
+/// [`LandingPipeline::process_entry`] on every terminal outcome. Probed by
+/// [`LandingPipeline::enqueue`] before writing a new queue tuple, so a
+/// redelivered completion for an already-fully-processed candidate is
+/// dropped rather than reprocessed (design doc §2.6).
+const LANDING_PROCESSED_IDENTITY: &str = "landing_processed";
 
 /// The two gates that guard every landing attempt regardless of tier —
 /// `examples/workflows/steward.cue`'s `_gates` block, POLICY (#19) and
@@ -98,7 +132,7 @@ const REVIEW_WORKFLOW: &str = "steward-review";
 /// distinct fields — the first is the tuple scope and ticket/artifact scope,
 /// the second is the filesystem root `Repo::discover` and `Supervisor::land`
 /// need) rather than inventing a new convention.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct LandingQueueEntry {
     pub(crate) repo_name: String,
     pub(crate) repo_path: String,
@@ -111,6 +145,25 @@ pub(crate) struct LandingQueueEntry {
     /// `0` until then — never read before enqueue sets it.
     #[serde(default)]
     pub(crate) seq: u64,
+    /// In-flight progress marker (design doc §2.6), transitioned by
+    /// [`LandingQueue::claim_next`]/[`LandingQueue::set_status`] — NOT an
+    /// admission gate: [`LandingQueue::claim_next`] considers every status
+    /// eligible, so a restart re-discovers a `RunningGates`/`AwaitingReview`
+    /// entry a crashed prior process left behind exactly like a fresh
+    /// `Queued` one. Purely diagnostic plus the record of "was this claimed
+    /// at least once" for anyone reading the queue directly (`rk scan`).
+    #[serde(default)]
+    pub(crate) status: LandingEntryStatus,
+}
+
+/// See [`LandingQueueEntry::status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LandingEntryStatus {
+    #[default]
+    Queued,
+    RunningGates,
+    AwaitingReview,
 }
 
 /// A durable, per-`(repo,target)` FIFO of landing candidates — modeled
@@ -164,7 +217,15 @@ impl LandingQueue {
     fn enqueue(&self, mut entry: LandingQueueEntry) -> rk_core::Result<u64> {
         let seq = self.next_seq(&entry.repo_name)?;
         entry.seq = seq;
-        let payload = serde_json::to_value(&entry)
+        entry.status = LandingEntryStatus::Queued;
+        self.write(&entry)?;
+        Ok(seq)
+    }
+
+    /// Write (or overwrite, via delete-then-out — tuples have no in-place
+    /// update) the durable tuple representing `entry`'s current state.
+    fn write(&self, entry: &LandingQueueEntry) -> rk_core::Result<()> {
+        let payload = serde_json::to_value(entry)
             .map_err(|e| rk_core::Error::other(format!("landing queue entry: {e}")))?;
         let tuple = Tuple::new(
             Category::Event,
@@ -174,16 +235,38 @@ impl LandingQueue {
             payload,
         )
         .with_lifecycle(Lifecycle::Furniture);
-        self.space.out(tuple)?;
-        Ok(seq)
+        self.space.out(tuple)
     }
 
-    /// Claim the oldest queued candidate for `(repo_name, target)`, deleting
-    /// its tuple from the durable queue before returning it — single-consumer
-    /// ownership transfer, matching the design doc's admission model (§2.1).
-    /// See the module doc for why this claims at dequeue rather than after
-    /// full processing.
-    fn dequeue_next(
+    /// Find the current durable tuple for `entry` — matched by its `seq`
+    /// within `repo_name` scope, since `seq` is a monotonic per-repo counter
+    /// ([`Self::next_seq`]) and therefore unique. `None` once the entry has
+    /// been [`Self::remove`]d (or if it was never enqueued at all — a caller
+    /// driving [`LandingPipeline::process_entry`] directly, bypassing the
+    /// queue, has no durable tuple to find; every method here treats that as
+    /// a harmless no-op rather than an error).
+    fn find(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<Tuple>> {
+        let pending = self.space.scan(
+            &Pattern::category(Category::Event)
+                .scope(&entry.repo_name)
+                .identity(LANDING_QUEUE_IDENTITY),
+        )?;
+        Ok(pending
+            .into_iter()
+            .find(|t| t.payload.get("seq").and_then(Value::as_u64) == Some(entry.seq)))
+    }
+
+    /// Claim the oldest candidate for `(repo_name, target)` — regardless of
+    /// its current [`LandingEntryStatus`] — and durably transition it to
+    /// `RunningGates`. Deliberately does NOT delete the tuple: a candidate
+    /// stays visible in the durable queue for the whole of its processing, so
+    /// a crash mid-gate-run or mid-review-wait leaves it discoverable by the
+    /// next [`Self::claim_next`] call rather than silently dropping it (see
+    /// the module doc's restart-safety note). Single-consumer ownership
+    /// transfer within one process is still exactly-once: nothing else in
+    /// this process calls `claim_next` again for the same key until the
+    /// candidate just claimed finishes processing.
+    fn claim_next(
         &self,
         repo_name: &str,
         target: &str,
@@ -203,10 +286,40 @@ impl LandingQueue {
         let Some(tuple) = pending.into_iter().next() else {
             return Ok(None);
         };
-        let entry: LandingQueueEntry = serde_json::from_value(tuple.payload.clone())
+        let mut entry: LandingQueueEntry = serde_json::from_value(tuple.payload.clone())
             .map_err(|e| rk_core::Error::other(format!("landing queue entry: {e}")))?;
         self.space.delete(tuple.id)?;
+        entry.status = LandingEntryStatus::RunningGates;
+        self.write(&entry)?;
         Ok(Some(entry))
+    }
+
+    /// Durably transition an already-claimed `entry` to `status` (delete the
+    /// current tuple, write a fresh one). A no-op if `entry` has no durable
+    /// tuple right now (see [`Self::find`]'s doc).
+    fn set_status(
+        &self,
+        entry: &LandingQueueEntry,
+        status: LandingEntryStatus,
+    ) -> rk_core::Result<()> {
+        let Some(tuple) = self.find(entry)? else {
+            return Ok(());
+        };
+        self.space.delete(tuple.id)?;
+        let mut updated = entry.clone();
+        updated.status = status;
+        self.write(&updated)
+    }
+
+    /// Remove `entry`'s durable tuple — called once processing reaches a
+    /// terminal [`LandingOutcome`]. A no-op if it has none (see
+    /// [`Self::find`]'s doc).
+    fn remove(&self, entry: &LandingQueueEntry) -> rk_core::Result<()> {
+        let Some(tuple) = self.find(entry)? else {
+            return Ok(());
+        };
+        self.space.delete(tuple.id)?;
+        Ok(())
     }
 
     /// Every distinct `(repo_name, target)` key with at least one candidate
@@ -232,6 +345,22 @@ fn sanitize_path_component(raw: &str) -> String {
     raw.chars()
         .map(|c| if c == '/' || c == '\\' { '_' } else { c })
         .collect()
+}
+
+/// A durable workflow instance id, stable across repeat calls for the SAME
+/// work key — the request-review counterpart to
+/// `reactor::stable_workflow_instance_id`. Deriving it from `(repo, branch,
+/// head_sha)` rather than a fresh random id per call is what makes
+/// [`LandingPipeline::request_review`] safe to invoke twice for the same
+/// candidate (a restart-driven reprocess): `run_owned_with_id` resolves the
+/// second call to the first call's already-running (or already-finished)
+/// instance instead of spawning a duplicate reviewer.
+fn review_instance_id(entry: &LandingQueueEntry) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(
+        format!("{}@{}@{}", entry.repo_name, entry.branch, entry.head_sha).as_bytes(),
+    );
+    format!("landing-review-{}", hex::encode(&digest[..16]))
 }
 
 /// One resolved named check plus the env pairs and wall-clock bound it runs
@@ -335,28 +464,100 @@ impl LandingPipeline {
         }
     }
 
-    pub(crate) fn enqueue(&self, entry: LandingQueueEntry) -> rk_core::Result<u64> {
-        self.queue.enqueue(entry)
+    /// Enqueue a fresh completion as a landing candidate, guarded by the
+    /// `work_key = (repo, branch, head_sha)` dedup (module doc, design doc
+    /// §2.6): `Ok(None)` means this exact candidate was already fully
+    /// processed (a `landing_processed` marker exists) and nothing was
+    /// written — a redelivered completion tuple is dropped here rather than
+    /// repeating gate/review work. `Ok(Some(seq))` is the fresh queue
+    /// position, as before.
+    pub(crate) fn enqueue(&self, entry: LandingQueueEntry) -> rk_core::Result<Option<u64>> {
+        if self.already_processed(&entry)? {
+            return Ok(None);
+        }
+        Ok(Some(self.queue.enqueue(entry)?))
+    }
+
+    /// Has `entry`'s exact `(repo, branch, head_sha)` already reached a
+    /// terminal [`LandingOutcome`]? See [`Self::mark_processed`], the write
+    /// side of this marker.
+    fn already_processed(&self, entry: &LandingQueueEntry) -> rk_core::Result<bool> {
+        let pattern = Pattern::for_commit(
+            Category::Event,
+            LANDING_PROCESSED_IDENTITY,
+            &entry.branch,
+            &entry.head_sha,
+        )
+        .scope(&entry.repo_name);
+        Ok(!self.space.scan(&pattern)?.is_empty())
+    }
+
+    /// Durably record that `entry`'s work key reached a terminal outcome —
+    /// the write side of [`Self::already_processed`]'s dedup probe. Called
+    /// from every terminal return in [`Self::process_entry`], independent of
+    /// whether `entry` arrived through the queue or a direct call (a caller
+    /// bypassing the queue for testing still gets the same double-land
+    /// protection on its next `enqueue`).
+    fn mark_processed(
+        &self,
+        entry: &LandingQueueEntry,
+        outcome: &LandingOutcome,
+    ) -> rk_core::Result<()> {
+        let outcome_str = match outcome {
+            LandingOutcome::Landed(_) => "landed",
+            LandingOutcome::GateHeld => "gate-held",
+            LandingOutcome::ReworkFiled(_) => "rework-filed",
+            LandingOutcome::Escalated(_) => "escalated",
+        };
+        let tuple = Tuple::new(
+            Category::Event,
+            entry.repo_name.clone(),
+            LANDING_PROCESSED_IDENTITY,
+            "daemon",
+            json!({
+                "branch": entry.branch,
+                "target": entry.target,
+                "head_sha": entry.head_sha,
+                "task": entry.task,
+                "outcome": outcome_str,
+            }),
+        )
+        .with_lifecycle(Lifecycle::Furniture);
+        self.space.out(tuple)
     }
 
     /// Process exactly one candidate for `(repo_name, target)`, or `None` if
     /// the key has nothing queued. Single-consumer per key by construction:
     /// callers wanting to fully drain a key call this in a loop (see
     /// [`Self::drain_key`]).
+    ///
+    /// `claim_next` transitions the durable entry to `RunningGates` rather
+    /// than deleting it (restart-safety, module doc); this only removes it
+    /// once [`Self::process_entry`] returns a terminal outcome. On an `Err`
+    /// (an infra fault, not a verdict on the branch — a git call that failed,
+    /// a `Supervisor::land` call that errored rather than cleanly reporting
+    /// `merged: false`) the entry is deliberately left in place so the next
+    /// poll cycle retries it instead of losing the candidate.
     pub(crate) async fn process_next(
         &self,
         repo_name: &str,
         target: &str,
     ) -> rk_core::Result<Option<LandingOutcome>> {
-        let Some(entry) = self.queue.dequeue_next(repo_name, target)? else {
+        let Some(entry) = self.queue.claim_next(repo_name, target)? else {
             return Ok(None);
         };
-        Ok(Some(self.process_entry(entry).await?))
+        let result = self.process_entry(&entry).await;
+        if result.is_ok() {
+            self.queue.remove(&entry)?;
+        }
+        result.map(Some)
     }
 
-    async fn process_entry(&self, entry: LandingQueueEntry) -> rk_core::Result<LandingOutcome> {
-        if !self.run_gates(&entry).await? {
-            return Ok(LandingOutcome::GateHeld);
+    async fn process_entry(&self, entry: &LandingQueueEntry) -> rk_core::Result<LandingOutcome> {
+        if !self.run_gates(entry).await? {
+            let outcome = LandingOutcome::GateHeld;
+            self.mark_processed(entry, &outcome)?;
+            return Ok(outcome);
         }
         if matches!(entry.diff_class.as_str(), "doc-only" | "trivial") {
             let result = self
@@ -368,10 +569,14 @@ impl LandingPipeline {
                     false,
                 )
                 .await?;
-            return Ok(LandingOutcome::Landed(result));
+            let outcome = LandingOutcome::Landed(result);
+            self.mark_processed(entry, &outcome)?;
+            return Ok(outcome);
         }
-        let verdict = self.review_verdict(&entry).await?;
-        self.route_verdict(&entry, verdict.as_deref()).await
+        let verdict = self.review_verdict(entry).await?;
+        let outcome = self.route_verdict(entry, verdict.as_deref()).await?;
+        self.mark_processed(entry, &outcome)?;
+        Ok(outcome)
     }
 
     /// Resolve a recommendation for `entry`: a hit against Phase 2's
@@ -413,7 +618,19 @@ impl LandingPipeline {
     /// pattern) — a daemon restart loses nothing: the reviewer keeps working
     /// against its own worktree regardless of the pipeline's state, and the
     /// verdict tuple is durable even though this exact wait is not (§2.6).
+    ///
+    /// The workflow launch uses a STABLE instance id derived from `entry`'s
+    /// work key (`review_instance_id`), not a fresh random one: a daemon
+    /// restart re-claims the durable queue entry (still `AwaitingReview` from
+    /// before the crash) and calls this again from scratch, and
+    /// `run_owned_with_id` returns the EXISTING instance's snapshot instead
+    /// of launching a second reviewer for a request already in flight — the
+    /// same "never orphan a reviewer" guarantee the design doc's §2.6
+    /// prescribes, but also never double-spawns one.
     async fn request_review(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<String>> {
+        self.queue
+            .set_status(entry, LandingEntryStatus::AwaitingReview)?;
+
         let mut params = HashMap::new();
         params.insert("taskId".to_string(), Value::String(entry.task.clone()));
         params.insert("branch".to_string(), Value::String(entry.branch.clone()));
@@ -428,7 +645,13 @@ impl LandingPipeline {
         // `Repo::discover` and repo-local definition resolution), unlike the
         // `repo` WORKFLOW PARAM above, which is the repo's scope name used
         // to address its verdict artifact.
-        self.engine.run(REVIEW_WORKFLOW, &entry.repo_path, params)?;
+        self.engine.run_owned_with_id(
+            review_instance_id(entry),
+            REVIEW_WORKFLOW,
+            &entry.repo_path,
+            params,
+            None,
+        )?;
 
         let pattern = Pattern::for_commit(
             Category::Artifact,
@@ -552,15 +775,28 @@ impl LandingPipeline {
     }
 
     /// One polling pass: discover every `(repo_name, target)` key with a
-    /// candidate queued and drain each independently. Distinct keys never
-    /// interleave with each other's ordering (each is drained to empty
-    /// before the next starts), but nothing here serializes two DIFFERENT
-    /// keys against each other — matching the design doc's "different target
-    /// branches in the same repo merge concurrently" granularity.
+    /// candidate queued (or left `RunningGates`/`AwaitingReview` by a crashed
+    /// prior process — restart-safety, module doc) and drain each
+    /// independently. Distinct keys never interleave with each other's
+    /// ordering (each is drained to empty before the next starts), but
+    /// nothing here serializes two DIFFERENT keys against each other —
+    /// matching the design doc's "different target branches in the same repo
+    /// merge concurrently" granularity.
+    ///
+    /// One key's failure does not abort the whole pass — logged and skipped,
+    /// left for the next poll cycle to retry (this drives a live daemon
+    /// loop, so one repo's transient fault must not stall every other repo's
+    /// landing traffic).
     pub(crate) async fn run_cycle(&self) -> rk_core::Result<Vec<LandingOutcome>> {
         let mut outcomes = Vec::new();
         for (repo_name, target) in self.queue.pending_keys()? {
-            outcomes.extend(self.drain_key(&repo_name, &target).await?);
+            match self.drain_key(&repo_name, &target).await {
+                Ok(o) => outcomes.extend(o),
+                Err(e) => warn!(
+                    repo = %repo_name, target = %target, error = %e,
+                    "landing pipeline: drain_key failed, will retry next cycle"
+                ),
+            }
         }
         Ok(outcomes)
     }
@@ -985,7 +1221,7 @@ workflow: {
             head_sha: "deadbeef".into(),
             diff_class: "trivial".into(),
             task: "t".into(),
-            seq: 0,
+            ..Default::default()
         };
 
         // Interleave two repos (independent keys) and, within "alpha", two
@@ -998,23 +1234,24 @@ workflow: {
         queue.enqueue(entry("beta", "main", "c2")).unwrap();
         queue.enqueue(entry("alpha", "main", "b3")).unwrap();
 
-        let alpha_main: Vec<String> =
-            std::iter::from_fn(|| queue.dequeue_next("alpha", "main").unwrap())
-                .map(|e| e.branch)
-                .collect();
-        assert_eq!(alpha_main, vec!["b1", "b2", "b3"]);
+        // `claim_next` transitions status rather than deleting (T4
+        // restart-safety), so a caller that wants the classic "drain to
+        // empty" behavior must explicitly `remove` each claimed entry —
+        // exactly what `LandingPipeline::process_next` does once processing
+        // reaches a terminal outcome.
+        let claim_all = |repo: &str, target: &str| {
+            let mut branches = Vec::new();
+            while let Some(e) = queue.claim_next(repo, target).unwrap() {
+                assert_eq!(e.status, LandingEntryStatus::RunningGates);
+                branches.push(e.branch.clone());
+                queue.remove(&e).unwrap();
+            }
+            branches
+        };
 
-        let alpha_release: Vec<String> =
-            std::iter::from_fn(|| queue.dequeue_next("alpha", "release").unwrap())
-                .map(|e| e.branch)
-                .collect();
-        assert_eq!(alpha_release, vec!["r1"]);
-
-        let beta_main: Vec<String> =
-            std::iter::from_fn(|| queue.dequeue_next("beta", "main").unwrap())
-                .map(|e| e.branch)
-                .collect();
-        assert_eq!(beta_main, vec!["c1", "c2"]);
+        assert_eq!(claim_all("alpha", "main"), vec!["b1", "b2", "b3"]);
+        assert_eq!(claim_all("alpha", "release"), vec!["r1"]);
+        assert_eq!(claim_all("beta", "main"), vec!["c1", "c2"]);
 
         // Every key drained to empty; nothing left queued anywhere.
         assert!(queue.pending_keys().unwrap().is_empty());
@@ -1045,7 +1282,7 @@ workflow: {
                 head_sha,
                 diff_class: "doc-only".into(),
                 task: "add note".into(),
-                seq: 0,
+                ..Default::default()
             })
             .unwrap();
 
@@ -1097,7 +1334,7 @@ workflow: {
                 head_sha,
                 diff_class: "doc-only".into(),
                 task: "add src".into(),
-                seq: 0,
+                ..Default::default()
             })
             .unwrap();
 
@@ -1146,7 +1383,7 @@ workflow: {
             head_sha: head_sha.to_string(),
             diff_class: "large".into(),
             task: "add src".into(),
-            seq: 0,
+            ..Default::default()
         }
     }
 
@@ -1285,19 +1522,19 @@ workflow: {
         let (repo_dir, head_sha, main_before) = review_candidate_repo();
         let entry = review_candidate_entry(repo_dir.path(), &head_sha);
 
-        // "Before restart": the pipeline dequeues nothing here — T2's queue
-        // claims at dequeue time, and requeue-on-restart is T4's job (see
-        // this module's doc comment) — instead this drives `process_entry`
-        // directly, the T2->T3 hand-off point, to isolate the review-
-        // integration half: the pipeline parks on the verdict tuple and
-        // never gets one before the simulated crash.
+        // "Before restart": this drives `process_entry` directly rather than
+        // through the queue, to isolate the review-integration half from
+        // T4's queue-level restart-safety (covered separately by
+        // `crates/rk-daemon/tests/landing_pipeline_e2e.rs`): the pipeline
+        // parks on the verdict tuple and never gets one before the simulated
+        // crash.
         {
             let space = Space::open(&layout.db_path()).unwrap();
             let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
             let handle = tokio::spawn({
                 let pipeline = Arc::clone(&pipeline);
                 let entry = entry.clone();
-                async move { pipeline.process_entry(entry).await }
+                async move { pipeline.process_entry(&entry).await }
             });
             wait_for_spawn_count(&space, 1).await;
             handle.abort();
@@ -1317,7 +1554,7 @@ workflow: {
         // future — it reprocesses the same candidate and finds the verdict
         // through the identical durable pattern the cache probe uses
         // (§1.3/§2.6), so no second reviewer is ever spawned.
-        let outcome = pipeline.process_entry(entry).await.unwrap();
+        let outcome = pipeline.process_entry(&entry).await.unwrap();
         let LandingOutcome::Landed(result) = &outcome else {
             panic!("expected Landed, got {outcome:?}");
         };
