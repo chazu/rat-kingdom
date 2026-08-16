@@ -6059,10 +6059,13 @@ fn acquire_singleton_lock(layout: &Layout) -> rk_core::Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
 
     let path = layout.lockfile_path();
+    // Explicitly `truncate(false)`: the previous holder's pid must survive
+    // the open so a losing contender can still read it off below.
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(&path)?;
 
     // SAFETY: `file` owns a valid fd for the duration of this call, and
