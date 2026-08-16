@@ -164,8 +164,17 @@ impl Repo {
 
     /// Resolve `rev` (a branch name, sha, or any revision `git` accepts) to its
     /// full commit sha.
+    ///
+    /// Bounded: this and [`Repo::diff_stat`] run on daemon completion paths
+    /// (`route_completion`'s diff summary), where an unbounded subprocess under
+    /// extreme machine load blocked tokio workers until the whole daemon
+    /// wedged (observed 2026-08-16, TKT-01M04D394PQ8VS5N3V441D1MDD). Local
+    /// ref/diff reads take milliseconds; the generous bound only fires under
+    /// pathology, and every caller already fails closed on `Err`.
     pub fn rev_parse(&self, rev: &str) -> rk_core::Result<String> {
-        Ok(self.git(&["rev-parse", rev])?.trim().to_string())
+        Ok(git_bounded(&self.root, &["rev-parse", rev], LOCAL_READ_TIMEOUT)?
+            .trim()
+            .to_string())
     }
 
     /// File list and total changed-line count for the `base...head` symmetric
@@ -174,14 +183,14 @@ impl Repo {
     /// `--numstat`; those count as 0 lines, matching that check's `awk` script.
     pub fn diff_stat(&self, base: &str, head: &str) -> rk_core::Result<DiffStat> {
         let range = format!("{base}...{head}");
-        let names = self.git(&["diff", "--name-only", &range])?;
+        let names = git_bounded(&self.root, &["diff", "--name-only", &range], LOCAL_READ_TIMEOUT)?;
         let files: Vec<String> = names
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .map(str::to_string)
             .collect();
-        let numstat = self.git(&["diff", "--numstat", &range])?;
+        let numstat = git_bounded(&self.root, &["diff", "--numstat", &range], LOCAL_READ_TIMEOUT)?;
         let mut lines: u64 = 0;
         for row in numstat.lines() {
             let mut cols = row.split_whitespace();
@@ -712,6 +721,10 @@ fn git_output(dir: &Path, args: &[&str]) -> rk_core::Result<String> {
 /// pinned thread. Polls `try_wait` on a short interval — cheap for an operation
 /// measured in seconds, and the captured output is bounded (`--quiet`) so the
 /// pipe never fills while we poll.
+/// Bound for local (no-network) git reads on daemon hot paths. See
+/// [`Repo::rev_parse`] for why these are bounded at all.
+const LOCAL_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn git_bounded(dir: &Path, args: &[&str], timeout: Duration) -> rk_core::Result<String> {
     let mut child = Command::new("git")
         .arg("-C")

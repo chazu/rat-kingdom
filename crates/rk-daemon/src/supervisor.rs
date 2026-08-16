@@ -2538,11 +2538,26 @@ impl Supervisor {
     /// behind [`Self::diff_summary`] must run before the flip, not between
     /// the flip and the emit — that gap is a race two integration tests
     /// caught on this branch's first gate runs.
+    ///
+    /// Runs the git subprocesses via `block_in_place` when the multi-thread
+    /// runtime is available: `handle_event` executes on a tokio worker, and a
+    /// slow git under machine load blocking workers directly is exactly what
+    /// wedged the whole daemon socket (TKT-01M04D394PQ8VS5N3V441D1MDD).
+    /// `block_in_place` hands this worker's queue to another thread for the
+    /// duration; the git calls themselves are additionally subprocess-bounded
+    /// in rk-git, so the block is never unbounded either way.
     fn diff_summary_for(&self, name: &str) -> DiffSummary {
         let record = self.lock_registry().get(name).cloned();
-        match record {
-            Some(record) => self.diff_summary(&record),
-            None => DiffSummary::fallback(),
+        let Some(record) = record else {
+            return DiffSummary::fallback();
+        };
+        let on_multithread = tokio::runtime::Handle::try_current()
+            .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            .unwrap_or(false);
+        if on_multithread {
+            tokio::task::block_in_place(|| self.diff_summary(&record))
+        } else {
+            self.diff_summary(&record)
         }
     }
 
