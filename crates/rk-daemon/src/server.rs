@@ -6100,6 +6100,89 @@ fn acquire_singleton_lock(layout: &Layout) -> rk_core::Result<std::fs::File> {
     Ok(file)
 }
 
+#[cfg(test)]
+mod singleton_lock_tests {
+    use super::*;
+
+    #[test]
+    fn second_acquisition_fails_while_first_is_held_and_names_the_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        layout.ensure().unwrap();
+
+        // flock is per open-file-description, not per process: two separate
+        // `open()`s of the same path from this one process still conflict,
+        // which is exactly what lets this run as a plain in-process test.
+        let _held = acquire_singleton_lock(&layout).expect("first acquisition succeeds");
+        let err = acquire_singleton_lock(&layout)
+            .expect_err("second acquisition must fail while the first is held");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already holds the lock"),
+            "unexpected message: {msg}"
+        );
+        assert!(
+            msg.contains(&std::process::id().to_string()),
+            "refusal should name the holder pid: {msg}"
+        );
+    }
+
+    /// Proves the lock needs no separate stale-lock recovery path: a real
+    /// second OS process holds it, gets SIGKILLed (no destructors, no
+    /// cleanup — an in-process `File` drop would prove nothing about this),
+    /// and a fresh acquisition afterward succeeds immediately.
+    #[test]
+    fn lock_is_recovered_after_the_holder_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        layout.ensure().unwrap();
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // Child: hold the lock and park until killed. Only sync,
+            // fork-safe calls here — no tokio, no destructors on exit.
+            match acquire_singleton_lock(&layout) {
+                Ok(_guard) => loop {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                },
+                Err(_) => unsafe { libc::_exit(1) },
+            }
+        }
+
+        // Parent: poll until the child actually holds the lock.
+        let mut child_holds_it = false;
+        for _ in 0..500 {
+            if acquire_singleton_lock(&layout).is_err() {
+                child_holds_it = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        unsafe {
+            if !child_holds_it {
+                libc::kill(pid, libc::SIGKILL);
+                let mut status = 0;
+                libc::waitpid(pid, &mut status, 0);
+            }
+        }
+        assert!(child_holds_it, "child never acquired the lock");
+
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+
+        let recovered = acquire_singleton_lock(&layout);
+        assert!(
+            recovered.is_ok(),
+            "lock was not recovered after the holder was killed: {:?}",
+            recovered.err()
+        );
+    }
+}
+
 fn read_pid(layout: &Layout) -> Option<u32> {
     std::fs::read_to_string(layout.pid_file())
         .ok()?
