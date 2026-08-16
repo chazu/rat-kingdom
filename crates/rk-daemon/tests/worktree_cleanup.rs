@@ -138,12 +138,28 @@ workflow: {
 }
 "#;
 
+/// Same shape as `NO_DISMISS`, but the spawned task's title starts with
+/// `dirty-` so the fake harness (see `FAKE` above) leaves an uncommitted file
+/// in the worktree instead of committing. Exercises the finalize-time sweep's
+/// dirty-worktree guard (TKT-01M05A2GRAHMMD2RB8CTMNP7RY rework 2).
+const DIRTY_NO_DISMISS: &str = r#"
+workflow: {
+    name: "dirty-no-dismiss"
+    steps: [
+        {type: "spawn", role: "rat", task: {title: "dirty-finalize-1"}, harness: "fake"},
+        {type: "wait", timeout: "30s"},
+        {type: "evaluate", expect: {is_error: false}},
+    ]
+}
+"#;
+
 fn init_workflow_repo() -> tempfile::TempDir {
     let repo = tempfile::tempdir().unwrap();
     scratch_repo(repo.path());
     let wf_dir = repo.path().join(".rk").join("workflows");
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(wf_dir.join("no-dismiss.cue"), NO_DISMISS).unwrap();
+    std::fs::write(wf_dir.join("dirty-no-dismiss.cue"), DIRTY_NO_DISMISS).unwrap();
     repo
 }
 
@@ -238,6 +254,80 @@ async fn finalize_dismisses_agents_the_workflow_never_dismissed() {
     assert!(
         !worktree.exists(),
         "finalize's cleanup sweep must reclaim the worktree: {worktree:?} still exists"
+    );
+}
+
+/// Rework 2 (TKT-01M05A2GRAHMMD2RB8CTMNP7RY): the finalize-time cleanup sweep
+/// (`dismiss_orphaned_instance_agents`) must apply the SAME dirty-worktree
+/// guard `reap_git` already applies to the periodic sweep, instead of
+/// unconditionally force-removing via `dismiss`. An instance that
+/// terminalizes with a spawned agent still holding uncommitted edits must
+/// leave that worktree standing and surface an obstacle naming it — the
+/// salvage window budget-killed rats depend on must not close just because
+/// the reclaim happened through finalize instead of the periodic sweep.
+#[tokio::test]
+async fn finalize_sweep_parks_a_dirty_worktree() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = init_workflow_repo();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    let layout = Layout::at(home.path());
+    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
+        enabled: false,
+        finalize_cleanup_enabled: true,
+        ..rk_core::config::WorktreeSweepConfig::default()
+    });
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let instance = run_workflow(&mut client, repo_dir.path(), "dirty-no-dismiss").await;
+    wait_workflow_terminal(&mut client, &instance).await;
+
+    // Same poll shape as the clean-case test above: finalize persists the
+    // instance's terminal status before the sweep runs, so wait for the
+    // sweep's own effect (the agent record settling) rather than trusting
+    // `workflow.status` alone.
+    let mut worktree: Option<PathBuf> = None;
+    let mut agent_name: Option<String> = None;
+    let mut final_state: Option<String> = None;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let agents = list(&mut client, json!({})).await;
+        let Some(rec) = agents.iter().find(|a| a["workflow_instance"] == instance) else {
+            continue;
+        };
+        worktree = rec["worktree"].as_str().map(PathBuf::from);
+        agent_name = rec["name"].as_str().map(str::to_string);
+        final_state = rec["state"].as_str().map(str::to_string);
+        if final_state.as_deref() == Some("dismissed") {
+            break;
+        }
+    }
+    assert_eq!(
+        final_state.as_deref(),
+        Some("dismissed"),
+        "finalize's cleanup sweep must still dismiss the agent record, only sparing the worktree"
+    );
+    let worktree = worktree.expect("agent record carried a worktree path");
+    let agent_name = agent_name.expect("agent record carried a name");
+    assert!(
+        worktree.join("dirty.txt").exists(),
+        "fake harness should have left an uncommitted file, and the sweep must not have removed it: {worktree:?}"
+    );
+
+    let obstacles = client
+        .call("space.scan", json!({"category": "obstacle"}))
+        .await
+        .unwrap();
+    let tuples = obstacles["tuples"].as_array().cloned().unwrap_or_default();
+    let found = tuples.iter().any(|t| {
+        t["payload"]["type"] == json!("worktree_parked_dirty")
+            && t["payload"]["agent"] == json!(agent_name)
+    });
+    assert!(
+        found,
+        "expected a worktree_parked_dirty obstacle naming {agent_name}: {tuples:?}"
     );
 }
 
