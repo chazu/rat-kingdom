@@ -44,8 +44,8 @@ spawned `steward` workflow instances ran all 12 steps to `status: completed`:
   held unmerged, not a miss — that is the steward doing its job)
 
 So per the live tuplespace, **all six triggers fired, exactly once, via the
-direct dispatch path, within single-digit-to-low-teens seconds of the
-completion landing** — there is no reactor-side non-fire to explain for this
+direct dispatch path, within 15 seconds of the
+completion landing (sub-second to 15.0s measured)** — there is no reactor-side non-fire to explain for this
 specific batch. Two of the three reported "missed" completions (Wriggle-5,
 Peanut-5) in fact auto-merged successfully; the third (Django-6) correctly
 got routed to REWORK.
