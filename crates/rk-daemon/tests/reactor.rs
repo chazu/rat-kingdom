@@ -1091,6 +1091,10 @@ async fn non_main_land_target_is_reported_main_is_not() {
     assert_eq!(events[0].payload["target"], "rat/camembert-4/tkt-9");
     assert_eq!(events[0].payload["branch"], "rat/basil-4/rework");
     assert_eq!(events[0].payload["trigger"], "steward-on-completion");
+    assert_eq!(
+        events[0].payload["text"],
+        "steward-on-completion workflow react-work will land rat/basil-4/rework on non-main target rat/camembert-4/tkt-9"
+    );
 
     // An ordinary completion landing on "main" must NOT produce the event.
     space

@@ -6791,11 +6791,62 @@ mod authorize_reasoned_tests {
     //! server-side from a role or supervision mismatch. These pin the reason
     //! tag for each arm so a future refactor can't silently re-collapse them.
     use super::*;
+    use crate::agents::{AgentRecord, AgentState};
     use rk_core::config::Config;
+    use rk_harness::TokenUsage;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
 
     fn test_daemon() -> (tempfile::TempDir, Daemon) {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::at(dir.path());
+        let daemon = Daemon::new(layout, &Config::default()).unwrap();
+        (dir, daemon)
+    }
+
+    fn test_daemon_with_role(role: &str) -> (tempfile::TempDir, Daemon) {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        layout.ensure().unwrap();
+        let now = chrono::Utc::now();
+        let record = AgentRecord {
+            name: "invalid-rat".into(),
+            role: role.into(),
+            coordination: None,
+            harness: "fake".into(),
+            permission_mode: None,
+            model: None,
+            repo_root: PathBuf::from("/tmp/repo"),
+            repo_name: "repo".into(),
+            task: Some("auth-reason-test".into()),
+            branch: Some("rat/invalid-rat/auth-reason-test".into()),
+            worktree: Some(PathBuf::from("/tmp/worktree/invalid-rat")),
+            target_branch: "main".into(),
+            parent: None,
+            workflow_instance: None,
+            coordinator: None,
+            session_id: Some("test-session".into()),
+            attach_target: None,
+            pid: None,
+            merge_commit: None,
+            state: AgentState::Running,
+            crashed: false,
+            stderr_tail: None,
+            result: None,
+            progress: None,
+            usage: TokenUsage::default(),
+            cost_usd: 0.0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+        };
+        let mut records = HashMap::new();
+        records.insert(record.name.clone(), record);
+        std::fs::write(
+            layout.home().join("agents.json"),
+            serde_json::to_vec(&records).unwrap(),
+        )
+        .unwrap();
         let daemon = Daemon::new(layout, &Config::default()).unwrap();
         (dir, daemon)
     }
@@ -6850,6 +6901,22 @@ mod authorize_reasoned_tests {
         let (allowed, reason) = daemon.authorize_reasoned(&request, &origin);
         assert!(!allowed);
         assert_eq!(reason, "supervised_agents_mismatch");
+    }
+
+    #[test]
+    fn invalid_role_is_tagged_with_a_controlled_registry_fixture() {
+        let (_dir, daemon) = test_daemon_with_role("not-a-supported-role");
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "invalid-rat");
+        let request = req("invalid-rat", "space.scan", &token);
+        let mut supervised = std::collections::HashSet::new();
+        supervised.insert("invalid-rat".to_string());
+        let origin = PeerOrigin {
+            pid_observed: true,
+            supervised_agents: supervised,
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &origin);
+        assert!(!allowed);
+        assert_eq!(reason, "invalid_role");
     }
 
     #[test]
