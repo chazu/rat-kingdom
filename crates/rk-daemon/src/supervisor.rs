@@ -2938,6 +2938,23 @@ impl Supervisor {
     /// branch delete on success), or a `Pr` push + opened pull/merge request
     /// that leaves the branch standing for review. Always removes the worktree.
     pub async fn dismiss(&self, name: &str, no_merge: bool) -> rk_core::Result<serde_json::Value> {
+        self.dismiss_inner(name, no_merge, false).await
+    }
+
+    /// Same as [`dismiss`](Self::dismiss), except when `park_if_dirty` is set:
+    /// a worktree carrying uncommitted changes is left standing (and reported
+    /// via an `obstacle` tuple) instead of force-removed. Used by
+    /// [`dismiss_orphaned_instance_agents`](Self::dismiss_orphaned_instance_agents),
+    /// the unattended finalize-time sweep, which must apply the same
+    /// dirty-worktree guard [`reap_git`](Self::reap_git) already applies —
+    /// unlike an explicit operator/workflow `dismiss`, nobody looked at this
+    /// worktree's contents before deciding to tear it down.
+    async fn dismiss_inner(
+        &self,
+        name: &str,
+        no_merge: bool,
+        park_if_dirty: bool,
+    ) -> rk_core::Result<serde_json::Value> {
         let record = self
             .lock_registry()
             .get(name)
@@ -2971,12 +2988,25 @@ impl Supervisor {
 
         if let Some(worktree) = &record.worktree {
             if worktree.exists() {
-                let repo = repo.clone();
-                let worktree = worktree.clone();
-                blocking_io("dismiss worktree cleanup", move || {
-                    repo.remove_worktree(&worktree)
-                })
-                .await?;
+                let dirty = if park_if_dirty {
+                    let worktree_check = worktree.clone();
+                    blocking_io("dismiss dirty-worktree check", move || {
+                        Repo::worktree_is_dirty(&worktree_check)
+                    })
+                    .await?
+                } else {
+                    false
+                };
+                if dirty {
+                    self.emit_parked_dirty_worktree_obstacle(&record, worktree);
+                } else {
+                    let repo = repo.clone();
+                    let worktree = worktree.clone();
+                    blocking_io("dismiss worktree cleanup", move || {
+                        repo.remove_worktree(&worktree)
+                    })
+                    .await?;
+                }
             }
         }
         if let Some(branch) = &record.branch {
@@ -3084,6 +3114,38 @@ impl Supervisor {
         }))
     }
 
+    /// Companion to [`dismiss_inner`](Self::dismiss_inner)'s `park_if_dirty`
+    /// guard: name the agent and worktree an unattended sweep declined to
+    /// force-remove, so an operator (or `rk inbox`) can see why the worktree
+    /// is still sitting there instead of the salvage window silently closing
+    /// unnoticed.
+    fn emit_parked_dirty_worktree_obstacle(
+        &self,
+        record: &AgentRecord,
+        worktree: &std::path::Path,
+    ) {
+        let tuple = Tuple::new(
+            Category::Obstacle,
+            record.repo_name.clone(),
+            record.name.clone(),
+            self.castle.clone(),
+            json!({
+                "type": "worktree_parked_dirty",
+                "agent": record.name,
+                "task": record.task,
+                "worktree": worktree.display().to_string(),
+                "text": format!(
+                    "{} finalized with uncommitted changes in its worktree — {} left standing, not force-removed",
+                    record.name,
+                    worktree.display()
+                ),
+            }),
+        );
+        if let Err(e) = self.space.out(tuple.into_trail(DEFAULT_TRAIL_TTL)) {
+            warn!(error = %e, "failed to emit parked-dirty-worktree obstacle");
+        }
+    }
+
     /// Guaranteed-cleanup safety net for a terminalizing workflow instance
     /// (`WorkflowEngine::finalize`): find every LIVE agent this instance
     /// spawned that itself already reached a terminal agent state
@@ -3103,6 +3165,15 @@ impl Supervisor {
     /// itself survives (only the worktree is reclaimed), so the work is never
     /// lost, only left for a human/ticket to land deliberately.
     ///
+    /// Also dismisses with `park_if_dirty: true` — nobody has looked at these
+    /// worktrees before this unattended sweep tears them down, so a worktree
+    /// still carrying uncommitted edits is left standing (with an `obstacle`
+    /// tuple naming it) rather than force-removed. This is the same
+    /// dirty-worktree guard [`reap_git`](Self::reap_git) applies to the
+    /// periodic sweep; the salvage window a budget-killed agent's uncommitted
+    /// work depends on must not close just because the terminalization path
+    /// is different from the periodic one.
+    ///
     /// Best-effort: a single agent's dismissal failing is logged and does not
     /// stop the sweep or the instance's own terminal-state persistence, which
     /// must succeed regardless of whether every spawned agent could be swept.
@@ -3120,7 +3191,7 @@ impl Supervisor {
         };
         let mut results = Vec::with_capacity(names.len());
         for name in names {
-            match self.dismiss(&name, true).await {
+            match self.dismiss_inner(&name, true, true).await {
                 Ok(_) => results.push((name, true)),
                 Err(error) => {
                     warn!(agent = %name, instance, %error, "finalize-time cleanup sweep could not dismiss agent");
