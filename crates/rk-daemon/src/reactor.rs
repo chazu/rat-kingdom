@@ -983,6 +983,11 @@ impl Reactor {
                 // could drain past `maxFires` in one window the moment a slot
                 // frees. Stop here and let the remainder wait for next cycle.
                 if self.rate_limited(trigger) {
+                    self.trace_fire_deferred(
+                        &trigger.name,
+                        "queue-drain",
+                        "rate cap reached while draining queued fires; remainder deferred to next cycle",
+                    );
                     break;
                 }
                 let mut pending = match self.space.scan(
@@ -1086,6 +1091,11 @@ impl Reactor {
                 // failures against their own bound.
                 let attempt = self.record_fire_attempt(&format!("queued:{key}"))?;
                 if attempt < MAX_FIRE_ATTEMPTS {
+                    self.trace_fire_deferred(
+                        &trigger.name,
+                        &tuple_id,
+                        &format!("queued dispatch retry {attempt}/{MAX_FIRE_ATTEMPTS}: {e}"),
+                    );
                     return Err(e);
                 }
                 warn!(
@@ -1113,6 +1123,27 @@ impl Reactor {
         }
     }
 
+    /// Durable trace for a tuple that MATCHED a trigger but whose fire was
+    /// deferred, retried, or otherwise held back short of a final
+    /// give-up/success. Before this, the only record of that state was a
+    /// `warn!` log line — gone the moment the process log rotated — which is
+    /// what let a genuine reactor miss masquerade as "did this fire or not"
+    /// for days: nothing durable named *why* a match didn't immediately
+    /// dispatch. Written to the same obstacle pile as
+    /// `reactor_rate_capped`/`reactor_fire_gave_up` so `rk scan obstacle
+    /// system` (or `rk inbox`) surfaces it days later, not just in a
+    /// still-running process's stderr.
+    fn trace_fire_deferred(&self, trigger_name: &str, tuple_id: &str, reason: &str) {
+        info!(trigger = %trigger_name, tuple = %tuple_id, reason, "reactor deferred a matched trigger fire");
+        let _ = self.space.out(Tuple::new(
+            Category::Obstacle,
+            SYSTEM_SCOPE,
+            "reactor_fire_deferred",
+            REACTOR_INSTANCE,
+            json!({"trigger": trigger_name, "tuple": tuple_id, "reason": reason}),
+        ));
+    }
+
     /// A trigger fire that failed for `reason`: keep retrying — `Err`, so the
     /// cursor stays pinned and the next cycle re-attempts the exact same tuple
     /// — until [`MAX_FIRE_ATTEMPTS`] is reached, then give up for good. Giving
@@ -1133,6 +1164,11 @@ impl Reactor {
     ) -> rk_core::Result<bool> {
         let attempt = self.record_fire_attempt(key)?;
         if attempt < MAX_FIRE_ATTEMPTS {
+            self.trace_fire_deferred(
+                trigger_name,
+                tuple_id,
+                &format!("retry {attempt}/{MAX_FIRE_ATTEMPTS}: {reason}"),
+            );
             return Err(rk_core::Error::other(reason));
         }
         warn!(

@@ -2087,6 +2087,180 @@ async fn permanently_failing_fire_gives_up_and_unpins_the_cursor() {
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
+/// Diagnosability aid (TKT-01M03ZXR2X84H9JZH505W6H97Z): a tuple that MATCHED
+/// a trigger but whose fire is only retried, not yet given up on, used to
+/// leave no durable trace at all — just a `warn!` log line gone the moment
+/// the process log rotated. That is what let a genuine reactor miss
+/// masquerade as "did this fire or not" days after the fact. Every retry
+/// attempt short of the final give-up must now write a durable
+/// `reactor_fire_deferred` obstacle naming the trigger and the reason, so a
+/// `rk scan obstacle system` days later still shows the match was seen and
+/// held back, not silently dropped.
+#[tokio::test]
+async fn permanently_retrying_fire_writes_a_durable_deferred_trace() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    std::fs::write(
+        repo.path().join(".rk/workflows/needs-param.cue"),
+        r#"workflow: {
+            name: "needs-param"
+            params: { must: {type: "string", required: true} }
+            steps: [{type: "run", command: "true"}]
+        }"#,
+    )
+    .unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+
+    let dir = layout.triggers_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("needy.cue"),
+        r#"triggers: [{name: "needy-drain", match: {category: "event", scope: "myrepo", identity: "needy"}, run: "needs-param", params: {must: "{{tuple.payload.absent}}"}}]"#,
+    )
+    .unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+    space
+        .out(Tuple::new(
+            Category::Event,
+            "myrepo",
+            "needy",
+            "Whisker",
+            json!({}),
+        ))
+        .unwrap();
+
+    // The very first retry (well before the eventual give-up) already writes
+    // a durable trace — diagnosability cannot wait for MAX_FIRE_ATTEMPTS.
+    assert_eq!(reactor.run_cycle().unwrap(), 0);
+    let deferred = space
+        .scan(&Pattern::category(Category::Obstacle).identity("reactor_fire_deferred"))
+        .unwrap();
+    assert_eq!(
+        deferred.len(),
+        1,
+        "the first retry must already leave a durable deferred trace"
+    );
+    assert_eq!(
+        deferred[0].payload.get("trigger").and_then(|v| v.as_str()),
+        Some("needy-drain")
+    );
+    assert!(
+        deferred[0]
+            .payload
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .contains("retry 1/"),
+        "reason must name the attempt number, not just a generic failure"
+    );
+
+    // Every subsequent retry adds its own trace, one per cycle.
+    for _ in 0..3 {
+        reactor.run_cycle().unwrap();
+    }
+    let deferred = space
+        .scan(&Pattern::category(Category::Obstacle).identity("reactor_fire_deferred"))
+        .unwrap();
+    assert_eq!(
+        deferred.len(),
+        4,
+        "one durable deferred trace per retry attempt, none silently dropped"
+    );
+
+    // The final attempt gives up for good (already covered by
+    // `permanently_failing_fire_gives_up_and_unpins_the_cursor`); confirm the
+    // deferred-trace count stops growing once the give-up marker lands.
+    reactor.run_cycle().unwrap();
+    let gave_up = space
+        .scan(&Pattern::category(Category::Obstacle).identity("reactor_fire_gave_up"))
+        .unwrap();
+    assert_eq!(gave_up.len(), 1);
+    let deferred = space
+        .scan(&Pattern::category(Category::Obstacle).identity("reactor_fire_deferred"))
+        .unwrap();
+    assert_eq!(
+        deferred.len(),
+        4,
+        "the give-up cycle itself does not add another deferred trace"
+    );
+}
+
+/// Companion to `drain_queued_fires_respects_the_rate_cap_not_just_max_in_flight`:
+/// when draining stops because the rolling rate cap is hit, that used to be a
+/// silent `break` — no log, no tuple, nothing a later investigation could find.
+/// It must now leave the same durable `reactor_fire_deferred` trace as a
+/// retried direct fire, naming the trigger so a stalled queue is diagnosable
+/// without re-deriving it from timing alone.
+#[tokio::test]
+async fn drain_rate_cap_writes_a_durable_deferred_trace() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    std::fs::write(
+        repo.path().join(".rk/workflows/slow-work.cue"),
+        r#"workflow: { name: "slow-work", steps: [{type: "run", command: "sleep 1"}] }"#,
+    )
+    .unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+
+    let dir = layout.triggers_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("burst.cue"),
+        r#"triggers: [{name: "burst-drain", match: {category: "event", scope: "myrepo", identity: "burst"}, run: "slow-work", maxInFlight: 1, maxFires: 2}]"#,
+    )
+    .unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let config = ReactorConfig {
+        window_secs: 3600, // one wide window for the whole test
+        ..Default::default()
+    };
+    let (reactor, engine) = build_reactor_and_engine_with_space(&layout, config, space.clone());
+
+    for i in 0..5 {
+        space
+            .out(Tuple::new(
+                Category::Event,
+                "myrepo",
+                "burst",
+                "Whisker",
+                json!({"i": i}),
+            ))
+            .unwrap();
+    }
+    reactor.run_cycle().unwrap();
+
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reactor.run_cycle().unwrap();
+        if engine.list().len() >= 3 {
+            break; // would only happen if the rate cap failed to hold
+        }
+    }
+    assert_eq!(engine.list().len(), 2, "sanity: rate cap still bounds dispatch");
+
+    let deferred = space
+        .scan(&Pattern::category(Category::Obstacle).identity("reactor_fire_deferred"))
+        .unwrap();
+    assert!(
+        !deferred.is_empty(),
+        "draining stalled on the rate cap must leave a durable trace, not a silent break"
+    );
+    assert!(deferred.iter().all(|t| t
+        .payload
+        .get("trigger")
+        .and_then(|v| v.as_str())
+        == Some("burst-drain")));
+}
+
 /// The durable queue behind a trigger's `maxInFlight` cap survives a daemon
 /// restart: reopening the space and rebuilding the reactor/engine from the
 /// same durable layout still sees the queued fire and dispatches it once its
