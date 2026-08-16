@@ -94,6 +94,13 @@ triggers: [
 		// A completion storm must not spawn a steward storm; each fire is still
 		// idempotent per completion tuple, this caps the rolling window.
 		maxFires: 20
+		// Admission control (steward remediation phase 1): cap concurrent
+		// steward reviewer instances at 2 — the empirically safe concurrency
+		// observed under a completion burst (mass-reviewer starvation and gate
+		// flake under load-average >> cores otherwise). A completion beyond the
+		// cap is durably queued, never dropped, and dispatched the moment an
+		// earlier steward review completes.
+		maxInFlight: 2
 	},
 ]
 

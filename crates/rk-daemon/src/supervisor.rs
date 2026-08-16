@@ -24,6 +24,15 @@ use tracing::{info, warn};
 
 const MIN_PROGRESS_INTERVAL: chrono::Duration = chrono::Duration::seconds(5);
 
+/// Error text [`Supervisor::spawn`] returns when `fleet_wip_cap` refused
+/// admission. Matched by name (not a dedicated [`rk_core::Error`] variant, to
+/// avoid widening a shared enum for one internal admission-control signal) by
+/// callers that must distinguish "no free slot right now, try again" from a
+/// genuine spawn failure — see
+/// [`WorkflowEngine::await_fleet_capacity`](crate::workflow_exec::WorkflowEngine::await_fleet_capacity).
+pub(crate) const FLEET_WIP_CAP_REFUSED: &str =
+    "fleet WIP cap reached: no free slot to admit this spawn";
+
 // Review-tiering diff_class thresholds (Phase 0 of the steward remediation).
 // The steward trigger reads `diff_class` off the completion payload to decide
 // whether a diff is worth an LLM reviewer's judgment at all; these bounds are
@@ -673,20 +682,36 @@ impl Supervisor {
     /// Async callers must not run Git discovery/worktree setup or harness
     /// launch on a Tokio worker. The synchronous method remains for already
     /// blocking supervisors and tests.
+    ///
+    /// `fleet_wip_cap`: see [`spawn`](Self::spawn).
     pub async fn spawn_async(
         self: &Arc<Self>,
         params: SpawnParams,
+        fleet_wip_cap: usize,
     ) -> rk_core::Result<AgentRecord> {
         let supervisor = Arc::clone(self);
         let handle = tokio::runtime::Handle::current();
         blocking_io("agent spawn", move || {
             let _entered = handle.enter();
-            supervisor.spawn(params)
+            supervisor.spawn(params, fleet_wip_cap)
         })
         .await
     }
 
-    pub fn spawn(self: &Arc<Self>, params: SpawnParams) -> rk_core::Result<AgentRecord> {
+    /// `fleet_wip_cap` is the fleet-wide concurrent-agent ceiling this call
+    /// must be atomically admitted against before any other spawn work
+    /// begins (worktree, branch, harness launch) — `0` means this caller
+    /// does not enforce one (manual/operator spawns, sub-spawns), matching
+    /// pre-admission-control behaviour. The continuous-drain autoscaler and a
+    /// workflow `spawn` step both pass the same `[drain] max_wip` value here,
+    /// which is what makes the ceiling bidirectional: both share one
+    /// admission path (see [`Registry::try_reserve_wip`]) so neither can
+    /// TOCTOU-race the other onto the same free slot.
+    pub fn spawn(
+        self: &Arc<Self>,
+        params: SpawnParams,
+        fleet_wip_cap: usize,
+    ) -> rk_core::Result<AgentRecord> {
         validate_role(&params.role)?;
         let repo = Repo::discover(std::path::Path::new(&params.repo))?;
         let repo_name = repo.name();
@@ -723,11 +748,22 @@ impl Supervisor {
             ));
         }
 
-        // Reserve the name atomically: it stays claimed against concurrent
-        // spawns until the journal row is inserted. Picking without reserving
-        // let two near-simultaneous spawns grab the same name and collide on
-        // the worktree path.
-        let name = self.lock_registry().reserve_name();
+        // Atomically admit one fleet-WIP slot and reserve the name in the
+        // SAME registry-lock critical section: the free-slot check and the
+        // reservation must not be two separate lock acquisitions, or two
+        // concurrent callers (a drain refill and a workflow `spawn` step, or
+        // two of either) can each observe the same free slot before either's
+        // spawn lands in the registry. Name reservation stays claimed against
+        // concurrent spawns until the journal row is inserted; picking
+        // without reserving let two near-simultaneous spawns grab the same
+        // name and collide on the worktree path.
+        let name = {
+            let mut reg = self.lock_registry();
+            if !reg.try_reserve_wip(fleet_wip_cap) {
+                return Err(rk_core::Error::other(FLEET_WIP_CAP_REFUSED));
+            }
+            reg.reserve_name()
+        };
         let (branch, worktree) = if params.role == ONBOARDER_ROLE {
             if !params.task.starts_with("onb-")
                 || !params
@@ -735,7 +771,9 @@ impl Supervisor {
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
             {
-                self.lock_registry().release_name(&name);
+                let mut reg = self.lock_registry();
+                reg.release_name(&name);
+                reg.release_wip(fleet_wip_cap);
                 return Err(rk_core::Error::other(
                     "onboarder task must be a stable onb- session id",
                 ));
@@ -768,9 +806,18 @@ impl Supervisor {
             permission_mode: effective.permission_mode.clone(),
         });
         if let Err(e) = self.lock_registry().insert(spawning) {
-            self.lock_registry().release_name(&name);
+            let mut reg = self.lock_registry();
+            reg.release_name(&name);
+            reg.release_wip(fleet_wip_cap);
             return Err(e);
         }
+        // The reservation's job is done: this spawn now has a live registry
+        // row (state `Spawning`), which itself counts toward the fleet-WIP
+        // ceiling from here on — worktree creation and harness launch (both
+        // potentially slow) proceed without holding the reservation, and any
+        // failure from here is recorded on that row via `mark_spawn_failed`,
+        // which naturally frees its slot by leaving the live count.
+        self.lock_registry().release_wip(fleet_wip_cap);
         if let Err(e) = repo.create_worktree(&worktree, &branch, &target_branch) {
             self.mark_spawn_failed(&name, &e);
             return Err(e);
@@ -4428,5 +4475,98 @@ mod respawn_tests {
             sup.decide_respawn(&rec, now + chrono::Duration::seconds(999), &cfg),
             RespawnDecision::Wait
         ));
+    }
+
+    fn spawn_params(repo: &Path, task: &str) -> SpawnParams {
+        SpawnParams {
+            repo: repo.display().to_string(),
+            task: task.into(),
+            prompt: None,
+            role: "rat".into(),
+            coordination: None,
+            harness: Some("fake".into()),
+            parent: None,
+            base: None,
+            model: None,
+            permission_mode: None,
+            attach: false,
+            workflow_instance: None,
+            coordinator: None,
+            instance_max_usd: None,
+        }
+    }
+
+    /// The fleet-WIP admission check and the reservation must happen in one
+    /// atomic step (TOCTOU regression for the review finding on
+    /// workflow_exec.rs's `await_fleet_capacity`): five spawns fired
+    /// genuinely concurrently (a multi-thread runtime, not the default
+    /// single-threaded `#[tokio::test]`, so this is real OS-thread
+    /// contention on the registry lock, not cooperative interleaving)
+    /// against `fleet_wip_cap = 2` must admit EXACTLY two, never more — no
+    /// window where two concurrent callers can each observe the same free
+    /// slot before either's spawn lands in the registry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fleet_wip_admission_is_atomic_under_concurrent_spawns() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+
+        let handles: Vec<_> = (0..5)
+            .map(|i| {
+                let sup = Arc::clone(&sup);
+                let params = spawn_params(repo.path(), &format!("concurrent-{i}"));
+                tokio::spawn(async move { sup.spawn_async(params, 2).await })
+            })
+            .collect();
+        let mut results = Vec::with_capacity(handles.len());
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+
+        let admitted = results.iter().filter(|r| r.is_ok()).count();
+        let refused = results
+            .iter()
+            .filter(|r| {
+                matches!(r, Err(e) if e.to_string() == FLEET_WIP_CAP_REFUSED)
+            })
+            .count();
+        assert_eq!(admitted, 2, "cap of 2 must admit exactly 2: {results:?}");
+        assert_eq!(refused, 3, "the other 3 must be refused cleanly: {results:?}");
+        // A refused attempt never reaches `reserve_name`/`insert`, so exactly
+        // one registry row must exist per ADMITTED spawn — checked as a total
+        // count rather than a live-state filter because the fake harness's
+        // default script can race to `Completed` before this assertion runs,
+        // which a live-only count would flag as a false cap violation.
+        assert_eq!(
+            sup.list().len(),
+            2,
+            "exactly the 2 admitted spawns should have a registry row"
+        );
+    }
+
+    /// A spawn refused (or otherwise failed) BEFORE its registry row goes
+    /// live must not leak its fleet-WIP reservation: with `fleet_wip_cap =
+    /// 1`, a failing spawn (an onboarder task that fails validation before
+    /// `insert`) followed by a real one must let the second succeed —
+    /// leaking here would wedge the ceiling closed forever.
+    #[tokio::test]
+    async fn failed_spawn_before_insert_releases_its_fleet_wip_reservation() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+
+        let mut bad = spawn_params(repo.path(), "not-a-valid-onboarder-task");
+        bad.role = crate::onboarding_sessions::ONBOARDER_ROLE.into();
+        let failure = sup.spawn_async(bad, 1).await;
+        assert!(failure.is_err(), "invalid onboarder task must fail validation");
+
+        let good = spawn_params(repo.path(), "concurrent-after-failure");
+        let record = sup
+            .spawn_async(good, 1)
+            .await
+            .expect("the failed attempt's reservation must have been released");
+        assert!(record.state.is_live());
     }
 }

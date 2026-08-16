@@ -46,6 +46,7 @@ fn build_reactor_with_config(
         false,
         Vec::new(),
         vec!["main".into(), "master".into()],
+        0,
     ));
     Arc::new(Reactor::new(
         space,
@@ -619,6 +620,7 @@ fn test_deployment_projection_does_not_fire_configured_workflow() {
         false,
         Vec::new(),
         vec!["main".into(), "master".into()],
+        0,
     ));
     let reactor = Reactor::new(
         space,

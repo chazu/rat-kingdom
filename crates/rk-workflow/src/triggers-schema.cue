@@ -40,6 +40,13 @@ triggers: [...#Trigger]
 	// Per-trigger fire cap within the reactor's rolling window. Bounded to <=100
 	// to mirror the `repeat` max discipline — a storm can never run unbounded.
 	maxFires?: int & >0 & <=100
+
+	// Cap on this trigger's concurrently in-flight (Running) workflow instances.
+	// Beyond the cap a match is durably QUEUED — never dropped, never run
+	// unbounded — and dispatched, oldest first, the moment an earlier instance
+	// completes and frees a slot. Unset means no cap (legacy, unbounded
+	// concurrency). Bounded to <=100 to mirror `maxFires`.
+	maxInFlight?: int & >0 & <=100
 }
 
 #TriggerMatch: {

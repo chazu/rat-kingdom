@@ -62,6 +62,22 @@ const COALESCE_FILED_IDENTITY: &str = "reactor_coalesced";
 /// files-once-until-closed guard beyond that.
 const COALESCE_FILED_TTL_SECS: i64 = 10 * 60;
 const MAX_MARKER_TTL_SECS: u64 = 365 * 24 * 3600;
+/// Identity of a durably-queued fire (system scope, Furniture): a trigger
+/// match held back because its `maxInFlight` cap was reached at match time.
+/// Never dropped — [`Reactor::drain_queued_fires`] dispatches it, oldest
+/// first, the moment an earlier instance of the same trigger completes.
+const QUEUE_IDENTITY: &str = "reactor_queued_fire";
+/// Identity of a durable per-`(trigger, tuple)` fire-attempt counter (system
+/// scope, Furniture). Every failed fire — retryable or not — records one, so
+/// [`Reactor::give_up_or_retry`] can bound how many cycles ANY single
+/// trigger's failure is allowed to pin the reactor's one global cursor.
+const FIRE_ATTEMPT_IDENTITY: &str = "reactor_fire_attempt";
+/// How many consecutive failed attempts a `(trigger, tuple)` fire gets before
+/// the reactor gives up on it for good. Bounds the cursor-pinning window of a
+/// permanently-failing fire (unregistered repo, a workflow's missing required
+/// param, a rate cap that never clears) to a handful of cycles instead of
+/// forever, while still tolerating a transient blip that clears on its own.
+const MAX_FIRE_ATTEMPTS: u32 = 5;
 
 /// A loaded trigger plus where it came from (a repo-local file defaults its
 /// target repo to that repo; a global-dir trigger has no default repo).
@@ -113,6 +129,13 @@ pub struct Reactor {
     layout: Layout,
     config: ReactorConfig,
     cursor_file: PathBuf,
+    /// Durable counter backing [`next_queue_seq`](Self::next_queue_seq): unlike
+    /// a queued fire's `RecordId`, whose same-millisecond suffix is random,
+    /// this assigns strictly increasing enqueue order so `drain_queued_fires`
+    /// can guarantee FIFO. Persisted (not in-memory like `fires`) because the
+    /// queue itself is durable `Furniture` that can outlive a restart.
+    queue_seq_file: PathBuf,
+    queue_seq: Mutex<Option<u64>>,
     /// Per-trigger fire timestamps for the rolling rate cap. In-memory: a storm
     /// is a live-daemon phenomenon, and a restart legitimately resets the window.
     fires: Mutex<HashMap<String, Vec<Instant>>>,
@@ -139,6 +162,7 @@ impl Reactor {
         config: ReactorConfig,
     ) -> Self {
         let cursor_file = layout.home().join("reactor-cursor");
+        let queue_seq_file = layout.home().join("reactor-queue-seq");
         Self {
             space,
             engine,
@@ -147,6 +171,8 @@ impl Reactor {
             layout,
             config,
             cursor_file,
+            queue_seq_file,
+            queue_seq: Mutex::new(None),
             fires: Mutex::new(HashMap::new()),
             trigger_cache: Mutex::new(None),
             last_pops: Mutex::new(None),
@@ -239,6 +265,12 @@ impl Reactor {
 
         fired += self.react_to_sdlc_ci_transition_backlog()?;
         fired += self.react_to_sdlc_alert_transition_backlog()?;
+
+        // Dispatch anything durably queued behind a trigger's `maxInFlight`
+        // cap. Independent of the delta above: a slot frees when an EARLIER
+        // instance completes, which need not emit a tuple this trigger's own
+        // pattern matches, so draining cannot piggyback on the delta loop.
+        fired += self.drain_queued_fires(&triggers);
 
         // Whole-store recomputes (quorum promotion, obstacle coalescence). Their
         // INPUT is deliberately the whole store, not the cursor delta: a
@@ -805,6 +837,7 @@ impl Reactor {
         if self.already_fired(&key)? {
             return Ok(false);
         }
+        let tuple_id = tuple.id.to_string();
         if self.rate_limited(trigger) {
             warn!(trigger = %trigger.name, "reactor rate cap reached; skipping fire");
             let _ = self.space.out(Tuple::new(
@@ -814,10 +847,12 @@ impl Reactor {
                 REACTOR_INSTANCE,
                 json!({"trigger": trigger.name, "window_secs": self.config.window_secs}),
             ));
-            return Err(rk_core::Error::other(format!(
-                "reactor trigger '{}' is rate limited",
-                trigger.name
-            )));
+            return self.give_up_or_retry(
+                &key,
+                &trigger.name,
+                &tuple_id,
+                format!("reactor trigger '{}' is rate limited", trigger.name),
+            );
         }
         // Target repo: explicit override > the trigger file's own repo > the
         // matched tuple's scope. It must resolve to a registered repo path.
@@ -827,22 +862,54 @@ impl Reactor {
             .or_else(|| loaded.source_repo.clone())
             .unwrap_or_else(|| tuple.scope.clone());
         let Some(record) = registry.get(&repo_name) else {
-            return Err(rk_core::Error::other(format!(
-                "reactor trigger '{}' targets unregistered repo '{}'",
-                trigger.name, repo_name
-            )));
+            return self.give_up_or_retry(
+                &key,
+                &trigger.name,
+                &tuple_id,
+                format!(
+                    "reactor trigger '{}' targets unregistered repo '{}'",
+                    trigger.name, repo_name
+                ),
+            );
         };
         let repo_path = record.path.to_string_lossy().to_string();
         let params = template_params(&trigger.params, tuple);
 
+        // Admission control: a trigger at its `maxInFlight` cap durably queues
+        // the fire instead of dropping it or running unbounded. The queue
+        // entry carries everything dispatch needs (resolved repo/params), not
+        // a reference back to `tuple` — by the time a slot frees, the landed
+        // tuple that triggered this may itself have decayed.
+        if let Some(cap) = trigger.max_in_flight {
+            if self.engine.live_count_for_trigger(&trigger.name) >= cap as usize {
+                self.enqueue_fire(&key, trigger, &repo_name, &repo_path, &params, &tuple_id)?;
+                self.mark_fired(&key, trigger, tuple, "queued")?;
+                info!(trigger = %trigger.name, tuple = %tuple_id, cap, "reactor queued fire: trigger at maxInFlight");
+                return Ok(false);
+            }
+        }
+
         // The workflow runs in the background; run() returns the instance now.
-        let instance = self.engine.run_owned_with_id(
+        let instance = match self.engine.run_owned_with_id_from_trigger(
             stable_workflow_instance_id(&key),
+            &trigger.name,
             &trigger.run,
             &repo_path,
             params.clone(),
-            None,
-        )?;
+        ) {
+            Ok(instance) => instance,
+            Err(e) => {
+                return self.give_up_or_retry(
+                    &key,
+                    &trigger.name,
+                    &tuple_id,
+                    format!(
+                        "reactor trigger '{}' failed to launch workflow '{}': {e}",
+                        trigger.name, trigger.run
+                    ),
+                );
+            }
+        };
         info!(
             trigger = %trigger.name,
             workflow = %trigger.run,
@@ -854,6 +921,262 @@ impl Reactor {
         self.mark_fired(&key, trigger, tuple, &instance.id)?;
         self.record_fire(&trigger.name);
         Ok(true)
+    }
+
+    /// Durably hold a fire that matched a trigger already at its `maxInFlight`
+    /// cap. `Furniture` (not `Ephemeral`): unlike the fire markers, nothing
+    /// ever TTLs a queued fire out from under a slow-draining trigger — it is
+    /// consumed exactly once, by [`dispatch_queued`](Self::dispatch_queued),
+    /// which explicitly deletes it.
+    fn enqueue_fire(
+        &self,
+        key: &str,
+        trigger: &Trigger,
+        repo_name: &str,
+        repo_path: &str,
+        params: &HashMap<String, Value>,
+        tuple_id: &str,
+    ) -> rk_core::Result<()> {
+        let seq = self.next_queue_seq()?;
+        let queued = Tuple::new(
+            Category::Event,
+            SYSTEM_SCOPE,
+            QUEUE_IDENTITY,
+            REACTOR_INSTANCE,
+            json!({
+                "key": key,
+                "trigger": trigger.name,
+                "run": trigger.run,
+                "repo_name": repo_name,
+                "repo_path": repo_path,
+                "params": params,
+                "tuple": tuple_id,
+                "seq": seq,
+            }),
+        )
+        .with_lifecycle(Lifecycle::Furniture);
+        self.space.out(queued)?;
+        Ok(())
+    }
+
+    /// Dispatch queued fires for every trigger below its `maxInFlight` cap,
+    /// oldest first. Called every cycle independent of the tuple delta: an
+    /// instance completing frees a slot without necessarily writing a tuple
+    /// THIS trigger's own pattern matches, so draining cannot piggyback on the
+    /// delta loop the way an ordinary fire does. Returns how many queued
+    /// fires were dispatched.
+    fn drain_queued_fires(&self, triggers: &[Loaded]) -> usize {
+        let mut dispatched = 0usize;
+        for loaded in triggers {
+            let trigger = &loaded.trigger;
+            let Some(cap) = trigger.max_in_flight else {
+                continue;
+            };
+            let cap = cap as usize;
+            loop {
+                if self.engine.live_count_for_trigger(&trigger.name) >= cap {
+                    break;
+                }
+                // The rolling rate cap applies to draining exactly as it does
+                // to an immediate fire (`try_fire`'s own `rate_limited` check):
+                // without this, a backlog built up while `maxInFlight` held
+                // could drain past `maxFires` in one window the moment a slot
+                // frees. Stop here and let the remainder wait for next cycle.
+                if self.rate_limited(trigger) {
+                    break;
+                }
+                let mut pending = match self.space.scan(
+                    &Pattern::category(Category::Event)
+                        .scope(SYSTEM_SCOPE)
+                        .identity(QUEUE_IDENTITY),
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(trigger = %trigger.name, error = %e, "reactor: queue scan failed");
+                        break;
+                    }
+                };
+                pending.retain(|t| {
+                    t.payload.get("trigger").and_then(Value::as_str) == Some(trigger.name.as_str())
+                });
+                // Order by the durable enqueue sequence, not `t.id`: a
+                // `RecordId`'s same-millisecond suffix is random, so two fires
+                // queued in the same millisecond would otherwise dispatch in
+                // an arbitrary order. Entries queued before this sequence
+                // existed default to 0 and naturally sort first, ahead of any
+                // freshly-numbered entry.
+                pending.sort_by_key(|t| {
+                    let seq = t.payload.get("seq").and_then(Value::as_u64).unwrap_or(0);
+                    (seq, t.id)
+                });
+                let Some(next) = pending.into_iter().next() else {
+                    break;
+                };
+                match self.dispatch_queued(trigger, &next) {
+                    Ok(true) => dispatched += 1,
+                    // Gave up on this one (see dispatch_queued); loop again so
+                    // a poison entry cannot starve the rest of the queue.
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!(trigger = %trigger.name, tuple = %next.id, error = %e, "reactor: queued dispatch failed, will retry next cycle");
+                        break;
+                    }
+                }
+            }
+        }
+        dispatched
+    }
+
+    /// Dispatch one queued fire. `run_owned_with_id_from_trigger` recomputes
+    /// the SAME stable instance id the immediate-fire path would have used, so
+    /// a crash between a successful launch and deleting the queue tuple is
+    /// safe: the retry on the next cycle resolves to the already-running
+    /// instance instead of a duplicate. Returns `Ok(true)` on a fresh
+    /// dispatch, `Ok(false)` if this entry was given up on (and removed) after
+    /// [`MAX_FIRE_ATTEMPTS`], `Err` to retry it again next cycle.
+    fn dispatch_queued(&self, trigger: &Trigger, queued: &Tuple) -> rk_core::Result<bool> {
+        let key = queued
+            .payload
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let run = queued
+            .payload
+            .get("run")
+            .and_then(Value::as_str)
+            .unwrap_or(trigger.run.as_str())
+            .to_string();
+        let repo_path = queued
+            .payload
+            .get("repo_path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let params: HashMap<String, Value> = queued
+            .payload
+            .get("params")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        let tuple_id = queued
+            .payload
+            .get("tuple")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        match self.engine.run_owned_with_id_from_trigger(
+            stable_workflow_instance_id(&key),
+            &trigger.name,
+            &run,
+            &repo_path,
+            params,
+        ) {
+            Ok(instance) => {
+                self.space.delete(queued.id)?;
+                self.record_fire(&trigger.name);
+                info!(trigger = %trigger.name, workflow = %run, instance = %instance.id, "reactor dispatched queued fire");
+                Ok(true)
+            }
+            Err(e) => {
+                // A distinct attempt namespace from the original (trigger,
+                // tuple) key: the original never entered give_up_or_retry (it
+                // enqueued successfully), so this counts only queued-dispatch
+                // failures against their own bound.
+                let attempt = self.record_fire_attempt(&format!("queued:{key}"))?;
+                if attempt < MAX_FIRE_ATTEMPTS {
+                    return Err(e);
+                }
+                warn!(
+                    trigger = %trigger.name,
+                    tuple = %tuple_id,
+                    attempts = attempt,
+                    error = %e,
+                    "reactor giving up on a queued fire after repeated failures"
+                );
+                let _ = self.space.out(Tuple::new(
+                    Category::Obstacle,
+                    SYSTEM_SCOPE,
+                    "reactor_fire_gave_up",
+                    REACTOR_INSTANCE,
+                    json!({
+                        "trigger": trigger.name,
+                        "tuple": tuple_id,
+                        "attempts": attempt,
+                        "reason": e.to_string(),
+                    }),
+                ));
+                self.space.delete(queued.id)?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// A trigger fire that failed for `reason`: keep retrying — `Err`, so the
+    /// cursor stays pinned and the next cycle re-attempts the exact same tuple
+    /// — until [`MAX_FIRE_ATTEMPTS`] is reached, then give up for good. Giving
+    /// up writes the ordinary dedup marker (so this `(trigger, tuple)` is
+    /// never reconsidered — the marker is the guard against double-firing
+    /// either way) and logs an obstacle so the failure stays visible, then
+    /// returns `Ok(false)` so the cursor advances past it. This is what bounds
+    /// how long ANY single trigger's failure — a permanently unregistered
+    /// repo, a workflow's missing required param, a rate cap that never
+    /// clears — can pin the reactor's one GLOBAL cursor and starve every
+    /// other trigger's dispatch behind it.
+    fn give_up_or_retry(
+        &self,
+        key: &str,
+        trigger_name: &str,
+        tuple_id: &str,
+        reason: String,
+    ) -> rk_core::Result<bool> {
+        let attempt = self.record_fire_attempt(key)?;
+        if attempt < MAX_FIRE_ATTEMPTS {
+            return Err(rk_core::Error::other(reason));
+        }
+        warn!(
+            trigger = %trigger_name,
+            tuple = %tuple_id,
+            attempts = attempt,
+            reason = %reason,
+            "reactor giving up on trigger fire after repeated non-retryable failures"
+        );
+        let _ = self.space.out(Tuple::new(
+            Category::Obstacle,
+            SYSTEM_SCOPE,
+            "reactor_fire_gave_up",
+            REACTOR_INSTANCE,
+            json!({
+                "trigger": trigger_name,
+                "tuple": tuple_id,
+                "attempts": attempt,
+                "reason": reason,
+            }),
+        ));
+        self.mark_fired_key(key, trigger_name, tuple_id, "gave-up")?;
+        Ok(false)
+    }
+
+    /// Durable, permanent (never TTL'd) count of failed fire attempts for one
+    /// `key` — a `(trigger, tuple)` pair, or a `queued:` namespaced variant for
+    /// a queued dispatch. Returns the attempt number just recorded.
+    fn record_fire_attempt(&self, key: &str) -> rk_core::Result<u32> {
+        let mut p = Pattern::category(Category::Event)
+            .scope(SYSTEM_SCOPE)
+            .identity(FIRE_ATTEMPT_IDENTITY);
+        p.payload_search = Some(format!("\"key\":\"{key}\""));
+        let attempt = self.space.scan(&p)?.len() as u32 + 1;
+        let marker = Tuple::new(
+            Category::Event,
+            SYSTEM_SCOPE,
+            FIRE_ATTEMPT_IDENTITY,
+            REACTOR_INSTANCE,
+            json!({"key": key, "attempt": attempt}),
+        )
+        .with_lifecycle(Lifecycle::Furniture);
+        self.space.out(marker)?;
+        Ok(attempt)
     }
 
     /// A fired trigger whose interpolated params carry a `target` other than
@@ -1568,6 +1891,21 @@ impl Reactor {
         tuple: &Tuple,
         instance: &str,
     ) -> rk_core::Result<()> {
+        self.mark_fired_key(key, &trigger.name, &tuple.id.to_string(), instance)
+    }
+
+    /// [`mark_fired`](Self::mark_fired) generalized over a bare trigger
+    /// name/tuple id rather than the loaded [`Trigger`]/matched [`Tuple`], so
+    /// [`give_up_or_retry`](Self::give_up_or_retry) can write the same
+    /// dedup marker from a failure path that may not have the original
+    /// `Tuple` in hand (a queued-dispatch failure only has its id).
+    fn mark_fired_key(
+        &self,
+        key: &str,
+        trigger_name: &str,
+        tuple_id: &str,
+        instance: &str,
+    ) -> rk_core::Result<()> {
         let mut marker = Tuple::new(
             Category::Event,
             SYSTEM_SCOPE,
@@ -1575,9 +1913,8 @@ impl Reactor {
             REACTOR_INSTANCE,
             json!({
                 "key": key,
-                "trigger": trigger.name,
-                "tuple": tuple.id.to_string(),
-                "workflow": trigger.run,
+                "trigger": trigger_name,
+                "tuple": tuple_id,
                 "instance": instance,
             }),
         );
@@ -1638,6 +1975,26 @@ impl Reactor {
     fn save_cursor(&self, sequence: u64) -> rk_core::Result<()> {
         std::fs::write(&self.cursor_file, sequence.to_string())?;
         Ok(())
+    }
+
+    /// Next value in the durable enqueue-order counter (see `queue_seq_file`
+    /// on the struct). Loaded from disk lazily on first use per process, then
+    /// cached and persisted forward on every call so a restart resumes above
+    /// the highest sequence ever assigned rather than reusing a low value that
+    /// would sort ahead of older, still-pending queue entries.
+    fn next_queue_seq(&self) -> rk_core::Result<u64> {
+        let mut cached = self.queue_seq.lock().unwrap_or_else(|p| p.into_inner());
+        let current = match *cached {
+            Some(v) => v,
+            None => std::fs::read_to_string(&self.queue_seq_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0),
+        };
+        let next = current + 1;
+        std::fs::write(&self.queue_seq_file, next.to_string())?;
+        *cached = Some(next);
+        Ok(next)
     }
 }
 
@@ -1942,6 +2299,7 @@ mod tests {
                 .collect(),
             exclude: Vec::new(),
             max_fires: None,
+            max_in_flight: None,
         }
     }
 
