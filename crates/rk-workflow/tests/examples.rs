@@ -76,6 +76,7 @@ fn all_shipped_examples_load() {
             "question".to_string(),
             json!("How does the tuplespace work?"),
         ),
+        ("branch".to_string(), json!("rat/example-task/tkt-1")),
     ]);
     for def in defs {
         let workflow = rk_workflow::load(&def, &inputs)

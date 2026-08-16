@@ -37,13 +37,14 @@
 #![allow(dead_code)]
 
 use crate::supervisor::Supervisor;
+use crate::tickets::{NewTicket, Tickets};
 use crate::workflow_exec::{OnTimeout, ResolvedRun, WorkflowEngine};
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
 use rk_space::Space;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::BTreeSet;
+use serde_json::{json, Value};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -69,6 +70,27 @@ const POLICY_GATE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 /// Fallback when a named check carries no `timeout` of its own (mirrors
 /// `workflow_exec::DEFAULT_RUN_TIMEOUT`, private to that module).
 const DEFAULT_CHECK_TIMEOUT: &str = "10m";
+
+/// Identity of a landing candidate's verdict artifact — Phase 2's
+/// commit-keyed cache (`Pattern::for_commit`, §1.3 of the design doc),
+/// written by the reviewer itself: `rk out artifact <repo> review --payload
+/// {...}` (`examples/workflows/steward-review.cue`).
+const REVIEW_ARTIFACT_IDENTITY: &str = "review";
+
+/// Identity of the steward's escalation `need` tuple. Matches
+/// `examples/workflows/steward.cue`'s `steward-report-stop`/
+/// `steward-report-unknown-verdict`/`steward-report-timeout` named checks,
+/// which all write `(need, <repo>, steward)` — `rk inbox` already ranks this
+/// identity, so escalating through the identical shape keeps operator-facing
+/// behavior unchanged even though the write is now a direct `Space::out`
+/// call instead of a shelled-out `rk out need` (§1.5).
+const STEWARD_NEED_IDENTITY: &str = "steward";
+
+/// Name of the shrunk, review-only workflow definition (design doc §2.5) —
+/// `examples/workflows/steward-review.cue`. [`LandingPipeline::request_review`]
+/// invokes it programmatically on a verdict-cache miss; it is never
+/// reactor-fired.
+const REVIEW_WORKFLOW: &str = "steward-review";
 
 /// One landing candidate: a completed rat's branch, gated then routed toward
 /// `Supervisor::land` (or, once T3 lands, a reviewer's verdict). Mirrors the
@@ -232,6 +254,12 @@ pub(crate) struct GateConfig {
     /// Wall-clock bound for the run gate specifically (the two policy gates
     /// use their own fixed [`POLICY_GATE_TIMEOUT`]).
     pub(crate) gate_timeout: Duration,
+    /// Wall-clock bound for a review request: how long
+    /// [`LandingPipeline::request_review`] parks on the reviewer's verdict
+    /// tuple before treating the candidate as a STOP-equivalent hold (design
+    /// doc §2.3 step 3) — matches `examples/workflows/steward.cue`'s
+    /// `reviewTimeout` param default.
+    pub(crate) review_timeout: Duration,
 }
 
 impl Default for GateConfig {
@@ -242,6 +270,7 @@ impl Default for GateConfig {
             max_diff_files: 50,
             max_diff_lines: 2000,
             gate_timeout: Duration::from_secs(60 * 60),
+            review_timeout: Duration::from_secs(15 * 60),
         }
     }
 }
@@ -249,18 +278,25 @@ impl Default for GateConfig {
 /// What became of one dequeued candidate.
 #[derive(Debug)]
 pub(crate) enum LandingOutcome {
-    /// Gates passed and the candidate needed no LLM judgment (doc-only/trivial
-    /// diff) — routed straight to `Supervisor::land`. Carries `land`'s own
-    /// result JSON (`merged`, `delivered`, ...).
+    /// Gates passed and the candidate either needed no LLM judgment
+    /// (doc-only/trivial diff) or got an APPROVE (fresh or cached) — routed
+    /// straight to `Supervisor::land`. Carries `land`'s own result JSON
+    /// (`merged`, `delivered`, ...).
     Landed(Value),
     /// A gate failed or timed out. `run_check_in` already recorded the
     /// durable `gate-failure` artifact; the branch is simply left unmerged —
     /// nothing further happens to it here.
     GateHeld,
-    /// Gates passed but the diff needs a reviewer's judgment before it can
-    /// land. The T2→T3 hand-off point (design doc §3): T3 plugs the
-    /// verdict-cache probe and APPROVE/REWORK/STOP routing in here.
-    NeedsReview(LandingQueueEntry),
+    /// The reviewer (fresh or cached) recommended REWORK: a follow-up ticket
+    /// was filed directly (`Tickets::create`, §1.5) and the branch held
+    /// unmerged — no `dismiss` is needed since no agent worktree exists for
+    /// the candidate itself.
+    ReworkFiled(Tuple),
+    /// STOP, an unrecognized verdict, or a review that never produced one
+    /// within `GateConfig::review_timeout` — all three get the same "genuine
+    /// human judgment call" treatment (design doc §2.4): a `need` tuple was
+    /// written directly (`Space::out`, §1.5) and the branch held unmerged.
+    Escalated(Tuple),
 }
 
 /// Daemon-native consumer: dequeues a candidate, runs its gates in a
@@ -269,8 +305,13 @@ pub(crate) enum LandingOutcome {
 pub(crate) struct LandingPipeline {
     supervisor: Arc<Supervisor>,
     engine: Arc<WorkflowEngine>,
+    tickets: Arc<Tickets>,
     layout: Layout,
     queue: LandingQueue,
+    /// Kept alongside `queue`'s own clone for the review-integration calls
+    /// T3 adds (`Space::scan`/`rd`/`out`, §1.3/§1.5) — none of which go
+    /// through the queue.
+    space: Space,
     gates: GateConfig,
 }
 
@@ -279,14 +320,17 @@ impl LandingPipeline {
         space: Space,
         supervisor: Arc<Supervisor>,
         engine: Arc<WorkflowEngine>,
+        tickets: Arc<Tickets>,
         layout: Layout,
     ) -> Self {
-        let queue = LandingQueue::new(space, &layout);
+        let queue = LandingQueue::new(space.clone(), &layout);
         Self {
             supervisor,
             engine,
+            tickets,
             layout,
             queue,
+            space,
             gates: GateConfig::default(),
         }
     }
@@ -326,7 +370,171 @@ impl LandingPipeline {
                 .await?;
             return Ok(LandingOutcome::Landed(result));
         }
-        Ok(LandingOutcome::NeedsReview(entry))
+        let verdict = self.review_verdict(&entry).await?;
+        self.route_verdict(&entry, verdict.as_deref()).await
+    }
+
+    /// Resolve a recommendation for `entry`: a hit against Phase 2's
+    /// commit-keyed verdict cache (§1.3/§2.3 step 2), or — on a miss — a
+    /// fresh review request (§2.3 step 3). `None` means neither produced
+    /// one: the review request timed out waiting on the verdict tuple,
+    /// routed by the caller as a STOP-equivalent hold (design doc §2.3).
+    async fn review_verdict(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<String>> {
+        if let Some(cached) = self.cached_verdict(entry)? {
+            return Ok(Some(cached));
+        }
+        self.request_review(entry).await
+    }
+
+    /// Non-blocking probe of Phase 2's commit-keyed verdict cache — ANY
+    /// prior run's recommendation for this exact `(repo, branch, head_sha)`,
+    /// regardless of who wrote it (§1.3). A hit is honored identically to a
+    /// fresh verdict — never re-reviewed to shop for a better opinion.
+    fn cached_verdict(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<String>> {
+        let pattern = Pattern::for_commit(
+            Category::Artifact,
+            REVIEW_ARTIFACT_IDENTITY,
+            &entry.branch,
+            &entry.head_sha,
+        )
+        .scope(&entry.repo_name);
+        Ok(self.space.scan(&pattern)?.into_iter().find_map(|t| {
+            t.payload
+                .get("recommendation")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }))
+    }
+
+    /// Spawn the shrunk review-only workflow (design doc §2.5,
+    /// `examples/workflows/steward-review.cue`) chained onto the candidate
+    /// branch, then park on the verdict tuple ITSELF rather than the
+    /// workflow instance's own completion (§1.5's `watch_attached_completion`
+    /// pattern) — a daemon restart loses nothing: the reviewer keeps working
+    /// against its own worktree regardless of the pipeline's state, and the
+    /// verdict tuple is durable even though this exact wait is not (§2.6).
+    async fn request_review(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<String>> {
+        let mut params = HashMap::new();
+        params.insert("taskId".to_string(), Value::String(entry.task.clone()));
+        params.insert("branch".to_string(), Value::String(entry.branch.clone()));
+        params.insert("repo".to_string(), Value::String(entry.repo_name.clone()));
+        params.insert("target".to_string(), Value::String(entry.target.clone()));
+        params.insert("headSha".to_string(), Value::String(entry.head_sha.clone()));
+        params.insert(
+            "reviewTimeout".to_string(),
+            Value::String(format!("{}s", self.gates.review_timeout.as_secs())),
+        );
+        // The engine's `repo` argument is a filesystem path (it feeds
+        // `Repo::discover` and repo-local definition resolution), unlike the
+        // `repo` WORKFLOW PARAM above, which is the repo's scope name used
+        // to address its verdict artifact.
+        self.engine.run(REVIEW_WORKFLOW, &entry.repo_path, params)?;
+
+        let pattern = Pattern::for_commit(
+            Category::Artifact,
+            REVIEW_ARTIFACT_IDENTITY,
+            &entry.branch,
+            &entry.head_sha,
+        )
+        .scope(&entry.repo_name);
+        let verdict = self.space.rd(&pattern, self.gates.review_timeout).await?;
+        Ok(verdict.and_then(|t| {
+            t.payload
+                .get("recommendation")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }))
+    }
+
+    /// Route a resolved (fresh or cached) recommendation — or `None` on a
+    /// review timeout — via direct daemon calls: no shell, no agent auth
+    /// token (§1.5/§2.4).
+    async fn route_verdict(
+        &self,
+        entry: &LandingQueueEntry,
+        verdict: Option<&str>,
+    ) -> rk_core::Result<LandingOutcome> {
+        match verdict {
+            Some("APPROVE") => {
+                let result = self
+                    .supervisor
+                    .land(
+                        Path::new(&entry.repo_path),
+                        &entry.branch,
+                        &entry.target,
+                        false,
+                    )
+                    .await?;
+                Ok(LandingOutcome::Landed(result))
+            }
+            Some("REWORK") => Ok(LandingOutcome::ReworkFiled(
+                self.file_rework_ticket(entry).await?,
+            )),
+            Some("STOP") => {
+                let text = format!(
+                    "steward: reviewer returned STOP for {} on {} — needs a human merge \
+                     decision; branch held unmerged",
+                    entry.task, entry.branch
+                );
+                Ok(LandingOutcome::Escalated(self.escalate(entry, text)?))
+            }
+            Some(other) => {
+                let text = format!(
+                    "steward: unrecognized review verdict '{other}' for {} on {} — branch held \
+                     unmerged, needs a human",
+                    entry.task, entry.branch
+                );
+                Ok(LandingOutcome::Escalated(self.escalate(entry, text)?))
+            }
+            None => {
+                let text = format!(
+                    "steward: review timed out for {} on {} — no verdict recorded within {}s; \
+                     branch held unmerged",
+                    entry.task,
+                    entry.branch,
+                    self.gates.review_timeout.as_secs()
+                );
+                Ok(LandingOutcome::Escalated(self.escalate(entry, text)?))
+            }
+        }
+    }
+
+    /// File the REWORK follow-up directly through `Tickets::create` (§1.5) —
+    /// the same shape `steward-file-rework-ticket` produces today, minus the
+    /// shell hop. The branch is left as-is: no agent worktree exists for the
+    /// candidate itself, so there is nothing to dismiss.
+    async fn file_rework_ticket(&self, entry: &LandingQueueEntry) -> rk_core::Result<Tuple> {
+        self.tickets
+            .create(NewTicket {
+                title: format!("rework: {}", entry.task),
+                body: Some(format!(
+                    "Steward routed REWORK on branch {}. Read the reviewer notes: rk scan \
+                     artifact {}",
+                    entry.branch, entry.repo_name
+                )),
+                scope: Some(entry.repo_name.clone()),
+                parent: None,
+                priority: "normal".to_string(),
+                labels: Vec::new(),
+                depends_on: Vec::new(),
+                created_by: Some("daemon".to_string()),
+                coalesce_key: None,
+            })
+            .await
+    }
+
+    /// Write a `need` tuple directly (§1.5) — the STOP/unrecognized-verdict/
+    /// review-timeout escalation shape `rk inbox` already ranks, unshelled.
+    fn escalate(&self, entry: &LandingQueueEntry, text: String) -> rk_core::Result<Tuple> {
+        let tuple = Tuple::new(
+            Category::Need,
+            entry.repo_name.clone(),
+            STEWARD_NEED_IDENTITY,
+            "daemon",
+            json!({"agent": "steward", "task": entry.task, "text": text}),
+        );
+        self.space.out(tuple.clone())?;
+        Ok(tuple)
     }
 
     /// Drain every candidate currently queued for `(repo_name, target)`,
@@ -519,9 +727,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tickets::Tickets;
     use rk_workflow::TierRouting;
-    use std::collections::HashMap;
     use std::process::Command;
 
     fn git(dir: &Path, args: &[&str]) {
@@ -591,8 +797,8 @@ checks: [
         layout: Layout,
         supervisor: Arc<Supervisor>,
         space: Space,
+        tickets: Arc<Tickets>,
     ) -> Arc<WorkflowEngine> {
-        let tickets = Arc::new(Tickets::new(space.clone(), "castle".into()));
         Arc::new(WorkflowEngine::new(
             layout,
             supervisor,
@@ -621,12 +827,79 @@ checks: [
                 rk_ledger::Budget::default(),
                 rk_ledger::FleetBudget::default(),
                 space.clone(),
-                tickets,
+                tickets.clone(),
             )
             .unwrap(),
         );
-        let engine = test_engine(layout.clone(), supervisor.clone(), space.clone());
-        LandingPipeline::new(space, supervisor, engine, layout)
+        let engine = test_engine(
+            layout.clone(),
+            supervisor.clone(),
+            space.clone(),
+            tickets.clone(),
+        );
+        LandingPipeline::new(space, supervisor, engine, tickets, layout)
+    }
+
+    /// Writes a minimal review-only workflow definition at the well-known
+    /// resolved path (`<home>/workflows/steward-review.cue`) —
+    /// [`REVIEW_WORKFLOW`]'s lookup name — using the `fake` harness so
+    /// `request_review` can spawn a real (cheap, scripted) reviewer process
+    /// without touching the shipped `examples/workflows/steward-review.cue`,
+    /// which pins a real harness/model.
+    fn write_review_workflow(layout: &Layout) {
+        let dir = layout.workflows_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("steward-review.cue"),
+            r#"
+package workflow
+
+workflow: {
+	name: "steward-review"
+	params: {
+		taskId:        {type: "string", required: false, default: "unknown"}
+		branch:        {type: "string", required: true}
+		repo:          {type: "string", required: false, default: "rat-kingdom"}
+		target:        {type: "string", required: false, default: "main"}
+		headSha:       {type: "string", required: false, default: ""}
+		reviewTimeout: {type: "string", required: false, default: "15m"}
+	}
+	agents: {
+		default: {harness: "fake", model: "sonnet"}
+	}
+	steps: [
+		{
+			type:   "spawn"
+			role:   "reviewer"
+			branch: _input.branch
+			task: {title: "review", description: "review it"}
+		},
+		{type: "wait", timeout: _input.reviewTimeout},
+		{type: "evaluate", expect: {is_error: false}},
+	]
+}
+"#,
+        )
+        .unwrap();
+    }
+
+    /// Poll until at least `want` `agent_spawned` events are visible, or
+    /// panic after a generous budget — the direct measurement that a
+    /// reviewer spawn actually happened (or didn't), matching this crate's
+    /// existing `workflow_verdict_cache.rs` convention of counting spawns
+    /// rather than inferring them from routing alone.
+    async fn wait_for_spawn_count(space: &Space, want: usize) -> usize {
+        for _ in 0..400 {
+            let n = space
+                .scan(&Pattern::category(Category::Event).identity("agent_spawned"))
+                .unwrap()
+                .len();
+            if n >= want {
+                return n;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {want} agent_spawned event(s)");
     }
 
     /// The T1->T2 interface, consumed from the module T2 lives in: build the
@@ -844,5 +1117,225 @@ checks: [
 
         let main_after = rev_parse(repo_dir.path(), "main");
         assert_eq!(main_before, main_after, "branch must not have landed");
+    }
+
+    /// Shared setup for the review-integration tests below: a repo with a
+    /// "large" (review-needing) candidate branch, checks that always pass,
+    /// and back on `main` when it returns. Returns `(repo_dir, head_sha,
+    /// main_before)`.
+    fn review_candidate_repo() -> (tempfile::TempDir, String, String) {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        let main_before = rev_parse(repo_dir.path(), "main");
+        git(repo_dir.path(), &["checkout", "main"]);
+        (repo_dir, head_sha, main_before)
+    }
+
+    fn review_candidate_entry(repo_dir: &Path, head_sha: &str) -> LandingQueueEntry {
+        LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: head_sha.to_string(),
+            diff_class: "large".into(),
+            task: "add src".into(),
+            seq: 0,
+        }
+    }
+
+    fn verdict_tuple(head_sha: &str, recommendation: &str) -> Tuple {
+        Tuple::new(
+            Category::Artifact,
+            "code-repo",
+            REVIEW_ARTIFACT_IDENTITY,
+            "some-reviewer",
+            json!({
+                "task": "add src",
+                "recommendation": recommendation,
+                "notes": "notes",
+                "head_sha": head_sha,
+                "branch": "feature",
+            }),
+        )
+    }
+
+    fn no_spawns(space: &Space) {
+        assert!(
+            space
+                .scan(&Pattern::category(Category::Event).identity("agent_spawned"))
+                .unwrap()
+                .is_empty(),
+            "a verdict-cache hit must not spawn a reviewer"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_hit_skips_spawn_entirely() {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+
+        let space = Space::open_in_memory().unwrap();
+        space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
+
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(review_candidate_entry(repo_dir.path(), &head_sha))
+            .unwrap();
+
+        let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let LandingOutcome::Landed(result) = &outcomes[0] else {
+            panic!("expected Landed, got {:?}", outcomes[0]);
+        };
+        assert_eq!(result["merged"], true, "result: {result}");
+
+        let main_listing = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir.path())
+            .args(["ls-tree", "--name-only", "-r", "main"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&main_listing.stdout);
+        assert!(listing.contains("src.rs"), "listing: {listing}");
+
+        no_spawns(&space);
+    }
+
+    #[tokio::test]
+    async fn cached_rework_routes_to_ticket_without_spawning() {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+
+        let space = Space::open_in_memory().unwrap();
+        space.out(verdict_tuple(&head_sha, "REWORK")).unwrap();
+
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(review_candidate_entry(repo_dir.path(), &head_sha))
+            .unwrap();
+
+        let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let LandingOutcome::ReworkFiled(ticket) = &outcomes[0] else {
+            panic!("expected ReworkFiled, got {:?}", outcomes[0]);
+        };
+        assert_eq!(ticket.payload["title"], "rework: add src");
+        assert_eq!(ticket.scope, "code-repo");
+
+        let main_after = rev_parse(repo_dir.path(), "main");
+        assert_eq!(main_before, main_after, "branch must not have landed");
+
+        no_spawns(&space);
+    }
+
+    #[tokio::test]
+    async fn cache_miss_spawns_one_reviewer_and_routes_on_late_verdict() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_review_workflow(&layout);
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        pipeline
+            .enqueue(review_candidate_entry(repo_dir.path(), &head_sha))
+            .unwrap();
+
+        let drain = tokio::spawn({
+            let pipeline = Arc::clone(&pipeline);
+            async move { pipeline.drain_key("code-repo", "main").await }
+        });
+
+        // The pipeline is now parked on the verdict tuple, not the
+        // reviewer's own instance completion — nothing routes until we
+        // supply one.
+        assert_eq!(wait_for_spawn_count(&space, 1).await, 1);
+
+        space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
+
+        let outcomes = drain.await.unwrap().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let LandingOutcome::Landed(result) = &outcomes[0] else {
+            panic!("expected Landed, got {:?}", outcomes[0]);
+        };
+        assert_eq!(result["merged"], true, "result: {result}");
+
+        assert_eq!(
+            space
+                .scan(&Pattern::category(Category::Event).identity("agent_spawned"))
+                .unwrap()
+                .len(),
+            1,
+            "exactly one reviewer must have been spawned"
+        );
+    }
+
+    #[tokio::test]
+    async fn park_and_resume_survives_space_level_restart_with_late_verdict() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_review_workflow(&layout);
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        // "Before restart": the pipeline dequeues nothing here — T2's queue
+        // claims at dequeue time, and requeue-on-restart is T4's job (see
+        // this module's doc comment) — instead this drives `process_entry`
+        // directly, the T2->T3 hand-off point, to isolate the review-
+        // integration half: the pipeline parks on the verdict tuple and
+        // never gets one before the simulated crash.
+        {
+            let space = Space::open(&layout.db_path()).unwrap();
+            let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+            let handle = tokio::spawn({
+                let pipeline = Arc::clone(&pipeline);
+                let entry = entry.clone();
+                async move { pipeline.process_entry(entry).await }
+            });
+            wait_for_spawn_count(&space, 1).await;
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        // "After restart": a fresh `Space` reopened on the SAME durable
+        // store. The reviewer — independent of the crashed daemon — finishes
+        // late and writes its verdict; simulated here by writing directly,
+        // standing in for the reviewer's own `rk out artifact` call landing
+        // against the restarted daemon.
+        let space = Space::open(&layout.db_path()).unwrap();
+        space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+
+        // The restarted pipeline does not resume the aborted `space.rd`
+        // future — it reprocesses the same candidate and finds the verdict
+        // through the identical durable pattern the cache probe uses
+        // (§1.3/§2.6), so no second reviewer is ever spawned.
+        let outcome = pipeline.process_entry(entry).await.unwrap();
+        let LandingOutcome::Landed(result) = &outcome else {
+            panic!("expected Landed, got {outcome:?}");
+        };
+        assert_eq!(result["merged"], true, "result: {result}");
+
+        let main_after = rev_parse(repo_dir.path(), "main");
+        assert_ne!(
+            main_before, main_after,
+            "branch must have landed after the restart"
+        );
+
+        assert_eq!(
+            space
+                .scan(&Pattern::category(Category::Event).identity("agent_spawned"))
+                .unwrap()
+                .len(),
+            1,
+            "the restarted pipeline must not spawn a second reviewer once the verdict is cached"
+        );
     }
 }
