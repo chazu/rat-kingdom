@@ -444,6 +444,10 @@ impl Daemon {
     /// serve until a `stop` request or SIGTERM/SIGINT arrives.
     pub async fn run(self) -> rk_core::Result<()> {
         self.layout.ensure()?;
+        // Singleton gate: must win this before touching the socket or any
+        // other daemon state. Held for the rest of `run()` via this binding;
+        // dropped (lock released) on return, including on crash/kill.
+        let _singleton_lock = acquire_singleton_lock(&self.layout)?;
         let sock = self.layout.socket_path();
 
         if sock.exists() {
@@ -6032,6 +6036,187 @@ where
     }
     out.push(b'\n');
     write.write_all(&out).await
+}
+
+/// Take the exclusive, kernel-held singleton lock for this `RK_HOME` before
+/// touching the socket or any other daemon state.
+///
+/// `flock` is atomic (unlike the connect-then-check-pid probe below, which
+/// has a TOCTOU window between the probe and `bind`) and is released by the
+/// kernel the instant every fd referencing it closes — including on SIGKILL
+/// — so a crashed daemon's lock is never actually "stale" and needs no
+/// separate recovery path: the next daemon simply acquires it. A second LIVE
+/// daemon against the same home gets a clean, immediate refusal naming the
+/// holder's pid instead of contending with the first over the socket file
+/// and the tuplespace WAL (TKT-01M04D394PQ8VS5N3V441D1MDD: multiple
+/// concurrent daemons — stray old builds, a leaked test daemon, imprecise
+/// kills — contending on one RK_HOME wedged the fleet under load).
+///
+/// The returned `File` must be kept alive for the daemon's lifetime; dropping
+/// it (including implicitly, on process exit or crash) releases the lock.
+fn acquire_singleton_lock(layout: &Layout) -> rk_core::Result<std::fs::File> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::io::AsRawFd;
+
+    let path = layout.lockfile_path();
+    // Explicitly `truncate(false)`: the previous holder's pid must survive
+    // the open so a losing contender can still read it off below.
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+
+    // SAFETY: `file` owns a valid fd for the duration of this call, and
+    // `flock` only touches the kernel's lock table entry for that fd.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            // The holder writes its pid immediately after taking the flock,
+            // but a contender can observe EWOULDBLOCK inside that tiny
+            // window. Re-read briefly so refusals name the holder in
+            // practice; the unknown-holder text below remains the honest
+            // fallback for a holder that dies mid-write.
+            let mut holder = String::new();
+            for _ in 0..10 {
+                holder.clear();
+                let _ = file.seek(SeekFrom::Start(0));
+                let _ = file.read_to_string(&mut holder);
+                if !holder.trim().is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let holder = holder.trim();
+            return Err(rk_core::Error::other(if holder.is_empty() {
+                format!(
+                    "another rat-kingdom daemon already holds the lock at {} (holder pid \
+                     unknown) — refusing to start a second daemon against this RK_HOME",
+                    path.display()
+                )
+            } else {
+                format!(
+                    "another rat-kingdom daemon (pid {holder}) already holds the lock at {} \
+                     — refusing to start a second daemon against this RK_HOME",
+                    path.display()
+                )
+            }));
+        }
+        return Err(err.into());
+    }
+
+    // We hold the lock: record our pid so a contender can name us, and a
+    // human can `kill` the right process directly from the refusal message.
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    write!(file, "{}", std::process::id())?;
+    file.flush()?;
+    Ok(file)
+}
+
+#[cfg(test)]
+mod singleton_lock_tests {
+    use super::*;
+
+    #[test]
+    fn second_acquisition_fails_while_first_is_held_and_names_the_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        layout.ensure().unwrap();
+
+        // flock is per open-file-description, not per process: two separate
+        // `open()`s of the same path from this one process still conflict,
+        // which is exactly what lets this run as a plain in-process test.
+        let _held = acquire_singleton_lock(&layout).expect("first acquisition succeeds");
+        let err = acquire_singleton_lock(&layout)
+            .expect_err("second acquisition must fail while the first is held");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already holds the lock"),
+            "unexpected message: {msg}"
+        );
+        assert!(
+            msg.contains(&std::process::id().to_string()),
+            "refusal should name the holder pid: {msg}"
+        );
+    }
+
+    /// Proves the lock needs no separate stale-lock recovery path: a real
+    /// second OS process holds it, gets SIGKILLed (no destructors, no
+    /// cleanup — an in-process `File` drop would prove nothing about this),
+    /// and a fresh acquisition afterward succeeds immediately.
+    #[test]
+    fn lock_is_recovered_after_the_holder_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        layout.ensure().unwrap();
+
+        // Handshake marker: the child touches this AFTER it holds the lock,
+        // so the parent never has to probe by transiently acquiring (a probe
+        // acquisition could win the race against the child's attempt and
+        // flake the test — the structural race review flagged).
+        let marker = dir.path().join("child-holds-lock");
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // Child: hold the lock and park until killed. Only sync,
+            // fork-safe calls here — no tokio, no destructors on exit.
+            // Retry the acquisition: the parent process itself briefly held
+            // the lock in earlier test setup on some platforms, and a single
+            // losing attempt must not abort the fixture.
+            for _ in 0..100 {
+                if let Ok(_guard) = acquire_singleton_lock(&layout) {
+                    let _ = std::fs::write(&marker, b"held");
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            unsafe { libc::_exit(1) }
+        }
+
+        // Parent: wait on the marker — no probe acquisitions.
+        let mut child_holds_it = false;
+        for _ in 0..500 {
+            if marker.exists() {
+                child_holds_it = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !child_holds_it {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                let mut status = 0;
+                libc::waitpid(pid, &mut status, 0);
+            }
+        }
+        assert!(child_holds_it, "child never acquired the lock");
+
+        // While the child demonstrably holds it, a refusal names the child.
+        let err = acquire_singleton_lock(&layout)
+            .expect_err("acquisition must fail while the child holds the lock");
+        assert!(
+            err.to_string().contains(&pid.to_string()),
+            "refusal should name the child holder pid {pid}: {err}"
+        );
+
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
+
+        let recovered = acquire_singleton_lock(&layout);
+        assert!(
+            recovered.is_ok(),
+            "lock was not recovered after the holder was killed: {:?}",
+            recovered.err()
+        );
+    }
 }
 
 fn read_pid(layout: &Layout) -> Option<u32> {

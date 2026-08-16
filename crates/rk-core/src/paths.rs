@@ -44,6 +44,14 @@ impl Layout {
         self.home.join("rk.pid")
     }
 
+    /// The `flock`-held singleton lock: exactly one daemon may hold this file
+    /// exclusively at a time, so a second daemon started against the same
+    /// `RK_HOME` (stray build, leaked test daemon, imprecise kill) refuses to
+    /// bind instead of contending with the first over the tuplespace WAL.
+    pub fn lockfile_path(&self) -> PathBuf {
+        self.home.join("rk.lock")
+    }
+
     /// The bearer token used to authenticate local RPC clients. It is kept
     /// separate from the castle signing key: the token authorizes this local
     /// daemon connection, while the castle key authenticates replicated notes.
