@@ -149,6 +149,7 @@ pub struct Daemon {
     allowed_target_branches: Vec<String>,
     auth_token: String,
     engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
+    landing: std::sync::OnceLock<Arc<crate::landing::LandingPipeline>>,
     repos: std::sync::Mutex<crate::repos::RepoRegistry>,
     onboarding_sessions: std::sync::Mutex<crate::onboarding_sessions::OnboardingSessions>,
     /// Serializes the Git apply/commit/verification recovery window. Session
@@ -426,6 +427,7 @@ impl Daemon {
                 .allowed_target_branches,
             auth_token,
             engine: std::sync::OnceLock::new(),
+            landing: std::sync::OnceLock::new(),
             repos,
             onboarding_sessions,
             onboarding_apply_lock: tokio::sync::Mutex::new(()),
@@ -626,16 +628,23 @@ impl Daemon {
         // The lossy feed is only a wake signal; a durable cursor scan is the
         // source of truth, so no event is missed even when the feed drops it.
         if daemon.reactor_config.enabled {
-            let reactor = Arc::new(crate::reactor::Reactor::new(
-                daemon.space.clone(),
-                daemon.engine(),
-                daemon.tickets.clone(),
-                // The live-session owner, so a promoted convention can be steered
-                // into already-running rats (TKT-34).
-                Some(Arc::clone(&daemon.supervisor)),
-                daemon.layout.clone(),
-                daemon.reactor_config.clone(),
-            ));
+            let reactor = Arc::new(
+                crate::reactor::Reactor::new(
+                    daemon.space.clone(),
+                    daemon.engine(),
+                    daemon.tickets.clone(),
+                    // The live-session owner, so a promoted convention can be steered
+                    // into already-running rats (TKT-34).
+                    Some(Arc::clone(&daemon.supervisor)),
+                    daemon.layout.clone(),
+                    daemon.reactor_config.clone(),
+                )
+                // So an `action: "land"` trigger (P3-T4) has somewhere to
+                // enqueue. Always wired when the reactor itself is enabled —
+                // inert (nothing to dispatch) unless a repo actually installs
+                // a "land" trigger.
+                .with_landing(daemon.landing()),
+            );
             // Baseline the cursor so a fresh daemon does not react to the whole
             // pre-existing backlog on first boot.
             if let Err(e) = reactor.initialize_cursor() {
@@ -675,6 +684,42 @@ impl Daemon {
                         Ok(Ok(n)) => debug!(fired = n, "reactor cycle fired workflows"),
                         Ok(Err(e)) => warn!(error = %e, "reactor cycle failed"),
                         Err(e) => warn!(error = %e, "reactor task panicked"),
+                    }
+                }
+            });
+
+            // Landing pipeline consumer loop (P3-T4): drains the daemon-native
+            // `LandingQueue` an `action: "land"` trigger feeds (design doc §2.1).
+            // Same shape as the reactor loop above it — feed-wake plus a
+            // fallback interval tick, since draining is "an instance completing
+            // frees a slot without necessarily writing a tuple this exact scan
+            // would match" polling, not event-driven (§2.1, mirroring the
+            // reactor's own `drain_queued_fires` rationale). Gated on the SAME
+            // `reactor_config.enabled` flag rather than a new config knob: with
+            // no `action: "land"` trigger installed, `run_cycle` finds nothing
+            // queued and is a cheap no-op.
+            let landing = daemon.landing();
+            let mut landing_feed = daemon.space.subscribe();
+            let mut landing_shutdown = daemon.shutdown_tx.subscribe();
+            let landing_interval = Duration::from_secs(daemon.reactor_config.interval_secs.max(1));
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(landing_interval);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        recv = landing_feed.recv() => match recv {
+                            Ok(_) => while landing_feed.try_recv().is_ok() {},
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                        _ = landing_shutdown.changed() => break,
+                    }
+                    match landing.run_cycle().await {
+                        Ok(outcomes) if outcomes.is_empty() => {}
+                        Ok(outcomes) => {
+                            debug!(processed = outcomes.len(), "landing pipeline cycle")
+                        }
+                        Err(e) => warn!(error = %e, "landing pipeline cycle failed"),
                     }
                 }
             });
@@ -849,6 +894,24 @@ impl Daemon {
                 // default) keeps workflow spawns uncapped exactly as before
                 // this admission control existed.
                 self.drain_config.max_wip,
+            ))
+        }))
+    }
+
+    /// The daemon-native landing pipeline (P3-T4) an `action: "land"` trigger
+    /// enqueues onto and the polling consumer loop drains — see the
+    /// `landing loop` block in [`Self::run`]. Lazily built, same shape as
+    /// [`Self::engine`], and sharing that same engine instance (it launches
+    /// the review-only workflow on a verdict-cache miss, `landing.rs`'s
+    /// `request_review`).
+    fn landing(&self) -> Arc<crate::landing::LandingPipeline> {
+        Arc::clone(self.landing.get_or_init(|| {
+            Arc::new(crate::landing::LandingPipeline::new(
+                self.space.clone(),
+                Arc::clone(&self.supervisor),
+                self.engine(),
+                Arc::clone(&self.tickets),
+                self.layout.clone(),
             ))
         }))
     }

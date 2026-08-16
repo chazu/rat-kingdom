@@ -23,6 +23,7 @@
 //! fire cap (`maxFires`, <=100) mirroring the `repeat` discipline.
 
 use crate::agents::AgentRecord;
+use crate::landing::{LandingPipeline, LandingQueueEntry};
 use crate::repos::RepoRegistry;
 use crate::supervisor::Supervisor;
 use crate::tickets::{NewTicket, Tickets};
@@ -33,7 +34,7 @@ use rk_core::paths::Layout;
 use rk_core::sdlc::{alert_diagnostic_text_is_unsafe, ConfiguredSourceName, SignalSourcePrincipal};
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, SYSTEM_SCOPE};
 use rk_space::Space;
-use rk_workflow::Trigger;
+use rk_workflow::{Trigger, TriggerAction};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -150,6 +151,12 @@ pub struct Reactor {
     /// catch up on any backlog that reached quorum while the reactor was down),
     /// so a burst of unrelated writes no longer forces a full-store rescan.
     last_pops: Mutex<Option<(u64, u64)>>,
+    /// The daemon-native landing pipeline an `action: "land"` trigger enqueues
+    /// onto (design doc §2.1 option (a), P3-T4). `None` in `Reactor::new` —
+    /// wired in via [`Self::with_landing`] so existing call sites (tests with
+    /// no landing pipeline, and no `action: "land"` trigger to dispatch) are
+    /// unaffected.
+    landing: Option<Arc<LandingPipeline>>,
 }
 
 impl Reactor {
@@ -176,7 +183,17 @@ impl Reactor {
             fires: Mutex::new(HashMap::new()),
             trigger_cache: Mutex::new(None),
             last_pops: Mutex::new(None),
+            landing: None,
         }
+    }
+
+    /// Wire a daemon-native landing pipeline so an `action: "land"` trigger
+    /// has somewhere to enqueue (P3-T4). Builder-style — called once, right
+    /// after `Reactor::new`, before the reactor is wrapped in its `Arc` — so
+    /// existing `Reactor::new` call sites need no change.
+    pub(crate) fn with_landing(mut self, landing: Arc<LandingPipeline>) -> Self {
+        self.landing = Some(landing);
+        self
     }
 
     /// Baseline the cursor to the newest existing tuple so a fresh daemon does
@@ -873,6 +890,21 @@ impl Reactor {
             );
         };
         let repo_path = record.path.to_string_lossy().to_string();
+
+        // "land" dispatch (P3-T4, design doc §2.1 option (a)) bypasses the
+        // workflow engine entirely: no `params` templating (the landing
+        // candidate's fields come straight off the matched tuple's own
+        // payload, not a workflow's `_input`), no `maxInFlight` admission
+        // (that's LandingQueue's own single-consumer-per-key job downstream,
+        // §2.1), no `trigger.run`. What IS still shared with the "workflow"
+        // path above this point — and is the whole point of reusing
+        // `try_fire` rather than a bespoke dispatch — is the `(trigger,
+        // tuple)` dedup marker, the rate cap, and the cursor-based
+        // restart-safety already checked above.
+        if trigger.action == TriggerAction::Land {
+            return self.fire_land_action(trigger, tuple, &key, &tuple_id, &repo_name, &repo_path);
+        }
+
         let params = template_params(&trigger.params, tuple);
 
         // Admission control: a trigger at its `maxInFlight` cap durably queues
@@ -929,6 +961,132 @@ impl Reactor {
         self.mark_fired(&key, trigger, tuple, &instance.id)?;
         self.record_fire(&trigger.name);
         Ok(true)
+    }
+
+    /// Dispatch an `action: "land"` trigger match: enqueue directly onto the
+    /// wired [`LandingPipeline`] instead of launching a workflow (P3-T4,
+    /// design doc §2.1 option (a)). The candidate's fields come straight off
+    /// `tuple.payload` — the `harness_result` shape `Supervisor::route_completion`
+    /// builds (`crates/rk-daemon/src/supervisor.rs`), not a templated
+    /// workflow param — since there is no workflow `_input` to template into
+    /// here.
+    fn fire_land_action(
+        &self,
+        trigger: &Trigger,
+        tuple: &Tuple,
+        key: &str,
+        tuple_id: &str,
+        repo_name: &str,
+        repo_path: &str,
+    ) -> rk_core::Result<bool> {
+        let Some(landing) = &self.landing else {
+            return self.give_up_or_retry(
+                key,
+                &trigger.name,
+                tuple_id,
+                format!(
+                    "reactor trigger '{}' has action \"land\" but no LandingPipeline is wired",
+                    trigger.name
+                ),
+            );
+        };
+
+        // Fail-closed admission (design doc §1.5, `harness-result-declared-done`):
+        // only a rat that both finished cleanly AND declared itself done is a
+        // landing candidate — a mid-flight kill or budget stop still records
+        // `is_error: false` but never reaches here.
+        let payload = &tuple.payload;
+        let is_error = payload
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let declared_done = payload
+            .get("declared_done")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if is_error || !declared_done {
+            self.mark_fired(key, trigger, tuple, "skipped-not-declared-done")?;
+            return Ok(false);
+        }
+
+        let branch = payload
+            .get("branch")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let head_sha = payload
+            .get("head_sha")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if branch.is_empty() || head_sha.is_empty() {
+            return self.give_up_or_retry(
+                key,
+                &trigger.name,
+                tuple_id,
+                format!(
+                    "reactor trigger '{}': harness_result missing branch/head_sha",
+                    trigger.name
+                ),
+            );
+        }
+        let target = payload
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("main")
+            .to_string();
+        let diff_class = payload
+            .get("diff_class")
+            .and_then(Value::as_str)
+            .unwrap_or("large")
+            .to_string();
+        let task = payload
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        let entry = LandingQueueEntry {
+            repo_name: repo_name.to_string(),
+            repo_path: repo_path.to_string(),
+            branch,
+            target,
+            head_sha,
+            diff_class,
+            task,
+            ..Default::default()
+        };
+        match landing.enqueue(entry) {
+            Ok(Some(seq)) => {
+                info!(
+                    trigger = %trigger.name,
+                    repo = %repo_name,
+                    tuple = %tuple.id,
+                    seq,
+                    "reactor enqueued landing candidate"
+                );
+                self.mark_fired(key, trigger, tuple, &format!("queued:{seq}"))?;
+                self.record_fire(&trigger.name);
+                Ok(true)
+            }
+            // work_key dedup (design doc §2.6): this exact (repo, branch,
+            // head_sha) already reached a terminal outcome — a redelivered
+            // completion, not a fresh candidate. Marked fired so THIS tuple
+            // is never re-evaluated either, but nothing new was enqueued.
+            Ok(None) => {
+                self.mark_fired(key, trigger, tuple, "deduped-already-processed")?;
+                Ok(false)
+            }
+            Err(e) => self.give_up_or_retry(
+                key,
+                &trigger.name,
+                tuple_id,
+                format!(
+                    "reactor trigger '{}' failed to enqueue landing candidate: {e}",
+                    trigger.name
+                ),
+            ),
+        }
     }
 
     /// Durably hold a fire that matched a trigger already at its `maxInFlight`
@@ -2343,6 +2501,7 @@ mod tests {
         Trigger {
             name: "t".into(),
             matcher: TriggerMatch::default(),
+            action: rk_workflow::TriggerAction::Workflow,
             run: "w".into(),
             repo: None,
             params: params

@@ -1121,7 +1121,15 @@ pub struct Trigger {
     pub name: String,
     #[serde(rename = "match")]
     pub matcher: TriggerMatch,
-    /// Workflow definition name to launch on a match.
+    /// What this trigger does on a match: launch a workflow (default), or —
+    /// Phase 3-T4 — enqueue directly onto the daemon-native LandingPipeline.
+    #[serde(default)]
+    pub action: TriggerAction,
+    /// Workflow definition name to launch on a match. Only meaningful when
+    /// `action` is [`TriggerAction::Workflow`]; a "land" trigger need not set
+    /// this (the schema makes it optional for that action, defaulting here to
+    /// empty rather than requiring callers to invent a placeholder name).
+    #[serde(default)]
     pub run: String,
     /// Registered repo name to run in; falls back to the tuple scope / the
     /// trigger file's own repo at dispatch time.
@@ -1142,6 +1150,18 @@ pub struct Trigger {
     /// dropped or dispatched unbounded; unset means no cap.
     #[serde(default, rename = "maxInFlight")]
     pub max_in_flight: Option<u32>,
+}
+
+/// A [`Trigger`]'s dispatch action. `Workflow` (the historical, and default,
+/// behavior) launches `Trigger::run` through the workflow engine. `Land`
+/// (Phase 3-T4) hands the match directly to the daemon-native
+/// `LandingPipeline` instead — no workflow instance, no CUE hop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TriggerAction {
+    #[default]
+    Workflow,
+    Land,
 }
 
 /// The tuple predicate half of a [`Trigger`]. Every set field must match (AND);
@@ -1518,6 +1538,22 @@ mod tests {
         assert_eq!(routing.route(&[], Some("high")), Some("premium"));
         // No label/priority match falls to the catch-all.
         assert_eq!(routing.route(&[], Some("low")), Some("normal"));
+    }
+
+    #[test]
+    fn trigger_action_defaults_to_workflow_and_land_needs_no_run() {
+        let triggers =
+            load_triggers_str(r#"triggers: [{name: "x", match: {category: "event"}, run: "wf"}]"#)
+                .unwrap();
+        assert_eq!(triggers[0].action, TriggerAction::Workflow);
+        assert_eq!(triggers[0].run, "wf");
+
+        let triggers = load_triggers_str(
+            r#"triggers: [{name: "y", match: {category: "event"}, action: "land"}]"#,
+        )
+        .unwrap();
+        assert_eq!(triggers[0].action, TriggerAction::Land);
+        assert_eq!(triggers[0].run, "");
     }
 
     #[test]

@@ -21,9 +21,20 @@ triggers: [...#Trigger]
 	// match anything — matched with the same Pattern::matches used everywhere.
 	match: #TriggerMatch
 
+	// Action this trigger performs on a match. "workflow" (default) launches
+	// the named `run` workflow through the workflow engine. "land" enqueues
+	// the match directly onto the daemon-native LandingPipeline (Phase 3-T4,
+	// docs/proposals/daemon-native-landing-pipeline.md §2.1 option (a))
+	// instead of spawning a workflow instance — `run` is not read for this
+	// action, only `match`/`repo`/`exclude`/`maxFires` are.
+	action?: "workflow" | "land"
+
 	// Workflow to run on a match (a definition name resolvable in the target
-	// repo's .rk/workflows or the global workflows dir).
-	run: string & =~"^[a-z][a-z0-9-]*$"
+	// repo's .rk/workflows or the global workflows dir). Required when
+	// `action` is "workflow" (the default) — enforced by the reactor at
+	// dispatch time, not by this schema, so a "land" trigger need not name
+	// one at all.
+	run?: string & =~"^[a-z][a-z0-9-]*$"
 
 	// Registered repo the workflow runs in. Defaults to the matched tuple's
 	// scope (repo-scoped tuples), or — for a repo-local trigger file — the repo
