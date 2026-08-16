@@ -957,7 +957,13 @@ async fn main() -> Result<()> {
                 }
                 WorkflowCommand::Status { id } => {
                     let result = client.call("workflow.status", json!({"name": id})).await?;
-                    println!("{}", result["instance"]);
+                    let instance = &result["instance"];
+                    println!("{instance}");
+                    if !cli.json {
+                        if let Some(target) = workflow_land_target(instance) {
+                            println!("land target: {target}");
+                        }
+                    }
                 }
                 WorkflowCommand::Timeline { id } => {
                     let result = client
@@ -1196,9 +1202,18 @@ async fn main() -> Result<()> {
 /// "Land target inheritance"). Flag it so it isn't mistaken for a run headed
 /// to main.
 fn workflow_target_suffix(instance: &serde_json::Value) -> String {
+    workflow_land_target(instance)
+        .map(|target| format!(" target={target}"))
+        .unwrap_or_default()
+}
+
+/// The effective non-default land target, if this workflow instance carries
+/// one. This is shared by `workflow list` and `workflow status` so the two
+/// human-facing views cannot drift on which target is worth calling out.
+fn workflow_land_target(instance: &serde_json::Value) -> Option<&str> {
     match instance["params"]["target"].as_str() {
-        Some(t) if !t.is_empty() && t != "main" => format!(" target={t}"),
-        _ => String::new(),
+        Some(target) if !target.is_empty() && target != "main" => Some(target),
+        _ => None,
     }
 }
 
@@ -1218,12 +1233,17 @@ mod workflow_display_tests {
             workflow_target_suffix(&inherited),
             " target=rat/camembert-4/tkt-9"
         );
+        assert_eq!(
+            super::workflow_land_target(&inherited),
+            Some("rat/camembert-4/tkt-9")
+        );
         for silent in [
             json!({"params": {"target": "main"}}),
             json!({"params": {"target": ""}}),
             json!({"params": {}}),
         ] {
             assert_eq!(workflow_target_suffix(&silent), "");
+            assert_eq!(super::workflow_land_target(&silent), None);
         }
     }
 }
