@@ -1575,4 +1575,102 @@ workflow: {
             "the restarted pipeline must not spawn a second reviewer once the verdict is cached"
         );
     }
+
+    /// T4's queue-level restart-safety (design doc §2.6, module doc): a
+    /// candidate crashed mid-gate-run is left `RunningGates` in the DURABLE
+    /// queue tuple (not deleted), and a restarted pipeline's `run_cycle`
+    /// (the same entrypoint the live daemon's polling loop calls) discovers
+    /// and completes it — proven here via a genuine on-disk `Space` reopen,
+    /// not an in-memory stand-in, and driven through `enqueue`/`run_cycle`
+    /// (not `process_entry` directly), so it exercises `claim_next` picking
+    /// up a non-`Queued` entry.
+    #[tokio::test]
+    async fn restart_mid_gate_run_resumes_and_lands() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        // A `verify` check with a real pause gives the "before restart" task
+        // a window to be aborted WHILE the gate is genuinely still running,
+        // not merely queued.
+        write_checks(
+            repo_dir.path(),
+            r#"
+checks: [
+    {name: "steward-protected-paths", command: "true", timeout: "30s"},
+    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "verify", command: "sleep 0.4 && true", timeout: "30s"},
+]
+"#,
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+        std::fs::write(repo_dir.path().join("docs").join("note.md"), "note\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "docs: add note"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        let main_before = rev_parse(repo_dir.path(), "main");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha,
+            diff_class: "doc-only".into(),
+            task: "add note".into(),
+            ..Default::default()
+        };
+
+        // "Before restart": a real on-disk Space, claimed and mid-gate when
+        // the hosting task is aborted (the crash).
+        {
+            let space = Space::open(&layout.db_path()).unwrap();
+            let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+            pipeline.enqueue(entry.clone()).unwrap().unwrap();
+            let handle = tokio::spawn({
+                let pipeline = Arc::clone(&pipeline);
+                async move { pipeline.run_cycle().await }
+            });
+            // Give claim_next time to run and the gate's `sleep 0.4` time to
+            // genuinely be mid-flight, well before it would finish.
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            handle.abort();
+            let _ = handle.await;
+
+            // The crash left the candidate durably RunningGates, not deleted.
+            let pending = space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                .unwrap();
+            assert_eq!(pending.len(), 1, "candidate must survive the crash");
+            let status: LandingEntryStatus =
+                serde_json::from_value(pending[0].payload["status"].clone()).unwrap();
+            assert_eq!(status, LandingEntryStatus::RunningGates);
+        }
+
+        // "After restart": fresh Space handle over the SAME on-disk store.
+        let space = Space::open(&layout.db_path()).unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let outcomes = pipeline.run_cycle().await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(&outcomes[0], LandingOutcome::Landed(r) if r["merged"] == true),
+            "expected Landed, got {:?}",
+            outcomes[0]
+        );
+
+        let main_after = rev_parse(repo_dir.path(), "main");
+        assert_ne!(
+            main_before, main_after,
+            "branch must have landed after the restart"
+        );
+        assert!(
+            space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                .unwrap()
+                .is_empty(),
+            "the queue entry must be removed once processing reaches a terminal outcome"
+        );
+    }
 }
