@@ -727,6 +727,12 @@ pub struct WorkflowEngine {
     /// until the sweep gives up; with the sweep disarmed a crash is final and
     /// the `wait` fails immediately (TKT-147).
     respawn_enabled: bool,
+    /// Whether `finalize` runs the guaranteed-cleanup safety net
+    /// (`Supervisor::dismiss_orphaned_instance_agents`) over every agent a
+    /// terminalizing workflow instance spawned. A separate switch from the
+    /// periodic `[worktree_sweep]` timer — see
+    /// `rk_core::config::WorktreeSweepConfig::finalize_cleanup_enabled`.
+    finalize_cleanup_enabled: bool,
     require_approval_for_landing: bool,
     automated_landing_workflows: Vec<String>,
     allowed_target_branches: Vec<String>,
@@ -765,6 +771,7 @@ impl WorkflowEngine {
         automated_landing_workflows: Vec<String>,
         allowed_target_branches: Vec<String>,
         fleet_wip_cap: usize,
+        finalize_cleanup_enabled: bool,
     ) -> Self {
         Self {
             layout,
@@ -776,6 +783,7 @@ impl WorkflowEngine {
             default_harness,
             require_named_checks,
             respawn_enabled,
+            finalize_cleanup_enabled,
             require_approval_for_landing,
             automated_landing_workflows,
             allowed_target_branches,
@@ -1009,14 +1017,20 @@ impl WorkflowEngine {
             // The instance record carries the workflow name for the event; read
             // it back rather than threading it through the moved `workflow`.
             let workflow_name = engine.status(&id).map(|i| i.workflow).unwrap_or_default();
-            if let Err(error) = engine.finalize(&id, &repo, &workflow_name, result) {
+            if let Err(error) = engine.finalize(&id, &repo, &workflow_name, result).await {
                 warn!(instance = %id, %error, "workflow terminal state was not persisted");
             }
         });
     }
 
-    /// Record an instance's terminal status and broadcast its completion event.
-    fn finalize(
+    /// Record an instance's terminal status, broadcast its completion event,
+    /// and run the guaranteed-cleanup safety net over every agent this
+    /// instance spawned (TKT-01M04N6W4X47KMXDA6MH0WPH8H): a `finally`-style
+    /// sweep, not per-arm CUE `dismiss`/`dismiss_all` steps, so a workflow
+    /// that errors out (or completes) before reaching its own cleanup step
+    /// still reclaims every spawned agent's worktree. See
+    /// [`Supervisor::dismiss_orphaned_instance_agents`].
+    async fn finalize(
         &self,
         id: &str,
         repo: &str,
@@ -1057,6 +1071,23 @@ impl WorkflowEngine {
             "daemon".to_string(),
             json!({"instance": id, "workflow": workflow_name, "error": error}),
         ));
+        // Best-effort: the instance's own terminal state is already durably
+        // persisted above regardless of whether every spawned agent could be
+        // swept, so a dismiss failure here is logged, never propagated. Gated
+        // by `finalize_cleanup_enabled` (defaults off for bare/test daemons):
+        // see the field doc for why this must not run unconditionally.
+        if self.finalize_cleanup_enabled {
+            let swept = self.supervisor.dismiss_orphaned_instance_agents(id).await;
+            if !swept.is_empty() {
+                let failed = swept.iter().filter(|(_, ok)| !ok).count();
+                info!(
+                    instance = %id,
+                    count = swept.len(),
+                    failed,
+                    "finalize-time cleanup sweep dismissed agents left behind by their own workflow steps"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2034,7 +2065,8 @@ impl WorkflowEngine {
         // identical to a top-level run.
         match self.execute(&child_id, workflow, &child_repo).await {
             Ok(()) => {
-                self.finalize(&child_id, &child_repo, &workflow_name, Ok(()))?;
+                self.finalize(&child_id, &child_repo, &workflow_name, Ok(()))
+                    .await?;
                 // The child's final result is this sub_workflow's return value.
                 Ok(self
                     .status(&child_id)
@@ -2043,12 +2075,15 @@ impl WorkflowEngine {
             }
             Err(e) => {
                 let msg = e.to_string();
-                if let Err(finalize_error) = self.finalize(
-                    &child_id,
-                    &child_repo,
-                    &workflow_name,
-                    Err(rk_core::Error::other(msg.clone())),
-                ) {
+                if let Err(finalize_error) = self
+                    .finalize(
+                        &child_id,
+                        &child_repo,
+                        &workflow_name,
+                        Err(rk_core::Error::other(msg.clone())),
+                    )
+                    .await
+                {
                     return Err(rk_core::Error::other(format!(
                         "sub_workflow '{}' (instance {child_id}) failed: {msg}; its terminal state also failed to persist: {finalize_error}",
                         sub.workflow
@@ -5064,6 +5099,7 @@ test a::flaky ... FAILED
             Vec::new(),
             Vec::new(),
             0,
+            false,
         )
     }
 

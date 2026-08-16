@@ -23,6 +23,8 @@ pub struct Config {
     pub scheduler: SchedulerConfig,
     pub supervisor: SupervisorConfig,
     pub review_sweep: ReviewSweepConfig,
+    pub worktree_sweep: WorktreeSweepConfig,
+    pub disk: DiskConfig,
     pub drain: DrainConfig,
     pub evaporation: EvaporationConfig,
     pub ingest: IngestConfig,
@@ -269,6 +271,95 @@ impl Default for ReviewSweepConfig {
             remote: "origin".into(),
             fetch_timeout_secs: 30,
         }
+    }
+}
+
+/// Periodic, unattended reclaim of git leftovers (worktree + local branch) for
+/// terminal agent records whose branch has already landed or is gone — the
+/// automated half of `rk prune --reap-git`, run on a timer instead of waiting
+/// for an operator to remember it. Root-caused by the 2026-08-16 incident: 104
+/// agent worktrees (298 GB, mostly `target/` dirs) leaked over ~3 weeks
+/// because steward/workflow failure paths skip their own `dismiss` step, and
+/// nothing ever swept the residue until the disk hit 97% full and daemon
+/// writes started failing with "terminal state persistence failed: io".
+///
+/// Reuses `Supervisor::archive_agents`'s existing cutoff/reap machinery
+/// (`rk-daemon` `supervisor.rs`) — this loop just fires it unattended. Safety
+/// is unchanged from the manual path: `Supervisor::reap_git` only reclaims a
+/// worktree whose branch is already merged into its target (or gone), and
+/// only when the worktree itself has no uncommitted changes; either
+/// condition failing leaves the worktree standing, reported, never deleted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WorktreeSweepConfig {
+    /// Master switch for the PERIODIC loop. When false the timer never
+    /// starts and `rk prune` remains the only way to reclaim leaked
+    /// worktrees. Independent of [`finalize_cleanup_enabled`](Self::finalize_cleanup_enabled)
+    /// — the finalize-time guarantee below.
+    pub enabled: bool,
+    /// Sweep cadence.
+    pub interval_secs: u64,
+    /// A terminal agent record (Completed/Failed/Dismissed) untouched for at
+    /// least this many days becomes eligible for archiving + git reclaim.
+    pub after_days: u64,
+    /// Master switch for the finalize-time safety net
+    /// (`WorkflowEngine::finalize` → `Supervisor::dismiss_orphaned_instance_agents`):
+    /// every terminalizing workflow instance dismisses (worktree-only,
+    /// no-merge) any agent it spawned that reached Completed/Failed without
+    /// going through its own `dismiss` step. This is the "guaranteed cleanup"
+    /// half of TKT-01M04N6W4X47KMXDA6MH0WPH8H and is intentionally a
+    /// SEPARATE toggle from `enabled` (the periodic timer): an operator who
+    /// disables the hourly sweep should not lose the per-workflow guarantee.
+    /// Defaults true for real deployments. Bare/test daemon constructors
+    /// default this false (mirroring `enabled`'s existing test default) —
+    /// left on unconditionally, it made every workflow-based e2e test in the
+    /// workspace do extra synchronous git reclaim work at finalize time,
+    /// adding enough load under `cargo test --workspace`'s full parallel run
+    /// to tip unrelated tests' fixed polling timeouts over the edge
+    /// (rework of TKT-01M04N6W4X47KMXDA6MH0WPH8H: two different steward gate
+    /// failures, each passing standalone). Tests that specifically cover
+    /// this guarantee opt back in explicitly via `set_worktree_sweep_config`.
+    pub finalize_cleanup_enabled: bool,
+}
+
+impl Default for WorktreeSweepConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // Hourly: leaked worktrees accumulate slowly (one per skipped
+            // dismiss), so there is no benefit to a tighter cadence — this
+            // just needs to run often enough that disk pressure never has a
+            // multi-week window to build up again.
+            interval_secs: 3600,
+            after_days: 3,
+            finalize_cleanup_enabled: true,
+        }
+    }
+}
+
+/// Disk-pressure preflight guard: refuse a new spawn (and thus a new
+/// worktree) when free space under `RK_HOME` is already below this floor,
+/// rather than letting the disk run to zero and failing deep inside an io
+/// path — the failure mode that turned the 2026-08-16 leaked-worktree
+/// incident into a daemon outage ("terminal state persistence failed: io").
+/// Checked at the single choke point every spawn funnels through
+/// (`Supervisor::spawn`), so both `agent.spawn` and a workflow `spawn` step
+/// are covered by one guard.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DiskConfig {
+    /// Minimum free space (GB) required under `RK_HOME` before a spawn may
+    /// proceed. Zero disables the guard.
+    pub min_free_gb: u64,
+}
+
+impl Default for DiskConfig {
+    fn default() -> Self {
+        // The operator's own emergency-sweep threshold from the 2026-08-16
+        // incident write-up: comfortably above the daemon's own working-set
+        // (space.db, logs, in-flight worktrees) so a refusal always leaves
+        // enough room for the daemon itself to keep operating.
+        Self { min_free_gb: 10 }
     }
 }
 

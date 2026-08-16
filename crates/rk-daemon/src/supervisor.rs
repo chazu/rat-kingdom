@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
@@ -419,6 +420,12 @@ pub struct Supervisor {
     /// Serializes concurrent land/dismiss merges to the same target branch so
     /// unattended auto-merges never interleave and lose a branch (TKT-51).
     merge_queue: MergeQueue,
+    /// `[disk] min_free_gb` (0 = disabled), applied by `Daemon::new` from
+    /// config. Defaults to 0 here — a bare `Supervisor` constructed directly
+    /// by a test or another crate stays disk-guard-free unless it opts in via
+    /// [`set_min_free_disk_gb`](Supervisor::set_min_free_disk_gb), so this
+    /// safety feature cannot spuriously fail spawns on a tight CI disk.
+    min_free_disk_gb: AtomicU64,
 }
 
 /// How far one agent generation has got through reporting its completion.
@@ -630,7 +637,15 @@ impl Supervisor {
             completions: Mutex::new(HashMap::new()),
             log,
             merge_queue: MergeQueue::default(),
+            min_free_disk_gb: AtomicU64::new(0),
         })
+    }
+
+    /// Set the `[disk] min_free_gb` floor (0 = disabled). Applied by
+    /// `Daemon::new` from config; exposed on `&self` (not `&mut self`) since
+    /// the supervisor is shared behind an `Arc` from construction onward.
+    pub fn set_min_free_disk_gb(&self, gb: u64) {
+        self.min_free_disk_gb.store(gb, Ordering::Relaxed);
     }
 
     /// The per-agent transcript store (for `agent.log` reads and `--follow`).
@@ -728,6 +743,7 @@ impl Supervisor {
             params.workflow_instance.as_deref(),
             params.instance_max_usd,
         )?;
+        self.check_disk_floor(&repo_name)?;
         let target_branch = match &params.base {
             Some(b) => b.clone(),
             None => repo_policy.delivery_target(&repo.current_branch()?),
@@ -1856,6 +1872,62 @@ impl Supervisor {
         }
     }
 
+    /// Disk-pressure preflight guard (`[disk] min_free_gb`): refuse a spawn
+    /// before it creates a new worktree if free space under `RK_HOME` is
+    /// already below the configured floor, instead of running the disk to
+    /// zero and failing deep inside an io path. Root-caused by the
+    /// 2026-08-16 incident: 104 leaked agent worktrees (298 GB) drove the
+    /// disk to 97% full, and the daemon started failing writes with
+    /// "terminal state persistence failed: io" rather than refusing new work
+    /// up front. Zero (the default for a bare `Supervisor`; `[disk]
+    /// min_free_gb` for a real daemon) disables the guard. Mirrors
+    /// [`check_dispatch_budget`](Self::check_dispatch_budget)'s placement —
+    /// both single spawns and workflow fan-out funnel through here before any
+    /// worktree/branch/name is allocated.
+    fn check_disk_floor(&self, repo: &str) -> rk_core::Result<()> {
+        let floor_gb = self.min_free_disk_gb.load(Ordering::Relaxed);
+        if floor_gb == 0 {
+            return Ok(());
+        }
+        let floor_bytes = floor_gb.saturating_mul(BYTES_PER_GB);
+        let available = disk_free_bytes(self.layout.home())?;
+        if available >= floor_bytes {
+            return Ok(());
+        }
+        let available_gb = available as f64 / BYTES_PER_GB as f64;
+        warn!(
+            available_gb,
+            floor_gb, "disk floor breached — refusing spawn"
+        );
+        self.emit_disk_pressure_obstacle(repo, available, floor_bytes);
+        Err(rk_core::Error::other(format!(
+            "refusing to spawn: only {available_gb:.1} GB free under {} — below the \
+             configured floor of {floor_gb} GB ([disk] min_free_gb)",
+            self.layout.home().display()
+        )))
+    }
+
+    /// Companion to [`emit_dispatch_obstacle`](Self::emit_dispatch_obstacle):
+    /// same `Category::Obstacle` shape, surfaced by `rk inbox`, but for a
+    /// disk-pressure refusal rather than a budget one.
+    fn emit_disk_pressure_obstacle(&self, repo: &str, available_bytes: u64, floor_bytes: u64) {
+        let tuple = Tuple::new(
+            Category::Obstacle,
+            repo.to_string(),
+            "disk-pressure".to_string(),
+            self.castle.clone(),
+            json!({
+                "type": "disk_pressure",
+                "available_bytes": available_bytes,
+                "floor_bytes": floor_bytes,
+                "path": self.layout.home().display().to_string(),
+            }),
+        );
+        if let Err(e) = self.space.out(tuple.into_trail(DEFAULT_TRAIL_TTL)) {
+            warn!(error = %e, "failed to emit disk pressure obstacle");
+        }
+    }
+
     /// Read-only preflight: would a spawn into `repo` be refused by the
     /// fleet/repo budget cap right now? Lets an autoscaler (the continuous-drain
     /// controller) skip claiming a ticket it could not dispatch, rather than
@@ -2871,6 +2943,23 @@ impl Supervisor {
     /// branch delete on success), or a `Pr` push + opened pull/merge request
     /// that leaves the branch standing for review. Always removes the worktree.
     pub async fn dismiss(&self, name: &str, no_merge: bool) -> rk_core::Result<serde_json::Value> {
+        self.dismiss_inner(name, no_merge, false).await
+    }
+
+    /// Same as [`dismiss`](Self::dismiss), except when `park_if_dirty` is set:
+    /// a worktree carrying uncommitted changes is left standing (and reported
+    /// via an `obstacle` tuple) instead of force-removed. Used by
+    /// [`dismiss_orphaned_instance_agents`](Self::dismiss_orphaned_instance_agents),
+    /// the unattended finalize-time sweep, which must apply the same
+    /// dirty-worktree guard [`reap_git`](Self::reap_git) already applies —
+    /// unlike an explicit operator/workflow `dismiss`, nobody looked at this
+    /// worktree's contents before deciding to tear it down.
+    async fn dismiss_inner(
+        &self,
+        name: &str,
+        no_merge: bool,
+        park_if_dirty: bool,
+    ) -> rk_core::Result<serde_json::Value> {
         let record = self
             .lock_registry()
             .get(name)
@@ -2904,12 +2993,25 @@ impl Supervisor {
 
         if let Some(worktree) = &record.worktree {
             if worktree.exists() {
-                let repo = repo.clone();
-                let worktree = worktree.clone();
-                blocking_io("dismiss worktree cleanup", move || {
-                    repo.remove_worktree(&worktree)
-                })
-                .await?;
+                let dirty = if park_if_dirty {
+                    let worktree_check = worktree.clone();
+                    blocking_io("dismiss dirty-worktree check", move || {
+                        Repo::worktree_is_dirty(&worktree_check)
+                    })
+                    .await?
+                } else {
+                    false
+                };
+                if dirty {
+                    self.emit_parked_dirty_worktree_obstacle(&record, worktree);
+                } else {
+                    let repo = repo.clone();
+                    let worktree = worktree.clone();
+                    blocking_io("dismiss worktree cleanup", move || {
+                        repo.remove_worktree(&worktree)
+                    })
+                    .await?;
+                }
             }
         }
         if let Some(branch) = &record.branch {
@@ -3015,6 +3117,94 @@ impl Supervisor {
             "branch_deleted": delivery.branch_deleted,
             "detail": delivery.detail,
         }))
+    }
+
+    /// Companion to [`dismiss_inner`](Self::dismiss_inner)'s `park_if_dirty`
+    /// guard: name the agent and worktree an unattended sweep declined to
+    /// force-remove, so an operator (or `rk inbox`) can see why the worktree
+    /// is still sitting there instead of the salvage window silently closing
+    /// unnoticed.
+    fn emit_parked_dirty_worktree_obstacle(
+        &self,
+        record: &AgentRecord,
+        worktree: &std::path::Path,
+    ) {
+        let tuple = Tuple::new(
+            Category::Obstacle,
+            record.repo_name.clone(),
+            record.name.clone(),
+            self.castle.clone(),
+            json!({
+                "type": "worktree_parked_dirty",
+                "agent": record.name,
+                "task": record.task,
+                "worktree": worktree.display().to_string(),
+                "text": format!(
+                    "{} finalized with uncommitted changes in its worktree — {} left standing, not force-removed",
+                    record.name,
+                    worktree.display()
+                ),
+            }),
+        );
+        if let Err(e) = self.space.out(tuple.into_trail(DEFAULT_TRAIL_TTL)) {
+            warn!(error = %e, "failed to emit parked-dirty-worktree obstacle");
+        }
+    }
+
+    /// Guaranteed-cleanup safety net for a terminalizing workflow instance
+    /// (`WorkflowEngine::finalize`): find every LIVE agent this instance
+    /// spawned that itself already reached a terminal agent state
+    /// (`Completed`/`Failed`) without ever going through `dismiss` — e.g.
+    /// because the workflow's own step sequence errored out before reaching
+    /// its `dismiss`/`dismiss_all` step, the exact steward/workflow failure
+    /// path that leaked 104 worktrees over the 2026-08-16 incident — and
+    /// dismiss each one now, so its worktree is reclaimed even when the
+    /// per-arm CUE steps that were supposed to do it never ran.
+    ///
+    /// Always dismisses with `no_merge: true`: this is a cleanup guarantee,
+    /// not a normal completion path, and the workflow that spawned these
+    /// agents already decided (by failing, or by completing without an
+    /// explicit dismiss) not to route them through its own merge logic — a
+    /// REWORK/STOP verdict deliberately holds a branch unmerged, and this
+    /// sweep must not second-guess that by merging it anyway. The branch
+    /// itself survives (only the worktree is reclaimed), so the work is never
+    /// lost, only left for a human/ticket to land deliberately.
+    ///
+    /// Also dismisses with `park_if_dirty: true` — nobody has looked at these
+    /// worktrees before this unattended sweep tears them down, so a worktree
+    /// still carrying uncommitted edits is left standing (with an `obstacle`
+    /// tuple naming it) rather than force-removed. This is the same
+    /// dirty-worktree guard [`reap_git`](Self::reap_git) applies to the
+    /// periodic sweep; the salvage window a budget-killed agent's uncommitted
+    /// work depends on must not close just because the terminalization path
+    /// is different from the periodic one.
+    ///
+    /// Best-effort: a single agent's dismissal failing is logged and does not
+    /// stop the sweep or the instance's own terminal-state persistence, which
+    /// must succeed regardless of whether every spawned agent could be swept.
+    pub async fn dismiss_orphaned_instance_agents(&self, instance: &str) -> Vec<(String, bool)> {
+        let names: Vec<String> = {
+            let reg = self.lock_registry();
+            reg.list()
+                .into_iter()
+                .filter(|a| {
+                    a.workflow_instance.as_deref() == Some(instance)
+                        && matches!(a.state, AgentState::Completed | AgentState::Failed)
+                })
+                .map(|a| a.name.clone())
+                .collect()
+        };
+        let mut results = Vec::with_capacity(names.len());
+        for name in names {
+            match self.dismiss_inner(&name, true, true).await {
+                Ok(_) => results.push((name, true)),
+                Err(error) => {
+                    warn!(agent = %name, instance, %error, "finalize-time cleanup sweep could not dismiss agent");
+                    results.push((name, false));
+                }
+            }
+        }
+        results
     }
 
     /// Revert a dismissed agent's landed merge — the undo for an unattended
@@ -3660,9 +3850,12 @@ impl Supervisor {
 
     /// Reclaim one archived agent's git leftovers — its worktree and local
     /// branch — but ONLY when the branch has already landed in its target (or
-    /// is already gone). An unmerged branch still holds the only copy of that
-    /// rat's work, so it is left standing and reported as skipped; nothing here
-    /// ever force-deletes unmerged work.
+    /// is already gone) AND the worktree itself carries no uncommitted
+    /// changes. An unmerged branch still holds the only copy of that rat's
+    /// work; uncommitted edits sitting in the worktree never made it onto any
+    /// commit, so a merged branch cannot vouch for them either — either
+    /// condition leaves the worktree standing and reported as skipped, never
+    /// force-deleted.
     ///
     /// Best-effort by construction: every failure becomes a `reaped: false` row
     /// with a reason rather than failing the archive that triggered it.
@@ -3683,6 +3876,20 @@ impl Supervisor {
                     record.target_branch
                 ),
             );
+        }
+        if let Some(worktree) = &record.worktree {
+            if worktree.exists() {
+                match Repo::worktree_is_dirty(worktree) {
+                    Ok(true) => {
+                        return row(
+                            false,
+                            "worktree has uncommitted changes — left standing".into(),
+                        )
+                    }
+                    Ok(false) => {}
+                    Err(e) => return row(false, format!("could not check worktree status: {e}")),
+                }
+            }
         }
         let mut detail = Vec::new();
         if let Some(worktree) = &record.worktree {
@@ -3929,6 +4136,34 @@ fn process_info(pid: u32) -> Option<ProcessInfo> {
         process_group,
         cwd,
     })
+}
+
+const BYTES_PER_GB: u64 = 1024 * 1024 * 1024;
+
+/// Bytes of free space available to the current (non-root) user on the
+/// filesystem containing `path` — `f_bavail`, not the possibly-larger
+/// root-only `f_bfree`, matching what `df` reports as "available" and the
+/// number that actually bounds a new worktree checkout.
+#[cfg(unix)]
+fn disk_free_bytes(path: &std::path::Path) -> rk_core::Result<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|e| {
+        rk_core::Error::other(format!("disk floor check: invalid path {path:?}: {e}"))
+    })?;
+    // SAFETY: statvfs writes into a single stack-allocated struct owned for
+    // the duration of this call; the C string it reads from outlives the call.
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+            return Err(rk_core::Error::other(format!(
+                "disk floor check: statvfs({}) failed: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]

@@ -127,6 +127,7 @@ fn build_reactor_and_engine_with_space(
         Vec::new(),
         vec!["main".into(), "master".into()],
         0,
+        false,
     ));
     let reactor = Arc::new(Reactor::new(
         space,
