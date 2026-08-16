@@ -292,14 +292,34 @@ impl Default for ReviewSweepConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct WorktreeSweepConfig {
-    /// Master switch. When false the sweep loop never starts and `rk prune`
-    /// remains the only way to reclaim leaked worktrees.
+    /// Master switch for the PERIODIC loop. When false the timer never
+    /// starts and `rk prune` remains the only way to reclaim leaked
+    /// worktrees. Independent of [`finalize_cleanup_enabled`](Self::finalize_cleanup_enabled)
+    /// — the finalize-time guarantee below.
     pub enabled: bool,
     /// Sweep cadence.
     pub interval_secs: u64,
     /// A terminal agent record (Completed/Failed/Dismissed) untouched for at
     /// least this many days becomes eligible for archiving + git reclaim.
     pub after_days: u64,
+    /// Master switch for the finalize-time safety net
+    /// (`WorkflowEngine::finalize` → `Supervisor::dismiss_orphaned_instance_agents`):
+    /// every terminalizing workflow instance dismisses (worktree-only,
+    /// no-merge) any agent it spawned that reached Completed/Failed without
+    /// going through its own `dismiss` step. This is the "guaranteed cleanup"
+    /// half of TKT-01M04N6W4X47KMXDA6MH0WPH8H and is intentionally a
+    /// SEPARATE toggle from `enabled` (the periodic timer): an operator who
+    /// disables the hourly sweep should not lose the per-workflow guarantee.
+    /// Defaults true for real deployments. Bare/test daemon constructors
+    /// default this false (mirroring `enabled`'s existing test default) —
+    /// left on unconditionally, it made every workflow-based e2e test in the
+    /// workspace do extra synchronous git reclaim work at finalize time,
+    /// adding enough load under `cargo test --workspace`'s full parallel run
+    /// to tip unrelated tests' fixed polling timeouts over the edge
+    /// (rework of TKT-01M04N6W4X47KMXDA6MH0WPH8H: two different steward gate
+    /// failures, each passing standalone). Tests that specifically cover
+    /// this guarantee opt back in explicitly via `set_worktree_sweep_config`.
+    pub finalize_cleanup_enabled: bool,
 }
 
 impl Default for WorktreeSweepConfig {
@@ -312,6 +332,7 @@ impl Default for WorktreeSweepConfig {
             // multi-week window to build up again.
             interval_secs: 3600,
             after_days: 3,
+            finalize_cleanup_enabled: true,
         }
     }
 }

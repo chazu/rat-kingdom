@@ -42,6 +42,7 @@ fn build_reactor(layout: &Layout, space: rk_space::Space) -> Arc<Reactor> {
         Vec::new(),
         vec!["main".into(), "master".into()],
         0,
+        false,
     ));
     Arc::new(Reactor::new(
         space,

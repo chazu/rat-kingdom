@@ -727,6 +727,12 @@ pub struct WorkflowEngine {
     /// until the sweep gives up; with the sweep disarmed a crash is final and
     /// the `wait` fails immediately (TKT-147).
     respawn_enabled: bool,
+    /// Whether `finalize` runs the guaranteed-cleanup safety net
+    /// (`Supervisor::dismiss_orphaned_instance_agents`) over every agent a
+    /// terminalizing workflow instance spawned. A separate switch from the
+    /// periodic `[worktree_sweep]` timer — see
+    /// `rk_core::config::WorktreeSweepConfig::finalize_cleanup_enabled`.
+    finalize_cleanup_enabled: bool,
     require_approval_for_landing: bool,
     automated_landing_workflows: Vec<String>,
     allowed_target_branches: Vec<String>,
@@ -765,6 +771,7 @@ impl WorkflowEngine {
         automated_landing_workflows: Vec<String>,
         allowed_target_branches: Vec<String>,
         fleet_wip_cap: usize,
+        finalize_cleanup_enabled: bool,
     ) -> Self {
         Self {
             layout,
@@ -776,6 +783,7 @@ impl WorkflowEngine {
             default_harness,
             require_named_checks,
             respawn_enabled,
+            finalize_cleanup_enabled,
             require_approval_for_landing,
             automated_landing_workflows,
             allowed_target_branches,
@@ -1065,16 +1073,20 @@ impl WorkflowEngine {
         ));
         // Best-effort: the instance's own terminal state is already durably
         // persisted above regardless of whether every spawned agent could be
-        // swept, so a dismiss failure here is logged, never propagated.
-        let swept = self.supervisor.dismiss_orphaned_instance_agents(id).await;
-        if !swept.is_empty() {
-            let failed = swept.iter().filter(|(_, ok)| !ok).count();
-            info!(
-                instance = %id,
-                count = swept.len(),
-                failed,
-                "finalize-time cleanup sweep dismissed agents left behind by their own workflow steps"
-            );
+        // swept, so a dismiss failure here is logged, never propagated. Gated
+        // by `finalize_cleanup_enabled` (defaults off for bare/test daemons):
+        // see the field doc for why this must not run unconditionally.
+        if self.finalize_cleanup_enabled {
+            let swept = self.supervisor.dismiss_orphaned_instance_agents(id).await;
+            if !swept.is_empty() {
+                let failed = swept.iter().filter(|(_, ok)| !ok).count();
+                info!(
+                    instance = %id,
+                    count = swept.len(),
+                    failed,
+                    "finalize-time cleanup sweep dismissed agents left behind by their own workflow steps"
+                );
+            }
         }
         Ok(())
     }
@@ -5087,6 +5099,7 @@ test a::flaky ... FAILED
             Vec::new(),
             Vec::new(),
             0,
+            false,
         )
     }
 

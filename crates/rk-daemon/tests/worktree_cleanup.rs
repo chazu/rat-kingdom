@@ -189,7 +189,18 @@ async fn finalize_dismisses_agents_the_workflow_never_dismissed() {
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
     let layout = Layout::at(home.path());
-    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    // Bare/test daemons default this off (TKT-01M04N6W4X47KMXDA6MH0WPH8H
+    // rework: left on unconditionally, every workflow-based e2e test paid
+    // for a synchronous git reclaim at finalize time, adding enough load
+    // under a full parallel `cargo test --workspace` run to tip unrelated
+    // tests' fixed polling timeouts over the edge). This is the one test
+    // that exercises the guarantee, so opt back in explicitly.
+    daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
+        enabled: false,
+        finalize_cleanup_enabled: true,
+        ..rk_core::config::WorktreeSweepConfig::default()
+    });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
 
@@ -305,6 +316,10 @@ async fn periodic_sweep_reclaims_a_leaked_worktree() {
         enabled: true,
         interval_secs: 1,
         after_days: 0,
+        // Out of scope for this test (no workflow instance involved, only a
+        // direct `agent.spawn`); left off to keep the test's assertion
+        // attributable to the periodic loop alone.
+        finalize_cleanup_enabled: false,
     });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;

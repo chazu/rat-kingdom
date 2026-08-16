@@ -426,11 +426,19 @@ impl Daemon {
             review_sweep_config: rk_core::config::ReviewSweepConfig::default(),
             // Disabled by default for bare/test constructors (mirrors the
             // Supervisor-level `min_free_disk_gb` default of 0): only
-            // `Daemon::new`'s config-loading path enables the periodic sweep
-            // and the disk-floor guard, so existing e2e tests built on
-            // `new_in_memory`/`with_space_*` are unaffected.
+            // `Daemon::new`'s config-loading path enables the periodic sweep,
+            // the finalize-time cleanup guarantee, and the disk-floor guard,
+            // so existing e2e tests built on `new_in_memory`/`with_space_*`
+            // are unaffected. `finalize_cleanup_enabled` is disabled here too
+            // (not just `enabled`, the periodic-timer switch) — left on
+            // unconditionally it made every workflow-based e2e test do extra
+            // synchronous git reclaim at finalize time, adding enough load
+            // under a full parallel `cargo test --workspace` run to tip
+            // unrelated tests' fixed polling timeouts over the edge (rework
+            // of TKT-01M04N6W4X47KMXDA6MH0WPH8H).
             worktree_sweep_config: rk_core::config::WorktreeSweepConfig {
                 enabled: false,
+                finalize_cleanup_enabled: false,
                 ..rk_core::config::WorktreeSweepConfig::default()
             },
             drain_config: rk_core::config::DrainConfig::default(),
@@ -907,6 +915,10 @@ impl Daemon {
                 // default) keeps workflow spawns uncapped exactly as before
                 // this admission control existed.
                 self.drain_config.max_wip,
+                // Finalize-time guaranteed-cleanup sweep (TKT-01M04N6W4X47KMXDA6MH0WPH8H):
+                // a separate switch from `worktree_sweep_config.enabled` (the
+                // periodic timer) — see the field doc.
+                self.worktree_sweep_config.finalize_cleanup_enabled,
             ))
         }))
     }
