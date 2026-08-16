@@ -20,7 +20,7 @@ workflow instance id — never the `"queued"` placeholder `enqueue_fire` writes,
 so every one of these six fired via the **direct, immediate** dispatch path
 in `try_fire`, not via the `maxInFlight` queue. Decoding the ULID timestamps
 embedded in the harness tuple id and its paired `reactor_fired` marker id
-shows dispatch landing within 10s of the completion in every case (several
+shows dispatch landing within 15 seconds of the completion in every case (several
 under 200ms):
 
 | agent | harness_result landed | fired | delta |
