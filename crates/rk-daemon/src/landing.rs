@@ -520,7 +520,6 @@ pub(crate) struct LandingPipeline {
     /// T3 adds (`Space::scan`/`rd`/`out`, §1.3/§1.5) — none of which go
     /// through the queue.
     space: Space,
-    gates: GateConfig,
 }
 
 impl LandingPipeline {
@@ -539,7 +538,32 @@ impl LandingPipeline {
             layout,
             queue,
             space,
-            gates: GateConfig::default(),
+        }
+    }
+
+    /// Resolve this entry's repo-owned gate/review policy from its activated
+    /// `.rk/repo.cue` (`RepositoryPolicy.landing`, digest-activated like
+    /// `delivery` — `Supervisor::repository_policy`) — the daemon-native
+    /// replacement for what `examples/workflows/steward.cue`'s mega-workflow
+    /// used to expose as workflow params (`protectedPaths`, `maxDiffFiles`,
+    /// `maxDiffLines`, `gateTimeout`, `reviewTimeout`). A repo registered
+    /// without an activated policy falls back to `GateConfig::default()`'s
+    /// values, matching `repository_policy`'s own legacy-translation
+    /// fallback. `check_name` is not repo.cue-configurable (out of this
+    /// ticket's scope): every repo's landing gate runs its named `verify`
+    /// check.
+    fn gate_config(&self, repo: &rk_git::Repo) -> GateConfig {
+        let policy = self.supervisor.repository_policy(repo).landing;
+        let defaults = GateConfig::default();
+        GateConfig {
+            check_name: defaults.check_name,
+            protected_paths: policy.protected_paths,
+            max_diff_files: policy.max_diff_files,
+            max_diff_lines: policy.max_diff_lines,
+            gate_timeout: crate::workflow_exec::parse_duration(&policy.gate_timeout)
+                .unwrap_or(defaults.gate_timeout),
+            review_timeout: crate::workflow_exec::parse_duration(&policy.review_timeout)
+                .unwrap_or(defaults.review_timeout),
         }
     }
 
@@ -657,7 +681,13 @@ impl LandingPipeline {
         if let Some(prior) = self.processed_outcome(entry)? {
             return Ok(LandingOutcome::Reconciled(prior));
         }
-        if !self.run_gates(entry).await? {
+        let repo_path = PathBuf::from(&entry.repo_path);
+        let git_repo = {
+            let repo_path = repo_path.clone();
+            blocking(move || rk_git::Repo::discover(&repo_path)).await?
+        };
+        let gates = self.gate_config(&git_repo);
+        if !self.run_gates(entry, &git_repo, &gates).await? {
             // The durable gate-failure artifact carries the evidence; the
             // need row is what makes the hold VISIBLE in `rk inbox` — parity
             // with the CUE steward's escalation contract.
@@ -686,8 +716,8 @@ impl LandingPipeline {
             self.mark_processed(entry, &outcome)?;
             return Ok(outcome);
         }
-        let verdict = self.review_verdict(entry).await?;
-        let outcome = self.route_verdict(entry, verdict.as_deref()).await?;
+        let verdict = self.review_verdict(entry, &gates).await?;
+        let outcome = self.route_verdict(entry, verdict.as_deref(), &gates).await?;
         self.mark_processed(entry, &outcome)?;
         Ok(outcome)
     }
@@ -697,11 +727,15 @@ impl LandingPipeline {
     /// fresh review request (§2.3 step 3). `None` means neither produced
     /// one: the review request timed out waiting on the verdict tuple,
     /// routed by the caller as a STOP-equivalent hold (design doc §2.3).
-    async fn review_verdict(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<String>> {
+    async fn review_verdict(
+        &self,
+        entry: &LandingQueueEntry,
+        gates: &GateConfig,
+    ) -> rk_core::Result<Option<String>> {
         if let Some(cached) = self.cached_verdict(entry)? {
             return Ok(Some(cached));
         }
-        self.request_review(entry).await
+        self.request_review(entry, gates).await
     }
 
     /// Non-blocking probe of Phase 2's commit-keyed verdict cache — ANY
@@ -740,7 +774,11 @@ impl LandingPipeline {
     /// of launching a second reviewer for a request already in flight — the
     /// same "never orphan a reviewer" guarantee the design doc's §2.6
     /// prescribes, but also never double-spawns one.
-    async fn request_review(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<String>> {
+    async fn request_review(
+        &self,
+        entry: &LandingQueueEntry,
+        gates: &GateConfig,
+    ) -> rk_core::Result<Option<String>> {
         self.queue
             .set_status(entry, LandingEntryStatus::AwaitingReview)?;
 
@@ -752,7 +790,7 @@ impl LandingPipeline {
         params.insert("headSha".to_string(), Value::String(entry.head_sha.clone()));
         params.insert(
             "reviewTimeout".to_string(),
-            Value::String(format!("{}s", self.gates.review_timeout.as_secs())),
+            Value::String(format!("{}s", gates.review_timeout.as_secs())),
         );
         // The engine's `repo` argument is a filesystem path (it feeds
         // `Repo::discover` and repo-local definition resolution), unlike the
@@ -773,7 +811,7 @@ impl LandingPipeline {
             &entry.head_sha,
         )
         .scope(&entry.repo_name);
-        let verdict = self.space.rd(&pattern, self.gates.review_timeout).await?;
+        let verdict = self.space.rd(&pattern, gates.review_timeout).await?;
         Ok(verdict.and_then(|t| {
             t.payload
                 .get("recommendation")
@@ -789,6 +827,7 @@ impl LandingPipeline {
         &self,
         entry: &LandingQueueEntry,
         verdict: Option<&str>,
+        gates: &GateConfig,
     ) -> rk_core::Result<LandingOutcome> {
         match verdict {
             Some("APPROVE") => {
@@ -828,7 +867,7 @@ impl LandingPipeline {
                      branch held unmerged",
                     entry.task,
                     entry.branch,
-                    self.gates.review_timeout.as_secs()
+                    gates.review_timeout.as_secs()
                 );
                 Ok(LandingOutcome::Escalated(self.escalate(entry, text)?))
             }
@@ -952,12 +991,13 @@ impl LandingPipeline {
     /// (POLICY, DIFF-SCOPE, the repo's named `verify` check) against a
     /// persistent daemon-owned worktree reset to the candidate's tip.
     /// Returns `Ok(true)` only if every gate reported `verdict: "pass"`.
-    async fn run_gates(&self, entry: &LandingQueueEntry) -> rk_core::Result<bool> {
+    async fn run_gates(
+        &self,
+        entry: &LandingQueueEntry,
+        git_repo: &rk_git::Repo,
+        gates: &GateConfig,
+    ) -> rk_core::Result<bool> {
         let repo_path = PathBuf::from(&entry.repo_path);
-        let git_repo = {
-            let repo_path = repo_path.clone();
-            blocking(move || rk_git::Repo::discover(&repo_path)).await?
-        };
         let gate_dir = self.gate_worktree_path(&entry.repo_name, &entry.target);
         {
             let git_repo = git_repo.clone();
@@ -972,7 +1012,7 @@ impl LandingPipeline {
         }
 
         let checks_file = repo_path.join(".rk").join("checks.cue");
-        let plan = self.gate_plan(&checks_file, &entry.target)?;
+        let plan = self.gate_plan(&checks_file, &entry.target, gates)?;
 
         let id = format!("landing:{}", entry.branch);
         for (check, env, timeout) in plan {
@@ -1029,7 +1069,12 @@ impl LandingPipeline {
     /// registry lookup `WorkflowEngine::find_check` does, reimplemented here
     /// because that method is private to `workflow_exec` and this pipeline
     /// has no `run` step / `ctx.active_agent` to go through.
-    fn gate_plan(&self, checks_file: &Path, target: &str) -> rk_core::Result<GatePlan> {
+    fn gate_plan(
+        &self,
+        checks_file: &Path,
+        target: &str,
+        gates: &GateConfig,
+    ) -> rk_core::Result<GatePlan> {
         if !checks_file.exists() {
             return Err(rk_core::Error::other(format!(
                 "landing pipeline: no check registry at {}",
@@ -1052,7 +1097,7 @@ impl LandingPipeline {
 
         let protected_paths = find(PROTECTED_PATHS_CHECK)?;
         let diff_scope = find(DIFF_SCOPE_CHECK)?;
-        let verify = find(&self.gates.check_name)?;
+        let verify = find(&gates.check_name)?;
 
         Ok(vec![
             (
@@ -1061,7 +1106,7 @@ impl LandingPipeline {
                     ("RK_CHECK_TARGET".to_string(), target.to_string()),
                     (
                         "RK_CHECK_PROTECTED_PATHS".to_string(),
-                        self.gates.protected_paths.clone(),
+                        gates.protected_paths.clone(),
                     ),
                 ],
                 POLICY_GATE_TIMEOUT,
@@ -1072,16 +1117,16 @@ impl LandingPipeline {
                     ("RK_CHECK_TARGET".to_string(), target.to_string()),
                     (
                         "RK_CHECK_MAX_DIFF_FILES".to_string(),
-                        self.gates.max_diff_files.to_string(),
+                        gates.max_diff_files.to_string(),
                     ),
                     (
                         "RK_CHECK_MAX_DIFF_LINES".to_string(),
-                        self.gates.max_diff_lines.to_string(),
+                        gates.max_diff_lines.to_string(),
                     ),
                 ],
                 POLICY_GATE_TIMEOUT,
             ),
-            (verify, Vec::new(), self.gates.gate_timeout),
+            (verify, Vec::new(), gates.gate_timeout),
         ])
     }
 }

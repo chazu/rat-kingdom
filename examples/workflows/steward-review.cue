@@ -21,12 +21,19 @@
 // verdict read, no routing — all three now live in the daemon-native
 // pipeline instead of CUE.
 //
-// `examples/workflows/steward.cue` remains the live, reactor-fired
-// production path until its trigger wiring is cut over
-// (TKT-01M049DXEHEA2SH6WRB18S79GD, "P3-T4") — shrinking or retiring it is
-// explicitly out of scope here (tracked separately:
+// CUTOVER STATUS (Phase 4, TKT-01M036PSF2WV7NHZE00G2EFCVK): the operator
+// executed the §6 runbook on 2026-08-16 — the live
+// `steward-landing-on-completion` trigger (action: land) replaced
+// `steward-on-completion` in the global triggers directory, so THIS
+// workflow (spawned programmatically by `LandingPipeline::request_review`)
+// is now the one genuinely live review path. `examples/workflows/steward.cue`
+// is no longer fired by anything; it remains in the tree only as the
+// pre-cutover reference implementation, plus its dedicated schema/routing
+// tests in `crates/rk-workflow/tests/examples.rs` and
+// `crates/rk-daemon/tests/workflow_verdict_cache.rs`. Deleting it and that
+// test coverage together (~450 lines) is tracked separately:
 // TKT-01M048ASYM00N37EBK1VM7FH5H, "Remove obsolete steward CUE gate
-// definitions after pipeline cutover").
+// definitions after pipeline cutover".
 //
 // Install with `rk workflow install examples/workflows/steward-review.cue`
 // (global) or into `<repo>/.rk/workflows/` (repo-local) — same install/drift

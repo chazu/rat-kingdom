@@ -2707,7 +2707,12 @@ impl Supervisor {
     /// fields into the same defaults. The registry is operator-owned and
     /// content-bound; live `.rk/repo.cue` edits do not take effect until the
     /// repository is re-added or an onboarding activation updates the record.
-    fn repository_policy(&self, repo: &Repo) -> rk_workflow::RepositoryPolicy {
+    ///
+    /// `pub(crate)` so [`crate::landing::LandingPipeline`] can resolve a
+    /// candidate's `landing` gate policy (protected paths, diff-scope
+    /// budget, gate/review timeouts) the same way `deliver_branch` resolves
+    /// `delivery` — one activated policy, one lookup.
+    pub(crate) fn repository_policy(&self, repo: &Repo) -> rk_workflow::RepositoryPolicy {
         let path = self.layout.home().join("repos.json");
         crate::repos::RepoRegistry::load(&path)
             .ok()
