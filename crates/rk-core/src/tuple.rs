@@ -276,6 +276,15 @@ pub struct Pattern {
     /// this field. There is no "cheap" prefix-only match anywhere.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_search: Option<String>,
+    /// A second literal substring, ANDed with `payload_search` rather than
+    /// replacing it. Exists because the serialized payload is one JSON
+    /// document and `payload_search` is one substring test — binding two
+    /// independent fields (e.g. `branch` AND `head_sha`, [`Pattern::for_commit`])
+    /// needs two separate `contains` checks, since the fields are not
+    /// guaranteed to sit adjacent in the serialized document. `None` when a
+    /// predicate only needs to bind one field, which remains the common case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_search_and: Option<String>,
     /// Exclusive lower bound on `id`: match only tuples with `id > after_id`.
     /// Ids are ULIDs (chronologically sortable), so this is a "newer than"
     /// cursor. The storage query answers it from the `id` PRIMARY KEY index —
@@ -377,6 +386,36 @@ impl Pattern {
         pattern
     }
 
+    /// The one predicate for "the tuple that names commit `<sha>` ON BRANCH
+    /// `<branch>` in its payload" — the exact-tip discriminator behind the
+    /// steward's commit-keyed verdict cache (Phase 2 of the steward
+    /// remediation).
+    ///
+    /// Unlike [`Pattern::for_agent_since`]/[`Pattern::for_workflow_instance`],
+    /// this is deliberately unscoped by author or run: ANY prior verdict
+    /// artifact for this exact branch tip is a valid cache hit, regardless of
+    /// which reviewer or steward instance produced it. A new commit changes
+    /// `sha`, which invalidates the cache naturally — there is no separate
+    /// eviction to get wrong.
+    ///
+    /// `branch` is bound too (rework of TKT-01M036NWEG0H019BJ16G59RZVP): a bare
+    /// sha is not exclusive to one branch — two branches cut from the same
+    /// point, before either gains a new commit, share a tip commit, and a
+    /// verdict recorded reviewing branch A's diff-against-target must never be
+    /// replayed onto branch B's (different) diff-against-target just because
+    /// they happen to have the same HEAD. `scope` (the repo) is bound by the
+    /// caller as always, so the full key is `(repo, branch, head_sha)`.
+    pub fn for_commit(category: Category, identity: impl Into<String>, branch: &str, sha: &str) -> Self {
+        let mut pattern = Self::category(category).identity(identity);
+        // serde_json renders a string field exactly like this regardless of key
+        // order, so each substring is a reliable exact test independent of the
+        // other — see `payload_search_and`'s doc for why this needs two checks
+        // rather than one combined string.
+        pattern.payload_search = Some(format!("\"head_sha\":\"{sha}\""));
+        pattern.payload_search_and = Some(format!("\"branch\":\"{branch}\""));
+        pattern
+    }
+
     /// The single authoritative match predicate. Both the storage query and the
     /// waiter wake path must agree with this exactly.
     pub fn matches(&self, tuple: &Tuple) -> bool {
@@ -400,10 +439,17 @@ impl Pattern {
                 return false;
             }
         }
-        if let Some(search) = &self.payload_search {
+        if self.payload_search.is_some() || self.payload_search_and.is_some() {
             let hay = tuple.payload.to_string();
-            if !hay.contains(search.as_str()) {
-                return false;
+            if let Some(search) = &self.payload_search {
+                if !hay.contains(search.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(search) = &self.payload_search_and {
+                if !hay.contains(search.as_str()) {
+                    return false;
+                }
             }
         }
         if let Some(after) = &self.after_id {
@@ -534,6 +580,36 @@ mod tests {
         assert!(p.matches(&t()));
         p.payload_search = Some("Nibbles".into());
         assert!(!p.matches(&t()));
+    }
+
+    fn review(branch: &str, sha: &str) -> Tuple {
+        Tuple::new(
+            Category::Artifact,
+            "myrepo",
+            "review",
+            "some-reviewer",
+            json!({"agent": "some-reviewer", "recommendation": "APPROVE", "branch": branch, "head_sha": sha}),
+        )
+    }
+
+    /// The rework's whole point (TKT-01M036NWEG0H019BJ16G59RZVP rework): two
+    /// branches sharing a tip commit — a fresh branch cut with no new commits
+    /// of its own — must not share a cached verdict. `for_commit` binds BOTH
+    /// fields, so a verdict recorded for branch A's tip must not satisfy a
+    /// probe for branch B at that same sha.
+    #[test]
+    fn for_commit_binds_branch_as_well_as_sha() {
+        let p = Pattern::for_commit(Category::Artifact, "review", "branch-a", "sha-shared")
+            .scope("myrepo");
+        assert!(p.matches(&review("branch-a", "sha-shared")), "missed own branch+sha");
+        assert!(
+            !p.matches(&review("branch-b", "sha-shared")),
+            "matched a different branch at the same shared tip commit"
+        );
+        assert!(
+            !p.matches(&review("branch-a", "sha-other")),
+            "matched a different commit on the same branch"
+        );
     }
 
     #[test]

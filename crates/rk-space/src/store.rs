@@ -1390,6 +1390,14 @@ fn append_pattern_filters(
         sql.push_str(" AND instr(payload, ?) > 0");
         args.push(search.clone());
     }
+    if let Some(search) = &pattern.payload_search_and {
+        // ANDed with `payload_search` above, not a replacement — see
+        // `Pattern::payload_search_and`'s doc for why binding two independent
+        // payload fields (e.g. `Pattern::for_commit`'s branch+sha) needs two
+        // separate `instr()` checks rather than one combined substring.
+        sql.push_str(" AND instr(payload, ?) > 0");
+        args.push(search.clone());
+    }
     if let Some(after) = &pattern.after_id {
         // id is the TEXT PRIMARY KEY and ULIDs sort lexicographically by
         // creation time, so this "newer than" bound is answered from the PK.
@@ -1936,6 +1944,14 @@ mod tests {
             },
             Pattern {
                 payload_search: Some("under_score".into()),
+                ..Default::default()
+            },
+            // Both substrings required (Pattern::for_commit's shape): matches
+            // only the tuple carrying `"agent":"Whisker"` AND `"n":1` — neither
+            // alone identifies it uniquely among this corpus.
+            Pattern {
+                payload_search: Some("\"agent\":\"Whisker\"".into()),
+                payload_search_and: Some("\"n\":1".into()),
                 ..Default::default()
             },
             Pattern {

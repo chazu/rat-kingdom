@@ -1577,16 +1577,24 @@ impl WorkflowEngine {
                     //   predicate the gate itself waits on, so gate and read
                     //   cannot disagree about whose decision this is. No
                     //   generation floor: an instance id is never reused.
+                    // - `forCommit` (steward Phase 2 verdict cache) — what was
+                    //   written for a specific branch tip, regardless of who
+                    //   wrote it or which run it belongs to. Deliberately the
+                    //   OPPOSITE scoping of the other two: it exists to find a
+                    //   PRIOR run's verdict, not this run's own.
                     //
-                    // All three of `search`/`fromAgent`/`fromInstance` write the
-                    // one `payload_search` slot, so at most one may be set.
+                    // All four of `search`/`fromAgent`/`fromInstance`/`forCommit`
+                    // write the one `payload_search` slot, so at most one may be
+                    // set.
                     let bindings = read.from_agent as u8
                         + read.from_instance as u8
-                        + read.search.is_some() as u8;
+                        + read.search.is_some() as u8
+                        + read.for_commit.is_some() as u8;
                     if bindings > 1 {
                         return Err(rk_core::Error::other(
-                            "read step sets more than one of `fromAgent`/`fromInstance`/`search`; \
-                             they claim the same payload predicate — keep one",
+                            "read step sets more than one of \
+                             `fromAgent`/`fromInstance`/`forCommit`/`search`; they claim the \
+                             same payload predicate — keep one",
                         ));
                     }
                     let mut pattern = if read.from_agent {
@@ -1604,6 +1612,25 @@ impl WorkflowEngine {
                         )
                     } else if read.from_instance {
                         Pattern::for_workflow_instance(category, read.identity.clone(), id)
+                    } else if let Some(sha) = read.for_commit.as_deref() {
+                        if sha.is_empty() {
+                            return Err(rk_core::Error::other(
+                                "read step has `forCommit` set to an empty sha; a cache lookup \
+                                 needs a real commit to key on — guard the step at CUE load \
+                                 time when the sha may be absent",
+                            ));
+                        }
+                        let branch = read.for_branch.as_deref().unwrap_or_default();
+                        if branch.is_empty() {
+                            return Err(rk_core::Error::other(
+                                "read step has `forCommit` but no (or an empty) `forBranch`; a \
+                                 sha alone is not exclusive to one branch — two branches cut \
+                                 from the same point share a tip commit, so this cache lookup \
+                                 needs the branch bound too, or guard the step at CUE load time \
+                                 when the branch may be absent",
+                            ));
+                        }
+                        Pattern::for_commit(category, read.identity.clone(), branch, sha)
                     } else {
                         let mut pattern =
                             Pattern::category(category).identity(read.identity.clone());
@@ -1626,26 +1653,53 @@ impl WorkflowEngine {
                             .await
                             .map_err(|e| rk_core::Error::other(format!("read failed: {e}")))?,
                     };
-                    let tuple = tuple.ok_or_else(|| {
-                        // Name the binding in the failure: a bound read that
-                        // matched nothing is otherwise indistinguishable from a
-                        // tuple that was never written. Under `fromAgent` the
-                        // usual cause is an agent that left its own name out of
-                        // the payload; under `fromInstance` it is a decision
-                        // recorded without this run's id.
-                        let bound_to = match (read.from_agent, ctx.active_agent.as_deref()) {
-                            (true, Some(agent)) => format!(" written by {agent}"),
-                            _ if read.from_instance => format!(" naming instance {id}"),
-                            _ => String::new(),
-                        };
-                        rk_core::Error::other(format!(
-                            "read timed out after {} for {} tuple '{}'{bound_to}",
-                            read.timeout, read.category, read.identity
-                        ))
-                    })?;
-                    let value = match &read.field {
-                        Some(field) => tuple.payload.get(field).cloned().unwrap_or(Value::Null),
-                        None => tuple.payload.clone(),
+                    // `onTimeout: "continue"` (steward Phase 2 verdict cache) lets
+                    // a bounded, non-blocking probe come back empty without
+                    // ending the run — the following `when` routes on "nothing
+                    // cached yet" instead. Every read before the cache used the
+                    // fail-closed default, unchanged here.
+                    let continue_on_miss = match read.on_timeout.as_str() {
+                        "fail" => false,
+                        "continue" => true,
+                        other => {
+                            return Err(rk_core::Error::other(format!(
+                                "read step: unknown onTimeout {other:?} (expected \"fail\" or \
+                                 \"continue\")"
+                            )));
+                        }
+                    };
+                    let value = match tuple {
+                        Some(tuple) => match &read.field {
+                            Some(field) => {
+                                tuple.payload.get(field).cloned().unwrap_or(Value::Null)
+                            }
+                            None => tuple.payload.clone(),
+                        },
+                        None if continue_on_miss => Value::Null,
+                        None => {
+                            // Name the binding in the failure: a bound read that
+                            // matched nothing is otherwise indistinguishable from
+                            // a tuple that was never written. Under `fromAgent`
+                            // the usual cause is an agent that left its own name
+                            // out of the payload; under `fromInstance` it is a
+                            // decision recorded without this run's id.
+                            let bound_to = match (read.from_agent, ctx.active_agent.as_deref()) {
+                                (true, Some(agent)) => format!(" written by {agent}"),
+                                _ if read.from_instance => format!(" naming instance {id}"),
+                                _ if read.for_commit.is_some() => {
+                                    format!(
+                                        " naming branch {:?} at commit {:?}",
+                                        read.for_branch.as_deref(),
+                                        read.for_commit.as_deref()
+                                    )
+                                }
+                                _ => String::new(),
+                            };
+                            return Err(rk_core::Error::other(format!(
+                                "read timed out after {} for {} tuple '{}'{bound_to}",
+                                read.timeout, read.category, read.identity
+                            )));
+                        }
                     };
                     self.update(id, |i| {
                         i.context.vars.insert(read.into.clone(), value.clone());
