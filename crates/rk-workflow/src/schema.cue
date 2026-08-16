@@ -234,8 +234,15 @@ workflow: #Workflow
 	// `search`/`fromAgent`/`fromInstance`. The sha must be non-empty; guard
 	// the step at CUE load time (an `if` over the param, not a runtime `when`)
 	// when it may be absent, the same way `steward.cue` gates review tiering
-	// on `diffClass`.
+	// on `diffClass`. Must be paired with `forBranch` — a sha alone is not
+	// exclusive to one branch (two branches cut from the same point, before
+	// either gains a new commit, share a tip).
 	forCommit?: string
+	// The branch `forCommit`'s sha belongs to. Required whenever `forCommit`
+	// is set — the engine rejects a `forCommit` probe with no (or empty)
+	// `forBranch` rather than silently running an unbound sha-only lookup.
+	// Ignored when `forCommit` is unset.
+	forBranch?: string
 	// JSON payload field to lift (e.g. "recommendation"); whole payload if unset.
 	field?: string
 	// ctx variable name to store the value under (referenced by `when.var`).

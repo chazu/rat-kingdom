@@ -1620,7 +1620,17 @@ impl WorkflowEngine {
                                  time when the sha may be absent",
                             ));
                         }
-                        Pattern::for_commit(category, read.identity.clone(), sha)
+                        let branch = read.for_branch.as_deref().unwrap_or_default();
+                        if branch.is_empty() {
+                            return Err(rk_core::Error::other(
+                                "read step has `forCommit` but no (or an empty) `forBranch`; a \
+                                 sha alone is not exclusive to one branch — two branches cut \
+                                 from the same point share a tip commit, so this cache lookup \
+                                 needs the branch bound too, or guard the step at CUE load time \
+                                 when the branch may be absent",
+                            ));
+                        }
+                        Pattern::for_commit(category, read.identity.clone(), branch, sha)
                     } else {
                         let mut pattern =
                             Pattern::category(category).identity(read.identity.clone());
@@ -1677,7 +1687,11 @@ impl WorkflowEngine {
                                 (true, Some(agent)) => format!(" written by {agent}"),
                                 _ if read.from_instance => format!(" naming instance {id}"),
                                 _ if read.for_commit.is_some() => {
-                                    format!(" naming commit {:?}", read.for_commit.as_deref())
+                                    format!(
+                                        " naming branch {:?} at commit {:?}",
+                                        read.for_branch.as_deref(),
+                                        read.for_commit.as_deref()
+                                    )
                                 }
                                 _ => String::new(),
                             };

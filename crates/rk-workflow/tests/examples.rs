@@ -608,11 +608,12 @@ fn steward_missing_diff_class_defaults_to_review_tier() {
     );
 }
 
-/// Provenance for the commit-keyed verdict cache (Phase 2): the reviewer's
-/// task carries the branch-tip SHA, and it is instructed to record head_sha
-/// in its verdict artifact. A non-empty headSha now takes the cached-review
-/// arm, so the reviewer spawn is nested inside its cache-miss (`""`) case
-/// rather than sitting at steps[0] — see
+/// Provenance for the commit-keyed verdict cache (Phase 2, and its rework):
+/// the reviewer's task carries the branch-tip SHA, and it is instructed to
+/// record BOTH head_sha and branch in its verdict artifact (the rework's fix:
+/// a sha alone is not exclusive to one branch). A non-empty headSha+branch now
+/// takes the cached-review arm, so the reviewer spawn is nested inside its
+/// cache-miss (`""`) case rather than sitting at steps[0] — see
 /// `steward_cached_verdict_probe_is_bound_to_the_exact_commit_and_gates_the_hit_path`
 /// for the shape of the cache probe itself.
 #[test]
@@ -622,11 +623,12 @@ fn steward_review_tier_threads_head_sha_into_reviewer_task_and_artifact() {
     let inputs = HashMap::from([
         ("taskId".to_string(), json!("fix-login")),
         ("headSha".to_string(), json!("deadbeef123")),
+        ("branch".to_string(), json!("rat/fix-login/tkt-1")),
     ]);
     let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
 
     let Step::When(cache_probe_route) = &workflow.steps[1] else {
-        panic!("a non-empty headSha must probe the verdict cache before reviewing");
+        panic!("a non-empty headSha+branch must probe the verdict cache before reviewing");
     };
     let cache_miss = &cache_probe_route.cases[""];
     let Step::Spawn(spawn) = &cache_miss[0] else {
@@ -645,6 +647,11 @@ fn steward_review_tier_threads_head_sha_into_reviewer_task_and_artifact() {
         description.contains("\"head_sha\": \"deadbeef123\""),
         "the reviewer must be instructed to record head_sha in its verdict artifact: {description}"
     );
+    assert!(
+        description.contains("\"branch\": \"rat/fix-login/tkt-1\""),
+        "the reviewer must be instructed to record branch in its verdict artifact, or a \
+         verdict from one branch can be reused on another sharing the same tip: {description}"
+    );
 }
 
 /// The commit-keyed verdict cache probe (Phase 2) itself: bounded,
@@ -659,11 +666,12 @@ fn steward_cached_verdict_probe_is_bound_to_the_exact_commit_and_gates_the_hit_p
     let inputs = HashMap::from([
         ("taskId".to_string(), json!("fix-login")),
         ("headSha".to_string(), json!("deadbeef123")),
+        ("branch".to_string(), json!("rat/fix-login/tkt-1")),
     ]);
     let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
 
     let Step::Read(probe) = &workflow.steps[0] else {
-        panic!("steward with a headSha must start with the cache probe read");
+        panic!("steward with a headSha+branch must start with the cache probe read");
     };
     assert_eq!(probe.category, "artifact");
     assert_eq!(probe.identity, "review");
@@ -671,6 +679,12 @@ fn steward_cached_verdict_probe_is_bound_to_the_exact_commit_and_gates_the_hit_p
         probe.for_commit.as_deref(),
         Some("deadbeef123"),
         "the cache probe must be keyed on this exact commit, not fromAgent/fromInstance"
+    );
+    assert_eq!(
+        probe.for_branch.as_deref(),
+        Some("rat/fix-login/tkt-1"),
+        "the cache probe must also bind the branch, or a verdict from one branch could satisfy \
+         a probe for another sharing the same tip commit"
     );
     assert!(!probe.from_agent, "forCommit and fromAgent share one predicate slot");
     assert!(!probe.from_instance, "forCommit and fromInstance share one predicate slot");
@@ -740,6 +754,34 @@ fn steward_empty_head_sha_skips_the_cache_probe_entirely() {
     );
     let Step::Spawn(spawn) = &workflow.steps[0] else {
         panic!("an empty headSha must start with the plain reviewer spawn, unchanged");
+    };
+    assert_eq!(spawn.agent.as_deref(), Some("reviewer"));
+}
+
+/// The rework's mirror case: a headSha WITHOUT a branch (a branchless attach
+/// rat, per `branch`'s own doc — empty only there) is exactly as unsafe to key
+/// a cache probe on as an empty sha, since the engine's `forBranch` guard
+/// would reject an unbound probe outright. steward.cue must not even attempt
+/// one — it takes the plain review arm, same as a missing headSha.
+#[test]
+fn steward_head_sha_without_branch_also_skips_the_cache_probe() {
+    use rk_workflow::Step;
+
+    let inputs = HashMap::from([
+        ("taskId".to_string(), json!("fix-login")),
+        ("headSha".to_string(), json!("deadbeef123")),
+    ]);
+    let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
+
+    assert!(
+        !workflow
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::Read(r) if r.for_commit.is_some())),
+        "a headSha with no branch must never reach a forCommit read"
+    );
+    let Step::Spawn(spawn) = &workflow.steps[0] else {
+        panic!("a headSha with no branch must start with the plain reviewer spawn, unchanged");
     };
     assert_eq!(spawn.agent.as_deref(), Some("reviewer"));
 }
@@ -838,10 +880,12 @@ fn every_shipped_verdict_read_is_bound_to_its_reviewer() {
             "question".to_string(),
             json!("How does the tuplespace work?"),
         ),
-        // Set so this sweep also exercises steward's commit-keyed cache probe
-        // (Phase 2) — a `headSha`-less load only ever sees the plain,
-        // `fromAgent`-bound review read.
+        // Set (both) so this sweep also exercises steward's commit-keyed cache
+        // probe (Phase 2 and its rework) — a `headSha`-less load, or one
+        // missing `branch`, only ever sees the plain, `fromAgent`-bound
+        // review read.
         ("headSha".to_string(), json!("cafefeed00")),
+        ("branch".to_string(), json!("rat/example-task/tkt-1")),
     ]);
     let mut total = 0;
     for def in rk_workflow::definitions(&examples_dir()) {
@@ -858,6 +902,13 @@ fn every_shipped_verdict_read_is_bound_to_its_reviewer() {
                  or a concurrent instance's or stale commit's verdict can route it",
                 read.into
             );
+            if read.for_commit.is_some() {
+                assert!(
+                    read.for_branch.as_deref().is_some_and(|b| !b.is_empty()),
+                    "{name}: a `forCommit` read must also bind `forBranch`, or a verdict from \
+                     one branch can satisfy a probe for another sharing the same tip commit"
+                );
+            }
         }
         total += reads.len();
     }

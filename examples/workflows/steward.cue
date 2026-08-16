@@ -54,22 +54,42 @@
 // auto-merge is only ever reached through a clean policy gate, a within-budget
 // diff, and a green suite (plus an explicit APPROVE in the review tier).
 //
-// COMMIT-KEYED VERDICT CACHE (Phase 2, TKT-01M036NWEG0H019BJ16G59RZVP), review
-// tier only. A retry against an UNCHANGED branch tip — the reactor refiring,
-// an operator re-running steward by hand after clearing an infra hold, a
-// daemon restart replaying a completion — used to re-spawn and re-pay for a
-// reviewer even though nothing about the diff had changed. Before spawning
-// one, the workflow now probes (bounded, non-blocking: `forCommit`,
-// `onTimeout: "continue"`) whether ANY prior run already recorded a verdict
-// for this EXACT `headSha`. On a hit it does NOT spawn a reviewer — that would
-// let a retry shop for a better opinion, defeating the cache — it spawns only
-// a cheap gate-holder (same shape as the reduced tier) to re-verify the
-// deterministic gates against `target`'s current state, then routes on the
-// cached recommendation through the same `_routeVerdict` logic a fresh review
-// uses. A cached REWORK/STOP is honored exactly like a fresh one. On a miss
-// (nothing cached, or no `headSha` to key on at all) it falls straight through
-// to the unchanged review tier below. Cache invalidation is automatic: a new
-// commit is a new sha, so a real code change is never served a stale verdict.
+// COMMIT-KEYED VERDICT CACHE (Phase 2, TKT-01M036NWEG0H019BJ16G59RZVP, and its
+// rework), review tier only. A retry against an UNCHANGED branch tip — the
+// reactor refiring, an operator re-running steward by hand after clearing an
+// infra hold, a daemon restart replaying a completion — used to re-spawn and
+// re-pay for a reviewer even though nothing about the diff had changed.
+// Before spawning one, the workflow now probes (bounded, non-blocking:
+// `forCommit`+`forBranch`, `onTimeout: "continue"`) whether ANY prior run
+// already recorded a verdict for this EXACT `headSha` ON THIS EXACT `branch`.
+// Both are bound, not just the sha (the rework's fix): two branches cut from
+// the same point, before either gains a new commit, share a tip commit, and a
+// sha-only probe would let branch A's verdict — reviewing branch A's diff
+// against `target` — satisfy a lookup for branch B, whose diff against
+// `target` may be completely different despite the shared HEAD.
+//
+// On a hit it does NOT spawn a reviewer — that would let a retry shop for a
+// better opinion, defeating the cache. It spawns only a cheap gate-holder
+// (same shape as the reduced tier) to re-verify the deterministic gates
+// against `target`'s current state, then routes on the cached recommendation
+// through the same `_routeVerdict` logic a fresh review uses. A cached
+// REWORK/STOP is honored exactly like a fresh one. On a miss (nothing cached,
+// or no `headSha`/`branch` to key on at all) it falls straight through to the
+// unchanged review tier below. Cache invalidation is automatic: a new commit
+// is a new sha, so a real code change is never served a stale verdict.
+//
+// DECIDED (operator call, rework of TKT-01M036NWEG0H019BJ16G59RZVP): the
+// cache-hit arm below still spawns and waits for a gate-holder — it is NOT a
+// shortcut that skips straight to routing the cached verdict. This is
+// intentional, not an oversight: "skip the reviewer" means skip the expensive
+// LLM judgment turn, not skip verification entirely. The deterministic gates
+// (protected paths, diff-scope, the real test suite) still run on every
+// landing attempt, cached verdict or not, because a suite that was green
+// yesterday can be red today (a flake, a dependency bump, `target` moving
+// under it) and because a `run`/`land` step needs SOME agent's worktree to
+// execute in regardless (there is no primitive, pre-Phase-3, to run a gate
+// without an active spawn). Only the $3-8 reasoning turn is skipped; nothing
+// downstream of it is weakened.
 //
 // This file is the SOURCE for every deployed copy. Install it with
 // `rk workflow install examples/workflows/steward.cue` rather than `cp`, and the
@@ -342,7 +362,7 @@ workflow: {
 						Decide APPROVE (clean, safe to auto-merge), REWORK (fixable issues
 						remain), or STOP (fundamentally wrong / needs a human call). Record
 						the verdict before finishing so the steward can route on it:
-						rk out artifact \(_input.repo) review --payload '{"task": "\(_input.taskId)", "recommendation": "APPROVE|REWORK|STOP", "notes": "...", "head_sha": "\(_input.headSha)"}'
+						rk out artifact \(_input.repo) review --payload '{"task": "\(_input.taskId)", "recommendation": "APPROVE|REWORK|STOP", "notes": "...", "head_sha": "\(_input.headSha)", "branch": "\(_input.branch)"}'
 						"""
 				}
 			},
@@ -460,35 +480,41 @@ workflow: {
 		]
 	}
 
-	// PHASE 2 (commit-keyed verdict cache, TKT-01M036NWEG0H019BJ16G59RZVP):
-	// before paying for a reviewer, ask whether ANY prior run already recorded
-	// a verdict for this EXACT branch tip — a bounded, non-blocking probe
-	// (`forCommit`, `onTimeout: "continue"`), not a wait for one to arrive.
+	// PHASE 2 (commit-keyed verdict cache, TKT-01M036NWEG0H019BJ16G59RZVP, and
+	// its rework): before paying for a reviewer, ask whether ANY prior run
+	// already recorded a verdict for this EXACT branch tip — a bounded,
+	// non-blocking probe (`forCommit`+`forBranch`, `onTimeout: "continue"`),
+	// not a wait for one to arrive.
 	//
 	//   HIT  (any recommendation, including REWORK/STOP): do NOT spawn a
 	//        reviewer to shop for a second opinion — that would defeat the
 	//        cache and let a retry launder a bad verdict into a better one.
-	//        Still spawn a cheap gate-holder (same shape as the reduced tier)
-	//        to host the deterministic gates, since `target` may have moved
-	//        since the cached verdict was recorded and a `run`/`land` step
-	//        needs an active agent's worktree regardless — then route on the
-	//        cached recommendation through the SAME `_routeVerdict` a fresh
-	//        review uses. No gate is weakened; only the LLM opinion is reused.
+	//        SPAWN AND WAIT FOR A GATE-HOLDER regardless (same shape as the
+	//        reduced tier) — this is not a shortcut left unfinished, it is
+	//        the decided shape: a cache hit reuses the LLM's JUDGMENT, not
+	//        the deterministic gates. `target` may have moved since the
+	//        cached verdict was recorded, and a `run`/`land` step needs an
+	//        active agent's worktree to execute in regardless (no primitive,
+	//        pre-Phase-3, runs a gate without one). Then route on the cached
+	//        recommendation through the SAME `_routeVerdict` a fresh review
+	//        uses. No gate is weakened; only the LLM opinion is reused.
 	//   MISS (`cachedVerdict` lifts as "" — `value_as_key` renders `null` that
 	//        way): fall through to the unchanged `_reviewArm` below.
 	//
-	// Only reachable when `_input.headSha` is non-empty (guarded where this is
-	// selected into `steps`, below) — an empty sha would key on
-	// `"head_sha":""`, matching any OTHER legacy artifact missing the field,
-	// which is exactly the false cache hit the engine's `forCommit` guard
-	// refuses. Cache invalidation is automatic: a new commit is a new sha, so
-	// there is nothing to evict by hand.
+	// Only reachable when `_input.headSha` AND `_input.branch` are both
+	// non-empty (guarded where this is selected into `steps`, below) — an
+	// empty sha would key on `"head_sha":""`, matching any OTHER legacy
+	// artifact missing the field, which is exactly the false cache hit the
+	// engine's `forCommit` guard refuses; an empty branch is refused the same
+	// way by the engine's `forBranch` guard. Cache invalidation is automatic:
+	// a new commit is a new sha, so there is nothing to evict by hand.
 	_cachedReviewArm: [
 		{
 			type:      "read"
 			category:  "artifact"
 			identity:  "review"
 			forCommit: _input.headSha
+			forBranch: _input.branch
 			field:     "recommendation"
 			into:      "cachedVerdict"
 			timeout:   "1s"
@@ -575,12 +601,15 @@ workflow: {
 	])
 
 	_needsReview: !(_input.diffClass == "doc-only" || _input.diffClass == "trivial")
+	// PHASE 2 (rework): a cache probe needs BOTH headSha and branch to key on
+	// — either missing (a legacy completion missing headSha, or a branchless
+	// attach rat with no branch to bind) cannot safely probe the cache and
+	// always takes the full review instead.
+	_canProbeCache: _input.headSha != "" && _input.branch != ""
 
 	steps: list.Concat([
 		if !_needsReview {_reducedArm},
-		// PHASE 2: a non-empty headSha can key a cache probe; an empty one
-		// (legacy completion) cannot, so it always takes the full review.
-		if _needsReview && _input.headSha != "" {_cachedReviewArm},
-		if _needsReview && _input.headSha == "" {_reviewArm},
+		if _needsReview && _canProbeCache {_cachedReviewArm},
+		if _needsReview && !_canProbeCache {_reviewArm},
 	])
 }

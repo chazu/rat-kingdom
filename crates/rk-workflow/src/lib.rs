@@ -563,8 +563,19 @@ pub struct ReadStep {
     /// The sha itself must be non-empty — set only when a real commit is known
     /// to key on (guard at CUE load time when it may be absent, the same way
     /// `steward.cue` gates review tiering on `diffClass`).
+    ///
+    /// Must be paired with [`ReadStep::for_branch`] (rework of
+    /// TKT-01M036NWEG0H019BJ16G59RZVP): a sha alone is not exclusive to one
+    /// branch — two branches cut from the same point, before either gains a
+    /// new commit, share a tip commit, and a bare sha probe would let a
+    /// verdict recorded for one satisfy a cache lookup for the other.
     #[serde(default, rename = "forCommit")]
     pub for_commit: Option<String>,
+    /// The branch `for_commit`'s sha belongs to — required whenever
+    /// `for_commit` is set (engine-enforced; empty/absent is an error, not a
+    /// silently unbound probe). Ignored when `for_commit` is unset.
+    #[serde(default, rename = "forBranch")]
+    pub for_branch: Option<String>,
     /// JSON payload field to lift; whole payload if unset.
     #[serde(default)]
     pub field: Option<String>,
