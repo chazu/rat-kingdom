@@ -36,8 +36,15 @@
 //! SAME workflow instance on a repeat call (a stable id derived from the
 //! candidate's work key, not a fresh random one), and a repeat
 //! `Supervisor::land` on an already-merged branch is a clean CAS no-op
-//! (design doc §1.1). See `crates/rk-daemon/tests/landing_pipeline_e2e.rs`
-//! for the restart-mid-gate and restart-mid-review-wait proofs.
+//! (design doc §1.1). See the `restart_mid_gate_run_resumes_and_lands` and
+//! `park_and_resume_survives_space_level_restart_with_late_verdict` tests
+//! below for the restart-mid-gate and restart-mid-review-wait proofs.
+//! `LandingQueue::claim_next`/`set_status` write the successor tuple BEFORE
+//! deleting the predecessor — not delete-then-write — precisely so a daemon
+//! crash landing in that narrow gap cannot lose the entry outright; a crash
+//! there instead leaves two durable tuples sharing one `seq`, which
+//! `LandingQueue::scan_current` heals on the next read by keeping the one
+//! with the higher `rev`. See `crash_between_write_and_delete_survives_the_entry`.
 //!
 //! `work_key = (repo, branch, head_sha)` dedup against a redelivered
 //! completion (a reactor retry after a crash, an operator manually
@@ -154,6 +161,16 @@ pub(crate) struct LandingQueueEntry {
     /// at least once" for anyone reading the queue directly (`rk scan`).
     #[serde(default)]
     pub(crate) status: LandingEntryStatus,
+    /// Monotonic per-entry transition counter (T4 restart-safety). Bumped by
+    /// every [`LandingQueue::claim_next`]/[`LandingQueue::set_status`] write.
+    /// Transitions are write-then-delete (the successor tuple lands durably
+    /// BEFORE the predecessor is removed), not delete-then-write, so a crash
+    /// in that gap can leave two durable tuples sharing one `seq` — `rev` is
+    /// how [`LandingQueue::scan_current`] tells the fresh successor from the
+    /// stale predecessor and heals the duplicate instead of exposing (or
+    /// losing) the entry.
+    #[serde(default)]
+    pub(crate) rev: u64,
 }
 
 /// See [`LandingQueueEntry::status`].
@@ -218,6 +235,7 @@ impl LandingQueue {
         let seq = self.next_seq(&entry.repo_name)?;
         entry.seq = seq;
         entry.status = LandingEntryStatus::Queued;
+        entry.rev = 0;
         self.write(&entry)?;
         Ok(seq)
     }
@@ -238,6 +256,61 @@ impl LandingQueue {
         self.space.out(tuple)
     }
 
+    /// Every durable tuple for `repo_name` (optionally narrowed to
+    /// `target`), with any crash-orphaned duplicate self-healed away.
+    /// `claim_next`/`set_status` transition status by writing the successor
+    /// tuple BEFORE deleting the predecessor (crash-safety, module doc): a
+    /// crash landing in that gap leaves two tuples sharing one `seq`. This
+    /// is where that gets resolved — the fresher one (higher `rev`, ties
+    /// broken by tuple id) is kept as canonical, and the stale predecessor
+    /// is deleted here as a side effect of the read. A reader that races
+    /// this cleanup can see the entry reflected by either tuple for one
+    /// scan; it can never see zero — that is the property the write-then-
+    /// delete ordering exists to guarantee.
+    fn scan_current(
+        &self,
+        repo_name: &str,
+        target: Option<&str>,
+    ) -> rk_core::Result<Vec<Tuple>> {
+        let mut pending = self.space.scan(
+            &Pattern::category(Category::Event)
+                .scope(repo_name)
+                .identity(LANDING_QUEUE_IDENTITY),
+        )?;
+        if let Some(target) = target {
+            pending.retain(|t| t.payload.get("target").and_then(Value::as_str) == Some(target));
+        }
+        let mut by_seq: HashMap<u64, Tuple> = HashMap::new();
+        let mut stale = Vec::new();
+        for tuple in pending {
+            let seq = tuple.payload.get("seq").and_then(Value::as_u64).unwrap_or(0);
+            let rev = tuple.payload.get("rev").and_then(Value::as_u64).unwrap_or(0);
+            match by_seq.remove(&seq) {
+                None => {
+                    by_seq.insert(seq, tuple);
+                }
+                Some(existing) => {
+                    let existing_rev =
+                        existing.payload.get("rev").and_then(Value::as_u64).unwrap_or(0);
+                    let (winner, loser) = if (rev, tuple.id) > (existing_rev, existing.id) {
+                        (tuple, existing)
+                    } else {
+                        (existing, tuple)
+                    };
+                    stale.push(loser.id);
+                    by_seq.insert(seq, winner);
+                }
+            }
+        }
+        for id in stale {
+            // Opportunistic: this heals an already-superseded duplicate, it
+            // is not itself the transition, so a failure here just leaves
+            // the cleanup to the next reader.
+            let _ = self.space.delete(id);
+        }
+        Ok(by_seq.into_values().collect())
+    }
+
     /// Find the current durable tuple for `entry` — matched by its `seq`
     /// within `repo_name` scope, since `seq` is a monotonic per-repo counter
     /// ([`Self::next_seq`]) and therefore unique. `None` once the entry has
@@ -246,12 +319,8 @@ impl LandingQueue {
     /// queue, has no durable tuple to find; every method here treats that as
     /// a harmless no-op rather than an error).
     fn find(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<Tuple>> {
-        let pending = self.space.scan(
-            &Pattern::category(Category::Event)
-                .scope(&entry.repo_name)
-                .identity(LANDING_QUEUE_IDENTITY),
-        )?;
-        Ok(pending
+        Ok(self
+            .scan_current(&entry.repo_name, None)?
             .into_iter()
             .find(|t| t.payload.get("seq").and_then(Value::as_u64) == Some(entry.seq)))
     }
@@ -271,12 +340,7 @@ impl LandingQueue {
         repo_name: &str,
         target: &str,
     ) -> rk_core::Result<Option<LandingQueueEntry>> {
-        let mut pending = self.space.scan(
-            &Pattern::category(Category::Event)
-                .scope(repo_name)
-                .identity(LANDING_QUEUE_IDENTITY),
-        )?;
-        pending.retain(|t| t.payload.get("target").and_then(Value::as_str) == Some(target));
+        let mut pending = self.scan_current(repo_name, Some(target))?;
         // Order by the durable enqueue sequence, not tuple id — a same-
         // millisecond RecordId suffix is random (see Reactor::drain_queued_fires).
         pending.sort_by_key(|t| {
@@ -288,14 +352,20 @@ impl LandingQueue {
         };
         let mut entry: LandingQueueEntry = serde_json::from_value(tuple.payload.clone())
             .map_err(|e| rk_core::Error::other(format!("landing queue entry: {e}")))?;
-        self.space.delete(tuple.id)?;
         entry.status = LandingEntryStatus::RunningGates;
+        entry.rev = entry.rev.wrapping_add(1);
+        // Write-then-delete (T4 crash-safety, module doc): the successor
+        // tuple lands durably BEFORE the predecessor is removed, so a crash
+        // in the gap leaves both readable (self-healed by `scan_current`)
+        // rather than leaving neither.
         self.write(&entry)?;
+        self.space.delete(tuple.id)?;
         Ok(Some(entry))
     }
 
-    /// Durably transition an already-claimed `entry` to `status` (delete the
-    /// current tuple, write a fresh one). A no-op if `entry` has no durable
+    /// Durably transition an already-claimed `entry` to `status`: write the
+    /// successor tuple, then delete the predecessor (crash-safe ordering,
+    /// same as [`Self::claim_next`]). A no-op if `entry` has no durable
     /// tuple right now (see [`Self::find`]'s doc).
     fn set_status(
         &self,
@@ -305,10 +375,12 @@ impl LandingQueue {
         let Some(tuple) = self.find(entry)? else {
             return Ok(());
         };
-        self.space.delete(tuple.id)?;
         let mut updated = entry.clone();
         updated.status = status;
-        self.write(&updated)
+        updated.rev = entry.rev.wrapping_add(1);
+        self.write(&updated)?;
+        self.space.delete(tuple.id)?;
+        Ok(())
     }
 
     /// Remove `entry`'s durable tuple — called once processing reaches a
@@ -1254,6 +1326,79 @@ workflow: {
         assert_eq!(claim_all("beta", "main"), vec!["c1", "c2"]);
 
         // Every key drained to empty; nothing left queued anywhere.
+        assert!(queue.pending_keys().unwrap().is_empty());
+    }
+
+    /// T4's crash-safety property (module doc): a daemon crash landing
+    /// between the successor write and the predecessor delete of a status
+    /// transition must never lose the candidate. Drives the two halves of
+    /// that write-then-delete transition separately — writing the successor
+    /// tuple via `queue.write` directly and deliberately skipping the
+    /// predecessor's delete, which IS the crash gap — and asserts the entry
+    /// is still exactly-once discoverable afterward, with no orphaned
+    /// duplicate left behind.
+    #[test]
+    fn crash_between_write_and_delete_survives_the_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let space = Space::open_in_memory().unwrap();
+        let queue = LandingQueue::new(space.clone(), &layout);
+
+        let mut entry = LandingQueueEntry {
+            repo_name: "alpha".into(),
+            repo_path: "/repos/alpha".into(),
+            branch: "b1".into(),
+            target: "main".into(),
+            head_sha: "deadbeef".into(),
+            diff_class: "trivial".into(),
+            task: "t".into(),
+            ..Default::default()
+        };
+        let seq = queue.enqueue(entry.clone()).unwrap();
+        entry.seq = seq;
+        assert!(
+            queue.find(&entry).unwrap().is_some(),
+            "predecessor tuple must exist right after enqueue"
+        );
+
+        // Drive claim_next's transition by hand, stopping after the write of
+        // the successor -- this is exactly the gap a daemon crash could land
+        // in. The predecessor's delete deliberately never runs.
+        let mut successor = entry.clone();
+        successor.status = LandingEntryStatus::RunningGates;
+        successor.rev = entry.rev + 1;
+        queue.write(&successor).unwrap();
+        // <-- simulated crash: `queue.space.delete(predecessor.id)` never happens.
+
+        // Both the stale Queued tuple and the fresh RunningGates tuple are
+        // durably present right now. The entry must still be discoverable —
+        // this is the property under test — not lost, and self-healing dedup
+        // must resolve it to a single canonical claim rather than exposing it
+        // (or losing it) twice.
+        let recovered = queue
+            .claim_next("alpha", "main")
+            .unwrap()
+            .expect("entry must survive the crash gap between write and delete");
+        assert_eq!(recovered.branch, "b1");
+        assert_eq!(recovered.seq, seq);
+        assert_eq!(recovered.status, LandingEntryStatus::RunningGates);
+
+        // The stale predecessor was cleaned up as part of the self-heal —
+        // exactly one durable tuple for this entry, not two.
+        let remaining = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "no duplicate/orphaned tuple must remain: {remaining:?}"
+        );
+
+        // Finishing processing (as `LandingPipeline::process_next` does on a
+        // terminal outcome) empties the queue cleanly, proving the crash
+        // never left a second, uncollectable copy behind.
+        queue.remove(&recovered).unwrap();
+        assert!(queue.claim_next("alpha", "main").unwrap().is_none());
         assert!(queue.pending_keys().unwrap().is_empty());
     }
 
