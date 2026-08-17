@@ -1,0 +1,15 @@
+{
+  "total_count": 1,
+  "workflow_runs": [
+    {
+      "id": 100001,
+      "run_attempt": 1,
+      "name": "ci",
+      "head_branch": "main",
+      "head_sha": "abc123def456abc123def456abc123def456ab",
+      "status": "completed",
+      "conclusion": "failure",
+      "html_url": "https://github.com/chazu/rat-kingdom/actions/runs/100001"
+    }
+  ]
+}

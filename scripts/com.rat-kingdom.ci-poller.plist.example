@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for scripts/rk-ci-poller.py (TKT-01M08HB56NRQ72ZZ4W6JKQ760Y, C4).
+  See the OPERATOR SETUP section in that script's docstring before using this.
+
+  Copy to ~/Library/LaunchAgents/com.rat-kingdom.ci-poller.plist, replace
+  every REPLACE_ME placeholder with a real absolute path, then:
+    launchctl load ~/Library/LaunchAgents/com.rat-kingdom.ci-poller.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rat-kingdom.ci-poller</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>REPLACE_ME/rat-kingdom/scripts/rk-ci-poller.py</string>
+        <string>--token-file</string>
+        <string>REPLACE_ME/.rat-kingdom/secrets/github-ci-token</string>
+        <string>--rk-bin</string>
+        <string>REPLACE_ME/.local/bin/rk</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>120</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/rk-ci-poller.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/rk-ci-poller.err.log</string>
+</dict>
+</plist>
