@@ -26,6 +26,7 @@ chrono.workspace = true
 hex.workspace = true
 sha2.workspace = true
 libc.workspace = true
+rand.workspace = true
 
 [features]
 # Builds `rk-fixture-done`, the fake harness's stand-in for `rk done`. Off in a

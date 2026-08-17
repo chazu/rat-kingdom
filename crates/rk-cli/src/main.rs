@@ -91,7 +91,10 @@ enum Command {
     Unarchive(agent_cmds::NameArg),
     /// One ranked triage list of everything awaiting a human, each row carrying
     /// the exact `rk` command that resolves it.
-    Inbox,
+    Inbox {
+        #[command(subcommand)]
+        command: Option<InboxCommand>,
+    },
     /// Live fleet dashboard: agents, workflows, budget, inbox (q to quit).
     Top {
         /// Refresh interval in seconds.
@@ -447,6 +450,16 @@ enum TicketCommand {
 }
 
 #[derive(Subcommand)]
+enum InboxCommand {
+    /// Durably acknowledge an escalation so the B2 re-notify sweep stops
+    /// pushing it. Idempotent — acking an already-acked id is a no-op.
+    Ack {
+        /// The tuple id shown in the row's `rk inbox ack <id>` action.
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum WorkflowCommand {
     /// Run a workflow by name (or .cue path).
     Run {
@@ -788,7 +801,10 @@ async fn main() -> Result<()> {
         Command::List(args) => agent_cmds::list(&layout, args, cli.json).await?,
         Command::Prune(args) => agent_cmds::prune(&layout, args, cli.json).await?,
         Command::Unarchive(args) => agent_cmds::unarchive(&layout, args, cli.json).await?,
-        Command::Inbox => agent_cmds::inbox(&layout, cli.json).await?,
+        Command::Inbox { command } => match command {
+            None => agent_cmds::inbox(&layout, cli.json).await?,
+            Some(InboxCommand::Ack { id }) => agent_cmds::inbox_ack(&layout, id, cli.json).await?,
+        },
         Command::Top { interval, all } => top::top(&layout, interval, all).await?,
         Command::Digest { since, llm } => observe::digest(&layout, &since, llm, cli.json).await?,
         Command::Status(args) => agent_cmds::status(&layout, args, cli.json).await?,

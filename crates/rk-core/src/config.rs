@@ -25,6 +25,7 @@ pub struct Config {
     pub supervisor: SupervisorConfig,
     pub review_sweep: ReviewSweepConfig,
     pub worktree_sweep: WorktreeSweepConfig,
+    pub recovery_sweep: RecoverySweepConfig,
     pub disk: DiskConfig,
     pub drain: DrainConfig,
     pub evaporation: EvaporationConfig,
@@ -398,6 +399,47 @@ impl Default for ReviewSweepConfig {
             interval_secs: 300,
             remote: "origin".into(),
             fetch_timeout_secs: 30,
+        }
+    }
+}
+
+/// Re-notify sweep for unacked automated-recovery escalations (strategic
+/// review B2). An automated recovery action (auto-respawn, kill-at-`rk done`,
+/// stale-instance timeout, orphaned-ticket reopen — B3/B5/B8/B9, all built on
+/// [`crate::notify`]'s announce helper) writes a durable escalation and pushes
+/// it through the configured `[[notify.sinks]]` once. Nothing else re-pushes
+/// it — exactly the gap that let a finished-but-unmerged branch sit unseen for
+/// two days (TKT-147). This sweep is the fix: an unacked escalation (`rk inbox
+/// ack <id>`) re-notifies at `first_renotify_secs`, then every
+/// `repeat_renotify_secs`, up to `max_renotifies` times, after which it stands
+/// as a passive `rk inbox` row with no further pushes — the same "dead sink
+/// degrades to the passive queue" philosophy B1 established, applied to a
+/// human who has not looked yet rather than a channel that cannot deliver.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RecoverySweepConfig {
+    /// Master switch. When false the sweep loop never starts; unacked
+    /// escalations still surface on `rk inbox`, they just never re-push.
+    pub enabled: bool,
+    /// How often the sweep checks for a due re-notify.
+    pub interval_secs: u64,
+    /// Delay after an escalation is written before its FIRST re-notify.
+    pub first_renotify_secs: u64,
+    /// Delay between each re-notify after the first.
+    pub repeat_renotify_secs: u64,
+    /// How many re-notifies an unacked escalation gets before the sweep
+    /// leaves it alone for good.
+    pub max_renotifies: u32,
+}
+
+impl Default for RecoverySweepConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 300,
+            first_renotify_secs: 4 * 3600,
+            repeat_renotify_secs: 24 * 3600,
+            max_renotifies: 3,
         }
     }
 }
