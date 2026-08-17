@@ -129,6 +129,10 @@ pub struct Daemon {
     syncer: Option<Arc<crate::sync::Syncer>>,
     sync_interval: Duration,
     reactor_config: rk_core::config::ReactorConfig,
+    /// Operator-configured escalation push channels (`[[notify.sinks]]`), handed
+    /// to the reactor's sink registry. Default (no tables) reproduces the
+    /// historical single herdr sink.
+    notify_config: rk_core::config::NotifyConfig,
     scheduler_config: rk_core::config::SchedulerConfig,
     sweep_config: rk_core::config::SupervisorConfig,
     review_sweep_config: rk_core::config::ReviewSweepConfig,
@@ -246,6 +250,7 @@ impl Daemon {
                 .collect(),
         };
         daemon.reactor_config = config.reactor.clone();
+        daemon.notify_config = config.notify.clone();
         daemon.scheduler_config = config.scheduler.clone();
         daemon.sweep_config = config.supervisor.clone();
         if let Some(msg) = daemon.sweep_config.review_timeout_warning() {
@@ -422,6 +427,7 @@ impl Daemon {
             syncer: None,
             sync_interval: Duration::from_secs(30),
             reactor_config: rk_core::config::ReactorConfig::default(),
+            notify_config: rk_core::config::NotifyConfig::default(),
             scheduler_config: rk_core::config::SchedulerConfig::default(),
             sweep_config: rk_core::config::SupervisorConfig::default(),
             review_sweep_config: rk_core::config::ReviewSweepConfig::default(),
@@ -709,7 +715,12 @@ impl Daemon {
                 // enqueue. Always wired when the reactor itself is enabled —
                 // inert (nothing to dispatch) unless a repo actually installs
                 // a "land" trigger.
-                .with_landing(daemon.landing()),
+                .with_landing(daemon.landing())
+                // Escalation push channels. Empty config resolves to the
+                // historical herdr-only registry, so an existing castle sees no
+                // change; adding a `[[notify.sinks]]` table adds a channel with
+                // no change at any escalation source.
+                .with_sinks(&daemon.notify_config),
             );
             // Baseline the cursor so a fresh daemon does not react to the whole
             // pre-existing backlog on first boot.

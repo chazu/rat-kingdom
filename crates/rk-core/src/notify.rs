@@ -24,9 +24,10 @@
 //!   queue — it never blocks recording, and never aborts the reactor cycle.
 //! * **Deduped per (notice, sink).** Delivery is at-least-once by nature (the
 //!   reactor re-scans, cursors can be lost), so the caller supplies a
-//!   [`SinkDedup`] backed by whatever durable marker it already keeps. A sink
-//!   that has already fired for a notice is skipped, and a sink that *failed*
-//!   is not marked — so a channel that comes back up can still be reached.
+//!   [`SinkDedup`] backed by whatever durable marker it already keeps. The
+//!   marker is written per ATTEMPT rather than per success — see
+//!   [`SinkRegistry::deliver_one`] for why a dead channel must not mean an
+//!   unbounded retry.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -277,19 +278,28 @@ impl SinkRegistry {
         if dedup.already_delivered(notice, name) {
             return Outcome::AlreadyDelivered;
         }
-        if let Err(e) = registered.sink.deliver(notice) {
-            // Best-effort: the operator still has the inbox row.
-            warn!(sink = name, tuple = %notice.tuple_id, error = %e, "notification sink failed");
-            return Outcome::Failed(e.to_string());
-        }
-        // Mark only after a real delivery, so a channel that was down when the
-        // notice arrived is retried rather than silently written off.
+        let outcome = match registered.sink.deliver(notice) {
+            Ok(()) => {
+                debug!(sink = name, tuple = %notice.tuple_id, class = %notice.class, "notification delivered");
+                Outcome::Delivered
+            }
+            Err(e) => {
+                // Best-effort: the operator still has the inbox row.
+                warn!(sink = name, tuple = %notice.tuple_id, error = %e, "notification sink failed");
+                Outcome::Failed(e.to_string())
+            }
+        };
+        // Marked on ATTEMPT, not on success. A castle with no channel installed
+        // (the headless case, and what an absent herdr server has always looked
+        // like) would otherwise re-attempt this notice on every re-scan forever.
+        // The escalation is durable and already ranked by `rk inbox` either way,
+        // so one logged failure is the honest cost of a dead channel — not an
+        // unbounded retry. A channel meant to survive outages should retry
+        // inside its own `deliver`, where it can bound the attempts.
         if let Err(e) = dedup.record_delivered(notice, name) {
             warn!(sink = name, tuple = %notice.tuple_id, error = %e, "notification dedup marker failed");
-            return Outcome::Failed(e.to_string());
         }
-        debug!(sink = name, tuple = %notice.tuple_id, class = %notice.class, "notification delivered");
-        Outcome::Delivered
+        outcome
     }
 }
 
@@ -397,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_sink_neither_blocks_a_live_one_nor_gets_marked() {
+    fn a_dead_sink_does_not_block_a_live_one() {
         struct Marks(Mutex<Vec<String>>);
         impl SinkDedup for Marks {
             fn already_delivered(&self, _n: &EscalationNotice, sink: &str) -> bool {
@@ -434,13 +444,13 @@ mod tests {
         assert_eq!(deliveries[1].outcome, Outcome::Delivered);
         assert_eq!(
             *marks.0.lock().unwrap(),
-            ["live"],
-            "only a real delivery is marked, so the dead sink retries"
+            ["dead", "live"],
+            "both are marked on attempt, so a missing channel is not retried forever"
         );
 
-        // Second pass: the live sink is suppressed, the dead one tried again.
+        // Second pass: both are suppressed by their markers.
         let deliveries = registry.fan_out(&notice(), &marks);
-        assert!(matches!(deliveries[0].outcome, Outcome::Failed(_)));
+        assert_eq!(deliveries[0].outcome, Outcome::AlreadyDelivered);
         assert_eq!(deliveries[1].outcome, Outcome::AlreadyDelivered);
     }
 
