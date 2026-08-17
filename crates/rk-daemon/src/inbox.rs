@@ -784,6 +784,7 @@ mod tests {
     fn agent(name: &str, state: AgentState) -> AgentRecord {
         AgentRecord {
             name: name.into(),
+            spawn: None,
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),

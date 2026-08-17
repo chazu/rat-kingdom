@@ -2744,6 +2744,7 @@ mod tests {
     fn agent(name: &str, repo: &str, state: crate::agents::AgentState) -> AgentRecord {
         AgentRecord {
             name: name.into(),
+            spawn: None,
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),
