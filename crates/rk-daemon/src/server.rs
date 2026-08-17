@@ -990,6 +990,7 @@ impl Daemon {
         let (read, mut write) = stream.into_split();
         let mut read = BufReader::new(read);
         let mut buf = Vec::new();
+        let mut noted_client_build = false;
 
         loop {
             buf.clear();
@@ -1025,7 +1026,26 @@ impl Daemon {
             if line.trim().is_empty() {
                 continue;
             }
-            let outcome = match serde_json::from_str::<Request>(&line) {
+            let parsed = serde_json::from_str::<Request>(&line);
+            // The other half of the handshake. The daemon has no terminal to
+            // warn into, but `daemon.log` is where anyone diagnosing "the
+            // feature I merged isn't there" ends up, and one line naming both
+            // builds turns that into a two-second answer. Once per connection:
+            // a rat makes many calls and they all carry the same stamp.
+            if let Ok(req) = &parsed {
+                if let Some(client) = req.client_version.as_deref() {
+                    if client != rk_core::version::BUILD_VERSION && !noted_client_build {
+                        noted_client_build = true;
+                        warn!(
+                            client_build = client,
+                            daemon_build = rk_core::version::BUILD_VERSION,
+                            caller = %req.caller,
+                            "caller is a different build than this daemon; restart the daemon onto it"
+                        );
+                    }
+                }
+            }
+            let outcome = match parsed {
                 Ok(req) if !self.authenticated(&req) => Outcome::Reply(Response::err(
                     req.id,
                     codes::UNAUTHORIZED,
@@ -5549,6 +5569,10 @@ impl Daemon {
     fn status(&self) -> Value {
         json!({
             "version": env!("CARGO_PKG_VERSION"),
+            // The version that can actually distinguish two daemons: `version`
+            // above has read `0.1.0` since the first commit, so an operator
+            // comparing it against a freshly installed binary learns nothing.
+            "build_version": rk_core::version::BUILD_VERSION,
             "pid": std::process::id(),
             // Operator-facing: the friendly alias if configured, else the actor
             // id. The wire id (self.castle) is never exposed here as a name.
@@ -6470,6 +6494,7 @@ mod agent_fact_authorisation_tests {
             method: "space.out".into(),
             auth: String::new(),
             caller: "Whisker".into(),
+            client_version: None,
             params: json!({
                 "category": "fact",
                 "scope": "rat-kingdom",
@@ -6500,6 +6525,7 @@ mod agent_fact_authorisation_tests {
             method: "space.out".into(),
             auth: String::new(),
             caller: "Whisker".into(),
+            client_version: None,
             params: json!({
                 "category": "fact",
                 "scope": "rat-kingdom",
@@ -6524,6 +6550,7 @@ mod agent_fact_authorisation_tests {
             method: "space.out".into(),
             auth: String::new(),
             caller: "Whisker".into(),
+            client_version: None,
             params: json!({
                 "category": "fact",
                 "scope": "rat-kingdom",
@@ -6539,6 +6566,7 @@ mod agent_fact_authorisation_tests {
                 method: "fact.vote".into(),
                 auth: String::new(),
                 caller: caller.into(),
+                client_version: None,
                 params: json!({"fact": fact_id, "vote": value}),
             })
         };
@@ -6564,6 +6592,7 @@ mod agent_fact_authorisation_tests {
             method: "space.scan".into(),
             auth: String::new(),
             caller: "operator".into(),
+            client_version: None,
             params: json!({"category": "fact"}),
         });
         assert_eq!(
@@ -6592,6 +6621,7 @@ mod agent_fact_authorisation_tests {
             method: "space.scan".into(),
             auth: String::new(),
             caller: "operator".into(),
+            client_version: None,
             params: json!({"category": "fact"}),
         });
         assert_eq!(
@@ -6612,6 +6642,7 @@ mod agent_fact_authorisation_tests {
             method: "space.out".into(),
             auth: String::new(),
             caller: "Whisker".into(),
+            client_version: None,
             params: json!({
                 "category": "fact_vote",
                 "scope": "rat-kingdom",
@@ -6857,6 +6888,7 @@ mod authorize_reasoned_tests {
             method: method.into(),
             auth: auth.into(),
             caller: caller.into(),
+            client_version: None,
             params: Value::Null,
         }
     }

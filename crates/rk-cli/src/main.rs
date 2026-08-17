@@ -695,13 +695,20 @@ async fn main() -> Result<()> {
                     if cli.json {
                         println!("{status}");
                     } else {
+                        // Prefer the build version: `version` alone cannot tell
+                        // a daemon started before a merge from one started
+                        // after it, which is the question this line is asked.
+                        // A daemon too old to report one falls back.
+                        let build = status["build_version"]
+                            .as_str()
+                            .or_else(|| status["version"].as_str())
+                            .unwrap_or("?");
                         println!(
-                            "running: pid {} · castle {} · {} tuples · uptime {}s · v{}",
+                            "running: pid {} · castle {} · {} tuples · uptime {}s · v{build}",
                             status["pid"],
                             status["castle"].as_str().unwrap_or("?"),
                             status["tuples"],
                             status["uptime_secs"],
-                            status["version"].as_str().unwrap_or("?")
                         );
                     }
                 }

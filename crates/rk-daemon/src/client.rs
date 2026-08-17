@@ -5,6 +5,7 @@ use crate::proto::{Request, Response, RpcError};
 use rk_core::paths::Layout;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -210,6 +211,7 @@ impl Client {
             method: method.to_string(),
             auth: self.auth_token.clone(),
             caller: self.caller.clone(),
+            client_version: Some(rk_core::version::BUILD_VERSION.into()),
             params,
         };
         let mut line = serde_json::to_vec(&req)?;
@@ -221,7 +223,9 @@ impl Client {
         if n == 0 {
             return Err(rk_core::Error::Protocol("daemon closed connection".into()));
         }
-        Ok(serde_json::from_str(&buf)?)
+        let response: Response = serde_json::from_str(&buf)?;
+        warn_on_version_mismatch(response.server_version.as_deref());
+        Ok(response)
     }
 
     pub async fn call_typed<T: DeserializeOwned>(
@@ -236,6 +240,29 @@ impl Client {
         let value = resp.result.unwrap_or(Value::Null);
         serde_json::from_value(value).map_err(|err| rk_core::Error::from(err).into())
     }
+}
+
+/// Whether this process has already said its piece about a build mismatch.
+static VERSION_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Complain to stderr when the daemon on the other end is a different build.
+///
+/// Once per process, not once per call: a single `rk` invocation makes several
+/// RPCs and the operator needs the warning to be impossible to miss, not
+/// repeated until it is noise. Stderr keeps `--json` stdout parseable.
+///
+/// `None` — a daemon too old to stamp its replies at all — is itself proof of
+/// a mismatch, since every build carrying this code stamps every response.
+fn warn_on_version_mismatch(server_version: Option<&str>) {
+    let remote = server_version.unwrap_or("an unstamped build (predates this handshake)");
+    let Some(warning) = rk_core::version::mismatch_warning(rk_core::version::BUILD_VERSION, remote)
+    else {
+        return;
+    };
+    if VERSION_WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!("{warning}");
 }
 
 /// A connection upgraded to a live tuple feed by [`Client::watch`].
