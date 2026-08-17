@@ -164,7 +164,7 @@ mod tests {
         for subsystem in FROZEN_SUBSYSTEMS {
             let label = format!("{FROZEN_PREFIX}{subsystem}");
             assert!(
-                blocks_automated_dispatch(&[label.clone()]),
+                blocks_automated_dispatch(std::slice::from_ref(&label)),
                 "{label} must block automated dispatch"
             );
             assert!(validate_label(&label).is_ok(), "{label} must validate");
