@@ -51,15 +51,8 @@ pub fn permission_mode(harness: &str) -> rk_core::Result<String> {
 /// remembering to deny it.
 pub fn method_allowed(role: &str, req: &Request) -> bool {
     match req.method.as_str() {
-        "ping"
-        | "status"
-        | "space.scan"
-        | "space.rd"
-        | "repo.list"
-        | "repo.get"
-        | "agent.status"
-        | "agent.log"
-        | "agent.progress" => true,
+        "ping" | "status" | "space.scan" | "space.rd" | "repo.list" | "repo.get"
+        | "agent.status" | "agent.log" | "agent.progress" => true,
         // The one permitted write: declaring yourself finished. Narrowed to a
         // task_done event naming the caller, so it cannot carry a finding for
         // another instance or masquerade as another tuple category.
