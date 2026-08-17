@@ -20,6 +20,7 @@ pub mod onboarding_proposals;
 pub mod onboarding_sessions;
 pub mod proto;
 pub mod reactor;
+pub mod read_only_roles;
 pub mod repos;
 pub mod scheduler;
 pub mod server;

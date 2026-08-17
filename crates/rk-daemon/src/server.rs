@@ -1172,11 +1172,11 @@ impl Daemon {
             return (false, "token_mismatch");
         }
         if let Some(record) = self.supervisor.status(&req.caller) {
-            if record.role == crate::onboarding_sessions::ONBOARDER_ROLE {
-                return if self.onboarder_authorized(req) {
+            if crate::read_only_roles::is_read_only_role(&record.role) {
+                return if crate::read_only_roles::method_allowed(&record.role, req) {
                     (true, "")
                 } else {
-                    (false, "onboarder_method_not_allowed")
+                    (false, "read_only_role_method_not_allowed")
                 };
             }
             if crate::supervisor::validate_role(&record.role).is_err() {
@@ -1254,38 +1254,6 @@ impl Daemon {
     /// reads, self progress, and the one completion event required by `rk
     /// done`. It is evaluated after peer-origin and token binding, so clearing
     /// ambient identity cannot select the operator arm above.
-    fn onboarder_authorized(&self, req: &Request) -> bool {
-        match req.method.as_str() {
-            "ping"
-            | "status"
-            | "space.scan"
-            | "space.rd"
-            | "repo.list"
-            | "repo.get"
-            | "repo.onboard.inspect"
-            | "repo.onboard.propose"
-            | "agent.status"
-            | "agent.log"
-            | "agent.progress" => true,
-            "space.out" => {
-                req.params.get("category").and_then(Value::as_str) == Some("event")
-                    && req.params.get("identity").and_then(Value::as_str) == Some("task_done")
-                    && req
-                        .params
-                        .get("instance")
-                        .and_then(Value::as_str)
-                        .is_none_or(|instance| instance == req.caller)
-                    && req
-                        .params
-                        .get("payload")
-                        .and_then(|payload| payload.get("agent"))
-                        .and_then(Value::as_str)
-                        == Some(req.caller.as_str())
-            }
-            _ => false,
-        }
-    }
-
     fn authenticated(&self, req: &Request) -> bool {
         if req
             .caller
