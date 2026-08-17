@@ -88,6 +88,14 @@ pub struct TicketChanges {
     pub assignee: Option<String>,
     #[serde(default)]
     pub parent: Option<String>,
+    /// Labels to add, deduped against the existing set. Additive rather than a
+    /// wholesale replace so a backlog groom can tag a ticket (e.g. with a
+    /// `frozen:<subsystem>` tag) without clobbering labels another pass set.
+    #[serde(default)]
+    pub add_labels: Vec<String>,
+    /// Labels to remove — how a freeze tag is lifted when a subsystem thaws.
+    #[serde(default)]
+    pub remove_labels: Vec<String>,
 }
 
 pub struct Tickets {
@@ -164,6 +172,11 @@ impl Tickets {
                 return Ok((existing, false));
             }
         }
+        // A freeze tag naming an unknown subsystem, or a carve-out naming an
+        // unratified reason, is rejected here rather than stored: the dispatch
+        // predicate fails closed on both, so an unvalidated typo would freeze a
+        // ticket silently and forever.
+        rk_core::freeze::validate_labels(&t.labels).map_err(rk_core::Error::other)?;
         // Dependencies must reference tickets that already exist. (A brand-new
         // ticket has no dependents, so it can never close a cycle here.)
         for dep in &t.depends_on {
@@ -275,6 +288,10 @@ impl Tickets {
                 )));
             }
         }
+        // Reject a malformed freeze tag at the point it is written, so a typo is
+        // a loud error at groom time rather than a ticket that silently never
+        // drains (the predicate itself fails closed — see rk_core::freeze).
+        rk_core::freeze::validate_labels(&changes.add_labels).map_err(rk_core::Error::other)?;
         let _guard = self.lock.lock().await;
         if let Some(next) = changes.status.as_deref() {
             let current = self
@@ -309,6 +326,20 @@ impl Tickets {
             }
             if let Some(v) = changes.parent {
                 obj.insert("parent".into(), json!(v));
+            }
+            if !changes.add_labels.is_empty() || !changes.remove_labels.is_empty() {
+                let labels = obj.entry("labels").or_insert_with(|| json!([]));
+                if let Some(arr) = labels.as_array_mut() {
+                    arr.retain(|l| {
+                        l.as_str()
+                            .is_none_or(|l| !changes.remove_labels.iter().any(|r| r == l))
+                    });
+                    for label in &changes.add_labels {
+                        if !arr.iter().any(|l| l.as_str() == Some(label.as_str())) {
+                            arr.push(json!(label));
+                        }
+                    }
+                }
             }
         })
         .await
@@ -764,6 +795,7 @@ mod tests {
             priority: None,
             assignee: Some("Whisker".into()),
             parent: None,
+            ..Default::default()
         };
         let updated = t.update(&a.identity, changes).await.unwrap();
         assert_eq!(updated.payload["status"], "in_progress");
@@ -783,6 +815,7 @@ mod tests {
             priority: None,
             assignee: None,
             parent: None,
+            ..Default::default()
         };
         assert!(t.update(&a.identity, changes).await.is_err());
     }
@@ -828,6 +861,7 @@ mod tests {
             priority: None,
             assignee: None,
             parent: None,
+            ..Default::default()
         };
         t.update(id, changes).await.unwrap();
     }

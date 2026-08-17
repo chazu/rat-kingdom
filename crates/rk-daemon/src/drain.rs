@@ -168,6 +168,20 @@ impl Drain {
             let Some(repo) = registry.get(&ticket.scope) else {
                 continue;
             };
+            // Freeze list (R6): a ticket tagged to a frozen subsystem is not
+            // drainable. The drain is a *generator* — left unconstrained it
+            // regrows frozen mass as fast as the freeze deletes it. Skipped
+            // before the claim, so a frozen ticket is never even moved to
+            // `in_progress`; it stays `open` and visible to an operator, who
+            // can still dispatch it deliberately by hand. `continue`, not
+            // `break`: the rest of the backlog still drains.
+            if rk_core::freeze::blocks_automated_dispatch(&string_array(&ticket.payload, "labels")) {
+                info!(
+                    ticket = %ticket.identity,
+                    "drain skipped ticket tagged to a frozen subsystem"
+                );
+                continue;
+            }
             // Cross-repo partition: in allowlist mode a repo absent or disabled
             // from the `repos` map is not drained, and a repo already holding its
             // per-repo cap is skipped (but other repos' tickets still dispatch,
