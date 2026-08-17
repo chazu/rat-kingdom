@@ -10,6 +10,12 @@
 //   {{tuple.id}}       {{tuple.payload.<field>}}
 // A param whose whole value is one {{tuple.payload.<field>}} placeholder passes
 // the raw JSON value (and type) through; otherwise it is string-interpolated.
+//
+// A {{tuple.payload.<field>}} value drawn from an ingest-sourced tuple (an
+// SDLC alert/webhook event) is fenced/escaped/provenance-marked before it
+// reaches a spawned prompt — see docs/reactor.md "Payload hygiene for
+// ingest-sourced tuples". Do not template such a field where it must stay a
+// bare short value.
 triggers: [
 	// When any rat records a blocking obstacle, kick off a triage workflow in
 	// the repo the obstacle is scoped to (its scope resolves to a registered

@@ -48,12 +48,18 @@ impl fmt::Display for ConfiguredSourceName {
     }
 }
 
+/// Tuple `instance` prefix identifying an authenticated ingest-source
+/// principal (see [`SignalSourcePrincipal::for_source`]), as opposed to a rat
+/// or the daemon itself. Shared with `rk-daemon`'s `ingest_auth` module (RPC
+/// caller prefix) so the two never drift apart.
+pub const SOURCE_PRINCIPAL_PREFIX: &str = "source:";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SignalSourcePrincipal(String);
 
 impl SignalSourcePrincipal {
     pub fn for_source(source: &ConfiguredSourceName) -> Self {
-        Self(format!("source:{}", source.as_str()))
+        Self(format!("{SOURCE_PRINCIPAL_PREFIX}{}", source.as_str()))
     }
 
     pub fn from_inline(_principal: &str) -> Result<Self, SignalValidationError> {
@@ -63,6 +69,15 @@ impl SignalSourcePrincipal {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// True when `instance` (a tuple's `instance`/author field) identifies an
+/// ingest-source principal rather than a rat or the daemon — i.e. the
+/// tuple's payload may carry externally-authored text (an alert annotation,
+/// a webhook body) that a trigger's params should not splice into a prompt
+/// verbatim. See `rk_core::prompt_hygiene::fence_external_text`.
+pub fn is_ingest_sourced(instance: &str) -> bool {
+    instance.starts_with(SOURCE_PRINCIPAL_PREFIX)
 }
 
 impl<'de> Deserialize<'de> for SignalSourcePrincipal {

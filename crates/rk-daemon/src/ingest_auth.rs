@@ -3,7 +3,7 @@ use rk_core::sdlc::{ConfiguredSourceName, SignalEnvelope, SignalLimits};
 use serde::Deserialize;
 use std::collections::HashSet;
 
-pub const SOURCE_CALLER_PREFIX: &str = "source:";
+pub const SOURCE_CALLER_PREFIX: &str = rk_core::sdlc::SOURCE_PRINCIPAL_PREFIX;
 
 #[derive(Debug, Clone)]
 pub struct SourcePrincipal {

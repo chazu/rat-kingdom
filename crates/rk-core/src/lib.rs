@@ -12,6 +12,7 @@ pub mod notify;
 pub mod paths;
 pub mod prime;
 pub mod product_to_code;
+pub mod prompt_hygiene;
 pub mod sdlc;
 pub mod tuple;
 pub mod version;

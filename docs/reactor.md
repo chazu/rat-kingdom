@@ -54,6 +54,41 @@ A param whose **whole value** is a single `{{tuple.payload.<key>}}` placeholder
 passes the raw JSON value through, preserving its type (so a workflow's `int` or
 `bool` param stays typed). Any other value is string-interpolated.
 
+#### Payload hygiene for ingest-sourced tuples
+
+Anyone who can shape the text of an alert or webhook — an annotation, a
+`summary` field — can shape part of a rat's prompt once a trigger templates
+that field into a spawn step's task title or description. That is a
+prompt-injection channel, so the templater does not trust it: a
+`{{tuple.payload.<key>}}` substitution whose tuple is **ingest-sourced**
+(`instance` starts with `source:` — see `rk_core::sdlc::is_ingest_sourced`,
+set by the `ingest.event` RPC for a configured `[[ingest.sources]]` entry) is
+rendered through `rk_core::prompt_hygiene::fence_external_text` instead of
+spliced in raw. The result is:
+
+- **length-capped** — truncated so unbounded input cannot grow a prompt without
+  bound.
+- **fenced** — wrapped in a delimited `[EXTERNAL TEXT ...] ``` ... ``` [END
+  EXTERNAL TEXT]` block, with backticks in the body neutralized so hostile
+  content cannot close the fence early and forge trailing text.
+- **provenance-marked** — tagged with the payload key and the ingest source's
+  `instance`, and told explicitly not to be followed as an instruction.
+
+This applies uniformly to every string payload field from an ingest-sourced
+tuple, including a lone whole-value `{{tuple.payload.<key>}}` placeholder — the
+templater cannot tell a free-text annotation apart from a short typed
+identifier at this point, so it treats both the same way a hostile annotation
+would need to be treated. **If you are writing a trigger that consumes an
+ingest-sourced tuple** (an SDLC signal event, or any future ingest source),
+expect payload text to arrive fenced in the spawned prompt — do not rely on it
+being a bare value usable as, say, a branch name or ticket title; prefer the
+tuple's structural fields (`category`/`scope`/`identity`/`id`) or the
+envelope's typed/allowlisted fields (`kind`, `environment`, `service`, ...)
+for anything that needs to stay a plain, short identifier. Non-ingest tuples
+(rat- or daemon-authored, e.g. an `obstacle`'s `text` field) are unaffected —
+this hygiene is scoped to the one channel that carries genuinely external
+text.
+
 ### Target repo resolution
 
 A fired workflow needs a real checkout to run in. The target repo name is, in
