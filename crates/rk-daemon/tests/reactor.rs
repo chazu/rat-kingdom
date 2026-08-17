@@ -1727,7 +1727,9 @@ async fn a_second_sink_registers_from_notify_config_alone() {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$RK_NOTICE_SEVERITY\" \"$1\" \"$RK_NOTICE_REF_TASK\" >> {}\n",
+            // `task` is promoted to the notice subject, so the ref that proves
+            // structured context survived is `agent`.
+            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$RK_NOTICE_SEVERITY\" \"$1\" \"$RK_NOTICE_REF_AGENT\" >> {}\n",
             delivered.display()
         ),
     )
@@ -1780,7 +1782,7 @@ kind = "carrier-pigeon"
 
     assert_eq!(
         std::fs::read_to_string(&delivered).unwrap(),
-        "critical|steward escalation — TKT-77|TKT-77\n",
+        "critical|steward escalation — TKT-77|steward\n",
         "a kind named only in [[notify.sinks]] delivered the notice, \
          with its severity and refs intact and no change at the escalation source"
     );
