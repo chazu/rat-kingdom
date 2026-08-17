@@ -866,6 +866,9 @@ schedules: [
   `[scheduler].catchup_minutes`).
 - **Single-flight.** Each schedule is guarded by its `name`: while its previous
   run is still `Running`, the next fire is skipped — a slow drain never stacks.
+  A `Running` instance older than `stale_running_hours` (default 6h) no longer
+  blocks: the bypass is escalated via a `need` tuple (once per wedged
+  instance) rather than silently routing around it forever.
 - **The `nightly-self-improve` chain** is the headline schedule: one workflow
   that grooms the backlog, drains it in parallel, then proposes prompt/convention
   refinements — the three self-improvement loops welded into a single instance so
@@ -875,8 +878,9 @@ schedules: [
 ```toml
 [scheduler]
 enabled = true
-interval_secs = 30      # cron-minute check cadence; clamped [1,60]
-catchup_minutes = 1440  # look-back bound after downtime; 0 = current minute only
+interval_secs = 30         # cron-minute check cadence; clamped [1,60]
+catchup_minutes = 1440     # look-back bound after downtime; 0 = current minute only
+stale_running_hours = 6    # age past which a wedged Running instance stops blocking its schedule
 ```
 
 See `docs/scheduler.md` for the full design (cursor/catch-up semantics, the

@@ -746,3 +746,64 @@ async fn stale_running_instance_no_longer_blocks_and_escalates() {
         "the stale instance must be escalated via a need tuple: {needs:?}"
     );
 }
+
+/// `try_fire` checks staleness twice — the in-memory fast path (populated by
+/// the earlier fire, so it still points at the now-stale instance) and, once
+/// that falls through, the durable restart-recovery scan (which finds the
+/// very same still-`Running` instance by schedule identity). Without
+/// idempotency that is two escalation `need`s for one wedged instance in a
+/// single cycle; this pins it down to exactly one.
+#[tokio::test]
+async fn stale_instance_escalates_exactly_once_across_both_check_paths() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+    write_global_schedule(
+        &layout,
+        "tick.cue",
+        r#"schedules: [{name: "every-min", cron: "* * * * *", run: "sched-work", repo: "myrepo"}]"#,
+    );
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let scheduler = build_scheduler(&layout, SchedulerConfig::default(), space.clone());
+
+    // Fire the first instance at a fixed past minute. Its real `started_at`
+    // (set by the engine at dispatch, not from the injected cron minute) sits
+    // close to actual wall-clock now, so on this very cycle it reads as fresh
+    // regardless of how far in the past `t` is.
+    let t = Utc.with_ymd_and_hms(2026, 7, 23, 8, 0, 0).unwrap();
+    assert_eq!(scheduler.run_cycle_at(t).unwrap(), 1);
+    assert_eq!(scheduler.engine_instance_count(), 1);
+
+    // A later cycle whose injected `now` is 7h past the instance's real
+    // `started_at` (over the 6h default bound) makes it stale. The
+    // scheduler's `running` cache still points at it from the fire above, so
+    // the fast path finds and escalates it; falling through, the durable scan
+    // finds the same still-`Running` instance and — pre-fix — escalates it
+    // again.
+    let next = Utc::now() + chrono::Duration::hours(7);
+    assert_eq!(
+        scheduler.run_cycle_at(next).unwrap(),
+        1,
+        "the stale instance no longer blocks; a replacement fires"
+    );
+    assert_eq!(scheduler.engine_instance_count(), 2);
+
+    let needs = space
+        .scan(&Pattern::category(Category::Need).identity("every-min"))
+        .unwrap();
+    let stale_needs: Vec<_> = needs
+        .iter()
+        .filter(|n| {
+            n.payload.get("type").and_then(|v| v.as_str()) == Some("schedule_stale_running")
+        })
+        .collect();
+    assert_eq!(
+        stale_needs.len(),
+        1,
+        "one stale instance must escalate exactly once, not once per check path: {stale_needs:?}"
+    );
+}

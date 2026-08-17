@@ -67,6 +67,16 @@ pub struct Scheduler {
     /// fire. Durable running instances retain the schedule name, so a restart
     /// cannot clear the actual per-schedule single-flight guard.
     running: Mutex<HashMap<String, String>>,
+    /// Instance ids already escalated as stale. `try_fire` checks staleness
+    /// from both the in-memory fast path and the durable restart-recovery
+    /// scan, and either can also be hit again on a later matching minute
+    /// while the same wedged instance is still the one on record (e.g. its
+    /// replacement dispatch keeps failing) — without this guard the same
+    /// instance emits a fresh `need` every time it is seen. Membership is
+    /// process-lifetime only, matching `running`'s durability: a restart
+    /// re-escalates once, which is acceptable since the instance is still
+    /// genuinely wedged.
+    escalated: Mutex<HashSet<String>>,
 }
 
 const MAX_CATCHUP_MINUTES: u64 = 7 * 24 * 60;
@@ -88,6 +98,7 @@ impl Scheduler {
             space,
             castle,
             running: Mutex::new(HashMap::new()),
+            escalated: Mutex::new(HashSet::new()),
         }
     }
 
@@ -276,7 +287,19 @@ impl Scheduler {
 
     /// Surface a bypassed stale instance via a `need` tuple (which `rk inbox`
     /// ranks) instead of silently letting the schedule route around it forever.
+    /// Idempotent per instance id: `try_fire` can reach this from both the
+    /// fast-path and durable-scan checks for the same instance in one call,
+    /// and a still-wedged instance can be seen again on a later matching
+    /// minute, so a second call for an id already escalated is a no-op.
     fn escalate_stale(&self, loaded: &Loaded, instance: &Instance, now: DateTime<Utc>) {
+        if !self
+            .escalated
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(instance.id.clone())
+        {
+            return;
+        }
         let sched = &loaded.schedule;
         let age = now.signed_duration_since(instance.started_at);
         let age_hours = age.num_hours();
