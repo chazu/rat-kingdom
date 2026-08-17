@@ -466,6 +466,175 @@ async fn unresolvable_repo_and_bad_cron_are_skipped() {
     assert_eq!(scheduler.engine_instance_count(), 0);
 }
 
+/// Read the durable minute-cursor back as a UTC instant.
+fn read_cursor(home: &Path) -> chrono::DateTime<Utc> {
+    let raw = std::fs::read_to_string(home.join("scheduler-cursor")).unwrap();
+    chrono::DateTime::parse_from_rfc3339(raw.trim())
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+/// A dispatch that errors must not retire its minute. The failure is injected by
+/// pointing the schedule at a workflow definition that does not exist yet
+/// (`find_definition` errors) — the cursor is held, and once the definition
+/// appears the SAME minute fires on the next tick. Without the hold, `0 3 * * *`
+/// would not match again until tomorrow and the fire would be lost.
+#[tokio::test]
+async fn dispatch_failure_holds_cursor_and_retries_the_same_minute() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+    write_global_schedule(
+        &layout,
+        "nightly.cue",
+        r#"schedules: [{name: "nightly", cron: "0 3 * * *", run: "late-work", repo: "myrepo"}]"#,
+    );
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let scheduler = build_scheduler(&layout, SchedulerConfig::default(), space);
+
+    let before = Utc.with_ymd_and_hms(2026, 7, 23, 2, 59, 0).unwrap();
+    std::fs::write(home.path().join("scheduler-cursor"), before.to_rfc3339()).unwrap();
+
+    let fire_minute = Utc.with_ymd_and_hms(2026, 7, 23, 3, 0, 0).unwrap();
+    assert_eq!(
+        scheduler.run_cycle_at(fire_minute).unwrap(),
+        0,
+        "the missing definition makes dispatch fail, so nothing fires"
+    );
+    assert_eq!(scheduler.engine_instance_count(), 0);
+    assert_eq!(
+        read_cursor(home.path()),
+        before,
+        "a failed dispatch must not retire its minute"
+    );
+
+    // The transient cause clears: the definition lands.
+    std::fs::write(
+        repo.path().join(".rk/workflows/late-work.cue"),
+        GATE_WORKFLOW,
+    )
+    .unwrap();
+
+    assert_eq!(
+        scheduler.run_cycle_at(fire_minute).unwrap(),
+        1,
+        "the held minute is re-attempted on the next tick and fires"
+    );
+    assert_eq!(scheduler.engine_instance_count(), 1);
+    assert_eq!(
+        read_cursor(home.path()),
+        fire_minute,
+        "the success path advances the cursor as before"
+    );
+}
+
+/// The hold is scoped to the earliest FAILING minute: schedules that already
+/// dispatched cleanly earlier in the same cycle still retire, so a stuck
+/// schedule cannot drag its healthy peers into a re-fire every tick.
+#[tokio::test]
+async fn cursor_is_held_only_from_the_earliest_failing_minute() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+    write_global_schedule(
+        &layout,
+        "mixed.cue",
+        r#"schedules: [
+            {name: "healthy", cron: "0 3 * * *", run: "sched-work", repo: "myrepo"},
+            {name: "broken", cron: "5 3 * * *", run: "late-work", repo: "myrepo"},
+        ]"#,
+    );
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let scheduler = build_scheduler(&layout, SchedulerConfig::default(), space);
+
+    std::fs::write(
+        home.path().join("scheduler-cursor"),
+        Utc.with_ymd_and_hms(2026, 7, 23, 2, 59, 0)
+            .unwrap()
+            .to_rfc3339(),
+    )
+    .unwrap();
+
+    let woke = Utc.with_ymd_and_hms(2026, 7, 23, 3, 5, 0).unwrap();
+    assert_eq!(
+        scheduler.run_cycle_at(woke).unwrap(),
+        1,
+        "healthy fires at 03:00; broken fails at 03:05"
+    );
+    assert_eq!(
+        read_cursor(home.path()),
+        Utc.with_ymd_and_hms(2026, 7, 23, 3, 4, 0).unwrap(),
+        "the cursor retires 03:00-03:04 and holds just before the failing minute"
+    );
+}
+
+/// A held cursor does not escape the catch-up bound: a failure older than
+/// `catchup_minutes` ages out of the look-back exactly like any other missed
+/// minute, so a permanently broken schedule cannot pin the window open.
+#[tokio::test]
+async fn held_cursor_still_respects_the_catchup_bound() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+    write_global_schedule(
+        &layout,
+        "nightly.cue",
+        r#"schedules: [{name: "nightly", cron: "0 3 * * *", run: "late-work", repo: "myrepo"}]"#,
+    );
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let scheduler = build_scheduler(
+        &layout,
+        SchedulerConfig {
+            catchup_minutes: 5,
+            ..SchedulerConfig::default()
+        },
+        space,
+    );
+
+    let before = Utc.with_ymd_and_hms(2026, 7, 23, 2, 59, 0).unwrap();
+    std::fs::write(home.path().join("scheduler-cursor"), before.to_rfc3339()).unwrap();
+
+    let fire_minute = Utc.with_ymd_and_hms(2026, 7, 23, 3, 0, 0).unwrap();
+    assert_eq!(
+        scheduler.run_cycle_at(fire_minute).unwrap(),
+        0,
+        "dispatch fails"
+    );
+    assert_eq!(read_cursor(home.path()), before, "cursor held");
+
+    // The definition lands, but the daemon does not wake again until 03:30 —
+    // well outside the 5-minute look-back, so 03:00 is no longer eligible.
+    std::fs::write(
+        repo.path().join(".rk/workflows/late-work.cue"),
+        GATE_WORKFLOW,
+    )
+    .unwrap();
+    let late = Utc.with_ymd_and_hms(2026, 7, 23, 3, 30, 0).unwrap();
+    assert_eq!(
+        scheduler.run_cycle_at(late).unwrap(),
+        0,
+        "the retry window is still bounded by catchup_minutes"
+    );
+    assert_eq!(scheduler.engine_instance_count(), 0);
+    assert_eq!(
+        read_cursor(home.path()),
+        late,
+        "with nothing left failing, the cursor advances to now"
+    );
+}
+
 /// A repo-local schedule file (`<repo>/.rk/schedules.cue`) defaults its target
 /// repo to the repo it was discovered in — no explicit `repo:` needed.
 #[tokio::test]
