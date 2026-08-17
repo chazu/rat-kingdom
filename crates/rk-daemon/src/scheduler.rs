@@ -21,15 +21,22 @@
 //! Each schedule is guarded by its own single-flight lock keyed on the schedule
 //! name: if its previous run's workflow instance is still `Running`, the fire is
 //! skipped. So a slow nightly drain never stacks a second copy on itself.
+//!
+//! A `Running` instance older than `stale_running_hours` (default 6h — above
+//! rat p99 runtime, well below the 24h nightly cadence) no longer counts as a
+//! block: a wedged instance would otherwise make its schedule skip forever.
+//! The bypass is surfaced, not silent — a `need` tuple escalates the stale
+//! instance so a human can investigate the wedge.
 
 use crate::repos::RepoRegistry;
-use crate::workflow_exec::{InstanceStatus, WorkflowEngine};
+use crate::workflow_exec::{Instance, InstanceStatus, WorkflowEngine};
 use crate::cron::Cron;
 use rk_core::config::SchedulerConfig;
 use rk_core::paths::Layout;
+use rk_core::tuple::{Category, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
 use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use rk_workflow::Schedule;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -47,6 +54,8 @@ pub struct Scheduler {
     layout: Layout,
     config: SchedulerConfig,
     cursor_file: PathBuf,
+    space: rk_space::Space,
+    castle: String,
     /// Per-schedule cache: schedule name -> the instance id of its most recent
     /// fire. Durable running instances retain the schedule name, so a restart
     /// cannot clear the actual per-schedule single-flight guard.
@@ -56,13 +65,21 @@ pub struct Scheduler {
 const MAX_CATCHUP_MINUTES: u64 = 7 * 24 * 60;
 
 impl Scheduler {
-    pub fn new(engine: Arc<WorkflowEngine>, layout: Layout, config: SchedulerConfig) -> Self {
+    pub fn new(
+        engine: Arc<WorkflowEngine>,
+        layout: Layout,
+        config: SchedulerConfig,
+        space: rk_space::Space,
+        castle: String,
+    ) -> Self {
         let cursor_file = layout.home().join("scheduler-cursor");
         Self {
             engine,
             layout,
             config,
             cursor_file,
+            space,
+            castle,
             running: Mutex::new(HashMap::new()),
         }
     }
@@ -128,7 +145,7 @@ impl Scheduler {
                 }
                 if cron.matches(minute) {
                     fired_names.insert(loaded.schedule.name.as_str());
-                    match self.try_fire(loaded, &registry) {
+                    match self.try_fire(loaded, &registry, now) {
                         Ok(true) => fired += 1,
                         Ok(false) => {}
                         Err(e) => {
@@ -145,17 +162,22 @@ impl Scheduler {
 
     /// Resolve the target repo, apply the single-flight guard, and dispatch.
     /// Returns whether a workflow was actually fired.
-    fn try_fire(&self, loaded: &Loaded, registry: &RepoRegistry) -> rk_core::Result<bool> {
+    fn try_fire(&self, loaded: &Loaded, registry: &RepoRegistry, now: DateTime<Utc>) -> rk_core::Result<bool> {
         let sched = &loaded.schedule;
 
-        // Fast path: skip if this process already remembers an active fire.
-        if let Some(id) = self.running.lock().unwrap_or_else(|p| p.into_inner()).get(&sched.name) {
-            if matches!(
-                self.engine.status(id).map(|i| i.status),
-                Some(InstanceStatus::Running)
-            ) {
-                info!(schedule = %sched.name, instance = %id, "scheduler: previous run still active; skipping (single-flight)");
-                return Ok(false);
+        // Fast path: skip if this process already remembers an active fire —
+        // unless that run has gone stale (wedged past the staleness bound), in
+        // which case it no longer blocks and is escalated instead.
+        if let Some(id) = self.running.lock().unwrap_or_else(|p| p.into_inner()).get(&sched.name).cloned() {
+            if let Some(instance) = self.engine.status(&id) {
+                if instance.status == InstanceStatus::Running {
+                    if self.is_stale(&instance, now) {
+                        self.escalate_stale(loaded, &instance, now);
+                    } else {
+                        info!(schedule = %sched.name, instance = %id, "scheduler: previous run still active; skipping (single-flight)");
+                        return Ok(false);
+                    }
+                }
             }
         }
 
@@ -190,12 +212,16 @@ impl Scheduler {
                         && instance.definition == sched.run
                         && instance.params == params))
         }) {
-            info!(schedule = %sched.name, instance = %instance.id, "scheduler: durable matching run still active; skipping (single-flight)");
-            self.running
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(sched.name.clone(), instance.id);
-            return Ok(false);
+            if self.is_stale(&instance, now) {
+                self.escalate_stale(loaded, &instance, now);
+            } else {
+                info!(schedule = %sched.name, instance = %instance.id, "scheduler: durable matching run still active; skipping (single-flight)");
+                self.running
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(sched.name.clone(), instance.id);
+                return Ok(false);
+            }
         }
 
         let instance = self
@@ -213,6 +239,54 @@ impl Scheduler {
             .unwrap_or_else(|p| p.into_inner())
             .insert(sched.name.clone(), instance.id);
         Ok(true)
+    }
+
+    /// Whether a `Running` instance has aged past the staleness bound and
+    /// should stop blocking its schedule's next fire.
+    fn is_stale(&self, instance: &Instance, now: DateTime<Utc>) -> bool {
+        let bound = ChronoDuration::hours(i64::try_from(self.config.stale_running_hours).unwrap_or(i64::MAX));
+        now.signed_duration_since(instance.started_at) > bound
+    }
+
+    /// Surface a bypassed stale instance via a `need` tuple (which `rk inbox`
+    /// ranks) instead of silently letting the schedule route around it forever.
+    fn escalate_stale(&self, loaded: &Loaded, instance: &Instance, now: DateTime<Utc>) {
+        let sched = &loaded.schedule;
+        let age = now.signed_duration_since(instance.started_at);
+        let age_hours = age.num_hours();
+        warn!(
+            schedule = %sched.name,
+            instance = %instance.id,
+            age_hours,
+            bound_hours = self.config.stale_running_hours,
+            "scheduler: previous run exceeds staleness bound; no longer blocking dispatch"
+        );
+        let scope = sched
+            .repo
+            .clone()
+            .or_else(|| loaded.source_repo.clone())
+            .unwrap_or_else(|| SYSTEM_SCOPE.to_string());
+        let tuple = Tuple::new(
+            Category::Need,
+            scope,
+            sched.name.clone(),
+            self.castle.clone(),
+            json!({
+                "type": "schedule_stale_running",
+                "schedule": sched.name,
+                "instance": instance.id,
+                "age_hours": age_hours,
+                "bound_hours": self.config.stale_running_hours,
+                "text": format!(
+                    "schedule {} has a Running instance {} that is {}h old, over the {}h \
+                     staleness bound; it no longer blocks dispatch — investigate the wedged run",
+                    sched.name, instance.id, age_hours, self.config.stale_running_hours,
+                ),
+            }),
+        );
+        if let Err(e) = self.space.out(tuple.into_trail(DEFAULT_TRAIL_TTL)) {
+            warn!(error = %e, "failed to emit schedule-stale-running need");
+        }
     }
 
     /// Discover schedules from the global dir and each registered repo's

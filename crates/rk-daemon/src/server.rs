@@ -800,6 +800,8 @@ impl Daemon {
                 daemon.engine(),
                 daemon.layout.clone(),
                 daemon.scheduler_config.clone(),
+                daemon.space.clone(),
+                daemon.castle.clone(),
             ));
             // Baseline the cursor so a fresh daemon does not fire schedules for
             // minutes that elapsed before it started.

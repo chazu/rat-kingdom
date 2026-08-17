@@ -219,6 +219,12 @@ pub struct SchedulerConfig {
     /// means no catch-up — only the current minute is evaluated (plain-cron
     /// semantics, like `cron` without `anacron`).
     pub catchup_minutes: u64,
+    /// Age (in hours) past which a schedule's single-flight `Running` instance
+    /// no longer blocks its next fire. Guards against a wedged instance making
+    /// a schedule skip forever: above rat p99 runtime (~5h), well below the
+    /// typical 24h nightly cadence. A bypassed stale instance is escalated via
+    /// a `need` tuple rather than silently ignored.
+    pub stale_running_hours: u64,
 }
 
 impl Default for SchedulerConfig {
@@ -230,6 +236,7 @@ impl Default for SchedulerConfig {
             // daily/hourly schedule once on the next boot, without replaying a
             // week of minutes.
             catchup_minutes: 24 * 60,
+            stale_running_hours: 6,
         }
     }
 }
