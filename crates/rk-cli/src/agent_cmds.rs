@@ -502,6 +502,24 @@ pub async fn inbox(layout: &Layout, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `rk inbox ack <id>` — durably acknowledge a `recovery-action` escalation
+/// (B2) so the daemon's re-notify sweep stops pushing it. Sink-agnostic: this
+/// CLI path is the same one a future rat-king sink would go through.
+pub async fn inbox_ack(layout: &Layout, id: String, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client.call("inbox.ack", json!({"id": id})).await?;
+    if as_json {
+        println!("{result}");
+        return Ok(());
+    }
+    if result["already"].as_bool().unwrap_or(false) {
+        println!("{id} was already acked");
+    } else {
+        println!("acked {id} — the re-notify sweep will stop pushing it");
+    }
+    Ok(())
+}
+
 fn total_tokens(usage: &Value) -> u64 {
     ["input", "output", "cache_read", "cache_creation"]
         .iter()

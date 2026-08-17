@@ -257,7 +257,7 @@ fn steward_escalation_notice(tuple: &Tuple) -> EscalationNotice {
 /// [`SinkFactory::with_kind`] line. Nothing downstream — not
 /// [`Reactor::notify_escalation`], not `SinkRegistry::fan_out`, not any
 /// escalation source — learns about it.
-fn sink_factory() -> SinkFactory {
+pub(crate) fn sink_factory() -> SinkFactory {
     SinkFactory::builtin().with_kind(rk_core::config::HERDR_SINK_KIND, |_| {
         Ok(Box::new(rk_mux::HerdrSink) as Box<dyn NotificationSink>)
     })

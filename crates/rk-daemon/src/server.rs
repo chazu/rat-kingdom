@@ -137,6 +137,9 @@ pub struct Daemon {
     sweep_config: rk_core::config::SupervisorConfig,
     review_sweep_config: rk_core::config::ReviewSweepConfig,
     worktree_sweep_config: rk_core::config::WorktreeSweepConfig,
+    /// B2 re-notify sweep: how often an unacked `recovery-action` escalation
+    /// re-pushes. See `crate::recovery::renotify_sweep`.
+    recovery_sweep_config: rk_core::config::RecoverySweepConfig,
     drain_config: rk_core::config::DrainConfig,
     evaporation_decay: f64,
     ingest_config: rk_core::config::IngestConfig,
@@ -258,6 +261,7 @@ impl Daemon {
         }
         daemon.review_sweep_config = config.review_sweep.clone();
         daemon.worktree_sweep_config = config.worktree_sweep.clone();
+        daemon.recovery_sweep_config = config.recovery_sweep.clone();
         daemon.supervisor.set_min_free_disk_gb(config.disk.min_free_gb);
         daemon.drain_config = config.drain.clone();
         daemon.evaporation_decay = config.evaporation.decay;
@@ -347,6 +351,11 @@ impl Daemon {
     #[doc(hidden)]
     pub fn set_worktree_sweep_config(&mut self, cfg: rk_core::config::WorktreeSweepConfig) {
         self.worktree_sweep_config = cfg;
+    }
+
+    #[doc(hidden)]
+    pub fn set_recovery_sweep_config(&mut self, cfg: rk_core::config::RecoverySweepConfig) {
+        self.recovery_sweep_config = cfg;
     }
 
     #[doc(hidden)]
@@ -447,6 +456,15 @@ impl Daemon {
                 enabled: false,
                 finalize_cleanup_enabled: false,
                 ..rk_core::config::WorktreeSweepConfig::default()
+            },
+            // Same reasoning as `worktree_sweep_config` above: the default is
+            // `enabled: true`, but a bare/test constructor must not grow a new
+            // periodic background loop that existing e2e tests never asked
+            // for. `Daemon::new`'s config-loading path is the only one that
+            // turns it on.
+            recovery_sweep_config: rk_core::config::RecoverySweepConfig {
+                enabled: false,
+                ..rk_core::config::RecoverySweepConfig::default()
             },
             drain_config: rk_core::config::DrainConfig::default(),
             evaporation_decay: rk_core::config::EvaporationConfig::default().decay,
@@ -663,6 +681,34 @@ impl Daemon {
                             }
                         }
                         _ = ws_shutdown.changed() => break,
+                    }
+                }
+            });
+        }
+
+        // B2 re-notify sweep: an unacked `recovery-action` escalation
+        // re-pushes at `first_renotify_secs`, then every
+        // `repeat_renotify_secs`, up to `max_renotifies` times — after which
+        // it stands as a passive `rk inbox` row with no further pushes. `rk
+        // inbox ack <id>` is the only thing that stops it early.
+        if daemon.recovery_sweep_config.enabled {
+            let daemon_ref = Arc::clone(&daemon);
+            let mut rc_shutdown = daemon.shutdown_tx.subscribe();
+            let interval = Duration::from_secs(daemon.recovery_sweep_config.interval_secs.max(1));
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            let d = Arc::clone(&daemon_ref);
+                            match tokio::task::spawn_blocking(move || d.recovery_renotify_sweep_once()).await {
+                                Ok(0) => {}
+                                Ok(n) => debug!(pushed = n, "recovery re-notify sweep pushed escalations"),
+                                Err(e) => warn!(error = %e, "recovery re-notify sweep task panicked"),
+                            }
+                        }
+                        _ = rc_shutdown.changed() => break,
                     }
                 }
             });
@@ -1899,6 +1945,7 @@ impl Daemon {
             }
             "budget.rollup" => reply(Response::ok(id, self.supervisor.fleet_rollup())),
             "inbox.list" => reply(self.handle_inbox(req).await),
+            "inbox.ack" => reply(self.handle_inbox_ack(req)),
             "agent.status" => reply(self.handle_named(req, |sup, name| {
                 sup.status(&name)
                     .map(|r| json!({"agent": r}))
@@ -2395,7 +2442,20 @@ impl Daemon {
             Ok(cleared) => cleared,
             Err(e) => return Err(e),
         };
-        let items = crate::inbox::build(
+        // Automated recovery-action escalations (B2) and their acks. `rk
+        // inbox` surfaces an unacked one via `recovery_action_rows`, a plain
+        // function rather than a `build` input — see its doc comment for why.
+        let recovery_actions =
+            match scan(Pattern::category(Category::Event).identity(crate::recovery::RECOVERY_ACTION_IDENTITY)) {
+                Ok(t) => t,
+                Err(e) => return Err(e),
+            };
+        let recovery_acks =
+            match scan(Pattern::category(Category::Event).identity(crate::recovery::INBOX_ACK_IDENTITY)) {
+                Ok(t) => t,
+                Err(e) => return Err(e),
+            };
+        let mut items = crate::inbox::build(
             &agents,
             &instances,
             &obstacles,
@@ -2418,7 +2478,11 @@ impl Daemon {
                 now: chrono::Utc::now(),
             },
         );
-        let mut items = items;
+        items.extend(crate::inbox::recovery_action_rows(
+            &recovery_actions,
+            &recovery_acks,
+        ));
+        items.sort_by_key(|b| std::cmp::Reverse(b.urgency));
         let mut response_truncated = source_truncated || items.len() > MAX_INBOX_ITEMS;
         items.truncate(MAX_INBOX_ITEMS);
         // A single tuple can carry a large operator-authored detail string, so
@@ -2447,6 +2511,83 @@ impl Daemon {
         match self.inbox_value(params.repo).await {
             Ok(value) => Response::ok(req.id, value),
             Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
+        }
+    }
+
+    /// `inbox.ack` (B2) — durably close out a `recovery-action` inbox row so
+    /// the re-notify sweep (`crate::recovery::renotify_sweep`) stops pushing
+    /// it. Sink-agnostic by design: this is the one path a human `rk inbox
+    /// ack` and a future rat-king sink both go through, mirroring
+    /// `space.withdraw`'s own RPC-not-`space.out` shape — writing the ack
+    /// directly here, rather than accepting an `Ack` tuple through
+    /// `handle_out`, is what lets this stay idempotent (a re-run reports
+    /// `already: true` instead of failing) without a caller having to scan
+    /// first.
+    fn handle_inbox_ack(&self, req: Request) -> Response {
+        let params: InboxAckParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let id = params.id.trim().to_string();
+        let record_id: RecordId = match id.parse() {
+            Ok(id) => id,
+            Err(_) => {
+                return Response::err(
+                    req.id,
+                    codes::BAD_PARAMS,
+                    format!("`{id}` is not a valid tuple id"),
+                )
+            }
+        };
+        let target = match self.space.get(record_id) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                return Response::err(req.id, codes::BAD_PARAMS, format!("no tuple {id}"))
+            }
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        if target.category != Category::Event
+            || target.identity != crate::recovery::RECOVERY_ACTION_IDENTITY
+        {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                format!("{id} is not a recovery-action escalation"),
+            );
+        }
+        let mut already = Pattern::category(Category::Event)
+            .identity(crate::recovery::INBOX_ACK_IDENTITY);
+        already.payload_search = Some(format!("\"tuple\":\"{id}\""));
+        match self.space.has_persistence_event_matching(&already) {
+            Ok(true) => {
+                return Response::ok(
+                    req.id,
+                    json!({"acked": id, "already": true, "written": false}),
+                )
+            }
+            Ok(false) => {}
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+        let caller = req.caller.clone();
+        let by = if caller.is_empty() {
+            OPERATOR_ACTOR.to_string()
+        } else {
+            caller
+        };
+        let ack = Tuple::new(
+            Category::Event,
+            target.scope.clone(),
+            crate::recovery::INBOX_ACK_IDENTITY,
+            by.clone(),
+            json!({"tuple": id, "acked_by": by}),
+        )
+        .with_lifecycle(Lifecycle::Furniture);
+        match self.space.out(ack) {
+            Ok(()) => Response::ok(
+                req.id,
+                json!({"acked": id, "already": false, "written": true, "by": by}),
+            ),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
     }
 
@@ -2645,6 +2786,29 @@ impl Daemon {
                 .unwrap_or(0),
             Err(e) => {
                 warn!(error = %e, "worktree sweep: archive_agents failed");
+                0
+            }
+        }
+    }
+
+    /// B2 re-notify sweep body: re-push every unacked `recovery-action`
+    /// escalation whose next scheduled re-notify is due. Builds its own
+    /// [`rk_core::notify::SinkRegistry`] from the SAME `[[notify.sinks]]`
+    /// config the reactor's first push used, so a re-notify reaches exactly
+    /// the channel set the original announce did — sinks are stateless
+    /// shell-outs (B1), so a second registry instance is free to build.
+    fn recovery_renotify_sweep_once(&self) -> usize {
+        let sinks = crate::reactor::sink_factory()
+            .registry(self.notify_config.resolved(self.reactor_config.notify_escalations));
+        let schedule = crate::recovery::RenotifySchedule {
+            first: Duration::from_secs(self.recovery_sweep_config.first_renotify_secs.max(1)),
+            repeat: Duration::from_secs(self.recovery_sweep_config.repeat_renotify_secs.max(1)),
+            max: self.recovery_sweep_config.max_renotifies,
+        };
+        match crate::recovery::renotify_sweep(&self.space, &sinks, &schedule, chrono::Utc::now()) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(error = %e, "recovery re-notify sweep failed");
                 0
             }
         }
@@ -5914,6 +6078,11 @@ struct NameParams {
 struct InboxParams {
     #[serde(default)]
     repo: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct InboxAckParams {
+    id: String,
 }
 
 /// `agent.list` view selector. Defaults keep the reply to the live registry so
