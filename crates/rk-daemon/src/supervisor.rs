@@ -1501,7 +1501,7 @@ impl Supervisor {
                 // The process is gone, so no further turn can follow: a turn
                 // result held back for want of a `rk done` is now provably this
                 // generation's last word, and must be published. Harnesses that
-                // end with the run (codex, axe, the test fake) take this path
+                // end with the run (codex, the test fake) take this path
                 // for every agent; a Claude session — which stays alive between
                 // turns to receive steers — normally reports at its `rk done`
                 // and only lands here when it is killed mid-task.
@@ -1526,7 +1526,7 @@ impl Supervisor {
                 // `is_error: false` to the workflow waiting on it.
                 //
                 // What survived was the same lie told more quietly: a rat that
-                // exited 0 mid-task — every codex/axe run, whose harness ends
+                // exited 0 mid-task — every codex run, whose harness ends
                 // with the run rather than staying alive between turns — also
                 // published `is_error: false`, and every workflow gating on
                 // `expect {is_error: false}` accepted an unfinished task. How
@@ -4478,7 +4478,7 @@ mod respawn_tests {
         assert_eq!(permission_mode("onboarder", "claude").unwrap(), "plan");
         assert_eq!(permission_mode("onboarder", "jcode").unwrap(), "read-only");
         assert!(
-            permission_mode("onboarder", "axe").is_err(),
+            permission_mode("onboarder", "unknown").is_err(),
             "a harness without an enforced read-only mode must fail closed"
         );
         assert_eq!(

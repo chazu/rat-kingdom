@@ -714,7 +714,7 @@ impl Default for LogConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct HarnessConfig {
-    /// Default harness kind for spawned rats: "claude" | "codex" | "axe" | "jcode".
+    /// Default harness kind for spawned rats: "claude" | "codex" | "jcode".
     pub default: String,
 }
 
@@ -835,7 +835,7 @@ mod tests {
             &file,
             r#"
 [agents.cheap]
-harness = "axe"
+harness = "codex"
 model = "haiku"
 
 [[tiers.rules]]

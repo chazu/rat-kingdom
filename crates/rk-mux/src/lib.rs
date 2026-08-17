@@ -246,7 +246,7 @@ mod tests {
         assert!(claude.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(!claude.contains(&"--permission-mode".to_string()));
 
-        assert!(interactive_argv("axe", None, None, None).is_err());
+        assert!(interactive_argv("fake", None, None, None).is_err());
     }
 
     #[test]

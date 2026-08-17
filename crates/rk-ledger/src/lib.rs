@@ -1,7 +1,7 @@
 //! Cost ledger: tokens→USD pricing and budget policy.
 //!
 //! Harnesses that self-report USD (Claude Code) are authoritative; for the
-//! rest (codex, axe) cost is computed from token deltas against a pricing
+//! rest (codex) cost is computed from token deltas against a pricing
 //! table. The vendored table is a curated subset of LiteLLM's
 //! `model_prices_and_context_window.json` (the de facto standard ccusage and
 //! OpenCode also use); `merge_pricing_json` layers a runtime refresh or user

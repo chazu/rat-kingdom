@@ -255,7 +255,7 @@ mod tests {
     fn tier_layer_beats_named_profile_but_loses_to_inline() {
         let global = HashMap::from([
             ("default".into(), profile(Some("claude"), Some("opus"))),
-            ("cheap".into(), profile(Some("axe"), Some("haiku"))),
+            ("cheap".into(), profile(Some("codex"), Some("haiku"))),
             ("premium".into(), profile(Some("claude"), Some("opus"))),
         ]);
         // Step names the `premium` profile, but a routing rule selected `cheap`;
@@ -271,7 +271,7 @@ mod tests {
             "fake",
         )
         .unwrap();
-        assert_eq!(resolved.harness, "axe", "tier harness beats named profile");
+        assert_eq!(resolved.harness, "codex", "tier harness beats named profile");
         assert_eq!(resolved.model.as_deref(), Some("haiku"));
 
         // An inline model override still beats the tier.
@@ -286,7 +286,7 @@ mod tests {
             "fake",
         )
         .unwrap();
-        assert_eq!(resolved.harness, "axe", "tier harness applies");
+        assert_eq!(resolved.harness, "codex", "tier harness applies");
         assert_eq!(
             resolved.model.as_deref(),
             Some("sonnet"),
