@@ -82,6 +82,14 @@ Macros: `@yearly`/`@annually`, `@monthly`, `@weekly`, `@daily`/`@midnight`,
   conservative fallback. Nested child instances are excluded from that fallback.
   A slow nightly drain therefore never stacks a second copy on itself, even
   across a daemon restart.
+- **Stale-running bypass.** A `Running` instance older than
+  `stale_running_hours` (default 6h — above rat p99 runtime, well below the
+  typical 24h nightly cadence) no longer counts as a single-flight block, so a
+  wedged instance can't make its schedule skip forever. The bypass is
+  escalated via a `need` tuple rather than silently ignored, and is idempotent
+  per instance: the same wedged instance emits exactly one escalation `need`,
+  no matter how many matching minutes or code paths see it before it's
+  cleared (e.g. by a replacement dispatch finally succeeding).
 
 Overnight cost is otherwise bounded by the fleet/repo budget caps
 (`rk_ledger::FleetBudget`), which refuse new dispatch once a cap is hit — the
@@ -120,13 +128,19 @@ shapes.
 
 ```toml
 [scheduler]
-enabled = true          # master switch; false = the scheduler loop never starts
-interval_secs = 30      # how often to check for a new cron minute; clamped [1,60]
-catchup_minutes = 1440  # bound on look-back after downtime; 0 = current minute only
+enabled = true             # master switch; false = the scheduler loop never starts
+interval_secs = 30         # how often to check for a new cron minute; clamped [1,60]
+catchup_minutes = 1440     # bound on look-back after downtime; 0 = current minute only
+stale_running_hours = 6    # age past which a wedged Running instance stops blocking its schedule
 ```
 
 `interval_secs` is clamped to `[1, 60]`: the loop must tick at least once a
 minute or a matching minute would be skipped.
+
+`stale_running_hours` bounds how long a single-flight `Running` instance can
+block its own schedule before the scheduler bypasses it (see "Stale-running
+bypass" above). Set it higher than your slowest legitimate run and comfortably
+below the schedule's own cadence.
 
 ## Where it lives
 
