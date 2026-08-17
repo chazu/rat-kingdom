@@ -67,6 +67,15 @@ pub struct UpdateArgs {
     /// Re-parent under another ticket.
     #[arg(long)]
     pub parent: Option<String>,
+    /// Add a label, keeping the ones already set (repeatable). This is how a
+    /// backlog groom applies a freeze tag, e.g.
+    /// `--add-label frozen:onboarding-wizard`.
+    #[arg(long = "add-label")]
+    pub add_labels: Vec<String>,
+    /// Remove a label (repeatable) — e.g. lifting a freeze tag when a
+    /// subsystem thaws.
+    #[arg(long = "remove-label")]
+    pub remove_labels: Vec<String>,
 }
 
 pub async fn new(layout: &Layout, args: NewArgs, as_json: bool) -> Result<()> {
@@ -278,6 +287,12 @@ pub async fn update(layout: &Layout, args: UpdateArgs, as_json: bool) -> Result<
         if let Some(v) = value {
             params[key] = json!(v);
         }
+    }
+    if !args.add_labels.is_empty() {
+        params["add_labels"] = json!(args.add_labels);
+    }
+    if !args.remove_labels.is_empty() {
+        params["remove_labels"] = json!(args.remove_labels);
     }
     let result = client.call("ticket.update", params).await?;
     let ticket = &result["ticket"];
