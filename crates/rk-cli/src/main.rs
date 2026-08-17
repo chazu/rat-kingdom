@@ -609,7 +609,7 @@ async fn decide(
     Ok(())
 }
 
-const PRIME_ROLES: [&str; 7] = [
+const PRIME_ROLES: [&str; 8] = [
     "operator",
     "onboarding",
     "rat",
@@ -617,6 +617,7 @@ const PRIME_ROLES: [&str; 7] = [
     "foreman",
     "verifier",
     "onboarder",
+    "diagnostician",
 ];
 
 fn print_prime(role: String, json_output: bool) -> Result<()> {

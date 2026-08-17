@@ -4,6 +4,7 @@
 
 use crate::agents::{AgentProgress, AgentRecord, AgentState, Registry};
 use crate::onboarding_sessions::{onboarding_branch, onboarding_worktree, ONBOARDER_ROLE};
+use crate::read_only_roles::{is_read_only_role, DIAGNOSTICIAN_ROLE};
 use chrono::{DateTime, Utc};
 use rk_core::config::SupervisorConfig;
 use rk_core::paths::Layout;
@@ -142,10 +143,10 @@ fn effective_agent_config(
     default_agent: &AgentProfile,
     params: &SpawnParams,
 ) -> rk_core::Result<EffectiveAgentConfig> {
-    // Onboarding is an assessment boundary: global worker defaults must never
-    // widen it. Explicit harness/model selection remains available, while the
-    // permission mode is forced by role.
-    if params.role == ONBOARDER_ROLE {
+    // A read-only role is an assessment boundary: global worker defaults must
+    // never widen it. Explicit harness/model selection remains available, while
+    // the permission mode is forced by role.
+    if is_read_only_role(&params.role) {
         let harness = params
             .harness
             .clone()
@@ -211,29 +212,24 @@ fn validate_permission_mode(harness: &str, permission_mode: &str) -> rk_core::Re
 pub fn validate_role(role: &str) -> rk_core::Result<()> {
     if matches!(
         role,
-        "rat" | "reviewer" | "foreman" | "verifier" | ONBOARDER_ROLE
+        "rat" | "reviewer" | "foreman" | "verifier" | ONBOARDER_ROLE | DIAGNOSTICIAN_ROLE
     ) {
         Ok(())
     } else {
         Err(rk_core::Error::other(format!(
-            "unknown agent role {role:?}; expected rat, reviewer, foreman, verifier, or onboarder"
+            "unknown agent role {role:?}; expected rat, reviewer, foreman, verifier, \
+             onboarder, or diagnostician"
         )))
     }
 }
 
-/// Onboarders are assessment-only. Their filesystem boundary is enforced by
-/// the harness rather than by prompt prose, and callers cannot override it.
+/// Read-only roles are assessment-only. Their filesystem boundary is enforced
+/// by the harness rather than by prompt prose, and callers cannot override it.
 fn permission_mode(role: &str, harness: &str) -> rk_core::Result<String> {
-    if role != ONBOARDER_ROLE {
+    if !is_read_only_role(role) {
         return Ok(default_permission_mode(harness).into());
     }
-    match harness {
-        "claude" => Ok("plan".into()),
-        "codex" | "fake" | "jcode" => Ok("read-only".into()),
-        other => Err(rk_core::Error::other(format!(
-            "harness {other:?} has no enforced read-only onboarding mode"
-        ))),
-    }
+    crate::read_only_roles::permission_mode(harness)
 }
 
 fn uses_harness_terminal_completion(role: &str, harness: &str) -> bool {
