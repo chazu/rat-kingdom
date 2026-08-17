@@ -45,6 +45,14 @@ impl AgentState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRecord {
     pub name: String,
+    /// Identity of this generation — the join key (`docs/2026-08-17-tkt-c1-generation-identity.md`).
+    /// `None` on a pre-migration record; use [`AgentRecord::spawn_id`], never
+    /// this field directly, so a reader always gets a stable id whether the
+    /// record was minted with one or predates the type. Never rewritten into
+    /// `agents.json` for a backfilled record — the accessor derives it fresh
+    /// every load instead.
+    #[serde(default)]
+    pub spawn: Option<rk_core::id::SpawnId>,
     pub role: String,
     #[serde(default)]
     pub coordination: Option<Coordination>,
@@ -169,6 +177,17 @@ impl AgentRecord {
     /// where `created_at` tells the archived copy from the live one.
     fn generation(&self) -> (&str, DateTime<Utc>) {
         (self.name.as_str(), self.created_at)
+    }
+
+    /// This generation's [`rk_core::id::SpawnId`] — the join key a consumer
+    /// should key on instead of `name` (§2.2 of the design doc). Records
+    /// minted after the migration carry one; a `None` (pre-migration) record
+    /// gets a deterministic synthetic id derived from `created_at`, computed
+    /// fresh on every call rather than rewritten into storage — see
+    /// [`rk_core::id::SpawnId::synthetic_for`].
+    pub fn spawn_id(&self) -> rk_core::id::SpawnId {
+        self.spawn
+            .unwrap_or_else(|| rk_core::id::SpawnId::synthetic_for(self.created_at))
     }
 }
 
@@ -644,6 +663,7 @@ mod tests {
     fn record(name: &str, state: AgentState) -> AgentRecord {
         AgentRecord {
             name: name.into(),
+            spawn: None,
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),

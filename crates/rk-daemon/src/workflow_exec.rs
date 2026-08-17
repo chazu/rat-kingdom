@@ -694,6 +694,14 @@ pub struct FannedAgent {
     pub agent: String,
     pub branch: Option<String>,
     pub ticket: Option<String>,
+    /// This generation's join key, captured at fan-out time. `dismiss_all`
+    /// verifies it against the live registry row before acting — see
+    /// `Supervisor::dismiss_checked` — so a fanned dismiss can never tear down
+    /// a different generation that came to hold `agent`'s name later.
+    /// `None` for a fan-out built before this migration; preserves the old
+    /// unchecked behaviour rather than refusing to dismiss.
+    #[serde(default)]
+    pub spawn: Option<rk_core::id::SpawnId>,
 }
 
 /// Control-flow signal threaded out of a step (or nested step sequence).
@@ -2210,6 +2218,7 @@ impl WorkflowEngine {
                 agent: record.name.clone(),
                 branch: record.branch.clone(),
                 ticket: Some(item.id),
+                spawn: record.spawn,
             });
         }
         Ok(fanned)
@@ -2248,7 +2257,19 @@ impl WorkflowEngine {
     /// `Supervisor::claim_completion`), because `wait` is not the only reader:
     /// the reactor's steward trigger and the ticket auto-close read the same
     /// event. Do not reintroduce a per-turn `harness_result`.
+    ///
+    /// Generation-identity migration (consumer B1,
+    /// `docs/2026-08-17-tkt-c1-generation-identity.md`): every `harness_result`
+    /// now carries `spawn` (`Supervisor::route_completion`), so a reachable
+    /// registry record with a minted `SpawnId` keys the read on
+    /// [`Pattern::for_spawn`] instead — an equality predicate that cannot match
+    /// a namesake regardless of timing, no floor required. Falls back to the
+    /// name+floor predicate only for a record with no minted id (unreachable,
+    /// or written before this migration).
     fn result_pattern(&self, id: &str, agent: &str) -> Pattern {
+        if let Some(spawn) = self.supervisor.status(agent).and_then(|r| r.spawn) {
+            return Pattern::for_spawn(Category::Event, "harness_result", spawn);
+        }
         Pattern::for_agent_since(
             Category::Event,
             "harness_result",
@@ -2538,6 +2559,7 @@ impl WorkflowEngine {
         for fa in fanout {
             let supervisor = Arc::clone(&self.supervisor);
             let agent = fa.agent.clone();
+            let spawn = fa.spawn;
             // Base no_merge from the step, plus: under only_clean, park (don't
             // merge) any agent not in the clean set.
             let parked = clean
@@ -2545,7 +2567,7 @@ impl WorkflowEngine {
                 .is_some_and(|clean| !clean.contains(&fa.agent));
             let no_merge = dismiss_all.no_merge || parked;
             set.spawn(async move {
-                let outcome = supervisor.dismiss(&agent, no_merge).await;
+                let outcome = supervisor.dismiss_checked(&agent, spawn, no_merge).await;
                 (agent, parked, outcome)
             });
         }

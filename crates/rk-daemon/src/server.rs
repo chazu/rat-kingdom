@@ -6823,6 +6823,7 @@ mod authorize_reasoned_tests {
         let now = chrono::Utc::now();
         let record = AgentRecord {
             name: "invalid-rat".into(),
+            spawn: None,
             role: role.into(),
             coordination: None,
             harness: "fake".into(),

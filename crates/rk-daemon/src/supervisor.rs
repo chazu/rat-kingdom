@@ -263,6 +263,7 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
     let now = Utc::now();
     AgentRecord {
         name: journal.name,
+        spawn: Some(rk_core::id::SpawnId::new()),
         role: journal.params.role.clone(),
         coordination: journal.params.coordination.clone(),
         harness: journal.harness,
@@ -2648,6 +2649,12 @@ impl Supervisor {
             "harness_result",
             json!({
                 "agent": record.name,
+                // Generation join key (docs/2026-08-17-tkt-c1-generation-identity.md,
+                // consumer C3): the producer side of B1/C1's dual-key read. A
+                // namesake predecessor's `harness_result` never carries this
+                // generation's id, so a spawn-keyed reader cannot match it —
+                // unlike "agent", which only a name+floor test disambiguates.
+                "spawn": record.spawn_id().to_string(),
                 // The completed agent's role ("rat", "reviewer", ...). Carried so
                 // a reactor trigger can scope reactively — e.g. the steward fires
                 // on `"role":"rat"` completions only, which also breaks its own
@@ -2939,7 +2946,29 @@ impl Supervisor {
     /// branch delete on success), or a `Pr` push + opened pull/merge request
     /// that leaves the branch standing for review. Always removes the worktree.
     pub async fn dismiss(&self, name: &str, no_merge: bool) -> rk_core::Result<serde_json::Value> {
-        self.dismiss_inner(name, no_merge, false).await
+        self.dismiss_inner(name, no_merge, false, None).await
+    }
+
+    /// Same as [`dismiss`](Self::dismiss), but for a caller that captured a
+    /// specific generation's [`rk_core::id::SpawnId`] earlier (a fan-out
+    /// member, at the moment it was spawned) and must not act on whoever
+    /// currently holds `name` if that is no longer the same generation.
+    ///
+    /// This is the fan-out half of the generation-identity migration
+    /// (`docs/2026-08-17-tkt-c1-generation-identity.md`, consumers B3/B4):
+    /// `dismiss_all` used to resolve purely by name, so a fanned-out
+    /// `dismiss` could — if the name it captured were ever reused before the
+    /// dismiss ran — tear down a different, unrelated live rat instead of the
+    /// one it fanned out. `expected_spawn: None` (a pre-migration
+    /// `FannedAgent` with no `spawn`) preserves the old, unchecked behaviour.
+    pub async fn dismiss_checked(
+        &self,
+        name: &str,
+        expected_spawn: Option<rk_core::id::SpawnId>,
+        no_merge: bool,
+    ) -> rk_core::Result<serde_json::Value> {
+        self.dismiss_inner(name, no_merge, false, expected_spawn)
+            .await
     }
 
     /// Same as [`dismiss`](Self::dismiss), except when `park_if_dirty` is set:
@@ -2955,12 +2984,23 @@ impl Supervisor {
         name: &str,
         no_merge: bool,
         park_if_dirty: bool,
+        expected_spawn: Option<rk_core::id::SpawnId>,
     ) -> rk_core::Result<serde_json::Value> {
         let record = self
             .lock_registry()
             .get(name)
             .cloned()
             .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
+        if let Some(expected) = expected_spawn {
+            let actual = record.spawn_id();
+            if actual != expected {
+                return Err(rk_core::Error::other(format!(
+                    "dismiss target mismatch: {name} is now a different generation than the \
+                     one this caller fanned out (expected spawn {expected}, found {actual}); \
+                     refusing to act on a stranger"
+                )));
+            }
+        }
 
         // Drop any held-back turn result BEFORE the kill: the `Exited` this
         // provokes must not publish a late `harness_result` for an agent the
@@ -3179,7 +3219,7 @@ impl Supervisor {
     /// stop the sweep or the instance's own terminal-state persistence, which
     /// must succeed regardless of whether every spawned agent could be swept.
     pub async fn dismiss_orphaned_instance_agents(&self, instance: &str) -> Vec<(String, bool)> {
-        let names: Vec<String> = {
+        let names: Vec<(String, rk_core::id::SpawnId)> = {
             let reg = self.lock_registry();
             reg.list()
                 .into_iter()
@@ -3187,12 +3227,12 @@ impl Supervisor {
                     a.workflow_instance.as_deref() == Some(instance)
                         && matches!(a.state, AgentState::Completed | AgentState::Failed)
                 })
-                .map(|a| a.name.clone())
+                .map(|a| (a.name.clone(), a.spawn_id()))
                 .collect()
         };
         let mut results = Vec::with_capacity(names.len());
-        for name in names {
-            match self.dismiss_inner(&name, true, true).await {
+        for (name, spawn) in names {
+            match self.dismiss_inner(&name, true, true, Some(spawn)).await {
                 Ok(_) => results.push((name, true)),
                 Err(error) => {
                     warn!(agent = %name, instance, %error, "finalize-time cleanup sweep could not dismiss agent");
@@ -4510,6 +4550,7 @@ mod respawn_tests {
         let now = Utc::now();
         AgentRecord {
             name: "Nibble".into(),
+            spawn: None,
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),
@@ -4595,6 +4636,64 @@ mod respawn_tests {
 
         // (e) No branch recorded => not merged (fail-safe, respawn preflight handles it).
         assert!(!sup.branch_already_merged(&record(p, None)));
+    }
+
+    /// The TKT-146 scenario, closed structurally
+    /// (`docs/2026-08-17-tkt-c1-generation-identity.md`, consumers B3/B4): a
+    /// fan-out's dismiss must not act on whoever currently holds the captured
+    /// name if that is a different generation than the one fanned out over —
+    /// the shape that let a `dismiss_all` SIGTERM a live rat one second into
+    /// its task because a namesake predecessor satisfied the read behind it.
+    #[tokio::test]
+    async fn dismiss_checked_refuses_a_namesake_that_is_not_the_expected_generation() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+
+        let fanned_out_spawn = rk_core::id::SpawnId::new();
+        let mut live = record(repo.path(), None);
+        live.name = "Nibble".into();
+        // A DIFFERENT generation now holds the name "Nibble" than the one this
+        // caller's fan-out captured.
+        live.spawn = Some(rk_core::id::SpawnId::new());
+        assert_ne!(live.spawn, Some(fanned_out_spawn));
+        sup.lock_registry().insert(live).unwrap();
+
+        let outcome = sup
+            .dismiss_checked("Nibble", Some(fanned_out_spawn), true)
+            .await;
+        let error = outcome.expect_err("must refuse to dismiss a different generation");
+        assert!(
+            error.to_string().contains("dismiss target mismatch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The companion case: when the live record IS the expected generation,
+    /// `dismiss_checked` must behave exactly like `dismiss` — the guard is a
+    /// pure precondition, not an extra restriction on the happy path.
+    #[tokio::test]
+    async fn dismiss_checked_proceeds_when_the_generation_matches() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+
+        let spawn = rk_core::id::SpawnId::new();
+        let mut live = record(repo.path(), None);
+        live.name = "Nibble".into();
+        live.spawn = Some(spawn);
+        // No worktree/branch to reconcile — isolates the assertion to the
+        // generation guard itself, not the rest of dismiss's git plumbing.
+        live.worktree = None;
+        sup.lock_registry().insert(live).unwrap();
+
+        let outcome = sup.dismiss_checked("Nibble", Some(spawn), true).await;
+        assert!(
+            outcome.is_ok(),
+            "the expected generation must not be refused: {outcome:?}"
+        );
     }
 
     #[test]

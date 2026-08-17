@@ -689,6 +689,7 @@ mod tests {
     ) -> AgentRecord {
         AgentRecord {
             name: name.into(),
+            spawn: None,
             role: "rat".into(),
             coordination: None,
             harness: harness.into(),
