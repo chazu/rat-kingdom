@@ -189,7 +189,15 @@ impl RecoveryAnnouncer {
         Self::default()
     }
 
-    fn rate_limited(&self, kind: &str, cap: &RateCap) -> bool {
+    /// Atomically checks the rolling cap for `kind` AND, if under cap,
+    /// records this fire — in one critical section. Splitting this into a
+    /// separate check-then-record pair (as an earlier version did) lets two
+    /// concurrent callers both observe "under cap" before either records its
+    /// fire, so both proceed and the cap is silently exceeded by however many
+    /// callers race the same window. Returns `true` if the action is held
+    /// (over cap); a held action does NOT record a fire, matching the
+    /// original record-fire-only-when-not-held behavior.
+    fn check_and_record(&self, kind: &str, cap: &RateCap) -> bool {
         if cap.max == 0 {
             return false;
         }
@@ -198,12 +206,11 @@ impl RecoveryAnnouncer {
         let mut fires = self.fires.lock().unwrap_or_else(|p| p.into_inner());
         let entry = fires.entry(kind.to_string()).or_default();
         entry.retain(|t| now.duration_since(*t) < window);
-        entry.len() as u32 >= cap.max
-    }
-
-    fn record_fire(&self, kind: &str) {
-        let mut fires = self.fires.lock().unwrap_or_else(|p| p.into_inner());
-        fires.entry(kind.to_string()).or_default().push(Instant::now());
+        let held = entry.len() as u32 >= cap.max;
+        if !held {
+            entry.push(now);
+        }
+        held
     }
 
     /// THE shared entry point for an automated recovery action: durably
@@ -223,7 +230,7 @@ impl RecoveryAnnouncer {
         action: RecoveryAction,
         cap: RateCap,
     ) -> rk_core::Result<AnnounceOutcome> {
-        let held = self.rate_limited(&action.kind, &cap);
+        let held = self.check_and_record(&action.kind, &cap);
         let mut notice = action.notice;
         if held {
             notice.severity = Severity::Critical;
@@ -254,9 +261,6 @@ impl RecoveryAnnouncer {
             "notice": notice,
         });
         space.out(tuple)?;
-        if !held {
-            self.record_fire(&action.kind);
-        }
         sinks.fan_out(&notice, &SpaceDedup { space });
         let event_id = notice.tuple_id;
         Ok(if held {
@@ -510,6 +514,71 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("rate cap hit"));
+    }
+
+    #[test]
+    fn concurrent_announces_cannot_exceed_the_cap() {
+        // Regression for a race where `rate_limited` (check) and
+        // `record_fire` (record) were separate critical sections: many
+        // threads could all observe "under cap" before any of them recorded
+        // a fire, letting the cap be exceeded. `check_and_record` closes that
+        // window by doing both under one lock. Set up one remaining slot
+        // (cap of N, N-1 already spent) and have N threads race it — exactly
+        // one must win.
+        let space = Space::open_in_memory().unwrap();
+        let (sinks, recorder) = registry();
+        let sinks = std::sync::Arc::new(sinks);
+        let announcer = std::sync::Arc::new(RecoveryAnnouncer::new());
+        let cap = RateCap::per_hour(6);
+
+        for i in 0..5 {
+            let outcome = announcer
+                .announce(
+                    &space,
+                    &sinks,
+                    RecoveryAction {
+                        kind: "respawn".into(),
+                        instance: "supervisor".into(),
+                        notice: notice("myrepo", &format!("warmup-{i}")),
+                    },
+                    cap,
+                )
+                .unwrap();
+            assert!(!outcome.held(), "warmup fires must not be held");
+        }
+        recorder.lock().unwrap().clear();
+
+        const RACERS: usize = 16;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(RACERS));
+        let handles: Vec<_> = (0..RACERS)
+            .map(|i| {
+                let announcer = announcer.clone();
+                let space = space.clone();
+                let sinks = sinks.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    announcer
+                        .announce(
+                            &space,
+                            &sinks,
+                            RecoveryAction {
+                                kind: "respawn".into(),
+                                instance: "supervisor".into(),
+                                notice: notice("myrepo", &format!("racer-{i}")),
+                            },
+                            cap,
+                        )
+                        .unwrap()
+                })
+            })
+            .collect();
+        let outcomes: Vec<AnnounceOutcome> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let winners = outcomes.iter().filter(|o| !o.held()).count();
+        assert_eq!(winners, 1, "exactly one racer must win the remaining slot");
+        assert_eq!(outcomes.len() - winners, RACERS - 1);
     }
 
     #[test]
