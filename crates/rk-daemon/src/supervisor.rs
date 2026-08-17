@@ -304,6 +304,92 @@ where
         .map_err(|e| rk_core::Error::other(format!("{operation} task failed: {e}")))?
 }
 
+/// Free-function core of [`Supervisor::repository_policy`] — split out so the
+/// ticket-delivery gate can resolve a policy from an owned `home` path inside
+/// a `'static` spawned task, without borrowing a `Supervisor`.
+fn resolve_repository_policy(home: &std::path::Path, repo: &Repo) -> rk_workflow::RepositoryPolicy {
+    let path = home.join("repos.json");
+    crate::repos::RepoRegistry::load(&path)
+        .ok()
+        .and_then(|registry| {
+            registry
+                .get_by_path(repo.root())
+                .map(|record| record.effective_policy())
+        })
+        .unwrap_or_default()
+}
+
+/// Why `branch` has not been delivered under `policy`'s mode, or `None` if it
+/// has (or the mode isn't gated). `gate_push_branch` controls whether
+/// `push-branch` is enforced — see [`Supervisor::require_ticket_delivered`]
+/// for why the automatic completion path leaves it `false`.
+fn ticket_undelivered_reason(
+    policy: &rk_workflow::RepositoryPolicy,
+    repo: &Repo,
+    branch: &str,
+    target: &str,
+    gate_push_branch: bool,
+) -> Option<String> {
+    match policy.delivery.mode {
+        DeliveryMode::Merge | DeliveryMode::MergePush => {
+            // Requires a *verified* merge, not `branch_merged_or_gone`'s
+            // "gone counts as delivered" — a deleted-but-never-merged branch
+            // must not read as done (TKT-18/46/147).
+            if repo.branch_verified_merged(branch, target) {
+                None
+            } else {
+                Some(format!(
+                    "branch '{branch}' has not merged into '{target}' yet (delivery mode: {:?})",
+                    policy.delivery.mode
+                ))
+            }
+        }
+        DeliveryMode::PushBranch if gate_push_branch => {
+            if repo.remote_branch_merged_or_gone(branch, target, &policy.delivery.remote) {
+                None
+            } else {
+                Some(format!(
+                    "branch '{branch}' has not landed on '{}/{target}' yet (delivery mode: push-branch)",
+                    policy.delivery.remote
+                ))
+            }
+        }
+        DeliveryMode::PushBranch | DeliveryMode::Pr => None,
+    }
+}
+
+/// Whether `branch` (bound for `target` in the repo rooted at `repo_root`)
+/// has been delivered per that repo's activated delivery-mode policy. Runs
+/// the git reads on a blocking-pool thread — see [`blocking_io`] — since this
+/// is called from spawned tasks, never the hot event-handling path.
+async fn ticket_delivered(
+    home: PathBuf,
+    repo_root: PathBuf,
+    branch: String,
+    target: String,
+    gate_push_branch: bool,
+) -> rk_core::Result<()> {
+    blocking_io("ticket delivery gate", move || {
+        let repo = Repo::discover(&repo_root).map_err(|e| {
+            // Unresolvable repo: fail CLOSED, unlike
+            // Supervisor::branch_already_merged's fail-safe "not merged" —
+            // that guard only ever skips a respawn (safe to under-trigger),
+            // while this one gates `done`, and open-failing it would let a
+            // ticket close without ever having checked delivery.
+            rk_core::Error::other(format!(
+                "repo at {} is unresolvable, cannot verify delivery: {e}",
+                repo_root.display()
+            ))
+        })?;
+        let policy = resolve_repository_policy(&home, &repo);
+        match ticket_undelivered_reason(&policy, &repo, &branch, &target, gate_push_branch) {
+            None => Ok(()),
+            Some(reason) => Err(rk_core::Error::other(reason)),
+        }
+    })
+    .await
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpawnParams {
     /// Path to the repository (or any path inside it).
@@ -2733,9 +2819,45 @@ impl Supervisor {
             if let Some(task) = record.task.clone() {
                 if task.starts_with(crate::tickets::ID_PREFIX) {
                     let tickets = self.tickets.clone();
+                    let home = self.layout.home().to_path_buf();
+                    let repo_root = record.repo_root.clone();
+                    let branch = record.branch.clone();
+                    let target = record.target_branch.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = tickets.set_status(&task, "done").await {
-                            warn!(ticket = %task, error = %e, "failed to mark ticket done");
+                        // Bind `done` to delivery per delivery-mode policy
+                        // (TKT-01M08HB566GFBZVMDKZ8DT1ES0 / strategic-review
+                        // C3): a merge/merge-push ticket must not read `done`
+                        // while its branch is still unmerged — the class
+                        // behind TKT-18/46/147, where an approved-looking
+                        // ticket's code never reached main. `push-branch` is
+                        // deliberately NOT gated here: its delivery (the
+                        // push) hasn't even been attempted yet at this point
+                        // in the lifecycle (that happens later, on dismiss),
+                        // and unlike merge-mode there is no later merge-driven
+                        // transition to `closed` to fall back on — gating it
+                        // here would strand the ticket at `in_progress`
+                        // forever. `pr` mode is deferred per the ticket. A
+                        // ticket with no branch (e.g. a grooming-only pass)
+                        // has nothing to gate on and proceeds as before.
+                        let gate = match branch {
+                            Some(branch) => {
+                                ticket_delivered(home, repo_root, branch, target, false).await
+                            }
+                            None => Ok(()),
+                        };
+                        match gate {
+                            Ok(()) => {
+                                if let Err(e) = tickets.set_status(&task, "done").await {
+                                    warn!(ticket = %task, error = %e, "failed to mark ticket done");
+                                }
+                            }
+                            Err(e) => {
+                                info!(
+                                    ticket = %task,
+                                    reason = %e,
+                                    "completion left ticket in_progress: not yet delivered per its repo's delivery-mode policy"
+                                );
+                            }
                         }
                     });
                 }
@@ -2781,15 +2903,53 @@ impl Supervisor {
     /// budget, gate/review timeouts) the same way `deliver_branch` resolves
     /// `delivery` — one activated policy, one lookup.
     pub(crate) fn repository_policy(&self, repo: &Repo) -> rk_workflow::RepositoryPolicy {
-        let path = self.layout.home().join("repos.json");
-        crate::repos::RepoRegistry::load(&path)
-            .ok()
-            .and_then(|registry| {
-                registry
-                    .get_by_path(repo.root())
-                    .map(|record| record.effective_policy())
-            })
-            .unwrap_or_default()
+        resolve_repository_policy(self.layout.home(), repo)
+    }
+
+    /// The most recent agent generation (live or archived) dispatched against
+    /// ticket `task`, if any — used to resolve the branch/repo a ticket's
+    /// `done` transition is checked against (TKT-01M08HB566GFBZVMDKZ8DT1ES0 /
+    /// strategic-review C3).
+    fn latest_task_record(&self, task: &str) -> Option<AgentRecord> {
+        self.lock_registry()
+            .list_all()
+            .into_iter()
+            .filter(|r| r.task.as_deref() == Some(task))
+            .max_by_key(|r| r.created_at)
+            .cloned()
+    }
+
+    /// Refuse an explicit `done` (steward/operator `rk ticket update --status
+    /// done`) on a ticket whose branch has not actually landed per its repo's
+    /// delivery-mode policy — closing the "approved but never merged" class
+    /// (TKT-18/46/147) at the point a human can act on the refusal instead of
+    /// silently believing the work shipped. `merge`/`merge-push` require the
+    /// branch to already be merged into (or gone from) its target;
+    /// `push-branch` requires the same against the remote-tracking ref (the
+    /// manual path can afford checking push-branch too — refusing an explicit
+    /// request never stalls anything, unlike gating the automatic completion
+    /// path before delivery has even been attempted, see the ticket-done
+    /// block in [`Self::route_completion`]). `pr` is intentionally left
+    /// unchecked:
+    /// its binding is deferred until a forge ingest source exists (see
+    /// strategic-review C4). A ticket with no dispatched branch (or an
+    /// unresolvable repo) has nothing to gate on and is left unaffected.
+    pub(crate) async fn require_ticket_delivered(&self, task: &str) -> rk_core::Result<()> {
+        let Some(record) = self.latest_task_record(task) else {
+            return Ok(());
+        };
+        let Some(branch) = record.branch.clone() else {
+            return Ok(());
+        };
+        ticket_delivered(
+            self.layout.home().to_path_buf(),
+            record.repo_root.clone(),
+            branch,
+            record.target_branch.clone(),
+            true,
+        )
+        .await
+        .map_err(|e| rk_core::Error::other(format!("ticket {task} cannot be marked done: {e}")))
     }
 
     /// Execute one repository policy against a source branch. Every delivery

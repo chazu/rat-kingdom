@@ -159,8 +159,13 @@ async fn spawn_complete_route_dismiss_merge() {
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
-/// A rat dispatched with a ticket id as its task closes the ticket's loop:
-/// completion → `done`, merge-on-dismiss → `closed`.
+/// A rat dispatched with a ticket id as its task closes the ticket's loop —
+/// but under the default (merge) delivery policy, `done` is bound to actual
+/// delivery (TKT-01M08HB566GFBZVMDKZ8DT1ES0 / strategic-review C3): a clean
+/// completion alone must not flip the ticket to `done` while its branch is
+/// still unmerged (that was the TKT-18/46/147 "approved but never merged"
+/// class). It only closes once dismiss actually merges the branch, going
+/// straight from `open` to `closed`.
 #[tokio::test]
 async fn ticket_dispatched_rat_closes_its_ticket() {
     let home = tempfile::tempdir().unwrap();
@@ -193,19 +198,28 @@ async fn ticket_dispatched_rat_closes_its_ticket() {
         .unwrap();
     let name = spawned["agent"]["name"].as_str().unwrap().to_string();
 
-    // On completion the ticket becomes `done`.
-    let mut done = false;
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let t = client.call("ticket.get", json!({"id": id})).await.unwrap();
-        if t["ticket"]["payload"]["status"] == "done" {
-            done = true;
+        if client
+            .call("agent.status", json!({"name": name}))
+            .await
+            .unwrap()["agent"]["state"]
+            == "completed"
+        {
             break;
         }
     }
-    assert!(done, "ticket was not marked done on completion");
+    // Give the fire-and-forget completion routing a moment to hit the
+    // delivery gate before asserting it left the ticket alone.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let t = client.call("ticket.get", json!({"id": id})).await.unwrap();
+    assert_eq!(
+        t["ticket"]["payload"]["status"], "open",
+        "a clean completion must not mark a merge-mode ticket done before its branch merges"
+    );
 
-    // Dismiss with merge closes it for good.
+    // Dismiss with merge closes it for good — straight from `open`, never
+    // having passed through `done`.
     let dismissed = client
         .call("agent.dismiss", json!({"name": name}))
         .await
