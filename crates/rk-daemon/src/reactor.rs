@@ -295,11 +295,19 @@ impl Reactor {
     /// (`[[notify.sinks]]`). Builder-style like [`Self::with_landing`], so the
     /// test call sites that only know a [`ReactorConfig`] keep the default
     /// registry built in [`Self::new`].
-    pub(crate) fn with_sinks(mut self, notify: &NotifyConfig) -> Self {
-        self.sinks = SinkRegistry::build(
+    pub(crate) fn with_sinks(self, notify: &NotifyConfig) -> Self {
+        let sinks = SinkRegistry::build(
             notify.resolved(self.config.notify_escalations),
             build_sink,
         );
+        self.with_sink_registry(sinks)
+    }
+
+    /// Install an already-built registry. The seam [`Self::with_sinks`] goes
+    /// through, and the one tests use to register a sink implementation that is
+    /// not a built-in `kind` — the same path a future out-of-tree sink takes.
+    pub fn with_sink_registry(mut self, sinks: SinkRegistry) -> Self {
+        self.sinks = sinks;
         self
     }
 

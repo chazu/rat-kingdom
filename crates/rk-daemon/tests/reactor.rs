@@ -95,10 +95,32 @@ fn build_reactor_with_space(
     build_reactor_and_engine_with_space(layout, config, space).0
 }
 
+/// As [`build_reactor_with_space`], but with the escalation push channels
+/// replaced — the seam an out-of-tree sink would use.
+fn build_reactor_with_sinks(
+    layout: &Layout,
+    config: ReactorConfig,
+    space: rk_space::Space,
+    sinks: rk_core::notify::SinkRegistry,
+) -> Arc<Reactor> {
+    let (reactor, _engine) =
+        build_reactor_and_engine_with_space_sinks(layout, config, space, Some(sinks));
+    reactor
+}
+
 fn build_reactor_and_engine_with_space(
     layout: &Layout,
     config: ReactorConfig,
     space: rk_space::Space,
+) -> (Arc<Reactor>, Arc<WorkflowEngine>) {
+    build_reactor_and_engine_with_space_sinks(layout, config, space, None)
+}
+
+fn build_reactor_and_engine_with_space_sinks(
+    layout: &Layout,
+    config: ReactorConfig,
+    space: rk_space::Space,
+    sinks: Option<rk_core::notify::SinkRegistry>,
 ) -> (Arc<Reactor>, Arc<WorkflowEngine>) {
     let tickets = Arc::new(Tickets::new(space.clone(), "test-castle".into()));
     let supervisor = Arc::new(
@@ -129,15 +151,19 @@ fn build_reactor_and_engine_with_space(
         0,
         false,
     ));
-    let reactor = Arc::new(Reactor::new(
+    let reactor = Reactor::new(
         space,
         engine.clone(),
         tickets,
         Some(supervisor),
         layout.clone(),
         config,
-    ));
-    (reactor, engine)
+    );
+    let reactor = match sinks {
+        Some(sinks) => reactor.with_sink_registry(sinks),
+        None => reactor,
+    };
+    (Arc::new(reactor), engine)
 }
 
 fn write_trigger(layout: &Layout) {
@@ -1557,6 +1583,92 @@ fn escalation_markers(space: &rk_space::Space) -> usize {
         .into_iter()
         .filter(|t| t.payload.get("kind").and_then(|k| k.as_str()) == Some("notify-escalation"))
         .count()
+}
+
+/// A second sink registers through config alone, and a dead one degrades to the
+/// passive inbox (B1 acceptance). The reactor's escalation source is untouched
+/// between the two cases — only the registry differs.
+#[tokio::test]
+async fn a_second_sink_registers_and_a_dead_sink_degrades() {
+    use rk_core::config::SinkConfig;
+    use rk_core::notify::{EscalationNotice, NotificationSink, SinkRegistry};
+    use std::sync::Mutex;
+
+    /// A sink that records what it was handed, or fails like an uninstalled
+    /// channel would.
+    struct Probe {
+        seen: Arc<Mutex<Vec<String>>>,
+        dead: bool,
+    }
+    impl NotificationSink for Probe {
+        fn kind(&self) -> &str {
+            "probe"
+        }
+        fn deliver(&self, notice: &EscalationNotice) -> rk_core::Result<()> {
+            if self.dead {
+                return Err(rk_core::Error::other("channel not installed"));
+            }
+            self.seen.lock().unwrap().push(notice.title());
+            Ok(())
+        }
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let live = Arc::new(Mutex::new(Vec::new()));
+
+    let mut sinks = SinkRegistry::new();
+    sinks.register(
+        SinkConfig {
+            name: Some("dead-channel".into()),
+            ..SinkConfig::of_kind("probe")
+        },
+        Box::new(Probe {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            dead: true,
+        }),
+    );
+    sinks.register(
+        SinkConfig {
+            name: Some("live-channel".into()),
+            classes: vec!["steward-escalation".into()],
+            ..SinkConfig::of_kind("probe")
+        },
+        Box::new(Probe {
+            seen: Arc::clone(&live),
+            dead: false,
+        }),
+    );
+    let reactor = build_reactor_with_sinks(&layout, ReactorConfig::default(), space.clone(), sinks);
+
+    space
+        .out(steward_need("myrepo", "TKT-42", "steward: STOP for TKT-42"))
+        .unwrap();
+    reactor.run_cycle().unwrap();
+
+    assert_eq!(
+        *live.lock().unwrap(),
+        ["steward escalation — TKT-42"],
+        "the second sink got the notice with no change at the escalation source"
+    );
+    assert_eq!(
+        escalation_markers(&space),
+        2,
+        "one marker per (escalation, sink): the dead channel is not retried forever"
+    );
+    // The dead sink neither aborted the cycle nor suppressed the live one, and
+    // the escalation itself is still on the passive queue.
+    assert_eq!(
+        space
+            .scan(&rk_core::tuple::Pattern::category(Category::Need).identity("steward"))
+            .unwrap()
+            .len(),
+        1,
+        "a dead sink degrades to the inbox — the need is untouched"
+    );
 }
 
 /// A steward escalation gets an active push exactly once, and only the steward:
