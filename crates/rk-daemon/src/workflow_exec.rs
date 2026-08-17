@@ -2117,7 +2117,15 @@ impl WorkflowEngine {
         repo: &str,
         fe: &ForEachStep,
     ) -> rk_core::Result<Vec<FannedAgent>> {
-        let items = self.query_tickets(&fe.query, repo)?;
+        // Freeze list (R6). The exclusion binds *automated* dispatch, so it is
+        // keyed on whether this instance was fired by the scheduler
+        // (`Instance.schedule` is `Some` only via `run_scheduled`) rather than
+        // on the workflow's name: it is the nightly cadence that regrows frozen
+        // mass unattended, not the fan-out shape. An operator running the same
+        // definition by hand (`rk workflow run backlog-drain`) is a deliberate
+        // act and still fans out over everything ready.
+        let scheduled = self.status(id).is_some_and(|i| i.schedule.is_some());
+        let items = self.query_tickets(&fe.query, repo, scheduled)?;
         if items.is_empty() {
             // Normal, not a fault: a nightly drain over an empty ready queue is
             // a quiet night. The empty set is still recorded, and the following
@@ -3094,7 +3102,17 @@ impl WorkflowEngine {
     /// Resolve a fan-out ticket query to a bounded list of items in the
     /// workflow's own repo scope. `status: "ready"` uses dependency-aware
     /// readiness; any other value is a literal status filter.
-    fn query_tickets(&self, query: &TicketQuery, repo: &str) -> rk_core::Result<Vec<TicketItem>> {
+    ///
+    /// `exclude_frozen` drops tickets tagged to a frozen subsystem (R6). It is
+    /// applied *before* `limit`, so a run of frozen tickets at the head of the
+    /// queue cannot silently eat the fan-out budget and turn a busy night into
+    /// a no-op — the limit bounds work dispatched, not tickets inspected.
+    fn query_tickets(
+        &self,
+        query: &TicketQuery,
+        repo: &str,
+        exclude_frozen: bool,
+    ) -> rk_core::Result<Vec<TicketItem>> {
         let scope = Some(repo_name_of(repo));
         let tuples = if query.status == "ready" {
             self.tickets.ready(scope)?
@@ -3103,6 +3121,18 @@ impl WorkflowEngine {
         };
         Ok(tuples
             .into_iter()
+            .filter(|t| {
+                if !exclude_frozen {
+                    return true;
+                }
+                let frozen = rk_core::freeze::blocks_automated_dispatch(&string_array(
+                    &t.payload, "labels",
+                ));
+                if frozen {
+                    info!(ticket = %t.identity, "scheduled fan-out skipped ticket tagged to a frozen subsystem");
+                }
+                !frozen
+            })
             .take(query.limit)
             .map(|t| TicketItem {
                 id: t.identity.clone(),

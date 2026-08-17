@@ -4,6 +4,7 @@ pub mod action;
 pub mod config;
 pub mod error;
 pub mod factory;
+pub mod freeze;
 pub mod id;
 pub mod identity;
 pub mod names;
