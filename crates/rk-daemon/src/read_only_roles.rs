@@ -91,6 +91,7 @@ mod tests {
             params,
             caller: caller.into(),
             auth: String::new(),
+            client_version: None,
         }
     }
 
