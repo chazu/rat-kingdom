@@ -332,7 +332,10 @@ fn ticket_undelivered_reason(
 ) -> Option<String> {
     match policy.delivery.mode {
         DeliveryMode::Merge | DeliveryMode::MergePush => {
-            if repo.branch_merged_or_gone(branch, target) {
+            // Requires a *verified* merge, not `branch_merged_or_gone`'s
+            // "gone counts as delivered" — a deleted-but-never-merged branch
+            // must not read as done (TKT-18/46/147).
+            if repo.branch_verified_merged(branch, target) {
                 None
             } else {
                 Some(format!(
@@ -367,11 +370,17 @@ async fn ticket_delivered(
     gate_push_branch: bool,
 ) -> rk_core::Result<()> {
     blocking_io("ticket delivery gate", move || {
-        let Ok(repo) = Repo::discover(&repo_root) else {
-            // Unresolvable repo: nothing to check against, fail open like
-            // Supervisor::branch_already_merged does for the same reason.
-            return Ok(());
-        };
+        let repo = Repo::discover(&repo_root).map_err(|e| {
+            // Unresolvable repo: fail CLOSED, unlike
+            // Supervisor::branch_already_merged's fail-safe "not merged" —
+            // that guard only ever skips a respawn (safe to under-trigger),
+            // while this one gates `done`, and open-failing it would let a
+            // ticket close without ever having checked delivery.
+            rk_core::Error::other(format!(
+                "repo at {} is unresolvable, cannot verify delivery: {e}",
+                repo_root.display()
+            ))
+        })?;
         let policy = resolve_repository_policy(&home, &repo);
         match ticket_undelivered_reason(&policy, &repo, &branch, &target, gate_push_branch) {
             None => Ok(()),

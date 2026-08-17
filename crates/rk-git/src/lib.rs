@@ -162,6 +162,20 @@ impl Repo {
         self.is_ancestor(branch, target)
     }
 
+    /// Whether `branch` has *verifiably* merged into `target`: it still
+    /// exists and its tip is an ancestor of `target`. Unlike
+    /// [`branch_merged_or_gone`](Repo::branch_merged_or_gone), a branch that
+    /// no longer exists does NOT count as delivered here — that "gone ⇒
+    /// dealt with" reading only holds where the daemon's own post-merge
+    /// cleanup or a human's forge-side delete is the expected cause (PR/
+    /// push-branch awaiting-review clearing). For merge-mode ticket-done
+    /// gating we cannot tell that apart from a branch that vanished before
+    /// ever landing (the exact "approved but never merged" class behind
+    /// TKT-18/46/147), so an absent branch fails closed as "not delivered".
+    pub fn branch_verified_merged(&self, branch: &str, target: &str) -> bool {
+        self.branch_exists(branch) && self.is_ancestor(branch, target)
+    }
+
     /// Resolve `rev` (a branch name, sha, or any revision `git` accepts) to its
     /// full commit sha.
     ///
