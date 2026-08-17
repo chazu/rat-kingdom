@@ -394,8 +394,10 @@ pub struct SupervisorConfig {
     /// invariant at daemon startup.
     pub stuck_after_secs: u64,
     /// Sustained burn (USD/minute across sweeps) above this is RUNNING AWAY.
-    /// Zero disables burn detection (off by default — it needs per-harness and
-    /// per-pricing tuning, and absolute cost caps already live in `budget`).
+    /// Zero disables burn detection. Shipped default 4.0: normal rats run
+    /// p99 $1.24/min lifetime-average (573-rat archive), observed runaways
+    /// sustained ~$7/min — roughly 3x margin on both sides, and matches the
+    /// operator's own live `config.toml` override.
     pub burn_usd_per_min: f64,
     /// After the first (soft) flag steers the rat, how long to wait before
     /// escalating to a kill if it is STILL flagged. Prefer steer-then-wait.
@@ -425,7 +427,7 @@ impl Default for SupervisorConfig {
             // 10m: comfortably below STEWARD_DEFAULT_REVIEW_TIMEOUT_SECS (15m) —
             // see the invariant on `stuck_after_secs` above.
             stuck_after_secs: 600,
-            burn_usd_per_min: 0.0,
+            burn_usd_per_min: 4.0,
             kill_grace_secs: 600,
             respawn_enabled: false,
             respawn_max_attempts: 3,

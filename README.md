@@ -545,7 +545,9 @@ stuck_after_secs = 600           # silence past this => STUCK (0 = off); keep
                                  # blocks on this rat (e.g. steward's
                                  # reviewTimeout, default 15m) or the soft
                                  # steer below never gets a chance to help
-burn_usd_per_min = 0.0           # sustained USD/min => RUNNING AWAY (0 = off)
+burn_usd_per_min = 4.0           # sustained USD/min => RUNNING AWAY (0 = off;
+                                 # 4.0 catches a runaway with ~3x margin both
+                                 # ways vs normal rats' p99 $1.24/min)
 kill_grace_secs = 600            # obstacle+steer first, kill only if still flagged
 respawn_enabled = false          # self-heal: auto-respawn crashed/orphaned rats
                                  # (off by default — it relaunches + spends)
