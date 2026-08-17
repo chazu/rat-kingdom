@@ -16,6 +16,13 @@
 //! look-back is bounded by `catchup_minutes`, so a daemon down overnight runs
 //! each missed daily/hourly schedule once, not a replay of every minute.
 //!
+//! A dispatch that FAILS does not retire its minute: the cursor is held just
+//! before the earliest failing minute, so the next cycle re-evaluates it. A
+//! nightly fire lost to a transient engine error is therefore retried on the
+//! following tick rather than silently dropped until tomorrow. The retry window
+//! is still bounded by `catchup_minutes` — a failure older than the look-back
+//! ages out like any other missed minute.
+//!
 //! # Single-flight
 //!
 //! Each schedule is guarded by its own single-flight lock keyed on the schedule
@@ -120,6 +127,15 @@ impl Scheduler {
         // A schedule fires at most once per cycle, no matter how many of its
         // minutes elapsed since the cursor (a missed nightly run runs once).
         let mut fired_names: HashSet<&str> = HashSet::new();
+        // The earliest minute whose dispatch failed retryably. The cursor is not
+        // advanced past it, so that minute is re-evaluated next cycle instead of
+        // being silently dropped — the reactor's cursor discipline, applied to
+        // the time axis. Unlike the reactor the cursor is a scalar minute rather
+        // than a store sequence, so we hold it just BEFORE the failing minute
+        // instead of not moving it at all: minutes that already dispatched
+        // cleanly earlier in this cycle still retire, and only the failure and
+        // what follows it are retried.
+        let mut failed_minute: Option<DateTime<Utc>> = None;
         let mut minute = start;
         while minute <= now_min {
             for (loaded, cron) in &parsed {
@@ -132,14 +148,24 @@ impl Scheduler {
                         Ok(true) => fired += 1,
                         Ok(false) => {}
                         Err(e) => {
-                            warn!(schedule = %loaded.schedule.name, error = %e, "scheduler dispatch failed")
+                            failed_minute.get_or_insert(minute);
+                            warn!(schedule = %loaded.schedule.name, error = %e, "scheduler dispatch failed; holding cursor for retry")
                         }
                     }
                 }
             }
             minute += ChronoDuration::minutes(1);
         }
-        self.save_cursor(now_min)?;
+        let advance_to = match failed_minute {
+            Some(m) => m - ChronoDuration::minutes(1),
+            None => now_min,
+        };
+        // A held cursor may already be at or past the hold point (the failure was
+        // in the very first evaluated minute, or the catch-up clamp moved `start`
+        // forward); never rewind it.
+        if cursor.is_none_or(|c| advance_to > c) {
+            self.save_cursor(advance_to)?;
+        }
         Ok(fired)
     }
 
