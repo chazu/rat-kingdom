@@ -213,6 +213,7 @@ mod tests {
                     method: "ingest.event".into(),
                     auth: token.clone(),
                     caller: caller.clone(),
+                    client_version: None,
                     params: json!({"source":"probe", "envelope": envelope("probe")}),
                 },
             )
@@ -226,6 +227,7 @@ mod tests {
                     method: "ingest.event".into(),
                     auth: token.clone(),
                     caller: caller.clone(),
+                    client_version: None,
                     params: json!({"source":"probe", "envelope": envelope("probe"), "scope":"repo"}),
                 },
             )
@@ -238,6 +240,7 @@ mod tests {
                     method: "space.out".into(),
                     auth: token,
                     caller,
+                    client_version: None,
                     params: json!({"category":"event", "identity":"bad"}),
                 },
             )
@@ -259,6 +262,7 @@ mod tests {
                     method: "ingest.event".into(),
                     auth: layout.auth_token().unwrap(),
                     caller: crate::ingest_auth::source_caller("probe"),
+                    client_version: None,
                     params: json!({"source":"probe", "envelope": envelope("probe")}),
                 },
             )
@@ -280,6 +284,7 @@ mod tests {
                     method: "ingest.event".into(),
                     auth: crate::ingest_auth::derive_source_token(&layout.auth_token().unwrap(), "unknown"),
                     caller: crate::ingest_auth::source_caller("unknown"),
+                    client_version: None,
                     params: json!({"source":"unknown", "envelope": envelope("unknown")}),
                 },
             )
@@ -304,6 +309,7 @@ mod tests {
                     method: "ingest.event".into(),
                     auth: token,
                     caller: crate::ingest_auth::source_caller("probe"),
+                    client_version: None,
                     params: json!({"source":"probe", "envelope": bad}),
                 },
             )
@@ -378,6 +384,7 @@ mod tests {
                     method: "ingest.event".into(),
                     auth: crate::ingest_auth::derive_source_token(&layout.auth_token().unwrap(), "probe"),
                     caller: crate::ingest_auth::source_caller("probe"),
+                    client_version: None,
                     params: json!({"source":"probe", "envelope": envelope("probe")}),
                 },
             )
@@ -608,6 +615,7 @@ mod tests {
             method: "space.out".into(),
             auth: agent_token.clone(),
             caller: "Whisker".into(),
+            client_version: None,
             params: json!({
                 "category": "need",
                 "scope": "repo",
@@ -628,6 +636,7 @@ mod tests {
             method: "space.out".into(),
             auth: agent_token.clone(),
             caller: "Whisker".into(),
+            client_version: None,
             params: json!({
                 "category": "task",
                 "scope": "repo",
@@ -647,6 +656,7 @@ mod tests {
             method: "space.out".into(),
             auth: agent_token.clone(),
             caller: "Whisker".into(),
+            client_version: None,
             params: json!({
                 "category": "event",
                 "scope": "repo",
@@ -679,6 +689,7 @@ mod tests {
                 method: method.into(),
                 auth: agent_token.clone(),
                 caller: "Whisker".into(),
+                client_version: None,
                 params,
             };
             let mut line = serde_json::to_vec(&denied).unwrap();
@@ -695,6 +706,7 @@ mod tests {
             method: "space.out".into(),
             auth: agent_token.clone(),
             caller: "Whisker".into(),
+            client_version: None,
             params: json!({"category": "need", "scope": "repo", "identity": "help"}),
         };
         let mut line = serde_json::to_vec(&allowed).unwrap();
@@ -805,6 +817,7 @@ mod tests {
                 method: "ingest.event".into(),
                 auth: token.clone(),
                 caller: caller.clone(),
+                client_version: None,
                 params: json!({"source":"probe", "envelope": envelope("probe", "ci_failed")}),
             },
         )
@@ -836,6 +849,7 @@ mod tests {
                 method: "ingest.state".into(),
                 auth: token.clone(),
                 caller: caller.clone(),
+                client_version: None,
                 params: json!({"repo": "repo", "limit": 5}),
             },
         )
@@ -854,6 +868,7 @@ mod tests {
                 method: "ingest.state".into(),
                 auth: token.clone(),
                 caller: caller.clone(),
+                client_version: None,
                 params: json!({"repo": "repo", "limit": 5, "principal": "operator"}),
             },
         )
@@ -955,6 +970,7 @@ mod tests {
                     method: method.into(),
                     auth,
                     caller,
+                    client_version: None,
                     params,
                 },
             )

@@ -6494,6 +6494,7 @@ mod agent_fact_authorisation_tests {
             method: "space.out".into(),
             auth: String::new(),
             caller: "Whisker".into(),
+            client_version: None,
             params: json!({
                 "category": "fact",
                 "scope": "rat-kingdom",
@@ -6524,6 +6525,7 @@ mod agent_fact_authorisation_tests {
             method: "space.out".into(),
             auth: String::new(),
             caller: "Whisker".into(),
+            client_version: None,
             params: json!({
                 "category": "fact",
                 "scope": "rat-kingdom",
@@ -6548,6 +6550,7 @@ mod agent_fact_authorisation_tests {
             method: "space.out".into(),
             auth: String::new(),
             caller: "Whisker".into(),
+            client_version: None,
             params: json!({
                 "category": "fact",
                 "scope": "rat-kingdom",
@@ -6563,6 +6566,7 @@ mod agent_fact_authorisation_tests {
                 method: "fact.vote".into(),
                 auth: String::new(),
                 caller: caller.into(),
+                client_version: None,
                 params: json!({"fact": fact_id, "vote": value}),
             })
         };
@@ -6588,6 +6592,7 @@ mod agent_fact_authorisation_tests {
             method: "space.scan".into(),
             auth: String::new(),
             caller: "operator".into(),
+            client_version: None,
             params: json!({"category": "fact"}),
         });
         assert_eq!(
@@ -6616,6 +6621,7 @@ mod agent_fact_authorisation_tests {
             method: "space.scan".into(),
             auth: String::new(),
             caller: "operator".into(),
+            client_version: None,
             params: json!({"category": "fact"}),
         });
         assert_eq!(
@@ -6636,6 +6642,7 @@ mod agent_fact_authorisation_tests {
             method: "space.out".into(),
             auth: String::new(),
             caller: "Whisker".into(),
+            client_version: None,
             params: json!({
                 "category": "fact_vote",
                 "scope": "rat-kingdom",
@@ -6881,6 +6888,7 @@ mod authorize_reasoned_tests {
             method: method.into(),
             auth: auth.into(),
             caller: caller.into(),
+            client_version: None,
             params: Value::Null,
         }
     }
