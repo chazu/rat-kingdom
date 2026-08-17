@@ -71,7 +71,7 @@
 
 use crate::supervisor::Supervisor;
 use crate::tickets::{NewTicket, Tickets};
-use crate::workflow_exec::{OnTimeout, ResolvedRun, WorkflowEngine};
+use crate::workflow_exec::{InstanceStatus, OnTimeout, ResolvedRun, WorkflowEngine};
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
 use rk_space::Space;
@@ -81,7 +81,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Identity of a durably-queued landing candidate (`Furniture`, scoped to the
 /// repo it belongs to) — the T2 counterpart to the reactor's
@@ -132,6 +132,18 @@ const STEWARD_NEED_IDENTITY: &str = "steward";
 /// invokes it programmatically on a verdict-cache miss; it is never
 /// reactor-fired.
 const REVIEW_WORKFLOW: &str = "steward-review";
+
+/// Poll slice for the liveness-aware review wait (module doc): how often
+/// [`LandingPipeline::request_review`] gives up on the current `rd` and
+/// checks the review instance's liveness before resuming the wait. Short
+/// enough that a genuinely dead reviewer's escalation lands within about one
+/// slice of it going terminal, not the full `reviewTimeout`/`reviewMaxWait`
+/// window. Shrunk under `cfg(test)` so the liveness-poll tests below exercise
+/// several real iterations without each costing a real 60s of wall-clock.
+#[cfg(not(test))]
+const REVIEW_POLL_SLICE: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const REVIEW_POLL_SLICE: Duration = Duration::from_millis(150);
 
 /// One landing candidate: a completed rat's branch, gated then routed toward
 /// `Supervisor::land` (or, once T3 lands, a reviewer's verdict). Mirrors the
@@ -456,11 +468,19 @@ pub(crate) struct GateConfig {
     /// use their own fixed [`POLICY_GATE_TIMEOUT`]).
     pub(crate) gate_timeout: Duration,
     /// Wall-clock bound for a review request: how long
-    /// [`LandingPipeline::request_review`] parks on the reviewer's verdict
-    /// tuple before treating the candidate as a STOP-equivalent hold (design
-    /// doc §2.3 step 3) — matches `examples/workflows/steward.cue`'s
-    /// `reviewTimeout` param default.
+    /// [`LandingPipeline::request_review`] waits on the reviewer's verdict
+    /// tuple before checking whether the reviewer is still alive (liveness-
+    /// aware wait, module doc) — matches `examples/workflows/steward.cue`'s
+    /// `reviewTimeout` param default. A reviewer still running past this
+    /// point is NOT abandoned; see [`Self::review_max_wait`].
     pub(crate) review_timeout: Duration,
+    /// Hard ceiling on the review wait: once a LIVE reviewer has run this
+    /// long with no verdict, `request_review` stops waiting and escalates a
+    /// "still running at ceiling" hold rather than waiting forever. A
+    /// reviewer that goes terminal (crashes, budget death) without a verdict
+    /// is never held to this ceiling — that case escalates immediately (see
+    /// `ReviewWaitOutcome::ReviewerDied`).
+    pub(crate) review_max_wait: Duration,
 }
 
 impl Default for GateConfig {
@@ -472,6 +492,7 @@ impl Default for GateConfig {
             max_diff_lines: 2000,
             gate_timeout: Duration::from_secs(60 * 60),
             review_timeout: Duration::from_secs(15 * 60),
+            review_max_wait: Duration::from_secs(45 * 60),
         }
     }
 }
@@ -493,10 +514,11 @@ pub(crate) enum LandingOutcome {
     /// unmerged — no `dismiss` is needed since no agent worktree exists for
     /// the candidate itself.
     ReworkFiled(Tuple),
-    /// STOP, an unrecognized verdict, or a review that never produced one
-    /// within `GateConfig::review_timeout` — all three get the same "genuine
-    /// human judgment call" treatment (design doc §2.4): a `need` tuple was
-    /// written directly (`Space::out`, §1.5) and the branch held unmerged.
+    /// STOP, an unrecognized verdict, a reviewer that went terminal without
+    /// ever producing one, or a still-live reviewer that ran the wait out to
+    /// `GateConfig::review_max_wait` — all get the same "genuine human
+    /// judgment call" treatment (design doc §2.4, module doc): a `need` tuple
+    /// was written directly (`Space::out`, §1.5) and the branch held unmerged.
     Escalated(Tuple),
     /// The work key already carried a terminal `landing_processed` marker
     /// when this entry was processed — the daemon crashed in the window
@@ -505,6 +527,23 @@ pub(crate) enum LandingOutcome {
     /// itself) already happened then; this run only reconciles the queue.
     /// Carries the recorded outcome string ("landed", "gate-held", ...).
     Reconciled(String),
+}
+
+/// How [`LandingPipeline::request_review`]'s liveness-aware wait (module doc)
+/// resolved — the three cases its escalation text must distinguish.
+#[derive(Debug)]
+enum ReviewWaitOutcome {
+    /// A recommendation landed — fresh or from Phase 2's verdict cache.
+    Verdict(String),
+    /// The review instance went terminal (`Completed` or `Failed`) without
+    /// ever producing a verdict tuple. Carries the instance's own captured
+    /// failure context (`Instance::error`) for the escalation text, falling
+    /// back to a generic note if the instance recorded none.
+    ReviewerDied(String),
+    /// The wait ran out `GateConfig::review_max_wait` with the reviewer
+    /// still `Running` and no verdict — a live-at-ceiling hold, distinct from
+    /// a dead reviewer.
+    CeilingReached,
 }
 
 /// Daemon-native consumer: dequeues a candidate, runs its gates in a
@@ -564,6 +603,8 @@ impl LandingPipeline {
                 .unwrap_or(defaults.gate_timeout),
             review_timeout: crate::workflow_exec::parse_duration(&policy.review_timeout)
                 .unwrap_or(defaults.review_timeout),
+            review_max_wait: crate::workflow_exec::parse_duration(&policy.review_max_wait)
+                .unwrap_or(defaults.review_max_wait),
         }
     }
 
@@ -717,23 +758,21 @@ impl LandingPipeline {
             return Ok(outcome);
         }
         let verdict = self.review_verdict(entry, &gates).await?;
-        let outcome = self.route_verdict(entry, verdict.as_deref(), &gates).await?;
+        let outcome = self.route_verdict(entry, verdict, &gates).await?;
         self.mark_processed(entry, &outcome)?;
         Ok(outcome)
     }
 
     /// Resolve a recommendation for `entry`: a hit against Phase 2's
     /// commit-keyed verdict cache (§1.3/§2.3 step 2), or — on a miss — a
-    /// fresh review request (§2.3 step 3). `None` means neither produced
-    /// one: the review request timed out waiting on the verdict tuple,
-    /// routed by the caller as a STOP-equivalent hold (design doc §2.3).
+    /// fresh, liveness-aware review request (§2.3 step 3, module doc).
     async fn review_verdict(
         &self,
         entry: &LandingQueueEntry,
         gates: &GateConfig,
-    ) -> rk_core::Result<Option<String>> {
+    ) -> rk_core::Result<ReviewWaitOutcome> {
         if let Some(cached) = self.cached_verdict(entry)? {
-            return Ok(Some(cached));
+            return Ok(ReviewWaitOutcome::Verdict(cached));
         }
         self.request_review(entry, gates).await
     }
@@ -760,11 +799,31 @@ impl LandingPipeline {
 
     /// Spawn the shrunk review-only workflow (design doc §2.5,
     /// `examples/workflows/steward-review.cue`) chained onto the candidate
-    /// branch, then park on the verdict tuple ITSELF rather than the
+    /// branch, then wait on the verdict tuple ITSELF rather than the
     /// workflow instance's own completion (§1.5's `watch_attached_completion`
     /// pattern) — a daemon restart loses nothing: the reviewer keeps working
     /// against its own worktree regardless of the pipeline's state, and the
     /// verdict tuple is durable even though this exact wait is not (§2.6).
+    ///
+    /// The wait is liveness-aware (module doc): rather than one fixed-length
+    /// `rd`, it polls in [`REVIEW_POLL_SLICE`] slices up to
+    /// `gates.review_max_wait`. A slice that times out with no verdict probes
+    /// the review instance — still `Running` keeps waiting (a slow reviewer
+    /// is not abandoned at `reviewTimeout`); gone terminal without a verdict
+    /// stops waiting immediately, after one last race probe, and surfaces the
+    /// instance's own captured failure context. Reaching the ceiling with a
+    /// still-live reviewer is the only case that waits the full window.
+    ///
+    /// The `reviewTimeout` param handed to the workflow itself is
+    /// `review_max_wait`, not `gates.review_timeout`: that param bounds the
+    /// workflow's own internal `wait` step (§ the review-only workflow's
+    /// `steps`), and if it stayed pinned to the base `reviewTimeout` a merely
+    /// slow-but-alive reviewer would trip THAT step's deadline at exactly the
+    /// point this wait is supposed to start tolerating it — indistinguishable
+    /// from a genuine crash. A genuine crash is still detected promptly
+    /// regardless of that bound: the workflow's `wait` step fails as soon as
+    /// the agent's own liveness check reports it gone (`abandoned`,
+    /// `workflow_exec::WorkflowEngine::await_result`), not at any timeout.
     ///
     /// The workflow launch uses a STABLE instance id derived from `entry`'s
     /// work key (`review_instance_id`), not a fresh random one: a daemon
@@ -778,7 +837,7 @@ impl LandingPipeline {
         &self,
         entry: &LandingQueueEntry,
         gates: &GateConfig,
-    ) -> rk_core::Result<Option<String>> {
+    ) -> rk_core::Result<ReviewWaitOutcome> {
         self.queue
             .set_status(entry, LandingEntryStatus::AwaitingReview)?;
 
@@ -790,14 +849,15 @@ impl LandingPipeline {
         params.insert("headSha".to_string(), Value::String(entry.head_sha.clone()));
         params.insert(
             "reviewTimeout".to_string(),
-            Value::String(format!("{}s", gates.review_timeout.as_secs())),
+            Value::String(format!("{}s", gates.review_max_wait.as_secs())),
         );
         // The engine's `repo` argument is a filesystem path (it feeds
         // `Repo::discover` and repo-local definition resolution), unlike the
         // `repo` WORKFLOW PARAM above, which is the repo's scope name used
         // to address its verdict artifact.
+        let instance_id = review_instance_id(entry);
         self.engine.run_owned_with_id(
-            review_instance_id(entry),
+            instance_id.clone(),
             REVIEW_WORKFLOW,
             &entry.repo_path,
             params,
@@ -811,26 +871,88 @@ impl LandingPipeline {
             &entry.head_sha,
         )
         .scope(&entry.repo_name);
-        let verdict = self.space.rd(&pattern, gates.review_timeout).await?;
-        Ok(verdict.and_then(|t| {
-            t.payload
-                .get("recommendation")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        }))
+
+        let started = tokio::time::Instant::now();
+        let deadline = started + gates.review_max_wait;
+        let mut logged_past_base_timeout = false;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                // One last race probe: the verdict may have landed in the gap
+                // between the previous slice's timeout and this check.
+                if let Some(cached) = self.cached_verdict(entry)? {
+                    return Ok(ReviewWaitOutcome::Verdict(cached));
+                }
+                return Ok(ReviewWaitOutcome::CeilingReached);
+            }
+            let slice = remaining.min(REVIEW_POLL_SLICE);
+            if let Some(tuple) = self.space.rd(&pattern, slice).await? {
+                let recommendation = tuple
+                    .payload
+                    .get("recommendation")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                return Ok(ReviewWaitOutcome::Verdict(recommendation));
+            }
+            if let Some(instance) = self.engine.status_any(&instance_id) {
+                if instance.status != InstanceStatus::Running {
+                    // Same race as above: probe once more before declaring
+                    // the reviewer dead-without-a-verdict.
+                    if let Some(cached) = self.cached_verdict(entry)? {
+                        return Ok(ReviewWaitOutcome::Verdict(cached));
+                    }
+                    let context = instance.error.unwrap_or_else(|| {
+                        "reviewer instance ended with no recorded error".to_string()
+                    });
+                    return Ok(ReviewWaitOutcome::ReviewerDied(context));
+                }
+            }
+            if !logged_past_base_timeout && started.elapsed() >= gates.review_timeout {
+                logged_past_base_timeout = true;
+                info!(
+                    repo = %entry.repo_name, branch = %entry.branch,
+                    base_review_timeout_secs = gates.review_timeout.as_secs(),
+                    ceiling_secs = gates.review_max_wait.as_secs(),
+                    "landing pipeline: reviewer still alive past the base reviewTimeout, \
+                     extending the wait toward the ceiling"
+                );
+            }
+        }
     }
 
-    /// Route a resolved (fresh or cached) recommendation — or `None` on a
-    /// review timeout — via direct daemon calls: no shell, no agent auth
-    /// token (§1.5/§2.4).
+    /// Route a resolved (fresh or cached) recommendation, a dead reviewer, or
+    /// a live-at-ceiling reviewer via direct daemon calls: no shell, no agent
+    /// auth token (§1.5/§2.4).
     async fn route_verdict(
         &self,
         entry: &LandingQueueEntry,
-        verdict: Option<&str>,
+        outcome: ReviewWaitOutcome,
         gates: &GateConfig,
     ) -> rk_core::Result<LandingOutcome> {
-        match verdict {
-            Some("APPROVE") => {
+        let verdict = match outcome {
+            ReviewWaitOutcome::Verdict(v) => v,
+            ReviewWaitOutcome::ReviewerDied(context) => {
+                let text = format!(
+                    "steward: reviewer for {} on {} ended without producing a verdict — branch \
+                     held unmerged. {context}",
+                    entry.task, entry.branch
+                );
+                return Ok(LandingOutcome::Escalated(self.escalate(entry, text)?));
+            }
+            ReviewWaitOutcome::CeilingReached => {
+                let text = format!(
+                    "steward: reviewer still running at the {}s wait ceiling for {} on {} — \
+                     branch held unmerged",
+                    gates.review_max_wait.as_secs(),
+                    entry.task,
+                    entry.branch
+                );
+                return Ok(LandingOutcome::Escalated(self.escalate(entry, text)?));
+            }
+        };
+        match verdict.as_str() {
+            "APPROVE" => {
                 let result = self
                     .supervisor
                     .land(
@@ -842,10 +964,10 @@ impl LandingPipeline {
                     .await?;
                 Ok(LandingOutcome::Landed(result))
             }
-            Some("REWORK") => Ok(LandingOutcome::ReworkFiled(
+            "REWORK" => Ok(LandingOutcome::ReworkFiled(
                 self.file_rework_ticket(entry).await?,
             )),
-            Some("STOP") => {
+            "STOP" => {
                 let text = format!(
                     "steward: reviewer returned STOP for {} on {} — needs a human merge \
                      decision; branch held unmerged",
@@ -853,21 +975,11 @@ impl LandingPipeline {
                 );
                 Ok(LandingOutcome::Escalated(self.escalate(entry, text)?))
             }
-            Some(other) => {
+            other => {
                 let text = format!(
                     "steward: unrecognized review verdict '{other}' for {} on {} — branch held \
                      unmerged, needs a human",
                     entry.task, entry.branch
-                );
-                Ok(LandingOutcome::Escalated(self.escalate(entry, text)?))
-            }
-            None => {
-                let text = format!(
-                    "steward: review timed out for {} on {} — no verdict recorded within {}s; \
-                     branch held unmerged",
-                    entry.task,
-                    entry.branch,
-                    gates.review_timeout.as_secs()
                 );
                 Ok(LandingOutcome::Escalated(self.escalate(entry, text)?))
             }
@@ -1267,6 +1379,16 @@ checks: [
     /// `request_review` can spawn a real (cheap, scripted) reviewer process
     /// without touching the shipped `examples/workflows/steward-review.cue`,
     /// which pins a real harness/model.
+    ///
+    /// A `timer` gate holds the instance `Running` for a couple of seconds
+    /// after spawn, before the `wait`/`evaluate` steps that would otherwise
+    /// let it complete near-instantly against the `fake` harness's canned,
+    /// sub-second script. Without this, a test that injects its verdict tuple
+    /// shortly after the spawn is detected would race the liveness-aware poll
+    /// loop (module doc): a poll slice landing after the instance has already
+    /// gone `Completed` — but before the test's `space.out` call — would read
+    /// as a terminal-without-a-verdict reviewer and misfire
+    /// `ReviewWaitOutcome::ReviewerDied` instead of honoring the late verdict.
     fn write_review_workflow(layout: &Layout) {
         let dir = layout.workflows_dir();
         std::fs::create_dir_all(&dir).unwrap();
@@ -1295,8 +1417,55 @@ workflow: {
 			branch: _input.branch
 			task: {title: "review", description: "review it"}
 		},
+		{type: "gate", gateType: "timer", duration: "2s"},
 		{type: "wait", timeout: _input.reviewTimeout},
 		{type: "evaluate", expect: {is_error: false}},
+	]
+}
+"#,
+        )
+        .unwrap();
+    }
+
+    /// A review-only workflow whose reviewer spawns for real (the `fake`
+    /// harness, same as [`write_review_workflow`]) but is immediately
+    /// followed by a `stop` step — a deterministic stand-in for "the
+    /// reviewer died before producing a verdict" that needs no genuinely
+    /// crashing subprocess and no shared process-wide harness-script env var
+    /// (which would race concurrently running unit tests elsewhere in this
+    /// crate's test binary). `Step::Stop` fails the whole instance with the
+    /// given reason as `Instance::error` (`workflow_exec::Step::Stop`
+    /// handling) — exactly the captured-context shape a genuine crash
+    /// produces, without needing one.
+    fn write_broken_review_workflow(layout: &Layout) {
+        let dir = layout.workflows_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("steward-review.cue"),
+            r#"
+package workflow
+
+workflow: {
+	name: "steward-review"
+	params: {
+		taskId:        {type: "string", required: false, default: "unknown"}
+		branch:        {type: "string", required: true}
+		repo:          {type: "string", required: false, default: "rat-kingdom"}
+		target:        {type: "string", required: false, default: "main"}
+		headSha:       {type: "string", required: false, default: ""}
+		reviewTimeout: {type: "string", required: false, default: "15m"}
+	}
+	agents: {
+		default: {harness: "fake", model: "sonnet"}
+	}
+	steps: [
+		{
+			type:   "spawn"
+			role:   "reviewer"
+			branch: _input.branch
+			task: {title: "review", description: "review it"}
+		},
+		{type: "stop", reason: "simulated reviewer crash: harness exited without reporting"},
 	]
 }
 "#,
@@ -2269,5 +2438,199 @@ checks: [
             "{}",
             listing("release")
         );
+    }
+
+    /// Liveness-aware review wait, case (a): a verdict that lands after the
+    /// base `reviewTimeout` but before the `reviewMaxWait` ceiling, with the
+    /// reviewer alive throughout, must be honored — not abandoned merely
+    /// because the base window elapsed (the Templeton-7 specimen this
+    /// behavior fixes, module doc).
+    #[tokio::test]
+    async fn slow_but_alive_reviewer_is_not_abandoned_before_ceiling() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_review_workflow(&layout);
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        let gates = GateConfig {
+            review_timeout: Duration::from_millis(200),
+            review_max_wait: Duration::from_secs(5),
+            ..GateConfig::default()
+        };
+
+        let wait = tokio::spawn({
+            let pipeline = Arc::clone(&pipeline);
+            let entry = entry.clone();
+            let gates = gates.clone();
+            async move { pipeline.request_review(&entry, &gates).await }
+        });
+
+        wait_for_spawn_count(&space, 1).await;
+        // The workflow's own timer gate holds the instance `Running` for 2s;
+        // supplying the verdict at ~600ms is comfortably past the 200ms base
+        // reviewTimeout but well before both the 2s gate and the 5s ceiling.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("request_review must not hang")
+            .unwrap()
+            .unwrap();
+        let ReviewWaitOutcome::Verdict(verdict) = outcome else {
+            panic!("expected Verdict, got {outcome:?}");
+        };
+        assert_eq!(verdict, "APPROVE");
+
+        let routed = pipeline
+            .route_verdict(&entry, ReviewWaitOutcome::Verdict(verdict), &gates)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&routed, LandingOutcome::Landed(r) if r["merged"] == true),
+            "routed: {routed:?}"
+        );
+        let main_after = rev_parse(repo_dir.path(), "main");
+        assert_ne!(main_before, main_after, "branch must have landed");
+        assert!(
+            space
+                .scan(&Pattern::category(Category::Need).identity(STEWARD_NEED_IDENTITY))
+                .unwrap()
+                .is_empty(),
+            "a live reviewer that produced a verdict before the ceiling must not escalate"
+        );
+    }
+
+    /// Liveness-aware review wait, case (b): a reviewer that goes terminal
+    /// without ever producing a verdict must not be held to the full wait
+    /// window — it escalates fast (well before even a generous base
+    /// `reviewTimeout`), carrying the instance's own captured failure
+    /// context, and the escalation text must read as a dead reviewer, not a
+    /// live-at-ceiling hold.
+    #[tokio::test]
+    async fn dead_reviewer_escalates_fast_with_death_context() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_broken_review_workflow(&layout);
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        // Generous base/ceiling: the point under test is that death is
+        // detected well before EITHER, not merely before the ceiling.
+        let gates = GateConfig {
+            review_timeout: Duration::from_secs(120),
+            review_max_wait: Duration::from_secs(600),
+            ..GateConfig::default()
+        };
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.request_review(&entry, &gates),
+        )
+        .await
+        .expect(
+            "a dead reviewer must escalate in well under 10s, nowhere near the 120s base \
+             reviewTimeout",
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "escalation took {elapsed:?}, expected well under the 120s base reviewTimeout"
+        );
+
+        let ReviewWaitOutcome::ReviewerDied(context) = outcome else {
+            panic!("expected ReviewerDied, got {outcome:?}");
+        };
+        assert!(!context.trim().is_empty(), "death context must not be empty");
+
+        let routed = pipeline
+            .route_verdict(
+                &entry,
+                ReviewWaitOutcome::ReviewerDied(context.clone()),
+                &gates,
+            )
+            .await
+            .unwrap();
+        let LandingOutcome::Escalated(need) = &routed else {
+            panic!("expected Escalated, got {routed:?}");
+        };
+        let text = need.payload["text"].as_str().unwrap();
+        assert!(
+            text.contains(&context),
+            "escalation text must carry the captured failure context: {text}"
+        );
+        assert!(
+            !text.contains("ceiling"),
+            "a dead reviewer must not read as the live-at-ceiling case: {text}"
+        );
+
+        let main_after = rev_parse(repo_dir.path(), "main");
+        assert_eq!(main_before, main_after, "branch must not have landed");
+    }
+
+    /// Liveness-aware review wait, case (c): a reviewer still alive when the
+    /// wait reaches `reviewMaxWait` escalates as a hold, but the message must
+    /// name the live-at-ceiling case rather than misreport it as a dead
+    /// reviewer.
+    #[tokio::test]
+    async fn live_reviewer_at_ceiling_escalates_as_still_running() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_review_workflow(&layout); // 2s timer gate before wait/evaluate
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        // The ceiling (800ms) falls well inside the workflow's 2s timer
+        // gate, so the instance is provably still `Running` — never a
+        // verdict is ever written.
+        let gates = GateConfig {
+            review_timeout: Duration::from_millis(100),
+            review_max_wait: Duration::from_millis(800),
+            ..GateConfig::default()
+        };
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.request_review(&entry, &gates),
+        )
+        .await
+        .expect("must resolve at the ceiling")
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(800) && elapsed < Duration::from_secs(3),
+            "expected to wait out roughly the 800ms ceiling, took {elapsed:?}"
+        );
+        assert!(
+            matches!(outcome, ReviewWaitOutcome::CeilingReached),
+            "expected CeilingReached, got {outcome:?}"
+        );
+
+        let routed = pipeline
+            .route_verdict(&entry, ReviewWaitOutcome::CeilingReached, &gates)
+            .await
+            .unwrap();
+        let LandingOutcome::Escalated(need) = &routed else {
+            panic!("expected Escalated, got {routed:?}");
+        };
+        let text = need.payload["text"].as_str().unwrap();
+        assert!(text.contains("ceiling"), "text: {text}");
+        assert!(
+            !text.to_lowercase().contains("died") && !text.to_lowercase().contains("crash"),
+            "a live-at-ceiling hold must not read as a dead reviewer: {text}"
+        );
+
+        let main_after = rev_parse(repo_dir.path(), "main");
+        assert_eq!(main_before, main_after, "branch must not have landed");
     }
 }

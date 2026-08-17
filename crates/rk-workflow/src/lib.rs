@@ -105,6 +105,12 @@ pub struct LandingPolicy {
     /// before treating the candidate as a STOP-equivalent hold, e.g. `"15m"`.
     #[serde(default = "default_review_timeout", rename = "reviewTimeout")]
     pub review_timeout: String,
+    /// Hard ceiling the landing pipeline extends the review wait to when the
+    /// reviewer is still alive past `reviewTimeout` (liveness-aware wait,
+    /// e.g. `"45m"`) — a reviewer that is merely slow rather than dead is not
+    /// abandoned at `reviewTimeout`, only at this ceiling.
+    #[serde(default = "default_review_max_wait", rename = "reviewMaxWait")]
+    pub review_max_wait: String,
 }
 
 impl Default for LandingPolicy {
@@ -115,6 +121,7 @@ impl Default for LandingPolicy {
             max_diff_lines: default_max_diff_lines(),
             gate_timeout: default_gate_timeout(),
             review_timeout: default_review_timeout(),
+            review_max_wait: default_review_max_wait(),
         }
     }
 }
@@ -257,6 +264,10 @@ fn default_gate_timeout() -> String {
 
 fn default_review_timeout() -> String {
     "15m".into()
+}
+
+fn default_review_max_wait() -> String {
+    "45m".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -972,6 +983,7 @@ fn validate_repository_policy(policy: &RepositoryPolicy) -> rk_core::Result<()> 
     }
     validate_duration_str("repo.landing.gateTimeout", &policy.landing.gate_timeout)?;
     validate_duration_str("repo.landing.reviewTimeout", &policy.landing.review_timeout)?;
+    validate_duration_str("repo.landing.reviewMaxWait", &policy.landing.review_max_wait)?;
     Ok(())
 }
 
@@ -2352,6 +2364,7 @@ checks: [
         assert_eq!(policy.landing.max_diff_lines, 2000);
         assert_eq!(policy.landing.gate_timeout, "60m");
         assert_eq!(policy.landing.review_timeout, "15m");
+        assert_eq!(policy.landing.review_max_wait, "45m");
     }
 
     #[test]
@@ -2365,6 +2378,7 @@ checks: [
                     maxDiffLines:   200
                     gateTimeout:    "30m"
                     reviewTimeout:  "5m"
+                    reviewMaxWait:  "20m"
                 }
             }
             "#,
@@ -2376,6 +2390,7 @@ checks: [
         assert_eq!(policy.landing.max_diff_lines, 200);
         assert_eq!(policy.landing.gate_timeout, "30m");
         assert_eq!(policy.landing.review_timeout, "5m");
+        assert_eq!(policy.landing.review_max_wait, "20m");
     }
 
     #[test]
@@ -2390,6 +2405,7 @@ checks: [
             r#"repo: {landing: {protectedPaths: ""}}"#,
             r#"repo: {landing: {gateTimeout: "60mm"}}"#,
             r#"repo: {landing: {reviewTimeout: "soon"}}"#,
+            r#"repo: {landing: {reviewMaxWait: "soon"}}"#,
         ] {
             assert!(load_repository_policy_str(source).is_err(), "{source}");
         }
