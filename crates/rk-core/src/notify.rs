@@ -29,9 +29,13 @@
 //!   [`SinkRegistry::deliver_one`] for why a dead channel must not mean an
 //!   unbounded retry.
 
+mod sinks;
+
+pub use sinks::{CommandSink, LogSink, COMMAND_SINK_KIND, LOG_SINK_KIND};
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 /// How loud a notice is. Ordered, so a sink can filter with `min_severity`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
@@ -189,6 +193,159 @@ impl Outcome {
     }
 }
 
+/// Builds one sink from its `[[notify.sinks]]` table.
+///
+/// Fallible on purpose: a kind with required options (`command` needs a program
+/// to run) must be able to refuse a table it cannot honour, rather than
+/// registering a channel that reports success while delivering nowhere.
+pub type SinkCtor =
+    Box<dyn Fn(&crate::config::SinkConfig) -> crate::Result<Box<dyn NotificationSink>> + Send + Sync>;
+
+/// The `kind` → implementation table, and THE registration seam.
+///
+/// Adding a delivery channel is two things and no more: implement
+/// [`NotificationSink`], and name it in one [`SinkFactory::with_kind`] call.
+/// After that it is selectable purely from `[[notify.sinks]]` — no escalation
+/// source, no reactor call site and no `SinkRegistry` caller changes, which is
+/// the whole point of the indirection.
+///
+/// The daemon keeps one of these ([`builtin`](Self::builtin) plus the `herdr`
+/// kind, which lives in `rk-mux` and so cannot be registered from here).
+/// Out-of-tree embedders build their own.
+#[derive(Default)]
+pub struct SinkFactory {
+    ctors: BTreeMap<String, SinkCtor>,
+}
+
+/// Why one `[[notify.sinks]]` table produced no sink. Both variants are the
+/// operator's to fix, so both are surfaced at `error!` and neither is fatal.
+#[derive(Debug)]
+pub enum SinkBuildError {
+    /// No registered kind by that name — almost always a typo, so the message
+    /// carries the kinds that *are* registered.
+    UnknownKind { name: String, kind: String, known: Vec<String> },
+    /// The kind exists but rejected its table (missing or unparseable option).
+    Misconfigured {
+        name: String,
+        kind: String,
+        error: crate::Error,
+    },
+}
+
+impl std::fmt::Display for SinkBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SinkBuildError::UnknownKind { name, kind, known } => write!(
+                f,
+                "notification sink `{name}` has unknown kind `{kind}`; known kinds: {}",
+                known.join(", ")
+            ),
+            SinkBuildError::Misconfigured { name, kind, error } => write!(
+                f,
+                "notification sink `{name}` of kind `{kind}` is misconfigured: {error}"
+            ),
+        }
+    }
+}
+
+impl SinkFactory {
+    /// A factory that knows no kinds. Every configured sink will be skipped —
+    /// useful only as the base for [`with_kind`](Self::with_kind) and in tests.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Every kind implementable with nothing but `rk-core`: [`LogSink`] and
+    /// [`CommandSink`]. `command` is the important one — it is what lets an
+    /// operator add a genuinely new channel (chat webhook, phone push, a script
+    /// driving `rk`) from config alone.
+    pub fn builtin() -> Self {
+        Self::empty()
+            .with_kind(LOG_SINK_KIND, |_| {
+                Ok(Box::new(LogSink) as Box<dyn NotificationSink>)
+            })
+            .with_kind(COMMAND_SINK_KIND, |config| {
+                CommandSink::from_config(config)
+                    .map(|sink| Box::new(sink) as Box<dyn NotificationSink>)
+            })
+    }
+
+    /// Register `kind`. Re-registering a kind replaces it, so an embedder can
+    /// override a built-in.
+    pub fn with_kind(
+        mut self,
+        kind: impl Into<String>,
+        ctor: impl Fn(&crate::config::SinkConfig) -> crate::Result<Box<dyn NotificationSink>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.ctors.insert(kind.into(), Box::new(ctor));
+        self
+    }
+
+    /// The registered kinds, sorted — what an operator gets told when they typo
+    /// one.
+    pub fn kinds(&self) -> Vec<&str> {
+        self.ctors.keys().map(String::as_str).collect()
+    }
+
+    /// Build one sink from one table.
+    pub fn build_sink(
+        &self,
+        config: &crate::config::SinkConfig,
+    ) -> Result<Box<dyn NotificationSink>, SinkBuildError> {
+        let ctor = self
+            .ctors
+            .get(&config.kind)
+            .ok_or_else(|| SinkBuildError::UnknownKind {
+                name: config.name().to_string(),
+                kind: config.kind.clone(),
+                known: self.kinds().into_iter().map(str::to_string).collect(),
+            })?;
+        ctor(config).map_err(|error| SinkBuildError::Misconfigured {
+            name: config.name().to_string(),
+            kind: config.kind.clone(),
+            error,
+        })
+    }
+
+    /// Build a registry from resolved config, reporting the tables that produced
+    /// nothing instead of swallowing them. A bad table skips exactly itself: the
+    /// daemon must not fall over, and the other channels must still be built.
+    pub fn try_registry(
+        &self,
+        configs: impl IntoIterator<Item = crate::config::SinkConfig>,
+    ) -> (SinkRegistry, Vec<SinkBuildError>) {
+        let mut registry = SinkRegistry::new();
+        let mut skipped = Vec::new();
+        for config in configs {
+            match self.build_sink(&config) {
+                Ok(sink) => registry.register(config, sink),
+                Err(e) => skipped.push(e),
+            }
+        }
+        (registry, skipped)
+    }
+
+    /// [`try_registry`](Self::try_registry), logging each skipped table.
+    ///
+    /// `error!`, not `warn!`, and naming the known kinds: a channel the operator
+    /// configured and believes in but which was never built is a silent loss of
+    /// every future escalation on it. The escalations themselves survive on `rk
+    /// inbox` — but nothing else tells the operator their config did nothing.
+    pub fn registry(
+        &self,
+        configs: impl IntoIterator<Item = crate::config::SinkConfig>,
+    ) -> SinkRegistry {
+        let (registry, skipped) = self.try_registry(configs);
+        for problem in &skipped {
+            error!("{problem}; escalations for it stay on `rk inbox` only");
+        }
+        registry
+    }
+}
+
 /// A sink plus the config that decides which notices reach it.
 struct Registered {
     config: crate::config::SinkConfig,
@@ -212,28 +369,6 @@ impl SinkRegistry {
     /// from a factory.
     pub fn register(&mut self, config: crate::config::SinkConfig, sink: Box<dyn NotificationSink>) {
         self.sinks.push(Registered { config, sink });
-    }
-
-    /// Build a registry from resolved config, asking `factory` for an
-    /// implementation per `kind`. An unknown kind is warned about and skipped —
-    /// a typo in config must not take the daemon down, and the escalation is
-    /// still on the inbox.
-    pub fn build(
-        configs: impl IntoIterator<Item = crate::config::SinkConfig>,
-        mut factory: impl FnMut(&str) -> Option<Box<dyn NotificationSink>>,
-    ) -> Self {
-        let mut registry = Self::new();
-        for config in configs {
-            match factory(&config.kind) {
-                Some(sink) => registry.register(config, sink),
-                None => warn!(
-                    sink = %config.name(),
-                    kind = %config.kind,
-                    "unknown notification sink kind; skipping"
-                ),
-            }
-        }
-        registry
     }
 
     pub fn is_empty(&self) -> bool {
@@ -454,15 +589,47 @@ mod tests {
         assert_eq!(deliveries[1].outcome, Outcome::AlreadyDelivered);
     }
 
+    /// The registration seam: one `with_kind` line makes a kind selectable from
+    /// config, and a table that produces nothing is reported rather than dropped.
     #[test]
-    fn an_unknown_kind_is_skipped_not_fatal() {
-        let registry = SinkRegistry::build(
-            [SinkConfig::of_kind("recorder"), SinkConfig::of_kind("carrier-pigeon")],
-            |kind| match kind {
-                "recorder" => Some(Box::new(Recorder::default()) as Box<dyn NotificationSink>),
-                _ => None,
+    fn the_factory_builds_registered_kinds_and_reports_the_rest() {
+        let factory = SinkFactory::builtin().with_kind("recorder", |_| {
+            Ok(Box::new(Recorder::default()) as Box<dyn NotificationSink>)
+        });
+        assert_eq!(factory.kinds(), ["command", "log", "recorder"]);
+
+        let (registry, skipped) = factory.try_registry([
+            SinkConfig::of_kind("recorder"),
+            // A built-in second kind, from config alone, with no code change at
+            // any caller — the B1 criterion.
+            SinkConfig::of_kind(LOG_SINK_KIND),
+            SinkConfig::of_kind("carrier-pigeon"),
+            // Registered kind, unusable table: `command` with no program.
+            SinkConfig {
+                name: Some("half-written".into()),
+                ..SinkConfig::of_kind(COMMAND_SINK_KIND)
             },
-        );
-        assert_eq!(registry.names(), ["recorder"]);
+        ]);
+
+        assert_eq!(registry.names(), ["recorder", "log"]);
+        assert_eq!(skipped.len(), 2);
+        // A typo is diagnosable from the message alone: it lists what IS known.
+        let unknown = skipped[0].to_string();
+        assert!(unknown.contains("unknown kind `carrier-pigeon`"), "{unknown}");
+        assert!(unknown.contains("command, log, recorder"), "{unknown}");
+        let bad = skipped[1].to_string();
+        assert!(bad.contains("`half-written`"), "{bad}");
+        assert!(bad.contains("misconfigured"), "{bad}");
+
+        // A bad table skips exactly itself — the good sinks still deliver.
+        assert!(registry.fan_out(&notice(), &NoDedup)[0].outcome.delivered());
+    }
+
+    #[test]
+    fn an_empty_factory_builds_nothing_and_says_why() {
+        let (registry, skipped) =
+            SinkFactory::empty().try_registry([SinkConfig::of_kind(LOG_SINK_KIND)]);
+        assert!(registry.is_empty());
+        assert!(matches!(skipped[0], SinkBuildError::UnknownKind { .. }));
     }
 }

@@ -3,6 +3,7 @@
 use figment::providers::{Env, Format, Serialized, Toml};
 use figment::Figment;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -106,6 +107,16 @@ pub struct SinkConfig {
     pub classes: Vec<String>,
     /// Severity floor. `info` (the default) accepts everything.
     pub min_severity: crate::notify::Severity,
+    /// Per-kind parameters (`[notify.sinks.options]`), interpreted by the sink
+    /// implementation and opaque to everything else.
+    ///
+    /// This is what keeps "add a channel by editing config" true for a channel
+    /// that needs to be *told* something — the `command` kind's program, a
+    /// future webhook's URL — without every new kind adding a field here that no
+    /// other kind reads. A kind that needs an option it did not get must fail to
+    /// build (see [`crate::notify::CommandSink::from_config`]) so the operator
+    /// hears about it.
+    pub options: BTreeMap<String, String>,
 }
 
 impl SinkConfig {
@@ -117,7 +128,24 @@ impl SinkConfig {
             enabled: true,
             classes: Vec::new(),
             min_severity: crate::notify::Severity::Info,
+            options: BTreeMap::new(),
         }
+    }
+
+    /// Builder for [`Self::options`], for tests and programmatic wiring.
+    pub fn with_option(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.options.insert(key.into(), value.into());
+        self
+    }
+
+    /// One `[notify.sinks.options]` entry, trimmed. An option present but blank
+    /// reads as absent: a half-filled TOML template should hit the sink's
+    /// required-option error, not be taken literally.
+    pub fn option(&self, key: &str) -> Option<&str> {
+        self.options
+            .get(key)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
     }
 
     /// The registry/dedup key: the operator's name, else the kind.
@@ -959,6 +987,53 @@ tier = "cheap"
         // A rule with neither predicate is the catch-all fallback.
         assert_eq!(cfg.tiers.rules[2].priority, None);
         assert_eq!(cfg.tiers.rules[2].label, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The B1 promise at the config layer: a second channel is `[[notify.sinks]]`
+    /// tables in the operator's file, options and all, reaching
+    /// [`NotifyConfig::resolved`] verbatim.
+    #[test]
+    fn notify_sinks_parse_from_toml_with_per_kind_options() {
+        let dir = std::env::temp_dir().join(format!("rk-cfg-notify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        std::fs::write(
+            &file,
+            r#"
+[[notify.sinks]]
+kind = "herdr"
+
+[[notify.sinks]]
+name = "ops-chat"
+kind = "command"
+classes = ["steward-escalation"]
+min_severity = "warn"
+
+[notify.sinks.options]
+command = "/usr/local/bin/rk-notify-chat"
+timeout_secs = "30"
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load(&file).unwrap();
+        let sinks = cfg.notify.resolved(true);
+        assert_eq!(sinks.len(), 2, "the operator's list, verbatim");
+        assert_eq!(sinks[0].name(), "herdr", "unnamed falls back to the kind");
+        assert!(sinks[0].options.is_empty());
+
+        let chat = &sinks[1];
+        assert_eq!(chat.name(), "ops-chat");
+        assert_eq!(chat.kind, "command");
+        assert_eq!(chat.classes, ["steward-escalation"]);
+        assert_eq!(chat.min_severity, crate::notify::Severity::Warn);
+        assert_eq!(chat.option("command"), Some("/usr/local/bin/rk-notify-chat"));
+        assert_eq!(chat.option("timeout_secs"), Some("30"));
+        assert_eq!(chat.option("nope"), None);
+
+        // The legacy master switch still wins over any list.
+        assert!(cfg.notify.resolved(false).is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

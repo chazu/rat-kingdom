@@ -31,7 +31,7 @@ use crate::workflow_exec::WorkflowEngine;
 use rk_core::config::{NotifyConfig, ReactorConfig};
 use rk_core::id::RecordId;
 use rk_core::notify::{
-    EscalationNotice, NotificationSink, Outcome, Severity, SinkDedup, SinkRegistry,
+    EscalationNotice, NotificationSink, Outcome, Severity, SinkDedup, SinkFactory, SinkRegistry,
 };
 use rk_core::paths::Layout;
 use rk_core::sdlc::{alert_diagnostic_text_is_unsafe, ConfiguredSourceName, SignalSourcePrincipal};
@@ -245,14 +245,22 @@ fn steward_escalation_notice(tuple: &Tuple) -> EscalationNotice {
     notice
 }
 
-/// Build the sink implementation for a configured `kind`. The one place a new
-/// channel is wired in; an unknown kind returns `None` and
-/// [`SinkRegistry::build`] logs and skips it.
-fn build_sink(kind: &str) -> Option<Box<dyn NotificationSink>> {
-    match kind {
-        rk_core::config::HERDR_SINK_KIND => Some(Box::new(rk_mux::HerdrSink)),
-        _ => None,
-    }
+/// The daemon's sink factory: every kind an operator can name in
+/// `[[notify.sinks]]`.
+///
+/// That is [`SinkFactory::builtin`] (`log`, and `command` — the one that makes a
+/// brand-new channel a config edit rather than a patch) plus `herdr`, which has
+/// to be registered here because `rk_mux` depends on `rk_core` and so cannot be
+/// reached from the core table.
+///
+/// This function is the entire wiring cost of a new in-tree channel: one
+/// [`SinkFactory::with_kind`] line. Nothing downstream — not
+/// [`Reactor::notify_escalation`], not `SinkRegistry::fan_out`, not any
+/// escalation source — learns about it.
+fn sink_factory() -> SinkFactory {
+    SinkFactory::builtin().with_kind(rk_core::config::HERDR_SINK_KIND, |_| {
+        Ok(Box::new(rk_mux::HerdrSink) as Box<dyn NotificationSink>)
+    })
 }
 
 impl Reactor {
@@ -269,10 +277,7 @@ impl Reactor {
         // No `[[notify.sinks]]` known here, so this resolves to the historical
         // default: one herdr sink iff `notify_escalations`. A daemon with
         // operator-configured sinks replaces this via `with_sinks`.
-        let sinks = SinkRegistry::build(
-            NotifyConfig::default().resolved(config.notify_escalations),
-            build_sink,
-        );
+        let sinks = sink_factory().registry(NotifyConfig::default().resolved(config.notify_escalations));
         Self {
             space,
             engine,
@@ -292,14 +297,15 @@ impl Reactor {
     }
 
     /// Replace the escalation push channels with the operator's configured set
-    /// (`[[notify.sinks]]`). Builder-style like [`Self::with_landing`], so the
-    /// test call sites that only know a [`ReactorConfig`] keep the default
-    /// registry built in [`Self::new`].
-    pub(crate) fn with_sinks(self, notify: &NotifyConfig) -> Self {
-        let sinks = SinkRegistry::build(
-            notify.resolved(self.config.notify_escalations),
-            build_sink,
-        );
+    /// (`[[notify.sinks]]`), built through [`sink_factory`]. Builder-style like
+    /// [`Self::with_landing`], so the test call sites that only know a
+    /// [`ReactorConfig`] keep the default registry built in [`Self::new`].
+    ///
+    /// This is the production path from config text to live channels, and the
+    /// one an integration test should drive: it proves a kind is reachable from
+    /// `[[notify.sinks]]` alone, which injecting a pre-built registry cannot.
+    pub fn with_sinks(self, notify: &NotifyConfig) -> Self {
+        let sinks = sink_factory().registry(notify.resolved(self.config.notify_escalations));
         self.with_sink_registry(sinks)
     }
 
