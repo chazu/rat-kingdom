@@ -12,6 +12,7 @@ pub mod prime;
 pub mod product_to_code;
 pub mod sdlc;
 pub mod tuple;
+pub mod version;
 
 pub use error::{Error, Result};
 
