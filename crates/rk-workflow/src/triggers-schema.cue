@@ -9,6 +9,14 @@
 //   {{tuple.payload.<key>}} — a top-level payload field. When a param's whole
 //     value is a single such placeholder the raw JSON value (and its type) is
 //     passed through; otherwise it is string-interpolated.
+//
+// Payload hygiene: a {{tuple.payload.<key>}} substitution over an
+// ingest-sourced tuple (instance starts with "source:" — an SDLC alert/webhook
+// event, see rk_core::sdlc::is_ingest_sourced) is fenced, provenance-marked,
+// and length-capped before it reaches a spawned prompt — see docs/reactor.md
+// "Payload hygiene for ingest-sourced tuples". Do not template such a field
+// somewhere it must stay a bare short value (a branch name, a ticket title);
+// prefer the tuple's structural fields or the envelope's typed fields instead.
 package triggers
 
 triggers: [...#Trigger]
