@@ -745,6 +745,61 @@ pub fn dropped_lands(lands: &[Tuple]) -> Vec<&Tuple> {
         dropped
     }
 
+/// One row per unacked `recovery_action` escalation (strategic review B2):
+/// the durable record `recovery::RecoveryAnnouncer::announce` writes for an
+/// automated recovery action (auto-respawn, kill-at-`rk done`,
+/// stale-instance timeout, orphaned-ticket reopen). Standalone rather than
+/// folded into [`build`] so this module never has to depend on
+/// `crate::recovery` for anything but the identity strings it already
+/// re-derives here — the caller (`server.rs::inbox_value`) merges this
+/// output into `build`'s and re-sorts by urgency.
+///
+/// `rk inbox ack <id>` is the ONLY thing that retires a row: unlike a
+/// `need`/`obstacle`, nothing here auto-clears from git or a later event, and
+/// the B2 re-notify sweep keeps pushing exactly as long as this row keeps
+/// showing up here.
+pub fn recovery_action_rows(actions: &[Tuple], acks: &[Tuple]) -> Vec<InboxItem> {
+    let acked: HashSet<&str> = acks
+        .iter()
+        .filter_map(|t| t.payload.get("tuple").and_then(|v| v.as_str()))
+        .collect();
+    actions
+        .iter()
+        .filter(|t| !acked.contains(t.id.to_string().as_str()))
+        .map(|t| {
+            let id = t.id.to_string();
+            let notice = t.payload.get("notice");
+            let severity = notice
+                .and_then(|n| n.get("severity"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("info");
+            let urgency = match severity {
+                "critical" => urgency::FAILED,
+                "warn" => urgency::OBSTACLE,
+                _ => urgency::NEED,
+            };
+            let subject = notice
+                .and_then(|n| n.get("subject"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(&t.identity)
+                .to_string();
+            let detail = notice
+                .and_then(|n| n.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("(recovery action)")
+                .to_string();
+            InboxItem {
+                urgency,
+                kind: "recovery-action".into(),
+                subject,
+                scope: t.scope.clone(),
+                detail,
+                action: format!("rk inbox ack {id}"),
+            }
+        })
+        .collect()
+}
+
 /// Read a boolean outcome flag off an event payload. A missing or non-boolean
 /// field is `false` — events written before a flag existed must not read as if
 /// the outcome it names had happened.
@@ -868,6 +923,59 @@ mod tests {
             "castle",
             json!({ "branch": branch, "target": target, "url": url }),
         )
+    }
+
+    fn recovery_action(scope: &str, subject: &str, severity: &str, text: &str) -> Tuple {
+        Tuple::new(
+            Category::Event,
+            scope,
+            "recovery_action",
+            "reactor",
+            json!({
+                "action_kind": "respawn",
+                "held": false,
+                "notice": {
+                    "tuple_id": "placeholder",
+                    "class": "recovery-test",
+                    "severity": severity,
+                    "scope": scope,
+                    "subject": subject,
+                    "text": text,
+                    "suggested_action": null,
+                    "refs": {},
+                },
+            }),
+        )
+    }
+
+    fn ack(tuple_id: &str) -> Tuple {
+        Tuple::new(
+            Category::Event,
+            "repo",
+            "inbox_ack",
+            "operator",
+            json!({ "tuple": tuple_id, "acked_by": "operator" }),
+        )
+    }
+
+    #[test]
+    fn recovery_action_rows_surfaces_unacked_and_drops_acked() {
+        let stale = recovery_action("repo", "Whisker", "critical", "respawn held");
+        let live = recovery_action("repo", "Nibbles", "warn", "respawn ok");
+        let acked_row = ack(&stale.id.to_string());
+
+        let rows = recovery_action_rows(&[stale.clone(), live.clone()], &[acked_row]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, "Nibbles");
+        assert_eq!(rows[0].kind, "recovery-action");
+        assert_eq!(rows[0].urgency, urgency::OBSTACLE);
+        assert_eq!(rows[0].action, format!("rk inbox ack {}", live.id));
+
+        // Nothing acked: both rows stand.
+        let rows = recovery_action_rows(&[stale.clone(), live.clone()], &[]);
+        assert_eq!(rows.len(), 2);
+        let critical_row = rows.iter().find(|r| r.subject == "Whisker").unwrap();
+        assert_eq!(critical_row.urgency, urgency::FAILED);
     }
 
     #[test]
