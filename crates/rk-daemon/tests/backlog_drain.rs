@@ -65,6 +65,7 @@ workflow: {
         },
         {type: "wait_all", timeout: "60s"},
         {type: "evaluate", expect: {all_ok: true}},
+        {type: "dismiss_all"},
     ]
 }
 "#;
@@ -130,8 +131,8 @@ async fn backlog_drain_fans_out_and_joins() {
         .await
         .unwrap();
     let id = started["instance"]["id"].as_str().unwrap().to_string();
-    // for_each, wait_all, evaluate — no aspects.
-    assert_eq!(started["instance"]["total_steps"], 3);
+    // for_each, wait_all, evaluate, dismiss_all — no aspects.
+    assert_eq!(started["instance"]["total_steps"], 4);
 
     let mut completed = false;
     for _ in 0..300 {
@@ -159,25 +160,28 @@ async fn backlog_drain_fans_out_and_joins() {
         assert_eq!(agent["harness"], "fake");
     }
 
-    // Both drained tickets closed their loop: the supervisor marks a clean
-    // finish done (fire-and-forget, so poll). The other-repo ticket is untouched.
-    let mut all_done = false;
+    // Both drained tickets closed their loop: `dismiss_all` merges every
+    // rat's branch, and a merge-mode ticket only reads `done` once delivered
+    // (TKT-01M08HB566GFBZVMDKZ8DT1ES0 / strategic-review C3) — so a clean
+    // finish alone left them `open`, and the merge takes them straight to
+    // `closed`. The other-repo ticket is untouched.
+    let mut all_closed = false;
     for _ in 0..50 {
         let tickets = client
             .call("ticket.list", json!({"scope": repo_name}))
             .await
             .unwrap();
-        all_done = tickets["tickets"]
+        all_closed = tickets["tickets"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|t| t["payload"]["status"] == "done");
-        if all_done {
+            .all(|t| t["payload"]["status"] == "closed");
+        if all_closed {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(all_done, "both drained tickets should reach status done");
+    assert!(all_closed, "both drained tickets should reach status closed");
     let other = client
         .call("ticket.list", json!({"scope": "other-repo"}))
         .await

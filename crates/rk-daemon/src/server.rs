@@ -3864,6 +3864,16 @@ impl Daemon {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
+        // Bind `done` to delivery (TKT-01M08HB566GFBZVMDKZ8DT1ES0 / strategic-
+        // review C3): a steward or operator marking a merge-mode/push-branch
+        // ticket done before its branch actually landed is exactly the
+        // TKT-18/46/147 "approved but never merged" class — refuse it here,
+        // with a pointed error, instead of letting the ticket claim done.
+        if params.changes.status.as_deref() == Some("done") {
+            if let Err(e) = self.supervisor.require_ticket_delivered(&params.id).await {
+                return Response::err(req.id, codes::INTERNAL, e.to_string());
+            }
+        }
         match self.tickets.update(&params.id, params.changes).await {
             Ok(ticket) => Response::ok(req.id, json!({"ticket": ticket})),
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
