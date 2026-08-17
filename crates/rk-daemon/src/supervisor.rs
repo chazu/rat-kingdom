@@ -4041,7 +4041,7 @@ impl Supervisor {
         }
     }
 
-    fn lock_registry(&self) -> std::sync::MutexGuard<'_, Registry> {
+    pub(crate) fn lock_registry(&self) -> std::sync::MutexGuard<'_, Registry> {
         match self.registry.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
