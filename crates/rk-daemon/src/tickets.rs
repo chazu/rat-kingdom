@@ -795,6 +795,7 @@ mod tests {
             priority: None,
             assignee: Some("Whisker".into()),
             parent: None,
+            ..Default::default()
         };
         let updated = t.update(&a.identity, changes).await.unwrap();
         assert_eq!(updated.payload["status"], "in_progress");
@@ -814,6 +815,7 @@ mod tests {
             priority: None,
             assignee: None,
             parent: None,
+            ..Default::default()
         };
         assert!(t.update(&a.identity, changes).await.is_err());
     }
@@ -859,6 +861,7 @@ mod tests {
             priority: None,
             assignee: None,
             parent: None,
+            ..Default::default()
         };
         t.update(id, changes).await.unwrap();
     }
