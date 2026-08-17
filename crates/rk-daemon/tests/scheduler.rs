@@ -9,6 +9,7 @@
 use chrono::{TimeZone, Utc};
 use rk_core::config::SchedulerConfig;
 use rk_core::paths::Layout;
+use rk_core::tuple::{Category, Pattern};
 use rk_daemon::repos::{RepoRecord, RepoRegistry};
 use rk_daemon::scheduler::Scheduler;
 use rk_daemon::supervisor::Supervisor;
@@ -110,8 +111,14 @@ fn build_engine(layout: &Layout, space: rk_space::Space) -> Arc<WorkflowEngine> 
 }
 
 fn build_scheduler(layout: &Layout, config: SchedulerConfig, space: rk_space::Space) -> Arc<Scheduler> {
-    let engine = build_engine(layout, space);
-    Arc::new(Scheduler::new(engine, layout.clone(), config))
+    let engine = build_engine(layout, space.clone());
+    Arc::new(Scheduler::new(
+        engine,
+        layout.clone(),
+        config,
+        space,
+        "test-castle".into(),
+    ))
 }
 
 /// A matching cron minute fires the workflow exactly once; the cursor then
@@ -273,6 +280,8 @@ async fn restart_rebuilds_single_flight_from_durable_running_work() {
         restarted_engine,
         layout.clone(),
         SchedulerConfig::default(),
+        rk_space::Space::open_in_memory().unwrap(),
+        "test-castle".into(),
     );
 
     assert_eq!(
@@ -328,6 +337,8 @@ async fn restart_matches_legacy_schedule_by_definition_alias() {
         restarted_engine,
         layout.clone(),
         SchedulerConfig::default(),
+        rk_space::Space::open_in_memory().unwrap(),
+        "test-castle".into(),
     );
 
     assert_eq!(
@@ -393,6 +404,8 @@ async fn restart_does_not_use_a_linked_nested_child_as_schedule_single_flight() 
         restarted_engine,
         layout.clone(),
         SchedulerConfig::default(),
+        rk_space::Space::open_in_memory().unwrap(),
+        "test-castle".into(),
     );
 
     assert_eq!(
@@ -663,4 +676,73 @@ async fn repo_local_schedule_defaults_its_repo() {
         "repo-local schedule resolves to its own repo and fires"
     );
     assert_eq!(scheduler.engine_instance_count(), 1);
+}
+
+/// A wedged `Running` instance older than the staleness bound (default 6h) no
+/// longer blocks its schedule's next matching minute — and the bypass is
+/// escalated via a `need` tuple rather than silently ignored.
+#[tokio::test]
+async fn stale_running_instance_no_longer_blocks_and_escalates() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    register_repo(&layout, "myrepo", repo.path());
+    write_global_schedule(
+        &layout,
+        "tick.cue",
+        r#"schedules: [{name: "every-min", cron: "* * * * *", run: "sched-work", repo: "myrepo"}]"#,
+    );
+
+    let first = build_scheduler(
+        &layout,
+        SchedulerConfig::default(),
+        rk_space::Space::open_in_memory().unwrap(),
+    );
+    let t = Utc.with_ymd_and_hms(2026, 7, 23, 8, 0, 0).unwrap();
+    assert_eq!(first.run_cycle_at(t).unwrap(), 1);
+
+    // Simulate a wedge: back-date the fired instance's `started_at` by 7h,
+    // past the 6h default staleness bound.
+    let snapshots = layout.home().join("workflow-instances");
+    let snapshot = std::fs::read_dir(&snapshots)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut wedged: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&snapshot).unwrap()).unwrap();
+    let wedged_started = t - chrono::Duration::hours(7);
+    wedged["started_at"] = serde_json::json!(wedged_started.to_rfc3339());
+    std::fs::write(&snapshot, serde_json::to_vec_pretty(&wedged).unwrap()).unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let restarted_engine = build_engine(&layout, space.clone());
+    assert_eq!(restarted_engine.rehydrate().len(), 1, "the wedged instance must rehydrate");
+    let restarted = Scheduler::new(
+        restarted_engine,
+        layout.clone(),
+        SchedulerConfig::default(),
+        space.clone(),
+        "test-castle".into(),
+    );
+
+    let next = t + chrono::Duration::minutes(1);
+    assert_eq!(
+        restarted.run_cycle_at(next).unwrap(),
+        1,
+        "a Running instance past the staleness bound must not block the next fire",
+    );
+    assert_eq!(restarted.engine_instance_count(), 2);
+
+    let needs = space
+        .scan(&Pattern::category(Category::Need).identity("every-min"))
+        .unwrap();
+    assert!(
+        needs.iter().any(|n| n.payload.get("type").and_then(|v| v.as_str())
+            == Some("schedule_stale_running")),
+        "the stale instance must be escalated via a need tuple: {needs:?}"
+    );
 }
