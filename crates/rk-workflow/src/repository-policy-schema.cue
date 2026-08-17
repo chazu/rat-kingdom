@@ -44,7 +44,11 @@ repo: #RepositoryPolicy
 	maxDiffLines: int | *2000
 	// Wall-clock bound for the repo's real `verify` check.
 	gateTimeout: string | *"60m"
-	// Wall-clock bound the landing pipeline parks on a review verdict before
-	// treating the candidate as a STOP-equivalent hold.
+	// Wall-clock bound the landing pipeline waits on a review verdict before
+	// checking whether the reviewer is still alive (liveness-aware wait).
 	reviewTimeout: string | *"15m"
+	// Hard ceiling on the review wait: a reviewer still alive past
+	// reviewTimeout is not abandoned until this ceiling. Only a reviewer that
+	// goes terminal without a verdict escalates before it.
+	reviewMaxWait: string | *"45m"
 }
