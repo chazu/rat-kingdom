@@ -2,7 +2,6 @@
 //! protocols. No terminal scraping, no keystroke injection, no sleeps —
 //! completion and state are events, not pane contents.
 
-pub mod axe;
 pub mod claude;
 pub mod codex;
 pub mod fake;
@@ -116,23 +115,6 @@ enum KillSignal {
 }
 
 impl SessionControl {
-    /// A control handle for adapters with no stdin protocol: signals only.
-    pub(crate) fn signal_only(pid: Option<u32>) -> Self {
-        let (kill_tx, mut kill_rx) = mpsc::channel::<KillSignal>(4);
-        tokio::spawn(async move {
-            while let Some(sig) = kill_rx.recv().await {
-                match sig {
-                    KillSignal::Interrupt => send_group_signal(pid, SIGINT),
-                    KillSignal::Kill => send_group_signal(pid, SIGTERM),
-                }
-            }
-        });
-        Self {
-            steer_tx: None,
-            kill_tx,
-        }
-    }
-
     /// Send mid-session guidance. Errors if this harness cannot steer.
     pub async fn steer(&self, message: &str) -> rk_core::Result<()> {
         let Some(tx) = &self.steer_tx else {
@@ -197,11 +179,10 @@ pub fn make_harness(kind: &str) -> rk_core::Result<Box<dyn Harness>> {
     match kind {
         "claude" => Ok(Box::new(claude::ClaudeHarness)),
         "codex" => Ok(Box::new(codex::CodexHarness)),
-        "axe" => Ok(Box::new(axe::AxeHarness)),
         "fake" => Ok(Box::new(fake::FakeHarness)),
         "jcode" => Ok(Box::new(jcode::JcodeHarness)),
         other => Err(rk_core::Error::other(format!(
-            "unknown harness kind: {other} (available: claude, codex, axe, jcode, fake)"
+            "unknown harness kind: {other} (available: claude, codex, jcode, fake)"
         ))),
     }
 }

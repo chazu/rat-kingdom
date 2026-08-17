@@ -13,7 +13,6 @@ no terminal scraping, no keystroke injection, no sleeps.
 | [`cue`](https://cuelang.org) CLI | workflow definitions | for workflows |
 | `claude` (Claude Code) | default harness | at least one harness |
 | `codex` (Codex CLI) | second harness | optional |
-| `axe` | budget-capped one-shot harness | optional |
 | [`jcode`](https://jcode.sh/docs) | multi-provider NDJSON harness | optional |
 | [`herdr`](https://herdr.dev) | attachable interactive rats | optional |
 
@@ -117,7 +116,7 @@ because they answer different questions — a branch may hold the only copy of a
 rat's work, a transcript only narrates work that lives elsewhere — so combine
 them (`--reap-git --reap-logs`) when you want everything reclaimed.
 
-Spawn options: `--harness claude|codex|axe|jcode|fake`, `--model`, `--role
+Spawn options: `--harness claude|codex|jcode|fake`, `--model`, `--role
 rat|reviewer`, `--base <branch>`, `--parent <agent>` (completion routing),
 `--permission-mode`, `--no-merge` on dismiss, `--attach` (below). `rk status`
 shows the effective harness, model, and permission mode recorded for the
@@ -952,7 +951,7 @@ baseline. A toolchain bump may add lints over code that was clean when written
 unrelated change.
 
 Crate map: `rk-core` (tuple model, config, priming), `rk-space` (tuplespace),
-`rk-git` (worktrees/merges), `rk-harness` (claude/codex/axe/jcode/fake adapters),
+`rk-git` (worktrees/merges), `rk-harness` (claude/codex/jcode/fake adapters),
 `rk-ledger` (pricing/budgets), `rk-workflow` (CUE definitions), `rk-sync`
 (git-notes replication), `rk-mux` (herdr), `rk-daemon` (supervisor, executor,
 server), `rk-cli` (`rk`).

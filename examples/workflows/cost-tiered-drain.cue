@@ -33,11 +33,11 @@ workflow: {
 		budgetUsd: {type: "int", required: false, default: 10}
 	}
 
-	// Two cost tiers plus the fallthrough default. Cheap runs the bounded axe
-	// harness; premium runs claude for the hard tickets.
+	// Two cost tiers plus the fallthrough default. Cheap runs a small model;
+	// premium runs the big one for the hard tickets.
 	agents: {
 		default: {harness: "claude"}
-		cheap:   {harness: "axe"}
+		cheap:   {harness: "claude", model: "haiku"}
 		premium: {harness: "claude", model: "opus"}
 	}
 

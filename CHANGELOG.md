@@ -16,6 +16,16 @@ daemon **reactor** as the keystone. Most of the work below was delivered by the
 fleet reviewing and merging *itself* through the steward loop (see _How this was
 built_).
 
+### Removed
+
+- **`axe` harness adapter** — deleted (`rk-harness/src/axe.rs`, the `axe` arm of
+  `make_harness`, and its config/CUE/CLI/README surface). A usage audit on
+  2026-08-17 found zero lifetime `axe` spawns across 801 agents, and every
+  adapter is maintenance on the critical path the moment its harness's protocol
+  shifts. `claude`, `codex`, `jcode`, and `fake` remain; `--harness axe`,
+  `harness = "axe"` in config, and `harness: "axe"` in a workflow's agent
+  profile are now errors.
+
 ### System hardening and remediation (2026-07-26–27)
 
 - **Operator-led onboarding prime** — `rk onboard` is exact sugar for

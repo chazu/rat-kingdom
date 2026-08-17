@@ -303,7 +303,7 @@ async fn a_rat_killed_after_a_clean_turn_reports_a_failure() {
 }
 
 /// The second proof that no further turn can follow: the process is gone.
-/// Harnesses that end with the run (codex, axe, the test fake) take this path
+/// Harnesses that end with the run (codex, the test fake) take this path
 /// for every agent, so a rat that never got to its `rk done` still reports.
 ///
 /// TKT-175: it reports as a FAILURE. Reaching the exit-flush is itself the proof
