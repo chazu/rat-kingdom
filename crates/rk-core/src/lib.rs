@@ -8,6 +8,7 @@ pub mod freeze;
 pub mod id;
 pub mod identity;
 pub mod names;
+pub mod notify;
 pub mod paths;
 pub mod prime;
 pub mod product_to_code;

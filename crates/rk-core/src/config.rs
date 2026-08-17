@@ -3,6 +3,7 @@
 use figment::providers::{Env, Format, Serialized, Toml};
 use figment::Figment;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -38,6 +39,133 @@ pub struct Config {
     /// Drives fan-out spawns onto cheap or premium tiers so a fixed budget runs
     /// a wider fleet. See [`TierRoutingConfig`].
     pub tiers: TierRoutingConfig,
+    /// Where escalations get pushed. See [`NotifyConfig`].
+    pub notify: NotifyConfig,
+}
+
+/// Operator push channels for escalations (`[[notify.sinks]]`).
+///
+/// Empty by default, which is not the same as "no notifications": an empty list
+/// means *use the built-in default*, so an existing castle that never heard of
+/// this section keeps the herdr desktop push it always had. See
+/// [`NotifyConfig::resolved`] for the exact back-compat mapping onto the older
+/// `reactor.notify_escalations` switch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct NotifyConfig {
+    /// Configured channels, in delivery order. Each entry is a `[[notify.sinks]]`
+    /// table.
+    pub sinks: Vec<SinkConfig>,
+}
+
+impl NotifyConfig {
+    /// The channels that should actually be built, given the legacy master
+    /// switch.
+    ///
+    /// * `notify_escalations = false` ⇒ no sinks at all. That bool predates this
+    ///   section and documented itself as "keep escalations purely on the
+    ///   passive inbox queue", so it stays a hard kill switch rather than
+    ///   silently losing its meaning to a config the operator never wrote.
+    /// * no `[[notify.sinks]]` ⇒ exactly the historical behaviour, expressed as
+    ///   one default herdr sink.
+    /// * any `[[notify.sinks]]` ⇒ the operator's list, verbatim. Adding a second
+    ///   channel means adding a table, with no change at any escalation source.
+    pub fn resolved(&self, notify_escalations: bool) -> Vec<SinkConfig> {
+        if !notify_escalations {
+            return Vec::new();
+        }
+        if self.sinks.is_empty() {
+            return vec![SinkConfig::of_kind(HERDR_SINK_KIND)];
+        }
+        self.sinks.clone()
+    }
+}
+
+/// The sink kind implemented by `rk_mux::HerdrSink` — the historical (and
+/// default) escalation channel.
+pub const HERDR_SINK_KIND: &str = "herdr";
+
+/// One `[[notify.sinks]]` table: which implementation, and which notices reach
+/// it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SinkConfig {
+    /// Operator-facing name, unique within the registry. It is the dedup key,
+    /// so renaming a sink lets already-pushed notices through once more.
+    /// Unset ⇒ the kind, which is what a single-channel castle wants. Optional
+    /// rather than defaulted-to-kind because `#[serde(default)]` fills a
+    /// missing field from `Default::default()`, which would hand every unnamed
+    /// sink the *default* kind's name.
+    pub name: Option<String>,
+    /// Which implementation to build (`herdr`, …). An unknown kind is warned
+    /// about and skipped, never fatal.
+    pub kind: String,
+    /// Set false to keep a sink configured but silent.
+    pub enabled: bool,
+    /// Notice classes this sink accepts (e.g. `steward-escalation`). Empty
+    /// accepts every class — the common case for a single desktop channel.
+    pub classes: Vec<String>,
+    /// Severity floor. `info` (the default) accepts everything.
+    pub min_severity: crate::notify::Severity,
+    /// Per-kind parameters (`[notify.sinks.options]`), interpreted by the sink
+    /// implementation and opaque to everything else.
+    ///
+    /// This is what keeps "add a channel by editing config" true for a channel
+    /// that needs to be *told* something — the `command` kind's program, a
+    /// future webhook's URL — without every new kind adding a field here that no
+    /// other kind reads. A kind that needs an option it did not get must fail to
+    /// build (see [`crate::notify::CommandSink::from_config`]) so the operator
+    /// hears about it.
+    pub options: BTreeMap<String, String>,
+}
+
+impl SinkConfig {
+    /// A sink of `kind`, named after it, accepting everything.
+    pub fn of_kind(kind: impl Into<String>) -> Self {
+        Self {
+            name: None,
+            kind: kind.into(),
+            enabled: true,
+            classes: Vec::new(),
+            min_severity: crate::notify::Severity::Info,
+            options: BTreeMap::new(),
+        }
+    }
+
+    /// Builder for [`Self::options`], for tests and programmatic wiring.
+    pub fn with_option(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.options.insert(key.into(), value.into());
+        self
+    }
+
+    /// One `[notify.sinks.options]` entry, trimmed. An option present but blank
+    /// reads as absent: a half-filled TOML template should hit the sink's
+    /// required-option error, not be taken literally.
+    pub fn option(&self, key: &str) -> Option<&str> {
+        self.options
+            .get(key)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// The registry/dedup key: the operator's name, else the kind.
+    pub fn name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.kind)
+    }
+
+    /// Does this sink want `notice`? Enabled, class in the allow-list (or the
+    /// list is empty), severity at or above the floor.
+    pub fn accepts(&self, notice: &crate::notify::EscalationNotice) -> bool {
+        self.enabled
+            && (self.classes.is_empty() || self.classes.iter().any(|c| c == &notice.class))
+            && notice.severity >= self.min_severity
+    }
+}
+
+impl Default for SinkConfig {
+    fn default() -> Self {
+        Self::of_kind(HERDR_SINK_KIND)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -861,6 +989,53 @@ tier = "cheap"
         // A rule with neither predicate is the catch-all fallback.
         assert_eq!(cfg.tiers.rules[2].priority, None);
         assert_eq!(cfg.tiers.rules[2].label, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The B1 promise at the config layer: a second channel is `[[notify.sinks]]`
+    /// tables in the operator's file, options and all, reaching
+    /// [`NotifyConfig::resolved`] verbatim.
+    #[test]
+    fn notify_sinks_parse_from_toml_with_per_kind_options() {
+        let dir = std::env::temp_dir().join(format!("rk-cfg-notify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        std::fs::write(
+            &file,
+            r#"
+[[notify.sinks]]
+kind = "herdr"
+
+[[notify.sinks]]
+name = "ops-chat"
+kind = "command"
+classes = ["steward-escalation"]
+min_severity = "warn"
+
+[notify.sinks.options]
+command = "/usr/local/bin/rk-notify-chat"
+timeout_secs = "30"
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load(&file).unwrap();
+        let sinks = cfg.notify.resolved(true);
+        assert_eq!(sinks.len(), 2, "the operator's list, verbatim");
+        assert_eq!(sinks[0].name(), "herdr", "unnamed falls back to the kind");
+        assert!(sinks[0].options.is_empty());
+
+        let chat = &sinks[1];
+        assert_eq!(chat.name(), "ops-chat");
+        assert_eq!(chat.kind, "command");
+        assert_eq!(chat.classes, ["steward-escalation"]);
+        assert_eq!(chat.min_severity, crate::notify::Severity::Warn);
+        assert_eq!(chat.option("command"), Some("/usr/local/bin/rk-notify-chat"));
+        assert_eq!(chat.option("timeout_secs"), Some("30"));
+        assert_eq!(chat.option("nope"), None);
+
+        // The legacy master switch still wins over any list.
+        assert!(cfg.notify.resolved(false).is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

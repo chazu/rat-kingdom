@@ -28,8 +28,11 @@ use crate::repos::RepoRegistry;
 use crate::supervisor::Supervisor;
 use crate::tickets::{NewTicket, Tickets};
 use crate::workflow_exec::WorkflowEngine;
-use rk_core::config::ReactorConfig;
+use rk_core::config::{NotifyConfig, ReactorConfig};
 use rk_core::id::RecordId;
+use rk_core::notify::{
+    EscalationNotice, NotificationSink, Outcome, Severity, SinkDedup, SinkFactory, SinkRegistry,
+};
 use rk_core::paths::Layout;
 use rk_core::sdlc::{alert_diagnostic_text_is_unsafe, ConfiguredSourceName, SignalSourcePrincipal};
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, SYSTEM_SCOPE};
@@ -157,6 +160,107 @@ pub struct Reactor {
     /// no landing pipeline, and no `action: "land"` trigger to dispatch) are
     /// unaffected.
     landing: Option<Arc<LandingPipeline>>,
+    /// The configured operator push channels. Built once (sinks are stateless
+    /// shell-outs, so there is nothing to refresh per cycle) and consulted
+    /// through the single [`SinkRegistry::fan_out`]. Empty means escalations
+    /// stay purely on the passive `rk inbox` queue.
+    sinks: SinkRegistry,
+}
+
+/// The [`SinkDedup`] the reactor hands to every fan-out: "has this sink already
+/// pushed this notice" answered from the same durable `reactor:marker` tuples
+/// [`Reactor::already_fired`] uses for triggers.
+///
+/// Marker keys are per-(tuple, sink) — `notify-escalation@<tuple>@<sink>` — so
+/// adding a channel does not inherit another channel's "already pushed". The
+/// herdr sink additionally honours the pre-registry key
+/// (`notify-escalation@<tuple>`), so a daemon upgraded mid-flight does not
+/// re-pop notifications it already showed.
+struct EscalationDedup<'a>(&'a Reactor);
+
+impl EscalationDedup<'_> {
+    fn key(notice: &EscalationNotice, sink: &str) -> String {
+        format!("notify-escalation@{}@{sink}", notice.tuple_id)
+    }
+
+    fn legacy_key(notice: &EscalationNotice, sink: &str) -> Option<String> {
+        (sink == rk_core::config::HERDR_SINK_KIND)
+            .then(|| format!("notify-escalation@{}", notice.tuple_id))
+    }
+}
+
+impl SinkDedup for EscalationDedup<'_> {
+    fn already_delivered(&self, notice: &EscalationNotice, sink: &str) -> bool {
+        // A marker read that errors is treated as "not yet delivered": a
+        // duplicate popup is a far cheaper failure than a silently dropped
+        // escalation.
+        std::iter::once(Self::key(notice, sink))
+            .chain(Self::legacy_key(notice, sink))
+            .any(|key| self.0.already_fired(&key).unwrap_or(false))
+    }
+
+    fn record_delivered(&self, notice: &EscalationNotice, sink: &str) -> rk_core::Result<()> {
+        self.0
+            .mark_notified(&Self::key(notice, sink), &notice.tuple_id, sink)
+    }
+}
+
+/// Describe a steward escalation `need` as a channel-agnostic notice.
+///
+/// The class is `steward-escalation`, which is both the config routing key
+/// (`classes = ["steward-escalation"]`) and — rendered as spaced words by
+/// [`EscalationNotice::title`] — the historical popup title "steward escalation
+/// — <task>". Severity is `critical`: this is the case where a branch is
+/// finished and blocked on a human.
+///
+/// Every *other* string field of the need rides along as a structured ref, so a
+/// richer channel than a desktop popup (a chat card, a rat-king reading the
+/// notice) gets the branch/instance/verdict context without this function
+/// needing to know which keys the steward will add next.
+fn steward_escalation_notice(tuple: &Tuple) -> EscalationNotice {
+    const PROMOTED: [&str; 3] = ["task", "text", "action"];
+    let field = |key: &str| tuple.payload.get(key).and_then(Value::as_str);
+
+    let mut notice = EscalationNotice::new(
+        tuple.id.to_string(),
+        "steward-escalation",
+        Severity::Critical,
+        &tuple.scope,
+        field("task").unwrap_or("unknown"),
+        field("text").unwrap_or("a completed branch needs a human merge decision"),
+    );
+    if let Some(action) = field("action") {
+        notice.suggested_action = Some(action.to_string());
+    }
+    if let Some(payload) = tuple.payload.as_object() {
+        for (key, value) in payload {
+            if PROMOTED.contains(&key.as_str()) {
+                continue;
+            }
+            if let Some(value) = value.as_str() {
+                notice.refs.insert(key.clone(), value.to_string());
+            }
+        }
+    }
+    notice
+}
+
+/// The daemon's sink factory: every kind an operator can name in
+/// `[[notify.sinks]]`.
+///
+/// That is [`SinkFactory::builtin`] (`log`, and `command` — the one that makes a
+/// brand-new channel a config edit rather than a patch) plus `herdr`, which has
+/// to be registered here because `rk_mux` depends on `rk_core` and so cannot be
+/// reached from the core table.
+///
+/// This function is the entire wiring cost of a new in-tree channel: one
+/// [`SinkFactory::with_kind`] line. Nothing downstream — not
+/// [`Reactor::notify_escalation`], not `SinkRegistry::fan_out`, not any
+/// escalation source — learns about it.
+fn sink_factory() -> SinkFactory {
+    SinkFactory::builtin().with_kind(rk_core::config::HERDR_SINK_KIND, |_| {
+        Ok(Box::new(rk_mux::HerdrSink) as Box<dyn NotificationSink>)
+    })
 }
 
 impl Reactor {
@@ -170,6 +274,10 @@ impl Reactor {
     ) -> Self {
         let cursor_file = layout.home().join("reactor-cursor");
         let queue_seq_file = layout.home().join("reactor-queue-seq");
+        // No `[[notify.sinks]]` known here, so this resolves to the historical
+        // default: one herdr sink iff `notify_escalations`. A daemon with
+        // operator-configured sinks replaces this via `with_sinks`.
+        let sinks = sink_factory().registry(NotifyConfig::default().resolved(config.notify_escalations));
         Self {
             space,
             engine,
@@ -184,7 +292,29 @@ impl Reactor {
             trigger_cache: Mutex::new(None),
             last_pops: Mutex::new(None),
             landing: None,
+            sinks,
         }
+    }
+
+    /// Replace the escalation push channels with the operator's configured set
+    /// (`[[notify.sinks]]`), built through [`sink_factory`]. Builder-style like
+    /// [`Self::with_landing`], so the test call sites that only know a
+    /// [`ReactorConfig`] keep the default registry built in [`Self::new`].
+    ///
+    /// This is the production path from config text to live channels, and the
+    /// one an integration test should drive: it proves a kind is reachable from
+    /// `[[notify.sinks]]` alone, which injecting a pre-built registry cannot.
+    pub fn with_sinks(self, notify: &NotifyConfig) -> Self {
+        let sinks = sink_factory().registry(notify.resolved(self.config.notify_escalations));
+        self.with_sink_registry(sinks)
+    }
+
+    /// Install an already-built registry. The seam [`Self::with_sinks`] goes
+    /// through, and the one tests use to register a sink implementation that is
+    /// not a built-in `kind` — the same path a future out-of-tree sink takes.
+    pub fn with_sink_registry(mut self, sinks: SinkRegistry) -> Self {
+        self.sinks = sinks;
+        self
     }
 
     /// Wire a daemon-native landing pipeline so an `action: "land"` trigger
@@ -1448,44 +1578,49 @@ impl Reactor {
         ));
     }
 
-    /// Built-in reaction: push a desktop notification when the steward
-    /// escalates to the operator. TKT-19 surfaces STOP/unknown verdicts as a
-    /// `need` that `rk inbox` ranks — a passive queue. This adds the active
-    /// push the leverage doc calls for, so a human is pinged the moment a
-    /// branch needs a merge decision instead of only on the next inbox check.
+    /// Built-in reaction: push the operator when the steward escalates. TKT-19
+    /// surfaces STOP/unknown verdicts as a `need` that `rk inbox` ranks — a
+    /// passive queue. This adds the active push the leverage doc calls for, so
+    /// a human is pinged the moment a branch needs a merge decision instead of
+    /// only on the next inbox check.
     ///
-    /// Fires at most once per need tuple, guarded by the same durable marker
-    /// the trigger path uses (so an at-least-once re-scan never double-pops).
-    /// A reinforced escalation keeps its id below the cursor, so it is never
-    /// re-seen — repeat pushes only happen after the old need evaporates and a
-    /// fresh one is written, which is the intended de-spam. Degrades to a
-    /// no-op with no herdr server, so a headless castle is unaffected. Returns
-    /// whether a notification was pushed.
+    /// The escalation source's whole job is to describe the event: build an
+    /// [`EscalationNotice`] and hand it to the one fan-out. WHICH channels see
+    /// it — desktop, and later anything else, including a rat-king that acts on
+    /// it through ordinary `rk` commands — is `[[notify.sinks]]` config, not
+    /// code here.
+    ///
+    /// Fires at most once per (need tuple, sink), guarded by the same durable
+    /// marker the trigger path uses (so an at-least-once re-scan never
+    /// double-pops). A reinforced escalation keeps its id below the cursor, so
+    /// it is never re-seen — repeat pushes only happen after the old need
+    /// evaporates and a fresh one is written, which is the intended de-spam.
+    /// With no sinks configured (or none reachable) this degrades to the
+    /// passive inbox, so a headless castle is unaffected. Returns whether any
+    /// sink took it.
     fn notify_escalation(&self, tuple: &Tuple) -> rk_core::Result<bool> {
-        if !self.config.notify_escalations {
+        if self.sinks.is_empty() {
             return Ok(false);
         }
         if tuple.category != Category::Need || tuple.identity != STEWARD_ESCALATION_IDENTITY {
             return Ok(false);
         }
-        let key = format!("notify-escalation@{}", tuple.id);
-        if self.already_fired(&key)? {
-            return Ok(false);
+        let notice = steward_escalation_notice(tuple);
+        let deliveries = self.sinks.fan_out(&notice, &EscalationDedup(self));
+        let attempted = deliveries
+            .iter()
+            .filter(|d| !matches!(d.outcome, Outcome::Filtered | Outcome::AlreadyDelivered))
+            .count();
+        if attempted > 0 {
+            info!(
+                tuple = %tuple.id,
+                task = %notice.subject,
+                sinks = attempted,
+                delivered = deliveries.iter().filter(|d| d.outcome.delivered()).count(),
+                "reactor pushed steward escalation notification"
+            );
         }
-        let task = tuple
-            .payload
-            .get("task")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let body = tuple
-            .payload
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("a completed branch needs a human merge decision");
-        rk_mux::HerdrMux::notify(&format!("steward escalation — {task}"), body);
-        self.mark_notified(&key, tuple)?;
-        info!(tuple = %tuple.id, task, "reactor pushed steward escalation notification");
-        Ok(true)
+        Ok(attempted > 0)
     }
 
     /// Built-in SDLC CI reaction. Storage emits exactly one transition tuple per
@@ -1987,11 +2122,11 @@ impl Reactor {
         self.space.out(marker)
     }
 
-    /// Durable "already notified" marker for the built-in escalation push. It
+    /// Durable "already notified" marker for one (escalation, sink) pair. It
     /// has no trigger/workflow of its own, so it writes the marker directly,
     /// sharing `MARKER_IDENTITY` + the `key` field so [`already_fired`] de-dups
     /// it exactly as it does a fired trigger.
-    fn mark_notified(&self, key: &str, tuple: &Tuple) -> rk_core::Result<()> {
+    fn mark_notified(&self, key: &str, tuple_id: &str, sink: &str) -> rk_core::Result<()> {
         let mut marker = Tuple::new(
             Category::Event,
             SYSTEM_SCOPE,
@@ -2000,7 +2135,8 @@ impl Reactor {
             json!({
                 "key": key,
                 "kind": "notify-escalation",
-                "tuple": tuple.id.to_string(),
+                "tuple": tuple_id,
+                "sink": sink,
             }),
         );
         marker.lifecycle = Lifecycle::Ephemeral;

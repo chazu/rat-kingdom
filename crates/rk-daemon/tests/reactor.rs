@@ -95,11 +95,61 @@ fn build_reactor_with_space(
     build_reactor_and_engine_with_space(layout, config, space).0
 }
 
+/// As [`build_reactor_with_space`], but with the escalation push channels
+/// replaced — the seam an out-of-tree sink would use.
+fn build_reactor_with_sinks(
+    layout: &Layout,
+    config: ReactorConfig,
+    space: rk_space::Space,
+    sinks: rk_core::notify::SinkRegistry,
+) -> Arc<Reactor> {
+    let (reactor, _engine) =
+        build_reactor_and_engine_with_space_sinks(layout, config, space, Some(sinks));
+    reactor
+}
+
 fn build_reactor_and_engine_with_space(
     layout: &Layout,
     config: ReactorConfig,
     space: rk_space::Space,
 ) -> (Arc<Reactor>, Arc<WorkflowEngine>) {
+    build_reactor_and_engine_with_space_sinks(layout, config, space, None)
+}
+
+/// As [`build_reactor_with_space`], but with the escalation push channels built
+/// from `[[notify.sinks]]` config through the daemon's own sink factory — the
+/// production path, and the only one that proves a kind is reachable from config
+/// alone.
+fn build_reactor_from_notify_config(
+    layout: &Layout,
+    config: ReactorConfig,
+    space: rk_space::Space,
+    notify: &rk_core::config::NotifyConfig,
+) -> Arc<Reactor> {
+    let (reactor, _engine) = build_reactor_parts(layout, config, space);
+    Arc::new(reactor.with_sinks(notify))
+}
+
+fn build_reactor_and_engine_with_space_sinks(
+    layout: &Layout,
+    config: ReactorConfig,
+    space: rk_space::Space,
+    sinks: Option<rk_core::notify::SinkRegistry>,
+) -> (Arc<Reactor>, Arc<WorkflowEngine>) {
+    let (reactor, engine) = build_reactor_parts(layout, config, space);
+    let reactor = match sinks {
+        Some(sinks) => reactor.with_sink_registry(sinks),
+        None => reactor,
+    };
+    (Arc::new(reactor), engine)
+}
+
+/// The un-`Arc`ed reactor, so a caller can still apply a `with_*` builder.
+fn build_reactor_parts(
+    layout: &Layout,
+    config: ReactorConfig,
+    space: rk_space::Space,
+) -> (Reactor, Arc<WorkflowEngine>) {
     let tickets = Arc::new(Tickets::new(space.clone(), "test-castle".into()));
     let supervisor = Arc::new(
         Supervisor::new(
@@ -129,14 +179,14 @@ fn build_reactor_and_engine_with_space(
         0,
         false,
     ));
-    let reactor = Arc::new(Reactor::new(
+    let reactor = Reactor::new(
         space,
         engine.clone(),
         tickets,
         Some(supervisor),
         layout.clone(),
         config,
-    ));
+    );
     (reactor, engine)
 }
 
@@ -1557,6 +1607,203 @@ fn escalation_markers(space: &rk_space::Space) -> usize {
         .into_iter()
         .filter(|t| t.payload.get("kind").and_then(|k| k.as_str()) == Some("notify-escalation"))
         .count()
+}
+
+/// Fan-out semantics over an *injected* registry: two sinks both see the
+/// escalation, a dead one degrades to the passive inbox, and each gets its own
+/// dedup marker. This drives `with_sink_registry` — the out-of-tree embedder
+/// seam — because it needs sink implementations that are not built-in kinds.
+///
+/// It deliberately says nothing about config; that the same channels are
+/// reachable from `[[notify.sinks]]` text alone is
+/// [`a_second_sink_registers_from_notify_config_alone`].
+#[tokio::test]
+async fn a_second_sink_registers_and_a_dead_sink_degrades() {
+    use rk_core::config::SinkConfig;
+    use rk_core::notify::{EscalationNotice, NotificationSink, SinkRegistry};
+    use std::sync::Mutex;
+
+    /// A sink that records what it was handed, or fails like an uninstalled
+    /// channel would.
+    struct Probe {
+        seen: Arc<Mutex<Vec<String>>>,
+        dead: bool,
+    }
+    impl NotificationSink for Probe {
+        fn kind(&self) -> &str {
+            "probe"
+        }
+        fn deliver(&self, notice: &EscalationNotice) -> rk_core::Result<()> {
+            if self.dead {
+                return Err(rk_core::Error::other("channel not installed"));
+            }
+            self.seen.lock().unwrap().push(notice.title());
+            Ok(())
+        }
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let live = Arc::new(Mutex::new(Vec::new()));
+
+    let mut sinks = SinkRegistry::new();
+    sinks.register(
+        SinkConfig {
+            name: Some("dead-channel".into()),
+            ..SinkConfig::of_kind("probe")
+        },
+        Box::new(Probe {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            dead: true,
+        }),
+    );
+    sinks.register(
+        SinkConfig {
+            name: Some("live-channel".into()),
+            classes: vec!["steward-escalation".into()],
+            ..SinkConfig::of_kind("probe")
+        },
+        Box::new(Probe {
+            seen: Arc::clone(&live),
+            dead: false,
+        }),
+    );
+    let reactor = build_reactor_with_sinks(&layout, ReactorConfig::default(), space.clone(), sinks);
+
+    space
+        .out(steward_need("myrepo", "TKT-42", "steward: STOP for TKT-42"))
+        .unwrap();
+    reactor.run_cycle().unwrap();
+
+    assert_eq!(
+        *live.lock().unwrap(),
+        ["steward escalation — TKT-42"],
+        "the second sink got the notice with no change at the escalation source"
+    );
+    assert_eq!(
+        escalation_markers(&space),
+        2,
+        "one marker per (escalation, sink): the dead channel is not retried forever"
+    );
+    // The dead sink neither aborted the cycle nor suppressed the live one, and
+    // the escalation itself is still on the passive queue.
+    assert_eq!(
+        space
+            .scan(&rk_core::tuple::Pattern::category(Category::Need).identity("steward"))
+            .unwrap()
+            .len(),
+        1,
+        "a dead sink degrades to the inbox — the need is untouched"
+    );
+}
+
+/// **The B1 acceptance test.** A second delivery channel exists because an
+/// operator wrote `[[notify.sinks]]` in their config file — nothing else.
+///
+/// Everything here is the production path: real TOML text, `Config::load`,
+/// `Reactor::with_sinks`, the daemon's own sink factory, a real escalation `need`
+/// drained by a real `run_cycle`. No sink is constructed by the test and no
+/// registry is injected, so the only way the script can run is if a `kind` named
+/// in config alone reached a live channel.
+///
+/// The config also names a kind that does not exist, to pin down that a typo
+/// costs the operator that one channel and nothing else.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_second_sink_registers_from_notify_config_alone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+
+    // The "second channel" an operator is adding: any program at all. It records
+    // what the sink handed it so we can assert the notice survived the trip.
+    let delivered = home.path().join("delivered.txt");
+    let script = home.path().join("push.sh");
+    std::fs::write(
+        &script,
+        format!(
+            // `task` is promoted to the notice subject, so the ref that proves
+            // structured context survived is `agent`.
+            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$RK_NOTICE_SEVERITY\" \"$1\" \"$RK_NOTICE_REF_AGENT\" >> {}\n",
+            delivered.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The whole of the operator's change: config text. Note `herdr` is absent —
+    // the historical default is fully replaced by the configured list.
+    let config_file = home.path().join("config.toml");
+    std::fs::write(
+        &config_file,
+        format!(
+            r#"
+[[notify.sinks]]
+name = "ops-script"
+kind = "command"
+classes = ["steward-escalation"]
+
+[notify.sinks.options]
+command = "{}"
+
+[[notify.sinks]]
+name = "typo"
+kind = "carrier-pigeon"
+"#,
+            script.display()
+        ),
+    )
+    .unwrap();
+
+    let config = rk_core::config::Config::load(&config_file).unwrap();
+    assert_eq!(config.notify.sinks.len(), 2, "both tables parsed");
+
+    let space = rk_space::Space::open_in_memory().unwrap();
+    let reactor = build_reactor_from_notify_config(
+        &layout,
+        config.reactor.clone(),
+        space.clone(),
+        &config.notify,
+    );
+
+    space
+        .out(steward_need(
+            "myrepo",
+            "TKT-77",
+            "steward: STOP for TKT-77 — needs a human merge decision",
+        ))
+        .unwrap();
+    reactor.run_cycle().unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&delivered).unwrap(),
+        "critical|steward escalation — TKT-77|steward\n",
+        "a kind named only in [[notify.sinks]] delivered the notice, \
+         with its severity and refs intact and no change at the escalation source"
+    );
+    assert_eq!(
+        escalation_markers(&space),
+        1,
+        "one marker for the one channel that was actually built — the unknown \
+         kind did not silently claim a delivery"
+    );
+
+    // The unknown kind cost itself and nothing else: the good sink ran above,
+    // and the escalation is still on the passive queue either way.
+    reactor.run_cycle().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&delivered)
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "still deduped per (notice, sink) — a config-built sink is not special"
+    );
 }
 
 /// A steward escalation gets an active push exactly once, and only the steward:

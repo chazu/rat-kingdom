@@ -6,6 +6,7 @@
 //! from pre-1.0 protocol churn). Everything degrades gracefully: no herdr, no
 //! attach surface, headless spawns unaffected.
 
+use rk_core::notify::{EscalationNotice, NotificationSink};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
@@ -121,6 +122,32 @@ impl HerdrMux {
                     .iter()
                     .any(|f| f.as_str() == Some(target))
             })
+    }
+}
+
+/// The herdr desktop push as a [`NotificationSink`] — the default (and, before
+/// the sink registry, the only) escalation channel.
+///
+/// Renders exactly what the hardwired call rendered: `HerdrMux::notify(title,
+/// body)` with the notice's own title/body. Unlike [`HerdrMux::notify`], which
+/// swallows everything, this reports failure so the registry can decline to
+/// write a dedup marker and retry the notice on a later escalation.
+pub struct HerdrSink;
+
+impl NotificationSink for HerdrSink {
+    fn kind(&self) -> &str {
+        rk_core::config::HERDR_SINK_KIND
+    }
+
+    fn deliver(&self, notice: &EscalationNotice) -> rk_core::Result<()> {
+        run_herdr(&[
+            "notification",
+            "show",
+            &notice.title(),
+            "--body",
+            &notice.body(),
+        ])?;
+        Ok(())
     }
 }
 
