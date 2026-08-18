@@ -817,6 +817,25 @@ triggers: [
   instance|id}}` and `{{tuple.payload.<field>}}` (a lone payload placeholder
   passes the raw JSON value through; otherwise it is string-interpolated).
 
+Install and audit deployed copies the same way as workflows (`rk workflow
+install`/`drift`, above) — `rk trigger drift` is the source-of-truth check a
+manual `cp examples/*.cue ~/.rat-kingdom/triggers/` has no other way to get.
+This matters most when swapping one trigger file for another that matches the
+same predicate (e.g. the daemon-native landing pipeline cutover,
+`docs/proposals/daemon-native-landing-pipeline.md` §6): leaving the old file
+behind double-dispatches every matching completion instead of quietly doing
+nothing, so confirming it's gone is not optional.
+
+```bash
+rk trigger install examples/triggers-landing-pipeline.cue
+rk trigger drift --repo .          # flags a deployed copy no current source backs
+```
+
+`rk trigger install --repo <repo>` always targets `<repo>/.rk/triggers.cue`
+regardless of the source file's own name — the reactor only ever reads that
+one fixed repo-local path (`Reactor::trigger_files`), never a directory of
+many, unlike the global `~/.rat-kingdom/triggers/` deployment.
+
 Configure in `config.toml`:
 
 ```toml
