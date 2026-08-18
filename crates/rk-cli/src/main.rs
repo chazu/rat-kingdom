@@ -585,6 +585,160 @@ enum DaemonCommand {
     Status,
     /// Stop the running daemon.
     Stop,
+    /// One-command drain -> restart -> reconcile: stop admitting new
+    /// dispatch, wait for live rats to finish (parking any still running at
+    /// the deadline), restart the daemon binary onto whatever `rk` now
+    /// resolves to, then respawn the rats this rollover parked.
+    Rollover {
+        /// Seconds to wait for live rats to finish naturally before parking
+        /// them. Parked rats respawn after the restart either way, so 0
+        /// parks immediately.
+        #[arg(long, default_value_t = 120)]
+        wait_secs: u64,
+    },
+}
+
+/// Drive `rk daemon rollover` end to end: pause dispatch, wait out
+/// `wait_secs` for live rats to finish naturally, stop the daemon (parking
+/// whoever is still running — `on_daemon_started` marks them `Orphaned` on
+/// the next boot, worktree/branch/session preserved), bring a fresh daemon
+/// process up onto whatever `rk` now resolves to, then respawn exactly the
+/// rats this run parked.
+///
+/// Deliberately narrower than the periodic self-healing sweep
+/// (`respawn_enabled`): it only ever touches agents it captured as live
+/// right before calling `stop`, and only if the restart actually orphaned
+/// them (one that finished during the wait is `Completed`, not `Orphaned`,
+/// and must not be resumed) — so it never disturbs an unrelated agent an
+/// operator left `Orphaned` from an earlier incident, and it works
+/// regardless of the `respawn_enabled` policy flag.
+async fn daemon_rollover(layout: &Layout, wait_secs: u64, as_json: bool) -> Result<()> {
+    let mut client = Client::connect(layout)
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon is not running — nothing to roll over"))?;
+
+    let mut live = match rollover_drain(&mut client, wait_secs, as_json).await {
+        Ok(live) => live,
+        Err(e) => {
+            // Don't leave a live daemon stuck refusing dispatch over a
+            // failure that happened before we ever got to `stop`.
+            let _ = client.call("daemon.resume_dispatch", json!({})).await;
+            return Err(e);
+        }
+    };
+
+    if !live.is_empty() && !as_json {
+        println!(
+            "rollover: {} rat(s) still running after {wait_secs}s — parking them, they will respawn",
+            live.len()
+        );
+    }
+
+    client.call("stop", json!({})).await?;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        if Client::connect(layout).await.is_err() {
+            break;
+        }
+    }
+
+    // Bring the new daemon up onto whatever binary `rk` now resolves to.
+    // `connect_or_spawn` refuses to auto-start from inside an agent session
+    // (RK_AGENT set) — this command is operator-only (see `authorize_reasoned`)
+    // so that refusal, if hit, is itself the right answer.
+    let mut client = Client::connect_or_spawn(layout).await?;
+
+    // Reconcile: respawn only the rats parked above, and only the ones the
+    // restart actually orphaned.
+    let mut respawned = Vec::new();
+    let mut failed = Vec::new();
+    if !live.is_empty() {
+        let agents = client.call("agent.list", json!({})).await?;
+        let orphaned: std::collections::HashSet<String> = agents["agents"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|r| r["state"].as_str() == Some("orphaned"))
+                    .filter_map(|r| r["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        live.retain(|name| orphaned.contains(name));
+        for name in &live {
+            match client.call("agent.respawn", json!({"name": name})).await {
+                Ok(_) => respawned.push(name.clone()),
+                Err(e) => failed.push((name.clone(), e.to_string())),
+            }
+        }
+    }
+
+    if as_json {
+        println!(
+            "{}",
+            json!({
+                "rolled_over": true,
+                "respawned": respawned,
+                "respawn_failed": failed
+                    .iter()
+                    .map(|(n, e)| json!({"name": n, "error": e}))
+                    .collect::<Vec<_>>(),
+            })
+        );
+    } else {
+        println!("rollover complete: new daemon up");
+        if !respawned.is_empty() {
+            println!("  respawned: {}", respawned.join(", "));
+        }
+        for (name, err) in &failed {
+            println!("  respawn failed for {name}: {err}");
+        }
+    }
+    Ok(())
+}
+
+/// The drain phase of [`daemon_rollover`]: pause dispatch, then poll live
+/// agents down to zero or `wait_secs`, whichever comes first. Returns
+/// whoever is still live at the end — the set about to be parked.
+async fn rollover_drain(client: &mut Client, wait_secs: u64, as_json: bool) -> Result<Vec<String>> {
+    let pause = client.call("daemon.pause_dispatch", json!({})).await?;
+    let mut live: Vec<String> = pause["live_agents"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !as_json {
+        println!(
+            "rollover: dispatch paused, {} live rat(s) to drain",
+            live.len()
+        );
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+    while !live.is_empty() {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        tokio::time::sleep(remaining.min(std::time::Duration::from_secs(2))).await;
+        let agents = client.call("agent.list", json!({})).await?;
+        live = agents["agents"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|r| matches!(r["state"].as_str(), Some("running" | "spawning")))
+                    .filter_map(|r| r["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !as_json {
+            println!("rollover: waiting on {} live rat(s)...", live.len());
+        }
+    }
+
+    Ok(live)
 }
 
 /// Emit a human approval decision for a workflow instance parked at an
@@ -751,6 +905,9 @@ async fn main() -> Result<()> {
                 } else {
                     println!("stopped");
                 }
+            }
+            DaemonCommand::Rollover { wait_secs } => {
+                daemon_rollover(&layout, wait_secs, cli.json).await?;
             }
         },
         Command::Out(args) => space_cmds::out(&layout, args, cli.json).await?,

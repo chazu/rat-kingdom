@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
@@ -509,6 +509,11 @@ pub struct Supervisor {
     /// [`set_min_free_disk_gb`](Supervisor::set_min_free_disk_gb), so this
     /// safety feature cannot spuriously fail spawns on a tight CI disk.
     min_free_disk_gb: AtomicU64,
+    /// Set by `daemon.pause_dispatch` (`rk daemon rollover`'s drain step);
+    /// gates admission in [`spawn`](Self::spawn) only — it does not touch
+    /// agents already running. In-memory: a fresh daemon process always
+    /// starts unpaused, so a rollover can never leave a *future* daemon stuck.
+    dispatch_paused: AtomicBool,
 }
 
 /// How far one agent generation has got through reporting its completion.
@@ -721,6 +726,7 @@ impl Supervisor {
             log,
             merge_queue: MergeQueue::default(),
             min_free_disk_gb: AtomicU64::new(0),
+            dispatch_paused: AtomicBool::new(false),
         })
     }
 
@@ -729,6 +735,20 @@ impl Supervisor {
     /// the supervisor is shared behind an `Arc` from construction onward.
     pub fn set_min_free_disk_gb(&self, gb: u64) {
         self.min_free_disk_gb.store(gb, Ordering::Relaxed);
+    }
+
+    /// Pause or resume new-agent admission ([`spawn`](Self::spawn)). Used by
+    /// `rk daemon rollover` to stop the drain autoscaler, scheduler, and
+    /// `agent.spawn`/`workflow.run` from growing the live-agent count while
+    /// it waits the fleet down to park it for a daemon restart — all three
+    /// dispatch sources funnel through the same `spawn` admission path, so
+    /// one flag here covers all of them.
+    pub fn set_dispatch_paused(&self, paused: bool) {
+        self.dispatch_paused.store(paused, Ordering::Relaxed);
+    }
+
+    pub fn dispatch_paused(&self) -> bool {
+        self.dispatch_paused.load(Ordering::Relaxed)
     }
 
     /// The per-agent transcript store (for `agent.log` reads and `--follow`).
@@ -810,6 +830,11 @@ impl Supervisor {
         params: SpawnParams,
         fleet_wip_cap: usize,
     ) -> rk_core::Result<AgentRecord> {
+        if self.dispatch_paused.load(Ordering::Relaxed) {
+            return Err(rk_core::Error::other(
+                "dispatch is paused for a daemon rollover; try again shortly",
+            ));
+        }
         validate_role(&params.role)?;
         let repo = Repo::discover(std::path::Path::new(&params.repo))?;
         let repo_name = repo.name();

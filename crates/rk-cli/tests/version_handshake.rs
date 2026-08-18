@@ -80,7 +80,7 @@ fn a_daemon_on_another_build_warns_naming_both() {
         "warning must name the CLI's own build: {stderr}"
     );
     assert!(
-        stderr.contains("rk daemon stop"),
+        stderr.contains("rk daemon rollover"),
         "warning must say how to fix it: {stderr}"
     );
     // The warning is advice, not an error: a mismatched daemon still answers,
