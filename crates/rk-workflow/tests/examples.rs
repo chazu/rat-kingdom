@@ -140,23 +140,15 @@ fn shipped_example_triggers_load() {
             t.run
         );
     }
-    let steward = triggers
-        .iter()
-        .find(|trigger| trigger.name == "steward-on-completion")
-        .expect("shipped completion trigger");
-    assert_eq!(
-        steward.params.get("target").map(String::as_str),
-        Some("{{tuple.payload.target}}"),
-        "steward must preserve the daemon-authored agent base"
-    );
 }
 
-/// P3-T4's alternative completion-feed trigger: an `action: "land"` trigger
-/// needs no `run` (the schema makes it optional for that action), and its
-/// match predicate must stay identical to `steward-on-completion`'s so the
-/// cutover runbook's swap is a like-for-like replacement.
+/// The daemon-native landing pipeline's completion feed (steward remediation
+/// Phase 3-T4, post-cutover replacement for the retired `steward-on-completion`
+/// workflow trigger): an `action: "land"` trigger needs no `run` (the schema
+/// makes it optional for that action), and it must match every plain-rat
+/// completion the old workflow trigger used to.
 #[test]
-fn landing_pipeline_trigger_loads_with_no_run_and_matches_steward_completion_shape() {
+fn landing_pipeline_trigger_loads_with_no_run_and_matches_rat_completions() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -170,21 +162,13 @@ fn landing_pipeline_trigger_loads_with_no_run_and_matches_steward_completion_sha
         .expect("shipped landing-pipeline trigger");
     assert_eq!(landing.action, rk_workflow::TriggerAction::Land);
     assert_eq!(landing.run, "");
-
-    let steward_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("examples")
-        .join("triggers.cue");
-    let steward_triggers = rk_workflow::load_triggers(&steward_file).unwrap();
-    let steward = steward_triggers
-        .iter()
-        .find(|t| t.name == "steward-on-completion")
-        .expect("shipped completion trigger");
+    assert_eq!(landing.matcher.category.as_deref(), Some("event"));
+    assert_eq!(landing.matcher.identity.as_deref(), Some("harness_result"));
     assert_eq!(
-        landing.matcher, steward.matcher,
-        "the landing-pipeline trigger must match the exact same completions \
-         steward-on-completion does, so the cutover runbook's swap is like-for-like"
+        landing.matcher.search.as_deref(),
+        Some("\"role\":\"rat\""),
+        "must scope to plain-rat completions, the same re-entrancy break the \
+         retired workflow trigger relied on"
     );
 }
 
@@ -404,459 +388,13 @@ fn reviewer_drives_rework_loads_and_routes() {
 }
 
 #[test]
-fn steward_loads_and_routes() {
-    use rk_workflow::Step;
-    // Trigger passes {taskId, branch, repo}; the rest default. Loads with just
-    // taskId, proving every other param is defaulted (the reactor supplies the
-    // real branch/repo at fire time).
-    let inputs = HashMap::from([("taskId".to_string(), json!("fix-login"))]);
-    let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
-
-    // The reviewer chains onto the completed branch (spawn.branch set), so the
-    // gates below run against that work — not a fresh branch off HEAD.
-    let Step::Spawn(spawn) = &workflow.steps[0] else {
-        panic!("steward must start by spawning the reviewer");
-    };
-    assert_eq!(spawn.role, "reviewer");
-    let resolved =
-        rk_workflow::resolve::resolve(spawn, &workflow.agents, &HashMap::new(), "fake").unwrap();
-    assert_eq!(resolved.harness, "codex");
-    assert_eq!(resolved.model.as_deref(), Some("gpt-5.6-luna"));
-    assert!(
-        spawn.branch.is_some(),
-        "reviewer must chain onto the branch param"
-    );
-
-    // Two fail-closed gates precede the merge decision: a protected-path POLICY
-    // gate and the repo's real RUN gate, each a `run` + `evaluate {exit: 0}`.
-    let runs: Vec<&rk_workflow::RunStep> = workflow
-        .steps
-        .iter()
-        .filter_map(|s| match s {
-            Step::Run(r) => Some(r),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        runs.iter().any(|r| {
-            r.check.as_deref() == Some("steward-protected-paths")
-                && r.env.contains_key("RK_CHECK_TARGET")
-                && r.env.contains_key("RK_CHECK_PROTECTED_PATHS")
-        }),
-        "a repository-authorized protected-path policy gate must run before merge"
-    );
-    // A diff-scope gate bounds the SIZE of the branch's diff (#20): count files
-    // and added+removed lines vs the target and exit non-zero when over budget.
-    // The budget params interpolate to bare integers, so match the numstat probe.
-    assert!(
-        runs.iter().any(|r| {
-            r.check.as_deref() == Some("steward-diff-scope")
-                && r.env.contains_key("RK_CHECK_MAX_DIFF_FILES")
-                && r.env.contains_key("RK_CHECK_MAX_DIFF_LINES")
-        }),
-        "a repository-authorized diff-scope guardrail must run before merge"
-    );
-    assert!(
-        runs.iter()
-            .all(|r| r.command.is_none() && r.check.is_some()),
-        "steward top-level run gates must use repo-owned named checks"
-    );
-    let gate_evaluates = workflow
-        .steps
-        .iter()
-        .filter(|s| matches!(s, Step::Evaluate(e) if e.expect.get("exit").is_some()))
-        .count();
-    assert!(
-        gate_evaluates >= 3,
-        "the policy, diff-scope, and run gates must each fail closed on non-zero exit"
-    );
-
-    // The verdict is lifted, then routed on.
-    let read = workflow
-        .steps
-        .iter()
-        .find_map(|s| match s {
-            Step::Read(r) => Some(r),
-            _ => None,
-        })
-        .expect("a read step lifting the verdict");
-    assert_eq!(read.into, "verdict");
-    assert_eq!(read.field.as_deref(), Some("recommendation"));
-    // TKT-161: the steward is fired PER rat completion, so instances run
-    // concurrently on one repo by design and every one of them reads
-    // (artifact, <repo>, review). The binding is what stops the APPROVE arm
-    // below — the only arm that lands — from acting on a peer's verdict.
-    assert!(
-        read.from_agent,
-        "the verdict read must be bound to the reviewer that wrote it"
-    );
-
-    let Step::When(when) = workflow.steps.last().unwrap() else {
-        panic!("steward should end in a when routing on the verdict");
-    };
-    assert_eq!(when.var, "verdict");
-    // APPROVE is the ONLY path that lands (auto-merge).
-    assert!(
-        when.cases["APPROVE"]
-            .iter()
-            .any(|s| matches!(s, Step::Land(_))),
-        "APPROVE must land the branch"
-    );
-    // Every repository delivery mode reports the same success truth. This
-    // keeps the steward independent of merge/push/PR mechanics.
-    let land_gate = when.cases["APPROVE"]
-        .iter()
-        .find_map(|s| match s {
-            Step::Evaluate(e) if e.expect.get("delivered").is_some() => Some(e),
-            _ => None,
-        })
-        .expect("APPROVE must gate the policy result on delivered:true");
-    assert_eq!(land_gate.expect.get("delivered"), Some(&json!(true)));
-    assert!(land_gate.any_of.is_empty());
-    assert!(
-        !when.cases["REWORK"]
-            .iter()
-            .any(|s| matches!(s, Step::Land(_))),
-        "REWORK must never land"
-    );
-    // REWORK files a durable ticket rather than looping a rework rat here.
-    assert!(
-        when.cases["REWORK"]
-            .iter()
-            .any(|s| matches!(s, Step::Run(r) if r.check.as_deref() == Some("steward-file-rework-ticket"))),
-        "REWORK must file a follow-up ticket"
-    );
-    // STOP escalates to the operator via a need tuple and holds the branch.
-    assert!(
-        when.cases["STOP"].iter().any(
-            |s| matches!(s, Step::Run(r) if r.check.as_deref() == Some("steward-report-stop"))
-        ),
-        "STOP must escalate via a need tuple"
-    );
-    // Unknown verdict: escalate and fail loudly.
-    assert!(
-        !when.default.is_empty(),
-        "unknown verdicts must route to a default arm"
-    );
-    assert!(when.default.iter().any(|s| matches!(s, Step::Stop(_))));
-}
-
-/// Review tiering (TKT-01M036N1RT74H6NPRH5FMM8A6T): a diffClass of
-/// "doc-only" (or "trivial") takes the REDUCED tier — a gate-holder spawn
-/// instead of a reviewer, no verdict read/routing, and an unconditional land
-/// once the shared gates pass.
-#[test]
-fn steward_reduced_tier_skips_reviewer_and_lands_unconditionally() {
-    use rk_workflow::Step;
-
-    let inputs = HashMap::from([
-        ("taskId".to_string(), json!("fix-typo")),
-        ("diffClass".to_string(), json!("doc-only")),
-    ]);
-    let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
-
-    let Step::Spawn(spawn) = &workflow.steps[0] else {
-        panic!("reduced tier must still start with a spawn (only a spawned agent's worktree can host the gates)");
-    };
-    assert_eq!(
-        spawn.agent.as_deref(),
-        Some("gateholder"),
-        "the reduced tier must spawn the gate-holder profile, not the reviewer"
-    );
-    assert!(
-        spawn.branch.is_some(),
-        "the gate-holder must chain onto the completed branch, same as the reviewer"
-    );
-
-    // The same deterministic gates still run — tiering only skips the LLM
-    // review, never the gates.
-    let runs: Vec<&rk_workflow::RunStep> = workflow
-        .steps
-        .iter()
-        .filter_map(|s| match s {
-            Step::Run(r) => Some(r),
-            _ => None,
-        })
-        .collect();
-    assert!(runs
-        .iter()
-        .any(|r| r.check.as_deref() == Some("steward-protected-paths")));
-    assert!(runs
-        .iter()
-        .any(|r| r.check.as_deref() == Some("steward-diff-scope")));
-    assert!(runs.iter().any(|r| r.check.as_deref() == Some("verify")));
-
-    // No verdict to read or route on — nothing reviewed the diff.
-    assert!(
-        !workflow.steps.iter().any(|s| matches!(s, Step::Read(_))),
-        "the reduced tier must not read a review verdict"
-    );
-    assert!(
-        !workflow
-            .steps
-            .iter()
-            .any(|s| matches!(s, Step::When(w) if w.var == "verdict")),
-        "the reduced tier must not route on a review verdict"
-    );
-
-    // Land is unconditional (not nested inside a verdict `when`) and still
-    // gates the delivery result.
-    let land = workflow
-        .steps
-        .iter()
-        .rev()
-        .find_map(|s| match s {
-            Step::Land(l) => Some(l),
-            _ => None,
-        })
-        .expect("reduced tier must land the branch");
-    assert_eq!(land.target, "main");
-    let evaluate_after_land = workflow
-        .steps
-        .iter()
-        .rev()
-        .find_map(|s| match s {
-            Step::Evaluate(e) if e.expect.get("delivered").is_some() => Some(e),
-            _ => None,
-        })
-        .expect("land must be gated by a delivered:true evaluate");
-    assert_eq!(
-        evaluate_after_land.expect.get("delivered"),
-        Some(&json!(true))
-    );
-}
-
-/// A completion payload with no diffClass at all (a legacy completion) must
-/// default to "large" and take the unchanged review tier — fail-closed
-/// toward review, not toward skipping it.
-#[test]
-fn steward_missing_diff_class_defaults_to_review_tier() {
-    use rk_workflow::Step;
-
-    let inputs = HashMap::from([("taskId".to_string(), json!("fix-login"))]);
-    let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
-
-    let Step::Spawn(spawn) = &workflow.steps[0] else {
-        panic!("missing diffClass must still start with the reviewer spawn");
-    };
-    assert_eq!(spawn.role, "reviewer");
-    assert_eq!(
-        spawn.agent.as_deref(),
-        Some("reviewer"),
-        "a missing diffClass must default to \"large\" and take the review tier"
-    );
-    assert!(
-        workflow.steps.iter().any(|s| matches!(s, Step::Read(_))),
-        "the review tier must still read a verdict"
-    );
-}
-
-/// Provenance for the commit-keyed verdict cache (Phase 2, and its rework):
-/// the reviewer's task carries the branch-tip SHA, and it is instructed to
-/// record BOTH head_sha and branch in its verdict artifact (the rework's fix:
-/// a sha alone is not exclusive to one branch). A non-empty headSha+branch now
-/// takes the cached-review arm, so the reviewer spawn is nested inside its
-/// cache-miss (`""`) case rather than sitting at steps[0] — see
-/// `steward_cached_verdict_probe_is_bound_to_the_exact_commit_and_gates_the_hit_path`
-/// for the shape of the cache probe itself.
-#[test]
-fn steward_review_tier_threads_head_sha_into_reviewer_task_and_artifact() {
-    use rk_workflow::Step;
-
-    let inputs = HashMap::from([
-        ("taskId".to_string(), json!("fix-login")),
-        ("headSha".to_string(), json!("deadbeef123")),
-        ("branch".to_string(), json!("rat/fix-login/tkt-1")),
-    ]);
-    let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
-
-    let Step::When(cache_probe_route) = &workflow.steps[1] else {
-        panic!("a non-empty headSha+branch must probe the verdict cache before reviewing");
-    };
-    let cache_miss = &cache_probe_route.cases[""];
-    let Step::Spawn(spawn) = &cache_miss[0] else {
-        panic!("a cache miss must fall through to spawning the reviewer");
-    };
-    let description = spawn
-        .task
-        .description
-        .as_deref()
-        .expect("reviewer task must carry a description");
-    assert!(
-        description.contains("deadbeef123"),
-        "the reviewer's task must be told the branch-tip SHA it is reviewing"
-    );
-    assert!(
-        description.contains("\"head_sha\": \"deadbeef123\""),
-        "the reviewer must be instructed to record head_sha in its verdict artifact: {description}"
-    );
-    assert!(
-        description.contains("\"branch\": \"rat/fix-login/tkt-1\""),
-        "the reviewer must be instructed to record branch in its verdict artifact, or a \
-         verdict from one branch can be reused on another sharing the same tip: {description}"
-    );
-}
-
-/// The commit-keyed verdict cache probe (Phase 2) itself: bounded,
-/// non-blocking, keyed on the exact commit, and — critically — its cache-HIT
-/// path must never spawn the expensive `reviewer` agent, only the cheap
-/// `gateholder` used elsewhere to host deterministic gates. A hit that spawned
-/// a fresh reviewer anyway would defeat the entire point of the cache.
-#[test]
-fn steward_cached_verdict_probe_is_bound_to_the_exact_commit_and_gates_the_hit_path() {
-    use rk_workflow::Step;
-
-    let inputs = HashMap::from([
-        ("taskId".to_string(), json!("fix-login")),
-        ("headSha".to_string(), json!("deadbeef123")),
-        ("branch".to_string(), json!("rat/fix-login/tkt-1")),
-    ]);
-    let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
-
-    let Step::Read(probe) = &workflow.steps[0] else {
-        panic!("steward with a headSha+branch must start with the cache probe read");
-    };
-    assert_eq!(probe.category, "artifact");
-    assert_eq!(probe.identity, "review");
-    assert_eq!(
-        probe.for_commit.as_deref(),
-        Some("deadbeef123"),
-        "the cache probe must be keyed on this exact commit, not fromAgent/fromInstance"
-    );
-    assert_eq!(
-        probe.for_branch.as_deref(),
-        Some("rat/fix-login/tkt-1"),
-        "the cache probe must also bind the branch, or a verdict from one branch could satisfy \
-         a probe for another sharing the same tip commit"
-    );
-    assert!(
-        !probe.from_agent,
-        "forCommit and fromAgent share one predicate slot"
-    );
-    assert!(
-        !probe.from_instance,
-        "forCommit and fromInstance share one predicate slot"
-    );
-    assert_eq!(probe.field.as_deref(), Some("recommendation"));
-    assert_eq!(probe.into, "cachedVerdict");
-    assert_eq!(
-        probe.on_timeout, "continue",
-        "a cache miss must not fail the instance — it must fall through to a fresh review"
-    );
-
-    let Step::When(route) = &workflow.steps[1] else {
-        panic!("the cache probe must be followed by a when on cachedVerdict");
-    };
-    assert_eq!(route.var, "cachedVerdict");
-
-    // The HIT path (any non-empty cached recommendation) must spawn only the
-    // cheap gate-holder — never a fresh `reviewer` — so a retry cannot shop
-    // for a better opinion than the one already on record.
-    let hit_spawn = route
-        .default
-        .iter()
-        .find_map(|s| match s {
-            Step::Spawn(sp) => Some(sp),
-            _ => None,
-        })
-        .expect("the cache-hit path must still spawn a gate-holder to host the gates");
-    assert_eq!(
-        hit_spawn.agent.as_deref(),
-        Some("gateholder"),
-        "a cache hit must never spawn the expensive reviewer agent"
-    );
-    assert!(
-        !route
-            .default
-            .iter()
-            .any(|s| matches!(s, Step::Spawn(sp) if sp.agent.as_deref() == Some("reviewer"))),
-        "a cache hit must not spawn a fresh reviewer anywhere in its routing"
-    );
-
-    // The MISS path (`""`, what a `null` cached value renders as) falls
-    // through to the ordinary review arm, which does spawn the reviewer.
-    assert!(
-        route.cases[""]
-            .iter()
-            .any(|s| matches!(s, Step::Spawn(sp) if sp.agent.as_deref() == Some("reviewer"))),
-        "a cache miss must still spawn the reviewer, unchanged from before the cache"
-    );
-}
-
-/// An empty headSha (a legacy completion predating Phase 0) cannot key a
-/// cache lookup at all — `forCommit: ""` would false-positive-match any other
-/// legacy artifact missing the field. It must take the plain review arm with
-/// no cache probe, exactly as it did before the cache existed.
-#[test]
-fn steward_empty_head_sha_skips_the_cache_probe_entirely() {
-    use rk_workflow::Step;
-
-    let inputs = HashMap::from([("taskId".to_string(), json!("fix-login"))]);
-    let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
-
-    assert!(
-        !workflow
-            .steps
-            .iter()
-            .any(|s| matches!(s, Step::Read(r) if r.for_commit.is_some())),
-        "an empty headSha must never reach a forCommit read"
-    );
-    let Step::Spawn(spawn) = &workflow.steps[0] else {
-        panic!("an empty headSha must start with the plain reviewer spawn, unchanged");
-    };
-    assert_eq!(spawn.agent.as_deref(), Some("reviewer"));
-}
-
-/// The rework's mirror case: a headSha WITHOUT a branch (a branchless attach
-/// rat, per `branch`'s own doc — empty only there) is exactly as unsafe to key
-/// a cache probe on as an empty sha, since the engine's `forBranch` guard
-/// would reject an unbound probe outright. steward.cue must not even attempt
-/// one — it takes the plain review arm, same as a missing headSha.
-#[test]
-fn steward_head_sha_without_branch_also_skips_the_cache_probe() {
-    use rk_workflow::Step;
-
-    let inputs = HashMap::from([
-        ("taskId".to_string(), json!("fix-login")),
-        ("headSha".to_string(), json!("deadbeef123")),
-    ]);
-    let workflow = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
-
-    assert!(
-        !workflow
-            .steps
-            .iter()
-            .any(|s| matches!(s, Step::Read(r) if r.for_commit.is_some())),
-        "a headSha with no branch must never reach a forCommit read"
-    );
-    let Step::Spawn(spawn) = &workflow.steps[0] else {
-        panic!("a headSha with no branch must start with the plain reviewer spawn, unchanged");
-    };
-    assert_eq!(spawn.agent.as_deref(), Some("reviewer"));
-}
-
-#[test]
-fn shipped_land_workflows_gate_failed_delivery() {
+fn land_on_approve_gates_failed_delivery() {
     use rk_workflow::Step;
 
     let inputs = HashMap::from([
         ("taskId".to_string(), json!("risky-change")),
         ("description".to_string(), json!("rework retry logic")),
     ]);
-
-    let steward = rk_workflow::load(&examples_dir().join("steward.cue"), &inputs).unwrap();
-    let Step::When(steward_route) = steward.steps.last().unwrap() else {
-        panic!("steward should end in verdict routing");
-    };
-    let steward_gate = steward_route.cases["APPROVE"]
-        .iter()
-        .find_map(|step| match step {
-            Step::Evaluate(e) if e.expect.get("delivered").is_some() => Some(e),
-            _ => None,
-        })
-        .expect("steward APPROVE must gate the land delivery result");
-    assert_eq!(steward_gate.expect.get("delivered"), Some(&json!(true)));
-    assert!(steward_gate.any_of.is_empty());
 
     let approval = rk_workflow::load(&examples_dir().join("land-on-approve.cue"), &inputs).unwrap();
     let Step::When(approval_route) = approval.steps.last().unwrap() else {
@@ -928,11 +466,6 @@ fn every_shipped_verdict_read_is_bound_to_its_reviewer() {
             "question".to_string(),
             json!("How does the tuplespace work?"),
         ),
-        // Set (both) so this sweep also exercises steward's commit-keyed cache
-        // probe (Phase 2 and its rework) — a `headSha`-less load, or one
-        // missing `branch`, only ever sees the plain, `fromAgent`-bound
-        // review read.
-        ("headSha".to_string(), json!("cafefeed00")),
         ("branch".to_string(), json!("rat/example-task/tkt-1")),
     ]);
     let mut total = 0;
@@ -960,11 +493,11 @@ fn every_shipped_verdict_read_is_bound_to_its_reviewer() {
         }
         total += reads.len();
     }
-    // The premise: the shipped set really does contain verdict-routed workflows
-    // (steward + reviewer-drives-rework). Without this the loop above passes
-    // vacuously if they are all renamed away.
+    // The premise: the shipped set really does contain a verdict-routed
+    // workflow (reviewer-drives-rework). Without this the loop above passes
+    // vacuously if it is renamed away.
     assert!(
-        total >= 2,
+        total >= 1,
         "expected the shipped examples to route on reviewer verdicts, found {total}"
     );
 }

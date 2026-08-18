@@ -56,58 +56,14 @@ triggers: [
 	},
 
 	// THE STEWARD (leverage #2). On every rat completion, reactively triage that
-	// rat's branch: a cheap reviewer + the repo's real gate + a protected-path
-	// policy check decide auto-merge / rework-ticket / escalate — so the operator
-	// reviews exceptions, not every branch.
-	//
-	// `"role":"rat"` scopes the fire to plain-rat completions, which is also the
-	// re-entrancy break: the reviewer the steward spawns completes as a
-	// "reviewer" (not "rat"), so its own harness_result never re-triggers the
-	// steward on the branch it just reviewed. (`is_error` is NOT filtered here —
-	// an errored rat's branch is still triaged, and its broken work is caught by
-	// the run gate and held unmerged, not merged.)
-	//
-	// REVIEW TIERING (TKT-01M036N1RT74H6NPRH5FMM8A6T): diffClass/headSha are
-	// templated raw from the daemon-computed completion payload; steward.cue's
-	// declared param defaults ("large" / "") cover a legacy completion missing
-	// either field — safe since the reactor omits a null-templated param rather
-	// than passing it through, so the workflow's own default applies instead of
-	// hard-failing the fire (TKT-146/f359a95).
-	//
-	// NOTE: installing this makes ALL rat completions auto-merge on a clean
-	// verdict (or, for a doc-only/trivial diff, on the gates alone — see
-	// steward.cue). Do not also run an approval-gated workflow (land-on-approve)
-	// over the same completions, or the two race for the branch.
-	{
-		name:  "steward-on-completion"
-		match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}
-		run:   "steward"
-		params: {
-			// String-interpolated (always a string) so a taskless rat still loads.
-			taskId: "{{tuple.payload.task}}"
-			// Raw pass-through: the exact branch the reviewer must chain onto.
-			branch: "{{tuple.payload.branch}}"
-			// Daemon-authored base branch; preserves feature-branch routing.
-			target: "{{tuple.payload.target}}"
-			// The repo the completion is scoped to.
-			repo: "{{tuple.scope}}"
-			// Precomputed diff classification driving review tiering (see above).
-			diffClass: "{{tuple.payload.diff_class}}"
-			// The completed rat's branch-tip SHA, threaded into the reviewer's
-			// task/verdict artifact for future commit-keyed verdict caching.
-			headSha: "{{tuple.payload.head_sha}}"
-		}
-		// A completion storm must not spawn a steward storm; each fire is still
-		// idempotent per completion tuple, this caps the rolling window.
-		maxFires: 20
-		// Admission control (steward remediation phase 1): cap concurrent
-		// steward reviewer instances at 2 — the empirically safe concurrency
-		// observed under a completion burst (mass-reviewer starvation and gate
-		// flake under load-average >> cores otherwise). A completion beyond the
-		// cap is durably queued, never dropped, and dispatched the moment an
-		// earlier steward review completes.
-		maxInFlight: 2
-	},
+	// rat's branch: the daemon-native landing pipeline decides auto-merge /
+	// rework-ticket / escalate — so the operator reviews exceptions, not every
+	// branch. This used to be a `run: "steward"` workflow trigger fired from
+	// here; that mega-workflow and its trigger entry are retired post-cutover
+	// (steward remediation Phase 4, TKT-01M048ASYM00N37EBK1VM7FH5H) in favor of
+	// `examples/triggers-landing-pipeline.cue`'s `steward-landing-on-completion`
+	// (`action: "land"`), which hands the same completions straight to
+	// `crates/rk-daemon/src/landing.rs` instead of spawning a CUE workflow.
 ]
 
 // ── Reference: the convention-quorum loop (TKT-22) ──────────────────────────
