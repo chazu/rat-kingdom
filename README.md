@@ -548,10 +548,18 @@ burn_usd_per_min = 4.0           # sustained USD/min => RUNNING AWAY (0 = off;
                                  # 4.0 catches a runaway with ~3x margin both
                                  # ways vs normal rats' p99 $1.24/min)
 kill_grace_secs = 600            # obstacle+steer first, kill only if still flagged
-respawn_enabled = false          # self-heal: auto-respawn crashed/orphaned rats
-                                 # (off by default — it relaunches + spends)
+respawn_enabled = true           # self-heal: auto-respawn crashed/orphaned rats
+                                 # (an agent whose branch already merged is
+                                 # never auto-respawned)
 respawn_max_attempts = 3         # crash-loop cap: give up after N, escalate a need
-respawn_backoff_secs = 60        # base backoff, doubled per attempt (never merged)
+respawn_backoff_secs = 300       # base backoff, doubled per attempt (never merged)
+                                 # (~15min across 3 attempts, so a systemic
+                                 # failure doesn't exhaust them in ~3min)
+respawn_rate_cap_per_hour = 10   # castle-wide: at most this many auto-respawns
+                                 # (any agent) per rolling hour (0 = uncapped);
+                                 # the one past the cap is HELD and escalated,
+                                 # not fired — catches a fleet-wide storm a
+                                 # per-agent cap alone would miss
 
 [drain]                          # continuous-drain: WIP-limited fleet autoscaler
 enabled = false                  # off by default — turning it on hands the

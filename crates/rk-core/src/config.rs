@@ -581,9 +581,10 @@ pub struct SupervisorConfig {
     pub kill_grace_secs: u64,
     /// Self-healing respawn: when true, the same sweep auto-`respawn`s agents
     /// that crashed out of their run (Orphaned by a daemon restart, or Failed)
-    /// instead of leaving them for a manual `rk respawn`. Off by default — it
-    /// relaunches agents (and spends), so it is opt-in like burn detection.
-    /// An agent whose branch already merged is never auto-respawned.
+    /// instead of leaving them for a manual `rk respawn`. Shipped enabled
+    /// (strategic review B3) now that `respawn_rate_cap_per_hour` bounds a
+    /// fleet-wide storm and every action announces via the recovery helper;
+    /// an agent whose branch already merged is never auto-respawned.
     pub respawn_enabled: bool,
     /// Crash-loop bound: how many times the sweep will auto-respawn one agent
     /// before giving up and escalating a `need` for a human. Zero disables
@@ -592,8 +593,23 @@ pub struct SupervisorConfig {
     /// Base backoff (seconds) between auto-respawns of the same agent. Grows
     /// exponentially per attempt (`base * 2^(attempt-1)`) so a genuinely-broken
     /// task backs off instead of respawn-looping hot. The first attempt fires
-    /// immediately; the backoff gates every retry after it.
+    /// immediately; the backoff gates every retry after it. Shipped default
+    /// 300s (up from an earlier 60s): three attempts then span ~15 minutes
+    /// instead of ~3, so a systemic failure (bad redeploy, the TKT-146 class)
+    /// does not burn through the whole crash-loop budget before a human even
+    /// notices.
     pub respawn_backoff_secs: u64,
+    /// Castle-wide rolling cap: at most this many auto-respawns (any agent,
+    /// any repo) within a trailing hour. Zero disables the cap. Distinct from
+    /// `respawn_max_attempts`, which bounds one agent's own crash loop — 200
+    /// of 786 archived rats failed, often in correlated incidents (a daemon
+    /// restart orphans the whole fleet at once), so a per-agent cap alone
+    /// cannot stop a fleet-wide respawn storm. Enforced by the
+    /// `RecoveryAnnouncer` rate-cap helper (`rk-daemon::recovery`, strategic
+    /// review B2/B3): the action past the cap is HELD (not fired) and
+    /// escalated at raised severity instead, same as any other rate-capped
+    /// recovery action.
+    pub respawn_rate_cap_per_hour: u32,
 }
 
 impl Default for SupervisorConfig {
@@ -606,9 +622,10 @@ impl Default for SupervisorConfig {
             stuck_after_secs: 600,
             burn_usd_per_min: 4.0,
             kill_grace_secs: 600,
-            respawn_enabled: false,
+            respawn_enabled: true,
             respawn_max_attempts: 3,
-            respawn_backoff_secs: 60,
+            respawn_backoff_secs: 300,
+            respawn_rate_cap_per_hour: 10,
         }
     }
 }

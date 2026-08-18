@@ -100,6 +100,7 @@ async fn crashed_agent_auto_respawns_up_to_cap_then_escalates() {
         respawn_enabled: true,
         respawn_max_attempts: 2,
         respawn_backoff_secs: 0,
+        respawn_rate_cap_per_hour: 0,
     });
     tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
@@ -157,6 +158,99 @@ async fn crashed_agent_auto_respawns_up_to_cap_then_escalates() {
         })
         .count();
     assert_eq!(exhausted_needs, 1, "cap should escalate exactly one need");
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+/// TKT-B3: the castle-wide rate cap is a separate bound from the per-agent
+/// crash-loop cap above — it groups every agent's respawns into one rolling
+/// window so a fleet-wide correlated crash (a bad redeploy, TKT-146) cannot
+/// blow past it just because each individual agent is still under its own
+/// `respawn_max_attempts`. A respawn past the cap must be HELD (not fired)
+/// and still announced via the recovery helper.
+#[tokio::test]
+async fn castle_wide_respawn_rate_cap_holds_the_excess() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", "read -r _p; exit 3");
+
+    let layout = Layout::at(home.path());
+    let space = Space::open_in_memory().unwrap();
+    let mut daemon = Daemon::with_space_for_tests(
+        layout.clone(),
+        "test-castle".into(),
+        "fake".into(),
+        Budget::default(),
+        space,
+    )
+    .unwrap();
+    // Per-agent cap generous (5) so only the castle-wide cap (2/hour) binds;
+    // no backoff so every crashed agent is a fresh respawn candidate on every
+    // sweep tick.
+    daemon.set_sweep_config(SupervisorConfig {
+        enabled: true,
+        interval_secs: 1,
+        stuck_after_secs: 0,
+        burn_usd_per_min: 0.0,
+        kill_grace_secs: 1,
+        respawn_enabled: true,
+        respawn_max_attempts: 5,
+        respawn_backoff_secs: 0,
+        respawn_rate_cap_per_hour: 2,
+    });
+    tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    // Three independently-crashing agents so a single sweep tick has more
+    // respawn candidates than the castle-wide cap allows.
+    let mut names = Vec::new();
+    for i in 0..3 {
+        let spawned = client
+            .call(
+                "agent.spawn",
+                json!({
+                    "repo": repo_dir.path().to_string_lossy(),
+                    "task": format!("doomed-{i}"),
+                    "harness": "fake",
+                }),
+            )
+            .await
+            .unwrap();
+        names.push(spawned["agent"]["name"].as_str().unwrap().to_string());
+    }
+
+    // Let several sweep ticks run — long enough for the cap to bind at least
+    // once, nowhere near the 1h window that would let it reset.
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+
+    let events = client
+        .call("space.scan", json!({"category": "event"}))
+        .await
+        .unwrap();
+    let events = events["tuples"].as_array().unwrap();
+    let respawn_actions: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|t| t["identity"] == "recovery_action" && t["payload"]["action_kind"] == "respawn")
+        .collect();
+    assert!(
+        !respawn_actions.is_empty(),
+        "every auto-respawn attempt (fired or held) must announce via the recovery helper"
+    );
+    assert!(
+        respawn_actions.iter().any(|t| t["payload"]["held"] == true),
+        "castle-wide cap should have held at least one respawn: {respawn_actions:#?}"
+    );
+
+    let mut total_respawns = 0usize;
+    for name in &names {
+        total_respawns += respawn_count(&mut client, name).await;
+    }
+    assert!(
+        total_respawns <= 2,
+        "castle-wide rate cap must bound total respawns across the fleet, got {total_respawns}"
+    );
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
