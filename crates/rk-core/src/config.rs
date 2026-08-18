@@ -26,6 +26,7 @@ pub struct Config {
     pub review_sweep: ReviewSweepConfig,
     pub worktree_sweep: WorktreeSweepConfig,
     pub recovery_sweep: RecoverySweepConfig,
+    pub instance_timeout_sweep: InstanceTimeoutSweepConfig,
     pub disk: DiskConfig,
     pub drain: DrainConfig,
     pub evaporation: EvaporationConfig,
@@ -447,6 +448,54 @@ impl Default for RecoverySweepConfig {
             first_renotify_secs: 4 * 3600,
             repeat_renotify_secs: 24 * 3600,
             max_renotifies: 3,
+        }
+    }
+}
+
+/// Stale-`Running`-instance hard timeout sweep (strategic review B8). A panic
+/// in an instance's execution future skips `WorkflowEngine::finalize`
+/// (`rk-daemon` `workflow_exec.rs`), so the instance would otherwise stay
+/// `Running` forever with no live task backing it — observed: a 6.4-day
+/// wedged outlier. Deliberately a TIMEOUT, not a liveness probe: "Running with
+/// no live future" is not decidable from durable state alone (see the S4 note
+/// in the strategic review). Past `default_timeout_secs` wall-clock (a
+/// workflow's own `staleTimeout:` field overrides this per-instance), the
+/// sweep marks the instance failed, finalizes it (including the
+/// guaranteed-cleanup agent sweep), and escalates through the B2 announce
+/// helper (`crate::recovery` in `rk-daemon`, mirrored by [`RecoverySweepConfig`]
+/// above).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct InstanceTimeoutSweepConfig {
+    /// Master switch. When false the sweep loop never starts; a wedged
+    /// instance stays `Running` until an operator notices and clears it by
+    /// hand.
+    pub enabled: bool,
+    /// How often the sweep checks every live instance's wall-clock age.
+    pub interval_secs: u64,
+    /// Default hard timeout in seconds, used unless a workflow's own
+    /// `staleTimeout:` overrides it. 12h — more than 2x the slowest
+    /// legitimate run observed.
+    pub default_timeout_secs: u64,
+    /// Rate cap on the `instance-timeout` recovery-action kind: at most this
+    /// many timeout-driven failures announced per rolling hour (jittered
+    /// ±10%, see `RecoveryAnnouncer`). Timeouts are inherently rare (a 12h
+    /// dwell before one can even fire), so this exists as a backstop against
+    /// a pathological case — e.g. a bug that wedges many instances into the
+    /// same state at once — not because steady volume is expected.
+    pub rate_cap_per_hour: u32,
+}
+
+impl Default for InstanceTimeoutSweepConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // Ten minutes: the timeout itself is 12h, so a sweep running far
+            // more often than that costs nothing and keeps worst-case
+            // detection lag small relative to the timeout it enforces.
+            interval_secs: 600,
+            default_timeout_secs: 12 * 3600,
+            rate_cap_per_hour: 20,
         }
     }
 }

@@ -287,6 +287,14 @@ pub struct Workflow {
     /// reaches it, further dispatch is refused. `None` = unlimited.
     #[serde(default)]
     pub budget: Option<WorkflowBudget>,
+    /// Optional per-instance override of the daemon's stale-`Running`-instance
+    /// hard timeout (strategic review B8). `None` defers to
+    /// `[instance_timeout_sweep] default_timeout_secs`. A duration string
+    /// parsed by `rk-daemon` `workflow_exec.rs::parse_duration` at instance
+    /// launch, not validated here — same deferred-validation pattern as every
+    /// other step-level `timeout:` field in this schema.
+    #[serde(default, rename = "staleTimeout")]
+    pub stale_timeout: Option<String>,
     pub steps: Vec<Step>,
     #[serde(default)]
     pub aspects: Vec<Aspect>,

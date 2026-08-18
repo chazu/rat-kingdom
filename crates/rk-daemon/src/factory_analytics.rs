@@ -745,6 +745,7 @@ mod tests {
             completed_at: Some(Utc.timestamp_opt(1_030, 0).unwrap()),
             archived_at: None,
             trigger: None,
+            stale_timeout_secs: None,
         }
     }
 

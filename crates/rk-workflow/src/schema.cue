@@ -41,6 +41,13 @@ workflow: #Workflow
 	// below the global fleet/repo caps.
 	budget?: #WorkflowBudget
 
+	// Per-instance override of the daemon's stale-`Running`-instance hard
+	// timeout (`[instance_timeout_sweep] default_timeout_secs`, 12h by
+	// default). Set this on a workflow expected to legitimately run longer
+	// than the fleet-wide default, so the sweep does not fail it out from
+	// under itself. A duration string like "24h" or "90m".
+	staleTimeout?: string
+
 	// Steps run in sequence. At least one required.
 	steps: [...#Step] & [_, ...]
 

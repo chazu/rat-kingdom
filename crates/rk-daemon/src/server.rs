@@ -140,6 +140,16 @@ pub struct Daemon {
     /// B2 re-notify sweep: how often an unacked `recovery-action` escalation
     /// re-pushes. See `crate::recovery::renotify_sweep`.
     recovery_sweep_config: rk_core::config::RecoverySweepConfig,
+    /// B8 stale-`Running`-instance hard timeout sweep. See
+    /// `crate::workflow_exec::WorkflowEngine::stale_timeout_sweep_once`.
+    instance_timeout_sweep_config: rk_core::config::InstanceTimeoutSweepConfig,
+    /// Shared B2 announce-helper state across every automated recovery source
+    /// this daemon runs (today: the B8 instance-timeout sweep). MUST be a
+    /// single long-lived instance, not one built per sweep call: its rate-cap
+    /// bookkeeping is an in-memory rolling window keyed by `RecoveryAction::kind`,
+    /// and a fresh `RecoveryAnnouncer` per call would silently reset that
+    /// window every tick, defeating the cap.
+    recovery_announcer: crate::recovery::RecoveryAnnouncer,
     drain_config: rk_core::config::DrainConfig,
     evaporation_decay: f64,
     ingest_config: rk_core::config::IngestConfig,
@@ -262,6 +272,7 @@ impl Daemon {
         daemon.review_sweep_config = config.review_sweep.clone();
         daemon.worktree_sweep_config = config.worktree_sweep.clone();
         daemon.recovery_sweep_config = config.recovery_sweep.clone();
+        daemon.instance_timeout_sweep_config = config.instance_timeout_sweep.clone();
         daemon.supervisor.set_min_free_disk_gb(config.disk.min_free_gb);
         daemon.drain_config = config.drain.clone();
         daemon.evaporation_decay = config.evaporation.decay;
@@ -356,6 +367,14 @@ impl Daemon {
     #[doc(hidden)]
     pub fn set_recovery_sweep_config(&mut self, cfg: rk_core::config::RecoverySweepConfig) {
         self.recovery_sweep_config = cfg;
+    }
+
+    #[doc(hidden)]
+    pub fn set_instance_timeout_sweep_config(
+        &mut self,
+        cfg: rk_core::config::InstanceTimeoutSweepConfig,
+    ) {
+        self.instance_timeout_sweep_config = cfg;
     }
 
     #[doc(hidden)]
@@ -466,6 +485,14 @@ impl Daemon {
                 enabled: false,
                 ..rk_core::config::RecoverySweepConfig::default()
             },
+            // Same reasoning as `recovery_sweep_config` above: a bare/test
+            // constructor must not grow a new periodic background loop that
+            // existing e2e tests never asked for.
+            instance_timeout_sweep_config: rk_core::config::InstanceTimeoutSweepConfig {
+                enabled: false,
+                ..rk_core::config::InstanceTimeoutSweepConfig::default()
+            },
+            recovery_announcer: crate::recovery::RecoveryAnnouncer::new(),
             drain_config: rk_core::config::DrainConfig::default(),
             evaporation_decay: rk_core::config::EvaporationConfig::default().decay,
             ingest_config: rk_core::config::IngestConfig::default(),
@@ -721,6 +748,35 @@ impl Daemon {
                             }
                         }
                         _ = rc_shutdown.changed() => break,
+                    }
+                }
+            });
+        }
+
+        // B8 stale-`Running`-instance hard timeout sweep: a Running instance
+        // older than its effective timeout (workflow `staleTimeout:` override,
+        // else `default_timeout_secs`) is marked failed, finalized, and
+        // escalated through the B2 announce helper. Not spawn_blocking'd like
+        // the sweeps above — it awaits `WorkflowEngine::stale_timeout_sweep_once`
+        // directly (guaranteed-cleanup dismissal is already async), the same
+        // shape as the landing pipeline loop below.
+        if daemon.instance_timeout_sweep_config.enabled {
+            let daemon_ref = Arc::clone(&daemon);
+            let mut it_shutdown = daemon.shutdown_tx.subscribe();
+            let interval =
+                Duration::from_secs(daemon.instance_timeout_sweep_config.interval_secs.max(1));
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            match daemon_ref.stale_instance_timeout_sweep_once().await {
+                                0 => {}
+                                n => info!(timed_out = n, "stale-instance timeout sweep marked instances failed"),
+                            }
+                        }
+                        _ = it_shutdown.changed() => break,
                     }
                 }
             });
@@ -2851,6 +2907,26 @@ impl Daemon {
                 0
             }
         }
+    }
+
+    /// B8 stale-`Running`-instance hard timeout sweep body: delegates to
+    /// [`crate::workflow_exec::WorkflowEngine::stale_timeout_sweep_once`],
+    /// supplying the SAME sink set the reactor's own escalations use (mirrors
+    /// [`recovery_renotify_sweep_once`](Self::recovery_renotify_sweep_once))
+    /// and the daemon's single long-lived [`recovery_announcer`](Self::recovery_announcer)
+    /// so the rate cap accumulates correctly across sweep ticks.
+    async fn stale_instance_timeout_sweep_once(&self) -> usize {
+        let sinks = crate::reactor::sink_factory()
+            .registry(self.notify_config.resolved(self.reactor_config.notify_escalations));
+        self.engine()
+            .stale_timeout_sweep_once(
+                chrono::Utc::now(),
+                Duration::from_secs(self.instance_timeout_sweep_config.default_timeout_secs.max(1)),
+                &self.recovery_announcer,
+                &sinks,
+                crate::recovery::RateCap::per_hour(self.instance_timeout_sweep_config.rate_cap_per_hour),
+            )
+            .await
     }
 
     /// Append an `Event` tuple authored by this castle. Best-effort: a store
