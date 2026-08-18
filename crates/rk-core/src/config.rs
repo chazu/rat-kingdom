@@ -26,6 +26,7 @@ pub struct Config {
     pub review_sweep: ReviewSweepConfig,
     pub worktree_sweep: WorktreeSweepConfig,
     pub recovery_sweep: RecoverySweepConfig,
+    pub ticket_reopen_sweep: TicketReopenSweepConfig,
     pub disk: DiskConfig,
     pub drain: DrainConfig,
     pub evaporation: EvaporationConfig,
@@ -447,6 +448,48 @@ impl Default for RecoverySweepConfig {
             first_renotify_secs: 4 * 3600,
             repeat_renotify_secs: 24 * 3600,
             max_renotifies: 3,
+        }
+    }
+}
+
+/// Sweep for orphaned `in_progress` tickets (strategic review B9, seam 5).
+/// Drain only refills from `status = open` (`rk-daemon` `tickets.rs`), and an
+/// errored rat leaves its ticket `in_progress` with nothing to reopen it —
+/// the backlog silently loses a slot forever. This sweep is the fix: an
+/// `in_progress` ticket whose assignee has had no LIVE agent record for
+/// `stale_after_secs` reopens to `open` (drain-eligible again) and announces
+/// through the B2 recovery-announce helper (`rk-daemon` `recovery.rs`).
+///
+/// The staleness clock is anchored on the more recent of the ticket's own
+/// last edit and the assignee's own last state transition, so the delay
+/// covers two distinct races, not just one: spawn handoff (`status` flips to
+/// `in_progress` before `assignee` is recorded — a few seconds, not never)
+/// and restart recovery (an `Orphaned` agent gets the B3 respawn sweep's own
+/// backoff window to reclaim it before this sweep gives up).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TicketReopenSweepConfig {
+    /// Master switch. When false the sweep loop never starts; a ticket whose
+    /// rat died stays `in_progress` until an operator reopens it by hand.
+    pub enabled: bool,
+    /// Sweep cadence. Short relative to `stale_after_secs` so the reopen
+    /// lands close to the acceptance bound (a dead rat's ticket reopens
+    /// within roughly `stale_after_secs + interval_secs`).
+    pub interval_secs: u64,
+    /// How long an `in_progress` ticket may go with no live owning agent
+    /// before it reopens.
+    pub stale_after_secs: u64,
+}
+
+impl Default for TicketReopenSweepConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 60,
+            // 15 minutes: long enough that the B3 respawn sweep's backoff
+            // window (attempts span ~15min) gets a real chance to reclaim an
+            // orphaned agent before this sweep gives up on its ticket.
+            stale_after_secs: 15 * 60,
         }
     }
 }
