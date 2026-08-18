@@ -1053,7 +1053,7 @@ impl Daemon {
                             client_build = client,
                             daemon_build = rk_core::version::BUILD_VERSION,
                             caller = %req.caller,
-                            "caller is a different build than this daemon; restart the daemon onto it"
+                            "caller is a different build than this daemon; `rk daemon rollover` onto it"
                         );
                     }
                 }
@@ -1188,6 +1188,8 @@ impl Daemon {
         if !matches!(
             req.method.as_str(),
             "stop"
+                | "daemon.pause_dispatch"
+                | "daemon.resume_dispatch"
                 | "agent.spawn"
                 | "agent.respawn"
                 | "agent.dismiss"
@@ -1832,6 +1834,29 @@ impl Daemon {
                 let resp = Response::ok(id, json!({"stopping": true}));
                 let _ = self.shutdown_tx.send(true);
                 reply(resp)
+            }
+            // `rk daemon rollover`'s drain step: stop admitting new dispatch
+            // and report who is still live so the CLI knows what it is
+            // waiting on. Does not touch already-running agents.
+            "daemon.pause_dispatch" => {
+                self.supervisor.set_dispatch_paused(true);
+                let live: Vec<String> = self
+                    .supervisor
+                    .list()
+                    .into_iter()
+                    .filter(|r| r.state.is_live())
+                    .map(|r| r.name)
+                    .collect();
+                reply(Response::ok(
+                    id,
+                    json!({"paused": true, "live_agents": live}),
+                ))
+            }
+            // Best-effort unwind if a rollover aborts before it reaches
+            // `stop` — a fresh daemon process always starts unpaused anyway.
+            "daemon.resume_dispatch" => {
+                self.supervisor.set_dispatch_paused(false);
+                reply(Response::ok(id, json!({"paused": false})))
             }
             "space.out" => reply(self.handle_out(req)),
             "ingest.event" => reply(self.handle_ingest_event(req)),

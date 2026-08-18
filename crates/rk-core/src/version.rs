@@ -43,7 +43,7 @@ pub fn mismatch_warning(local: &str, remote: &str) -> Option<String> {
         "!! rk build mismatch: this CLI is {local}, the running daemon is {remote}.\n\
          !! The daemon is serving different code — anything merged or built since it\n\
          !! started does not exist yet, and commands relying on it will fail oddly.\n\
-         !! Restart it onto this build:  rk daemon stop && rk ping"
+         !! Roll it onto this build without losing fleet state:  rk daemon rollover"
     ))
 }
 
@@ -65,7 +65,7 @@ mod tests {
         assert!(warning.contains("0.1.0+bbbbbbbbbbbb"), "{warning}");
         // The AC is "warns loudly": it has to be more than a version dump, and
         // it has to tell the operator what to do about it.
-        assert!(warning.contains("rk daemon stop"), "{warning}");
+        assert!(warning.contains("rk daemon rollover"), "{warning}");
     }
 
     #[test]
