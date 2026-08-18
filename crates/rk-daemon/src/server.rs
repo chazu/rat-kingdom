@@ -263,6 +263,13 @@ impl Daemon {
         daemon.worktree_sweep_config = config.worktree_sweep.clone();
         daemon.recovery_sweep_config = config.recovery_sweep.clone();
         daemon.supervisor.set_min_free_disk_gb(config.disk.min_free_gb);
+        daemon
+            .supervisor
+            .set_done_kill_grace_secs(config.supervisor.done_kill_grace_secs);
+        daemon.supervisor.set_sinks(
+            crate::reactor::sink_factory()
+                .registry(config.notify.resolved(config.reactor.notify_escalations)),
+        );
         daemon.drain_config = config.drain.clone();
         daemon.evaporation_decay = config.evaporation.decay;
         daemon.ingest_config = config.ingest.clone();
@@ -330,6 +337,11 @@ impl Daemon {
 
     #[doc(hidden)]
     pub fn set_sweep_config(&mut self, cfg: rk_core::config::SupervisorConfig) {
+        // Propagated to the supervisor's own atomic too (not just stored for
+        // the periodic sweep tick): `done_kill_grace_secs` is read from the
+        // event-handling path in real time, same reasoning as
+        // `min_free_disk_gb` — see `Supervisor::schedule_done_kill`.
+        self.supervisor.set_done_kill_grace_secs(cfg.done_kill_grace_secs);
         self.sweep_config = cfg;
     }
 
