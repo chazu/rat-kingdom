@@ -1,0 +1,7 @@
+# Pin the toolchain everywhere cargo runs — mise already pins 1.95.0 locally
+# (mise.toml), but CI installed floating `stable`, which drifted to 1.97 and
+# failed clippy on lints that don't exist locally (2026-08-18, `some_filter`).
+# One version, all contexts; bump deliberately, in one place, with mise.toml.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
