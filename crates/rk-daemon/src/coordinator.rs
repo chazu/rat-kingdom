@@ -664,6 +664,7 @@ mod tests {
         let now = chrono::Utc::now();
         AgentRecord {
             name: name.into(),
+            spawn: None,
             role: role.into(),
             coordination: (role == "foreman").then(|| rk_workflow::Coordination {
                 reports_to: Some("coordinator".into()),

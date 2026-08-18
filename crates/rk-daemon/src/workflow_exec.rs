@@ -366,6 +366,17 @@ impl InstanceStatus {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowContext {
     pub active_agent: Option<String>,
+    /// The generation of `active_agent` captured at the moment `spawn` minted
+    /// it. This is the sequential counterpart to `FannedAgent::spawn`: a
+    /// `dismiss` step resolves `active_agent` by name only, and a name is
+    /// recycled once its holder is archived (TKT-146), so a `dismiss` that
+    /// runs after a same-named respawn (a namesake spawned between this
+    /// step's `wait` and its `dismiss`) must refuse to act on it rather than
+    /// silently tearing down a stranger. `None` for a context that predates
+    /// this field (deserialized from a durable snapshot written before the
+    /// migration); preserves the old unchecked behaviour.
+    #[serde(default)]
+    pub active_agent_spawn: Option<rk_core::id::SpawnId>,
     pub active_branch: Option<String>,
     pub previous_result: Option<Value>,
     /// Values lifted from the space by `read` steps, keyed by `read.into`.
@@ -694,6 +705,14 @@ pub struct FannedAgent {
     pub agent: String,
     pub branch: Option<String>,
     pub ticket: Option<String>,
+    /// This generation's join key, captured at fan-out time. `dismiss_all`
+    /// verifies it against the live registry row before acting — see
+    /// `Supervisor::dismiss_checked` — so a fanned dismiss can never tear down
+    /// a different generation that came to hold `agent`'s name later.
+    /// `None` for a fan-out built before this migration; preserves the old
+    /// unchecked behaviour rather than refusing to dismiss.
+    #[serde(default)]
+    pub spawn: Option<rk_core::id::SpawnId>,
 }
 
 /// Control-flow signal threaded out of a step (or nested step sequence).
@@ -1456,6 +1475,7 @@ impl WorkflowEngine {
                     self.update(id, |i| {
                         i.awaiting = None;
                         i.context.active_agent = Some(record.name.clone());
+                        i.context.active_agent_spawn = Some(record.spawn_id());
                         i.context.active_branch = record.branch.clone();
                     });
                 }
@@ -1507,11 +1527,16 @@ impl WorkflowEngine {
                     let agent = ctx.active_agent.clone().ok_or_else(|| {
                         rk_core::Error::other("dismiss step with no active agent")
                     })?;
-                    let outcome = self.supervisor.dismiss(&agent, dismiss.no_merge).await?;
+                    let expected_spawn = ctx.active_agent_spawn;
+                    let outcome = self
+                        .supervisor
+                        .dismiss_checked(&agent, expected_spawn, dismiss.no_merge)
+                        .await?;
                     self.update(id, |i| {
                         i.context.previous_result = Some(outcome.clone());
                         i.context.awaited = Vec::new();
                         i.context.active_agent = None;
+                        i.context.active_agent_spawn = None;
                     });
                 }
                 Step::Gate(gate) => match gate.gate_type.as_str() {
@@ -2210,6 +2235,7 @@ impl WorkflowEngine {
                 agent: record.name.clone(),
                 branch: record.branch.clone(),
                 ticket: Some(item.id),
+                spawn: record.spawn,
             });
         }
         Ok(fanned)
@@ -2248,7 +2274,19 @@ impl WorkflowEngine {
     /// `Supervisor::claim_completion`), because `wait` is not the only reader:
     /// the reactor's steward trigger and the ticket auto-close read the same
     /// event. Do not reintroduce a per-turn `harness_result`.
+    ///
+    /// Generation-identity migration (consumer B1,
+    /// `docs/2026-08-17-tkt-c1-generation-identity.md`): every `harness_result`
+    /// now carries `spawn` (`Supervisor::route_completion`), so a reachable
+    /// registry record with a minted `SpawnId` keys the read on
+    /// [`Pattern::for_spawn`] instead — an equality predicate that cannot match
+    /// a namesake regardless of timing, no floor required. Falls back to the
+    /// name+floor predicate only for a record with no minted id (unreachable,
+    /// or written before this migration).
     fn result_pattern(&self, id: &str, agent: &str) -> Pattern {
+        if let Some(spawn) = self.supervisor.status(agent).and_then(|r| r.spawn) {
+            return Pattern::for_spawn(Category::Event, "harness_result", spawn);
+        }
         Pattern::for_agent_since(
             Category::Event,
             "harness_result",
@@ -2538,6 +2576,7 @@ impl WorkflowEngine {
         for fa in fanout {
             let supervisor = Arc::clone(&self.supervisor);
             let agent = fa.agent.clone();
+            let spawn = fa.spawn;
             // Base no_merge from the step, plus: under only_clean, park (don't
             // merge) any agent not in the clean set.
             let parked = clean
@@ -2545,7 +2584,7 @@ impl WorkflowEngine {
                 .is_some_and(|clean| !clean.contains(&fa.agent));
             let no_merge = dismiss_all.no_merge || parked;
             set.spawn(async move {
-                let outcome = supervisor.dismiss(&agent, no_merge).await;
+                let outcome = supervisor.dismiss_checked(&agent, spawn, no_merge).await;
                 (agent, parked, outcome)
             });
         }
@@ -4251,6 +4290,7 @@ fn step_label(step: &Step) -> String {
 mod tests {
     use super::*;
     use rk_core::id::RecordId;
+    use rk_workflow::DismissStep;
 
     #[test]
     fn atomic_persist_replaces_file_without_temporary_artifacts() {
@@ -5249,5 +5289,126 @@ test a::flaky ... FAILED
         assert_eq!(failures[0].payload["agent"], json!("daemon"));
         assert_eq!(failures[0].payload["verdict"], json!("fail"));
         assert_eq!(failures[0].payload["exit"], json!(3));
+    }
+
+    /// TKT-146, closed for the SEQUENTIAL path
+    /// (`docs/2026-08-17-tkt-c1-generation-identity.md`): a `dismiss` step
+    /// must not act on whoever currently holds `ctx.activeAgent`'s name if
+    /// that is a different generation than the one this instance's own
+    /// `spawn` step captured. Mirrors
+    /// `dismiss_checked_refuses_a_namesake_that_is_not_the_expected_generation`
+    /// in `supervisor.rs`, but drives it through `Step::Dismiss` itself so the
+    /// wiring is under test, not just the guard it calls: the exact TKT-146
+    /// shape is spawn -> wait -> [a namesake respawns] -> dismiss, and the
+    /// dismiss must refuse rather than tear down the new namesake.
+    #[tokio::test]
+    async fn dismiss_step_refuses_a_namesake_that_respawned_between_wait_and_dismiss() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        let now = Utc::now();
+
+        let waited_generation = rk_core::id::SpawnId::new();
+        let mut record = crate::agents::AgentRecord {
+            name: "Nibble".into(),
+            spawn: Some(waited_generation),
+            role: "rat".into(),
+            coordination: None,
+            harness: "fake".into(),
+            permission_mode: None,
+            model: None,
+            repo_root: PathBuf::from("/repo"),
+            repo_name: "repo".into(),
+            task: Some("t".into()),
+            branch: Some("rat/nibble/t".into()),
+            worktree: Some(PathBuf::from("/repo")),
+            target_branch: "main".into(),
+            parent: None,
+            workflow_instance: None,
+            coordinator: None,
+            session_id: None,
+            attach_target: None,
+            pid: None,
+            merge_commit: None,
+            state: AgentState::Running,
+            crashed: false,
+            stderr_tail: None,
+            result: None,
+            progress: None,
+            usage: rk_harness::TokenUsage::default(),
+            cost_usd: 0.0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+        };
+        // The workflow's own `spawn` step ran and its `wait` completed against
+        // this generation.
+        engine.supervisor.lock_registry().insert(record.clone()).unwrap();
+
+        let id = "inst-namesake-dismiss";
+        let instance = Instance {
+            id: id.into(),
+            workflow: "wf".into(),
+            repo: "/repo".into(),
+            coordinator: None,
+            schedule: None,
+            status: InstanceStatus::Running,
+            revision: 0,
+            current_step: 0,
+            total_steps: 1,
+            context: WorkflowContext {
+                active_agent: Some("Nibble".into()),
+                active_agent_spawn: Some(waited_generation),
+                ..Default::default()
+            },
+            error: None,
+            awaiting: None,
+            instance_max_usd: None,
+            definition: "wf".into(),
+            definition_digest: String::new(),
+            automated_landing_authorized: false,
+            params: HashMap::new(),
+            depth: 0,
+            started_at: now,
+            completed_at: None,
+            archived_at: None,
+            trigger: None,
+        };
+        engine.store_if_absent(instance).unwrap();
+
+        // A namesake respawns between this instance's `wait` and its
+        // `dismiss`: a different generation now holds "Nibble".
+        let respawned_generation = rk_core::id::SpawnId::new();
+        record.spawn = Some(respawned_generation);
+        record.created_at = Utc::now();
+        engine.supervisor.lock_registry().insert(record).unwrap();
+
+        let outcome = engine
+            .run_step(
+                id,
+                &Step::Dismiss(DismissStep::default()),
+                "/repo",
+                &HashMap::new(),
+                &TierRouting::default(),
+            )
+            .await;
+
+        let error = match outcome {
+            Err(e) => e,
+            Ok(_) => panic!("must refuse to dismiss a different generation"),
+        };
+        assert!(
+            error.to_string().contains("dismiss target mismatch"),
+            "unexpected error: {error}"
+        );
+
+        // The new namesake must be untouched: still live, still that generation.
+        let live = engine
+            .supervisor
+            .lock_registry()
+            .get("Nibble")
+            .cloned()
+            .unwrap();
+        assert_eq!(live.spawn, Some(respawned_generation));
+        assert_eq!(live.state, AgentState::Running);
     }
 }

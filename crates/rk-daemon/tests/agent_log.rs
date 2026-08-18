@@ -237,6 +237,7 @@ async fn a_name_that_named_two_rats_serves_each_generation_separately() {
 fn terminal_record(name: &str, created_at: DateTime<Utc>) -> AgentRecord {
     AgentRecord {
         name: name.into(),
+        spawn: None,
         role: "rat".into(),
         coordination: None,
         harness: "fake".into(),

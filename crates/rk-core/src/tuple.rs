@@ -357,6 +357,26 @@ impl Pattern {
         pattern
     }
 
+    /// The one predicate for "the tuple `<identity>` that THIS generation of
+    /// agent wrote", keyed on [`crate::id::SpawnId`] instead of a name.
+    ///
+    /// This is the structural retirement of [`Self::for_agent_since`]
+    /// (TKT-146/TKT-159, see its doc comment for the full incident account): a
+    /// `SpawnId` is minted once per generation and never reused, so — like
+    /// [`Self::for_workflow_instance`] — no `after_id` floor is needed to
+    /// exclude a namesake predecessor. The key itself cannot collide.
+    ///
+    /// Kept alongside `for_agent_since` for the dual-key compatibility window
+    /// (`docs/2026-08-17-tkt-c1-generation-identity.md` §2.4): a producer that
+    /// has not yet stamped `spawn` into its payload still needs the name+floor
+    /// fallback. Delete `for_agent_since` only once every producer stamps
+    /// `spawn`.
+    pub fn for_spawn(category: Category, identity: impl Into<String>, spawn: crate::id::SpawnId) -> Self {
+        let mut pattern = Self::category(category).identity(identity);
+        pattern.payload_search = Some(format!("\"spawn\":\"{spawn}\""));
+        pattern
+    }
+
     /// The one predicate for "the tuple that names workflow instance
     /// `<instance_id>` in its payload" — the per-instance discriminator behind
     /// approval routing.
@@ -542,6 +562,28 @@ mod tests {
             !p.matches(&generation_two),
             "\"Whisker\" matched \"Whisker-2\""
         );
+    }
+
+    /// `for_spawn`'s whole point, same incident as `for_agent_since` above but
+    /// keyed on the id instead of a name+floor: a namesake predecessor's tuple
+    /// must not match, and no floor is needed to make that true.
+    #[test]
+    fn for_spawn_rejects_a_namesake_predecessors_tuple() {
+        use crate::id::SpawnId;
+
+        let predecessor_spawn = SpawnId::new();
+        let mine_spawn = SpawnId::new();
+
+        let mut predecessor = t();
+        predecessor.id = RecordId::floor_at(Utc::now() - chrono::Duration::days(2));
+        predecessor.payload = json!({"agent": "Whisker", "spawn": predecessor_spawn.to_string()});
+
+        let mut mine = t();
+        mine.payload = json!({"agent": "Whisker", "spawn": mine_spawn.to_string()});
+
+        let p = Pattern::for_spawn(Category::Event, "task_done", mine_spawn);
+        assert!(!p.matches(&predecessor), "matched a predecessor's tuple");
+        assert!(p.matches(&mine), "missed this generation's own tuple");
     }
 
     /// TKT-172: the approval decision for one instance must not satisfy
