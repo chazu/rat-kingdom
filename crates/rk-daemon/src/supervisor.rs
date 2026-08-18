@@ -474,6 +474,18 @@ pub struct Supervisor {
     registry: Mutex<Registry>,
     /// Live control handles (not persisted; gone after restart).
     controls: Mutex<HashMap<String, SessionControl>>,
+    /// Identity of the process session currently behind `controls[name]`, one
+    /// fresh [`rk_core::id::SpawnId`] per `harness.launch` call. Deliberately
+    /// NOT `AgentRecord.spawn`/`created_at`: a manual `rk respawn` of a
+    /// `Completed` record intentionally reuses that record's generation
+    /// (`respawn_mode`'s comment on `let generation = updated.created_at;`),
+    /// so a generation-keyed check cannot tell the predecessor process from
+    /// its respawned successor. This map can, because a respawn overwrites
+    /// the entry with a new token — giving
+    /// [`kill_lingering_after_done`](Self::kill_lingering_after_done) a key
+    /// that actually changes across a respawn instead of a stale check with
+    /// stale data.
+    session_tokens: Mutex<HashMap<String, rk_core::id::SpawnId>>,
     space: Space,
     /// Shared with the server so ticket-lifecycle writes serialize on one lock.
     tickets: Arc<crate::tickets::Tickets>,
@@ -730,6 +742,7 @@ impl Supervisor {
             default_agent: defaults.profile,
             registry: Mutex::new(registry),
             controls: Mutex::new(HashMap::new()),
+            session_tokens: Mutex::new(HashMap::new()),
             space,
             tickets,
             pricing,
@@ -1063,8 +1076,7 @@ impl Supervisor {
                 record.pid = session.pid;
             })?
             .ok_or_else(|| rk_core::Error::other("spawn journal row vanished"))?;
-        self.lock_controls()
-            .insert(name.clone(), session.control.clone());
+        let session_token = self.track_session(&name, session.control.clone());
 
         self.emit_event(
             &repo_name,
@@ -1096,7 +1108,7 @@ impl Supervisor {
         let generation = record.created_at;
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                supervisor.handle_event(&name, generation, event);
+                supervisor.handle_event(&name, generation, session_token, event);
             }
         });
 
@@ -1409,8 +1421,10 @@ impl Supervisor {
                 r.stderr_tail = None;
             })?
             .ok_or_else(|| rk_core::Error::other("record vanished"))?;
-        self.lock_controls()
-            .insert(name.to_string(), session.control.clone());
+        // Overwrites whatever token the predecessor session registered, so a
+        // grace timer armed for that session can no longer match this one
+        // (see `session_tokens` on `Supervisor`).
+        let session_token = self.track_session(name, session.control.clone());
 
         self.emit_event(
             &updated.repo_name,
@@ -1450,7 +1464,7 @@ impl Supervisor {
         let generation = updated.created_at;
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                supervisor.handle_event(&owned, generation, event);
+                supervisor.handle_event(&owned, generation, session_token, event);
             }
         });
         Ok(updated)
@@ -1549,8 +1563,17 @@ impl Supervisor {
 
     /// `generation` is the agent record's `created_at`, captured once when the
     /// event loop is wired up: transcript writes are keyed on the generation, not
-    /// the name, so a line can never land in a namesake's file.
-    fn handle_event(self: &Arc<Self>, name: &str, generation: DateTime<Utc>, event: HarnessEvent) {
+    /// the name, so a line can never land in a namesake's file. `session` is
+    /// this specific process launch's token (see `session_tokens` on
+    /// `Supervisor`) — unlike `generation`, it changes across a respawn even
+    /// though the two share the same record.
+    fn handle_event(
+        self: &Arc<Self>,
+        name: &str,
+        generation: DateTime<Utc>,
+        session: rk_core::id::SpawnId,
+        event: HarnessEvent,
+    ) {
         match event {
             HarnessEvent::Started { session_id } => {
                 let _ = self.lock_registry().update(name, |r| {
@@ -1613,7 +1636,7 @@ impl Supervisor {
                         // `Failed`, not `Completed`, and stays reachable by
                         // the respawn sweep instead.
                         if !is_error && claim.declared_done {
-                            self.schedule_done_kill(name.to_string(), generation);
+                            self.schedule_done_kill(name.to_string(), generation, session);
                         }
                     } else {
                         info!(
@@ -2948,37 +2971,50 @@ impl Supervisor {
     /// `is_live()` agents, so once this record is `Completed` its process —
     /// interactive harnesses stay alive between turns — is otherwise never
     /// checked again; nothing else kills it. `generation` pins this timer to
-    /// the exact generation that completed: a respawn (or a second `Completed`
-    /// turn under a fresh generation reusing the same name) must never have
-    /// ITS process shot out from under it by a stale timer armed for the
-    /// generation before it.
-    fn schedule_done_kill(self: &Arc<Self>, name: String, generation: DateTime<Utc>) {
+    /// the record it fired on; `session` (B5 rework) pins it to the exact
+    /// process launch — a manual `rk respawn` during the grace window keeps
+    /// `generation` (see `respawn_mode`'s comment on why) but gets a fresh
+    /// `session` token, so it cannot be shot out from under it by a stale
+    /// timer armed for the process it replaced.
+    fn schedule_done_kill(
+        self: &Arc<Self>,
+        name: String,
+        generation: DateTime<Utc>,
+        session: rk_core::id::SpawnId,
+    ) {
         let this = Arc::clone(self);
         let grace_secs = self.done_kill_grace_secs.load(Ordering::Relaxed).max(1);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(grace_secs)).await;
-            this.kill_lingering_after_done(&name, generation, grace_secs)
+            this.kill_lingering_after_done(&name, generation, session, grace_secs)
                 .await;
         });
     }
 
     /// The grace timer's payoff: if a process is STILL tracked under `name`
-    /// for the SAME generation that armed the timer, it did not exit on its
-    /// own within the grace window — SIGKILL its whole process group. A
-    /// clean exit within the window already removed the control handle (see
-    /// the `Exited` arm of [`handle_event`](Supervisor::handle_event)), so
-    /// that path is a no-op here, matching the "clean-exit path unaffected"
-    /// acceptance criterion.
+    /// for the SAME generation AND session that armed the timer, it did not
+    /// exit on its own within the grace window — SIGKILL its whole process
+    /// group. A clean exit within the window already removed the control
+    /// handle (see the `Exited` arm of [`handle_event`](Supervisor::handle_event)),
+    /// so that path is a no-op here, matching the "clean-exit path
+    /// unaffected" acceptance criterion. The `session` check (not `generation`
+    /// alone) is what makes a respawn during the grace window safe: a respawn
+    /// reuses the record's generation but registers a new session token, so a
+    /// timer armed for the predecessor no longer matches.
     async fn kill_lingering_after_done(
         self: &Arc<Self>,
         name: &str,
         generation: DateTime<Utc>,
+        session: rk_core::id::SpawnId,
         grace_secs: u64,
     ) {
         let record = match self.lock_registry().get(name) {
             Some(r) if r.created_at == generation => r.clone(),
-            _ => return, // respawned, dismissed, or already gone — not our process
+            _ => return, // dismissed, or already gone — not our process
         };
+        if self.lock_session_tokens().get(name) != Some(&session) {
+            return; // respawned since — a new session now owns this name
+        }
         if !self.lock_controls().contains_key(name) {
             return; // exited on its own within the grace window
         }
@@ -4391,6 +4427,27 @@ impl Supervisor {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }
+    }
+
+    fn lock_session_tokens(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, rk_core::id::SpawnId>> {
+        match self.session_tokens.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Register a freshly launched session's control handle under `name`,
+    /// stamping a fresh per-session token alongside it — the key
+    /// [`kill_lingering_after_done`](Self::kill_lingering_after_done) needs to
+    /// tell a respawned session apart from the one a grace timer was armed
+    /// for, since both share the same `AgentRecord` generation.
+    fn track_session(&self, name: &str, control: SessionControl) -> rk_core::id::SpawnId {
+        let token = rk_core::id::SpawnId::new();
+        self.lock_controls().insert(name.to_string(), control);
+        self.lock_session_tokens().insert(name.to_string(), token);
+        token
     }
 
     fn lock_sweep_state(&self) -> std::sync::MutexGuard<'_, HashMap<String, SweepState>> {

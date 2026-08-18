@@ -228,3 +228,62 @@ async fn clean_exit_after_done_is_not_touched() {
         "a harness that exited cleanly on its own must never be SIGKILLed: {actions:?}"
     );
 }
+
+/// B5 rework: a manual `rk respawn` of a `Completed` rat, issued during the
+/// predecessor's grace window, must survive that predecessor's trailing
+/// done-kill timer. `respawn_mode` intentionally reuses the record's
+/// generation (`created_at`) so the transcript keeps appending to the same
+/// file — but that means a generation-keyed grace check cannot tell the
+/// predecessor process from its respawned successor, and the timer armed for
+/// the first `rk done` SIGKILLs the second session's fresh process instead of
+/// the (still-lingering, orphaned) first one. The fix keys the check on a
+/// per-launch session token that a respawn overwrites, not on the generation.
+///
+/// Both generations run the same `lingers-after-done` script, so the
+/// respawned session eventually gets a legitimate done-kill of its own (its
+/// OWN timer, armed at its OWN completion) — this test only asserts survival
+/// in the window after the PREDECESSOR's deadline but before the respawned
+/// generation's own deadline, which is exactly the window the bug killed it
+/// in.
+#[tokio::test]
+async fn respawn_during_grace_survives_predecessor_done_kill() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let grace_secs = 3;
+    let (mut client, _repo, agent) =
+        spawn(home.path(), repo_dir.path(), "lingers-after-done", grace_secs).await;
+
+    let record = await_state(&mut client, &agent, "completed").await;
+    let pid1 = record["pid"]
+        .as_u64()
+        .expect("the predecessor is still lingering right after completion");
+    assert!(pid_alive(pid1), "predecessor must still be running");
+
+    // Respawn partway through the predecessor's grace window, leaving margin
+    // on both sides: before the predecessor's timer fires, and before the
+    // respawned generation's own timer (armed at ITS completion, moments
+    // from now) catches up to it.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let respawned = client
+        .call("agent.respawn", json!({"name": agent}))
+        .await
+        .unwrap();
+    let pid2 = respawned["agent"]["pid"]
+        .as_u64()
+        .expect("respawn must report a fresh pid");
+    assert_ne!(pid1, pid2, "respawn must launch a distinct process");
+
+    // Land past the predecessor's deadline (~3s after its completion, ~1.5s
+    // from now) but before the respawned generation's own deadline (~3s after
+    // ITS completion, ~1.5s+grace from now) — the window the bug killed pid2
+    // in.
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+
+    assert!(
+        pid_alive(pid2),
+        "the respawned session must survive the predecessor's done-kill grace timer"
+    );
+
+    let _ = Command::new("kill").args(["-9", &pid1.to_string()]).status();
+    let _ = Command::new("kill").args(["-9", &pid2.to_string()]).status();
+}
