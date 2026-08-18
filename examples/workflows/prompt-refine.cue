@@ -24,6 +24,16 @@ workflow: {
 					Scan recurring pain:
 					  rk scan obstacle ; rk scan need ; rk scan fact system
 					Cross-reference with recent workflow_failed events.
+					Classify each failure before proposing a prompt change. A prompt
+					candidate requires evidence that the relevant tool/model/workflow
+					gate was available and that the current role instructions caused
+					the observed behavior. Missing executables, inaccessible models,
+					workflow-policy refusals, daemon authorization errors, merge
+					collisions, and repository-check failures are infrastructure,
+					workflow, or gate findings unless evidence proves otherwise.
+					For those boundaries, do not write a speculative prompt proposal:
+					file one ticket with the exact run id, step, error, and owning
+					boundary, then continue mining other evidence.
 					Where a recurring failure traces to a weak role prompt or a missing
 					convention, propose a concrete edit (write a diff/patch under
 					docs/proposals/prompts/) and, for durable rules, propose a convention:
