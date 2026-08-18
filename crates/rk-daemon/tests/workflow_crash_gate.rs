@@ -162,7 +162,19 @@ async fn a_rat_that_dies_without_reporting_fails_the_chain() {
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", CRASHING_FAKE);
     let layout = Layout::at(home.path());
-    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    // These tests are about the crash-gate/fail-fast path (TKT-147), not
+    // auto-respawn (strategic review B3): a `Failed` agent with respawn
+    // enabled is deliberately NOT "abandoned" yet (see
+    // `WorkflowEngine::abandoned`) — the wait keeps blocking for the
+    // self-healing sweep to either revive it or exhaust its crash-loop cap.
+    // Disable respawn explicitly so this suite exercises the "nothing will
+    // ever bring it back" path regardless of the supervisor's shipped
+    // default.
+    daemon.set_sweep_config(rk_core::config::SupervisorConfig {
+        respawn_enabled: false,
+        ..rk_core::config::SupervisorConfig::default()
+    });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
 
@@ -212,7 +224,19 @@ async fn a_result_the_crashed_rat_could_not_have_produced_is_rejected() {
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", CRASHING_FAKE);
     let layout = Layout::at(home.path());
-    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    // These tests are about the crash-gate/fail-fast path (TKT-147), not
+    // auto-respawn (strategic review B3): a `Failed` agent with respawn
+    // enabled is deliberately NOT "abandoned" yet (see
+    // `WorkflowEngine::abandoned`) — the wait keeps blocking for the
+    // self-healing sweep to either revive it or exhaust its crash-loop cap.
+    // Disable respawn explicitly so this suite exercises the "nothing will
+    // ever bring it back" path regardless of the supervisor's shipped
+    // default.
+    daemon.set_sweep_config(rk_core::config::SupervisorConfig {
+        respawn_enabled: false,
+        ..rk_core::config::SupervisorConfig::default()
+    });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
 
@@ -285,7 +309,19 @@ async fn a_crashed_rat_in_a_fan_out_fails_the_join() {
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", CRASHING_FAKE);
     let layout = Layout::at(home.path());
-    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    // These tests are about the crash-gate/fail-fast path (TKT-147), not
+    // auto-respawn (strategic review B3): a `Failed` agent with respawn
+    // enabled is deliberately NOT "abandoned" yet (see
+    // `WorkflowEngine::abandoned`) — the wait keeps blocking for the
+    // self-healing sweep to either revive it or exhaust its crash-loop cap.
+    // Disable respawn explicitly so this suite exercises the "nothing will
+    // ever bring it back" path regardless of the supervisor's shipped
+    // default.
+    daemon.set_sweep_config(rk_core::config::SupervisorConfig {
+        respawn_enabled: false,
+        ..rk_core::config::SupervisorConfig::default()
+    });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
 

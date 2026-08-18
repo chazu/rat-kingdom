@@ -587,6 +587,13 @@ impl Daemon {
         if daemon.sweep_config.enabled {
             let supervisor = Arc::clone(&daemon.supervisor);
             let cfg = daemon.sweep_config.clone();
+            // Same `[[notify.sinks]]` config the reactor's escalations and the
+            // B2 re-notify sweep resolve (`recovery_renotify_sweep_once`) —
+            // sinks are stateless shell-outs (B1), so rebuilding the registry
+            // fresh each tick is cheap and keeps this loop independent of
+            // `Server` internals.
+            let notify_config = daemon.notify_config.clone();
+            let notify_escalations = daemon.reactor_config.notify_escalations;
             let mut sweep_shutdown = daemon.shutdown_tx.subscribe();
             let interval = Duration::from_secs(cfg.interval_secs.max(1));
             tokio::spawn(async move {
@@ -599,14 +606,19 @@ impl Daemon {
                         _ = tick.tick() => {
                             let supervisor = Arc::clone(&supervisor);
                             let cfg = cfg.clone();
+                            let notify_config = notify_config.clone();
                             let handle = tokio::runtime::Handle::current();
                             if let Err(e) = tokio::task::spawn_blocking(move || {
                                 let _entered = handle.enter();
                                 supervisor.sweep(&cfg);
                                 // Self-healing respawn rides the same tick (TKT-53):
                                 // relaunch crashed/orphaned rats with crash-loop
-                                // backoff. No-op unless [supervisor].respawn_enabled.
-                                supervisor.respawn_sweep(&cfg);
+                                // backoff, castle-wide rate-capped and announced
+                                // (strategic review B3). No-op unless
+                                // [supervisor].respawn_enabled.
+                                let sinks = crate::reactor::sink_factory()
+                                    .registry(notify_config.resolved(notify_escalations));
+                                supervisor.respawn_sweep(&cfg, &sinks);
                             })
                             .await
                             {

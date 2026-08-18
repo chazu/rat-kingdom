@@ -7,6 +7,7 @@ use crate::onboarding_sessions::{onboarding_branch, onboarding_worktree, ONBOARD
 use crate::read_only_roles::{is_read_only_role, DIAGNOSTICIAN_ROLE};
 use chrono::{DateTime, Utc};
 use rk_core::config::SupervisorConfig;
+use rk_core::notify::{EscalationNotice, Severity, SinkRegistry};
 use rk_core::paths::Layout;
 use rk_core::prime::{render, PrimeContext, VerificationCheck, MAX_INJECTED_FACTS};
 use rk_core::tuple::{Category, Pattern, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
@@ -491,6 +492,11 @@ pub struct Supervisor {
     /// clock + whether the cap has already been escalated). In-memory: a daemon
     /// restart is a fresh episode, so attempt counts reset with it.
     respawn_state: Mutex<HashMap<String, RespawnState>>,
+    /// Castle-wide rolling rate cap + durable announce for auto-respawns
+    /// (strategic review B2/B3): shared across every agent so the cap groups
+    /// on the `"respawn"` kind fleet-wide, not per agent. In-memory, like
+    /// `respawn_state` — a daemon restart is a fresh rolling window.
+    recovery_announcer: crate::recovery::RecoveryAnnouncer,
     /// Per-agent completion-routing state, so one agent generation emits
     /// exactly one durable `harness_result` — the one for the turn it actually
     /// finished on (TKT-160). In-memory: a daemon restart loses the withheld
@@ -722,6 +728,7 @@ impl Supervisor {
             fleet_warned: Mutex::new(std::collections::HashSet::new()),
             sweep_state: Mutex::new(HashMap::new()),
             respawn_state: Mutex::new(HashMap::new()),
+            recovery_announcer: crate::recovery::RecoveryAnnouncer::new(),
             completions: Mutex::new(HashMap::new()),
             log,
             merge_queue: MergeQueue::default(),
@@ -2346,7 +2353,14 @@ impl Supervisor {
     ///
     /// Shares the liveness-sweep loop (TKT-15): the server calls this right
     /// after `sweep()` on the same tick.
-    pub fn respawn_sweep(self: &Arc<Self>, cfg: &SupervisorConfig) {
+    ///
+    /// Every fired (or held) respawn announces through `sinks` via the
+    /// castle-wide [`recovery::RecoveryAnnouncer`](crate::recovery), gated by
+    /// `cfg.respawn_rate_cap_per_hour` — the fleet-wide counterpart to the
+    /// per-agent `respawn_max_attempts` bound above. A respawn past the cap is
+    /// HELD (not launched) and escalated at raised severity instead; it is
+    /// retried on a later tick once the rolling window has room again.
+    pub fn respawn_sweep(self: &Arc<Self>, cfg: &SupervisorConfig, sinks: &SinkRegistry) {
         if !cfg.respawn_enabled || cfg.respawn_max_attempts == 0 {
             return;
         }
@@ -2378,15 +2392,51 @@ impl Supervisor {
                         warn!(agent = %record.name, "skipping auto-respawn: over budget cap");
                         continue;
                     }
-                    let attempt = self.record_respawn_attempt(&record.name, now);
-                    info!(
-                        agent = %record.name,
-                        attempt,
-                        max = cfg.respawn_max_attempts,
-                        "self-healing sweep respawning crashed agent"
+                    let notice = EscalationNotice::new(
+                        "placeholder",
+                        "respawn",
+                        Severity::Warn,
+                        record.repo_name.clone(),
+                        record.name.clone(),
+                        format!(
+                            "self-healing sweep auto-respawning crashed agent {} (task: {})",
+                            record.name,
+                            record.task.as_deref().unwrap_or("-")
+                        ),
                     );
-                    if let Err(e) = self.respawn(&record.name) {
-                        warn!(agent = %record.name, error = %e, "auto-respawn failed");
+                    let outcome = self.recovery_announcer.announce(
+                        &self.space,
+                        sinks,
+                        crate::recovery::RecoveryAction {
+                            kind: "respawn".into(),
+                            instance: "supervisor".into(),
+                            notice,
+                        },
+                        crate::recovery::RateCap::per_hour(cfg.respawn_rate_cap_per_hour),
+                    );
+                    match outcome {
+                        Ok(outcome) if outcome.held() => {
+                            warn!(
+                                agent = %record.name,
+                                cap = cfg.respawn_rate_cap_per_hour,
+                                "auto-respawn HELD: castle-wide respawn rate cap hit"
+                            );
+                        }
+                        Ok(_) => {
+                            let attempt = self.record_respawn_attempt(&record.name, now);
+                            info!(
+                                agent = %record.name,
+                                attempt,
+                                max = cfg.respawn_max_attempts,
+                                "self-healing sweep respawning crashed agent"
+                            );
+                            if let Err(e) = self.respawn(&record.name) {
+                                warn!(agent = %record.name, error = %e, "auto-respawn failed");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(agent = %record.name, error = %e, "failed to announce auto-respawn; skipping this tick");
+                        }
                     }
                 }
                 RespawnDecision::Escalate => {
