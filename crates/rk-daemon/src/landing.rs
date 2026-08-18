@@ -2207,11 +2207,55 @@ workflow: {
         assert_eq!(historical_rows[0].subject, produced_rows[0].subject);
         assert_eq!(historical_rows[0].scope, produced_rows[0].scope);
         assert_eq!(historical_rows[0].action, produced_rows[0].action);
-        assert!(
-            produced_rows[0].detail.contains("STOP"),
-            "detail: {}",
-            produced_rows[0].detail
-        );
+        // Byte-identical, not just "mentions STOP": the historical text was
+        // hand-built to match `escalate`'s exact wording for this task/branch,
+        // so the row `rk inbox` renders must be the two sides' `detail`
+        // agreeing character-for-character, not merely overlapping.
+        assert_eq!(historical_rows[0].detail, produced_rows[0].detail);
+    }
+
+    /// The REWORK counterpart to `escalation_row_matches_the_workflow_driven_
+    /// steward_shape` above. A REWORK verdict never reaches `rk inbox` — no
+    /// source `build` reads from scans `Category::Task` (tickets), so the
+    /// follow-up ticket `file_rework_ticket` files has no row to compare
+    /// against another row. What must still match, byte-for-byte, is the
+    /// TICKET SHAPE itself: the pre-cutover `steward-file-rework-ticket`
+    /// named check (removed in `.rk/checks.cue`/`examples/checks.cue`, Phase
+    /// 4) ran exactly `rk ticket new "rework: $RK_CHECK_TASK_ID" --repo
+    /// "$RK_CHECK_REPO" --body "Steward routed REWORK on branch
+    /// $RK_CHECK_BRANCH. Read the reviewer notes: rk scan artifact
+    /// $RK_CHECK_REPO"` — title, scope, and body are asserted against that
+    /// exact historical template here, not just that *some* ticket got
+    /// filed.
+    #[tokio::test]
+    async fn rework_ticket_matches_the_workflow_driven_steward_shape() {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+
+        let space = Space::open_in_memory().unwrap();
+        space.out(verdict_tuple(&head_sha, "REWORK")).unwrap();
+
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(review_candidate_entry(repo_dir.path(), &head_sha))
+            .unwrap();
+
+        let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let LandingOutcome::ReworkFiled(produced) = &outcomes[0] else {
+            panic!("expected ReworkFiled, got {:?}", outcomes[0]);
+        };
+
+        let main_after = rev_parse(repo_dir.path(), "main");
+        assert_eq!(main_before, main_after, "branch must not have landed");
+
+        let historical_title = "rework: add src";
+        let historical_body =
+            "Steward routed REWORK on branch feature. Read the reviewer notes: rk scan \
+             artifact code-repo";
+        assert_eq!(produced.payload["title"], historical_title);
+        assert_eq!(produced.payload["body"], historical_body);
+        assert_eq!(produced.scope, "code-repo");
     }
 
     #[tokio::test]
