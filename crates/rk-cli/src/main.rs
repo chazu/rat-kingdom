@@ -1,8 +1,8 @@
 //! `rk` — the rat-kingdom CLI.
 
 mod agent_cmds;
-mod factory_dashboard;
 mod factory_cmds;
+mod factory_dashboard;
 mod factory_skill;
 mod ingest_cmds;
 mod observe;

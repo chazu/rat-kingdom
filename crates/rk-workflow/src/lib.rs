@@ -182,13 +182,7 @@ impl RepositoryPolicy {
     }
 }
 
-fn render_work_template(
-    template: &str,
-    agent: &str,
-    task: &str,
-    repo: &str,
-    role: &str,
-) -> String {
+fn render_work_template(template: &str, agent: &str, task: &str, repo: &str, role: &str) -> String {
     template
         .replace("{{agent}}", agent)
         .replace("{{task}}", task)
@@ -991,7 +985,10 @@ fn validate_repository_policy(policy: &RepositoryPolicy) -> rk_core::Result<()> 
     }
     validate_duration_str("repo.landing.gateTimeout", &policy.landing.gate_timeout)?;
     validate_duration_str("repo.landing.reviewTimeout", &policy.landing.review_timeout)?;
-    validate_duration_str("repo.landing.reviewMaxWait", &policy.landing.review_max_wait)?;
+    validate_duration_str(
+        "repo.landing.reviewMaxWait",
+        &policy.landing.review_max_wait,
+    )?;
     Ok(())
 }
 
@@ -1792,10 +1789,7 @@ workflow: {
 }
 "#;
         let workflow = load_str(source, &HashMap::new()).unwrap();
-        assert_eq!(
-            workflow.agents["default"].harness.as_deref(),
-            Some("jcode")
-        );
+        assert_eq!(workflow.agents["default"].harness.as_deref(), Some("jcode"));
     }
 
     #[test]
@@ -2244,7 +2238,8 @@ triggers: [
 
     #[test]
     fn trigger_max_in_flight_over_cap_is_a_cue_error() {
-        let bad = r#"triggers: [{name: "x", match: {category: "need"}, run: "w", maxInFlight: 101}]"#;
+        let bad =
+            r#"triggers: [{name: "x", match: {category: "need"}, run: "w", maxInFlight: 101}]"#;
         let err = load_triggers_str(bad).unwrap_err();
         assert!(err.to_string().contains("cue export failed"), "{err}");
     }
@@ -2435,8 +2430,7 @@ checks: [
 
     #[test]
     fn check_unknown_environment_policy_is_a_cue_error() {
-        let bad =
-            r#"checks: [{name: "x", command: "true", environmentPolicy: "ambient_magic"}]"#;
+        let bad = r#"checks: [{name: "x", command: "true", environmentPolicy: "ambient_magic"}]"#;
         let err = load_checks_str(bad).unwrap_err();
         assert!(err.to_string().contains("environmentPolicy"), "{err}");
     }

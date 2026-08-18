@@ -160,10 +160,7 @@ async fn nightly_self_improve_runs_all_three_phases() {
     let base = repo_dir.path();
     git(base, &["checkout", "main"]);
     let tracked = git(base, &["ls-files"]);
-    let merged: Vec<&str> = tracked
-        .lines()
-        .filter(|f| f.starts_with("work-"))
-        .collect();
+    let merged: Vec<&str> = tracked.lines().filter(|f| f.starts_with("work-")).collect();
     assert_eq!(
         merged.len(),
         3,

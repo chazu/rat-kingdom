@@ -189,10 +189,7 @@ async fn activated_agent_base_policy_authorizes_unattended_feature_branch_landin
         .to_string_lossy()
         .to_string();
     client
-        .call(
-            "repo.add",
-            json!({"name": repo_name, "path": repo.path()}),
-        )
+        .call("repo.add", json!({"name": repo_name, "path": repo.path()}))
         .await
         .unwrap();
 

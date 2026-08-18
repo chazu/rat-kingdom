@@ -371,13 +371,7 @@ async fn delayed_lower_record_id_is_processed_after_cursor_advance() {
     let now = chrono::Utc::now();
     let mut delayed = ping();
     delayed.id = RecordId::floor_at(now);
-    let mut boundary = Tuple::new(
-        Category::Event,
-        "myrepo",
-        "boundary",
-        "Whisker",
-        json!({}),
-    );
+    let mut boundary = Tuple::new(Category::Event, "myrepo", "boundary", "Whisker", json!({}));
     boundary.id = RecordId::floor_at(now + chrono::Duration::days(1));
 
     space.out(boundary).unwrap();
@@ -420,11 +414,7 @@ async fn restart_after_future_record_id_processes_normal_write() {
     }
 
     let reopened = rk_space::Space::open(&layout.db_path()).unwrap();
-    let restarted = build_reactor_with_space(
-        &layout,
-        ReactorConfig::default(),
-        reopened.clone(),
-    );
+    let restarted = build_reactor_with_space(&layout, ReactorConfig::default(), reopened.clone());
     let mut normal = ping();
     normal.id = RecordId::floor_at(now);
     reopened.out(normal).unwrap();
@@ -550,11 +540,8 @@ async fn existing_stable_reactor_instance_prevents_duplicate_launch_without_mark
     register_repo(&layout, "myrepo", repo.path());
     std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
     let space = rk_space::Space::open_in_memory().unwrap();
-    let (reactor, engine) = build_reactor_and_engine_with_space(
-        &layout,
-        ReactorConfig::default(),
-        space.clone(),
-    );
+    let (reactor, engine) =
+        build_reactor_and_engine_with_space(&layout, ReactorConfig::default(), space.clone());
     let tuple = ping();
     let instance_id = stable_reactor_instance_id("ping-drain", tuple.id);
     engine
@@ -586,11 +573,7 @@ async fn workflow_launch_fails_when_initial_instance_cannot_be_persisted() {
     let layout = Layout::at(home.path());
     layout.ensure().unwrap();
     let space = rk_space::Space::open_in_memory().unwrap();
-    let (_, engine) = build_reactor_and_engine_with_space(
-        &layout,
-        ReactorConfig::default(),
-        space,
-    );
+    let (_, engine) = build_reactor_and_engine_with_space(&layout, ReactorConfig::default(), space);
     std::fs::write(layout.home().join("workflow-instances"), "not a directory").unwrap();
 
     let result = engine.run_owned_with_id(
@@ -601,7 +584,10 @@ async fn workflow_launch_fails_when_initial_instance_cannot_be_persisted() {
         None,
     );
 
-    assert!(result.is_err(), "a workflow must not launch without durable instance state");
+    assert!(
+        result.is_err(),
+        "a workflow must not launch without durable instance state"
+    );
     assert!(engine.status("must-be-durable").is_none());
 }
 
@@ -639,10 +625,9 @@ async fn archived_stable_instance_id_prevents_relaunch() {
         )
         .unwrap();
     for _ in 0..50 {
-        if engine
-            .status(&id)
-            .is_some_and(|instance| instance.status != rk_daemon::workflow_exec::InstanceStatus::Running)
-        {
+        if engine.status(&id).is_some_and(|instance| {
+            instance.status != rk_daemon::workflow_exec::InstanceStatus::Running
+        }) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -734,10 +719,7 @@ async fn closing_a_ticket_dispatches_its_newly_ready_dependent() {
 
     // A ticket and a dependent that is blocked on it, both in myrepo.
     let tickets = Tickets::new(space.clone(), "test-castle".into());
-    let a = tickets
-        .create(new_ticket("root", "myrepo"))
-        .await
-        .unwrap();
+    let a = tickets.create(new_ticket("root", "myrepo")).await.unwrap();
     let b = tickets
         .create(new_ticket("dependent", "myrepo"))
         .await
@@ -748,7 +730,11 @@ async fn closing_a_ticket_dispatches_its_newly_ready_dependent() {
     // nothing fires yet), then confirm the dependent is blocked.
     assert_eq!(reactor.run_cycle().unwrap(), 0, "no close event yet");
     assert!(
-        tickets.ready(Some("myrepo".into())).unwrap().iter().all(|t| t.identity != b.identity),
+        tickets
+            .ready(Some("myrepo".into()))
+            .unwrap()
+            .iter()
+            .all(|t| t.identity != b.identity),
         "dependent is blocked while its dep is open"
     );
 
@@ -756,7 +742,11 @@ async fn closing_a_ticket_dispatches_its_newly_ready_dependent() {
     // the drain — the dependent is now ready to be picked up.
     tickets.set_status(&a.identity, "done").await.unwrap();
     assert!(
-        tickets.ready(Some("myrepo".into())).unwrap().iter().any(|t| t.identity == b.identity),
+        tickets
+            .ready(Some("myrepo".into()))
+            .unwrap()
+            .iter()
+            .any(|t| t.identity == b.identity),
         "closing the dep unblocked the dependent"
     );
     assert_eq!(
@@ -1115,7 +1105,11 @@ async fn non_main_land_target_is_reported_main_is_not() {
     // `rk workflow status`/`list` read (list renders " target=<branch>" from
     // exactly this params field; see rk-cli workflow_target_suffix tests).
     let instances = engine.list();
-    assert_eq!(instances.len(), 1, "trigger must launch exactly one instance");
+    assert_eq!(
+        instances.len(),
+        1,
+        "trigger must launch exactly one instance"
+    );
     assert_eq!(instances[0].workflow, "react-work");
     assert_eq!(
         instances[0].params.get("target"),
@@ -1255,7 +1249,11 @@ async fn trigger_param_over_an_absent_payload_field_falls_back_to_the_workflow_d
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(spawns.len(), 1, "the tagged workflow's spawn step never ran");
+    assert_eq!(
+        spawns.len(),
+        1,
+        "the tagged workflow's spawn step never ran"
+    );
     assert_eq!(spawns[0].payload["task"], "reacted-no-tag");
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
@@ -1291,7 +1289,10 @@ async fn live_daemon_promotes_convention_at_quorum() {
     for _ in 0..200 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let convs = client
-            .call("space.scan", json!({"category": "convention", "scope": "system"}))
+            .call(
+                "space.scan",
+                json!({"category": "convention", "scope": "system"}),
+            )
             .await
             .unwrap();
         if let Some(arr) = convs["tuples"].as_array() {
@@ -1303,7 +1304,10 @@ async fn live_daemon_promotes_convention_at_quorum() {
             }
         }
     }
-    assert!(promoted, "reactor never promoted the quorum-reached suggestion");
+    assert!(
+        promoted,
+        "reactor never promoted the quorum-reached suggestion"
+    );
 }
 
 fn suggestion(id: &str, author: &str, text: &str) -> Tuple {
@@ -1352,7 +1356,9 @@ async fn quorum_promotes_suggestion_to_convention_once() {
     };
     let reactor = build_reactor_with_space(&layout, config, space.clone());
 
-    space.out(suggestion("sug-abc", "Whisker", "rebase, never merge")).unwrap();
+    space
+        .out(suggestion("sug-abc", "Whisker", "rebase, never merge"))
+        .unwrap();
     space.out(endorsement("sug-abc", "Whisker")).unwrap();
     space.out(endorsement("sug-abc", "Nibbles")).unwrap();
     // A duplicate endorsement from an already-counted agent: must not count.
@@ -1360,7 +1366,10 @@ async fn quorum_promotes_suggestion_to_convention_once() {
 
     // Two distinct endorsers: below quorum, no convention yet.
     reactor.run_cycle().unwrap();
-    assert!(conventions(&space).is_empty(), "sub-quorum must not promote");
+    assert!(
+        conventions(&space).is_empty(),
+        "sub-quorum must not promote"
+    );
 
     // The third distinct endorser trips quorum.
     space.out(endorsement("sug-abc", "Gouda")).unwrap();
@@ -1382,7 +1391,11 @@ async fn quorum_promotes_suggestion_to_convention_once() {
     // Idempotent: re-running (even with more endorsements) never double-promotes.
     space.out(endorsement("sug-abc", "Brie")).unwrap();
     reactor.run_cycle().unwrap();
-    assert_eq!(conventions(&space).len(), 1, "convention is the promote-once guard");
+    assert_eq!(
+        conventions(&space).len(),
+        1,
+        "convention is the promote-once guard"
+    );
 }
 
 /// A quorum cannot promote a suggestion whose text has already decayed: a
@@ -1469,13 +1482,25 @@ async fn obstacles_coalesce_into_one_ticket_at_quorum() {
     // Two distinct rats hit the same wall; one of them restates it (a second
     // tuple on the same instance). Distinct reporters = 2, below quorum.
     space
-        .out(obstacle("myrepo", "Whisker", "cargo build fails on rk-space"))
+        .out(obstacle(
+            "myrepo",
+            "Whisker",
+            "cargo build fails on rk-space",
+        ))
         .unwrap();
     space
-        .out(obstacle("myrepo", "Whisker", "cargo build FAILS on rk-space!!"))
+        .out(obstacle(
+            "myrepo",
+            "Whisker",
+            "cargo build FAILS on rk-space!!",
+        ))
         .unwrap();
     space
-        .out(obstacle("myrepo", "Nibbles", "Cargo build fails on rk-space."))
+        .out(obstacle(
+            "myrepo",
+            "Nibbles",
+            "Cargo build fails on rk-space.",
+        ))
         .unwrap();
     reactor.run_cycle().unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1540,14 +1565,26 @@ async fn distinct_topics_and_scopes_file_separate_tickets() {
     let reactor = build_reactor_with_space(&layout, config, space.clone());
 
     // Wall A in repo one.
-    space.out(obstacle("one", "Whisker", "flaky network test")).unwrap();
-    space.out(obstacle("one", "Nibbles", "flaky network test")).unwrap();
+    space
+        .out(obstacle("one", "Whisker", "flaky network test"))
+        .unwrap();
+    space
+        .out(obstacle("one", "Nibbles", "flaky network test"))
+        .unwrap();
     // Same words, different repo → different topic key.
-    space.out(obstacle("two", "Whisker", "flaky network test")).unwrap();
-    space.out(obstacle("two", "Gouda", "flaky network test")).unwrap();
+    space
+        .out(obstacle("two", "Whisker", "flaky network test"))
+        .unwrap();
+    space
+        .out(obstacle("two", "Gouda", "flaky network test"))
+        .unwrap();
     // A wholly different wall in repo one, at quorum too.
-    space.out(obstacle("one", "Brie", "missing config key")).unwrap();
-    space.out(obstacle("one", "Sooty", "missing config key")).unwrap();
+    space
+        .out(obstacle("one", "Brie", "missing config key"))
+        .unwrap();
+    space
+        .out(obstacle("one", "Sooty", "missing config key"))
+        .unwrap();
 
     reactor.run_cycle().unwrap();
     let tickets = wait_for_coalesced(&space, 3).await;
@@ -1556,10 +1593,20 @@ async fn distinct_topics_and_scopes_file_separate_tickets() {
         .map(|t| t.payload["coalesce_key"].as_str().unwrap().to_string())
         .collect();
     keys.sort();
-    assert_eq!(keys.len(), 3, "three distinct (scope, topic) buckets → three tickets");
-    assert!(keys.iter().any(|k| k.starts_with("one::") && k.contains("flaky")));
-    assert!(keys.iter().any(|k| k.starts_with("two::") && k.contains("flaky")));
-    assert!(keys.iter().any(|k| k.starts_with("one::") && k.contains("missing")));
+    assert_eq!(
+        keys.len(),
+        3,
+        "three distinct (scope, topic) buckets → three tickets"
+    );
+    assert!(keys
+        .iter()
+        .any(|k| k.starts_with("one::") && k.contains("flaky")));
+    assert!(keys
+        .iter()
+        .any(|k| k.starts_with("two::") && k.contains("flaky")));
+    assert!(keys
+        .iter()
+        .any(|k| k.starts_with("one::") && k.contains("missing")));
 }
 
 /// Coalescence is off when the quorum is zero: the pile stays flat.
@@ -1577,11 +1624,16 @@ async fn zero_quorum_disables_coalescence() {
     let reactor = build_reactor_with_space(&layout, config, space.clone());
 
     for agent in ["a", "b", "c", "d"] {
-        space.out(obstacle("myrepo", agent, "the same wall")).unwrap();
+        space
+            .out(obstacle("myrepo", agent, "the same wall"))
+            .unwrap();
     }
     reactor.run_cycle().unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(coalesced_tickets(&space).is_empty(), "zero quorum files nothing");
+    assert!(
+        coalesced_tickets(&space).is_empty(),
+        "zero quorum files nothing"
+    );
 }
 
 /// A steward escalation `need`: identity "steward", as `rk out need <repo>
@@ -1797,10 +1849,7 @@ kind = "carrier-pigeon"
     // and the escalation is still on the passive queue either way.
     reactor.run_cycle().unwrap();
     assert_eq!(
-        std::fs::read_to_string(&delivered)
-            .unwrap()
-            .lines()
-            .count(),
+        std::fs::read_to_string(&delivered).unwrap().lines().count(),
         1,
         "still deduped per (notice, sink) — a config-built sink is not special"
     );
@@ -1865,7 +1914,11 @@ async fn escalation_notify_can_be_disabled() {
     let reactor = build_reactor_with_space(&layout, config, space.clone());
 
     space
-        .out(steward_need("myrepo", "TKT-7", "steward: STOP, needs a human"))
+        .out(steward_need(
+            "myrepo",
+            "TKT-7",
+            "steward: STOP, needs a human",
+        ))
         .unwrap();
     reactor.run_cycle().unwrap();
     assert_eq!(
@@ -2077,7 +2130,11 @@ async fn max_in_flight_queues_a_burst_and_drains_it_as_slots_free() {
     let queued = space
         .scan(&Pattern::category(Category::Event).identity("reactor_queued_fire"))
         .unwrap();
-    assert_eq!(queued.len(), 3, "the remaining 3 are durably queued, not dropped");
+    assert_eq!(
+        queued.len(),
+        3,
+        "the remaining 3 are durably queued, not dropped"
+    );
 
     // Drive the reactor by hand (simulated feed loss) as slots free.
     let mut ran = 0;
@@ -2310,7 +2367,11 @@ async fn permanently_failing_fire_gives_up_and_unpins_the_cursor() {
 
     // Bounded retries: the cursor stays pinned while attempts are exhausted.
     for attempt in 1..5 {
-        assert_eq!(reactor.run_cycle().unwrap(), 0, "attempt {attempt} must not fire");
+        assert_eq!(
+            reactor.run_cycle().unwrap(),
+            0,
+            "attempt {attempt} must not fire"
+        );
         assert!(
             !home.path().join("reactor-cursor").exists(),
             "attempt {attempt}: still retrying, cursor must stay pinned"
@@ -2497,7 +2558,11 @@ async fn drain_rate_cap_writes_a_durable_deferred_trace() {
             break; // would only happen if the rate cap failed to hold
         }
     }
-    assert_eq!(engine.list().len(), 2, "sanity: rate cap still bounds dispatch");
+    assert_eq!(
+        engine.list().len(),
+        2,
+        "sanity: rate cap still bounds dispatch"
+    );
 
     let deferred = space
         .scan(&Pattern::category(Category::Obstacle).identity("reactor_fire_deferred"))
@@ -2506,18 +2571,20 @@ async fn drain_rate_cap_writes_a_durable_deferred_trace() {
         !deferred.is_empty(),
         "draining stalled on the rate cap must leave a durable trace, not a silent break"
     );
-    assert!(deferred.iter().all(|t| t
-        .payload
-        .get("trigger")
-        .and_then(|v| v.as_str())
-        == Some("burst-drain")));
+    assert!(deferred
+        .iter()
+        .all(|t| t.payload.get("trigger").and_then(|v| v.as_str()) == Some("burst-drain")));
     // Every trace names a CONCRETE tuple, never a placeholder: the admission
     // trace carries the fired tuple's id, and the drain-deferral trace carries
     // the queued fire's ORIGINAL tuple id (from the queue entry payload) so
     // the misfire diagnosis can walk from a completion straight to why it
     // waited.
     for t in &deferred {
-        let named = t.payload.get("tuple").and_then(|v| v.as_str()).unwrap_or("");
+        let named = t
+            .payload
+            .get("tuple")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         assert!(
             !named.is_empty() && named != "queue-drain" && named != "unknown",
             "deferral trace must name the affected tuple, got: {named:?}"
@@ -2566,12 +2633,28 @@ async fn queued_fire_survives_daemon_restart() {
         let (reactor, engine) =
             build_reactor_and_engine_with_space(&layout, ReactorConfig::default(), space.clone());
         space
-            .out(Tuple::new(Category::Event, "myrepo", "burst", "Whisker", json!({"i": 0})))
+            .out(Tuple::new(
+                Category::Event,
+                "myrepo",
+                "burst",
+                "Whisker",
+                json!({"i": 0}),
+            ))
             .unwrap();
         space
-            .out(Tuple::new(Category::Event, "myrepo", "burst", "Whisker", json!({"i": 1})))
+            .out(Tuple::new(
+                Category::Event,
+                "myrepo",
+                "burst",
+                "Whisker",
+                json!({"i": 1}),
+            ))
             .unwrap();
-        assert_eq!(reactor.run_cycle().unwrap(), 1, "only one dispatches at the cap of 1");
+        assert_eq!(
+            reactor.run_cycle().unwrap(),
+            1,
+            "only one dispatches at the cap of 1"
+        );
         // Wait for the single dispatched instance to settle before "restart",
         // so no background execution task outlives this scope.
         for _ in 0..100 {
@@ -2588,7 +2671,11 @@ async fn queued_fire_survives_daemon_restart() {
         let queued = space
             .scan(&Pattern::category(Category::Event).identity("reactor_queued_fire"))
             .unwrap();
-        assert_eq!(queued.len(), 1, "the second is durably queued before restart");
+        assert_eq!(
+            queued.len(),
+            1,
+            "the second is durably queued before restart"
+        );
     }
 
     // "Restart": reopen the space and rebuild the reactor/engine from the same
@@ -2605,7 +2692,11 @@ async fn queued_fire_survives_daemon_restart() {
         1,
         "the queue entry survived the restart"
     );
-    assert_eq!(engine.list().len(), 1, "the completed instance rehydrated too");
+    assert_eq!(
+        engine.list().len(),
+        1,
+        "the completed instance rehydrated too"
+    );
 
     assert_eq!(
         reactor.run_cycle().unwrap(),

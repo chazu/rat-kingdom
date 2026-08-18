@@ -165,9 +165,9 @@ impl RepoRegistry {
             if record.path == repo_path {
                 record.merge_mode = match activated.policy.delivery.mode {
                     DeliveryMode::Pr => MergeMode::Pr,
-                    DeliveryMode::Merge
-                    | DeliveryMode::MergePush
-                    | DeliveryMode::PushBranch => MergeMode::Direct,
+                    DeliveryMode::Merge | DeliveryMode::MergePush | DeliveryMode::PushBranch => {
+                        MergeMode::Direct
+                    }
                 };
                 record.remote = Some(activated.policy.delivery.remote.clone());
                 record.activated_policy = Some(activated.clone());
@@ -221,7 +221,10 @@ mod tests {
             reg.add(record("myrepo", "/tmp/myrepo")).unwrap();
         }
         let reg = RepoRegistry::load(&path).unwrap();
-        assert_eq!(reg.get("myrepo").unwrap().path, PathBuf::from("/tmp/myrepo"));
+        assert_eq!(
+            reg.get("myrepo").unwrap().path,
+            PathBuf::from("/tmp/myrepo")
+        );
     }
 
     #[test]
@@ -255,11 +258,26 @@ mod tests {
 
     #[test]
     fn infer_host_reads_every_remote_form() {
-        assert_eq!(infer_host("git@github.com:owner/repo.git").as_deref(), Some("github.com"));
-        assert_eq!(infer_host("https://gitlab.com/owner/repo.git").as_deref(), Some("gitlab.com"));
-        assert_eq!(infer_host("ssh://git@gitlab.com:2222/owner/repo.git").as_deref(), Some("gitlab.com"));
-        assert_eq!(infer_host("https://user@bitbucket.org/o/r").as_deref(), Some("bitbucket.org"));
-        assert_eq!(infer_host("git://example.com/o/r.git").as_deref(), Some("example.com"));
+        assert_eq!(
+            infer_host("git@github.com:owner/repo.git").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            infer_host("https://gitlab.com/owner/repo.git").as_deref(),
+            Some("gitlab.com")
+        );
+        assert_eq!(
+            infer_host("ssh://git@gitlab.com:2222/owner/repo.git").as_deref(),
+            Some("gitlab.com")
+        );
+        assert_eq!(
+            infer_host("https://user@bitbucket.org/o/r").as_deref(),
+            Some("bitbucket.org")
+        );
+        assert_eq!(
+            infer_host("git://example.com/o/r.git").as_deref(),
+            Some("example.com")
+        );
         assert_eq!(infer_host(""), None);
         assert_eq!(infer_host("   "), None);
         assert_eq!(infer_host("just-a-path"), None);

@@ -75,10 +75,7 @@ async fn onboarding_activates_the_exact_repository_policy_into_the_registry() {
         .to_string_lossy()
         .to_string();
     client
-        .call(
-            "repo.add",
-            json!({"name": name, "path": repo.path()}),
-        )
+        .call("repo.add", json!({"name": name, "path": repo.path()}))
         .await
         .unwrap();
     let started = client
@@ -146,7 +143,10 @@ async fn onboarding_activates_the_exact_repository_policy_into_the_registry() {
         .unwrap();
     let approved = &registered["repo"]["activated_policy"];
     assert_eq!(approved["policy"]["delivery"]["mode"], "merge-push");
-    assert_eq!(approved["digest"], activated["proposal"]["activation"]["target_digest"]);
+    assert_eq!(
+        approved["digest"],
+        activated["proposal"]["activation"]["target_digest"]
+    );
 
     handle.abort();
     std::env::remove_var("RK_FAKE_HARNESS_CMD");

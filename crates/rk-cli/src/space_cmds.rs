@@ -409,8 +409,7 @@ pub async fn scan(
     display: &CastleDisplay,
 ) -> Result<()> {
     let base = &args.base;
-    let mut params =
-        pattern_params(&base.category, &base.scope, &base.identity, &base.search);
+    let mut params = pattern_params(&base.category, &base.scope, &base.identity, &base.search);
     if args.hot {
         params["hot"] = json!(true);
     }
@@ -493,7 +492,14 @@ pub async fn done(layout: &Layout, args: DoneArgs, as_json: bool) -> Result<()> 
         payload["summary"] = json!(summary);
     }
     write_sugar(
-        layout, "event", &repo, "task_done", None, payload, None, as_json,
+        layout,
+        "event",
+        &repo,
+        "task_done",
+        None,
+        payload,
+        None,
+        as_json,
     )
     .await
 }
@@ -663,7 +669,10 @@ pub async fn endorse(layout: &Layout, args: EndorseArgs, as_json: bool) -> Resul
         .unwrap_or(false)
     {
         if as_json {
-            println!("{}", json!({ "endorsed": args.suggestion, "already": true }));
+            println!(
+                "{}",
+                json!({ "endorsed": args.suggestion, "already": true })
+            );
         } else {
             println!("already endorsed {}", args.suggestion);
         }
@@ -790,7 +799,11 @@ mod tests {
     #[test]
     fn fields_layer_on_top_of_payload_and_reject_non_objects() {
         let mut payload = json!({"agent": "steward", "kept": true});
-        apply_fields(&mut payload, &["agent=other".into(), "k=v=with=equals".into()]).unwrap();
+        apply_fields(
+            &mut payload,
+            &["agent=other".into(), "k=v=with=equals".into()],
+        )
+        .unwrap();
         assert_eq!(payload["agent"], "other");
         assert_eq!(payload["kept"], true);
         assert_eq!(payload["k"], "v=with=equals");
@@ -833,16 +846,25 @@ mod tests {
         }
 
         let s = SuggestCli::parse_from(["rk", "always rebase"]);
-        assert!(s.args.ttl.is_none(), "a proposal must not default to a window");
+        assert!(
+            s.args.ttl.is_none(),
+            "a proposal must not default to a window"
+        );
         assert_eq!(ballot_ttl_secs(s.args.ttl.as_deref()).unwrap(), None);
 
         let e = EndorseCli::parse_from(["rk", "sug-8nsqa4132x"]);
-        assert!(e.args.ttl.is_none(), "a cast vote must not default to a window");
+        assert!(
+            e.args.ttl.is_none(),
+            "a cast vote must not default to a window"
+        );
         assert_eq!(ballot_ttl_secs(e.args.ttl.as_deref()).unwrap(), None);
 
         // `--ttl` still time-boxes a ballot on purpose, and still validates.
         let boxed = SuggestCli::parse_from(["rk", "hold through the migration", "--ttl", "2h"]);
-        assert_eq!(ballot_ttl_secs(boxed.args.ttl.as_deref()).unwrap(), Some(7200));
+        assert_eq!(
+            ballot_ttl_secs(boxed.args.ttl.as_deref()).unwrap(),
+            Some(7200)
+        );
         assert!(ballot_ttl_secs(Some("nope")).is_err());
     }
 

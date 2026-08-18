@@ -110,7 +110,11 @@ fn build_engine(layout: &Layout, space: rk_space::Space) -> Arc<WorkflowEngine> 
     ))
 }
 
-fn build_scheduler(layout: &Layout, config: SchedulerConfig, space: rk_space::Space) -> Arc<Scheduler> {
+fn build_scheduler(
+    layout: &Layout,
+    config: SchedulerConfig,
+    space: rk_space::Space,
+) -> Arc<Scheduler> {
     let engine = build_engine(layout, space.clone());
     Arc::new(Scheduler::new(
         engine,
@@ -182,7 +186,11 @@ async fn first_boot_baselines_cursor_and_skips_current_minute() {
     );
     // A minute later, it fires.
     let next = now + chrono::Duration::minutes(1);
-    assert_eq!(scheduler.run_cycle_at(next).unwrap(), 1, "next minute fires");
+    assert_eq!(
+        scheduler.run_cycle_at(next).unwrap(),
+        1,
+        "next minute fires"
+    );
     assert_eq!(scheduler.engine_instance_count(), 1);
 }
 
@@ -285,7 +293,9 @@ async fn restart_rebuilds_single_flight_from_durable_running_work() {
     );
 
     assert_eq!(
-        restarted.run_cycle_at(t + chrono::Duration::minutes(1)).unwrap(),
+        restarted
+            .run_cycle_at(t + chrono::Duration::minutes(1))
+            .unwrap(),
         0,
         "a restart must not stack the same scheduled work while it is still running",
     );
@@ -409,7 +419,9 @@ async fn restart_does_not_use_a_linked_nested_child_as_schedule_single_flight() 
     );
 
     assert_eq!(
-        restarted.run_cycle_at(t + chrono::Duration::minutes(1)).unwrap(),
+        restarted
+            .run_cycle_at(t + chrono::Duration::minutes(1))
+            .unwrap(),
         1,
         "a nested child belongs to its parent, not the top-level schedule guard",
     );
@@ -720,7 +732,11 @@ async fn stale_running_instance_no_longer_blocks_and_escalates() {
 
     let space = rk_space::Space::open_in_memory().unwrap();
     let restarted_engine = build_engine(&layout, space.clone());
-    assert_eq!(restarted_engine.rehydrate().len(), 1, "the wedged instance must rehydrate");
+    assert_eq!(
+        restarted_engine.rehydrate().len(),
+        1,
+        "the wedged instance must rehydrate"
+    );
     let restarted = Scheduler::new(
         restarted_engine,
         layout.clone(),
@@ -741,8 +757,10 @@ async fn stale_running_instance_no_longer_blocks_and_escalates() {
         .scan(&Pattern::category(Category::Need).identity("every-min"))
         .unwrap();
     assert!(
-        needs.iter().any(|n| n.payload.get("type").and_then(|v| v.as_str())
-            == Some("schedule_stale_running")),
+        needs
+            .iter()
+            .any(|n| n.payload.get("type").and_then(|v| v.as_str())
+                == Some("schedule_stale_running")),
         "the stale instance must be escalated via a need tuple: {needs:?}"
     );
 }

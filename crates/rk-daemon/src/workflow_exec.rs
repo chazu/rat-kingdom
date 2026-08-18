@@ -1317,7 +1317,8 @@ impl WorkflowEngine {
             .lock()
             .values()
             .filter(|instance| {
-                instance.status == InstanceStatus::Running && instance.depth == 0
+                instance.status == InstanceStatus::Running
+                    && instance.depth == 0
                     && !blocked.contains(&instance.id)
             })
             .cloned()
@@ -1345,9 +1346,7 @@ impl WorkflowEngine {
             .collect();
         let orphans: Vec<Instance> = snapshots
             .iter()
-            .filter(|instance| {
-                instance.depth > 0 && !linked.contains(instance.id.as_str())
-            })
+            .filter(|instance| instance.depth > 0 && !linked.contains(instance.id.as_str()))
             .cloned()
             .collect();
         let mut blocked = HashSet::new();
@@ -1531,12 +1530,7 @@ impl WorkflowEngine {
             // Advance only AFTER the step completes, so a restart resumes at the
             // interrupted step and never re-runs a finished one.
             if !self.update_with_reason(id, "step_advanced", |instance| {
-                complete_top_level_step(
-                    instance,
-                    index,
-                    clear_subworkflow,
-                    subworkflow_result,
-                );
+                complete_top_level_step(instance, index, clear_subworkflow, subworkflow_result);
             }) {
                 return Err(rk_core::Error::other(format!(
                     "could not durably advance workflow {id} after step {index}"
@@ -1568,9 +1562,13 @@ impl WorkflowEngine {
                             ));
                         }
                         let result_for_snapshot = result.clone();
-                        self.try_update_with_reason(id, "nested_sub_workflow_joined", |instance| {
-                            join_nested_subworkflow_result(instance, result_for_snapshot);
-                        })?;
+                        self.try_update_with_reason(
+                            id,
+                            "nested_sub_workflow_joined",
+                            |instance| {
+                                join_nested_subworkflow_result(instance, result_for_snapshot);
+                            },
+                        )?;
                         joined_subworkflow = true;
                     }
                     Flow::NextAfterNestedSubworkflow => {
@@ -1903,9 +1901,7 @@ impl WorkflowEngine {
                     };
                     let value = match tuple {
                         Some(tuple) => match &read.field {
-                            Some(field) => {
-                                tuple.payload.get(field).cloned().unwrap_or(Value::Null)
-                            }
+                            Some(field) => tuple.payload.get(field).cloned().unwrap_or(Value::Null),
                             None => tuple.payload.clone(),
                         },
                         None if continue_on_miss => Value::Null,
@@ -2253,7 +2249,9 @@ impl WorkflowEngine {
                     return Err(rk_core::Error::other(format!(
                         "sub_workflow '{}' (instance {child_id}) failed: {}",
                         sub.workflow,
-                        existing.error.unwrap_or_else(|| "unknown child failure".into())
+                        existing
+                            .error
+                            .unwrap_or_else(|| "unknown child failure".into())
                     )));
                 }
                 InstanceStatus::Running => {}
@@ -2967,8 +2965,18 @@ impl WorkflowEngine {
             // (TKT-01M02QT9KTDY2CN6YJEVP3VCF8).
             if timed_out && resolved.on_timeout == OnTimeout::Fail {
                 self.record_gate_failure(
-                    id, repo, agent, command, exit, verdict, timed_out, &stdout,
-                    stdout_truncated, &stderr, stderr_truncated, &history,
+                    id,
+                    repo,
+                    agent,
+                    command,
+                    exit,
+                    verdict,
+                    timed_out,
+                    &stdout,
+                    stdout_truncated,
+                    &stderr,
+                    stderr_truncated,
+                    &history,
                 );
                 return Err(rk_core::Error::other(stderr));
             }
@@ -3022,8 +3030,18 @@ impl WorkflowEngine {
         // instance error (TKT-01M02AMKD24WZVVMARJPXKYKSW).
         if verdict != "pass" {
             self.record_gate_failure(
-                id, repo, agent, command, exit, verdict, timed_out, &stdout, stdout_truncated,
-                &stderr, stderr_truncated, &history,
+                id,
+                repo,
+                agent,
+                command,
+                exit,
+                verdict,
+                timed_out,
+                &stdout,
+                stdout_truncated,
+                &stderr,
+                stderr_truncated,
+                &history,
             );
         }
 
@@ -3086,10 +3104,8 @@ impl WorkflowEngine {
         // carry. Put the daemon's own binary directory first so a check always
         // resolves the same `rk` the daemon is running, regardless of who
         // started the daemon.
-        if let Some(path) = check_child_path(
-            std::env::current_exe().ok(),
-            std::env::var_os("PATH"),
-        ) {
+        if let Some(path) = check_child_path(std::env::current_exe().ok(), std::env::var_os("PATH"))
+        {
             child_command.env("PATH", path);
         }
         if resolved.environment_policy == rk_workflow::CheckEnvironmentPolicy::StripRkSpawn {
@@ -3372,7 +3388,9 @@ impl WorkflowEngine {
     pub fn live_count_for_trigger(&self, trigger: &str) -> usize {
         self.lock()
             .values()
-            .filter(|i| i.status == InstanceStatus::Running && i.trigger.as_deref() == Some(trigger))
+            .filter(|i| {
+                i.status == InstanceStatus::Running && i.trigger.as_deref() == Some(trigger)
+            })
             .count()
     }
 
@@ -3517,9 +3535,9 @@ impl WorkflowEngine {
                     let rollback_errors: Vec<String> = originals
                         .iter()
                         .filter_map(|snapshot| {
-                            self.persist_to(&live_dir, snapshot).err().map(|error| {
-                                format!("restore {} failed: {error}", snapshot.id)
-                            })
+                            self.persist_to(&live_dir, snapshot)
+                                .err()
+                                .map(|error| format!("restore {} failed: {error}", snapshot.id))
                         })
                         .collect();
                     return Err(rk_core::Error::other(if rollback_errors.is_empty() {
@@ -3951,9 +3969,9 @@ where
     let dir_was_missing = !dir.exists();
     std::fs::create_dir_all(dir)?;
     if dir_was_missing {
-        let parent = dir.parent().ok_or_else(|| {
-            rk_core::Error::other("workflow snapshot directory has no parent")
-        })?;
+        let parent = dir
+            .parent()
+            .ok_or_else(|| rk_core::Error::other("workflow snapshot directory has no parent"))?;
         sync(parent)?;
     }
     let file_name = path
@@ -3961,10 +3979,7 @@ where
         .and_then(|name| name.to_str())
         .ok_or_else(|| rk_core::Error::other("workflow snapshot path has no file name"))?;
     let sequence = PERSIST_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(
-        "{file_name}.tmp-{}-{sequence}",
-        std::process::id()
-    ));
+    let tmp = dir.join(format!("{file_name}.tmp-{}-{sequence}", std::process::id()));
     let backup = dir.join(format!(
         "{file_name}.backup-{}-{sequence}",
         std::process::id()
@@ -3984,14 +3999,9 @@ where
         std::fs::rename(&tmp, path)?;
         if let Err(commit_error) = sync(dir) {
             let rollback = if had_previous {
-                restore_snapshot_from_backup_with(
-                    path,
-                    &backup,
-                    sync,
-                    &mut |from, to| {
-                        std::fs::rename(from, to).map_err(rk_core::Error::from)
-                    },
-                )
+                restore_snapshot_from_backup_with(path, &backup, sync, &mut |from, to| {
+                    std::fs::rename(from, to).map_err(rk_core::Error::from)
+                })
             } else {
                 std::fs::remove_file(path)
                     .map_err(rk_core::Error::from)
@@ -4549,7 +4559,9 @@ mod tests {
         let error = persist_bytes_atomically_with_sync(&path, b"replacement", &mut |_| {
             syncs += 1;
             if syncs >= 2 {
-                Err(rk_core::Error::other(format!("injected sync failure {syncs}")))
+                Err(rk_core::Error::other(format!(
+                    "injected sync failure {syncs}"
+                )))
             } else {
                 Ok(())
             }
@@ -4624,7 +4636,10 @@ mod tests {
 
         assert_eq!(instance.current_step, 1);
         assert_eq!(instance.context.active_subworkflow, None);
-        assert_eq!(instance.context.previous_result, Some(json!({"joined": true})));
+        assert_eq!(
+            instance.context.previous_result,
+            Some(json!({"joined": true}))
+        );
     }
 
     #[test]
@@ -4660,24 +4675,34 @@ mod tests {
 
         join_nested_subworkflow_result(&mut instance, json!({"joined": true}));
         assert_eq!(instance.current_step, 0);
-        assert_eq!(instance.context.active_subworkflow.as_deref(), Some("child"));
+        assert_eq!(
+            instance.context.active_subworkflow.as_deref(),
+            Some("child")
+        );
 
         complete_top_level_step(&mut instance, 0, true, None);
         assert_eq!(instance.current_step, 1);
         assert_eq!(instance.context.active_subworkflow, None);
-        assert_eq!(instance.context.previous_result, Some(json!({"joined": true})));
+        assert_eq!(
+            instance.context.previous_result,
+            Some(json!({"joined": true}))
+        );
     }
 
     #[test]
     fn terminal_persistence_failure_is_returned_to_the_joining_parent() {
         let error = require_persisted_transition(
-            Err(rk_core::Error::other("injected terminal persistence failure")),
+            Err(rk_core::Error::other(
+                "injected terminal persistence failure",
+            )),
             "child",
             "terminal state",
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("injected terminal persistence failure"));
+        assert!(error
+            .to_string()
+            .contains("injected terminal persistence failure"));
         assert!(error.to_string().contains("child"));
     }
 
@@ -4689,13 +4714,11 @@ mod tests {
         std::fs::write(&path, b"replacement").unwrap();
         std::fs::write(&backup, b"previous").unwrap();
 
-        let error = restore_snapshot_from_backup_with(
-            &path,
-            &backup,
-            &mut |_| Ok(()),
-            &mut |_, _| Err(rk_core::Error::other("injected restore failure")),
-        )
-        .unwrap_err();
+        let error =
+            restore_snapshot_from_backup_with(&path, &backup, &mut |_| Ok(()), &mut |_, _| {
+                Err(rk_core::Error::other("injected restore failure"))
+            })
+            .unwrap_err();
 
         assert!(error.to_string().contains("injected restore failure"));
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
@@ -4730,10 +4753,7 @@ mod tests {
             stale_timeout_secs: None,
         };
 
-        mark_recovery_failure_in_memory(
-            &mut instance,
-            "injected recovery persistence failure",
-        );
+        mark_recovery_failure_in_memory(&mut instance, "injected recovery persistence failure");
 
         assert_eq!(instance.status, InstanceStatus::Failed);
         assert!(instance
@@ -4888,7 +4908,10 @@ test a::flaky ... FAILED
 ";
         assert_eq!(extract_failing_tests(stdout), vec!["a::flaky"]);
         assert_eq!(extract_failing_tests(""), Vec::<String>::new());
-        assert_eq!(extract_failing_tests("no test lines here at all"), Vec::<String>::new());
+        assert_eq!(
+            extract_failing_tests("no test lines here at all"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -5535,7 +5558,11 @@ test a::flaky ... FAILED
         };
         // The workflow's own `spawn` step ran and its `wait` completed against
         // this generation.
-        engine.supervisor.lock_registry().insert(record.clone()).unwrap();
+        engine
+            .supervisor
+            .lock_registry()
+            .insert(record.clone())
+            .unwrap();
 
         let id = "inst-namesake-dismiss";
         let instance = Instance {
@@ -5677,7 +5704,10 @@ test a::flaky ... FAILED
         assert_eq!(resolve_stale_timeout_secs(&workflow).unwrap(), None);
 
         workflow.stale_timeout = Some("24h".into());
-        assert_eq!(resolve_stale_timeout_secs(&workflow).unwrap(), Some(24 * 3600));
+        assert_eq!(
+            resolve_stale_timeout_secs(&workflow).unwrap(),
+            Some(24 * 3600)
+        );
 
         workflow.stale_timeout = Some("not-a-duration".into());
         assert!(resolve_stale_timeout_secs(&workflow).is_err());
@@ -5793,7 +5823,10 @@ test a::flaky ... FAILED
         engine.store_if_absent(instance.clone()).unwrap();
 
         // The sweep wins the race first and marks the instance Failed.
-        let timed_out = engine.timeout_stale_instance(&instance, 12 * 3600).await.unwrap();
+        let timed_out = engine
+            .timeout_stale_instance(&instance, 12 * 3600)
+            .await
+            .unwrap();
         assert!(timed_out);
         assert_eq!(
             engine.status("wf-race").unwrap().status,

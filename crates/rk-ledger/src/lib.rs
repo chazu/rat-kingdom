@@ -169,7 +169,11 @@ impl FleetBudget {
         repo_spent_usd: f64,
         instance: Option<(f64, f64)>,
     ) -> DispatchCheck {
-        let warn_frac = if self.warn_at > 0.0 { self.warn_at } else { 0.8 };
+        let warn_frac = if self.warn_at > 0.0 {
+            self.warn_at
+        } else {
+            0.8
+        };
         let mut worst = DispatchCheck::ok();
         let mut entries = vec![
             (BudgetScope::Fleet, fleet_spent_usd, self.fleet_max_usd),

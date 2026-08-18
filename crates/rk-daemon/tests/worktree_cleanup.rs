@@ -186,7 +186,10 @@ async fn wait_workflow_terminal(client: &mut Client, id: &str) -> String {
             .call("workflow.status", json!({"name": id}))
             .await
             .unwrap();
-        let s = status["instance"]["status"].as_str().unwrap_or("").to_string();
+        let s = status["instance"]["status"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
         if s == "completed" || s == "failed" {
             return s;
         }
@@ -233,10 +236,7 @@ async fn finalize_dismisses_agents_the_workflow_never_dismissed() {
     for _ in 0..200 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let agents = list(&mut client, json!({})).await;
-        let Some(rec) = agents
-            .iter()
-            .find(|a| a["workflow_instance"] == instance)
-        else {
+        let Some(rec) = agents.iter().find(|a| a["workflow_instance"] == instance) else {
             continue;
         };
         worktree = rec["worktree"].as_str().map(PathBuf::from);
@@ -377,10 +377,7 @@ async fn reap_git_leaves_a_dirty_worktree_standing() {
         "a dirty worktree must never be force-removed"
     );
     assert!(
-        row["reason"]
-            .as_str()
-            .unwrap_or("")
-            .contains("uncommitted"),
+        row["reason"].as_str().unwrap_or("").contains("uncommitted"),
         "reason should say why: {}",
         row["reason"]
     );

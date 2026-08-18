@@ -62,9 +62,7 @@ async fn respawn_count(client: &mut Client, name: &str) -> usize {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|t| {
-            t["identity"] == "agent_respawned" && t["payload"]["agent"] == name
-        })
+        .filter(|t| t["identity"] == "agent_respawned" && t["payload"]["agent"] == name)
         .count()
 }
 
@@ -127,9 +125,10 @@ async fn crashed_agent_auto_respawns_up_to_cap_then_escalates() {
             .call("space.scan", json!({"category": "need"}))
             .await
             .unwrap();
-        escalated = needs["tuples"].as_array().unwrap().iter().any(|t| {
-            t["payload"]["type"] == "respawn_exhausted" && t["payload"]["agent"] == name
-        });
+        escalated =
+            needs["tuples"].as_array().unwrap().iter().any(|t| {
+                t["payload"]["type"] == "respawn_exhausted" && t["payload"]["agent"] == name
+            });
         if escalated {
             break;
         }
@@ -154,9 +153,7 @@ async fn crashed_agent_auto_respawns_up_to_cap_then_escalates() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|t| {
-            t["payload"]["type"] == "respawn_exhausted" && t["payload"]["agent"] == name
-        })
+        .filter(|t| t["payload"]["type"] == "respawn_exhausted" && t["payload"]["agent"] == name)
         .count();
     assert_eq!(exhausted_needs, 1, "cap should escalate exactly one need");
 

@@ -22,7 +22,9 @@ fn rk(layout: &Layout, args: &[&str]) -> std::process::Output {
 
 async fn rk_async(layout: &Layout, args: Vec<&'static str>) -> std::process::Output {
     let layout = layout.clone();
-    tokio::task::spawn_blocking(move || rk(&layout, &args)).await.unwrap()
+    tokio::task::spawn_blocking(move || rk(&layout, &args))
+        .await
+        .unwrap()
 }
 
 fn config() -> Config {
@@ -35,7 +37,11 @@ fn config() -> Config {
     config
 }
 
-async fn start() -> (tempfile::TempDir, Layout, tokio::task::JoinHandle<rk_core::Result<()>>) {
+async fn start() -> (
+    tempfile::TempDir,
+    Layout,
+    tokio::task::JoinHandle<rk_core::Result<()>>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let layout = Layout::at(dir.path());
     let daemon = Daemon::new(layout.clone(), &config()).unwrap();
@@ -93,7 +99,11 @@ fn ci_recovered_args(delivery_id: &'static str) -> Vec<&'static str> {
 async fn test_ingest_event_cli_builds_canonical_ci_failed_envelope() {
     let (_dir, layout, handle) = start().await;
     let output = rk_async(&layout, ci_args("cli-build-1")).await;
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["accepted"], true);
     assert_eq!(value["receipt"]["delivery_id"], "cli-build-1");
@@ -110,11 +120,24 @@ async fn test_ingest_event_cli_builds_successful_ci_recovered_envelope() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let state = rk_async(&layout, vec!["--json", "ingest", "state", "--source", "probe", "--repo", "repo"]).await;
-    assert!(state.status.success(), "{}", String::from_utf8_lossy(&state.stderr));
+    let state = rk_async(
+        &layout,
+        vec![
+            "--json", "ingest", "state", "--source", "probe", "--repo", "repo",
+        ],
+    )
+    .await;
+    assert!(
+        state.status.success(),
+        "{}",
+        String::from_utf8_lossy(&state.stderr)
+    );
     let value: Value = serde_json::from_slice(&state.stdout).unwrap();
     assert_eq!(value["facts"][0]["payload"]["current"]["status"], "success");
-    assert_eq!(value["facts"][0]["payload"]["current"]["conclusion"], "success");
+    assert_eq!(
+        value["facts"][0]["payload"]["current"]["conclusion"],
+        "success"
+    );
     stop(&layout, handle).await;
 }
 
@@ -122,10 +145,23 @@ async fn test_ingest_event_cli_builds_successful_ci_recovered_envelope() {
 fn test_ingest_event_cli_rejects_raw_telemetry_file_flag() {
     let dir = tempfile::tempdir().unwrap();
     let layout = Layout::at(dir.path());
-    let output = rk(&layout, &["ingest", "event", "--source", "probe", "--raw-telemetry-file", "vendor.json"]);
+    let output = rk(
+        &layout,
+        &[
+            "ingest",
+            "event",
+            "--source",
+            "probe",
+            "--raw-telemetry-file",
+            "vendor.json",
+        ],
+    );
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("raw-telemetry-file") || stderr.contains("unexpected"), "{stderr}");
+    assert!(
+        stderr.contains("raw-telemetry-file") || stderr.contains("unexpected"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -145,7 +181,17 @@ fn test_ingest_event_cli_file_accepts_canonical_envelope_only() {
     let layout = Layout::at(dir.path());
     let file = dir.path().join("vendor.json");
     std::fs::write(&file, r#"{"raw":"telemetry"}"#).unwrap();
-    let output = rk(&layout, &["ingest", "event", "--source", "probe", "--file", file.to_str().unwrap()]);
+    let output = rk(
+        &layout,
+        &[
+            "ingest",
+            "event",
+            "--source",
+            "probe",
+            "--file",
+            file.to_str().unwrap(),
+        ],
+    );
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("canonical SignalEnvelope"));
 }
@@ -154,9 +200,23 @@ fn test_ingest_event_cli_file_accepts_canonical_envelope_only() {
 async fn test_ingest_state_cli_calls_daemon_read_only_handler() {
     let (_dir, layout, handle) = start().await;
     let ingest = rk_async(&layout, ci_args("state-1")).await;
-    assert!(ingest.status.success(), "{}", String::from_utf8_lossy(&ingest.stderr));
-    let output = rk_async(&layout, vec!["--json", "ingest", "state", "--source", "probe", "--repo", "repo"]).await;
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        ingest.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ingest.stderr)
+    );
+    let output = rk_async(
+        &layout,
+        vec![
+            "--json", "ingest", "state", "--source", "probe", "--repo", "repo",
+        ],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["facts"].as_array().unwrap().len(), 1);
     assert!(value["facts"][0]["payload"].get("payload").is_none());
@@ -167,9 +227,16 @@ async fn test_ingest_state_cli_calls_daemon_read_only_handler() {
 async fn test_ingest_event_cli_prints_receipt_with_global_json() {
     let (_dir, layout, handle) = start().await;
     let output = rk_async(&layout, ci_args("json-receipt-1")).await;
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(value["receipt"].is_object());
-    assert!(value["receipt"]["semantic_state_digest"].as_str().unwrap().starts_with("sha256:"));
+    assert!(value["receipt"]["semantic_state_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
     stop(&layout, handle).await;
 }

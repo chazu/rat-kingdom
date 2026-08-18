@@ -115,7 +115,9 @@ async fn instance_cap_refuses_later_dispatch_once_hit() {
                 failed = true;
                 break;
             }
-            "completed" => panic!("workflow completed but the instance cap should have refused the second spawn"),
+            "completed" => panic!(
+                "workflow completed but the instance cap should have refused the second spawn"
+            ),
             _ => {}
         }
     }

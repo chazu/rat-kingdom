@@ -218,7 +218,10 @@ async fn dead_escalation_check_does_not_mask_the_gate_failure() {
         error.starts_with("gate failed first: verdict fail, exit 1"),
         "error must lead with the gate result: {error}"
     );
-    assert!(error.contains("stderr: boom"), "gate stderr present: {error}");
+    assert!(
+        error.contains("stderr: boom"),
+        "gate stderr present: {error}"
+    );
     assert!(
         error.contains("exited 3, expected 0") && error.contains("escalate-broke"),
         "escalation failure present: {error}"

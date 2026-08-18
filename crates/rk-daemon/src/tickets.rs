@@ -642,7 +642,10 @@ fn valid_transition(previous: &str, next: &str) -> bool {
         return true;
     }
     match previous {
-        "open" => matches!(next, "claimed" | "in_progress" | "blocked" | "done" | "closed"),
+        "open" => matches!(
+            next,
+            "claimed" | "in_progress" | "blocked" | "done" | "closed"
+        ),
         "claimed" => matches!(next, "in_progress" | "blocked" | "done" | "closed"),
         "in_progress" => matches!(next, "blocked" | "done" | "closed"),
         "blocked" => matches!(next, "open" | "in_progress" | "done" | "closed"),
@@ -794,10 +797,7 @@ mod tests {
     #[tokio::test]
     async fn external_snapshot_digest_excludes_current_factory_execution_only() {
         let tickets = tickets();
-        tickets
-            .create(new("external", "repo", None))
-            .await
-            .unwrap();
+        tickets.create(new("external", "repo", None)).await.unwrap();
         let baseline = tickets.snapshot_digest("repo").unwrap();
         let guard = tickets.mutation_guard().await;
         let mut owned = new("owned", "repo", None);
@@ -862,7 +862,10 @@ mod tests {
         };
         assert!(t.update(&a.identity, ordinary).await.is_err());
         t.reopen(&a.identity, "open").await.unwrap();
-        assert_eq!(t.get(&a.identity).unwrap().unwrap().payload["status"], "open");
+        assert_eq!(
+            t.get(&a.identity).unwrap().unwrap().payload["status"],
+            "open"
+        );
     }
 
     #[tokio::test]
@@ -876,7 +879,9 @@ mod tests {
 
         assert_eq!(t.list(Some("myrepo".into()), None, None).unwrap().len(), 2);
         assert_eq!(
-            t.list(None, None, Some(root.identity.clone())).unwrap().len(),
+            t.list(None, None, Some(root.identity.clone()))
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(t.list(None, Some("open".into()), None).unwrap().len(), 3);
@@ -904,13 +909,26 @@ mod tests {
         t.add_dep(&b.identity, &a.identity).await.unwrap(); // b depends on a
 
         // b is blocked, a is ready.
-        let ready: Vec<_> = t.ready(None).unwrap().into_iter().map(|x| x.identity).collect();
+        let ready: Vec<_> = t
+            .ready(None)
+            .unwrap()
+            .into_iter()
+            .map(|x| x.identity)
+            .collect();
         assert_eq!(ready, vec![a.identity.clone()]);
-        assert_eq!(t.blockers(&b.identity).unwrap().unwrap(), vec![a.identity.clone()]);
+        assert_eq!(
+            t.blockers(&b.identity).unwrap().unwrap(),
+            vec![a.identity.clone()]
+        );
 
         // Finish a → b becomes ready.
         set_status(&t, &a.identity, "done").await;
-        let ready: Vec<_> = t.ready(None).unwrap().into_iter().map(|x| x.identity).collect();
+        let ready: Vec<_> = t
+            .ready(None)
+            .unwrap()
+            .into_iter()
+            .map(|x| x.identity)
+            .collect();
         assert_eq!(ready, vec![b.identity.clone()]);
         assert!(t.blockers(&b.identity).unwrap().unwrap().is_empty());
     }
@@ -923,7 +941,7 @@ mod tests {
         let c = t.create(new("c", "r", None)).await.unwrap();
         t.add_dep(&b.identity, &a.identity).await.unwrap(); // b -> a
         t.add_dep(&c.identity, &b.identity).await.unwrap(); // c -> b
-        // a -> c would close a cycle a -> c -> b -> a.
+                                                            // a -> c would close a cycle a -> c -> b -> a.
         assert!(t.add_dep(&a.identity, &c.identity).await.is_err());
         // Self-dependency is rejected too.
         assert!(t.add_dep(&a.identity, &a.identity).await.is_err());
@@ -970,10 +988,7 @@ mod tests {
             }
             won
         }
-        let (a, b) = tokio::join!(
-            drain(t.clone(), ids.clone()),
-            drain(t.clone(), ids.clone())
-        );
+        let (a, b) = tokio::join!(drain(t.clone(), ids.clone()), drain(t.clone(), ids.clone()));
 
         // No ticket won by both drains.
         for id in &a {

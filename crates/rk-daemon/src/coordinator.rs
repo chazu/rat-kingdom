@@ -50,13 +50,20 @@ impl CoordinatorSessions {
         })
     }
 
-    pub fn register(&mut self, coordinator: &str, after: Option<u64>) -> rk_core::Result<CoordinatorSession> {
+    pub fn register(
+        &mut self,
+        coordinator: &str,
+        after: Option<u64>,
+    ) -> rk_core::Result<CoordinatorSession> {
         let now = chrono::Utc::now();
-        let entry = self.sessions.entry(coordinator.to_string()).or_insert_with(|| CoordinatorSession {
-            coordinator: coordinator.to_string(),
-            cursor: after.unwrap_or(0),
-            updated_at: now,
-        });
+        let entry = self
+            .sessions
+            .entry(coordinator.to_string())
+            .or_insert_with(|| CoordinatorSession {
+                coordinator: coordinator.to_string(),
+                cursor: after.unwrap_or(0),
+                updated_at: now,
+            });
         if let Some(after) = after {
             entry.cursor = entry.cursor.max(after);
         }
@@ -70,11 +77,14 @@ impl CoordinatorSessions {
         self.sessions.get(coordinator).map(|session| session.cursor)
     }
 
-    pub fn acknowledge(&mut self, coordinator: &str, cursor: u64) -> rk_core::Result<CoordinatorSession> {
-        let session = self
-            .sessions
-            .get_mut(coordinator)
-            .ok_or_else(|| rk_core::Error::other(format!("unknown coordinator session: {coordinator}")))?;
+    pub fn acknowledge(
+        &mut self,
+        coordinator: &str,
+        cursor: u64,
+    ) -> rk_core::Result<CoordinatorSession> {
+        let session = self.sessions.get_mut(coordinator).ok_or_else(|| {
+            rk_core::Error::other(format!("unknown coordinator session: {coordinator}"))
+        })?;
         session.cursor = session.cursor.max(cursor);
         session.updated_at = chrono::Utc::now();
         let snapshot = session.clone();
@@ -129,18 +139,17 @@ impl CoordinatorFilter {
         if self.repo.as_deref().is_some_and(|repo| tuple.scope != repo) {
             return false;
         }
-        if self
-            .coordinator
-            .as_deref()
-            .is_some_and(|coordinator| {
-                tuple.payload.get("coordinator").and_then(Value::as_str)
-                    != Some(coordinator)
-            })
-        {
+        if self.coordinator.as_deref().is_some_and(|coordinator| {
+            tuple.payload.get("coordinator").and_then(Value::as_str) != Some(coordinator)
+        }) {
             return false;
         }
         if !self.include.is_empty() {
-            let route = tuple.payload.get("route").and_then(Value::as_str).unwrap_or("rollup");
+            let route = tuple
+                .payload
+                .get("route")
+                .and_then(Value::as_str)
+                .unwrap_or("rollup");
             let class = if matches!(route, "escalate" | "terminal") {
                 "attention"
             } else {
@@ -163,10 +172,7 @@ impl CoordinatorFilter {
         self.repo
             .as_deref()
             .is_none_or(|repo| repo_matches(repo, &instance.repo))
-            && self
-                .instance
-                .as_deref()
-                .is_none_or(|id| instance.id == id)
+            && self.instance.as_deref().is_none_or(|id| instance.id == id)
             && self
                 .coordinator
                 .as_deref()
@@ -174,13 +180,12 @@ impl CoordinatorFilter {
     }
 
     pub fn matches_agent(&self, agent: &AgentRecord) -> bool {
-        self.repo
+        self.repo.as_deref().is_none_or(|repo| {
+            repo == agent.repo_name || repo_matches(repo, &agent.repo_root.to_string_lossy())
+        }) && self
+            .instance
             .as_deref()
-            .is_none_or(|repo| repo == agent.repo_name || repo_matches(repo, &agent.repo_root.to_string_lossy()))
-            && self
-                .instance
-                .as_deref()
-                .is_none_or(|id| agent.workflow_instance.as_deref() == Some(id))
+            .is_none_or(|id| agent.workflow_instance.as_deref() == Some(id))
             && self
                 .coordinator
                 .as_deref()
@@ -329,7 +334,10 @@ pub fn hierarchical_snapshot(
         .iter()
         .filter(|instance| filter.matches_workflow(instance))
         .collect();
-    let workflow_ids: HashSet<&str> = workflows.iter().map(|instance| instance.id.as_str()).collect();
+    let workflow_ids: HashSet<&str> = workflows
+        .iter()
+        .map(|instance| instance.id.as_str())
+        .collect();
     let selected: Vec<&AgentRecord> = agents
         .iter()
         .filter(|agent| filter.matches_agent(agent))
@@ -373,19 +381,32 @@ pub fn hierarchical_snapshot(
     let mut attention: Vec<CoordinationAttention> = events
         .iter()
         .filter(|event| filter.matches_event(&event.event))
-        .filter(|event| event.event.payload.get("route").and_then(Value::as_str) == Some("escalate")
-            || event.event.payload.get("route").and_then(Value::as_str) == Some("terminal"))
+        .filter(|event| {
+            event.event.payload.get("route").and_then(Value::as_str) == Some("escalate")
+                || event.event.payload.get("route").and_then(Value::as_str) == Some("terminal")
+        })
         .map(|event| CoordinationAttention {
             cursor: event.cursor,
             kind: event.event.identity.clone(),
-            severity: event.event.payload.get("severity").and_then(Value::as_str).unwrap_or("warning").to_string(),
+            severity: event
+                .event
+                .payload
+                .get("severity")
+                .and_then(Value::as_str)
+                .unwrap_or("warning")
+                .to_string(),
             workflow_instance: event_instance(&event.event).map(str::to_string),
             agent: event_agent(&event.event).map(str::to_string),
-            summary: event.event.payload.get("summary")
+            summary: event
+                .event
+                .payload
+                .get("summary")
                 .or_else(|| event.event.payload.get("reason"))
                 .and_then(Value::as_str)
                 .unwrap_or("coordination event")
-                .chars().take(512).collect(),
+                .chars()
+                .take(512)
+                .collect(),
         })
         .collect();
     for middle in &middle_rats {
@@ -431,7 +452,10 @@ fn is_descendant(all: &[AgentRecord], agent: &AgentRecord, root: &str) -> bool {
         if !seen.insert(name) {
             return false;
         }
-        parent = all.iter().find(|candidate| candidate.name == name).and_then(|candidate| candidate.parent.as_deref());
+        parent = all
+            .iter()
+            .find(|candidate| candidate.name == name)
+            .and_then(|candidate| candidate.parent.as_deref());
     }
     false
 }
@@ -459,18 +483,40 @@ fn middle_rat_summary(
             AgentState::Orphaned => rollup.orphaned += 1,
             AgentState::Dismissed => rollup.dismissed += 1,
         }
-        if descendant.progress.as_ref().is_some_and(|progress| progress.status == "blocked") {
+        if descendant
+            .progress
+            .as_ref()
+            .is_some_and(|progress| progress.status == "blocked")
+        {
             rollup.blocked += 1;
         }
         if descendant.state.is_live() {
             let age = (now - descendant.created_at).num_seconds().max(0);
-            rollup.oldest_active_age_secs = Some(rollup.oldest_active_age_secs.map_or(age, |current| current.max(age)));
+            rollup.oldest_active_age_secs = Some(
+                rollup
+                    .oldest_active_age_secs
+                    .map_or(age, |current| current.max(age)),
+            );
         }
     }
     rollup.escalated = events
         .iter()
-        .filter(|event| event.event.payload.get("route").and_then(Value::as_str) == Some("escalate"))
-        .filter(|event| event.event.payload.get("agent").and_then(Value::as_str).is_some_and(|name| name == agent.name || all.iter().any(|candidate| candidate.name == name && is_descendant(all, candidate, &agent.name))))
+        .filter(|event| {
+            event.event.payload.get("route").and_then(Value::as_str) == Some("escalate")
+        })
+        .filter(|event| {
+            event
+                .event
+                .payload
+                .get("agent")
+                .and_then(Value::as_str)
+                .is_some_and(|name| {
+                    name == agent.name
+                        || all.iter().any(|candidate| {
+                            candidate.name == name && is_descendant(all, candidate, &agent.name)
+                        })
+                })
+        })
         .count();
     let last_meaningful_update = agent
         .progress
@@ -492,8 +538,14 @@ fn middle_rat_summary(
         task: agent.task.clone(),
         cost_usd: agent.cost_usd,
         rollup,
-        summary: agent.progress.as_ref().map(|progress| progress.summary.clone()),
-        next: agent.progress.as_ref().and_then(|progress| progress.next.clone()),
+        summary: agent
+            .progress
+            .as_ref()
+            .map(|progress| progress.summary.clone()),
+        next: agent
+            .progress
+            .as_ref()
+            .and_then(|progress| progress.next.clone()),
         last_meaningful_update,
         stale,
     }
@@ -534,13 +586,16 @@ fn agent_summary(agent: &AgentRecord) -> AgentSummary {
         cost_usd: agent.cost_usd,
         created_at: agent.created_at,
         updated_at: agent.updated_at,
-        progress: agent.progress.as_ref().map(|progress| AgentProgressSummary {
-            summary: progress.summary.clone(),
-            next: progress.next.clone(),
-            status: progress.status.clone(),
-            revision: progress.revision,
-            updated_at: progress.updated_at,
-        }),
+        progress: agent
+            .progress
+            .as_ref()
+            .map(|progress| AgentProgressSummary {
+                summary: progress.summary.clone(),
+                next: progress.next.clone(),
+                status: progress.status.clone(),
+                revision: progress.revision,
+                updated_at: progress.updated_at,
+            }),
     }
 }
 
@@ -600,8 +655,8 @@ pub fn replay(scanned: Vec<CoordinatorEvent>, filter: &CoordinatorFilter) -> Rep
 mod tests {
     use super::*;
     use crate::agents::AgentProgress;
-    use rk_harness::TokenUsage;
     use rk_core::tuple::{Category, Tuple};
+    use rk_harness::TokenUsage;
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -634,17 +689,15 @@ mod tests {
     fn replay_uses_a_sentinel_boundary_when_history_is_truncated() {
         let filter = CoordinatorFilter::default();
         let tuples: Vec<_> = (0..=MAX_REPLAY_EVENTS)
-            .map(|i| {
-                CoordinatorEvent {
-                    cursor: i as u64 + 1,
-                    event: Tuple::new(
-                        Category::Event,
-                        "repo",
-                        "workflow_state_changed",
-                        "castle",
-                        json!({"instance": format!("wf-{i}")}),
-                    ),
-                }
+            .map(|i| CoordinatorEvent {
+                cursor: i as u64 + 1,
+                event: Tuple::new(
+                    Category::Event,
+                    "repo",
+                    "workflow_state_changed",
+                    "castle",
+                    json!({"instance": format!("wf-{i}")}),
+                ),
             })
             .collect();
         let sentinel = tuples[MAX_REPLAY_EVENTS].cursor;
@@ -735,8 +788,20 @@ mod tests {
         };
         let agents = vec![
             agent("Foreman-1", "foreman", None, AgentState::Running, None),
-            agent("Leaf-1", "rat", Some("Foreman-1"), AgentState::Running, Some(blocked)),
-            agent("Leaf-2", "rat", Some("Foreman-1"), AgentState::Completed, None),
+            agent(
+                "Leaf-1",
+                "rat",
+                Some("Foreman-1"),
+                AgentState::Running,
+                Some(blocked),
+            ),
+            agent(
+                "Leaf-2",
+                "rat",
+                Some("Foreman-1"),
+                AgentState::Completed,
+                None,
+            ),
             agent("Unrelated", "rat", None, AgentState::Running, None),
         ];
         let filter = CoordinatorFilter {
@@ -752,7 +817,10 @@ mod tests {
         assert_eq!(rollup.running, 1);
         assert_eq!(rollup.completed, 1);
         assert_eq!(rollup.blocked, 1);
-        assert!(snapshot.agents.iter().all(|agent| agent.name == "Foreman-1"));
+        assert!(snapshot
+            .agents
+            .iter()
+            .all(|agent| agent.name == "Foreman-1"));
     }
 
     #[test]

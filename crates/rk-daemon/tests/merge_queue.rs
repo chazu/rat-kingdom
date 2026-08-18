@@ -118,7 +118,9 @@ async fn concurrent_dismisses_all_merge_into_main() {
         let layout = layout.clone();
         handles.push(tokio::spawn(async move {
             let mut c = Client::connect_as_operator(&layout).await.unwrap();
-            c.call("agent.dismiss", json!({"name": name})).await.unwrap()
+            c.call("agent.dismiss", json!({"name": name}))
+                .await
+                .unwrap()
         }));
     }
 

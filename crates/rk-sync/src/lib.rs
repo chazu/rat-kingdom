@@ -560,7 +560,8 @@ mod tests {
 
         let t = tuple(Category::Need, "help", "castle-a");
         let tid = t.id;
-        sync.append(&[sync.record(SyncOp::Out { tuple: t })]).unwrap();
+        sync.append(&[sync.record(SyncOp::Out { tuple: t })])
+            .unwrap();
         assert_eq!(sync.materialize_tuples().unwrap().len(), 1);
 
         sync.append(&[sync.record(SyncOp::Take { tuple_id: tid })])
@@ -578,10 +579,14 @@ mod tests {
         let need = tuple(Category::Need, "help", "castle-a");
         let need_id = need.id;
         let kept = tuple(Category::Fact, "still-here", "castle-a");
-        sync.append(&[sync.record(SyncOp::Out { tuple: need.clone() })])
-            .unwrap();
-        sync.append(&[sync.record(SyncOp::Out { tuple: kept.clone() })])
-            .unwrap();
+        sync.append(&[sync.record(SyncOp::Out {
+            tuple: need.clone(),
+        })])
+        .unwrap();
+        sync.append(&[sync.record(SyncOp::Out {
+            tuple: kept.clone(),
+        })])
+        .unwrap();
         sync.append(&[sync.record(SyncOp::Take { tuple_id: need_id })])
             .unwrap();
 

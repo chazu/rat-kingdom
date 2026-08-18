@@ -189,7 +189,6 @@ async fn fleet_cap_refuses_dispatch_once_hit() {
     assert!(rollup["fleet"]["spent_usd"].as_f64().unwrap() >= 0.30);
     assert_eq!(rollup["fleet"]["cap_usd"].as_f64().unwrap(), 0.30);
     assert_eq!(rollup["fleet"]["status"].as_str().unwrap(), "exceeded");
-
 }
 
 /// TKT-39: dismissing a LIVE over-budget agent drops its spend off the fleet
@@ -259,7 +258,6 @@ async fn dismissed_agent_drops_off_fleet_tally() {
         allowed.is_ok(),
         "after dismissal the cap is clear — 3rd spawn should be allowed, got {allowed:?}"
     );
-
 }
 
 /// TKT-40: a COMPLETED agent's spend must also drop off the fleet tally. The
@@ -328,5 +326,4 @@ async fn completed_agent_drops_off_fleet_tally() {
         allowed.is_ok(),
         "a completed agent's spend must not block a later spawn, got {allowed:?}"
     );
-
 }

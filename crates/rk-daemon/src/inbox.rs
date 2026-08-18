@@ -241,8 +241,14 @@ pub fn build(
         let detail = match obstacle_type {
             Some(ty) if ty.starts_with("budget_") => format!(
                 "{ty}: ${:.2}, {} tokens",
-                t.payload.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                t.payload.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                t.payload
+                    .get("cost_usd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                t.payload
+                    .get("tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
             ),
             _ => t
                 .payload
@@ -742,8 +748,8 @@ pub fn dropped_lands(lands: &[Tuple]) -> Vec<&Tuple> {
         .collect();
     // Deterministic order: newest first (event ids are time-sortable).
     dropped.sort_by_key(|b| std::cmp::Reverse(b.id));
-        dropped
-    }
+    dropped
+}
 
 /// One row per unacked `recovery_action` escalation (strategic review B2):
 /// the durable record `recovery::RecoveryAnnouncer::announce` writes for an
@@ -1315,7 +1321,10 @@ mod tests {
             },
             &Ballots::default(),
         );
-        assert!(inbox.is_empty(), "newest successful state must win: {inbox:?}");
+        assert!(
+            inbox.is_empty(),
+            "newest successful state must win: {inbox:?}"
+        );
     }
 
     #[test]
@@ -1526,7 +1535,12 @@ mod tests {
     #[test]
     fn a_withdrawn_ballot_stops_nagging() {
         let suggestions = vec![
-            suggestion("sug-pulled", "rat-1", "the author thought better of it", None),
+            suggestion(
+                "sug-pulled",
+                "rat-1",
+                "the author thought better of it",
+                None,
+            ),
             suggestion("sug-live", "rat-2", "still worth backing", None),
         ];
         let withdrawals = vec![withdrawal("sug-pulled", "rat-1")];
@@ -1554,7 +1568,12 @@ mod tests {
     /// the tally underneath it looks.
     #[test]
     fn a_withdrawn_ballot_stays_closed_even_at_quorum() {
-        let suggestions = vec![suggestion("sug-pulled", "rat-1", "popular but pulled", None)];
+        let suggestions = vec![suggestion(
+            "sug-pulled",
+            "rat-1",
+            "popular but pulled",
+            None,
+        )];
         let endorsements = vec![
             endorsement("sug-pulled", "rat-7"),
             endorsement("sug-pulled", "rat-8"),

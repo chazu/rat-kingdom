@@ -140,7 +140,8 @@ impl Repo {
         // 1 when it is not, and non-0/1 on a bad revision — `git()` maps every
         // non-zero exit to Err, collapsing "not an ancestor" and "bad rev" into
         // the same false. That is the safe direction: unknown ⇒ not merged.
-        self.git(&["merge-base", "--is-ancestor", commit, of]).is_ok()
+        self.git(&["merge-base", "--is-ancestor", commit, of])
+            .is_ok()
     }
 
     /// Whether an awaiting-review branch has been dealt with on the forge:
@@ -186,9 +187,11 @@ impl Repo {
     /// ref/diff reads take milliseconds; the generous bound only fires under
     /// pathology, and every caller already fails closed on `Err`.
     pub fn rev_parse(&self, rev: &str) -> rk_core::Result<String> {
-        Ok(git_bounded(&self.root, &["rev-parse", rev], LOCAL_READ_TIMEOUT)?
-            .trim()
-            .to_string())
+        Ok(
+            git_bounded(&self.root, &["rev-parse", rev], LOCAL_READ_TIMEOUT)?
+                .trim()
+                .to_string(),
+        )
     }
 
     /// File list and total changed-line count for the `base...head` symmetric
@@ -197,14 +200,22 @@ impl Repo {
     /// `--numstat`; those count as 0 lines, matching that check's `awk` script.
     pub fn diff_stat(&self, base: &str, head: &str) -> rk_core::Result<DiffStat> {
         let range = format!("{base}...{head}");
-        let names = git_bounded(&self.root, &["diff", "--name-only", &range], LOCAL_READ_TIMEOUT)?;
+        let names = git_bounded(
+            &self.root,
+            &["diff", "--name-only", &range],
+            LOCAL_READ_TIMEOUT,
+        )?;
         let files: Vec<String> = names
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
             .map(str::to_string)
             .collect();
-        let numstat = git_bounded(&self.root, &["diff", "--numstat", &range], LOCAL_READ_TIMEOUT)?;
+        let numstat = git_bounded(
+            &self.root,
+            &["diff", "--numstat", &range],
+            LOCAL_READ_TIMEOUT,
+        )?;
         let mut lines: u64 = 0;
         for row in numstat.lines() {
             let mut cols = row.split_whitespace();
@@ -376,7 +387,13 @@ impl Repo {
             return Ok(());
         }
         self.reap_stale_worktree(path);
-        self.git(&["worktree", "add", "--detach", &path.to_string_lossy(), "HEAD"])?;
+        self.git(&[
+            "worktree",
+            "add",
+            "--detach",
+            &path.to_string_lossy(),
+            "HEAD",
+        ])?;
         debug!(?path, "created gate worktree");
         Ok(())
     }
@@ -547,10 +564,7 @@ impl Repo {
         remote_branch: &str,
         remote: &str,
     ) -> rk_core::Result<String> {
-        if branch.trim().is_empty()
-            || remote_branch.trim().is_empty()
-            || remote.trim().is_empty()
-        {
+        if branch.trim().is_empty() || remote_branch.trim().is_empty() || remote.trim().is_empty() {
             return Err(rk_core::Error::other(
                 "push_branch_as requires local branch, remote branch, and remote",
             ));
@@ -603,7 +617,9 @@ impl Repo {
             return PrOutcome {
                 opened: false,
                 url: None,
-                detail: "open_pull_request_as requires local branch, remote branch, target, and remote".into(),
+                detail:
+                    "open_pull_request_as requires local branch, remote branch, target, and remote"
+                        .into(),
             };
         }
         if let Err(e) = self
@@ -638,7 +654,9 @@ impl Repo {
                 let url = extract_pr_url(&out);
                 let detail = match host {
                     Host::GitLab => "merge request created via push option".into(),
-                    Host::GitHub => "branch pushed; open the pull request via the compare URL".into(),
+                    Host::GitHub => {
+                        "branch pushed; open the pull request via the compare URL".into()
+                    }
                     Host::Unknown => {
                         "branch pushed to an unrecognized host; open the PR manually".into()
                     }
@@ -652,9 +670,7 @@ impl Repo {
             Err(e) => PrOutcome {
                 opened: false,
                 url: None,
-                detail: format!(
-                    "push failed for {branch} -> {remote}/{remote_branch}: {e}"
-                ),
+                detail: format!("push failed for {branch} -> {remote}/{remote_branch}: {e}"),
             },
         }
     }
@@ -1128,7 +1144,9 @@ mod tests {
         let list_after = repo.git(&["worktree", "list", "--porcelain"]).unwrap();
         assert_eq!(list_before, list_after);
         assert_eq!(
-            list_after.matches(&gate.to_string_lossy().to_string()).count(),
+            list_after
+                .matches(&gate.to_string_lossy().to_string())
+                .count(),
             1,
             "worktree must be registered exactly once"
         );
@@ -1160,7 +1178,10 @@ mod tests {
             }
         });
 
-        assert!(gate.join("README.md").exists(), "checkout must survive the race");
+        assert!(
+            gate.join("README.md").exists(),
+            "checkout must survive the race"
+        );
         let list = repo.git(&["worktree", "list", "--porcelain"]).unwrap();
         assert_eq!(
             list.matches(&gate.to_string_lossy().to_string()).count(),
@@ -1336,7 +1357,10 @@ mod tests {
         std::fs::write(dir.path().join("README.md"), "human work\n").unwrap();
         let before = git_in(dir.path(), &["rev-parse", "refs/heads/main"]).unwrap();
         let result = repo.merge_branch(&branch, "main");
-        assert!(result.is_err(), "dirty target checkout must block ref advance");
+        assert!(
+            result.is_err(),
+            "dirty target checkout must block ref advance"
+        );
         let after = git_in(dir.path(), &["rev-parse", "refs/heads/main"]).unwrap();
         assert_eq!(after, before, "main ref must remain unchanged");
         assert_eq!(
@@ -1550,7 +1574,8 @@ mod tests {
         // Human deletes the branch on the forge (PR mode keeps it otherwise),
         // reflected locally as a gone ref — treated as cleared even without an
         // ancestry check, since there is no ref left to compare.
-        repo.remove_worktree(&dir.path().join("wt-nibbles")).unwrap();
+        repo.remove_worktree(&dir.path().join("wt-nibbles"))
+            .unwrap();
         repo.delete_branch(&branch).unwrap();
         assert!(!repo.branch_exists(&branch));
         assert!(repo.branch_merged_or_gone(&branch, "main"));
@@ -1585,11 +1610,7 @@ mod tests {
         let clone = dir.path().join("forge-clone");
         run(
             dir.path(),
-            &[
-                "clone",
-                &bare.to_string_lossy(),
-                &clone.to_string_lossy(),
-            ],
+            &["clone", &bare.to_string_lossy(), &clone.to_string_lossy()],
         );
         run(&clone, &["config", "user.email", "forge@example.com"]);
         run(&clone, &["config", "user.name", "Forge"]);
@@ -1683,6 +1704,9 @@ mod tests {
 
         let stat = repo.diff_stat("main", &branch).unwrap();
         assert_eq!(stat.files, vec!["blob.bin".to_string()]);
-        assert_eq!(stat.lines, 0, "binary files report '-'/'-', not a line count");
+        assert_eq!(
+            stat.lines, 0,
+            "binary files report '-'/'-', not a line count"
+        );
     }
 }

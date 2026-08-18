@@ -176,7 +176,10 @@ async fn gated_merge_approval_merges_the_branch() {
 
     // The approved work reached main, and its branch was consumed by the merge.
     let listing = git_out(repo_dir.path(), &["ls-tree", "--name-only", "main"]);
-    assert!(listing.contains("work-"), "approved work in main: {listing}");
+    assert!(
+        listing.contains("work-"),
+        "approved work in main: {listing}"
+    );
     let branches = git_out(repo_dir.path(), &["branch", "--list", "rat/*"]);
     assert!(
         branches.trim().is_empty(),

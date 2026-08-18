@@ -258,18 +258,9 @@ mod tests {
             Some("danger-full-access"),
         )
         .unwrap();
-        assert_eq!(
-            jcode,
-            ["jcode", "--no-update", "--model", "gpt-5.5"]
-        );
+        assert_eq!(jcode, ["jcode", "--no-update", "--model", "gpt-5.5"]);
 
-        let claude = interactive_argv(
-            "claude",
-            None,
-            None,
-            Some("bypassPermissions"),
-        )
-        .unwrap();
+        let claude = interactive_argv("claude", None, None, Some("bypassPermissions")).unwrap();
         assert!(claude.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(!claude.contains(&"--permission-mode".to_string()));
 

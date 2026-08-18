@@ -1000,7 +1000,10 @@ mod tests {
             let scope_at = text
                 .find("This STOP is\n   scoped to the two entry calls above")
                 .expect("LAND-proving STOP should state its own scope");
-            assert!(scope_at > land_at, "{role}: scope note should follow the STOP it qualifies");
+            assert!(
+                scope_at > land_at,
+                "{role}: scope note should follow the STOP it qualifies"
+            );
         }
     }
 

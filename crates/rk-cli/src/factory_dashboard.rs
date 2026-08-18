@@ -3,16 +3,14 @@
 //! This is a read-only ratatui projection over the same typed daemon snapshot,
 //! inbox, and replay RPCs used by the JSON and plain-text modes.
 
-use crate::factory_cmds::{
-    FactoryDashboardArgs, fetch_dashboard, resolve_dashboard_repo,
-};
+use crate::factory_cmds::{fetch_dashboard, resolve_dashboard_repo, FactoryDashboardArgs};
 use anyhow::Result;
-use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout as TuiLayout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs};
+use ratatui::Frame;
 use rk_core::paths::Layout;
 use rk_daemon::Client;
 use serde_json::Value;
@@ -119,9 +117,7 @@ impl App {
         self.events = events;
         self.refreshed_at = Instant::now();
         self.refresh_error = None;
-        self.offset = self
-            .offset
-            .min(self.selected_row_count().saturating_sub(1));
+        self.offset = self.offset.min(self.selected_row_count().saturating_sub(1));
     }
 }
 
@@ -230,7 +226,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
     let state = if let Some(error) = &app.refresh_error {
-        Span::styled(format!("REFRESH ERROR: {error}"), Style::default().fg(Color::Red))
+        Span::styled(
+            format!("REFRESH ERROR: {error}"),
+            Style::default().fg(Color::Red),
+        )
     } else if resync {
         Span::styled("RESYNCING", Style::default().fg(Color::Yellow))
     } else {
@@ -250,8 +249,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         array(&snapshot["approvals"], "proposals").len(),
     ));
     frame.render_widget(
-        Paragraph::new(vec![line, counts])
-            .block(Block::default().borders(Borders::BOTTOM)),
+        Paragraph::new(vec![line, counts]).block(Block::default().borders(Borders::BOTTOM)),
         area,
     );
 }
@@ -276,8 +274,8 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_overview(frame: &mut Frame, area: Rect, app: &App) {
     let snapshot = &app.snapshot["snapshot"];
-    let [metrics, panels] = TuiLayout::vertical([Constraint::Length(4), Constraint::Min(4)])
-        .areas(area);
+    let [metrics, panels] =
+        TuiLayout::vertical([Constraint::Length(4), Constraint::Min(4)]).areas(area);
     let [inbox, activity] =
         TuiLayout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
             .areas(panels);
@@ -300,9 +298,17 @@ fn draw_overview(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw("     "),
         metric("OPEN TICKETS", open_tickets.to_string(), Color::Yellow),
         Span::raw("     "),
-        metric("HUMAN ACTIONS", array(snapshot, "inbox").len().to_string(), Color::Magenta),
+        metric(
+            "HUMAN ACTIONS",
+            array(snapshot, "inbox").len().to_string(),
+            Color::Magenta,
+        ),
         Span::raw("     "),
-        metric("SPEND", format!("${spent:.2} / ${remaining:.2} left"), Color::Cyan),
+        metric(
+            "SPEND",
+            format!("${spent:.2} / ${remaining:.2} left"),
+            Color::Cyan,
+        ),
     ]);
     frame.render_widget(
         Paragraph::new(metrics_line).block(
@@ -397,7 +403,14 @@ fn draw_workflows(frame: &mut Frame, area: Rect, app: &App) {
         TableSpec {
             title: "workflow runs",
             headings: &["ID", "WORKFLOW", "STATUS", "STEP", "AWAITING", "STARTED"],
-            paths: &["id", "workflow", "status", "current_step", "awaiting", "started_at"],
+            paths: &[
+                "id",
+                "workflow",
+                "status",
+                "current_step",
+                "awaiting",
+                "started_at",
+            ],
             widths: [
                 Constraint::Length(18),
                 Constraint::Length(20),
@@ -419,7 +432,12 @@ fn draw_tickets(frame: &mut Frame, area: Rect, app: &App) {
         TableSpec {
             title: "tickets",
             headings: &["ID", "STATUS", "TITLE", "UPDATED"],
-            paths: &["identity", "payload.status", "payload.title", "payload.updated_at"],
+            paths: &[
+                "identity",
+                "payload.status",
+                "payload.title",
+                "payload.updated_at",
+            ],
             widths: [
                 Constraint::Length(30),
                 Constraint::Length(10),
@@ -595,8 +613,8 @@ fn key(value: &'static str) -> Span<'static> {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, Tab, draw};
-    use ratatui::{Terminal, backend::TestBackend};
+    use super::{draw, App, Tab};
+    use ratatui::{backend::TestBackend, Terminal};
     use serde_json::json;
 
     #[test]

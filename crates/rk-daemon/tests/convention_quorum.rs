@@ -215,7 +215,10 @@ async fn a_ballot_written_without_a_window_is_durable() {
 
     let sug_id = "sug-durable";
     client
-        .call("space.out", suggest(sug_id, "Whisker", "ballots are ledgers"))
+        .call(
+            "space.out",
+            suggest(sug_id, "Whisker", "ballots are ledgers"),
+        )
         .await
         .unwrap();
     client
@@ -225,7 +228,10 @@ async fn a_ballot_written_without_a_window_is_durable() {
 
     for category in ["suggestion", "endorsement"] {
         let scan = client
-            .call("space.scan", json!({"category": category, "scope": "system"}))
+            .call(
+                "space.scan",
+                json!({"category": category, "scope": "system"}),
+            )
             .await
             .unwrap();
         let t = scan["tuples"]

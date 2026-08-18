@@ -566,7 +566,11 @@ impl VerificationReport {
                     entry.acceptance_criterion_id
                 ));
             }
-            if entry.gap.as_deref().is_some_and(|gap| gap.trim().is_empty()) {
+            if entry
+                .gap
+                .as_deref()
+                .is_some_and(|gap| gap.trim().is_empty())
+            {
                 errors.push(format!(
                     "{} gap must not be empty",
                     entry.acceptance_criterion_id

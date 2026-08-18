@@ -20,9 +20,7 @@ fn run(home: &std::path::Path, args: &[&str]) -> std::process::Output {
 #[test]
 fn install_skill_onboards_jcode_globally_and_is_idempotent() {
     let home = tempfile::tempdir().unwrap();
-    let destination = home
-        .path()
-        .join(".jcode/skills/factory-foreman");
+    let destination = home.path().join(".jcode/skills/factory-foreman");
 
     let first = run(home.path(), &["--json", "factory", "install-skill"]);
     assert!(

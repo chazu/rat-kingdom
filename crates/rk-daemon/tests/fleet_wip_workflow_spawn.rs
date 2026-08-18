@@ -162,7 +162,10 @@ async fn two_concurrent_workflow_spawns_share_the_fleet_wip_cap_and_both_complet
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 
-    assert!(both_done, "both concurrent workflow instances should complete");
+    assert!(
+        both_done,
+        "both concurrent workflow instances should complete"
+    );
     // The cap is an UPPER bound, sampled — see continuous_drain.rs for why
     // this is not also asserted as a lower bound.
     assert!(

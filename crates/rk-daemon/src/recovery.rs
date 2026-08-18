@@ -152,8 +152,7 @@ impl SpaceDedup<'_> {
 
 impl SinkDedup for SpaceDedup<'_> {
     fn already_delivered(&self, notice: &EscalationNotice, sink: &str) -> bool {
-        let mut pattern =
-            Pattern::category(Category::Event).identity(DELIVERY_MARKER_IDENTITY);
+        let mut pattern = Pattern::category(Category::Event).identity(DELIVERY_MARKER_IDENTITY);
         pattern.payload_search = Some(format!("\"key\":\"{}\"", Self::key(notice, sink)));
         self.space
             .has_persistence_event_matching(&pattern)
@@ -391,7 +390,10 @@ mod tests {
     fn registry() -> (SinkRegistry, std::sync::Arc<StdMutex<Vec<String>>>) {
         let seen = std::sync::Arc::new(StdMutex::new(Vec::new()));
         let mut registry = SinkRegistry::new();
-        registry.register(SinkConfig::of_kind("recorder"), Box::new(Recorder(seen.clone())));
+        registry.register(
+            SinkConfig::of_kind("recorder"),
+            Box::new(Recorder(seen.clone())),
+        );
         (registry, seen)
     }
 
@@ -449,7 +451,10 @@ mod tests {
         assert_eq!(written[0].id.to_string(), outcome.event_id());
         assert_eq!(written[0].payload["action_kind"], "respawn");
         assert_eq!(written[0].payload["held"], false);
-        assert_eq!(*recorder.lock().unwrap(), vec![outcome.event_id().to_string()]);
+        assert_eq!(
+            *recorder.lock().unwrap(),
+            vec![outcome.event_id().to_string()]
+        );
     }
 
     #[test]
@@ -612,38 +617,68 @@ mod tests {
         };
 
         // Before 4h: nothing due.
-        let pushed = renotify_sweep(&space, &sinks, &schedule, created + chrono::Duration::hours(1))
-            .unwrap();
+        let pushed = renotify_sweep(
+            &space,
+            &sinks,
+            &schedule,
+            created + chrono::Duration::hours(1),
+        )
+        .unwrap();
         assert_eq!(pushed, 0);
         assert!(recorder.lock().unwrap().is_empty());
 
         // At 4h: first re-notify.
-        let pushed = renotify_sweep(&space, &sinks, &schedule, created + chrono::Duration::hours(4))
-            .unwrap();
+        let pushed = renotify_sweep(
+            &space,
+            &sinks,
+            &schedule,
+            created + chrono::Duration::hours(4),
+        )
+        .unwrap();
         assert_eq!(pushed, 1);
         assert_eq!(recorder.lock().unwrap().len(), 1);
 
         // Re-running the sweep at the same instant does not double-push.
-        let pushed = renotify_sweep(&space, &sinks, &schedule, created + chrono::Duration::hours(4))
-            .unwrap();
+        let pushed = renotify_sweep(
+            &space,
+            &sinks,
+            &schedule,
+            created + chrono::Duration::hours(4),
+        )
+        .unwrap();
         assert_eq!(pushed, 0);
         assert_eq!(recorder.lock().unwrap().len(), 1);
 
         // At 28h (4h + 24h): second re-notify.
-        let pushed = renotify_sweep(&space, &sinks, &schedule, created + chrono::Duration::hours(28))
-            .unwrap();
+        let pushed = renotify_sweep(
+            &space,
+            &sinks,
+            &schedule,
+            created + chrono::Duration::hours(28),
+        )
+        .unwrap();
         assert_eq!(pushed, 1);
         assert_eq!(recorder.lock().unwrap().len(), 2);
 
         // At 52h (4h + 2*24h): third and last re-notify (max = 3).
-        let pushed = renotify_sweep(&space, &sinks, &schedule, created + chrono::Duration::hours(52))
-            .unwrap();
+        let pushed = renotify_sweep(
+            &space,
+            &sinks,
+            &schedule,
+            created + chrono::Duration::hours(52),
+        )
+        .unwrap();
         assert_eq!(pushed, 1);
         assert_eq!(recorder.lock().unwrap().len(), 3);
 
         // At 76h: max already reached, no further push, ever.
-        let pushed = renotify_sweep(&space, &sinks, &schedule, created + chrono::Duration::hours(76))
-            .unwrap();
+        let pushed = renotify_sweep(
+            &space,
+            &sinks,
+            &schedule,
+            created + chrono::Duration::hours(76),
+        )
+        .unwrap();
         assert_eq!(pushed, 0);
         assert_eq!(recorder.lock().unwrap().len(), 3);
     }

@@ -339,7 +339,13 @@ mod tests {
         let log = log_at(tmp.path());
         let gen = at(1000);
         log.append("cinder", gen, LogEvent::Text { text: "hi".into() });
-        log.append("cinder", gen, LogEvent::Tool { name: "Bash".into() });
+        log.append(
+            "cinder",
+            gen,
+            LogEvent::Tool {
+                name: "Bash".into(),
+            },
+        );
         log.append(
             "cinder",
             gen,
@@ -353,7 +359,10 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert!(matches!(&entries[0].event, LogEvent::Text { text } if text == "hi"));
         assert!(matches!(&entries[1].event, LogEvent::Tool { name } if name == "Bash"));
-        assert!(matches!(&entries[2].event, LogEvent::Retry { attempt: 2, .. }));
+        assert!(matches!(
+            &entries[2].event,
+            LogEvent::Retry { attempt: 2, .. }
+        ));
     }
 
     #[test]
@@ -362,7 +371,13 @@ mod tests {
         let log = log_at(tmp.path());
         let gen = at(1000);
         for i in 0..10 {
-            log.append("r", gen, LogEvent::Tool { name: i.to_string() });
+            log.append(
+                "r",
+                gen,
+                LogEvent::Tool {
+                    name: i.to_string(),
+                },
+            );
         }
         let tail = log.read(&only("r", gen), Some(3));
         assert_eq!(tail.len(), 3);
@@ -384,7 +399,13 @@ mod tests {
         let log = log_at(tmp.path());
         let mut rx = log.subscribe();
         let gen = at(1000);
-        log.append("cinder", gen, LogEvent::Tool { name: "Read".into() });
+        log.append(
+            "cinder",
+            gen,
+            LogEvent::Tool {
+                name: "Read".into(),
+            },
+        );
         let rec = rx.try_recv().expect("entry should be broadcast");
         assert_eq!(rec.agent, "cinder");
         // The generation rides along so a follower of one rat is never handed a
@@ -425,10 +446,26 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let log = log_at(tmp.path());
         let (old, new) = (at(1000), at(2000));
-        log.append("cinder", old, LogEvent::Text { text: "first".into() });
-        log.append("cinder", new, LogEvent::Text { text: "second".into() });
+        log.append(
+            "cinder",
+            old,
+            LogEvent::Text {
+                text: "first".into(),
+            },
+        );
+        log.append(
+            "cinder",
+            new,
+            LogEvent::Text {
+                text: "second".into(),
+            },
+        );
         let legacy = tmp.path().join("agent-logs").join("cinder.jsonl");
-        std::fs::write(&legacy, "{\"ts\":\"1970-01-01T00:16:40Z\",\"kind\":\"text\",\"text\":\"legacy\"}\n").unwrap();
+        std::fs::write(
+            &legacy,
+            "{\"ts\":\"1970-01-01T00:16:40Z\",\"kind\":\"text\",\"text\":\"legacy\"}\n",
+        )
+        .unwrap();
 
         assert!(log.delete_for("cinder", old).unwrap(), "file was there");
 
@@ -475,8 +512,20 @@ mod tests {
         let log = log_at(tmp.path());
         let (first, second) = (at(1000), at(2000));
 
-        log.append("Gouda", first, LogEvent::Text { text: "gen1".into() });
-        log.append("Gouda", second, LogEvent::Text { text: "gen2".into() });
+        log.append(
+            "Gouda",
+            first,
+            LogEvent::Text {
+                text: "gen1".into(),
+            },
+        );
+        log.append(
+            "Gouda",
+            second,
+            LogEvent::Text {
+                text: "gen2".into(),
+            },
+        );
 
         let older = log.read(&Generation::of("Gouda", first, Some(second)), None);
         assert_eq!(older.len(), 1, "the older rat sees only its own line");

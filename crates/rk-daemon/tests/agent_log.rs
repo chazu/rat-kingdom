@@ -107,7 +107,11 @@ async fn supervisor_persists_transcript_and_log_serves_it() {
         .unwrap();
     let tail = tailed["entries"].as_array().unwrap();
     assert_eq!(tail.len(), 1);
-    assert_eq!(&tail[0], entries.last().unwrap(), "tail returns the true last entry");
+    assert_eq!(
+        &tail[0],
+        entries.last().unwrap(),
+        "tail returns the true last entry"
+    );
 
     // An unknown agent is an empty transcript, not an error.
     let empty = client
@@ -179,7 +183,10 @@ async fn a_name_that_named_two_rats_serves_each_generation_separately() {
         "Gouda",
         &[
             (older_at + TimeDelta::try_seconds(5).unwrap(), "first rat"),
-            (older_at + TimeDelta::try_seconds(9).unwrap(), "first rat again"),
+            (
+                older_at + TimeDelta::try_seconds(9).unwrap(),
+                "first rat again",
+            ),
             (newer_at + TimeDelta::try_seconds(5).unwrap(), "second rat"),
         ],
     );
@@ -218,7 +225,10 @@ async fn a_name_that_named_two_rats_serves_each_generation_separately() {
 
     // `tail` bounds the selected generation, not the file.
     let tailed = client
-        .call("agent.log", json!({"name": "Gouda", "generation": 1, "tail": 1}))
+        .call(
+            "agent.log",
+            json!({"name": "Gouda", "generation": 1, "tail": 1}),
+        )
         .await
         .unwrap();
     let entries = tailed["entries"].as_array().unwrap();

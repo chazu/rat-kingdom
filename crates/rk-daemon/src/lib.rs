@@ -197,7 +197,9 @@ mod tests {
                 &crate::ingest_auth::derive_source_token(root, "probe"),
             )
             .unwrap();
-            let params = serde_json::from_value(json!({"source":"other", "envelope": envelope("probe")})).unwrap();
+            let params =
+                serde_json::from_value(json!({"source":"other", "envelope": envelope("probe")}))
+                    .unwrap();
             assert!(crate::ingest_auth::validate_event(&principal, &params).is_err());
         }
 
@@ -269,7 +271,10 @@ mod tests {
                 },
             )
             .await;
-            assert_eq!(response.error.unwrap().code, crate::proto::codes::UNAUTHORIZED);
+            assert_eq!(
+                response.error.unwrap().code,
+                crate::proto::codes::UNAUTHORIZED
+            );
             let mut operator = connect(&layout).await;
             operator.call("stop", json!({})).await.unwrap();
             handle.await.unwrap().unwrap();
@@ -284,14 +289,20 @@ mod tests {
                 Request {
                     id: "unknown".into(),
                     method: "ingest.event".into(),
-                    auth: crate::ingest_auth::derive_source_token(&layout.auth_token().unwrap(), "unknown"),
+                    auth: crate::ingest_auth::derive_source_token(
+                        &layout.auth_token().unwrap(),
+                        "unknown",
+                    ),
                     caller: crate::ingest_auth::source_caller("unknown"),
                     client_version: None,
                     params: json!({"source":"unknown", "envelope": envelope("unknown")}),
                 },
             )
             .await;
-            assert_eq!(response.error.unwrap().code, crate::proto::codes::UNAUTHORIZED);
+            assert_eq!(
+                response.error.unwrap().code,
+                crate::proto::codes::UNAUTHORIZED
+            );
             let mut operator = connect(&layout).await;
             operator.call("stop", json!({})).await.unwrap();
             handle.await.unwrap().unwrap();
@@ -301,7 +312,8 @@ mod tests {
         async fn test_ingest_event_validates_before_persisting() {
             let (_dir, layout, handle) =
                 start_daemon_with_config(config_with_source(source("probe"))).await;
-            let token = crate::ingest_auth::derive_source_token(&layout.auth_token().unwrap(), "probe");
+            let token =
+                crate::ingest_auth::derive_source_token(&layout.auth_token().unwrap(), "probe");
             let mut bad = envelope("probe");
             bad["summary"] = json!("");
             let response = raw_request(
@@ -318,7 +330,10 @@ mod tests {
             .await;
             assert_eq!(response.error.unwrap().code, crate::proto::codes::FORBIDDEN);
             let mut operator = connect(&layout).await;
-            let scan = operator.call("space.scan", json!({"category":"event"})).await.unwrap();
+            let scan = operator
+                .call("space.scan", json!({"category":"event"}))
+                .await
+                .unwrap();
             assert_eq!(scan["tuples"].as_array().unwrap().len(), 0);
             operator.call("stop", json!({})).await.unwrap();
             handle.await.unwrap().unwrap();
@@ -330,7 +345,10 @@ mod tests {
                 start_daemon_with_config(config_with_source(source("probe"))).await;
             let result = ingest_probe(&layout).await;
             assert_eq!(result["accepted"], true);
-            assert!(result["receipt"]["semantic_state_digest"].as_str().unwrap().starts_with("sha256:"));
+            assert!(result["receipt"]["semantic_state_digest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:"));
             let mut operator = connect(&layout).await;
             operator.call("stop", json!({})).await.unwrap();
             handle.await.unwrap().unwrap();
@@ -342,9 +360,14 @@ mod tests {
                 start_daemon_with_config(config_with_source(source("probe"))).await;
             let result = ingest_probe(&layout).await;
             let mut operator = connect(&layout).await;
-            let scan = operator.call("space.scan", json!({"category":"event", "scope":"ci"})).await.unwrap();
+            let scan = operator
+                .call("space.scan", json!({"category":"event", "scope":"ci"}))
+                .await
+                .unwrap();
             let tuples = scan["tuples"].as_array().unwrap();
-            assert!(tuples.iter().any(|tuple| tuple["id"] == result["receipt"]["projected_event_id"]));
+            assert!(tuples
+                .iter()
+                .any(|tuple| tuple["id"] == result["receipt"]["projected_event_id"]));
             operator.call("stop", json!({})).await.unwrap();
             handle.await.unwrap().unwrap();
         }
@@ -355,9 +378,19 @@ mod tests {
                 start_daemon_with_config(config_with_source(source("probe"))).await;
             let result = ingest_probe(&layout).await;
             let fact_id = result["receipt"]["projected_fact_ids"][0].clone();
-            let mut source_client = Client::connect_as(&layout, &crate::ingest_auth::source_caller("probe")).await.unwrap();
-            let state = source_client.call("ingest.state", json!({"repo":"repo"})).await.unwrap();
-            assert!(state["facts"].as_array().unwrap().iter().any(|fact| fact["id"] == fact_id));
+            let mut source_client =
+                Client::connect_as(&layout, &crate::ingest_auth::source_caller("probe"))
+                    .await
+                    .unwrap();
+            let state = source_client
+                .call("ingest.state", json!({"repo":"repo"}))
+                .await
+                .unwrap();
+            assert!(state["facts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|fact| fact["id"] == fact_id));
             let mut operator = connect(&layout).await;
             operator.call("stop", json!({})).await.unwrap();
             handle.await.unwrap().unwrap();
@@ -368,8 +401,14 @@ mod tests {
             let (_dir, layout, handle) =
                 start_daemon_with_config(config_with_source(source("probe"))).await;
             ingest_probe(&layout).await;
-            let mut source_client = Client::connect_as(&layout, &crate::ingest_auth::source_caller("probe")).await.unwrap();
-            let state = source_client.call("ingest.state", json!({"repo":"repo"})).await.unwrap();
+            let mut source_client =
+                Client::connect_as(&layout, &crate::ingest_auth::source_caller("probe"))
+                    .await
+                    .unwrap();
+            let state = source_client
+                .call("ingest.state", json!({"repo":"repo"}))
+                .await
+                .unwrap();
             let fact = &state["facts"].as_array().unwrap()[0];
             assert!(fact["payload"].get("current").is_some());
             assert!(fact["payload"].get("payload").is_none());
@@ -384,7 +423,10 @@ mod tests {
                 Request {
                     id: "ingest-probe".into(),
                     method: "ingest.event".into(),
-                    auth: crate::ingest_auth::derive_source_token(&layout.auth_token().unwrap(), "probe"),
+                    auth: crate::ingest_auth::derive_source_token(
+                        &layout.auth_token().unwrap(),
+                        "probe",
+                    ),
                     caller: crate::ingest_auth::source_caller("probe"),
                     client_version: None,
                     params: json!({"source":"probe", "envelope": envelope("probe")}),
@@ -531,8 +573,13 @@ mod tests {
             {
                 let mut reg = Registry::load(&layout.home().join("agents.json")).unwrap();
                 for i in 0..live_count {
-                    reg.insert(padded(&format!("live-{i}"), AgentState::Running, 35_000, false))
-                        .unwrap();
+                    reg.insert(padded(
+                        &format!("live-{i}"),
+                        AgentState::Running,
+                        35_000,
+                        false,
+                    ))
+                    .unwrap();
                 }
                 for i in 0..archived_count {
                     reg.insert(padded(
@@ -828,7 +875,10 @@ mod tests {
         assert!(ok.error.is_none(), "ingest.event should validate: {ok:?}");
         let result = ok.result.unwrap();
         assert_eq!(result["accepted"], true);
-        assert!(result["receipt"]["semantic_state_digest"].as_str().unwrap().starts_with("sha256:"));
+        assert!(result["receipt"]["semantic_state_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
 
         let mut operator_for_scan = connect(&layout).await;
         let scan = operator_for_scan

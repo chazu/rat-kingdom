@@ -171,11 +171,15 @@ async fn doc_only_diff_class_skips_reviewer_but_still_gates_and_lands() {
         .map(|r| r["model"].as_str().map(String::from))
         .collect();
     assert!(
-        models.iter().any(|m| m.as_deref() == Some("gateholder-model")),
+        models
+            .iter()
+            .any(|m| m.as_deref() == Some("gateholder-model")),
         "the reduced tier must spawn the gate-holder profile: {models:?}"
     );
     assert!(
-        !models.iter().any(|m| m.as_deref() == Some("reviewer-model")),
+        !models
+            .iter()
+            .any(|m| m.as_deref() == Some("reviewer-model")),
         "the reduced tier must never spawn the reviewer profile: {models:?}"
     );
 
@@ -222,11 +226,15 @@ async fn missing_diff_class_defaults_to_the_review_tier() {
         .map(|r| r["model"].as_str().map(String::from))
         .collect();
     assert!(
-        models.iter().any(|m| m.as_deref() == Some("reviewer-model")),
+        models
+            .iter()
+            .any(|m| m.as_deref() == Some("reviewer-model")),
         "a missing diffClass must default to the review tier: {models:?}"
     );
     assert!(
-        !models.iter().any(|m| m.as_deref() == Some("gateholder-model")),
+        !models
+            .iter()
+            .any(|m| m.as_deref() == Some("gateholder-model")),
         "a missing diffClass must never take the reduced tier: {models:?}"
     );
 

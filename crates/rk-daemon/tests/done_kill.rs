@@ -77,7 +77,12 @@ case "$RK_TASK" in
 esac
 "#;
 
-async fn spawn(home: &Path, repo_dir: &Path, task: &str, grace_secs: u64) -> (Client, String, String) {
+async fn spawn(
+    home: &Path,
+    repo_dir: &Path,
+    task: &str,
+    grace_secs: u64,
+) -> (Client, String, String) {
     let repo_name = init_repo(repo_dir);
     std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(FAKE));
     let layout = Layout::at(home);
@@ -156,10 +161,13 @@ async fn recovery_actions(client: &mut Client, scope: &str, kind: &str) -> Vec<V
 async fn lingering_harness_is_killed_after_grace() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
-    let (mut client, repo, agent) = spawn(home.path(), repo_dir.path(), "lingers-after-done", 1).await;
+    let (mut client, repo, agent) =
+        spawn(home.path(), repo_dir.path(), "lingers-after-done", 1).await;
 
     let record = await_state(&mut client, &agent, "completed").await;
-    let pid = record["pid"].as_u64().expect("a lingering agent still has a pid");
+    let pid = record["pid"]
+        .as_u64()
+        .expect("a lingering agent still has a pid");
     assert!(
         pid_alive(pid),
         "the fake harness sleeps 30s after `rk done` — it must still be alive right after completion"
@@ -175,7 +183,10 @@ async fn lingering_harness_is_killed_after_grace() {
             break;
         }
     }
-    assert!(dead, "pid {pid} was not killed within 30s of a clean `rk done`");
+    assert!(
+        dead,
+        "pid {pid} was not killed within 30s of a clean `rk done`"
+    );
 
     // Kill announced via the recovery-announce helper: a durable
     // `recovery_action` event for `kill-process-group` was written.
@@ -195,7 +206,9 @@ async fn lingering_harness_is_killed_after_grace() {
         .unwrap();
     let entries = log["entries"].as_array().unwrap();
     assert!(
-        entries.iter().any(|e| e.to_string().contains("working on it")),
+        entries
+            .iter()
+            .any(|e| e.to_string().contains("working on it")),
         "expected the pre-completion transcript to survive the kill: {entries:?}"
     );
 }
@@ -210,7 +223,8 @@ async fn clean_exit_after_done_is_not_touched() {
     // A grace window long enough that, if this path were mistakenly treated
     // like the lingering one, the test would still catch it well before the
     // grace timer fires.
-    let (mut client, repo, agent) = spawn(home.path(), repo_dir.path(), "exits-after-done", 5).await;
+    let (mut client, repo, agent) =
+        spawn(home.path(), repo_dir.path(), "exits-after-done", 5).await;
 
     // `AgentState::Completed` (as opposed to `Failed`) is itself the proof
     // this was a clean, declared finish — `is_error` lives on the published
@@ -250,8 +264,13 @@ async fn respawn_during_grace_survives_predecessor_done_kill() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let grace_secs = 3;
-    let (mut client, _repo, agent) =
-        spawn(home.path(), repo_dir.path(), "lingers-after-done", grace_secs).await;
+    let (mut client, _repo, agent) = spawn(
+        home.path(),
+        repo_dir.path(),
+        "lingers-after-done",
+        grace_secs,
+    )
+    .await;
 
     let record = await_state(&mut client, &agent, "completed").await;
     let pid1 = record["pid"]
@@ -284,6 +303,10 @@ async fn respawn_during_grace_survives_predecessor_done_kill() {
         "the respawned session must survive the predecessor's done-kill grace timer"
     );
 
-    let _ = Command::new("kill").args(["-9", &pid1.to_string()]).status();
-    let _ = Command::new("kill").args(["-9", &pid2.to_string()]).status();
+    let _ = Command::new("kill")
+        .args(["-9", &pid1.to_string()])
+        .status();
+    let _ = Command::new("kill")
+        .args(["-9", &pid2.to_string()])
+        .status();
 }

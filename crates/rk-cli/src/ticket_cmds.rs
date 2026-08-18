@@ -187,7 +187,10 @@ pub async fn dep(
 ) -> Result<()> {
     let mut client = Client::connect_or_spawn(layout).await?;
     let result = client
-        .call("ticket.dep", json!({ "id": id, "dep": dep, "remove": remove }))
+        .call(
+            "ticket.dep",
+            json!({ "id": id, "dep": dep, "remove": remove }),
+        )
         .await?;
     let ticket = &result["ticket"];
     if as_json {
@@ -216,7 +219,11 @@ pub async fn show(layout: &Layout, id: String, as_json: bool) -> Result<()> {
         return Ok(());
     }
     let p = &t["payload"];
-    println!("{}: {}", t["identity"].as_str().unwrap_or("?"), p["title"].as_str().unwrap_or(""));
+    println!(
+        "{}: {}",
+        t["identity"].as_str().unwrap_or("?"),
+        p["title"].as_str().unwrap_or("")
+    );
     println!("  status    {}", p["status"].as_str().unwrap_or("?"));
     println!("  priority  {}", p["priority"].as_str().unwrap_or("normal"));
     println!("  scope     {}", t["scope"].as_str().unwrap_or("?"));
@@ -241,7 +248,11 @@ pub async fn show(layout: &Layout, id: String, as_json: bool) -> Result<()> {
                     }
                 })
                 .collect();
-            let state = if blockers.is_empty() { "ready" } else { "BLOCKED" };
+            let state = if blockers.is_empty() {
+                "ready"
+            } else {
+                "BLOCKED"
+            };
             println!("  deps      {} [{}]", rendered.join(", "), state);
         }
     }

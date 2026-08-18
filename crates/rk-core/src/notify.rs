@@ -198,8 +198,9 @@ impl Outcome {
 /// Fallible on purpose: a kind with required options (`command` needs a program
 /// to run) must be able to refuse a table it cannot honour, rather than
 /// registering a channel that reports success while delivering nowhere.
-pub type SinkCtor =
-    Box<dyn Fn(&crate::config::SinkConfig) -> crate::Result<Box<dyn NotificationSink>> + Send + Sync>;
+pub type SinkCtor = Box<
+    dyn Fn(&crate::config::SinkConfig) -> crate::Result<Box<dyn NotificationSink>> + Send + Sync,
+>;
 
 /// The `kind` → implementation table, and THE registration seam.
 ///
@@ -223,7 +224,11 @@ pub struct SinkFactory {
 pub enum SinkBuildError {
     /// No registered kind by that name — almost always a typo, so the message
     /// carries the kinds that *are* registered.
-    UnknownKind { name: String, kind: String, known: Vec<String> },
+    UnknownKind {
+        name: String,
+        kind: String,
+        known: Vec<String>,
+    },
     /// The kind exists but rejected its table (missing or unparseable option).
     Misconfigured {
         name: String,
@@ -615,7 +620,10 @@ mod tests {
         assert_eq!(skipped.len(), 2);
         // A typo is diagnosable from the message alone: it lists what IS known.
         let unknown = skipped[0].to_string();
-        assert!(unknown.contains("unknown kind `carrier-pigeon`"), "{unknown}");
+        assert!(
+            unknown.contains("unknown kind `carrier-pigeon`"),
+            "{unknown}"
+        );
         assert!(unknown.contains("command, log, recorder"), "{unknown}");
         let bad = skipped[1].to_string();
         assert!(bad.contains("`half-written`"), "{bad}");

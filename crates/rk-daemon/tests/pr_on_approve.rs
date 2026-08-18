@@ -224,7 +224,11 @@ async fn pr_on_approve_opens_pr_and_keeps_branch() {
     let remote_ref = Command::new("git")
         .arg("-C")
         .arg(origin.path())
-        .args(["rev-parse", "--verify", &format!("refs/heads/{held_branch}")])
+        .args([
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{held_branch}"),
+        ])
         .output()
         .unwrap();
     assert!(
@@ -271,7 +275,11 @@ async fn pr_on_approve_rejection_opens_no_pr() {
     let remote_ref = Command::new("git")
         .arg("-C")
         .arg(origin.path())
-        .args(["rev-parse", "--verify", &format!("refs/heads/{held_branch}")])
+        .args([
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{held_branch}"),
+        ])
         .output()
         .unwrap();
     assert!(

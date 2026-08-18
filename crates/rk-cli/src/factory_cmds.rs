@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use rk_core::paths::Layout;
 use rk_daemon::Client;
@@ -339,7 +339,13 @@ pub async fn run(layout: &Layout, command: FactoryCommand, json_output: bool) ->
             } else {
                 print!(
                     "{}",
-                    render_dashboard(&snapshot, &events, args.repo.as_deref(), args.row_limit, args.event_limit)
+                    render_dashboard(
+                        &snapshot,
+                        &events,
+                        args.repo.as_deref(),
+                        args.row_limit,
+                        args.event_limit
+                    )
                 );
             }
         }
@@ -899,8 +905,14 @@ fn render_dashboard(
 
 fn render_approvals(out: &mut String, approvals: &Value, row_limit: usize) {
     writeln!(out, "## Approvals\n").unwrap();
-    let proposals = approvals["proposals"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    let grants = approvals["grants"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let proposals = approvals["proposals"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let grants = approvals["grants"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     writeln!(out, "- Proposals: {}", proposals.len()).unwrap();
     writeln!(out, "- Grants: {}\n", grants.len()).unwrap();
     if proposals.is_empty() {
@@ -971,7 +983,13 @@ fn render_mapping(out: &mut String, heading: &str, value: &Value) {
         return;
     };
     for (key, value) in mapping {
-        writeln!(out, "- {}: {}", key.replace('_', " "), markdown_text(&plain(value))).unwrap();
+        writeln!(
+            out,
+            "- {}: {}",
+            key.replace('_', " "),
+            markdown_text(&plain(value))
+        )
+        .unwrap();
     }
     writeln!(out).unwrap();
 }
@@ -986,7 +1004,10 @@ fn render_events(out: &mut String, replay: &Value, event_limit: usize) {
         )
         .unwrap();
     }
-    let events = replay["events"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let events = replay["events"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     if events.is_empty() {
         writeln!(out, "_none_\n").unwrap();
         return;
@@ -1388,8 +1409,7 @@ fn parse_digest(digest: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DashboardOutputMode, dashboard_output_mode, render_dashboard,
-        render_recommend_markdown,
+        dashboard_output_mode, render_dashboard, render_recommend_markdown, DashboardOutputMode,
     };
     use serde_json::json;
 
@@ -1493,7 +1513,10 @@ mod tests {
 
         let markdown = render_dashboard(&snapshot, &replay, Some("rat-kingdom"), 20, 20);
 
-        assert!(markdown.find("first").unwrap() < markdown.find("second").unwrap(), "{markdown}");
+        assert!(
+            markdown.find("first").unwrap() < markdown.find("second").unwrap(),
+            "{markdown}"
+        );
     }
 
     #[test]
@@ -1587,23 +1610,71 @@ mod tests {
         });
 
         let markdown = render_recommend_markdown(&result);
-        let active = markdown.split("## Recommendations").nth(1).unwrap().split("## Suppressed").next().unwrap();
+        let active = markdown
+            .split("## Recommendations")
+            .nth(1)
+            .unwrap()
+            .split("## Suppressed")
+            .next()
+            .unwrap();
         let suppressed = markdown.split("## Suppressed").nth(1).unwrap();
 
         assert!(active.contains("high_rework"), "active section: {active}");
-        assert!(!active.contains("ci_instability"), "active section must omit suppressed records: {active}");
-        assert!(!active.contains("recurrence"), "active section must omit empty advice: {active}");
-        assert!(suppressed.contains("ci_instability"), "suppressed section: {suppressed}");
-        assert!(suppressed.contains("metric_unavailable"), "suppressed section: {suppressed}");
-        assert!(suppressed.contains("source_family=Phase4CiSignal"), "suppressed section: {suppressed}");
-        assert!(suppressed.contains("task_class=unknown"), "suppressed section: {suppressed}");
-        assert!(suppressed.contains("workflow=unknown"), "suppressed section: {suppressed}");
-        assert!(suppressed.contains("harness=unknown"), "suppressed section: {suppressed}");
-        assert!(suppressed.contains("model=unknown"), "suppressed section: {suppressed}");
-        assert!(suppressed.contains("active_source_count=0"), "suppressed section: {suppressed}");
-        assert!(suppressed.contains("archived_source_count=0"), "suppressed section: {suppressed}");
-        assert!(suppressed.contains("event_count=0"), "suppressed section: {suppressed}");
-        assert!(!suppressed.contains("available=false"), "suppressed section must not fabricate availability: {suppressed}");
-        assert!(!suppressed.contains("sample="), "suppressed section must not relabel event_count as sample: {suppressed}");
+        assert!(
+            !active.contains("ci_instability"),
+            "active section must omit suppressed records: {active}"
+        );
+        assert!(
+            !active.contains("recurrence"),
+            "active section must omit empty advice: {active}"
+        );
+        assert!(
+            suppressed.contains("ci_instability"),
+            "suppressed section: {suppressed}"
+        );
+        assert!(
+            suppressed.contains("metric_unavailable"),
+            "suppressed section: {suppressed}"
+        );
+        assert!(
+            suppressed.contains("source_family=Phase4CiSignal"),
+            "suppressed section: {suppressed}"
+        );
+        assert!(
+            suppressed.contains("task_class=unknown"),
+            "suppressed section: {suppressed}"
+        );
+        assert!(
+            suppressed.contains("workflow=unknown"),
+            "suppressed section: {suppressed}"
+        );
+        assert!(
+            suppressed.contains("harness=unknown"),
+            "suppressed section: {suppressed}"
+        );
+        assert!(
+            suppressed.contains("model=unknown"),
+            "suppressed section: {suppressed}"
+        );
+        assert!(
+            suppressed.contains("active_source_count=0"),
+            "suppressed section: {suppressed}"
+        );
+        assert!(
+            suppressed.contains("archived_source_count=0"),
+            "suppressed section: {suppressed}"
+        );
+        assert!(
+            suppressed.contains("event_count=0"),
+            "suppressed section: {suppressed}"
+        );
+        assert!(
+            !suppressed.contains("available=false"),
+            "suppressed section must not fabricate availability: {suppressed}"
+        );
+        assert!(
+            !suppressed.contains("sample="),
+            "suppressed section must not relabel event_count as sample: {suppressed}"
+        );
     }
 }

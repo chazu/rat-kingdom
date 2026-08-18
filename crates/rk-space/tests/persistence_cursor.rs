@@ -124,9 +124,7 @@ fn persistence_boundary_survives_reopen_and_clock_rollback() {
     let restarted = Space::open(&db).unwrap();
     let rolled_back = fact(RecordId::floor_at(now), "rolled-back");
     restarted.out(rolled_back.clone()).unwrap();
-    let delta = restarted
-        .persistence_delta(Some(first_boundary))
-        .unwrap();
+    let delta = restarted.persistence_delta(Some(first_boundary)).unwrap();
 
     assert!(delta.boundary > first_boundary);
     assert_eq!(delta.tuples, vec![rolled_back]);
@@ -156,7 +154,10 @@ fn independent_connections_share_one_persistence_sequence() {
             .tuples,
         vec![delayed]
     );
-    assert_eq!(second.latest_persistence_sequence().unwrap(), first_boundary + 1);
+    assert_eq!(
+        second.latest_persistence_sequence().unwrap(),
+        first_boundary + 1
+    );
 }
 
 #[test]
@@ -180,10 +181,7 @@ fn legacy_database_backfills_deterministically_without_hiding_new_low_ids() {
     let db = dir.path().join("legacy.db");
     let now = Utc::now();
     let low = fact(RecordId::floor_at(now), "legacy-low");
-    let high = fact(
-        RecordId::floor_at(now + Duration::days(1)),
-        "legacy-high",
-    );
+    let high = fact(RecordId::floor_at(now + Duration::days(1)), "legacy-high");
     create_legacy_database(&db, &[&high, &low]);
 
     let space = Space::open(&db).unwrap();
@@ -219,7 +217,10 @@ fn sequence_only_database_with_deleted_history_upgrades_without_rewinding() {
 
     let space = Space::open(&db).unwrap();
     assert_eq!(space.latest_persistence_sequence().unwrap(), 2);
-    assert_eq!(space.persistence_delta(None).unwrap().tuples, vec![surviving]);
+    assert_eq!(
+        space.persistence_delta(None).unwrap().tuples,
+        vec![surviving]
+    );
 
     let future = fact(
         RecordId::floor_at(Utc::now() + Duration::days(1)),
@@ -258,7 +259,10 @@ fn sequence_only_database_recovers_from_failed_pre_journal_upgrade() {
 
     let space = Space::open(&db).unwrap();
     assert_eq!(space.latest_persistence_sequence().unwrap(), 2);
-    assert_eq!(space.persistence_delta(None).unwrap().tuples, vec![surviving]);
+    assert_eq!(
+        space.persistence_delta(None).unwrap().tuples,
+        vec![surviving]
+    );
 }
 
 #[test]
@@ -272,7 +276,8 @@ fn reopening_fails_closed_when_migrated_sequence_state_is_missing() {
         assert!(space.delete(tuple.id).unwrap());
     }
     let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute("DELETE FROM tuple_sequence_state", []).unwrap();
+    conn.execute("DELETE FROM tuple_sequence_state", [])
+        .unwrap();
     drop(conn);
 
     assert!(
@@ -287,7 +292,8 @@ fn insert_aborts_when_sequence_state_is_missing() {
     let db = dir.path().join("missing-live-state.db");
     let space = Space::open(&db).unwrap();
     let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute("DELETE FROM tuple_sequence_state", []).unwrap();
+    conn.execute("DELETE FROM tuple_sequence_state", [])
+        .unwrap();
     drop(conn);
     let tuple = fact(RecordId::floor_at(Utc::now()), "must-not-persist");
 
@@ -404,7 +410,10 @@ fn reopening_does_not_heal_a_missing_trusted_journal_event_from_live_rows() {
     .unwrap();
     drop(conn);
 
-    assert!(Space::open(&db).is_err(), "trusted journal gaps must fail closed");
+    assert!(
+        Space::open(&db).is_err(),
+        "trusted journal gaps must fail closed"
+    );
 }
 
 #[test]
@@ -414,7 +423,8 @@ fn failed_migration_does_not_leave_journal_schema_residue() {
     let surviving = fact(RecordId::floor_at(Utc::now()), "missing-state");
     create_sequence_only_database_after_deletion(&db, &surviving);
     let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute("DELETE FROM tuple_sequence_state", []).unwrap();
+    conn.execute("DELETE FROM tuple_sequence_state", [])
+        .unwrap();
     drop(conn);
 
     assert!(Space::open(&db).is_err());
@@ -429,7 +439,10 @@ fn failed_migration_does_not_leave_journal_schema_residue() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(!journal_exists, "failed migration DDL must roll back atomically");
+    assert!(
+        !journal_exists,
+        "failed migration DDL must roll back atomically"
+    );
 }
 
 #[test]
@@ -450,8 +463,15 @@ fn persistence_journal_ignores_insert_or_replace_of_an_existing_sequence() {
         [Utc::now().to_rfc3339()],
     );
 
-    assert_eq!(replacement.unwrap(), 0, "REPLACE must be reduced to a no-op");
-    assert_eq!(space.persistence_delta(None).unwrap().tuples, vec![original]);
+    assert_eq!(
+        replacement.unwrap(),
+        0,
+        "REPLACE must be reduced to a no-op"
+    );
+    assert_eq!(
+        space.persistence_delta(None).unwrap().tuples,
+        vec![original]
+    );
 }
 
 #[test]
@@ -477,10 +497,17 @@ fn current_journal_allows_older_insert_or_ignore_backfill_to_be_a_noop() {
         [],
     );
 
-    assert_eq!(inserted.unwrap(), 0, "older backfill must remain an exact no-op");
+    assert_eq!(
+        inserted.unwrap(),
+        0,
+        "older backfill must remain an exact no-op"
+    );
     drop(conn);
     let reopened = Space::open(&db).unwrap();
-    assert_eq!(reopened.persistence_delta(None).unwrap().tuples, vec![original]);
+    assert_eq!(
+        reopened.persistence_delta(None).unwrap().tuples,
+        vec![original]
+    );
 }
 
 #[test]

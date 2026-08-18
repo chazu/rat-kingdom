@@ -159,7 +159,10 @@ async fn cue_workflow_runs_end_to_end_with_agent_resolution() {
         .iter()
         .filter(|event| event["payload"]["instance"].as_str() == Some(id.as_str()))
         .collect();
-    assert!(transitions.len() >= 2, "workflow transitions: {transitions:?}");
+    assert!(
+        transitions.len() >= 2,
+        "workflow transitions: {transitions:?}"
+    );
     assert_eq!(transitions[0]["payload"]["reason"], "started");
     let revisions: Vec<_> = transitions
         .iter()
@@ -489,7 +492,10 @@ async fn run_step_green_check_gates_and_merges() {
         .output()
         .unwrap();
     let listing = String::from_utf8_lossy(&files.stdout).to_string();
-    assert!(listing.contains("work-"), "green work must merge: {listing}");
+    assert!(
+        listing.contains("work-"),
+        "green work must merge: {listing}"
+    );
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
@@ -793,16 +799,26 @@ async fn run_step_retry_on_fail_recovers_and_records_the_retry() {
                 completed = true;
                 break;
             }
-            "failed" => panic!("retry should have recovered: {}", status["instance"]["error"]),
+            "failed" => panic!(
+                "retry should have recovered: {}",
+                status["instance"]["error"]
+            ),
             _ => {}
         }
     }
-    assert!(completed, "retried workflow did not complete: {last_status}");
+    assert!(
+        completed,
+        "retried workflow did not complete: {last_status}"
+    );
 
     let gate_result = &last_status["instance"]["context"]["vars"]["gateResult"];
     assert_eq!(gate_result["verdict"].as_str(), Some("pass"));
     let retries = gate_result["retries"].as_array().expect("retries recorded");
-    assert_eq!(retries.len(), 1, "exactly one failed attempt before recovery");
+    assert_eq!(
+        retries.len(),
+        1,
+        "exactly one failed attempt before recovery"
+    );
     assert_eq!(retries[0]["verdict"].as_str(), Some("fail"));
 
     // The final verdict passed, so no gate-failure artifact for this instance
@@ -818,7 +834,10 @@ async fn run_step_retry_on_fail_recovers_and_records_the_retry() {
         .filter(|t| t["identity"].as_str() == Some("gate-failure"))
         .filter(|t| t["payload"]["instance"].as_str() == Some(id.as_str()))
         .count();
-    assert_eq!(gate_failures, 0, "a recovered retry must not write gate-failure");
+    assert_eq!(
+        gate_failures, 0,
+        "a recovered retry must not write gate-failure"
+    );
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
@@ -904,7 +923,10 @@ async fn run_step_default_timeout_persists_a_durable_gate_failure_artifact() {
             break;
         }
     }
-    assert!(failed, "timed-out run gate did not fail closed: {last_status}");
+    assert!(
+        failed,
+        "timed-out run gate did not fail closed: {last_status}"
+    );
     let err = last_status["instance"]["error"].as_str().unwrap_or("");
     assert!(err.contains("timed out"), "unexpected error: {err}");
 

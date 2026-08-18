@@ -95,14 +95,7 @@ async fn spawn_ticket_resolves_repo_through_system_scoped_parent_chain() {
     assert_eq!(sub["ticket"]["scope"], "system");
 
     let output = Command::new(env!("CARGO_BIN_EXE_rk"))
-        .args([
-            "--json",
-            "spawn",
-            "--ticket",
-            &sub_id,
-            "--harness",
-            "fake",
-        ])
+        .args(["--json", "spawn", "--ticket", &sub_id, "--harness", "fake"])
         .env("RK_HOME", home.path())
         .env_remove("RK_AGENT")
         .env_remove("RK_AUTH_TOKEN")

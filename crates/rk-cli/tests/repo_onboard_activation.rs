@@ -365,12 +365,8 @@ async fn automation_activation_is_explicit_content_bound_and_restart_safe() {
     // bytes. The operator must restore or repropose the changed content.
     let changed_repo = repository("onboard-changed-file");
     let changed_start = start_session(&mut operator, changed_repo.path()).await;
-    let changed_session = changed_start["session"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let changed_worktree =
-        PathBuf::from(changed_start["session"]["worktree"].as_str().unwrap());
+    let changed_session = changed_start["session"]["id"].as_str().unwrap().to_string();
+    let changed_worktree = PathBuf::from(changed_start["session"]["worktree"].as_str().unwrap());
     let changed = stage(
         &mut operator,
         &changed_session,
@@ -389,10 +385,7 @@ async fn automation_activation_is_explicit_content_bound_and_restart_safe() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(
-        changed_error.contains("dirty checkout"),
-        "{changed_error}"
-    );
+    assert!(changed_error.contains("dirty checkout"), "{changed_error}");
     assert!(!changed_repo.path().join(".rk/triggers.cue").exists());
 
     // Different repository sessions remain distinct and concurrent activation

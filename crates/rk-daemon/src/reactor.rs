@@ -277,7 +277,8 @@ impl Reactor {
         // No `[[notify.sinks]]` known here, so this resolves to the historical
         // default: one herdr sink iff `notify_escalations`. A daemon with
         // operator-configured sinks replaces this via `with_sinks`.
-        let sinks = sink_factory().registry(NotifyConfig::default().resolved(config.notify_escalations));
+        let sinks =
+            sink_factory().registry(NotifyConfig::default().resolved(config.notify_escalations));
         Self {
             space,
             engine,
@@ -653,14 +654,20 @@ impl Reactor {
         let targets = convention_steer_targets(&agents, scope);
         for name in &targets {
             match supervisor.steer(name, &message).await {
-                Ok(()) => debug!(rat = %name, scope, "reactor steered rat with promoted convention"),
+                Ok(()) => {
+                    debug!(rat = %name, scope, "reactor steered rat with promoted convention")
+                }
                 Err(e) => {
                     debug!(rat = %name, error = %e, "reactor convention steer skipped (no live session)")
                 }
             }
         }
         if !targets.is_empty() {
-            info!(scope, rats = targets.len(), "reactor steered live rats with a promoted convention");
+            info!(
+                scope,
+                rats = targets.len(),
+                "reactor steered live rats with a promoted convention"
+            );
         }
     }
 
@@ -755,7 +762,9 @@ impl Reactor {
                     filed += 1;
                     info!(topic = %topic, scope = %scope, count, quorum, "reactor coalesced obstacles into a ticket");
                 }
-                Err(e) => warn!(topic = %topic, error = %e, "reactor: coalesced ticket filing failed"),
+                Err(e) => {
+                    warn!(topic = %topic, error = %e, "reactor: coalesced ticket filing failed")
+                }
             }
         }
         Ok(filed)
@@ -1667,7 +1676,9 @@ impl Reactor {
     }
 
     fn react_to_sdlc_ci_transition_backlog(&self) -> rk_core::Result<usize> {
-        let transitions = self.space.scan(&Pattern::category(Category::Event).scope("ci"))?;
+        let transitions = self
+            .space
+            .scan(&Pattern::category(Category::Event).scope("ci"))?;
         let mut fired = 0;
         for tuple in transitions
             .iter()
@@ -2000,9 +2011,7 @@ impl Reactor {
         if self.config.marker_ttl_secs > 0 {
             let ttl_secs = i64::try_from(self.config.marker_ttl_secs.min(MAX_MARKER_TTL_SECS))
                 .expect("MAX_MARKER_TTL_SECS must fit i64");
-            marker.expires_at = Some(
-                chrono::Utc::now() + chrono::Duration::seconds(ttl_secs),
-            );
+            marker.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(ttl_secs));
         }
         self.space.out(marker)
     }
@@ -2115,9 +2124,7 @@ impl Reactor {
         if self.config.marker_ttl_secs > 0 {
             let ttl_secs = i64::try_from(self.config.marker_ttl_secs.min(MAX_MARKER_TTL_SECS))
                 .expect("MAX_MARKER_TTL_SECS must fit i64");
-            marker.expires_at = Some(
-                chrono::Utc::now() + chrono::Duration::seconds(ttl_secs),
-            );
+            marker.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(ttl_secs));
         }
         self.space.out(marker)
     }
@@ -2143,9 +2150,7 @@ impl Reactor {
         if self.config.marker_ttl_secs > 0 {
             let ttl_secs = i64::try_from(self.config.marker_ttl_secs.min(MAX_MARKER_TTL_SECS))
                 .expect("MAX_MARKER_TTL_SECS must fit i64");
-            marker.expires_at = Some(
-                chrono::Utc::now() + chrono::Duration::seconds(ttl_secs),
-            );
+            marker.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(ttl_secs));
         }
         self.space.out(marker)
     }
@@ -2283,9 +2288,7 @@ impl Reactor {
         if self.config.marker_ttl_secs > 0 {
             let ttl_secs = i64::try_from(self.config.marker_ttl_secs.min(MAX_MARKER_TTL_SECS))
                 .expect("MAX_MARKER_TTL_SECS must fit i64");
-            marker.expires_at = Some(
-                chrono::Utc::now() + chrono::Duration::seconds(ttl_secs),
-            );
+            marker.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(ttl_secs));
         }
         self.space.out(marker)
     }
@@ -2776,8 +2779,10 @@ mod tests {
     #[test]
     fn ingest_sourced_whole_value_placeholder_is_fenced() {
         let t = ingest_tuple(json!({"summary": "hostile text"}));
-        let params =
-            template_params(&trigger(&[("description", "{{tuple.payload.summary}}")]).params, &t);
+        let params = template_params(
+            &trigger(&[("description", "{{tuple.payload.summary}}")]).params,
+            &t,
+        );
         let rendered = params["description"].as_str().unwrap();
         assert!(rendered.contains("[EXTERNAL TEXT"));
         assert!(rendered.contains("hostile text"));
@@ -2806,7 +2811,10 @@ mod tests {
     fn normalize_topic_folds_case_and_punctuation() {
         // Different phrasings of one wall collapse to the same topic key.
         assert_eq!(normalize_topic("Cargo build FAILS!!"), "cargo build fails");
-        assert_eq!(normalize_topic("  cargo   build  fails  "), "cargo build fails");
+        assert_eq!(
+            normalize_topic("  cargo   build  fails  "),
+            "cargo build fails"
+        );
         assert_eq!(
             normalize_topic("cargo-build: fails (rk-space)"),
             "cargo build fails rk space"

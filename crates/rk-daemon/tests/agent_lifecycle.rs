@@ -180,7 +180,10 @@ async fn ticket_dispatched_rat_closes_its_ticket() {
 
     // File a ticket, then dispatch a rat whose task IS that ticket id.
     let ticket = client
-        .call("ticket.new", json!({"title": "do the thing", "scope": "svc"}))
+        .call(
+            "ticket.new",
+            json!({"title": "do the thing", "scope": "svc"}),
+        )
         .await
         .unwrap();
     let id = ticket["ticket"]["identity"].as_str().unwrap().to_string();

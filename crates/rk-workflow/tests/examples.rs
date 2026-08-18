@@ -28,8 +28,7 @@ fn repository_verify_check_trusts_only_its_current_worktree() {
         .expect("repository must declare a verify check");
 
     assert_eq!(
-        verify.command,
-        "MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" mise run verify",
+        verify.command, "MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" mise run verify",
         "the named check runs in transient agent worktrees, so trust must be process-local"
     );
     assert_eq!(
@@ -593,7 +592,10 @@ fn steward_reduced_tier_skips_reviewer_and_lands_unconditionally() {
         "the reduced tier must not read a review verdict"
     );
     assert!(
-        !workflow.steps.iter().any(|s| matches!(s, Step::When(w) if w.var == "verdict")),
+        !workflow
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::When(w) if w.var == "verdict")),
         "the reduced tier must not route on a review verdict"
     );
 
@@ -618,7 +620,10 @@ fn steward_reduced_tier_skips_reviewer_and_lands_unconditionally() {
             _ => None,
         })
         .expect("land must be gated by a delivered:true evaluate");
-    assert_eq!(evaluate_after_land.expect.get("delivered"), Some(&json!(true)));
+    assert_eq!(
+        evaluate_after_land.expect.get("delivered"),
+        Some(&json!(true))
+    );
 }
 
 /// A completion payload with no diffClass at all (a legacy completion) must
@@ -724,8 +729,14 @@ fn steward_cached_verdict_probe_is_bound_to_the_exact_commit_and_gates_the_hit_p
         "the cache probe must also bind the branch, or a verdict from one branch could satisfy \
          a probe for another sharing the same tip commit"
     );
-    assert!(!probe.from_agent, "forCommit and fromAgent share one predicate slot");
-    assert!(!probe.from_instance, "forCommit and fromInstance share one predicate slot");
+    assert!(
+        !probe.from_agent,
+        "forCommit and fromAgent share one predicate slot"
+    );
+    assert!(
+        !probe.from_instance,
+        "forCommit and fromInstance share one predicate slot"
+    );
     assert_eq!(probe.field.as_deref(), Some("recommendation"));
     assert_eq!(probe.into, "cachedVerdict");
     assert_eq!(
@@ -847,8 +858,7 @@ fn shipped_land_workflows_gate_failed_delivery() {
     assert_eq!(steward_gate.expect.get("delivered"), Some(&json!(true)));
     assert!(steward_gate.any_of.is_empty());
 
-    let approval =
-        rk_workflow::load(&examples_dir().join("land-on-approve.cue"), &inputs).unwrap();
+    let approval = rk_workflow::load(&examples_dir().join("land-on-approve.cue"), &inputs).unwrap();
     let Step::When(approval_route) = approval.steps.last().unwrap() else {
         panic!("land-on-approve should end in approval routing");
     };
@@ -987,7 +997,9 @@ fn pr_on_approve_opens_a_pr_on_approve_only() {
     assert_eq!(open_pr.target, "main");
     // APPROVE must never fall back to a direct land/merge.
     assert!(
-        !when.cases["true"].iter().any(|s| matches!(s, Step::Land(_))),
+        !when.cases["true"]
+            .iter()
+            .any(|s| matches!(s, Step::Land(_))),
         "pr-on-approve must hand off via a PR, never land directly"
     );
     // The PR result is gated: a failed push must fail closed, not complete clean.
@@ -1069,7 +1081,11 @@ fn approval_gated_examples_bind_their_decision_read_to_the_instance() {
         ("taskId".to_string(), json!("risky-change")),
         ("description".to_string(), json!("rework retry logic")),
     ]);
-    for name in ["gated-merge.cue", "land-on-approve.cue", "pr-on-approve.cue"] {
+    for name in [
+        "gated-merge.cue",
+        "land-on-approve.cue",
+        "pr-on-approve.cue",
+    ] {
         let workflow = rk_workflow::load(&examples_dir().join(name), &inputs).unwrap();
         // The premise: these examples do park at an approval gate. If one stops
         // doing so the loop below would vacuously pass, so assert it outright.

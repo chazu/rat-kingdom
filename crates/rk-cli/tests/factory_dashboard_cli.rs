@@ -98,10 +98,7 @@ async fn dashboard_includes_the_native_operator_inbox() {
         .await
         .unwrap();
 
-    let output = run_with_layout(
-        &layout,
-        &["factory", "dashboard", "--repo", "rat-kingdom"],
-    );
+    let output = run_with_layout(&layout, &["factory", "dashboard", "--repo", "rat-kingdom"]);
     assert!(
         output.status.success(),
         "stderr: {}\nstdout: {}",

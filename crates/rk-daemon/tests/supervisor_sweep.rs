@@ -200,7 +200,11 @@ async fn busy_runaway_rat_is_flagged_runaway_by_burn_rate() {
     let mut runaway = false;
     for _ in 0..120 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if obstacle_kinds(&mut client).await.iter().any(|k| k == "runaway") {
+        if obstacle_kinds(&mut client)
+            .await
+            .iter()
+            .any(|k| k == "runaway")
+        {
             runaway = true;
             break;
         }

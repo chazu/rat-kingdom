@@ -207,10 +207,8 @@ mod product_to_code_workflow {
 
     #[test]
     fn test_workflow_propose_rejects_graph_with_cycle_before_dispatch() {
-        let graph_path = std::env::temp_dir().join(format!(
-            "rk-p2c-workflow-cycle-{}.json",
-            std::process::id()
-        ));
+        let graph_path =
+            std::env::temp_dir().join(format!("rk-p2c-workflow-cycle-{}.json", std::process::id()));
         fs::write(
             &graph_path,
             r#"{
@@ -322,7 +320,10 @@ mod product_to_code_workflow {
         assert_eq!(value["submitted_to_daemon"], true);
         assert_eq!(value["proposal_id"], value["digest"]);
         assert_eq!(value["proposal_id"].as_str().unwrap().len(), 64);
-        assert_eq!(value["canonical_action"]["kind"], "product_to_code.dispatch");
+        assert_eq!(
+            value["canonical_action"]["kind"],
+            "product_to_code.dispatch"
+        );
 
         let dispatches = value["canonical_action"]["dispatches"].as_array().unwrap();
         assert_eq!(dispatches.len(), 1);

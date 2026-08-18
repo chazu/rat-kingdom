@@ -314,7 +314,10 @@ workflow: {
         ));
         assert_eq!(executed["result"]["status"], "completed");
         assert_eq!(executed["approval"]["status"], "consumed");
-        assert_eq!(executed["result"]["dispatched"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            executed["result"]["dispatched"].as_array().unwrap().len(),
+            1
+        );
         assert_eq!(executed["result"]["blocked"].as_array().unwrap().len(), 1);
 
         handle.abort();

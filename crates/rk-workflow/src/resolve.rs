@@ -271,7 +271,10 @@ mod tests {
             "fake",
         )
         .unwrap();
-        assert_eq!(resolved.harness, "codex", "tier harness beats named profile");
+        assert_eq!(
+            resolved.harness, "codex",
+            "tier harness beats named profile"
+        );
         assert_eq!(resolved.model.as_deref(), Some("haiku"));
 
         // An inline model override still beats the tier.

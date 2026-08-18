@@ -197,7 +197,9 @@ async fn dismiss_all_only_clean_merges_clean_parks_failed() {
                 failed = true;
                 break;
             }
-            "completed" => panic!("expected the parked failure to fail the instance, but it completed"),
+            "completed" => {
+                panic!("expected the parked failure to fail the instance, but it completed")
+            }
             _ => {}
         }
     }
@@ -210,10 +212,7 @@ async fn dismiss_all_only_clean_merges_clean_parks_failed() {
     let base = repo_dir.path();
     git(base, &["checkout", "main"]);
     let tracked = git(base, &["ls-files"]);
-    let merged_files: Vec<&str> = tracked
-        .lines()
-        .filter(|f| f.starts_with("work-"))
-        .collect();
+    let merged_files: Vec<&str> = tracked.lines().filter(|f| f.starts_with("work-")).collect();
     assert_eq!(
         merged_files.len(),
         1,
@@ -314,10 +313,7 @@ async fn dismiss_all_merges_every_fanout_branch() {
     let base = repo_dir.path();
     git(base, &["checkout", "main"]);
     let tracked = git(base, &["ls-files"]);
-    let merged_files: Vec<&str> = tracked
-        .lines()
-        .filter(|f| f.starts_with("work-"))
-        .collect();
+    let merged_files: Vec<&str> = tracked.lines().filter(|f| f.starts_with("work-")).collect();
     assert_eq!(
         merged_files.len(),
         2,

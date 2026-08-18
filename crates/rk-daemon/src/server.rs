@@ -10,14 +10,14 @@ use chrono::{DateTime, Utc};
 use rk_core::action::{
     ActionProposal, ApprovalGrant, ApprovalStatus, FactoryAction, ProductToCodeBlockedNode,
     ProductToCodeDispatchAction, ProductToCodeDispatchExecutionResult,
-    ProductToCodeDispatchedWorkflow, ProductToCodeWorkflowDispatch, TicketGraphApplyAction,
-    TicketGraphAppliedEdge, TicketGraphApplyExecutionResult, TicketGraphApplyPreconditions,
+    ProductToCodeDispatchedWorkflow, ProductToCodeWorkflowDispatch, TicketGraphAppliedEdge,
+    TicketGraphApplyAction, TicketGraphApplyExecutionResult, TicketGraphApplyPreconditions,
     WorkflowRunAction,
 };
 use rk_core::id::RecordId;
 use rk_core::paths::Layout;
-use rk_core::sdlc::SignalSourcePrincipal;
 use rk_core::product_to_code::contracts::{InitiativeContract, TicketGraph};
+use rk_core::sdlc::SignalSourcePrincipal;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, SYSTEM_SCOPE};
 use rk_space::{CoordinatorEvent, Space};
 use serde::Deserialize;
@@ -277,7 +277,9 @@ impl Daemon {
         daemon.recovery_sweep_config = config.recovery_sweep.clone();
         daemon.instance_timeout_sweep_config = config.instance_timeout_sweep.clone();
         daemon.ticket_reopen_sweep_config = config.ticket_reopen_sweep.clone();
-        daemon.supervisor.set_min_free_disk_gb(config.disk.min_free_gb);
+        daemon
+            .supervisor
+            .set_min_free_disk_gb(config.disk.min_free_gb);
         daemon
             .supervisor
             .set_done_kill_grace_secs(config.supervisor.done_kill_grace_secs);
@@ -356,7 +358,8 @@ impl Daemon {
         // the periodic sweep tick): `done_kill_grace_secs` is read from the
         // event-handling path in real time, same reasoning as
         // `min_free_disk_gb` — see `Supervisor::schedule_done_kill`.
-        self.supervisor.set_done_kill_grace_secs(cfg.done_kill_grace_secs);
+        self.supervisor
+            .set_done_kill_grace_secs(cfg.done_kill_grace_secs);
         self.sweep_config = cfg;
     }
 
@@ -1602,8 +1605,7 @@ impl Daemon {
     ) -> crate::factory_analytics::AnalyticsInputs {
         let repo = req.repo.clone().unwrap_or_default();
         let in_window = |ms: i64| -> bool {
-            req.since.is_none_or(|since| ms >= since)
-                && req.until.is_none_or(|until| ms <= until)
+            req.since.is_none_or(|since| ms >= since) && req.until.is_none_or(|until| ms <= until)
         };
         // Always read active + archived immutable snapshots. The pure fact/
         // scorecard layer applies include_archived to metric numerators while
@@ -1623,7 +1625,10 @@ impl Daemon {
             .into_iter()
             .filter(|instance| req.repo.as_deref().is_none_or(|r| instance.repo == r))
             .filter(|instance| {
-                let observed_at = instance.completed_at.unwrap_or(instance.started_at).timestamp_millis();
+                let observed_at = instance
+                    .completed_at
+                    .unwrap_or(instance.started_at)
+                    .timestamp_millis();
                 in_window(observed_at)
             })
             .collect();
@@ -1633,24 +1638,37 @@ impl Daemon {
                 .filter(|ticket| in_window(ticket.created_at.timestamp_millis()))
                 .collect(),
             Err(error) => {
-                runtime_unavailable.push(rk_core::factory::outcome_facts::OutcomeEvidenceKind::RecurrenceKey);
-                read_warnings.push(format!("source_family_read_failed: RecurrenceKey unavailable: {error}"));
+                runtime_unavailable
+                    .push(rk_core::factory::outcome_facts::OutcomeEvidenceKind::RecurrenceKey);
+                read_warnings.push(format!(
+                    "source_family_read_failed: RecurrenceKey unavailable: {error}"
+                ));
                 Vec::new()
             }
         };
         let approval_grants = match self.action_approvals.list_grants() {
             Ok(grants) => grants
                 .into_iter()
-                .filter(|grant| req.repo.as_deref().is_none_or(|repo| grant.scope.repo.identity == repo))
+                .filter(|grant| {
+                    req.repo
+                        .as_deref()
+                        .is_none_or(|repo| grant.scope.repo.identity == repo)
+                })
                 .filter(|grant| in_window(grant.approved_at.timestamp_millis()))
                 .collect(),
             Err(error) => {
-                runtime_unavailable.push(rk_core::factory::outcome_facts::OutcomeEvidenceKind::HumanGateDecision);
-                read_warnings.push(format!("source_family_read_failed: HumanGateDecision unavailable: {error}"));
+                runtime_unavailable
+                    .push(rk_core::factory::outcome_facts::OutcomeEvidenceKind::HumanGateDecision);
+                read_warnings.push(format!(
+                    "source_family_read_failed: HumanGateDecision unavailable: {error}"
+                ));
                 Vec::new()
             }
         };
-        let sdlc_ci_facts = match self.space.scan(&Pattern::category(Category::Event).scope("ci")) {
+        let sdlc_ci_facts = match self
+            .space
+            .scan(&Pattern::category(Category::Event).scope("ci"))
+        {
             Ok(events) => events
                 .into_iter()
                 .filter(|event| {
@@ -1674,8 +1692,11 @@ impl Daemon {
                 })
                 .collect(),
             Err(error) => {
-                runtime_unavailable.push(rk_core::factory::outcome_facts::OutcomeEvidenceKind::Phase4CiSignal);
-                read_warnings.push(format!("source_family_read_failed: Phase4CiSignal unavailable: {error}"));
+                runtime_unavailable
+                    .push(rk_core::factory::outcome_facts::OutcomeEvidenceKind::Phase4CiSignal);
+                read_warnings.push(format!(
+                    "source_family_read_failed: Phase4CiSignal unavailable: {error}"
+                ));
                 Vec::new()
             }
         };
@@ -1689,9 +1710,8 @@ impl Daemon {
                 .filter(|fact| in_window(fact.created_at.timestamp_millis()))
                 .collect(),
             Err(error) => {
-                runtime_unavailable.push(
-                    rk_core::factory::outcome_facts::OutcomeEvidenceKind::StructuredRevert,
-                );
+                runtime_unavailable
+                    .push(rk_core::factory::outcome_facts::OutcomeEvidenceKind::StructuredRevert);
                 read_warnings.push(format!(
                     "source_family_read_failed: StructuredRevert unavailable: {error}"
                 ));
@@ -2600,16 +2620,18 @@ impl Daemon {
         // Automated recovery-action escalations (B2) and their acks. `rk
         // inbox` surfaces an unacked one via `recovery_action_rows`, a plain
         // function rather than a `build` input — see its doc comment for why.
-        let recovery_actions =
-            match scan(Pattern::category(Category::Event).identity(crate::recovery::RECOVERY_ACTION_IDENTITY)) {
-                Ok(t) => t,
-                Err(e) => return Err(e),
-            };
-        let recovery_acks =
-            match scan(Pattern::category(Category::Event).identity(crate::recovery::INBOX_ACK_IDENTITY)) {
-                Ok(t) => t,
-                Err(e) => return Err(e),
-            };
+        let recovery_actions = match scan(
+            Pattern::category(Category::Event).identity(crate::recovery::RECOVERY_ACTION_IDENTITY),
+        ) {
+            Ok(t) => t,
+            Err(e) => return Err(e),
+        };
+        let recovery_acks = match scan(
+            Pattern::category(Category::Event).identity(crate::recovery::INBOX_ACK_IDENTITY),
+        ) {
+            Ok(t) => t,
+            Err(e) => return Err(e),
+        };
         let mut items = crate::inbox::build(
             &agents,
             &instances,
@@ -2696,9 +2718,7 @@ impl Daemon {
         };
         let target = match self.space.get(record_id) {
             Ok(Some(t)) => t,
-            Ok(None) => {
-                return Response::err(req.id, codes::BAD_PARAMS, format!("no tuple {id}"))
-            }
+            Ok(None) => return Response::err(req.id, codes::BAD_PARAMS, format!("no tuple {id}")),
             Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
         };
         if target.category != Category::Event
@@ -2710,8 +2730,8 @@ impl Daemon {
                 format!("{id} is not a recovery-action escalation"),
             );
         }
-        let mut already = Pattern::category(Category::Event)
-            .identity(crate::recovery::INBOX_ACK_IDENTITY);
+        let mut already =
+            Pattern::category(Category::Event).identity(crate::recovery::INBOX_ACK_IDENTITY);
         already.payload_search = Some(format!("\"tuple\":\"{id}\""));
         match self.space.has_persistence_event_matching(&already) {
             Ok(true) => {
@@ -2953,8 +2973,10 @@ impl Daemon {
     /// the channel set the original announce did — sinks are stateless
     /// shell-outs (B1), so a second registry instance is free to build.
     fn recovery_renotify_sweep_once(&self) -> usize {
-        let sinks = crate::reactor::sink_factory()
-            .registry(self.notify_config.resolved(self.reactor_config.notify_escalations));
+        let sinks = crate::reactor::sink_factory().registry(
+            self.notify_config
+                .resolved(self.reactor_config.notify_escalations),
+        );
         let schedule = crate::recovery::RenotifySchedule {
             first: Duration::from_secs(self.recovery_sweep_config.first_renotify_secs.max(1)),
             repeat: Duration::from_secs(self.recovery_sweep_config.repeat_renotify_secs.max(1)),
@@ -2976,15 +2998,23 @@ impl Daemon {
     /// and the daemon's single long-lived [`recovery_announcer`](Self::recovery_announcer)
     /// so the rate cap accumulates correctly across sweep ticks.
     async fn stale_instance_timeout_sweep_once(&self) -> usize {
-        let sinks = crate::reactor::sink_factory()
-            .registry(self.notify_config.resolved(self.reactor_config.notify_escalations));
+        let sinks = crate::reactor::sink_factory().registry(
+            self.notify_config
+                .resolved(self.reactor_config.notify_escalations),
+        );
         self.engine()
             .stale_timeout_sweep_once(
                 chrono::Utc::now(),
-                Duration::from_secs(self.instance_timeout_sweep_config.default_timeout_secs.max(1)),
+                Duration::from_secs(
+                    self.instance_timeout_sweep_config
+                        .default_timeout_secs
+                        .max(1),
+                ),
                 &self.recovery_announcer,
                 &sinks,
-                crate::recovery::RateCap::per_hour(self.instance_timeout_sweep_config.rate_cap_per_hour),
+                crate::recovery::RateCap::per_hour(
+                    self.instance_timeout_sweep_config.rate_cap_per_hour,
+                ),
             )
             .await
     }
@@ -3018,7 +3048,10 @@ impl Daemon {
     async fn ticket_reopen_sweep_at(&self, now: DateTime<Utc>) -> usize {
         let stale_after =
             chrono::Duration::seconds(self.ticket_reopen_sweep_config.stale_after_secs as i64);
-        let in_progress = match self.tickets.list(None, Some("in_progress".to_string()), None) {
+        let in_progress = match self
+            .tickets
+            .list(None, Some("in_progress".to_string()), None)
+        {
             Ok(tickets) => tickets,
             Err(e) => {
                 warn!(error = %e, "ticket reopen sweep: list failed");
@@ -3028,8 +3061,10 @@ impl Daemon {
         if in_progress.is_empty() {
             return 0;
         }
-        let sinks = crate::reactor::sink_factory()
-            .registry(self.notify_config.resolved(self.reactor_config.notify_escalations));
+        let sinks = crate::reactor::sink_factory().registry(
+            self.notify_config
+                .resolved(self.reactor_config.notify_escalations),
+        );
         let announcer = crate::recovery::RecoveryAnnouncer::new();
         let mut reopened = 0usize;
         for ticket in in_progress {
@@ -3038,26 +3073,28 @@ impl Daemon {
                 .get("assignee")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let agent = assignee.as_deref().and_then(|name| self.supervisor.status(name)).or_else(|| {
-                // A ticket with no `assignee` is not necessarily ownerless: a
-                // drain claim writes `assignee` only after its spawn returns
-                // (drain.rs), so a ticket in the gap between claim and that
-                // write — or one left behind by a daemon predating that
-                // write — can still have a live rat working it. `task ==
-                // ticket id` is the same identity both the drain and the CLI
-                // spawn path (agent_cmds.rs) key on, so it is a reliable
-                // fallback match. Only tried when `assignee` is absent: a
-                // ticket that names a dead/gone assignee must not be
-                // rescued by an unrelated live agent that happens to share
-                // its task.
-                if assignee.is_some() {
-                    return None;
-                }
-                self.supervisor
-                    .list()
-                    .into_iter()
-                    .find(|a| a.state.is_live() && a.task.as_deref() == Some(ticket.identity.as_str()))
-            });
+            let agent = assignee
+                .as_deref()
+                .and_then(|name| self.supervisor.status(name))
+                .or_else(|| {
+                    // A ticket with no `assignee` is not necessarily ownerless: a
+                    // drain claim writes `assignee` only after its spawn returns
+                    // (drain.rs), so a ticket in the gap between claim and that
+                    // write — or one left behind by a daemon predating that
+                    // write — can still have a live rat working it. `task ==
+                    // ticket id` is the same identity both the drain and the CLI
+                    // spawn path (agent_cmds.rs) key on, so it is a reliable
+                    // fallback match. Only tried when `assignee` is absent: a
+                    // ticket that names a dead/gone assignee must not be
+                    // rescued by an unrelated live agent that happens to share
+                    // its task.
+                    if assignee.is_some() {
+                        return None;
+                    }
+                    self.supervisor.list().into_iter().find(|a| {
+                        a.state.is_live() && a.task.as_deref() == Some(ticket.identity.as_str())
+                    })
+                });
             if agent.as_ref().is_some_and(|a| a.state.is_live()) {
                 continue;
             }
@@ -4139,28 +4176,31 @@ impl Daemon {
             )
         };
         self.supervisor
-            .spawn_async(crate::supervisor::SpawnParams {
-                repo: session.repo_path.to_string_lossy().into_owned(),
-                task: session.id.clone(),
-                prompt: Some(format!(
-                    "Assess this repository read-only for onboarding session {}. \
+            .spawn_async(
+                crate::supervisor::SpawnParams {
+                    repo: session.repo_path.to_string_lossy().into_owned(),
+                    task: session.id.clone(),
+                    prompt: Some(format!(
+                        "Assess this repository read-only for onboarding session {}. \
                      The daemon's deterministic starting assessment follows. Confirm \
                      evidence and report ambiguity. {proposal_instruction} \
                      {completion_instruction}\n\n{}",
-                    session.id, assessment,
-                )),
-                role: crate::onboarding_sessions::ONBOARDER_ROLE.into(),
-                coordination: None,
-                harness: Some(session.harness.clone()),
-                parent: None,
-                base: Some(session.base_branch.clone()),
-                model: session.model.clone(),
-                permission_mode: None,
-                attach,
-                workflow_instance: None,
-                coordinator: None,
-                instance_max_usd: None,
-            }, 0)
+                        session.id, assessment,
+                    )),
+                    role: crate::onboarding_sessions::ONBOARDER_ROLE.into(),
+                    coordination: None,
+                    harness: Some(session.harness.clone()),
+                    parent: None,
+                    base: Some(session.base_branch.clone()),
+                    model: session.model.clone(),
+                    permission_mode: None,
+                    attach,
+                    workflow_instance: None,
+                    coordinator: None,
+                    instance_max_usd: None,
+                },
+                0,
+            )
             .await
     }
 
@@ -4650,11 +4690,9 @@ impl Daemon {
             || submitted.initiative != stored.initiative
             || submitted.apply_plan != stored.apply_plan
         {
-            let recomputed = crate::action_approval::recompute_proposal_digest(
-                &proposal,
-                &submitted_action,
-            )
-            .unwrap_or_else(|error| format!("<error:{error}>"));
+            let recomputed =
+                crate::action_approval::recompute_proposal_digest(&proposal, &submitted_action)
+                    .unwrap_or_else(|error| format!("<error:{error}>"));
             return Response::err(
                 req.id,
                 codes::FORBIDDEN,
@@ -4680,11 +4718,17 @@ impl Daemon {
         };
         let _guard = self.ticket_graph_apply_lock.lock().await;
         let ticket_guard = self.tickets.mutation_guard().await;
-        let existing = match self.action_approvals.ticket_graph_result(&params.proposal_id) {
+        let existing = match self
+            .action_approvals
+            .ticket_graph_result(&params.proposal_id)
+        {
             Ok(result) => result,
             Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
         };
-        if let Some(mut result) = existing.clone().filter(|result| result.status == "completed") {
+        if let Some(mut result) = existing
+            .clone()
+            .filter(|result| result.status == "completed")
+        {
             let (reconciled, approval) = match self
                 .action_approvals
                 .finish_ticket_graph_success(&params.proposal_id, result.clone())
@@ -4696,14 +4740,11 @@ impl Daemon {
             result.idempotent_replay = true;
             return Response::ok(req.id, json!({"result": result, "approval": approval}));
         }
-        let actual_preconditions = match self.ticket_graph_live_preconditions(
-            &stored,
-            &ticket_guard,
-            &execution_id,
-        ) {
-            Ok(preconditions) => preconditions,
-            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
-        };
+        let actual_preconditions =
+            match self.ticket_graph_live_preconditions(&stored, &ticket_guard, &execution_id) {
+                Ok(preconditions) => preconditions,
+                Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+            };
         if actual_preconditions != stored.preconditions {
             let message = format!(
                 "ticket graph CAS mismatch: expected repo_head={} ticket_store_digest={}, actual repo_head={} ticket_store_digest={}",
@@ -5187,11 +5228,17 @@ impl Daemon {
             return Response::err(req.id, codes::INTERNAL, "approval missing execution id");
         };
         let _guard = self.ticket_graph_apply_lock.lock().await;
-        let existing = match self.action_approvals.product_to_code_result(&params.proposal_id) {
+        let existing = match self
+            .action_approvals
+            .product_to_code_result(&params.proposal_id)
+        {
             Ok(result) => result,
             Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
         };
-        if let Some(mut result) = existing.clone().filter(|result| result.status == "completed") {
+        if let Some(mut result) = existing
+            .clone()
+            .filter(|result| result.status == "completed")
+        {
             let (reconciled, approval) = match self
                 .action_approvals
                 .finish_product_to_code_success(&params.proposal_id, result.clone())
@@ -5903,10 +5950,10 @@ impl Daemon {
             Ok(source) => source,
             Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
         };
-        let receipt = match self.space.accept_sdlc_signal(
-            params.envelope,
-            SignalSourcePrincipal::for_source(&source),
-        ) {
+        let receipt = match self
+            .space
+            .accept_sdlc_signal(params.envelope, SignalSourcePrincipal::for_source(&source))
+        {
             Ok(receipt) => receipt,
             Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
         };
@@ -5935,11 +5982,19 @@ impl Daemon {
         }
         let source = Some(principal.name.as_str());
         let (scope, subject) = ingest_state_filter(&params);
-        match self.space.current_sdlc_facts(source, scope.as_deref(), subject.as_deref()) {
+        match self
+            .space
+            .current_sdlc_facts(source, scope.as_deref(), subject.as_deref())
+        {
             Ok(mut facts) => {
                 if let Some(repo) = params.repo.as_deref() {
                     let prefix = format!("{repo}:");
-                    facts.retain(|fact| fact.payload.get("subject").and_then(Value::as_str).is_some_and(|s| s.starts_with(&prefix)));
+                    facts.retain(|fact| {
+                        fact.payload
+                            .get("subject")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| s.starts_with(&prefix))
+                    });
                 }
                 facts.truncate(requested);
                 Response::ok(req.id, json!({"facts": facts, "truncated": false}))
@@ -7174,22 +7229,25 @@ mod default_agent_profile_tests {
         let daemon = Daemon::new(Layout::at(dir.path().join("rk-home")), &config).unwrap();
         let record = daemon
             .supervisor
-            .spawn_async(crate::supervisor::SpawnParams {
-                repo: repo.display().to_string(),
-                task: "direct-defaults".into(),
-                prompt: Some("finish".into()),
-                role: "rat".into(),
-                coordination: None,
-                harness: None,
-                parent: None,
-                base: None,
-                model: None,
-                permission_mode: None,
-                attach: false,
-                workflow_instance: None,
-                coordinator: None,
-                instance_max_usd: None,
-            }, 0)
+            .spawn_async(
+                crate::supervisor::SpawnParams {
+                    repo: repo.display().to_string(),
+                    task: "direct-defaults".into(),
+                    prompt: Some("finish".into()),
+                    role: "rat".into(),
+                    coordination: None,
+                    harness: None,
+                    parent: None,
+                    base: None,
+                    model: None,
+                    permission_mode: None,
+                    attach: false,
+                    workflow_instance: None,
+                    coordinator: None,
+                    instance_max_usd: None,
+                },
+                0,
+            )
             .await
             .unwrap();
 
@@ -7491,7 +7549,11 @@ mod ticket_reopen_sweep_tests {
     /// no-assignee fallback tests: a drain spawn keys `task` to the ticket id
     /// (`SpawnParams` in drain.rs), which is exactly what the sweep's
     /// fallback match uses in place of a missing `assignee`.
-    fn daemon_with_agent_task(name: &str, state: AgentState, task: &str) -> (tempfile::TempDir, Daemon) {
+    fn daemon_with_agent_task(
+        name: &str,
+        state: AgentState,
+        task: &str,
+    ) -> (tempfile::TempDir, Daemon) {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::at(dir.path());
         layout.ensure().unwrap();

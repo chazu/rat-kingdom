@@ -130,7 +130,10 @@ impl CommandSink {
         let mut env = BTreeMap::from([
             ("RK_NOTICE_TUPLE".to_string(), notice.tuple_id.clone()),
             ("RK_NOTICE_CLASS".to_string(), notice.class.clone()),
-            ("RK_NOTICE_SEVERITY".to_string(), notice.severity.to_string()),
+            (
+                "RK_NOTICE_SEVERITY".to_string(),
+                notice.severity.to_string(),
+            ),
             ("RK_NOTICE_SCOPE".to_string(), notice.scope.clone()),
             ("RK_NOTICE_SUBJECT".to_string(), notice.subject.clone()),
             ("RK_NOTICE_TEXT".to_string(), notice.text.clone()),
@@ -189,9 +192,7 @@ impl NotificationSink for CommandSink {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| {
-                crate::Error::other(format!("could not run `{}`: {e}", self.program))
-            })?;
+            .map_err(|e| crate::Error::other(format!("could not run `{}`: {e}", self.program)))?;
 
         // Broken pipe here is normal: a script that ignores stdin closes it.
         // The notice is small, but a child that never reads while we write more
@@ -200,9 +201,8 @@ impl NotificationSink for CommandSink {
             let _ = stdin.write_all(&payload);
         }
 
-        let status = wait_bounded(&mut child, self.timeout).map_err(|e| {
-            crate::Error::other(format!("`{}` {e}", self.program))
-        })?;
+        let status = wait_bounded(&mut child, self.timeout)
+            .map_err(|e| crate::Error::other(format!("`{}` {e}", self.program)))?;
         if !status.success() {
             return Err(crate::Error::other(format!(
                 "`{}` exited {}",
@@ -377,7 +377,9 @@ mod tests {
         .unwrap();
 
         let started = Instant::now();
-        let err = sink.deliver(&notice()).expect_err("a hung child must not win");
+        let err = sink
+            .deliver(&notice())
+            .expect_err("a hung child must not win");
         assert!(err.to_string().contains("timed out"), "{err}");
         assert!(
             started.elapsed() < Duration::from_secs(30),

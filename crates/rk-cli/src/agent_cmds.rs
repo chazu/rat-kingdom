@@ -551,24 +551,15 @@ fn format_status(a: &Value) -> String {
     .unwrap();
     for (label, value) in [
         ("role", a["role"].as_str().unwrap_or("?").to_string()),
-        (
-            "harness",
-            a["harness"].as_str().unwrap_or("?").to_string(),
-        ),
+        ("harness", a["harness"].as_str().unwrap_or("?").to_string()),
         ("model", a["model"].as_str().unwrap_or("-").to_string()),
         (
             "permissions",
             a["permission_mode"].as_str().unwrap_or("-").to_string(),
         ),
-        (
-            "repo",
-            a["repo_root"].as_str().unwrap_or("?").to_string(),
-        ),
+        ("repo", a["repo_root"].as_str().unwrap_or("?").to_string()),
         ("task", a["task"].as_str().unwrap_or("-").to_string()),
-        (
-            "branch",
-            a["branch"].as_str().unwrap_or("-").to_string(),
-        ),
+        ("branch", a["branch"].as_str().unwrap_or("-").to_string()),
         (
             "base",
             a["target_branch"].as_str().unwrap_or("-").to_string(),

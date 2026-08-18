@@ -175,7 +175,8 @@ impl Drain {
             // `in_progress`; it stays `open` and visible to an operator, who
             // can still dispatch it deliberately by hand. `continue`, not
             // `break`: the rest of the backlog still drains.
-            if rk_core::freeze::blocks_automated_dispatch(&string_array(&ticket.payload, "labels")) {
+            if rk_core::freeze::blocks_automated_dispatch(&string_array(&ticket.payload, "labels"))
+            {
                 info!(
                     ticket = %ticket.identity,
                     "drain skipped ticket tagged to a frozen subsystem"
@@ -646,9 +647,7 @@ mod tests {
             &[(Some("high"), None, "premium")],
             &[("premium", Some("claude"), Some("opus"))],
         );
-        let resolved = d
-            .resolve_tier(&ticket("TKT-1", "low", Utc::now()))
-            .unwrap();
+        let resolved = d.resolve_tier(&ticket("TKT-1", "low", Utc::now())).unwrap();
         assert_eq!(resolved.harness, "fake", "falls back to default harness");
         assert_eq!(resolved.model, None);
     }

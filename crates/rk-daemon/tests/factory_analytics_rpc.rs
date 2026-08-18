@@ -107,7 +107,10 @@ async fn setup_with_space() -> (
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
     client
-        .call("repo.add", json!({"name":"repo-a", "path": repo_dir.path()}))
+        .call(
+            "repo.add",
+            json!({"name":"repo-a", "path": repo_dir.path()}),
+        )
         .await
         .unwrap();
     (home, repo_dir, layout, handle, space, client)
@@ -213,7 +216,10 @@ async fn settled_agent_name(client: &mut Client) -> String {
 
 async fn snapshot_state(client: &mut Client) -> Value {
     client
-        .call("factory.snapshot", json!({"repo":"repo-a", "include_archived":true}))
+        .call(
+            "factory.snapshot",
+            json!({"repo":"repo-a", "include_archived":true}),
+        )
         .await
         .unwrap()["snapshot"]
         .clone()
@@ -225,7 +231,10 @@ async fn assert_bad_params(client: &mut Client, params: Value, expected: &str) {
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains(expected), "{err:?} did not contain {expected:?}");
+    assert!(
+        err.contains(expected),
+        "{err:?} did not contain {expected:?}"
+    );
 }
 
 #[tokio::test]
@@ -280,7 +289,10 @@ async fn factory_recommend_rpc_returns_advisory_read_only_recommendations() {
         "update-workflow",
         "\"approve\"",
     ] {
-        assert!(!blob.contains(banned), "advisory payload must not contain {banned}");
+        assert!(
+            !blob.contains(banned),
+            "advisory payload must not contain {banned}"
+        );
     }
 
     client.call("stop", json!({})).await.unwrap();
@@ -295,17 +307,31 @@ async fn factory_rpcs_report_missing_source_families_as_unobserved_not_zero() {
         .await
         .unwrap();
     let warnings = resp["warnings"].as_array().unwrap();
-    for family in ["Phase3Contract", "Phase3VerifiedDelivery", "PricingSnapshot"] {
-        assert!(!availability_of(&resp, family), "{family} must be unobserved");
+    for family in [
+        "Phase3Contract",
+        "Phase3VerifiedDelivery",
+        "PricingSnapshot",
+    ] {
         assert!(
-            warnings.iter().any(|w| w.as_str().unwrap().contains(family)),
+            !availability_of(&resp, family),
+            "{family} must be unobserved"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap().contains(family)),
             "warning must name unobserved family {family}"
         );
     }
     for family in ["StructuredReviewerRework", "StructuredRevert"] {
-        assert!(availability_of(&resp, family), "{family} has a daemon read seam");
+        assert!(
+            availability_of(&resp, family),
+            "{family} has a daemon read seam"
+        );
         assert_eq!(source_count(&resp, family)["event_count"], json!(0));
-        assert!(warnings.iter().all(|w| !w.as_str().unwrap().contains(family)));
+        assert!(warnings
+            .iter()
+            .all(|w| !w.as_str().unwrap().contains(family)));
     }
     client.call("stop", json!({})).await.unwrap();
     handle.await.unwrap().unwrap();
@@ -361,13 +387,28 @@ async fn factory_analytics_reads_revert_fact_and_rework_verdict_end_to_end() {
         .call("factory.scorecards", json!({"repo":repo_scope.clone()}))
         .await
         .unwrap();
-    assert_eq!(first, second, "same daemon state must serialize identically");
+    assert_eq!(
+        first, second,
+        "same daemon state must serialize identically"
+    );
     assert!(availability_of(&first, "StructuredRevert"));
     assert!(availability_of(&first, "StructuredReviewerRework"));
-    assert_eq!(source_count(&first, "StructuredRevert")["active_source_count"], json!(1));
-    assert_eq!(source_count(&first, "StructuredRevert")["event_count"], json!(1));
-    assert_eq!(source_count(&first, "StructuredReviewerRework")["active_source_count"], json!(1));
-    assert_eq!(source_count(&first, "StructuredReviewerRework")["event_count"], json!(1));
+    assert_eq!(
+        source_count(&first, "StructuredRevert")["active_source_count"],
+        json!(1)
+    );
+    assert_eq!(
+        source_count(&first, "StructuredRevert")["event_count"],
+        json!(1)
+    );
+    assert_eq!(
+        source_count(&first, "StructuredReviewerRework")["active_source_count"],
+        json!(1)
+    );
+    assert_eq!(
+        source_count(&first, "StructuredReviewerRework")["event_count"],
+        json!(1)
+    );
 
     let row = first["scorecards"]
         .as_array()
@@ -433,7 +474,10 @@ async fn factory_rpcs_are_deterministic_and_read_only_across_repeated_calls() {
         + before["approvals"]["proposals"].as_array().unwrap().len()
         + before["approvals"]["grants"].as_array().unwrap().len()
         > 0;
-    assert!(has_nonempty_state, "read-only proof must compare nonempty factory state");
+    assert!(
+        has_nonempty_state,
+        "read-only proof must compare nonempty factory state"
+    );
 
     let first = client
         .call("factory.scorecards", json!({"repo":"repo-a"}))
@@ -445,23 +489,36 @@ async fn factory_rpcs_are_deterministic_and_read_only_across_repeated_calls() {
         .unwrap();
 
     assert_eq!(first["generated_at"], json!("2023-11-14T22:13:20.123Z"));
-    assert_eq!(first, second, "fixed clock makes the whole RPC response deterministic");
+    assert_eq!(
+        first, second,
+        "fixed clock makes the whole RPC response deterministic"
+    );
 
     let recommend = client
-        .call("factory.recommend", json!({"repo":"repo-a", "min_sample":1000}))
+        .call(
+            "factory.recommend",
+            json!({"repo":"repo-a", "min_sample":1000}),
+        )
         .await
         .unwrap();
-    assert!(recommend["recommendations"].as_array().unwrap().iter().all(|r| {
-        r["advice"].is_null() || r["suppressed"] == json!(true)
-    }));
+    assert!(recommend["recommendations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| { r["advice"].is_null() || r["suppressed"] == json!(true) }));
     if !recommend["recommendations"].as_array().unwrap().is_empty() {
-        assert!(recommend["suppressions"].as_array().unwrap().iter().any(|s| {
-            s["reason"] == json!("LowSample")
-        }));
+        assert!(recommend["suppressions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| { s["reason"] == json!("LowSample") }));
     }
 
     let after = snapshot_state(&mut client).await;
-    assert_eq!(before, after, "scorecards/recommend must not mutate factory state");
+    assert_eq!(
+        before, after,
+        "scorecards/recommend must not mutate factory state"
+    );
 
     client.call("stop", json!({})).await.unwrap();
     handle.await.unwrap().unwrap();
@@ -482,7 +539,11 @@ async fn factory_analytics_scorecards_windows_workflow_approval_and_ci_sources()
         .out(ci_event("failed", "ci_failed", fixed_clock()))
         .unwrap();
     space
-        .out(ci_event("recovered", "ci_recovered", fixed_clock() + chrono::Duration::seconds(1)))
+        .out(ci_event(
+            "recovered",
+            "ci_recovered",
+            fixed_clock() + chrono::Duration::seconds(1),
+        ))
         .unwrap();
 
     let all = client
@@ -490,7 +551,10 @@ async fn factory_analytics_scorecards_windows_workflow_approval_and_ci_sources()
         .await
         .unwrap();
     assert_eq!(source_count(&all, "RecurrenceKey")["event_count"], json!(1));
-    assert_eq!(source_count(&all, "Phase4CiSignal")["event_count"], json!(2));
+    assert_eq!(
+        source_count(&all, "Phase4CiSignal")["event_count"],
+        json!(2)
+    );
 
     let future_since = (Utc::now() + chrono::Duration::days(1)).timestamp_millis();
     let future = client
@@ -500,8 +564,18 @@ async fn factory_analytics_scorecards_windows_workflow_approval_and_ci_sources()
         )
         .await
         .unwrap();
-    for family in ["AgentRecord", "WorkflowInstance", "HumanGateDecision", "RecurrenceKey", "Phase4CiSignal"] {
-        assert_eq!(source_count(&future, family)["event_count"], json!(0), "{family} must honor since");
+    for family in [
+        "AgentRecord",
+        "WorkflowInstance",
+        "HumanGateDecision",
+        "RecurrenceKey",
+        "Phase4CiSignal",
+    ] {
+        assert_eq!(
+            source_count(&future, family)["event_count"],
+            json!(0),
+            "{family} must honor since"
+        );
     }
 
     client.call("stop", json!({})).await.unwrap();

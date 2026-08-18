@@ -222,11 +222,7 @@ pub async fn run(layout: &Layout, command: ProductToCodeCommand, json_output: bo
 /// Phase 2 `factory.propose_action` path as graph propose-apply. No local
 /// mutation and no approved-id shortcut exist here; the daemon owns approval
 /// and dispatch.
-async fn run_workflow(
-    layout: &Layout,
-    command: WorkflowCommand,
-    json_output: bool,
-) -> Result<i32> {
+async fn run_workflow(layout: &Layout, command: WorkflowCommand, json_output: bool) -> Result<i32> {
     let WorkflowCommand::Propose(args) = command;
     let initiative: InitiativeContract = read_json(&args.initiative)?;
     let research: ArchitectureResearchArtifact = read_json(&args.research)?;

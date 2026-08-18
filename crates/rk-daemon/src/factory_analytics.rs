@@ -15,11 +15,11 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use rk_core::action::ApprovalGrant;
 use rk_core::factory::outcome_events::{FactoryMetricPayload, StructuredOutcomeInput};
 use rk_core::factory::outcome_facts::{
     OutcomeEvidenceKind, OutcomeFact, OutcomeFactBuilder, OutcomeFactSource,
 };
-use rk_core::action::ApprovalGrant;
 use rk_core::factory::recommendations::{
     evaluate_recommendation_report, RecommendationSuppression, SuppressionReason,
 };
@@ -230,7 +230,10 @@ fn normalize_inputs(
 
     for instance in &inputs.instances {
         let archived = instance.archived_at.is_some();
-        let observed_at_ms = instance.completed_at.unwrap_or(instance.started_at).timestamp_millis();
+        let observed_at_ms = instance
+            .completed_at
+            .unwrap_or(instance.started_at)
+            .timestamp_millis();
         let payload = if let Some(completed_at) = instance.completed_at {
             FactoryMetricPayload::LeadTime {
                 started_at_ms: instance.started_at.timestamp_millis(),
@@ -275,8 +278,11 @@ fn normalize_inputs(
         if !is_structured_revert_fact(fact) {
             continue;
         }
-        let agent_id = structured_string(&fact.payload, "agent")
-            .or_else(|| fact.identity.strip_prefix("merge-reverted-").map(str::to_owned));
+        let agent_id = structured_string(&fact.payload, "agent").or_else(|| {
+            fact.identity
+                .strip_prefix("merge-reverted-")
+                .map(str::to_owned)
+        });
         let agent = agent_of(agent_id.as_deref());
         let workflow_instance_id = agent.and_then(|agent| agent.workflow_instance.clone());
         let merge_commit = structured_string(&fact.payload, "merge_commit");
@@ -350,36 +356,70 @@ fn normalize_inputs(
     }
 
     for ticket in &inputs.tickets {
-        let Some(key) = ticket.payload.get("coalesce_key").and_then(Value::as_str) else { continue; };
-        if key.trim().is_empty() { continue; }
+        let Some(key) = ticket.payload.get("coalesce_key").and_then(Value::as_str) else {
+            continue;
+        };
+        if key.trim().is_empty() {
+            continue;
+        }
         structured.push(StructuredOutcomeInput {
-            repo: inputs.repo.clone(), source_family: OutcomeEvidenceKind::RecurrenceKey,
-            source_id: ticket.identity.clone(), source_version: None, archived: false,
-            archive_reason: None, observed_at_ms: ticket.created_at.timestamp_millis(),
-            task_class: None, workflow: None, harness: None, model: None, agent_id: None,
-            workflow_instance_id: None, ticket_id: Some(ticket.identity.clone()),
-            phase3_outcome_id: None, phase4_signal_id: None,
-            recurrence_key: Some(key.trim().to_owned()), coalesce_key: Some(key.trim().to_owned()),
-            payload: FactoryMetricPayload::Recurrence, decoy_prose: String::new(),
+            repo: inputs.repo.clone(),
+            source_family: OutcomeEvidenceKind::RecurrenceKey,
+            source_id: ticket.identity.clone(),
+            source_version: None,
+            archived: false,
+            archive_reason: None,
+            observed_at_ms: ticket.created_at.timestamp_millis(),
+            task_class: None,
+            workflow: None,
+            harness: None,
+            model: None,
+            agent_id: None,
+            workflow_instance_id: None,
+            ticket_id: Some(ticket.identity.clone()),
+            phase3_outcome_id: None,
+            phase4_signal_id: None,
+            recurrence_key: Some(key.trim().to_owned()),
+            coalesce_key: Some(key.trim().to_owned()),
+            payload: FactoryMetricPayload::Recurrence,
+            decoy_prose: String::new(),
         });
     }
 
     for grant in &inputs.approval_grants {
         structured.push(StructuredOutcomeInput {
-            repo: inputs.repo.clone(), source_family: OutcomeEvidenceKind::HumanGateDecision,
-            source_id: grant.proposal_id.clone(), source_version: Some(grant.digest.clone()), archived: false,
-            archive_reason: None, observed_at_ms: grant.approved_at.timestamp_millis(),
-            task_class: None, workflow: None, harness: None, model: None,
-            agent_id: Some(grant.requester.clone()), workflow_instance_id: grant.instance_id.clone(),
-            ticket_id: None, phase3_outcome_id: None, phase4_signal_id: None,
-            recurrence_key: None, coalesce_key: None,
-            payload: FactoryMetricPayload::HumanIntervention { count: 1 }, decoy_prose: String::new(),
+            repo: inputs.repo.clone(),
+            source_family: OutcomeEvidenceKind::HumanGateDecision,
+            source_id: grant.proposal_id.clone(),
+            source_version: Some(grant.digest.clone()),
+            archived: false,
+            archive_reason: None,
+            observed_at_ms: grant.approved_at.timestamp_millis(),
+            task_class: None,
+            workflow: None,
+            harness: None,
+            model: None,
+            agent_id: Some(grant.requester.clone()),
+            workflow_instance_id: grant.instance_id.clone(),
+            ticket_id: None,
+            phase3_outcome_id: None,
+            phase4_signal_id: None,
+            recurrence_key: None,
+            coalesce_key: None,
+            payload: FactoryMetricPayload::HumanIntervention { count: 1 },
+            decoy_prose: String::new(),
         });
     }
 
-    let mut prior_failed_by_subject_commit = std::collections::BTreeMap::<(String, String), String>::new();
+    let mut prior_failed_by_subject_commit =
+        std::collections::BTreeMap::<(String, String), String>::new();
     let mut ci_events = inputs.sdlc_ci_facts.iter().collect::<Vec<_>>();
-    ci_events.sort_by_key(|fact| (structured_time_ms(fact, "observed_at"), fact.identity.clone()));
+    ci_events.sort_by_key(|fact| {
+        (
+            structured_time_ms(fact, "observed_at"),
+            fact.identity.clone(),
+        )
+    });
     for fact in ci_events {
         if !is_structured_sdlc_ci_event(fact) {
             continue;
@@ -395,13 +435,20 @@ fn normalize_inputs(
             .payload
             .get("kind")
             .and_then(Value::as_str)
-            .map(|kind| kind.to_ascii_lowercase()) else { continue; };
+            .map(|kind| kind.to_ascii_lowercase())
+        else {
+            continue;
+        };
         let failed = kind == "ci_failed";
         let recovered = kind == "ci_recovered";
         if !failed && !recovered {
             continue;
         }
-        let subject = fact.payload.get("subject").and_then(Value::as_str).unwrap_or_default();
+        let subject = fact
+            .payload
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let source_version = fact
             .payload
             .pointer("/correlation/commit_sha")
@@ -430,10 +477,15 @@ fn normalize_inputs(
             harness: None,
             model: None,
             agent_id: None,
-            workflow_instance_id: Some(subject.to_owned()).filter(|subject| !subject.trim().is_empty()),
+            workflow_instance_id: Some(subject.to_owned())
+                .filter(|subject| !subject.trim().is_empty()),
             ticket_id: None,
             phase3_outcome_id: None,
-            phase4_signal_id: if recovered { prior_failed } else { Some(source_id.clone()) },
+            phase4_signal_id: if recovered {
+                prior_failed
+            } else {
+                Some(source_id.clone())
+            },
             recurrence_key: None,
             coalesce_key: None,
             payload: FactoryMetricPayload::Ci { failed, recovered },
@@ -456,7 +508,11 @@ fn normalize_inputs(
 }
 
 fn is_structured_sdlc_ci_event(tuple: &Tuple) -> bool {
-    let source = tuple.payload.get("source").and_then(Value::as_str).unwrap_or_default();
+    let source = tuple
+        .payload
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let delivery_id = tuple
         .payload
         .get("delivery_id")
@@ -471,7 +527,10 @@ fn is_structured_sdlc_ci_event(tuple: &Tuple) -> bool {
 fn is_structured_revert_fact(tuple: &Tuple) -> bool {
     tuple.category == rk_core::tuple::Category::Fact
         && tuple.identity.starts_with("merge-reverted-")
-        && !tuple.identity.trim_start_matches("merge-reverted-").is_empty()
+        && !tuple
+            .identity
+            .trim_start_matches("merge-reverted-")
+            .is_empty()
 }
 
 fn is_structured_rework_artifact(tuple: &Tuple) -> bool {
@@ -494,9 +553,8 @@ fn structured_string(payload: &Value, field: &str) -> Option<String> {
 }
 
 fn ticket_id_from_payload(payload: &Value) -> Option<String> {
-    structured_string(payload, "ticket_id").or_else(|| {
-        structured_string(payload, "task").filter(|task| task.starts_with("TKT-"))
-    })
+    structured_string(payload, "ticket_id")
+        .or_else(|| structured_string(payload, "task").filter(|task| task.starts_with("TKT-")))
 }
 
 fn structured_time_ms(tuple: &Tuple, field: &str) -> i64 {
@@ -643,8 +701,11 @@ pub fn recommend_response(
             }
         }
         report.suppressions.sort_by(|l, r| {
-            (&l.subject_group_key, &l.rule, &l.reason)
-                .cmp(&(&r.subject_group_key, &r.rule, &r.reason))
+            (&l.subject_group_key, &l.rule, &l.reason).cmp(&(
+                &r.subject_group_key,
+                &r.rule,
+                &r.reason,
+            ))
         });
         report.suppressions.dedup_by(|l, r| {
             l.subject_group_key == r.subject_group_key && l.rule == r.rule && l.reason == r.reason
@@ -870,14 +931,20 @@ mod tests {
             .iter()
             .find(|event| event.source_family == OutcomeEvidenceKind::StructuredRevert)
             .unwrap();
-        assert!(matches!(revert.payload, FactoryMetricPayload::Reverted { reverted: true }));
+        assert!(matches!(
+            revert.payload,
+            FactoryMetricPayload::Reverted { reverted: true }
+        ));
         assert_eq!(revert.agent_id.as_deref(), Some("rat-1"));
         assert_eq!(revert.ticket_id.as_deref(), Some("TKT-REVERT"));
         let rework = structured
             .iter()
             .find(|event| event.source_family == OutcomeEvidenceKind::StructuredReviewerRework)
             .unwrap();
-        assert!(matches!(rework.payload, FactoryMetricPayload::Reworked { requested: true }));
+        assert!(matches!(
+            rework.payload,
+            FactoryMetricPayload::Reworked { requested: true }
+        ));
         assert_eq!(rework.agent_id.as_deref(), Some("rat-1"));
         assert_eq!(rework.ticket_id.as_deref(), Some("TKT-REWORK"));
 
@@ -946,11 +1013,26 @@ mod tests {
     fn ci_history_uses_structured_sdlc_events_not_current_or_prose() {
         let mut in_scope = inputs();
         in_scope.sdlc_ci_facts = vec![
-            ci_event("delivery-failed", "ci_failed", 1_040, "failed then later recovered"),
-            ci_event("delivery-recovered", "ci_recovered", 1_050, "recovered from prior failure"),
+            ci_event(
+                "delivery-failed",
+                "ci_failed",
+                1_040,
+                "failed then later recovered",
+            ),
+            ci_event(
+                "delivery-recovered",
+                "ci_recovered",
+                1_050,
+                "recovered from prior failure",
+            ),
         ];
         in_scope.sdlc_ci_facts.push({
-            let mut tuple = ci_event("delivery-current-only", "deployment_succeeded", 1_060, "prose says ci_failed");
+            let mut tuple = ci_event(
+                "delivery-current-only",
+                "deployment_succeeded",
+                1_060,
+                "prose says ci_failed",
+            );
             tuple.identity = "sdlc:current:github:rat-kingdom:ci:build".into();
             tuple.payload["current"] = json!({"conclusion":"failure"});
             tuple
@@ -973,7 +1055,9 @@ mod tests {
     #[test]
     fn runtime_read_degradation_marks_family_unavailable_with_warning() {
         let mut degraded = inputs();
-        degraded.runtime_unavailable.push(OutcomeEvidenceKind::Phase4CiSignal);
+        degraded
+            .runtime_unavailable
+            .push(OutcomeEvidenceKind::Phase4CiSignal);
         degraded
             .read_warnings
             .push("source_family_read_failed: Phase4CiSignal unavailable: boom".into());
@@ -991,11 +1075,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(ci["available"], json!(false));
-        assert!(resp["warnings"]
-            .as_array()
+        assert!(resp["warnings"].as_array().unwrap().iter().any(|w| w
+            .as_str()
             .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("source_family_read_failed: Phase4CiSignal")));
+            .contains("source_family_read_failed: Phase4CiSignal")));
     }
 
     #[test]

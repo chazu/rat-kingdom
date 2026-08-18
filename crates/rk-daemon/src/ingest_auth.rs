@@ -78,7 +78,9 @@ impl SourcePrincipal {
         &self.limits
     }
 
-    pub fn configured_source(&self) -> Result<ConfiguredSourceName, rk_core::sdlc::SignalValidationError> {
+    pub fn configured_source(
+        &self,
+    ) -> Result<ConfiguredSourceName, rk_core::sdlc::SignalValidationError> {
         ConfiguredSourceName::new(self.name.clone())
     }
 }
@@ -111,7 +113,10 @@ pub fn validate_event(
             principal.name, kind
         ));
     }
-    params.envelope.validate(principal.limits()).map_err(|e| e.to_string())?;
+    params
+        .envelope
+        .validate(principal.limits())
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 

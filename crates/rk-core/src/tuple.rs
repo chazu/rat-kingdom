@@ -144,8 +144,7 @@ pub const FULL_STRENGTH: f64 = 1.0;
 pub const DEFAULT_TRAIL_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 /// Maximum accepted TTL for a pheromone trail or RPC-authored ephemeral tuple.
 /// Keeping this bounded avoids unchecked `u64` to `i64` duration conversions.
-pub const MAX_TRAIL_TTL: std::time::Duration =
-    std::time::Duration::from_secs(365 * 24 * 3600);
+pub const MAX_TRAIL_TTL: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
 
 impl std::str::FromStr for Category {
     type Err = crate::Error;
@@ -251,8 +250,8 @@ impl Tuple {
         let ttl = ttl.min(MAX_TRAIL_TTL);
         self.strength = Some(FULL_STRENGTH);
         self.lifecycle = Lifecycle::Ephemeral;
-        let duration = chrono::Duration::from_std(ttl)
-            .expect("MAX_TRAIL_TTL must fit chrono::Duration");
+        let duration =
+            chrono::Duration::from_std(ttl).expect("MAX_TRAIL_TTL must fit chrono::Duration");
         self.expires_at = Utc::now().checked_add_signed(duration);
         self
     }
@@ -371,7 +370,11 @@ impl Pattern {
     /// has not yet stamped `spawn` into its payload still needs the name+floor
     /// fallback. Delete `for_agent_since` only once every producer stamps
     /// `spawn`.
-    pub fn for_spawn(category: Category, identity: impl Into<String>, spawn: crate::id::SpawnId) -> Self {
+    pub fn for_spawn(
+        category: Category,
+        identity: impl Into<String>,
+        spawn: crate::id::SpawnId,
+    ) -> Self {
         let mut pattern = Self::category(category).identity(identity);
         pattern.payload_search = Some(format!("\"spawn\":\"{spawn}\""));
         pattern
@@ -425,7 +428,12 @@ impl Pattern {
     /// replayed onto branch B's (different) diff-against-target just because
     /// they happen to have the same HEAD. `scope` (the repo) is bound by the
     /// caller as always, so the full key is `(repo, branch, head_sha)`.
-    pub fn for_commit(category: Category, identity: impl Into<String>, branch: &str, sha: &str) -> Self {
+    pub fn for_commit(
+        category: Category,
+        identity: impl Into<String>,
+        branch: &str,
+        sha: &str,
+    ) -> Self {
         let mut pattern = Self::category(category).identity(identity);
         // serde_json renders a string field exactly like this regardless of key
         // order, so each substring is a reliable exact test independent of the
@@ -643,7 +651,10 @@ mod tests {
     fn for_commit_binds_branch_as_well_as_sha() {
         let p = Pattern::for_commit(Category::Artifact, "review", "branch-a", "sha-shared")
             .scope("myrepo");
-        assert!(p.matches(&review("branch-a", "sha-shared")), "missed own branch+sha");
+        assert!(
+            p.matches(&review("branch-a", "sha-shared")),
+            "missed own branch+sha"
+        );
         assert!(
             !p.matches(&review("branch-b", "sha-shared")),
             "matched a different branch at the same shared tip commit"
@@ -723,7 +734,10 @@ mod tests {
         for c in Category::ALL {
             let w = c.weight();
             assert!(w > 0.0, "{c:?} weight must be positive");
-            assert!(w < prev, "{c:?} weight {w} must be below the previous {prev}");
+            assert!(
+                w < prev,
+                "{c:?} weight {w} must be below the previous {prev}"
+            );
             prev = w;
         }
         assert!(Category::Fact.weight() > Category::Endorsement.weight());

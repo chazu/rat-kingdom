@@ -187,14 +187,21 @@ async fn activated_policy_controls_names_target_and_remote_delivery() {
         Command::new("git")
             .arg("-C")
             .arg(origin.path())
-            .args(["rev-parse", "--verify", &format!("refs/heads/{remote_branch}")])
+            .args([
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{remote_branch}")
+            ])
             .output()
             .unwrap()
             .status
             .success(),
         "configured remote branch must exist"
     );
-    assert_eq!(git(repo, &["rev-parse", "main"]), git(origin.path(), &["rev-parse", "main"]));
+    assert_eq!(
+        git(repo, &["rev-parse", "main"]),
+        git(origin.path(), &["rev-parse", "main"])
+    );
 
     handle.abort();
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
@@ -234,10 +241,7 @@ async fn merge_push_delivers_the_agents_feature_base_to_the_remote() {
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
     client
-        .call(
-            "repo.add",
-            json!({"name": "friendly-alias", "path": repo}),
-        )
+        .call("repo.add", json!({"name": "friendly-alias", "path": repo}))
         .await
         .unwrap();
     let spawned = client
@@ -273,7 +277,10 @@ async fn merge_push_delivers_the_agents_feature_base_to_the_remote() {
     assert_eq!(delivered["merged"], true, "{delivered}");
     assert_eq!(delivered["pushed"], true, "{delivered}");
     assert_eq!(delivered["target"], "feature/integration");
-    assert_ne!(git(repo, &["rev-parse", "feature/integration"]), feature_before);
+    assert_ne!(
+        git(repo, &["rev-parse", "feature/integration"]),
+        feature_before
+    );
     assert_eq!(git(repo, &["rev-parse", "main"]), main_before);
     assert_eq!(
         git(repo, &["rev-parse", "feature/integration"]),

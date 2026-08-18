@@ -45,10 +45,8 @@ fn onboard_json_identifies_the_onboarding_role() {
     );
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["role"], "onboarding");
-    assert!(
-        value["prime"]
-            .as_str()
-            .unwrap()
-            .contains("Verification contract")
-    );
+    assert!(value["prime"]
+        .as_str()
+        .unwrap()
+        .contains("Verification contract"));
 }

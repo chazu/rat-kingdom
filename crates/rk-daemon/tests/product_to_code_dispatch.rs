@@ -58,7 +58,11 @@ fn repository() -> tempfile::TempDir {
     std::fs::write(dir.path().join("README.md"), "# Fixture\n").unwrap();
     let wf_dir = dir.path().join(".rk/workflows");
     std::fs::create_dir_all(&wf_dir).unwrap();
-    std::fs::write(wf_dir.join("implement-featureset.cue"), IMPLEMENT_FEATURESET).unwrap();
+    std::fs::write(
+        wf_dir.join("implement-featureset.cue"),
+        IMPLEMENT_FEATURESET,
+    )
+    .unwrap();
     git(dir.path(), &["add", "."]);
     git(dir.path(), &["commit", "-m", "initial"]);
     dir
@@ -195,8 +199,7 @@ async fn test_dispatch_rejects_graph_apply_from_other_repo_or_graph_revision() {
     assert!(err.contains("graph revision"), "{err}");
 
     let mut changed_initiative_action = dispatch_action(&graph_proposal);
-    changed_initiative_action["initiative"]["title"] =
-        json!("Changed after the graph apply");
+    changed_initiative_action["initiative"]["title"] = json!("Changed after the graph apply");
     let err = client
         .call(
             "factory.propose_action",
@@ -382,17 +385,15 @@ async fn test_daemon_workflow_dispatch_uses_existing_phase2_proposal_validator()
 
     // Structural half: the daemon dispatch handler wraps the Phase 2 validator
     // entry points instead of duplicating digest logic.
-    let server_source = std::fs::read_to_string(format!(
-        "{}/src/server.rs",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap();
+    let server_source =
+        std::fs::read_to_string(format!("{}/src/server.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
     let dispatch_region_start = server_source
         .find("fn handle_product_to_code_dispatch_execute")
         .expect("dispatch execute handler exists");
     let dispatch_region = &server_source[dispatch_region_start..];
-    let dispatch_region = &dispatch_region
-        [..dispatch_region.find("\n    fn ").unwrap_or(dispatch_region.len())];
+    let dispatch_region = &dispatch_region[..dispatch_region
+        .find("\n    fn ")
+        .unwrap_or(dispatch_region.len())];
     assert!(
         dispatch_region.contains("begin_execute_action"),
         "dispatch executor must reuse the Phase 2 begin_execute_action validator"
@@ -422,7 +423,10 @@ async fn test_daemon_workflow_dispatch_runs_implement_featureset_for_unblocked_t
         canonical["dispatches"][0]["ticket_id"],
         json!(expected_ticket)
     );
-    assert_eq!(canonical["dispatches"][0]["workflow"], "implement-featureset");
+    assert_eq!(
+        canonical["dispatches"][0]["workflow"],
+        "implement-featureset"
+    );
     assert_eq!(canonical["blocked"][0]["graph_node_id"], "NODE-tests");
 
     approve(&mut client, &proposed).await;

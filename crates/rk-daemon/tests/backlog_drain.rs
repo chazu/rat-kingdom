@@ -181,7 +181,10 @@ async fn backlog_drain_fans_out_and_joins() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(all_closed, "both drained tickets should reach status closed");
+    assert!(
+        all_closed,
+        "both drained tickets should reach status closed"
+    );
     let other = client
         .call("ticket.list", json!({"scope": "other-repo"}))
         .await

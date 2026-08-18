@@ -748,8 +748,7 @@ fn print_onboarding_proposal(proposal: &OnboardingProposal) {
     if proposal.status == rk_daemon::onboarding_proposals::OnboardingProposalStatus::Verified
         && proposal.automation_kind().is_some()
         && proposal.activation.as_ref().is_none_or(|activation| {
-            activation.status
-                == rk_daemon::onboarding_proposals::OnboardingActivationStatus::Failed
+            activation.status == rk_daemon::onboarding_proposals::OnboardingActivationStatus::Failed
         })
     {
         println!(

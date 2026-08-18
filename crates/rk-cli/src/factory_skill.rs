@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs;
@@ -236,7 +236,7 @@ fn sibling_path(destination: &Path, label: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{InstallDisposition, install_factory_foreman_skill};
+    use super::{install_factory_foreman_skill, InstallDisposition};
     use std::fs;
 
     #[test]

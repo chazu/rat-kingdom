@@ -417,12 +417,7 @@ pub fn inspect(
     inspect_git(&top_level, &mut report);
     let instructions = inspect_instructions(&top_level, &mut report);
     let cue_available = command_exists("cue", &top_level);
-    inspect_repository_policy(
-        &top_level,
-        cue_available,
-        registered,
-        &mut report,
-    );
+    inspect_repository_policy(&top_level, cue_available, registered, &mut report);
     let checks = inspect_cue(&top_level, cue_available, context, &mut report);
     inspect_toolchain(&top_level, &instructions, &checks, &mut report);
 
@@ -497,24 +492,24 @@ fn inspect_repository_policy(
             "repository work/delivery policy is valid and content-bound"
         };
         let finding = Finding::new(
-                FindingKind::RepositoryPolicyPresent,
-                Severity::Info,
-                summary,
-            )
-            .evidence([
-                observed(relative(root, &file), format!("sha256 {digest}")),
-                observed(
-                    relative(root, &file),
-                    format!(
-                        "branch {}, worktree {}, target {}, mode {:?}, remote {}",
-                        policy.work.branch,
-                        policy.work.worktree,
-                        policy.delivery.target,
-                        policy.delivery.mode,
-                        policy.delivery.remote
-                    ),
+            FindingKind::RepositoryPolicyPresent,
+            Severity::Info,
+            summary,
+        )
+        .evidence([
+            observed(relative(root, &file), format!("sha256 {digest}")),
+            observed(
+                relative(root, &file),
+                format!(
+                    "branch {}, worktree {}, target {}, mode {:?}, remote {}",
+                    policy.work.branch,
+                    policy.work.worktree,
+                    policy.delivery.target,
+                    policy.delivery.mode,
+                    policy.delivery.remote
                 ),
-            ]);
+            ),
+        ]);
         report.findings.push(if registered_count == 0 {
             finding.recommend(
                 "Register the repository to activate this exact policy digest.",
@@ -1552,9 +1547,7 @@ fn command_tool(command: &str) -> Option<String> {
         }
         let mut words = words.into_iter();
         let mut word = words.next()?;
-        while matches!(word.as_str(), "!" | "{" | "(" | "command")
-            || shell_assignment(&word)
-        {
+        while matches!(word.as_str(), "!" | "{" | "(" | "command") || shell_assignment(&word) {
             word = words.next()?;
         }
         if word == "env" {

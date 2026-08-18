@@ -155,7 +155,10 @@ mod tests {
 
     #[test]
     fn a_plain_ticket_is_dispatchable() {
-        assert!(!blocks_automated_dispatch(&["strategic-review", "mechanical"]));
+        assert!(!blocks_automated_dispatch(&[
+            "strategic-review",
+            "mechanical"
+        ]));
         assert!(!blocks_automated_dispatch::<&str>(&[]));
     }
 
@@ -235,7 +238,11 @@ mod tests {
 
     #[test]
     fn freeze_labels_are_extracted_for_display() {
-        let labels = ["strategic-review", "frozen:ballots", "frozen-except:extraction"];
+        let labels = [
+            "strategic-review",
+            "frozen:ballots",
+            "frozen-except:extraction",
+        ];
         assert_eq!(
             freeze_labels(&labels),
             vec!["frozen:ballots", "frozen-except:extraction"]

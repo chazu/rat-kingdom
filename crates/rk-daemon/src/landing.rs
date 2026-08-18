@@ -279,11 +279,7 @@ impl LandingQueue {
     /// this cleanup can see the entry reflected by either tuple for one
     /// scan; it can never see zero — that is the property the write-then-
     /// delete ordering exists to guarantee.
-    fn scan_current(
-        &self,
-        repo_name: &str,
-        target: Option<&str>,
-    ) -> rk_core::Result<Vec<Tuple>> {
+    fn scan_current(&self, repo_name: &str, target: Option<&str>) -> rk_core::Result<Vec<Tuple>> {
         let mut pending = self.space.scan(
             &Pattern::category(Category::Event)
                 .scope(repo_name)
@@ -295,15 +291,26 @@ impl LandingQueue {
         let mut by_seq: HashMap<u64, Tuple> = HashMap::new();
         let mut stale = Vec::new();
         for tuple in pending {
-            let seq = tuple.payload.get("seq").and_then(Value::as_u64).unwrap_or(0);
-            let rev = tuple.payload.get("rev").and_then(Value::as_u64).unwrap_or(0);
+            let seq = tuple
+                .payload
+                .get("seq")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let rev = tuple
+                .payload
+                .get("rev")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             match by_seq.remove(&seq) {
                 None => {
                     by_seq.insert(seq, tuple);
                 }
                 Some(existing) => {
-                    let existing_rev =
-                        existing.payload.get("rev").and_then(Value::as_u64).unwrap_or(0);
+                    let existing_rev = existing
+                        .payload
+                        .get("rev")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
                     let (winner, loser) = if (rev, tuple.id) > (existing_rev, existing.id) {
                         (tuple, existing)
                     } else {
@@ -1814,7 +1821,11 @@ workflow: {
                     .identity(STEWARD_NEED_IDENTITY),
             )
             .unwrap();
-        assert_eq!(needs_after.len(), 1, "reconciliation must not duplicate the need row");
+        assert_eq!(
+            needs_after.len(),
+            1,
+            "reconciliation must not duplicate the need row"
+        );
 
         let failures = space
             .scan(
@@ -2271,7 +2282,10 @@ checks: [
             )
             .unwrap();
             git(repo_dir.path(), &["add", "."]);
-            git(repo_dir.path(), &["commit", "-m", &format!("docs: note {i}")]);
+            git(
+                repo_dir.path(),
+                &["commit", "-m", &format!("docs: note {i}")],
+            );
             let head_sha = rev_parse(repo_dir.path(), &branch);
             git(repo_dir.path(), &["checkout", "main"]);
             candidates.push((branch, head_sha));
@@ -2548,7 +2562,10 @@ checks: [
         let ReviewWaitOutcome::ReviewerDied(context) = outcome else {
             panic!("expected ReviewerDied, got {outcome:?}");
         };
-        assert!(!context.trim().is_empty(), "death context must not be empty");
+        assert!(
+            !context.trim().is_empty(),
+            "death context must not be empty"
+        );
 
         let routed = pipeline
             .route_verdict(

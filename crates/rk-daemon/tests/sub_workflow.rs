@@ -302,7 +302,10 @@ async fn sub_workflow_cycle_fails_closed_at_depth_cap() {
             _ => {}
         }
     }
-    assert!(failed, "workflow cycle did not fail closed at the depth cap");
+    assert!(
+        failed,
+        "workflow cycle did not fail closed at the depth cap"
+    );
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
@@ -386,7 +389,11 @@ async fn interrupted_sub_workflow_rejoins_the_same_durable_child_after_restart()
         .filter(|i| i["workflow"] == "parked-child")
         .collect();
 
-    assert_eq!(children.len(), 1, "restart must not mint a second child: {list}");
+    assert_eq!(
+        children.len(),
+        1,
+        "restart must not mint a second child: {list}"
+    );
     assert_eq!(children[0]["id"], original_child);
 }
 
@@ -437,7 +444,10 @@ async fn legacy_unlinked_running_child_fails_closed_instead_of_duplicating() {
         .join(format!("{parent_id}.json"));
     let mut parent: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&parent_file).unwrap()).unwrap();
-    parent["context"].as_object_mut().unwrap().remove("active_subworkflow");
+    parent["context"]
+        .as_object_mut()
+        .unwrap()
+        .remove("active_subworkflow");
     std::fs::write(&parent_file, serde_json::to_vec_pretty(&parent).unwrap()).unwrap();
 
     let daemon_b = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
@@ -447,7 +457,10 @@ async fn legacy_unlinked_running_child_fails_closed_instead_of_duplicating() {
     let list = client.call("workflow.list", json!({})).await.unwrap();
     let instances = list["instances"].as_array().unwrap();
     assert_eq!(
-        instances.iter().filter(|i| i["workflow"] == "parked-child").count(),
+        instances
+            .iter()
+            .filter(|i| i["workflow"] == "parked-child")
+            .count(),
         1,
         "an unlinked legacy child must not cause a replacement child launch: {list}"
     );
@@ -498,7 +511,10 @@ async fn legacy_unlinked_completed_child_fails_parent_closed_without_relaunch() 
     let _ = handle_a.await;
 
     let (parent_path, mut parent) = snapshot_for(home.path(), "parked-parent");
-    parent["context"].as_object_mut().unwrap().remove("active_subworkflow");
+    parent["context"]
+        .as_object_mut()
+        .unwrap()
+        .remove("active_subworkflow");
     std::fs::write(&parent_path, serde_json::to_vec_pretty(&parent).unwrap()).unwrap();
     let (child_path, mut child) = snapshot_for(home.path(), "parked-child");
     child["status"] = json!("completed");
@@ -512,7 +528,10 @@ async fn legacy_unlinked_completed_child_fails_parent_closed_without_relaunch() 
     let list = client.call("workflow.list", json!({})).await.unwrap();
     let instances = list["instances"].as_array().unwrap();
     assert_eq!(
-        instances.iter().filter(|i| i["workflow"] == "parked-child").count(),
+        instances
+            .iter()
+            .filter(|i| i["workflow"] == "parked-child")
+            .count(),
         1,
         "a terminal legacy child must not be relaunched: {list}"
     );
@@ -632,11 +651,17 @@ async fn mismatched_linked_child_is_failed_with_its_parent_instead_of_becoming_a
     let list = client.call("workflow.list", json!({})).await.unwrap();
     let instances = list["instances"].as_array().unwrap();
     assert_eq!(
-        instances.iter().find(|i| i["workflow"] == "parked-parent").unwrap()["status"],
+        instances
+            .iter()
+            .find(|i| i["workflow"] == "parked-parent")
+            .unwrap()["status"],
         "failed"
     );
     assert_eq!(
-        instances.iter().find(|i| i["workflow"] == "parked-child").unwrap()["status"],
+        instances
+            .iter()
+            .find(|i| i["workflow"] == "parked-child")
+            .unwrap()["status"],
         "failed",
         "a rejected linked child must not remain Running forever: {list}"
     );

@@ -1197,7 +1197,10 @@ timeout_secs = "30"
         assert_eq!(chat.kind, "command");
         assert_eq!(chat.classes, ["steward-escalation"]);
         assert_eq!(chat.min_severity, crate::notify::Severity::Warn);
-        assert_eq!(chat.option("command"), Some("/usr/local/bin/rk-notify-chat"));
+        assert_eq!(
+            chat.option("command"),
+            Some("/usr/local/bin/rk-notify-chat")
+        );
         assert_eq!(chat.option("timeout_secs"), Some("30"));
         assert_eq!(chat.option("nope"), None);
 

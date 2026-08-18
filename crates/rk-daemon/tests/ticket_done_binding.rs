@@ -128,10 +128,7 @@ async fn merge_mode_ticket_stays_open_until_actually_merged() {
     // The manual path ("steward mark-done") is refused the same way, with a
     // pointed error rather than a silent no-op.
     let refused = client
-        .call(
-            "ticket.update",
-            json!({"id": ticket_id, "status": "done"}),
-        )
+        .call("ticket.update", json!({"id": ticket_id, "status": "done"}))
         .await;
     let err = refused.expect_err("marking an unmerged merge-mode ticket done must be refused");
     assert!(
@@ -145,10 +142,7 @@ async fn merge_mode_ticket_stays_open_until_actually_merged() {
 
     // The merged path is unaffected: the same manual request now succeeds.
     let updated = client
-        .call(
-            "ticket.update",
-            json!({"id": ticket_id, "status": "done"}),
-        )
+        .call("ticket.update", json!({"id": ticket_id, "status": "done"}))
         .await
         .unwrap();
     assert_eq!(updated["ticket"]["payload"]["status"], "done", "{updated}");
@@ -280,7 +274,10 @@ async fn merge_mode_ticket_done_refused_when_repo_unresolvable() {
         .unwrap();
 
     let ticket = client
-        .call("ticket.new", json!({"title": "repo vanishes before delivery"}))
+        .call(
+            "ticket.new",
+            json!({"title": "repo vanishes before delivery"}),
+        )
         .await
         .unwrap();
     let ticket_id = ticket["ticket"]["identity"].as_str().unwrap().to_string();
@@ -316,9 +313,7 @@ async fn merge_mode_ticket_done_refused_when_repo_unresolvable() {
     let refused = client
         .call("ticket.update", json!({"id": ticket_id, "status": "done"}))
         .await;
-    refused.expect_err(
-        "an unresolvable repo must refuse the delivery check, not silently pass it",
-    );
+    refused.expect_err("an unresolvable repo must refuse the delivery check, not silently pass it");
 
     handle.abort();
     std::env::remove_var("RK_FAKE_HARNESS_CMD");

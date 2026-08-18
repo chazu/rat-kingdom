@@ -224,11 +224,8 @@ fn migrate(
         )
         .map_err(sql_err)?;
     if !commit_sequence_exists {
-        tx.execute(
-            "ALTER TABLE tuples ADD COLUMN commit_sequence INTEGER",
-            [],
-        )
-        .map_err(sql_err)?;
+        tx.execute("ALTER TABLE tuples ADD COLUMN commit_sequence INTEGER", [])
+            .map_err(sql_err)?;
     }
     let journal_floor_exists: bool = tx
         .query_row(
@@ -482,10 +479,17 @@ fn backfill_tuple_persistence_events(conn: &Connection) -> rk_core::Result<()> {
 }
 
 fn validate_sequence_journal(conn: &Connection) -> rk_core::Result<i64> {
-    let (last, legacy, floor, suffix_count, first_suffix, last_suffix, invalid_count):
-        (i64, i64, i64, i64, i64, i64, i64) = conn
-            .query_row(
-                "SELECT state.last_sequence,
+    let (last, legacy, floor, suffix_count, first_suffix, last_suffix, invalid_count): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = conn
+        .query_row(
+            "SELECT state.last_sequence,
                         state.legacy_backfill_sequence,
                         state.journal_floor_sequence,
                         (SELECT COUNT(*) FROM tuple_persistence_events
@@ -501,26 +505,24 @@ fn validate_sequence_journal(conn: &Connection) -> rk_core::Result<i64> {
                              OR commit_sequence > state.last_sequence)
                    FROM tuple_sequence_state AS state
                   WHERE state.singleton = 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                },
-            )
-            .map_err(sql_err)?;
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .map_err(sql_err)?;
     let suffix_contiguous = if last == floor {
         suffix_count == 0 && first_suffix == 0 && last_suffix == 0
     } else if last > floor {
-        suffix_count == last - floor
-            && first_suffix == floor + 1
-            && last_suffix == last
+        suffix_count == last - floor && first_suffix == floor + 1 && last_suffix == last
     } else {
         false
     };
@@ -660,9 +662,7 @@ impl Store {
         migrate(
             &mut conn,
             sequence_schema_preexisting,
-            journal_guards_preexisting
-                || journal_floor_preexisting
-                || journal_marker_preexisting,
+            journal_guards_preexisting || journal_floor_preexisting || journal_marker_preexisting,
         )?;
         Ok(Self { conn })
     }

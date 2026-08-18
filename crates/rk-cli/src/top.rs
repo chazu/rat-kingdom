@@ -246,8 +246,10 @@ fn draw_workflows(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         ],
     )
     .header(
-        Row::new(vec!["INSTANCE", "WORKFLOW", "STATUS", "STEP", "SPEND", "WHERE"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Row::new(vec![
+            "INSTANCE", "WORKFLOW", "STATUS", "STEP", "SPEND", "WHERE",
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .block(Block::default().borders(Borders::TOP).title("workflows"));
     frame.render_widget(table, area);

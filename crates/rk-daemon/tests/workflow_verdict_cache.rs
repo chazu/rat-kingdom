@@ -169,7 +169,12 @@ fn init_repo(dir: &Path) -> String {
     dir.file_name().unwrap().to_string_lossy().to_string()
 }
 
-async fn run_workflow(client: &mut Client, repo_dir: &Path, head_sha: &str, branch: &str) -> String {
+async fn run_workflow(
+    client: &mut Client,
+    repo_dir: &Path,
+    head_sha: &str,
+    branch: &str,
+) -> String {
     let started = client
         .call(
             "workflow.run",
@@ -599,7 +604,10 @@ async fn shipped_steward_cache_hit_spawns_gateholder_not_reviewer_and_lands() {
     std::fs::create_dir_all(layout.workflows_dir()).unwrap();
     std::fs::write(layout.workflows_dir().join("steward.cue"), steward_src).unwrap();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(INSTANT_DONE_FAKE));
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        fixture::with_rk_done(INSTANT_DONE_FAKE),
+    );
     let daemon = Daemon::new_in_memory(layout.clone(), "shipped-e2e".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;

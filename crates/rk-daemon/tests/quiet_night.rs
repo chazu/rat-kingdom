@@ -121,10 +121,7 @@ async fn quiet_night_completes_and_still_runs_the_phase_after_the_drain() {
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(wf_dir.join("quiet-night-test.cue"), QUIET_WORKFLOW).unwrap();
 
-    std::env::set_var(
-        "RK_FAKE_HARNESS_CMD",
-        fixture::with_rk_done(WORKING_FAKE),
-    );
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());

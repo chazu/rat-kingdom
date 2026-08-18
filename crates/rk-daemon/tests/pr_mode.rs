@@ -331,7 +331,13 @@ async fn review_sweep_clears_awaiting_review_on_forge_merge_without_a_pull() {
     git(forge.path(), &["config", "user.name", "F"]);
     git(
         forge.path(),
-        &["merge", "--no-ff", "-m", "merge PR", &format!("origin/{branch}")],
+        &[
+            "merge",
+            "--no-ff",
+            "-m",
+            "merge PR",
+            &format!("origin/{branch}"),
+        ],
     );
     git(forge.path(), &["push", "origin", "main"]);
 

@@ -274,7 +274,10 @@ pub fn build_digest(
 /// Render the structured digest as the plain-text report (also the exact text
 /// handed to the LLM under `--llm`).
 pub fn render_digest(digest: &Value) -> String {
-    let mut out = format!("fleet digest — last {}\n", digest["since"].as_str().unwrap_or("?"));
+    let mut out = format!(
+        "fleet digest — last {}\n",
+        digest["since"].as_str().unwrap_or("?")
+    );
     let rows = |key: &str| digest[key].as_array().cloned().unwrap_or_default();
 
     let spawned = rows("spawned");
@@ -394,10 +397,12 @@ pub fn render_digest(digest: &Value) -> String {
     if fleet.is_object() {
         let spent = fleet["spent_usd"].as_f64().unwrap_or(0.0);
         match fleet["max_usd"].as_f64() {
-            Some(max) if max > 0.0 => {
-                out.push_str(&format!("\nspend: ${spent:.2} of ${max:.2} fleet cap (live agents)\n"))
-            }
-            _ => out.push_str(&format!("\nspend: ${spent:.2} (live agents, no fleet cap)\n")),
+            Some(max) if max > 0.0 => out.push_str(&format!(
+                "\nspend: ${spent:.2} of ${max:.2} fleet cap (live agents)\n"
+            )),
+            _ => out.push_str(&format!(
+                "\nspend: ${spent:.2} (live agents, no fleet cap)\n"
+            )),
         }
     }
 
@@ -405,7 +410,10 @@ pub fn render_digest(digest: &Value) -> String {
     if inbox.is_empty() {
         out.push_str("\ninbox: clear\n");
     } else {
-        out.push_str(&format!("\ninbox: {} item(s) awaiting a human\n", inbox.len()));
+        out.push_str(&format!(
+            "\ninbox: {} item(s) awaiting a human\n",
+            inbox.len()
+        ));
         for it in inbox.iter().take(5) {
             out.push_str(&format!(
                 "  {} {} → {}\n",
@@ -482,12 +490,7 @@ pub async fn watch_workflow(
 /// Read or follow the bounded hierarchical coordinator view. The daemon owns
 /// cursor/replay semantics; this adapter only renders the compact snapshot and
 /// events so a host session can consume the same JSON contract.
-pub async fn monitor(
-    layout: &Layout,
-    params: Value,
-    follow: bool,
-    as_json: bool,
-) -> Result<()> {
+pub async fn monitor(layout: &Layout, params: Value, follow: bool, as_json: bool) -> Result<()> {
     if !follow {
         let mut client = Client::connect_or_spawn(layout).await?;
         if let Some(coordinator) = params["coordinator"].as_str().map(str::to_string) {
@@ -531,10 +534,13 @@ pub async fn monitor(
     }
     while let Some(note) = stream.next().await? {
         if note["method"].as_str() == Some("coordinator.event") {
-            render_monitor_event(&json!({
-                "cursor": note["params"]["cursor"],
-                "event": note["params"]["event"],
-            }), as_json);
+            render_monitor_event(
+                &json!({
+                    "cursor": note["params"]["cursor"],
+                    "event": note["params"]["event"],
+                }),
+                as_json,
+            );
         } else if note["method"].as_str() == Some("lagged") {
             if as_json {
                 println!("{}", json!({"kind": "resync", "data": note}));
@@ -554,9 +560,15 @@ fn render_monitor_snapshot(result: &Value, as_json: bool) {
     let snapshot = &result["snapshot"];
     println!(
         "coordinator cursor {} · {} workflow(s) · {} middle-rat(s)",
-        result["cursor"].as_u64().map(|cursor| cursor.to_string()).unwrap_or_else(|| "-".into()),
+        result["cursor"]
+            .as_u64()
+            .map(|cursor| cursor.to_string())
+            .unwrap_or_else(|| "-".into()),
         snapshot["workflows"].as_array().map(Vec::len).unwrap_or(0),
-        snapshot["middle_rats"].as_array().map(Vec::len).unwrap_or(0),
+        snapshot["middle_rats"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
     );
     for attention in snapshot["attention"].as_array().into_iter().flatten() {
         println!(
@@ -575,7 +587,10 @@ fn render_monitor_snapshot(result: &Value, as_json: bool) {
             rollup["total"],
             rollup["running"],
             rollup["blocked"],
-            middle["summary"].as_str().map(|summary| format!(" — {summary}")).unwrap_or_default(),
+            middle["summary"]
+                .as_str()
+                .map(|summary| format!(" — {summary}"))
+                .unwrap_or_default(),
         );
     }
 }
@@ -588,9 +603,14 @@ fn render_monitor_event(envelope: &Value, as_json: bool) {
     let event = &envelope["event"];
     println!(
         "cursor={} {} {}",
-        envelope["cursor"].as_u64().map(|cursor| cursor.to_string()).unwrap_or_else(|| "?".into()),
+        envelope["cursor"]
+            .as_u64()
+            .map(|cursor| cursor.to_string())
+            .unwrap_or_else(|| "?".into()),
         event["payload"]["route"].as_str().unwrap_or("event"),
-        event["payload"]["summary"].as_str().unwrap_or_else(|| event["identity"].as_str().unwrap_or("coordination")),
+        event["payload"]["summary"]
+            .as_str()
+            .unwrap_or_else(|| event["identity"].as_str().unwrap_or("coordination")),
     );
 }
 
@@ -644,11 +664,7 @@ async fn watch_workflow_connection(
             Some("coordinator.event") => {
                 let event = &note["params"]["event"];
                 if accept_revision(event, &mut last_revision) {
-                    render_coordinator_event(
-                        event,
-                        note["params"]["cursor"].as_u64(),
-                        as_json,
-                    );
+                    render_coordinator_event(event, note["params"]["cursor"].as_u64(), as_json);
                     if terminal_event(event, instance) {
                         return Ok(WatchConnection::Done);
                     }
@@ -664,9 +680,9 @@ async fn watch_workflow_connection(
                 if terminal_in_snapshot(&snapshot, instance) {
                     return Ok(WatchConnection::Done);
                 }
-                let next = snapshot["cursor"]
-                    .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("coordinator snapshot did not include a cursor"))?;
+                let next = snapshot["cursor"].as_u64().ok_or_else(|| {
+                    anyhow::anyhow!("coordinator snapshot did not include a cursor")
+                })?;
                 return Ok(WatchConnection::Resync(next.to_string()));
             }
             _ => {}
@@ -768,9 +784,7 @@ fn terminal_in_snapshot(result: &Value, instance: &str) -> bool {
         .into_iter()
         .flatten()
         .find(|workflow| workflow["id"].as_str() == Some(instance))
-        .is_some_and(|workflow| {
-            matches!(workflow["status"].as_str(), Some("completed" | "failed"))
-        })
+        .is_some_and(|workflow| matches!(workflow["status"].as_str(), Some("completed" | "failed")))
 }
 
 fn terminal_event(event: &Value, instance: &str) -> bool {
@@ -876,7 +890,11 @@ mod tests {
                 json!({"branch": "rat/rat-1/tkt-9", "target": "main", "merged": true}),
             ),
         ];
-        let obstacles = vec![tuple("wall", "2026-07-23T01:30:00Z", json!({"text": "stuck"}))];
+        let obstacles = vec![tuple(
+            "wall",
+            "2026-07-23T01:30:00Z",
+            json!({"text": "stuck"}),
+        )];
         let instances = vec![json!({
             "id": "wf-abc", "workflow": "steward", "status": "running",
             "current_step": 2, "total_steps": 5, "awaiting": "approval gate",
@@ -884,7 +902,14 @@ mod tests {
         let rollup = json!({"fleet": {"spent_usd": 1.25, "max_usd": 10.0}});
 
         let digest = build_digest(
-            "2h", cutoff, &events, &obstacles, &[], &instances, &rollup, &[],
+            "2h",
+            cutoff,
+            &events,
+            &obstacles,
+            &[],
+            &instances,
+            &rollup,
+            &[],
         );
 
         assert_eq!(digest["finished"].as_array().unwrap().len(), 1);
@@ -921,15 +946,28 @@ mod tests {
 
     #[test]
     fn timeline_line_marks_done_current_pending() {
-        let row = |index: usize, depth: usize, label: &str| {
-            json!({"index": index, "depth": depth, "label": label})
-        };
-        assert_eq!(timeline_line(&row(0, 0, "spawn"), 1, "running"), " ✔  1. spawn");
-        assert_eq!(timeline_line(&row(1, 0, "wait"), 1, "running"), " ▶  2. wait");
-        assert_eq!(timeline_line(&row(2, 0, "gate"), 1, "running"), " ·  3. gate");
-        assert_eq!(timeline_line(&row(1, 0, "wait"), 1, "failed"), " ✖  2. wait");
+        let row = |index: usize, depth: usize, label: &str| json!({"index": index, "depth": depth, "label": label});
+        assert_eq!(
+            timeline_line(&row(0, 0, "spawn"), 1, "running"),
+            " ✔  1. spawn"
+        );
+        assert_eq!(
+            timeline_line(&row(1, 0, "wait"), 1, "running"),
+            " ▶  2. wait"
+        );
+        assert_eq!(
+            timeline_line(&row(2, 0, "gate"), 1, "running"),
+            " ·  3. gate"
+        );
+        assert_eq!(
+            timeline_line(&row(1, 0, "wait"), 1, "failed"),
+            " ✖  2. wait"
+        );
         // Completed instances render the cursor row as done, and nested rows indent.
-        assert_eq!(timeline_line(&row(1, 0, "wait"), 1, "completed"), " ✔  2. wait");
+        assert_eq!(
+            timeline_line(&row(1, 0, "wait"), 1, "completed"),
+            " ✔  2. wait"
+        );
         assert_eq!(
             timeline_line(&row(1, 2, "dismiss (merge)"), 1, "running"),
             " ▶         dismiss (merge)"

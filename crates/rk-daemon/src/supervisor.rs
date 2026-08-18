@@ -172,10 +172,7 @@ fn effective_agent_config(
     validate_permission_mode(&harness, &mode)?;
     Ok(EffectiveAgentConfig {
         harness,
-        model: params
-            .model
-            .clone()
-            .or_else(|| default_agent.model.clone()),
+        model: params.model.clone().or_else(|| default_agent.model.clone()),
         permission_mode: mode,
     })
 }
@@ -195,12 +192,10 @@ fn validate_permission_mode(harness: &str, permission_mode: &str) -> rk_core::Re
 
     match permission_mode {
         "danger-full-access" | "bypassPermissions" => Ok(()),
-        "read-only" | "workspace-write" => Err(rk_core::Error::other(
-            format!(
-                "{harness} agents need danger-full-access to reach the rk daemon socket; \
+        "read-only" | "workspace-write" => Err(rk_core::Error::other(format!(
+            "{harness} agents need danger-full-access to reach the rk daemon socket; \
              use --permission-mode danger-full-access (or omit the override)",
-            ),
-        )),
+        ))),
         other => Err(rk_core::Error::other(format!(
             "unsupported {harness} permission mode '{other}': use danger-full-access"
         ))),
@@ -1247,41 +1242,41 @@ impl Supervisor {
     /// Reinstallable attach watcher. The pane can outlive the daemon, so
     /// restart recovery must be able to wire this durable signal back up.
     fn watch_attached_completion(self: &Arc<Self>, record: &AgentRecord) {
-            let supervisor = Arc::clone(self);
+        let supervisor = Arc::clone(self);
         let agent = record.name.clone();
-            let space = self.space.clone();
-            // Bound the read to this generation of the name. `task_done` events
-            // are durable and outlive the rat they name, so an unbounded name
+        let space = self.space.clone();
+        // Bound the read to this generation of the name. `task_done` events
+        // are durable and outlive the rat they name, so an unbounded name
         // search matches a predecessor's completion.
-            let since = record.created_at;
-            tokio::spawn(async move {
-                let pattern = Pattern::for_agent_since(Category::Event, "task_done", &agent, since);
-                match space
-                    .rd(&pattern, std::time::Duration::from_secs(24 * 3600))
-                    .await
-                {
-                    Ok(Some(tuple)) => {
-                        let diff = supervisor.diff_summary_for(&agent);
-                        let updated = supervisor.lock_registry().update(&agent, |r| {
-                            r.state = AgentState::Completed;
-                            r.result = tuple.payload["summary"]
-                                .as_str()
-                                .map(String::from)
-                                .or(Some("done".into()));
-                        });
-                        if let Ok(Some(record)) = updated {
-                            supervisor.route_completion(&record, false, true, diff);
-                            rk_mux::HerdrMux::notify(
-                                &format!("{agent} finished"),
-                                record.result.as_deref().unwrap_or(""),
-                            );
-                        }
+        let since = record.created_at;
+        tokio::spawn(async move {
+            let pattern = Pattern::for_agent_since(Category::Event, "task_done", &agent, since);
+            match space
+                .rd(&pattern, std::time::Duration::from_secs(24 * 3600))
+                .await
+            {
+                Ok(Some(tuple)) => {
+                    let diff = supervisor.diff_summary_for(&agent);
+                    let updated = supervisor.lock_registry().update(&agent, |r| {
+                        r.state = AgentState::Completed;
+                        r.result = tuple.payload["summary"]
+                            .as_str()
+                            .map(String::from)
+                            .or(Some("done".into()));
+                    });
+                    if let Ok(Some(record)) = updated {
+                        supervisor.route_completion(&record, false, true, diff);
+                        rk_mux::HerdrMux::notify(
+                            &format!("{agent} finished"),
+                            record.result.as_deref().unwrap_or(""),
+                        );
                     }
-                Ok(None) => warn!(agent = %agent, "attach-mode completion watch timed out"),
-                    Err(e) => warn!(error = %e, "completion watch failed"),
                 }
-            });
-        }
+                Ok(None) => warn!(agent = %agent, "attach-mode completion watch timed out"),
+                Err(e) => warn!(error = %e, "completion watch failed"),
+            }
+        });
+    }
 
     /// Resume an orphaned/failed agent in its preserved worktree.
     pub fn respawn(self: &Arc<Self>, name: &str) -> rk_core::Result<AgentRecord> {
@@ -1348,8 +1343,7 @@ impl Supervisor {
             None
         };
         let repo = Repo::discover(&record.repo_root)?;
-        let instruction_base =
-            self.instruction_base(&record.role, &record.target_branch, &repo);
+        let instruction_base = self.instruction_base(&record.role, &record.target_branch, &repo);
 
         let env = self.agent_env(
             &record.name,
@@ -2020,7 +2014,7 @@ impl Supervisor {
         };
         let check = self
             .fleet_budget
-                .check_dispatch_scoped(fleet_spent, repo_spent, instance_arg);
+            .check_dispatch_scoped(fleet_spent, repo_spent, instance_arg);
         match check.action {
             BudgetAction::Ok => Ok(()),
             BudgetAction::Warn => {
@@ -3270,11 +3264,7 @@ impl Supervisor {
                 let remote_branch_to_push = remote_branch.clone();
                 let remote_to_push = remote.clone();
                 match blocking_io("repository policy branch push", move || {
-                    repo.push_branch_as(
-                        &branch_to_push,
-                        &remote_branch_to_push,
-                        &remote_to_push,
-                    )
+                    repo.push_branch_as(&branch_to_push, &remote_branch_to_push, &remote_to_push)
                 })
                 .await
                 {
@@ -4685,7 +4675,10 @@ mod convention_supersession_tests {
                 "01M02ZZZZZZZZZZZZZZZZZZZZZ".into(),
                 "prove-your-tools-on-entry: report and proceed".into(),
             ),
-            ("01KY00000000000000000000AA".into(), "unrelated: keep me".into()),
+            (
+                "01KY00000000000000000000AA".into(),
+                "unrelated: keep me".into(),
+            ),
         ]);
         assert_eq!(
             injected,
@@ -5120,7 +5113,11 @@ mod respawn_tests {
 
     #[test]
     fn classify_diff_buckets_by_size_and_shape() {
-        assert_eq!(classify_diff(&[], 0), "trivial", "an empty diff is trivial, not doc-only");
+        assert_eq!(
+            classify_diff(&[], 0),
+            "trivial",
+            "an empty diff is trivial, not doc-only"
+        );
         assert_eq!(
             classify_diff(&["README.md".into(), "docs/guide.md".into()], 500),
             "doc-only",
@@ -5137,7 +5134,11 @@ mod respawn_tests {
             "small",
             "3 files exceeds the trivial file cap even under the line cap"
         );
-        assert_eq!(classify_diff(&["a".into()], 41), "small", "41 lines exceeds the trivial line cap");
+        assert_eq!(
+            classify_diff(&["a".into()], 41),
+            "small",
+            "41 lines exceeds the trivial line cap"
+        );
         assert_eq!(
             classify_diff(&vec!["f".to_string(); 10], 400),
             "small",
@@ -5148,7 +5149,11 @@ mod respawn_tests {
             "large",
             "11 files exceeds the small file cap"
         );
-        assert_eq!(classify_diff(&["a".into()], 401), "large", "401 lines exceeds the small line cap");
+        assert_eq!(
+            classify_diff(&["a".into()], 401),
+            "large",
+            "401 lines exceeds the small line cap"
+        );
     }
 
     #[test]
@@ -5299,12 +5304,13 @@ mod respawn_tests {
         let admitted = results.iter().filter(|r| r.is_ok()).count();
         let refused = results
             .iter()
-            .filter(|r| {
-                matches!(r, Err(e) if e.to_string() == FLEET_WIP_CAP_REFUSED)
-            })
+            .filter(|r| matches!(r, Err(e) if e.to_string() == FLEET_WIP_CAP_REFUSED))
             .count();
         assert_eq!(admitted, 2, "cap of 2 must admit exactly 2: {results:?}");
-        assert_eq!(refused, 3, "the other 3 must be refused cleanly: {results:?}");
+        assert_eq!(
+            refused, 3,
+            "the other 3 must be refused cleanly: {results:?}"
+        );
         // A refused attempt never reaches `reserve_name`/`insert`, so exactly
         // one registry row must exist per ADMITTED spawn — checked as a total
         // count rather than a live-state filter because the fake harness's
@@ -5332,7 +5338,10 @@ mod respawn_tests {
         let mut bad = spawn_params(repo.path(), "not-a-valid-onboarder-task");
         bad.role = crate::onboarding_sessions::ONBOARDER_ROLE.into();
         let failure = sup.spawn_async(bad, 1).await;
-        assert!(failure.is_err(), "invalid onboarder task must fail validation");
+        assert!(
+            failure.is_err(),
+            "invalid onboarder task must fail validation"
+        );
 
         let good = spawn_params(repo.path(), "concurrent-after-failure");
         let record = sup

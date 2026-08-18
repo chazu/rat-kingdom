@@ -1,5 +1,5 @@
 use crate::product_to_code::contracts::{
-    GenericEvidence, InitiativeContract, VerificationReport, verification_status,
+    verification_status, GenericEvidence, InitiativeContract, VerificationReport,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -80,11 +80,13 @@ pub fn validate_report(
             continue;
         }
         let has_browser_evidence = entry.evidence_ids.iter().any(|evidence_id| {
-            evidence_by_id.get(evidence_id.as_str()).is_some_and(|item| {
-                item.kind == "browser_acceptance"
-                    && payload_ids(&item.payload, "acceptance_criterion_ids")
-                        .contains(&entry.acceptance_criterion_id)
-            })
+            evidence_by_id
+                .get(evidence_id.as_str())
+                .is_some_and(|item| {
+                    item.kind == "browser_acceptance"
+                        && payload_ids(&item.payload, "acceptance_criterion_ids")
+                            .contains(&entry.acceptance_criterion_id)
+                })
         });
         if !has_browser_evidence {
             errors.push(format!(
@@ -111,8 +113,7 @@ pub fn validate_report(
                 .as_deref()
                 .filter(|gap| !gap.trim().is_empty())
                 .map(str::to_string);
-            if explicit_gap.is_none()
-                && !matches!(status, "partially_satisfied" | "not_satisfied")
+            if explicit_gap.is_none() && !matches!(status, "partially_satisfied" | "not_satisfied")
             {
                 return None;
             }
@@ -167,9 +168,10 @@ pub fn render_markdown(report: &VerificationReport) -> String {
     }
 
     output.push_str("## Satisfied\n\n");
-    for entry in entries.iter().filter(|entry| {
-        verification_status(&entry.status) == Some("satisfied")
-    }) {
+    for entry in entries
+        .iter()
+        .filter(|entry| verification_status(&entry.status) == Some("satisfied"))
+    {
         output.push_str(&format!(
             "- {}: evidence {}\n",
             entry.acceptance_criterion_id,

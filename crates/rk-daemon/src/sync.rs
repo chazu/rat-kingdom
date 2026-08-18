@@ -190,8 +190,8 @@ impl Syncer {
             let Some(tuple) = local_view.tuples.get(id) else {
                 continue;
             };
-            let synthetic_castle_presence = tuple.scope == rk_core::tuple::SYSTEM_SCOPE
-                && tuple.identity == "castle_presence";
+            let synthetic_castle_presence =
+                tuple.scope == rk_core::tuple::SYSTEM_SCOPE && tuple.identity == "castle_presence";
             let observed_locally = prev_known.contains(id)
                 || persisted_in_delta.contains(id)
                 || space.has_persistence_event(*id)?
@@ -542,9 +542,12 @@ mod tests {
             1,
             "sync must export a delayed local tuple below the previous ULID cursor"
         );
-        assert!(syncer.notes.own_records().unwrap().iter().any(
-            |record| matches!(&record.op, SyncOp::Out { tuple } if tuple.id == delayed_id)
-        ));
+        assert!(syncer
+            .notes
+            .own_records()
+            .unwrap()
+            .iter()
+            .any(|record| matches!(&record.op, SyncOp::Out { tuple } if tuple.id == delayed_id)));
     }
 
     #[tokio::test]
@@ -686,18 +689,17 @@ mod tests {
         );
         old_boundary.id = RecordId::floor_at(now + chrono::Duration::days(1));
         create_legacy_database(&layout.db_path(), &[&old_boundary, &delayed]);
-        std::fs::write(
-            home.path().join("sync-cursor"),
-            old_boundary.id.to_string(),
-        )
-        .unwrap();
+        std::fs::write(home.path().join("sync-cursor"), old_boundary.id.to_string()).unwrap();
 
         let space = Space::open(&layout.db_path()).unwrap();
         let syncer = Syncer::new(&layout, "castle-a", None).unwrap();
         assert_eq!(syncer.run_cycle(&space).unwrap().exported, 1);
-        assert!(syncer.notes.own_records().unwrap().iter().any(
-            |record| matches!(&record.op, SyncOp::Out { tuple } if tuple.id == delayed_id)
-        ));
+        assert!(syncer
+            .notes
+            .own_records()
+            .unwrap()
+            .iter()
+            .any(|record| matches!(&record.op, SyncOp::Out { tuple } if tuple.id == delayed_id)));
         let rewritten = std::fs::read_to_string(home.path().join("sync-cursor")).unwrap();
         assert_eq!(rewritten.trim().parse::<u64>().unwrap(), 2);
     }

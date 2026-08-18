@@ -255,7 +255,10 @@ mod tests {
         .is_ok();
         assert!(drained, "draining remaining events timed out");
         assert_eq!(exited_code, Some(Some(7)));
-        assert_eq!(last_stderr.as_deref(), Some("stderr line 4999 padded xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+        assert_eq!(
+            last_stderr.as_deref(),
+            Some("stderr line 4999 padded xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+        );
     }
 
     /// Minimal single-quoting for embedding a path in the fake harness's bash

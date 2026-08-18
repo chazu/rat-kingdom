@@ -30,7 +30,9 @@ fn rk(layout: &Layout, args: &[&str]) -> std::process::Output {
 
 async fn rk_async(layout: &Layout, args: Vec<&'static str>) -> std::process::Output {
     let layout = layout.clone();
-    tokio::task::spawn_blocking(move || rk(&layout, &args)).await.unwrap()
+    tokio::task::spawn_blocking(move || rk(&layout, &args))
+        .await
+        .unwrap()
 }
 
 fn config() -> Config {
@@ -43,7 +45,11 @@ fn config() -> Config {
     config
 }
 
-async fn start() -> (tempfile::TempDir, Layout, tokio::task::JoinHandle<rk_core::Result<()>>) {
+async fn start() -> (
+    tempfile::TempDir,
+    Layout,
+    tokio::task::JoinHandle<rk_core::Result<()>>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let layout = Layout::at(dir.path());
     let daemon = Daemon::new(layout.clone(), &config()).unwrap();
@@ -67,7 +73,12 @@ async fn stop(layout: &Layout, handle: tokio::task::JoinHandle<rk_core::Result<(
 // the run-failure.json / run-recovery.json fixtures: same source, same
 // delivery-id shape (`{run_id}-{run_attempt}`), same required correlation
 // fields (repo/branch/workflow/job/commit-sha).
-fn poller_args(kind: &'static str, delivery_id: &'static str, summary: &'static str, sha: &'static str) -> Vec<&'static str> {
+fn poller_args(
+    kind: &'static str,
+    delivery_id: &'static str,
+    summary: &'static str,
+    sha: &'static str,
+) -> Vec<&'static str> {
     vec![
         "--json",
         "ingest",
@@ -100,10 +111,19 @@ async fn test_poller_shaped_ci_failed_call_is_accepted_with_a_transition() {
     let (_dir, layout, handle) = start().await;
     let output = rk_async(
         &layout,
-        poller_args("ci_failed", "100001-1", "ci failure on main (abc123def456)", "abc123def456abc123def456abc123def456ab"),
+        poller_args(
+            "ci_failed",
+            "100001-1",
+            "ci failure on main (abc123def456)",
+            "abc123def456abc123def456abc123def456ab",
+        ),
     )
     .await;
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["accepted"], true);
     assert_eq!(value["receipt"]["delivery_id"], "100001-1");
@@ -117,16 +137,29 @@ async fn test_poller_shaped_ci_failed_call_is_accepted_with_a_transition() {
 #[tokio::test]
 async fn test_poller_reposting_the_same_run_attempt_is_a_dedup_no_op() {
     let (_dir, layout, handle) = start().await;
-    let args = poller_args("ci_failed", "100001-1", "ci failure on main (abc123def456)", "abc123def456abc123def456abc123def456ab");
+    let args = poller_args(
+        "ci_failed",
+        "100001-1",
+        "ci failure on main (abc123def456)",
+        "abc123def456abc123def456abc123def456ab",
+    );
 
     let first = rk_async(&layout, args.clone()).await;
-    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
     let first_value: Value = serde_json::from_slice(&first.stdout).unwrap();
 
     // Same run_id, same run_attempt -> same delivery_id, exactly as a
     // re-poll of an unfinished GitHub Actions run would produce.
     let second = rk_async(&layout, args).await;
-    assert!(second.status.success(), "{}", String::from_utf8_lossy(&second.stderr));
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
     let second_value: Value = serde_json::from_slice(&second.stdout).unwrap();
 
     assert_eq!(second_value["accepted"], true);
@@ -149,10 +182,19 @@ async fn test_poller_shaped_ci_recovered_call_emits_a_recovery_transition() {
 
     let failed = rk_async(
         &layout,
-        poller_args("ci_failed", "100001-1", "ci failure on main (abc123def456)", "abc123def456abc123def456abc123def456ab"),
+        poller_args(
+            "ci_failed",
+            "100001-1",
+            "ci failure on main (abc123def456)",
+            "abc123def456abc123def456abc123def456ab",
+        ),
     )
     .await;
-    assert!(failed.status.success(), "{}", String::from_utf8_lossy(&failed.stderr));
+    assert!(
+        failed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
 
     let recovered = rk_async(
         &layout,
@@ -164,7 +206,11 @@ async fn test_poller_shaped_ci_recovered_call_emits_a_recovery_transition() {
         ),
     )
     .await;
-    assert!(recovered.status.success(), "{}", String::from_utf8_lossy(&recovered.stderr));
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
     let recovered_value: Value = serde_json::from_slice(&recovered.stdout).unwrap();
     assert_eq!(recovered_value["accepted"], true);
     assert_eq!(
@@ -172,10 +218,32 @@ async fn test_poller_shaped_ci_recovered_call_emits_a_recovery_transition() {
         "failure -> success on the same subject must emit a recovery transition"
     );
 
-    let state = rk_async(&layout, vec!["--json", "ingest", "state", "--source", "github-ci", "--repo", "rat-kingdom"]).await;
-    assert!(state.status.success(), "{}", String::from_utf8_lossy(&state.stderr));
+    let state = rk_async(
+        &layout,
+        vec![
+            "--json",
+            "ingest",
+            "state",
+            "--source",
+            "github-ci",
+            "--repo",
+            "rat-kingdom",
+        ],
+    )
+    .await;
+    assert!(
+        state.status.success(),
+        "{}",
+        String::from_utf8_lossy(&state.stderr)
+    );
     let state_value: Value = serde_json::from_slice(&state.stdout).unwrap();
-    assert_eq!(state_value["facts"][0]["payload"]["current"]["status"], "success");
-    assert_eq!(state_value["facts"][0]["payload"]["current"]["conclusion"], "success");
+    assert_eq!(
+        state_value["facts"][0]["payload"]["current"]["status"],
+        "success"
+    );
+    assert_eq!(
+        state_value["facts"][0]["payload"]["current"]["conclusion"],
+        "success"
+    );
     stop(&layout, handle).await;
 }

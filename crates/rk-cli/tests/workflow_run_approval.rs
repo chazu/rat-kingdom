@@ -1,6 +1,6 @@
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -408,7 +408,11 @@ async fn test_factory_proposal_file_can_be_approved_and_executed_exactly() {
         ],
     ));
     let proposal_file = home.path().join("workflow-proposal.json");
-    std::fs::write(&proposal_file, serde_json::to_vec_pretty(&proposal).unwrap()).unwrap();
+    std::fs::write(
+        &proposal_file,
+        serde_json::to_vec_pretty(&proposal).unwrap(),
+    )
+    .unwrap();
 
     let approved = successful_json(run_rk(
         &layout,
@@ -433,7 +437,10 @@ async fn test_factory_proposal_file_can_be_approved_and_executed_exactly() {
         ],
     ));
     assert_eq!(executed["instance"]["workflow"], "noop");
-    assert_eq!(executed["instance"]["params"]["taskId"], "value with spaces");
+    assert_eq!(
+        executed["instance"]["params"]["taskId"],
+        "value with spaces"
+    );
     assert_eq!(executed["instance"]["coordinator"], "coord-file");
     assert_eq!(executed["approval"]["status"], "consumed");
 

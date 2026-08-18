@@ -35,13 +35,13 @@
 //! The bypass is surfaced, not silent — a `need` tuple escalates the stale
 //! instance so a human can investigate the wedge.
 
+use crate::cron::Cron;
 use crate::repos::RepoRegistry;
 use crate::workflow_exec::{Instance, InstanceStatus, WorkflowEngine};
-use crate::cron::Cron;
+use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use rk_core::config::SchedulerConfig;
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
-use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
 use rk_workflow::Schedule;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -128,8 +128,8 @@ impl Scheduler {
             Some(c) if c >= now_min => return Ok(0),
             Some(c) => {
                 let catchup = self.config.catchup_minutes.min(MAX_CATCHUP_MINUTES);
-                let earliest = now_min
-                    - ChronoDuration::minutes(i64::try_from(catchup).unwrap_or(i64::MAX));
+                let earliest =
+                    now_min - ChronoDuration::minutes(i64::try_from(catchup).unwrap_or(i64::MAX));
                 (c + ChronoDuration::minutes(1)).max(earliest)
             }
             // No cursor (initialize_cursor not run): evaluate only this minute.
@@ -199,13 +199,24 @@ impl Scheduler {
 
     /// Resolve the target repo, apply the single-flight guard, and dispatch.
     /// Returns whether a workflow was actually fired.
-    fn try_fire(&self, loaded: &Loaded, registry: &RepoRegistry, now: DateTime<Utc>) -> rk_core::Result<bool> {
+    fn try_fire(
+        &self,
+        loaded: &Loaded,
+        registry: &RepoRegistry,
+        now: DateTime<Utc>,
+    ) -> rk_core::Result<bool> {
         let sched = &loaded.schedule;
 
         // Fast path: skip if this process already remembers an active fire —
         // unless that run has gone stale (wedged past the staleness bound), in
         // which case it no longer blocks and is escalated instead.
-        if let Some(id) = self.running.lock().unwrap_or_else(|p| p.into_inner()).get(&sched.name).cloned() {
+        if let Some(id) = self
+            .running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&sched.name)
+            .cloned()
+        {
             if let Some(instance) = self.engine.status(&id) {
                 if instance.status == InstanceStatus::Running {
                     if self.is_stale(&instance, now) {
@@ -281,7 +292,9 @@ impl Scheduler {
     /// Whether a `Running` instance has aged past the staleness bound and
     /// should stop blocking its schedule's next fire.
     fn is_stale(&self, instance: &Instance, now: DateTime<Utc>) -> bool {
-        let bound = ChronoDuration::hours(i64::try_from(self.config.stale_running_hours).unwrap_or(i64::MAX));
+        let bound = ChronoDuration::hours(
+            i64::try_from(self.config.stale_running_hours).unwrap_or(i64::MAX),
+        );
         now.signed_duration_since(instance.started_at) > bound
     }
 

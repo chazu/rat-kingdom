@@ -457,7 +457,11 @@ mod product_to_code_ticket_graph {
             ],
         ));
         let proposal_file = home.path().join("graph-proposal.json");
-        fs::write(&proposal_file, serde_json::to_vec_pretty(&proposal).unwrap()).unwrap();
+        fs::write(
+            &proposal_file,
+            serde_json::to_vec_pretty(&proposal).unwrap(),
+        )
+        .unwrap();
 
         let approved = json_success(run_with_layout(
             &layout,
@@ -485,7 +489,9 @@ mod product_to_code_ticket_graph {
         assert_eq!(executed["approval"]["status"], "consumed");
         let created = executed["result"]["created_ticket_ids"].as_array().unwrap();
         assert_eq!(created.len(), 2);
-        assert!(created.iter().all(|id| id.as_str().unwrap().starts_with("TKT-")));
+        assert!(created
+            .iter()
+            .all(|id| id.as_str().unwrap().starts_with("TKT-")));
 
         handle.abort();
     }

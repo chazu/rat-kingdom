@@ -22,7 +22,10 @@ fn fixture_path(name: &str) -> String {
 }
 
 fn contract_path(name: &str) -> String {
-    format!("{}/contracts/product_to_code/{name}", env!("CARGO_MANIFEST_DIR"))
+    format!(
+        "{}/contracts/product_to_code/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    )
 }
 
 fn cue_vet_architecture_research_fixture(name: &str) -> Option<std::process::Output> {
@@ -69,7 +72,9 @@ fn test_architecture_research_artifact_requires_decisions_and_open_questions() {
 
 #[test]
 fn test_architecture_research_cue_accepts_positive_fixture() {
-    let Some(output) = cue_vet_architecture_research_fixture("cue/architecture_research_positive.json") else {
+    let Some(output) =
+        cue_vet_architecture_research_fixture("cue/architecture_research_positive.json")
+    else {
         return;
     };
 
@@ -301,13 +306,11 @@ fn test_ticket_graph_rejects_initiative_id_mismatch() {
         ),
         "{errors}"
     );
-    assert!(
-        graph
-            .apply_plan_for_initiative("rat-kingdom", &initiative)
-            .unwrap_err()
-            .to_string()
-            .contains("must match initiative id INIT-other")
-    );
+    assert!(graph
+        .apply_plan_for_initiative("rat-kingdom", &initiative)
+        .unwrap_err()
+        .to_string()
+        .contains("must match initiative id INIT-other"));
 }
 
 #[test]

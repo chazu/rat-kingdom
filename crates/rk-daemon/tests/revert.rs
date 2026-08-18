@@ -69,7 +69,10 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","ses
 /// Returns (agent name, ticket id).
 async fn merge_one_rat(client: &mut Client, repo: &Path) -> (String, String) {
     let ticket = client
-        .call("ticket.new", json!({"title": "do the thing", "scope": "svc"}))
+        .call(
+            "ticket.new",
+            json!({"title": "do the thing", "scope": "svc"}),
+        )
         .await
         .unwrap();
     let ticket_id = ticket["ticket"]["identity"].as_str().unwrap().to_string();
@@ -107,7 +110,9 @@ async fn merge_one_rat(client: &mut Client, repo: &Path) -> (String, String) {
         .unwrap();
     assert_eq!(dismissed["merged"], true, "detail: {}", dismissed["detail"]);
     assert!(
-        dismissed["merge_commit"].as_str().is_some_and(|c| !c.is_empty()),
+        dismissed["merge_commit"]
+            .as_str()
+            .is_some_and(|c| !c.is_empty()),
         "dismiss records the merge commit"
     );
     (name, ticket_id)
@@ -140,14 +145,19 @@ async fn revert_undoes_merge_reopens_ticket_and_emits_fact() {
         .unwrap();
     assert_eq!(reverted["reverted"], true, "detail: {}", reverted["detail"]);
     assert!(
-        reverted["revert_commit"].as_str().is_some_and(|c| !c.is_empty()),
+        reverted["revert_commit"]
+            .as_str()
+            .is_some_and(|c| !c.is_empty()),
         "revert reports the revert commit"
     );
 
     // The bad work is gone from main's tree AND the root checkout; history
     // keeps both the merge and the revert.
     let files = git_out(repo_dir.path(), &["ls-tree", "--name-only", "main"]);
-    assert!(!files.contains("regression.txt"), "main tree still has the bad file");
+    assert!(
+        !files.contains("regression.txt"),
+        "main tree still has the bad file"
+    );
     assert!(!repo_dir.path().join("regression.txt").exists());
     let log = git_out(repo_dir.path(), &["log", "--oneline", "main"]);
     assert!(log.contains("Revert"));
