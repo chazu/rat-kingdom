@@ -112,6 +112,7 @@ pub struct SessionControl {
 enum KillSignal {
     Interrupt,
     Kill,
+    Hard,
 }
 
 impl SessionControl {
@@ -146,10 +147,22 @@ impl SessionControl {
             .await
             .map_err(|_| rk_core::Error::other("session is no longer running"))
     }
+
+    /// Unconditional stop (SIGKILL — no chance for the harness to intercept
+    /// or clean up). Only for a process already confirmed lingering past a
+    /// grace window given to exit on its own; `kill` (SIGTERM) is always the
+    /// first resort.
+    pub async fn hard_kill(&self) -> rk_core::Result<()> {
+        self.kill_tx
+            .send(KillSignal::Hard)
+            .await
+            .map_err(|_| rk_core::Error::other("session is no longer running"))
+    }
 }
 
 pub(crate) const SIGINT: i32 = 2;
 pub(crate) const SIGTERM: i32 = 15;
+pub(crate) const SIGKILL: i32 = 9;
 
 /// Signal a child's process group (children lead their own group via
 /// `process_group(0)`).
@@ -360,6 +373,7 @@ pub(crate) mod runner {
                         match sig {
                             Some(KillSignal::Interrupt) => crate::send_group_signal(pid, crate::SIGINT),
                             Some(KillSignal::Kill) => crate::send_group_signal(pid, crate::SIGTERM),
+                            Some(KillSignal::Hard) => crate::send_group_signal(pid, crate::SIGKILL),
                             None => {}
                         }
                     }

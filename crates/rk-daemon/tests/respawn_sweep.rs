@@ -100,6 +100,7 @@ async fn crashed_agent_auto_respawns_up_to_cap_then_escalates() {
         respawn_enabled: true,
         respawn_max_attempts: 2,
         respawn_backoff_secs: 0,
+        ..SupervisorConfig::default()
     });
     tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;

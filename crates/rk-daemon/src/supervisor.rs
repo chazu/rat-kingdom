@@ -508,6 +508,23 @@ pub struct Supervisor {
     /// [`set_min_free_disk_gb`](Supervisor::set_min_free_disk_gb), so this
     /// safety feature cannot spuriously fail spawns on a tight CI disk.
     min_free_disk_gb: AtomicU64,
+    /// `[supervisor] done_kill_grace_secs` (seam 7): how long a harness
+    /// process gets to exit on its own after a clean `rk done` before
+    /// [`schedule_done_kill`](Supervisor::schedule_done_kill) SIGKILLs it.
+    /// An `AtomicU64`, not a config struct held on `Supervisor`, because it
+    /// must be read in real time from the event-handling path (mirrors
+    /// `min_free_disk_gb` above) rather than only on a periodic sweep tick.
+    done_kill_grace_secs: AtomicU64,
+    /// Push channels for automated recovery actions this supervisor
+    /// announces (kill-at-`rk done` today). Set once by `Daemon::new`'s
+    /// config-loading path via [`set_sinks`](Supervisor::set_sinks) —
+    /// bare/test constructors default to an empty registry, so the durable
+    /// announce tuple still gets written but nothing fans out.
+    sinks: Mutex<rk_core::notify::SinkRegistry>,
+    /// Rate-cap bookkeeping shared across this supervisor's recovery
+    /// announcements (`RecoveryAnnouncer` state must persist across calls to
+    /// cap correctly — see `recovery.rs`).
+    announcer: crate::recovery::RecoveryAnnouncer,
 }
 
 /// How far one agent generation has got through reporting its completion.
@@ -720,6 +737,11 @@ impl Supervisor {
             log,
             merge_queue: MergeQueue::default(),
             min_free_disk_gb: AtomicU64::new(0),
+            done_kill_grace_secs: AtomicU64::new(
+                rk_core::config::SupervisorConfig::default().done_kill_grace_secs,
+            ),
+            sinks: Mutex::new(rk_core::notify::SinkRegistry::default()),
+            announcer: crate::recovery::RecoveryAnnouncer::new(),
         })
     }
 
@@ -728,6 +750,22 @@ impl Supervisor {
     /// the supervisor is shared behind an `Arc` from construction onward.
     pub fn set_min_free_disk_gb(&self, gb: u64) {
         self.min_free_disk_gb.store(gb, Ordering::Relaxed);
+    }
+
+    /// Wire the `[[notify.sinks]]` fan-out for this supervisor's automated
+    /// recovery announcements. Applied by `Daemon::new` from config, same
+    /// pattern as [`set_min_free_disk_gb`](Supervisor::set_min_free_disk_gb)
+    /// — bare/test constructors never call this, so their announcements
+    /// still write the durable tuple but push to no channel.
+    pub fn set_sinks(&self, sinks: rk_core::notify::SinkRegistry) {
+        *self.sinks.lock().unwrap_or_else(|p| p.into_inner()) = sinks;
+    }
+
+    /// Set `[supervisor] done_kill_grace_secs`. Applied by `Daemon::new` from
+    /// config, same pattern as
+    /// [`set_min_free_disk_gb`](Supervisor::set_min_free_disk_gb).
+    pub fn set_done_kill_grace_secs(&self, secs: u64) {
+        self.done_kill_grace_secs.store(secs, Ordering::Relaxed);
     }
 
     /// The per-agent transcript store (for `agent.log` reads and `--follow`).
@@ -1543,6 +1581,14 @@ impl Supervisor {
                     if claim.publish {
                         info!(agent = name, is_error, "agent completed");
                         self.route_completion(&record, is_error, claim.declared_done, diff);
+                        // Seam 7: only a positively-declared, clean `rk done`
+                        // arms the post-completion kill grace — a turn that
+                        // merely errored out (`is_error`) leaves the record
+                        // `Failed`, not `Completed`, and stays reachable by
+                        // the respawn sweep instead.
+                        if !is_error && claim.declared_done {
+                            self.schedule_done_kill(name.to_string(), generation);
+                        }
                     } else {
                         info!(
                             agent = name,
@@ -2862,6 +2908,90 @@ impl Supervisor {
                     });
                 }
             }
+        }
+    }
+
+    /// Seam 7 (strategic-review B5): arm a one-shot grace timer the moment a
+    /// generation's clean `rk done` publishes. `sweep()` only ever looks at
+    /// `is_live()` agents, so once this record is `Completed` its process —
+    /// interactive harnesses stay alive between turns — is otherwise never
+    /// checked again; nothing else kills it. `generation` pins this timer to
+    /// the exact generation that completed: a respawn (or a second `Completed`
+    /// turn under a fresh generation reusing the same name) must never have
+    /// ITS process shot out from under it by a stale timer armed for the
+    /// generation before it.
+    fn schedule_done_kill(self: &Arc<Self>, name: String, generation: DateTime<Utc>) {
+        let this = Arc::clone(self);
+        let grace_secs = self.done_kill_grace_secs.load(Ordering::Relaxed).max(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(grace_secs)).await;
+            this.kill_lingering_after_done(&name, generation, grace_secs)
+                .await;
+        });
+    }
+
+    /// The grace timer's payoff: if a process is STILL tracked under `name`
+    /// for the SAME generation that armed the timer, it did not exit on its
+    /// own within the grace window — SIGKILL its whole process group. A
+    /// clean exit within the window already removed the control handle (see
+    /// the `Exited` arm of [`handle_event`](Supervisor::handle_event)), so
+    /// that path is a no-op here, matching the "clean-exit path unaffected"
+    /// acceptance criterion.
+    async fn kill_lingering_after_done(
+        self: &Arc<Self>,
+        name: &str,
+        generation: DateTime<Utc>,
+        grace_secs: u64,
+    ) {
+        let record = match self.lock_registry().get(name) {
+            Some(r) if r.created_at == generation => r.clone(),
+            _ => return, // respawned, dismissed, or already gone — not our process
+        };
+        if !self.lock_controls().contains_key(name) {
+            return; // exited on its own within the grace window
+        }
+        let notice = rk_core::notify::EscalationNotice::new(
+            name,
+            "kill-process-group",
+            rk_core::notify::Severity::Warn,
+            record.repo_name.clone(),
+            name,
+            format!(
+                "{name}'s harness process was still running {grace_secs}s after a clean \
+                 `rk done` — SIGKILLing its process group"
+            ),
+        )
+        .with_ref("task", record.task.clone().unwrap_or_default());
+        let outcome = self.announcer.announce(
+            &self.space,
+            &self.sinks.lock().unwrap_or_else(|p| p.into_inner()),
+            crate::recovery::RecoveryAction {
+                kind: "kill-process-group".to_string(),
+                instance: "supervisor".to_string(),
+                notice,
+            },
+            // 20/hour: generous enough that a genuine multi-agent lingering
+            // episode is fully visible, tight enough that a pathological
+            // fleet-wide loop cannot turn this into a notification storm.
+            crate::recovery::RateCap::per_hour(20),
+        );
+        match outcome {
+            Ok(outcome) if !outcome.held() => {
+                let control = self.lock_controls().remove(name);
+                if let Some(control) = control {
+                    warn!(
+                        agent = name,
+                        grace_secs, "harness still running past grace after `rk done` — SIGKILLing"
+                    );
+                    let _ = control.hard_kill().await;
+                }
+            }
+            // Rate-held: the escalation still went out (at raised severity,
+            // explaining why) — the action itself must NOT proceed. Leave
+            // the control handle in place so a later sweep/dismiss can still
+            // reach this process normally.
+            Ok(_) => {}
+            Err(e) => warn!(agent = name, error = %e, "failed to announce done-kill"),
         }
     }
 
