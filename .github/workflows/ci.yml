@@ -21,6 +21,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # rk-workflow validates workflow definitions by shelling out to the cue
+      # CLI; without it the workflow/onboarding/product-to-code test families
+      # all fail with "cue CLI not runnable".
+      - uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.12.0
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
