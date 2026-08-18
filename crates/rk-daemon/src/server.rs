@@ -137,6 +137,10 @@ pub struct Daemon {
     sweep_config: rk_core::config::SupervisorConfig,
     review_sweep_config: rk_core::config::ReviewSweepConfig,
     worktree_sweep_config: rk_core::config::WorktreeSweepConfig,
+    /// Retention for the landing pipeline's persistent gate worktrees
+    /// (`<home>/gate-worktrees/<repo>/<target>`) — see
+    /// `crate::landing::LandingPipeline::gate_worktree_sweep_once`.
+    gate_worktree_sweep_config: rk_core::config::GateWorktreeSweepConfig,
     /// B2 re-notify sweep: how often an unacked `recovery-action` escalation
     /// re-pushes. See `crate::recovery::renotify_sweep`.
     recovery_sweep_config: rk_core::config::RecoverySweepConfig,
@@ -274,6 +278,7 @@ impl Daemon {
         }
         daemon.review_sweep_config = config.review_sweep.clone();
         daemon.worktree_sweep_config = config.worktree_sweep.clone();
+        daemon.gate_worktree_sweep_config = config.gate_worktree_sweep.clone();
         daemon.recovery_sweep_config = config.recovery_sweep.clone();
         daemon.instance_timeout_sweep_config = config.instance_timeout_sweep.clone();
         daemon.ticket_reopen_sweep_config = config.ticket_reopen_sweep.clone();
@@ -502,6 +507,14 @@ impl Daemon {
                 enabled: false,
                 finalize_cleanup_enabled: false,
                 ..rk_core::config::WorktreeSweepConfig::default()
+            },
+            // Same reasoning as `worktree_sweep_config` above: a bare/test
+            // constructor must not grow a new periodic background loop that
+            // existing e2e tests never asked for. `Daemon::new`'s
+            // config-loading path is the only one that turns it on.
+            gate_worktree_sweep_config: rk_core::config::GateWorktreeSweepConfig {
+                enabled: false,
+                ..rk_core::config::GateWorktreeSweepConfig::default()
             },
             // Same reasoning as `worktree_sweep_config` above: the default is
             // `enabled: true`, but a bare/test constructor must not grow a new
@@ -753,6 +766,39 @@ impl Daemon {
                             }
                         }
                         _ = ws_shutdown.changed() => break,
+                    }
+                }
+            });
+        }
+
+        // Periodic gate-worktree retention sweep (`[gate_worktree_sweep]`):
+        // the persistent per-`(repo,target)` daemon-owned worktrees the
+        // landing pipeline gates against (`landing.rs` §2.2) have no
+        // dismiss-time cleanup the way an agent worktree does, so nothing
+        // else ever reclaims one — see
+        // docs/proposals/daemon-native-landing-pipeline.md §5 open question
+        // 4. Every reclaim this loop performs is gated the same way
+        // `worktree_sweep_once` gates agent reclaims: skipped outright while
+        // the `(repo, target)` key has any live `LandingQueue` entry.
+        if daemon.gate_worktree_sweep_config.enabled {
+            let daemon_ref = Arc::clone(&daemon);
+            let mut gws_shutdown = daemon.shutdown_tx.subscribe();
+            let interval =
+                Duration::from_secs(daemon.gate_worktree_sweep_config.interval_secs.max(1));
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            let d = Arc::clone(&daemon_ref);
+                            match tokio::task::spawn_blocking(move || d.gate_worktree_sweep_once()).await {
+                                Ok(0) => {}
+                                Ok(n) => info!(reclaimed = n, "gate worktree sweep reclaimed stale worktrees"),
+                                Err(e) => warn!(error = %e, "gate worktree sweep task panicked"),
+                            }
+                        }
+                        _ = gws_shutdown.changed() => break,
                     }
                 }
             });
@@ -2964,6 +3010,20 @@ impl Daemon {
                 0
             }
         }
+    }
+
+    /// One pass of the periodic gate-worktree retention sweep
+    /// (`[gate_worktree_sweep]`): reclaim `<home>/gate-worktrees/<repo>/
+    /// <target>` directories per `self.gate_worktree_sweep_config`'s
+    /// LRU/cap rules. The unattended, always-current-thresholds counterpart
+    /// to `rk prune --reap-git`'s `gate_worktrees` extension (`handle_agent_archive`),
+    /// which runs the identical reclaim on demand regardless of this switch.
+    fn gate_worktree_sweep_once(&self) -> usize {
+        self.landing()
+            .gate_worktree_sweep_once(&self.gate_worktree_sweep_config, false)
+            .iter()
+            .filter(|r| r.reclaimed)
+            .count()
     }
 
     /// B2 re-notify sweep body: re-push every unacked `recovery-action`
@@ -5416,6 +5476,16 @@ impl Daemon {
         };
         let supervisor = Arc::clone(&self.supervisor);
         let engine = self.engine();
+        // `reap_git` doubles as "also reclaim gate worktrees": both are the
+        // same kind of resource (a daemon-managed git worktree), so one flag
+        // covers both rather than growing a second one an operator has to
+        // learn. Thresholds always come from the live sweep config — a
+        // manual `rk prune --reap-git` is not gated by
+        // `gate_worktree_sweep_config.enabled`, the periodic-timer switch,
+        // the same way `rk prune --reap-git` itself ignores `worktree_sweep
+        // .enabled`.
+        let landing = self.landing();
+        let gate_worktree_cfg = self.gate_worktree_sweep_config.clone();
         let handle = tokio::runtime::Handle::current();
         let result = tokio::task::spawn_blocking(move || {
             let _entered = handle.enter();
@@ -5430,6 +5500,10 @@ impl Daemon {
                 engine.archive(&selection)?
             };
             value["instances"] = json!(instances);
+            if params.reap_git {
+                let reclaims = landing.gate_worktree_sweep_once(&gate_worktree_cfg, params.dry_run);
+                value["gate_worktrees"] = json!(reclaims);
+            }
             Ok::<_, rk_core::Error>(value)
         })
         .await;

@@ -383,12 +383,17 @@ pub async fn prune(layout: &Layout, args: PruneArgs, as_json: bool) -> Result<()
     }
     let agents = result["agents"].as_array().cloned().unwrap_or_default();
     let instances = result["instances"].as_array().cloned().unwrap_or_default();
+    // Only present when `--reap-git` was passed; driven purely by disk state
+    // under `gate-worktrees/`, independent of whether any agent record was
+    // archived this pass — a repo can accumulate stale gate worktrees with
+    // zero terminal agents due for archiving.
+    let gate_worktrees = result["gate_worktrees"].as_array().cloned().unwrap_or_default();
     let window = if args.all {
         "all eligible".to_string()
     } else {
         format!("older than {}", args.before)
     };
-    if agents.is_empty() && instances.is_empty() {
+    if agents.is_empty() && instances.is_empty() && gate_worktrees.is_empty() {
         println!("nothing to archive ({window})");
         return Ok(());
     }
@@ -430,6 +435,25 @@ pub async fn prune(layout: &Layout, args: PruneArgs, as_json: bool) -> Result<()
                     "kept"
                 },
                 r["agent"].as_str().unwrap_or("?"),
+                r["reason"].as_str().unwrap_or(""),
+            );
+        }
+    }
+    if !gate_worktrees.is_empty() {
+        println!(
+            "{verb} {} gate worktree(s) (LRU/cap retention):",
+            gate_worktrees.len()
+        );
+        for r in &gate_worktrees {
+            println!(
+                "  gate {:<8} {:<12} {:<20} {}",
+                if r["reclaimed"] == json!(true) {
+                    "reaped"
+                } else {
+                    "kept"
+                },
+                r["repo"].as_str().unwrap_or("?"),
+                r["target"].as_str().unwrap_or("?"),
                 r["reason"].as_str().unwrap_or(""),
             );
         }

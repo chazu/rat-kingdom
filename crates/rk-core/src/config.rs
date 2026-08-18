@@ -25,6 +25,7 @@ pub struct Config {
     pub supervisor: SupervisorConfig,
     pub review_sweep: ReviewSweepConfig,
     pub worktree_sweep: WorktreeSweepConfig,
+    pub gate_worktree_sweep: GateWorktreeSweepConfig,
     pub recovery_sweep: RecoverySweepConfig,
     pub instance_timeout_sweep: InstanceTimeoutSweepConfig,
     pub ticket_reopen_sweep: TicketReopenSweepConfig,
@@ -602,6 +603,58 @@ impl Default for WorktreeSweepConfig {
             interval_secs: 3600,
             after_days: 3,
             finalize_cleanup_enabled: true,
+        }
+    }
+}
+
+/// Periodic retention for the landing pipeline's persistent, daemon-owned
+/// gate worktrees (`<home>/gate-worktrees/<repo>/<target>`, `rk-daemon`
+/// `landing.rs`, docs/proposals/daemon-native-landing-pipeline.md §2.2).
+/// Unlike an agent's worktree — created fresh per spawn and cleaned up on
+/// `dismiss` — a gate worktree is created once per `(repo, target)` and
+/// reused across every landing attempt against that target, so nothing ever
+/// removes it on its own: a repo that renames its default branch, or one
+/// with many long-lived release targets, accumulates one multi-GB checkout
+/// per target forever (design doc §5 open question 4, filed as a follow-up
+/// rather than fixed in T1-T4).
+///
+/// Two independent eviction rules, either of which can reclaim a worktree:
+/// least-recently-used (a target unused for `max_age_days` is stale) and a
+/// per-repo cap (`max_per_repo`, keeping only the N most recently used
+/// targets). Both are `0`-disables, matching this codebase's existing
+/// `steward-diff-scope`/`DiskConfig` convention for an off switch. A
+/// worktree is NEVER reclaimed while its `(repo, target)` key has a live
+/// `rk-daemon` `LandingQueue` entry — the same fail-closed posture
+/// `Supervisor::reap_git` applies to agent worktrees, so this sweep can run
+/// unattended without racing an in-flight gate run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct GateWorktreeSweepConfig {
+    /// Master switch for the periodic loop. When false the timer never
+    /// starts; the reclaim logic itself is still reachable manually via `rk
+    /// prune --reap-git` (`agent.archive`'s `gate_worktrees` extension).
+    pub enabled: bool,
+    /// Sweep cadence.
+    pub interval_secs: u64,
+    /// A gate worktree not reset for a landing attempt in at least this many
+    /// days becomes eligible for reclaim. `0` disables the age rule.
+    pub max_age_days: u64,
+    /// Keep only the `max_per_repo` most-recently-used target worktrees per
+    /// repo; older ones are reclaimed regardless of age. `0` disables the
+    /// cap.
+    pub max_per_repo: u64,
+}
+
+impl Default for GateWorktreeSweepConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // Same cadence as `worktree_sweep`: gate worktrees accumulate
+            // slowly (one per distinct landing target), so there is no
+            // benefit to a tighter interval.
+            interval_secs: 3600,
+            max_age_days: 14,
+            max_per_repo: 5,
         }
     }
 }
