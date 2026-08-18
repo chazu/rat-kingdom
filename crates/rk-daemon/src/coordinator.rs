@@ -724,6 +724,7 @@ mod tests {
             completed_at: None,
             archived_at: None,
             trigger: None,
+            stale_timeout_secs: None,
         };
         let blocked = AgentProgress {
             summary: "waiting on API decision".into(),

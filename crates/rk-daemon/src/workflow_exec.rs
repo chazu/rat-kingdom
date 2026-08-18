@@ -3,10 +3,12 @@
 //! instances, context threading, and step semantics.
 
 use crate::agents::AgentState;
+use crate::recovery::{RateCap, RecoveryAction, RecoveryAnnouncer};
 use crate::supervisor::{SpawnParams, Supervisor, FLEET_WIP_CAP_REFUSED};
 use crate::tickets::Tickets;
 use chrono::{DateTime, Utc};
 use rk_core::id::prefixed_id;
+use rk_core::notify::{EscalationNotice, Severity, SinkRegistry};
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Pattern, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
 use rk_space::Space;
@@ -268,6 +270,14 @@ pub struct Instance {
     /// not per workflow definition (two triggers can share one `run`).
     #[serde(default)]
     pub trigger: Option<String>,
+    /// This instance's own override of the stale-`Running`-instance hard
+    /// timeout (strategic review B8), resolved from the workflow's
+    /// `staleTimeout:` field at launch. `None` defers to the sweep's
+    /// configured `default_timeout_secs`. Resolved once at launch (like
+    /// [`instance_max_usd`](Self::instance_max_usd)) rather than re-parsed
+    /// from `definition` on every sweep pass.
+    #[serde(default)]
+    pub stale_timeout_secs: Option<u64>,
 }
 
 impl Instance {
@@ -993,6 +1003,7 @@ impl WorkflowEngine {
         let workflow = rk_workflow::load(&file, &params)?;
         let automated_landing_authorized =
             self.is_automated_landing_definition(&file, &workflow.name);
+        let stale_timeout_secs = resolve_stale_timeout_secs(&workflow)?;
 
         let instance = Instance {
             id: instance_id,
@@ -1017,6 +1028,7 @@ impl WorkflowEngine {
             completed_at: None,
             archived_at: None,
             trigger,
+            stale_timeout_secs,
         };
         if let Some(existing) = self.store_if_absent(instance.clone())? {
             return Ok(existing);
@@ -1108,6 +1120,145 @@ impl WorkflowEngine {
             }
         }
         Ok(())
+    }
+
+    /// Guarded terminal transition for [`stale_timeout_sweep_once`](Self::stale_timeout_sweep_once):
+    /// mutates `instance.id` from `Running` to `Failed` ONLY IF it is still
+    /// `Running` under the lock at the moment of the write, so a genuine
+    /// completion racing the sweep between its read (in `stale_timeout_sweep_once`)
+    /// and this write always wins — the instance is never overwritten out from
+    /// under its own (still-live) execute() future. `Ok(false)` means that race
+    /// resolved itself (or the instance is already gone); that is NOT an error,
+    /// unlike the always-Running-at-entry precondition [`finalize`](Self::finalize)
+    /// assumes. When it does transition, this performs the same terminal-state
+    /// event + guaranteed-cleanup agent sweep `finalize` does — the ticket's
+    /// "mark failed, finalize" — deliberately not calling `finalize` itself,
+    /// which would call [`require_persisted_transition`] and turn the benign
+    /// race outcome into a hard error.
+    async fn timeout_stale_instance(
+        &self,
+        instance: &Instance,
+        timeout_secs: u64,
+    ) -> rk_core::Result<bool> {
+        let id = &instance.id;
+        let error_text = format!(
+            "stale-instance timeout: Running past {timeout_secs}s wall-clock with no completion (strategic review B8) — likely a wedged execution future that skipped finalize"
+        );
+        let transition = self.try_update_with_reason(id, "terminal", |i| {
+            if i.status != InstanceStatus::Running {
+                return;
+            }
+            i.status = InstanceStatus::Failed;
+            i.error = Some(error_text.clone());
+            i.completed_at = Some(chrono::Utc::now());
+        });
+        if let Err(persist_error) = &transition {
+            self.fail_recovery_in_memory(
+                id,
+                format!("stale-instance timeout persistence failed: {persist_error}"),
+            );
+        }
+        if !transition? {
+            return Ok(false);
+        }
+        info!(instance = %id, "workflow instance marked failed by the stale-Running hard timeout");
+        let _ = self.space.out(rk_core::tuple::Tuple::new(
+            Category::Event,
+            repo_name_of(&instance.repo),
+            "workflow_failed",
+            "daemon".to_string(),
+            json!({"instance": id, "workflow": instance.workflow, "error": error_text}),
+        ));
+        if self.finalize_cleanup_enabled {
+            let swept = self.supervisor.dismiss_orphaned_instance_agents(id).await;
+            if !swept.is_empty() {
+                let failed = swept.iter().filter(|(_, ok)| !ok).count();
+                info!(
+                    instance = %id,
+                    count = swept.len(),
+                    failed,
+                    "stale-instance timeout: cleanup sweep dismissed agents left behind"
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    /// One pass of the stale-`Running`-instance hard timeout sweep (strategic
+    /// review B8). A panic in an instance's execution future skips
+    /// [`finalize`](Self::finalize), so the instance would otherwise stay
+    /// `Running` forever with no live task backing it — this sweep is the only
+    /// thing that ever notices. Every `Running` instance older than its
+    /// effective timeout (the workflow's own `staleTimeout:` override, else
+    /// `default_timeout`) is marked failed, finalized, and escalated through
+    /// the B2 [`RecoveryAnnouncer`]. Returns the number of instances timed out.
+    pub async fn stale_timeout_sweep_once(
+        &self,
+        now: DateTime<Utc>,
+        default_timeout: Duration,
+        announcer: &RecoveryAnnouncer,
+        sinks: &SinkRegistry,
+        cap: RateCap,
+    ) -> usize {
+        let stale: Vec<Instance> = self
+            .list()
+            .into_iter()
+            .filter(|i| i.status == InstanceStatus::Running)
+            .filter(|i| {
+                let timeout = i
+                    .stale_timeout_secs
+                    .map(Duration::from_secs)
+                    .unwrap_or(default_timeout);
+                now.signed_duration_since(i.started_at)
+                    .to_std()
+                    .map(|elapsed| elapsed > timeout)
+                    .unwrap_or(false)
+            })
+            .collect();
+        let mut timed_out = 0usize;
+        for instance in stale {
+            let effective_secs = instance
+                .stale_timeout_secs
+                .unwrap_or(default_timeout.as_secs());
+            match self.timeout_stale_instance(&instance, effective_secs).await {
+                Ok(true) => {
+                    timed_out += 1;
+                    let notice = EscalationNotice::new(
+                        "pending",
+                        "instance-timeout",
+                        Severity::Critical,
+                        repo_name_of(&instance.repo),
+                        format!("{} ({})", instance.workflow, instance.id),
+                        format!(
+                            "workflow instance {} (workflow `{}`) stayed Running past its {effective_secs}s hard timeout with no completion. Marked failed and finalized automatically.",
+                            instance.id, instance.workflow
+                        ),
+                    )
+                    .with_ref("instance", instance.id.clone())
+                    .with_ref("workflow", instance.workflow.clone())
+                    .with_ref("repo", instance.repo.clone());
+                    if let Err(error) = announcer.announce(
+                        &self.space,
+                        sinks,
+                        RecoveryAction {
+                            kind: "instance-timeout".into(),
+                            instance: "daemon".into(),
+                            notice,
+                        },
+                        cap,
+                    ) {
+                        warn!(instance = %instance.id, %error, "stale-instance timeout: escalation announce failed");
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => warn!(
+                    instance = %instance.id,
+                    %error,
+                    "stale-instance timeout: failed to persist terminal transition"
+                ),
+            }
+        }
+        timed_out
     }
 
     /// Load persisted instances into memory on daemon startup (TKT-52).
@@ -2032,6 +2183,7 @@ impl WorkflowEngine {
             completed_at: None,
             archived_at: None,
             trigger: None,
+            stale_timeout_secs: resolve_stale_timeout_secs(&workflow)?,
         };
         if let Some(existing) = self.store_if_absent(child)? {
             if existing.workflow != workflow_name
@@ -4142,6 +4294,20 @@ pub(crate) fn parse_duration(s: &str) -> rk_core::Result<Duration> {
         .ok_or_else(invalid)
 }
 
+/// Resolve a workflow's `staleTimeout:` override (strategic review B8) into
+/// seconds at launch time, once, rather than re-parsing `definition` on every
+/// sweep pass. `None` when the workflow declares no override — the sweep then
+/// falls back to its configured `default_timeout_secs`. A malformed override
+/// fails the launch immediately (via `?` at the call site) rather than being
+/// silently ignored until the sweep would have needed it 12 hours later.
+fn resolve_stale_timeout_secs(workflow: &Workflow) -> rk_core::Result<Option<u64>> {
+    workflow
+        .stale_timeout
+        .as_deref()
+        .map(|s| parse_duration(s).map(|d| d.as_secs()))
+        .transpose()
+}
+
 /// One row of an instance's rendered step trace. `index` is the TOP-LEVEL
 /// step index the row belongs to — the executor's `current_step` cursor only
 /// counts top-level steps, so nested rows (a `when` case body, a `repeat`
@@ -4428,6 +4594,7 @@ mod tests {
             completed_at: None,
             archived_at: None,
             trigger: None,
+            stale_timeout_secs: None,
         };
 
         complete_top_level_step(&mut instance, 0, true, Some(json!({"joined": true})));
@@ -4465,6 +4632,7 @@ mod tests {
             completed_at: None,
             archived_at: None,
             trigger: None,
+            stale_timeout_secs: None,
         };
 
         join_nested_subworkflow_result(&mut instance, json!({"joined": true}));
@@ -4536,6 +4704,7 @@ mod tests {
             completed_at: None,
             archived_at: None,
             trigger: None,
+            stale_timeout_secs: None,
         };
 
         mark_recovery_failure_in_memory(
@@ -4977,6 +5146,7 @@ test a::flaky ... FAILED
             completed_at: None,
             archived_at: None,
             trigger: None,
+            stale_timeout_secs: None,
         };
         let original = before.work_key();
         before.definition_digest = "bbbb".into();
@@ -5372,6 +5542,7 @@ test a::flaky ... FAILED
             completed_at: None,
             archived_at: None,
             trigger: None,
+            stale_timeout_secs: None,
         };
         engine.store_if_absent(instance).unwrap();
 
@@ -5410,5 +5581,177 @@ test a::flaky ... FAILED
             .unwrap();
         assert_eq!(live.spawn, Some(respawned_generation));
         assert_eq!(live.state, AgentState::Running);
+    }
+
+    // --- B8: stale-`Running`-instance hard timeout sweep ---
+
+    struct RecordingSink(std::sync::Arc<Mutex<Vec<String>>>);
+
+    impl rk_core::notify::NotificationSink for RecordingSink {
+        fn kind(&self) -> &str {
+            "recorder"
+        }
+        fn deliver(&self, notice: &EscalationNotice) -> rk_core::Result<()> {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(notice.tuple_id.clone());
+            Ok(())
+        }
+    }
+
+    fn recording_sinks() -> (SinkRegistry, std::sync::Arc<Mutex<Vec<String>>>) {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut registry = SinkRegistry::new();
+        registry.register(
+            rk_core::config::SinkConfig::of_kind("recorder"),
+            Box::new(RecordingSink(seen.clone())),
+        );
+        (registry, seen)
+    }
+
+    fn wedged_instance(id: &str, started_at: DateTime<Utc>) -> Instance {
+        Instance {
+            id: id.into(),
+            workflow: "steward".into(),
+            repo: "/repo".into(),
+            coordinator: None,
+            schedule: None,
+            status: InstanceStatus::Running,
+            revision: 0,
+            current_step: 1,
+            total_steps: 3,
+            context: WorkflowContext::default(),
+            error: None,
+            awaiting: None,
+            instance_max_usd: None,
+            definition: "steward".into(),
+            definition_digest: String::new(),
+            automated_landing_authorized: false,
+            params: HashMap::new(),
+            depth: 0,
+            started_at,
+            completed_at: None,
+            archived_at: None,
+            trigger: None,
+            stale_timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn resolve_stale_timeout_secs_parses_the_override_and_defaults_to_none() {
+        let mut workflow = Workflow {
+            name: "wf".into(),
+            description: String::new(),
+            params: HashMap::new(),
+            agents: HashMap::new(),
+            tiers: TierRouting::default(),
+            budget: None,
+            stale_timeout: None,
+            steps: Vec::new(),
+            aspects: Vec::new(),
+        };
+        assert_eq!(resolve_stale_timeout_secs(&workflow).unwrap(), None);
+
+        workflow.stale_timeout = Some("24h".into());
+        assert_eq!(resolve_stale_timeout_secs(&workflow).unwrap(), Some(24 * 3600));
+
+        workflow.stale_timeout = Some("not-a-duration".into());
+        assert!(resolve_stale_timeout_secs(&workflow).is_err());
+    }
+
+    /// Acceptance criterion: an artificially wedged instance (`Running`,
+    /// `started_at` far past the default timeout) transitions to `failed` with
+    /// an escalation notice.
+    #[tokio::test]
+    async fn stale_timeout_sweep_fails_a_wedged_instance_and_announces() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        let started_at = Utc::now() - chrono::Duration::hours(13);
+        engine
+            .store_if_absent(wedged_instance("wf-wedged", started_at))
+            .unwrap();
+
+        let (sinks, recorder) = recording_sinks();
+        let announcer = RecoveryAnnouncer::new();
+        let timed_out = engine
+            .stale_timeout_sweep_once(
+                Utc::now(),
+                Duration::from_secs(12 * 3600),
+                &announcer,
+                &sinks,
+                RateCap::unlimited(),
+            )
+            .await;
+
+        assert_eq!(timed_out, 1);
+        let after = engine.status("wf-wedged").unwrap();
+        assert_eq!(after.status, InstanceStatus::Failed);
+        assert!(after.error.unwrap().contains("stale-instance timeout"));
+        assert_eq!(recorder.lock().unwrap().len(), 1);
+
+        let events = engine
+            .space
+            .scan(&Pattern::category(Category::Event).identity("workflow_failed"))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["instance"], json!("wf-wedged"));
+    }
+
+    /// Acceptance criterion: a long-running workflow with an explicit
+    /// `staleTimeout:` override is untouched by the default-timeout sweep.
+    #[tokio::test]
+    async fn stale_timeout_sweep_leaves_an_overridden_instance_running() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        // Past the 12h default, but within its own 24h override.
+        let started_at = Utc::now() - chrono::Duration::hours(13);
+        let mut instance = wedged_instance("wf-overridden", started_at);
+        instance.stale_timeout_secs = Some(24 * 3600);
+        engine.store_if_absent(instance).unwrap();
+
+        let (sinks, recorder) = recording_sinks();
+        let announcer = RecoveryAnnouncer::new();
+        let timed_out = engine
+            .stale_timeout_sweep_once(
+                Utc::now(),
+                Duration::from_secs(12 * 3600),
+                &announcer,
+                &sinks,
+                RateCap::unlimited(),
+            )
+            .await;
+
+        assert_eq!(timed_out, 0);
+        assert_eq!(
+            engine.status("wf-overridden").unwrap().status,
+            InstanceStatus::Running
+        );
+        assert!(recorder.lock().unwrap().is_empty());
+    }
+
+    /// The sweep must never race a genuine completion out from under it: the
+    /// guarded transition is a no-op on anything that is not `Running` at the
+    /// moment the lock is held, however old its `started_at` is.
+    #[tokio::test]
+    async fn timeout_stale_instance_is_a_guarded_no_op_once_already_terminal() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        let started_at = Utc::now() - chrono::Duration::hours(13);
+        let mut instance = wedged_instance("wf-already-done", started_at);
+        instance.status = InstanceStatus::Completed;
+        instance.completed_at = Some(Utc::now());
+        engine.store_if_absent(instance.clone()).unwrap();
+
+        let changed = engine
+            .timeout_stale_instance(&instance, 12 * 3600)
+            .await
+            .unwrap();
+
+        assert!(!changed);
+        assert_eq!(
+            engine.status("wf-already-done").unwrap().status,
+            InstanceStatus::Completed
+        );
     }
 }
