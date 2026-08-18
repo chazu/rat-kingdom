@@ -3202,7 +3202,23 @@ impl WorkflowEngine {
         automated: bool,
     ) -> rk_core::Result<()> {
         if automated {
-            if let Ok(git_repo) = rk_git::Repo::discover(Path::new(repo)) {
+            // `Repo::discover` shells out to git; `run_step` runs this
+            // synchronously inside its own async future, so keep the
+            // subprocess off the worker thread the same way
+            // `Supervisor::diff_summary_for` does. The flavor check (rather
+            // than an unconditional `block_in_place`) is needed because
+            // `#[tokio::test]` defaults to a current-thread runtime, where
+            // `block_in_place` panics.
+            let on_multithread = tokio::runtime::Handle::try_current()
+                .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+                .unwrap_or(false);
+            let repo_path = Path::new(repo);
+            let discovered = if on_multithread {
+                tokio::task::block_in_place(|| rk_git::Repo::discover(repo_path))
+            } else {
+                rk_git::Repo::discover(repo_path)
+            };
+            if let Ok(git_repo) = discovered {
                 let registry_path = self.layout.home().join("repos.json");
                 if let Ok(registry) = crate::repos::RepoRegistry::load(&registry_path) {
                     if let Some(approved) = registry
