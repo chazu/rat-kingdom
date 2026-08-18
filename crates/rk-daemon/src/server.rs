@@ -150,6 +150,9 @@ pub struct Daemon {
     /// and a fresh `RecoveryAnnouncer` per call would silently reset that
     /// window every tick, defeating the cap.
     recovery_announcer: crate::recovery::RecoveryAnnouncer,
+    /// B9 orphaned-ticket sweep (seam 5): reopen an `in_progress` ticket whose
+    /// assignee has no live agent record. See `ticket_reopen_sweep_once`.
+    ticket_reopen_sweep_config: rk_core::config::TicketReopenSweepConfig,
     drain_config: rk_core::config::DrainConfig,
     evaporation_decay: f64,
     ingest_config: rk_core::config::IngestConfig,
@@ -273,6 +276,7 @@ impl Daemon {
         daemon.worktree_sweep_config = config.worktree_sweep.clone();
         daemon.recovery_sweep_config = config.recovery_sweep.clone();
         daemon.instance_timeout_sweep_config = config.instance_timeout_sweep.clone();
+        daemon.ticket_reopen_sweep_config = config.ticket_reopen_sweep.clone();
         daemon.supervisor.set_min_free_disk_gb(config.disk.min_free_gb);
         daemon
             .supervisor
@@ -387,6 +391,14 @@ impl Daemon {
         cfg: rk_core::config::InstanceTimeoutSweepConfig,
     ) {
         self.instance_timeout_sweep_config = cfg;
+    }
+
+    #[doc(hidden)]
+    pub fn set_ticket_reopen_sweep_config(
+        &mut self,
+        cfg: rk_core::config::TicketReopenSweepConfig,
+    ) {
+        self.ticket_reopen_sweep_config = cfg;
     }
 
     #[doc(hidden)]
@@ -505,6 +517,12 @@ impl Daemon {
                 ..rk_core::config::InstanceTimeoutSweepConfig::default()
             },
             recovery_announcer: crate::recovery::RecoveryAnnouncer::new(),
+            // Same reasoning again: `Daemon::new`'s config-loading path is the
+            // only one that turns the periodic loop on for a real deployment.
+            ticket_reopen_sweep_config: rk_core::config::TicketReopenSweepConfig {
+                enabled: false,
+                ..rk_core::config::TicketReopenSweepConfig::default()
+            },
             drain_config: rk_core::config::DrainConfig::default(),
             evaporation_decay: rk_core::config::EvaporationConfig::default().decay,
             ingest_config: rk_core::config::IngestConfig::default(),
@@ -789,6 +807,36 @@ impl Daemon {
                             }
                         }
                         _ = it_shutdown.changed() => break,
+                    }
+                }
+            });
+        }
+
+        // B9 orphaned-ticket sweep (seam 5): an `in_progress` ticket whose
+        // assignee has had no live agent record for `stale_after_secs`
+        // reopens to `open` (drain-eligible again), announced through the B2
+        // helper. Drain only refills from `status = open`, so without this an
+        // errored rat's ticket is stuck `in_progress` forever. Runs directly
+        // on this async task rather than `spawn_blocking` — same as the drain
+        // loop below, which touches the same `Tickets`/`Space` methods this
+        // does — because they are lock-based, not blocking I/O.
+        if daemon.ticket_reopen_sweep_config.enabled {
+            let daemon_ref = Arc::clone(&daemon);
+            let mut tr_shutdown = daemon.shutdown_tx.subscribe();
+            let interval =
+                Duration::from_secs(daemon.ticket_reopen_sweep_config.interval_secs.max(1));
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            match daemon_ref.ticket_reopen_sweep_once().await {
+                                0 => {}
+                                n => debug!(reopened = n, "ticket reopen sweep reopened orphaned tickets"),
+                            }
+                        }
+                        _ = tr_shutdown.changed() => break,
                     }
                 }
             });
@@ -2939,6 +2987,144 @@ impl Daemon {
                 crate::recovery::RateCap::per_hour(self.instance_timeout_sweep_config.rate_cap_per_hour),
             )
             .await
+    }
+
+    /// B9 orphaned-ticket sweep body (strategic review, seam 5): reopen every
+    /// `in_progress` ticket whose assignee has had no LIVE agent record for
+    /// `stale_after_secs`.
+    ///
+    /// "No live owner" is anchored on the MORE RECENT of the ticket's own
+    /// last edit and the assignee's own last state transition, not on when
+    /// the ticket was originally claimed — a rat that has been quietly
+    /// working for an hour must not look "stale" the instant it dies, and a
+    /// ticket whose `assignee` hasn't landed yet (the CLI sets `status`
+    /// in_progress before recording `assignee` — `agent_cmds.rs`) must not
+    /// look ownerless before that handoff has had a chance to complete.
+    ///
+    /// Reopen itself is the CAS [`crate::tickets::Tickets::reopen_if_in_progress`]
+    /// (the mirror of `claim`'s `open` -> `in_progress`), so a ticket whose
+    /// rat finishes racing this sweep's read is never clobbered back to
+    /// `open` after it went `done`. The announce only fires once the reopen
+    /// actually won — a ticket that moved on between the scan and the write
+    /// produces no escalation, matching "announced" meaning "an action was
+    /// taken", not "a ticket was looked at".
+    async fn ticket_reopen_sweep_once(&self) -> usize {
+        self.ticket_reopen_sweep_at(chrono::Utc::now()).await
+    }
+
+    /// Testable core of [`Self::ticket_reopen_sweep_once`]: `now` is injected
+    /// rather than read from the clock, so a test can assert the 15-minute
+    /// staleness bound without an actual 15-minute wait.
+    async fn ticket_reopen_sweep_at(&self, now: DateTime<Utc>) -> usize {
+        let stale_after =
+            chrono::Duration::seconds(self.ticket_reopen_sweep_config.stale_after_secs as i64);
+        let in_progress = match self.tickets.list(None, Some("in_progress".to_string()), None) {
+            Ok(tickets) => tickets,
+            Err(e) => {
+                warn!(error = %e, "ticket reopen sweep: list failed");
+                return 0;
+            }
+        };
+        if in_progress.is_empty() {
+            return 0;
+        }
+        let sinks = crate::reactor::sink_factory()
+            .registry(self.notify_config.resolved(self.reactor_config.notify_escalations));
+        let announcer = crate::recovery::RecoveryAnnouncer::new();
+        let mut reopened = 0usize;
+        for ticket in in_progress {
+            let assignee = ticket
+                .payload
+                .get("assignee")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let agent = assignee.as_deref().and_then(|name| self.supervisor.status(name)).or_else(|| {
+                // A ticket with no `assignee` is not necessarily ownerless: a
+                // drain claim writes `assignee` only after its spawn returns
+                // (drain.rs), so a ticket in the gap between claim and that
+                // write — or one left behind by a daemon predating that
+                // write — can still have a live rat working it. `task ==
+                // ticket id` is the same identity both the drain and the CLI
+                // spawn path (agent_cmds.rs) key on, so it is a reliable
+                // fallback match. Only tried when `assignee` is absent: a
+                // ticket that names a dead/gone assignee must not be
+                // rescued by an unrelated live agent that happens to share
+                // its task.
+                if assignee.is_some() {
+                    return None;
+                }
+                self.supervisor
+                    .list()
+                    .into_iter()
+                    .find(|a| a.state.is_live() && a.task.as_deref() == Some(ticket.identity.as_str()))
+            });
+            if agent.as_ref().is_some_and(|a| a.state.is_live()) {
+                continue;
+            }
+            let ticket_updated_at = ticket
+                .payload
+                .get("updated_at")
+                .and_then(Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(ticket.created_at);
+            let owner_since = match &agent {
+                Some(a) => a.updated_at.max(ticket_updated_at),
+                None => ticket_updated_at,
+            };
+            if now - owner_since < stale_after {
+                continue;
+            }
+            let ticket_id = ticket.identity.clone();
+            let performed = match self.tickets.reopen_if_in_progress(&ticket_id).await {
+                Ok(performed) => performed,
+                Err(e) => {
+                    warn!(ticket = %ticket_id, error = %e, "ticket reopen sweep: reopen failed");
+                    continue;
+                }
+            };
+            if !performed {
+                // Moved on (claimed/done/closed) between the scan above and
+                // this write — nothing to announce.
+                continue;
+            }
+            let detail = match (&assignee, &agent) {
+                (Some(name), Some(a)) => format!(
+                    "no live owner for over {}m (assignee `{name}` is {:?})",
+                    stale_after.num_minutes(),
+                    a.state
+                ),
+                (Some(name), None) => format!(
+                    "no live owner for over {}m (assignee `{name}` has no agent record)",
+                    stale_after.num_minutes()
+                ),
+                (None, _) => format!("no assignee for over {}m", stale_after.num_minutes()),
+            };
+            let notice = rk_core::notify::EscalationNotice::new(
+                "pending",
+                "ticket-reopen",
+                rk_core::notify::Severity::Warn,
+                ticket.scope.clone(),
+                ticket_id.clone(),
+                format!("{ticket_id} reopened to `open`: {detail}"),
+            )
+            .with_ref("ticket", ticket_id.clone());
+            let action = crate::recovery::RecoveryAction {
+                kind: "ticket-reopen".to_string(),
+                instance: "ticket-reopen-sweep".to_string(),
+                notice,
+            };
+            if let Err(e) = announcer.announce(
+                &self.space,
+                &sinks,
+                action,
+                crate::recovery::RateCap::unlimited(),
+            ) {
+                warn!(ticket = %ticket_id, error = %e, "ticket reopen sweep: announce failed");
+            }
+            reopened += 1;
+        }
+        reopened
     }
 
     /// Append an `Event` tuple authored by this castle. Best-effort: a store
@@ -7275,5 +7461,265 @@ mod factory_snapshot_resync_tests {
             .await
             .unwrap();
         assert_eq!(snapshot["snapshot"]["repo_resync"]["required"], true);
+    }
+}
+
+#[cfg(test)]
+mod ticket_reopen_sweep_tests {
+    //! B9 (strategic review, seam 5): an `in_progress` ticket whose assignee
+    //! has had no live agent record for the stale window reopens to `open`,
+    //! announced through the B2 recovery helper.
+    use super::*;
+    use crate::agents::{AgentRecord, AgentState};
+    use crate::tickets::{NewTicket, TicketChanges};
+    use rk_core::config::Config;
+    use rk_harness::TokenUsage;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    /// Writes a fabricated `agents.json` directly (mirrors
+    /// `authorize_reasoned_tests::test_daemon_with_role`) so the daemon's
+    /// registry starts with a controllable agent state — no real spawn or
+    /// process needed. `updated_at` is real "now", so the test controls
+    /// staleness by injecting a future `now` into the sweep itself rather
+    /// than by faking the record's timestamp.
+    fn daemon_with_agent(name: &str, state: AgentState) -> (tempfile::TempDir, Daemon) {
+        daemon_with_agent_task(name, state, "ticket-reopen-sweep-test")
+    }
+
+    /// Like [`daemon_with_agent`] but with a caller-chosen `task`, for the
+    /// no-assignee fallback tests: a drain spawn keys `task` to the ticket id
+    /// (`SpawnParams` in drain.rs), which is exactly what the sweep's
+    /// fallback match uses in place of a missing `assignee`.
+    fn daemon_with_agent_task(name: &str, state: AgentState, task: &str) -> (tempfile::TempDir, Daemon) {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        layout.ensure().unwrap();
+        let now = chrono::Utc::now();
+        let record = AgentRecord {
+            name: name.into(),
+            spawn: None,
+            role: "rat".into(),
+            coordination: None,
+            harness: "fake".into(),
+            permission_mode: None,
+            model: None,
+            repo_root: PathBuf::from("/tmp/repo"),
+            repo_name: "repo".into(),
+            task: Some(task.into()),
+            branch: Some(format!("rat/{name}/task")),
+            worktree: Some(PathBuf::from(format!("/tmp/worktree/{name}"))),
+            target_branch: "main".into(),
+            parent: None,
+            workflow_instance: None,
+            coordinator: None,
+            session_id: Some("test-session".into()),
+            attach_target: None,
+            pid: None,
+            merge_commit: None,
+            state,
+            crashed: false,
+            stderr_tail: None,
+            result: None,
+            progress: None,
+            usage: TokenUsage::default(),
+            cost_usd: 0.0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+        };
+        let mut records = HashMap::new();
+        records.insert(record.name.clone(), record);
+        std::fs::write(
+            layout.home().join("agents.json"),
+            serde_json::to_vec(&records).unwrap(),
+        )
+        .unwrap();
+        let daemon = Daemon::new(layout, &Config::default()).unwrap();
+        (dir, daemon)
+    }
+
+    fn new_ticket() -> NewTicket {
+        NewTicket {
+            title: "orphan me".into(),
+            body: None,
+            scope: None,
+            parent: None,
+            priority: "normal".into(),
+            labels: vec![],
+            depends_on: vec![],
+            created_by: None,
+            coalesce_key: None,
+        }
+    }
+
+    /// Create a ticket and drive it `in_progress` with the given assignee,
+    /// mirroring `agent_cmds.rs`'s spawn path (status set, then assignee).
+    async fn in_progress_ticket(daemon: &Daemon, assignee: Option<&str>) -> String {
+        let ticket = daemon.tickets.create(new_ticket()).await.unwrap();
+        daemon
+            .tickets
+            .update(
+                &ticket.identity,
+                TicketChanges {
+                    status: Some("in_progress".into()),
+                    assignee: assignee.map(String::from),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        ticket.identity
+    }
+
+    #[tokio::test]
+    async fn a_live_owner_is_never_touched() {
+        let (_dir, daemon) = daemon_with_agent("Live-1", AgentState::Running);
+        let id = in_progress_ticket(&daemon, Some("Live-1")).await;
+
+        // Even far beyond the stale window, a live owner must never be swept.
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(2);
+        let reopened = daemon.ticket_reopen_sweep_at(far_future).await;
+
+        assert_eq!(reopened, 0);
+        let ticket = daemon.tickets.get(&id).unwrap().unwrap();
+        assert_eq!(ticket.payload["status"], json!("in_progress"));
+    }
+
+    #[tokio::test]
+    async fn a_dead_owner_reopens_after_the_stale_window_and_announces() {
+        let (_dir, daemon) = daemon_with_agent("Dead-1", AgentState::Failed);
+        let id = in_progress_ticket(&daemon, Some("Dead-1")).await;
+
+        let past_window = chrono::Utc::now() + chrono::Duration::minutes(20);
+        let reopened = daemon.ticket_reopen_sweep_at(past_window).await;
+
+        assert_eq!(reopened, 1);
+        let ticket = daemon.tickets.get(&id).unwrap().unwrap();
+        assert_eq!(ticket.payload["status"], json!("open"));
+
+        let events = daemon
+            .space
+            .scan(
+                &Pattern::category(Category::Event)
+                    .identity(crate::recovery::RECOVERY_ACTION_IDENTITY),
+            )
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one announced recovery action"
+        );
+        assert_eq!(events[0].payload["action_kind"], json!("ticket-reopen"));
+    }
+
+    #[tokio::test]
+    async fn a_dead_owner_within_the_grace_window_is_left_alone() {
+        let (_dir, daemon) = daemon_with_agent("Dead-2", AgentState::Failed);
+        let id = in_progress_ticket(&daemon, Some("Dead-2")).await;
+
+        let within_window = chrono::Utc::now() + chrono::Duration::minutes(5);
+        let reopened = daemon.ticket_reopen_sweep_at(within_window).await;
+
+        assert_eq!(reopened, 0);
+        let ticket = daemon.tickets.get(&id).unwrap().unwrap();
+        assert_eq!(ticket.payload["status"], json!("in_progress"));
+    }
+
+    /// Covers the spawn-handoff race: `status` flips to `in_progress` before
+    /// `assignee` is recorded (`agent_cmds.rs`). If the assignee never lands
+    /// (the spawn itself failed before recording it), the ticket must not
+    /// stay `in_progress` forever waiting for an owner that will never exist.
+    #[tokio::test]
+    async fn a_ticket_with_no_assignee_yet_still_eventually_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        let daemon = Daemon::new(layout, &Config::default()).unwrap();
+        let id = in_progress_ticket(&daemon, None).await;
+
+        let past_window = chrono::Utc::now() + chrono::Duration::minutes(20);
+        let reopened = daemon.ticket_reopen_sweep_at(past_window).await;
+
+        assert_eq!(reopened, 1);
+        let ticket = daemon.tickets.get(&id).unwrap().unwrap();
+        assert_eq!(ticket.payload["status"], json!("open"));
+    }
+
+    /// B9-rework: a drain-claimed ticket has no `assignee` in the gap before
+    /// the drain's post-spawn write lands (or on a daemon that predates that
+    /// write), but its live rat's `task` still equals the ticket id. The
+    /// sweep's fallback match must find that live owner and leave the ticket
+    /// alone, even far past the stale window — otherwise every drain-owned
+    /// live ticket gets reopened and double-dispatched on the first sweep.
+    #[tokio::test]
+    async fn a_null_assignee_ticket_with_a_live_task_match_is_never_touched() {
+        // Placeholder task at creation time — the real ticket id does not
+        // exist until after the ticket is created, so the fixture's task is
+        // patched to match it below (mirrors a real drain: the agent is
+        // spawned with `task = ticket.identity` from the start, but the test
+        // fixture cannot know that id in advance).
+        let (dir, daemon) = daemon_with_agent_task("Drain-Owned-1", AgentState::Running, "tbd");
+        let id = in_progress_ticket(&daemon, None).await;
+
+        let mut records: HashMap<String, AgentRecord> =
+            serde_json::from_slice(&std::fs::read(dir.path().join("agents.json")).unwrap())
+                .unwrap();
+        for record in records.values_mut() {
+            record.task = Some(id.clone());
+        }
+        std::fs::write(
+            dir.path().join("agents.json"),
+            serde_json::to_vec(&records).unwrap(),
+        )
+        .unwrap();
+        let daemon = Daemon::new(Layout::at(dir.path()), &Config::default()).unwrap();
+
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(2);
+        let reopened = daemon.ticket_reopen_sweep_at(far_future).await;
+
+        assert_eq!(reopened, 0);
+        let ticket = daemon.tickets.get(&id).unwrap().unwrap();
+        assert_eq!(ticket.payload["status"], json!("in_progress"));
+    }
+
+    /// B9-rework: a null-assignee ticket with NO live agent whose task
+    /// matches it (the genuinely orphaned case — e.g. the assignee's write
+    /// never landed and its rat is gone) must still reopen after the stale
+    /// window: the fallback match must not make every null-assignee ticket
+    /// immortal, only ones a live rat can actually be traced to.
+    #[tokio::test]
+    async fn a_null_assignee_ticket_with_no_live_task_match_still_reopens() {
+        let (_dir, daemon) = daemon_with_agent_task(
+            "Unrelated-Live-1",
+            AgentState::Running,
+            "some-other-task-entirely",
+        );
+        let id = in_progress_ticket(&daemon, None).await;
+
+        let past_window = chrono::Utc::now() + chrono::Duration::minutes(20);
+        let reopened = daemon.ticket_reopen_sweep_at(past_window).await;
+
+        assert_eq!(reopened, 1);
+        let ticket = daemon.tickets.get(&id).unwrap().unwrap();
+        assert_eq!(ticket.payload["status"], json!("open"));
+    }
+
+    /// A ticket that reaches `done` between the sweep's scan and its CAS
+    /// write must never be clobbered back to `open` — the whole point of
+    /// `reopen_if_in_progress` being a CAS rather than a blind set.
+    #[tokio::test]
+    async fn a_ticket_that_finished_racing_the_sweep_is_not_reopened() {
+        let (_dir, daemon) = daemon_with_agent("Dead-3", AgentState::Failed);
+        let id = in_progress_ticket(&daemon, Some("Dead-3")).await;
+
+        // Simulate the rat's own `rk done` landing between the sweep's scan
+        // and its write by moving the ticket to `done` directly, then
+        // exercise the CAS primitive the sweep itself calls.
+        daemon.tickets.set_status(&id, "done").await.unwrap();
+        let performed = daemon.tickets.reopen_if_in_progress(&id).await.unwrap();
+
+        assert!(!performed);
+        let ticket = daemon.tickets.get(&id).unwrap().unwrap();
+        assert_eq!(ticket.payload["status"], json!("done"));
     }
 }

@@ -384,6 +384,36 @@ impl Tickets {
         .await
     }
 
+    /// Atomically reopen an orphaned `in_progress` ticket: compare-and-set
+    /// `in_progress` -> `open`. Returns `true` if this call performed the
+    /// reopen, `false` if the ticket no longer exists or had already moved on
+    /// (a live owner advanced it, or it reached `done`/`closed`) between the
+    /// caller's staleness check and this write. The mirror of [`claim`]'s
+    /// `open` -> `in_progress` CAS, so the B9 orphaned-ticket sweep can never
+    /// clobber a ticket its own rat finished racing the sweep's read.
+    ///
+    /// [`claim`]: Self::claim
+    pub async fn reopen_if_in_progress(&self, id: &str) -> rk_core::Result<bool> {
+        let _guard = self.lock.lock().await;
+        let Some(existing) = self.take_ticket(id).await? else {
+            return Ok(false);
+        };
+        let in_progress =
+            existing.payload.get("status").and_then(Value::as_str) == Some("in_progress");
+        let mut payload = existing.payload.clone();
+        if in_progress {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("status".into(), json!("open"));
+                obj.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
+            }
+        }
+        // Always write the ticket back — with the new status on a win,
+        // unchanged on a loss — so a losing reopen never destroys the ticket
+        // it took (same reasoning as `claim`).
+        self.space.out(with_payload(existing, payload))?;
+        Ok(in_progress)
+    }
+
     /// Reopen a closed ticket as an explicit recovery action (used by
     /// `rk revert`). Ordinary updates cannot move a closed ticket backwards.
     pub async fn reopen(&self, id: &str, status: &str) -> rk_core::Result<Tuple> {
