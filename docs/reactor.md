@@ -41,6 +41,21 @@ The `match` block is turned into the same `rk_core::tuple::Pattern` that every
 reader in the system uses, so a trigger matches a tuple exactly when a
 `scan`/`rd`/`watch` with the same pattern would.
 
+### `action`: workflow vs. daemon-native land
+
+`action?: "workflow" | "land"` (schema: `crates/rk-workflow/src/triggers-schema.cue`)
+picks what a match does. Every trigger above is the default, `"workflow"`: spawn
+`run`'s named workflow with `params` templated in. `action: "land"` is the one
+built-in alternative — it does not spawn a workflow instance at all. Instead the
+reactor hands the matched tuple straight to the daemon-native `LandingPipeline`
+(`crates/rk-daemon/src/landing.rs`, `Reactor::fire_land_action`), which reads
+`branch`/`head_sha`/`target`/`diff_class`/`task` directly off the tuple's own
+payload — so `run` is not read for this action and need not be set, and `params`
+templating does not apply either. This is what the shipped landing pipeline
+example (`examples/triggers-landing-pipeline.cue`) uses; see
+[Shipped reaction: the steward and the landing pipeline](#shipped-reaction-the-steward-and-the-landing-pipeline)
+below.
+
 ### Param templating
 
 Each `params` value is templated from the matched tuple:
@@ -271,93 +286,252 @@ newest existing tuple, so it does **not** react to the entire pre-existing
 backlog at startup. Only tuples that arrive after boot are dispatched. A restart
 resumes from the persisted cursor.
 
-## Shipped reaction: the steward
+## Shipped reaction: the steward and the landing pipeline
 
-The **steward** (`examples/workflows/steward.cue` + the `steward-on-completion`
-trigger in `examples/triggers.cue`) is the reactor's flagship autonomy loop and
-the biggest single reduction in per-task operator attention: it automates the
-most-repeated operator decision, *"is this branch good to merge?"*. It is not a
-Rust built-in — it is a plain trigger + workflow you opt into by copying both
-into place, composing primitives that already exist.
+The **steward** is the reactor's flagship autonomy loop and the biggest single
+reduction in per-task operator attention: it automates the most-repeated
+operator decision, *"is this branch good to merge?"*, reactively triaging
+every rat completion (`Event/harness_result`, emitted by `route_completion`).
+It ships in two forms, and as of **2026-08-16 the daemon-native form is the one
+actually live on this fleet** (`docs/proposals/daemon-native-landing-pipeline.md`
+§6, Phase 3/4 of the steward remediation, `memory/steward-investigation`):
 
-On **every rat completion** (`Event/harness_result`, emitted by
-`route_completion`), the steward reactively triages that rat's branch:
+- **`action: "land"` — the daemon-native landing pipeline (live).** A trigger
+  (shipped as `steward-landing-on-completion` in
+  `examples/triggers-landing-pipeline.cue`) hands each matching completion
+  straight to `LandingPipeline` (`crates/rk-daemon/src/landing.rs`) — no
+  workflow instance spawned to carry it. See
+  [The daemon-native landing pipeline](#the-daemon-native-landing-pipeline)
+  below.
+- **`run: "steward"` — the workflow-driven mega-workflow (pre-cutover
+  reference).** The original design: a trigger (`steward-on-completion` in
+  `examples/triggers.cue`) spawns `examples/workflows/steward.cue`, which
+  hosts the gates, the verdict read, and the routing itself as CUE steps.
+  Nothing in a default installation fires it anymore — the operator's
+  `~/.rat-kingdom/triggers/` copy was swapped to the landing-pipeline trigger
+  in the same cutover — but the file remains in the tree as the reference
+  implementation and for its dedicated schema/routing test coverage
+  (`crates/rk-workflow/tests/examples.rs`,
+  `crates/rk-daemon/tests/workflow_verdict_cache.rs`). It is still the
+  behavior you get if you install `examples/triggers.cue`'s copy instead of
+  the landing-pipeline one — both remain valid, mutually exclusive choices;
+  see [Cutover and rollback](#cutover-and-rollback). Its removal is tracked
+  separately (TKT-01M048ASYM00N37EBK1VM7FH5H) and not yet done as of this
+  writing.
 
-1. spawns a cheap reviewer chained onto the completed branch;
-2. runs a **policy gate** — refuses to auto-merge a diff touching protected
-   paths (`git diff --name-only <target>...HEAD` matched against an ERE);
-3. runs a **diff-scope gate** — refuses to auto-merge a diff over a per-repo
-   size budget (`maxDiffFiles` / `maxDiffLines`, `0` = off), so a runaway rat
-   that dodges protected paths but rewrites half the repo is held for a human
-   rather than auto-merged;
-4. runs the repo's **real test/lint gate** (`run` step — teeth the harness
-   cannot forge);
-5. `read`s the reviewer's `APPROVE`/`REWORK`/`STOP` verdict artifact and routes:
-   - `APPROVE` → `land` the branch onto its **land target** (auto-merge —
-     usually `main`; see [Land target inheritance](#land-target-inheritance)
-     below for when it is not);
-   - `REWORK` → file a follow-up ticket, hold the branch;
-   - `STOP` / unknown → escalate via a `need` tuple (ranked into `rk inbox`
-     *and* pushed to the operator's desktop by the [escalation-notify
-     built-in](#built-in-reaction-escalation-notification)), hold the branch.
+Both forms triage a completed branch through the same five decisions — a
+policy gate, a diff-scope gate, the repo's real test/lint gate, a review
+verdict, and a routed outcome — described once below for the live form; the
+mega-workflow's steps are the identical logic expressed as CUE (see the
+extensive comments at the top of `examples/workflows/steward.cue` if you need
+the pre-cutover shape specifically).
 
-Every gate **fails closed**: a protected-path hit, an over-budget diff, or a red
-suite fails the instance so the branch is never merged and the failure surfaces
-in `rk inbox`. Auto-merge is only ever reached through a clean policy gate, a
-within-budget diff, a green suite, *and* an explicit `APPROVE`.
+### The daemon-native landing pipeline
+
+`steward-landing-on-completion` matches the identical `harness_result`
+predicate the old trigger did (`"role":"rat"`, fail-closed on `is_error`/
+`declared_done`, §1.5 of the design doc), but its `action: "land"` reads
+`branch`/`head_sha`/`target`/`diff_class`/`task` directly off the tuple
+payload in Rust and enqueues a `LandingQueueEntry` — a durable, per-`(repo,
+target)` FIFO, restart-safe by construction (queue entries are `Furniture`
+tuples, not in-process state). `LandingPipeline::run_cycle` drains each
+`(repo, target)` key concurrently (different targets in one repo land in
+parallel; within one key, candidates still gate-run one at a time).
+
+For each dequeued candidate, in order:
+
+1. **Policy gate** (`steward-protected-paths` named check) — refuses to
+   auto-merge a diff touching protected paths
+   (`git diff --name-only <target>...HEAD` matched against an ERE).
+2. **Diff-scope gate** (`steward-diff-scope` named check) — refuses to
+   auto-merge a diff over a per-repo size budget (`maxDiffFiles` /
+   `maxDiffLines`, `0` = off), so a runaway rat that dodges protected paths
+   but rewrites half the repo is held for a human rather than auto-merged.
+3. **Real test/lint gate** — the repo's own named check (`verify` by
+   default), run for real; teeth the harness cannot forge.
+
+All three run in a **persistent, daemon-owned detached worktree** —
+`<home>/gate-worktrees/<repo>/<target>`, reset to the candidate's tip each
+time — instead of a throwaway agent worktree. That is the structural change
+from the mega-workflow: no agent spawn is needed just to have somewhere to run
+three deterministic checks.
+
+4. **Review** (only if `diff_class` is not `doc-only`/`trivial`): a
+   commit-keyed verdict-cache probe (`Pattern::for_commit`, scoped to
+   `(repo, branch, head_sha)`) runs first, directly against the tuplespace —
+   no CUE read step. A **hit** (any prior `APPROVE`/`REWORK`/`STOP` for this
+   exact branch tip) is reused without spawning a second opinion. A **miss**
+   spawns the shrunk `examples/workflows/steward-review.cue` — a reviewer
+   chained onto the candidate branch, its *only* job — and parks on the
+   verdict tuple itself (`space.rd`, not the workflow instance's completion
+   state), which is what makes review survive a daemon restart mid-wait (see
+   [Restart safety](#restart-safety)). `doc-only`/`trivial` diffs and a cache
+   hit both reach step 5 with **zero agent spawns**.
+5. **Route** the verdict (fresh or cached), or the unconditional pass for a
+   diff that skipped review entirely:
+   - `APPROVE` (or no review needed) → `Supervisor::land` the branch onto its
+     **land target** directly (see
+     [Land target inheritance](#land-target-inheritance) below);
+   - `REWORK` → `Tickets::create` a follow-up ticket directly, hold the
+     branch;
+   - `STOP` / unrecognized verdict → `Space::out` a `need` tuple directly
+     (ranked into `rk inbox` *and* pushed to the operator's desktop by the
+     [escalation-notify built-in](#built-in-reaction-escalation-notification)),
+     hold the branch;
+   - a failing or timed-out gate → a durable `gate-failure` artifact + a
+     `need`, hold the branch.
+
+   None of these five outcomes shells out or spawns an agent — every one is a
+   direct async call from `LandingPipeline` into `Supervisor`, `Tickets`, or
+   `Space` (design doc §2.4). Every gate still **fails closed**: a
+   protected-path hit, an over-budget diff, or a red suite holds the branch,
+   surfaced in `rk inbox`. Auto-merge is only ever reached through a clean
+   policy gate, a within-budget diff, a green suite, and (when review wasn't
+   skipped) an explicit `APPROVE`.
+
+**Operator-facing landing authority has moved.** The mega-workflow's `land`
+step was gated by two daemon config knobs — `policy.automated_landing_workflows`
+(only a workflow named in this list may `land` unattended) and
+`policy.require_approval_for_landing` — both enforced in
+`crates/rk-daemon/src/workflow_exec.rs`. `LandingPipeline` calls
+`Supervisor::land` directly and never passes through that code path, so
+**neither knob governs the daemon-native pipeline**: for a repo whose triggers
+include an `action: "land"` entry, the trigger's own existence and match
+predicate *is* the unattended-landing authorization. This is the intended end
+state (steward remediation Phase 4, item 4: "landing authority becomes the
+daemon pipeline's own, not a string match on a workflow filename"), but the
+two config fields are not yet narrowed or removed from `rk-core`'s
+`PolicyConfig` (still `automated_landing_workflows: ["steward"]` by default) —
+they remain load-bearing only for the pre-cutover mega-workflow path. Tracked:
+TKT-01M048ASY8MDB5DVV5VG3WRM47.
 
 ### Land target inheritance
 
-`steward.cue` declares `target` with `default: "main"`, but the shipped
-`steward-on-completion` trigger does not rely on that default — it pins
-`target: "{{tuple.payload.target}}"`, reading the value straight off the
-completed rat's own `harness_result`. That payload field is
-`record.target_branch` (`supervisor.rs`): the completed rat's own `--base` when
-one was given at spawn, else the repo's configured delivery target. So the
-steward's land target silently **inherits the completed rat's base branch**,
-not a fixed `main`.
+`fire_land_action` reads `target` straight off the completed rat's own
+`harness_result` payload (default `"main"` if absent) — the identical field
+(`record.target_branch`, set in `supervisor.rs`: the completed rat's own
+`--base` when one was given at spawn, else the repo's configured delivery
+target) the mega-workflow's `target: "{{tuple.payload.target}}"` trigger param
+used. So the landing pipeline's land target silently **inherits the completed
+rat's base branch**, not a fixed `main` — unchanged behavior from before the
+cutover.
 
 This is deliberate for chained work: a rework rat spawned with
 `--base rat/feature/original-branch` (or a workflow step chained onto a prior
-step's branch) wants ITS steward to review-and-land onto that same feature
-branch, not skip past it to `main` — the feature branch is then stewarded to
-`main` as a whole once complete. Pinning `target` to a fixed value in the
-trigger would break that ergonomics.
+step's branch) wants its own landing pass to review-and-land onto that same
+feature branch, not skip past it to `main` — the feature branch is then landed
+to `main` as a whole once complete.
 
-The tradeoff is that the land target is otherwise invisible: a completed
-steward reads the same in `rk workflow list` whether it landed on `main` or on
-someone's feature branch, and an operator can easily assume "steward finished"
-means "reached main". Two things make a non-`main` target visible instead of
-silent:
-
-- **`rk workflow list`** appends `target=<branch>` to any instance whose
-  `params.target` is set and is not `"main"`.
-- **`reactor_non_main_land_target` event.** Whenever `try_fire` fires a
-  trigger whose interpolated params carry a `target` other than `"main"` (not
-  only the steward — any trigger that passes a `target` param through), the
-  reactor writes a repo-scoped `Event` — `{text, trigger, workflow, instance,
-  target, branch}` — authored by the reserved `reactor` instance, and logs a
-  `warn`. The `text` field is human-readable for inbox/event consumers and
-  names both the reviewed branch and its non-main target. Read the live set
-  with `rk scan event <repo>`.
+**Known visibility gap.** Before the cutover, `note_non_main_land_target`
+(`crates/rk-daemon/src/reactor.rs`) fired a repo-scoped
+`reactor_non_main_land_target` event whenever a workflow-firing trigger's
+interpolated `params.target` was not `"main"`, and `rk workflow list` appended
+`target=<branch>` to that instance — both ways an operator could see a
+completed steward had landed somewhere other than `main`. `fire_land_action`
+does not call `note_non_main_land_target` at all (that call site is specific
+to the workflow-firing path), and the zero-agent-spawn fast paths (step 4
+above) have no workflow instance for `rk workflow list` to annotate either.
+**A non-`main` land through the daemon-native pipeline is currently invisible
+by both of the old mechanisms.** `rk scan event <repo>` for `branch_landed`
+tuples (`Supervisor::land`'s own event, which always carries `target`) is the
+only current way to notice. This regression is not fixed here — flagged for a
+follow-up ticket rather than patched inline (see the completion artifact for
+this validation task).
 
 If you want base-chained completions reviewed but held for an explicit
-decision instead of auto-landed, override `target` in a repo-local copy of the
-trigger (pin it to `"main"` or the repo's configured delivery target) rather
-than editing the shared global one — that changes the tradeoff for every
+decision instead of auto-landed, override `target` in a repo-local trigger
+copy (pin it to `"main"` or the repo's configured delivery target) rather than
+editing the shared global one — that changes the tradeoff for every
 chained/rework rat in the repo, including the ones the ergonomics exists for.
 
 **Re-entrancy — match scoping.** The steward is the worked example of the fourth
 re-entrancy technique: its trigger's `match.search` is `"role":"rat"`, so it
-fires only on plain-rat completions. The reviewer it spawns completes as a
-`"reviewer"` (a field now carried on every `harness_result`), whose payload the
-search does not contain — so the steward never re-triggers itself on the branch
-it just reviewed. A reworked ticket, once drained, completes as a `"rat"` and
-re-enters the steward: a closed loop, not a runaway.
+fires only on plain-rat completions. The reviewer `steward-review.cue` spawns
+completes as a `"reviewer"` (a field carried on every `harness_result`), whose
+payload the search does not contain — so the pipeline never re-triggers itself
+on the branch it just reviewed. A reworked ticket, once drained, completes as
+a `"rat"` and re-enters the pipeline: a closed loop, not a runaway.
 
-> Installing the steward makes **all** rat completions auto-merge on a clean
-> verdict. Do not also run an approval-gated workflow (`land-on-approve`) over
-> the same completions, or the two race for the branch.
+> Installing either steward trigger makes **all** matching rat completions
+> auto-merge on a clean verdict. Do not run both `steward-on-completion` and
+> `steward-landing-on-completion` in the same triggers directory at once —
+> they match the identical predicate and would double-dispatch every
+> completion — and do not also run an approval-gated workflow
+> (`land-on-approve`) over the same completions, or they race for the branch.
+
+### Restart safety
+
+Three independent pieces of state, each durable rather than held only in
+process memory (design doc §2.6):
+
+- **The queue itself** — `Furniture` tuples plus a persisted per-repo seq
+  counter file; a restart simply resumes scanning. A crash between a queue
+  entry's status-transition write and its predecessor's delete is closed too
+  (write-then-delete with a `rev` counter, not delete-then-write) — a crash in
+  that gap leaves two tuples sharing one `seq` instead of losing the entry
+  outright, self-healed by the next read.
+- **In-flight candidate state** — a status field (`queued` / `running_gates` /
+  `awaiting_review`) lives on the durable queue entry itself. A restart's
+  `run_cycle` treats every status as eligible and reprocesses it: gates are
+  idempotent (a warm-worktree reset + shell command has no side effect unsafe
+  to redo), and a candidate found `awaiting_review` just re-issues the same
+  `space.rd` wait — if the reviewer already wrote its verdict while the daemon
+  was down, the durable tuple is already there and the wait resolves
+  immediately without spawning a second reviewer.
+- **Never double-land / never orphan a reviewer** — `Supervisor::land`'s CAS
+  (`Repo::advance_target`'s `update-ref <new> <old>`) makes a duplicate `land`
+  call on an already-merged branch a clean no-op; a `work_key = (repo, branch,
+  head_sha)` dedup marker (`landing_processed`) drops a redelivered completion
+  for an already-fully-processed candidate before it is even re-enqueued. And
+  because the pipeline parks on the verdict *tuple*, not the reviewer's
+  *workflow instance*, a daemon restart doesn't lose track of an in-flight
+  reviewer — the reviewer keeps working independently and the restarted
+  pipeline's `space.rd` on the same durable pattern picks up its verdict
+  whenever it lands.
+
+Covered end to end by `crates/rk-daemon/src/landing.rs`'s own test module —
+`restart_mid_gate_run_resumes_and_lands`,
+`park_and_resume_survives_space_level_restart_with_late_verdict`,
+`crash_between_write_and_delete_survives_the_entry`,
+`burst_of_completions_on_one_key_never_runs_gates_concurrently`, and
+`distinct_keys_drain_concurrently_within_one_run_cycle` — plus
+`crates/rk-daemon/tests/{land_on_approve,automated_landing,dropped_land}.rs`
+for the surrounding merge/delivery/inbox behavior.
+
+### Cutover and rollback
+
+Full runbook: `docs/proposals/daemon-native-landing-pipeline.md` §6. Summary:
+
+1. **Preconditions** — T1–T4 merged and the daemon rebuilt/restarted (a merged
+   Rust change is not live until redeployed); the target repo's
+   `.rk/checks.cue` registers `steward-protected-paths`, `steward-diff-scope`,
+   and its real `verify` check; `examples/workflows/steward-review.cue` is
+   installed wherever `steward.cue` was.
+2. **Swap the trigger** — copy `examples/triggers-landing-pipeline.cue`
+   alongside the existing trigger file under a *new* filename, then remove or
+   rename the old `steward-on-completion` entry in the same change (never run
+   both at once — see the warning above). Restart the daemon, or wait for the
+   trigger file's mtime-based reparse.
+3. **Verify parity by hand** before trusting it unattended (no automated
+   `rk workflow drift`-equivalent exists yet, §6.5): land one doc-only/trivial
+   change and confirm zero agent spawns; land one change needing real review
+   and confirm exactly one reviewer spawn; force a REWORK and a STOP and
+   confirm they surface in `rk inbox` in the same shape the workflow-driven
+   steward's did; force a failing gate and confirm a `gate-failure` artifact
+   plus a held branch.
+4. **Rollback** — restore the original `steward-on-completion` trigger file
+   and remove/rename the `action: "land"` one. Nothing about the swap is
+   destructive to in-flight state: a fully-processed candidate has no live
+   queue entry to roll back, and one still mid-flight when the trigger set is
+   swapped back simply stops being drained (it stays inert in the durable
+   queue until the landing trigger is restored or an operator manually
+   inspects/clears it — there is no automatic queue-to-workflow migration).
+5. **Known gaps**, tracked rather than fixed inline: no automated drift/parity
+   check; no attempt-counter backstop on `LandingQueue` analogous to the
+   reactor's `MAX_FIRE_ATTEMPTS` (a candidate whose processing keeps erroring —
+   not gate-failing, an actual `Err` — retries every poll cycle indefinitely);
+   gate-worktree disk/lifetime management is unbounded; and the land-target
+   visibility gap noted above.
 
 ## Built-in reaction: quorum promotion
 
