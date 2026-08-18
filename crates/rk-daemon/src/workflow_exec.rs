@@ -1072,11 +1072,31 @@ impl WorkflowEngine {
             Ok(()) => (InstanceStatus::Completed, None),
             Err(e) => (InstanceStatus::Failed, Some(e.to_string())),
         };
+        // Guarded like `timeout_stale_instance`: only write a terminal status
+        // if the instance is still `Running` under the lock at the moment of
+        // the write. Without this, a `finalize` from a genuinely still-running
+        // `execute()` future can race the B8 stale-timeout sweep and
+        // unconditionally overwrite the `Failed` it already persisted with
+        // this call's `Completed` — silently reviving a workflow the sweep
+        // had correctly declared wedged.
+        let mut already_terminal = false;
         let transition = self.try_update_with_reason(id, "terminal", |i| {
+            if i.status.is_terminal() {
+                already_terminal = true;
+                return;
+            }
             i.status = status;
             i.error = error.clone();
             i.completed_at = Some(chrono::Utc::now());
         });
+        if already_terminal {
+            // The race resolved itself before this write: something else
+            // (the stale-timeout sweep, or a duplicate finalize) already
+            // persisted a terminal status. That status wins; this is not a
+            // recovery failure, so do not escalate.
+            info!(instance = %id, status = ?status, "finalize: instance already terminal, not overwriting");
+            return Ok(());
+        }
         match &transition {
             Err(persist_error) => self.fail_recovery_in_memory(
                 id,
@@ -1128,10 +1148,13 @@ impl WorkflowEngine {
     /// completion racing the sweep between its read (in `stale_timeout_sweep_once`)
     /// and this write always wins — the instance is never overwritten out from
     /// under its own (still-live) execute() future. `Ok(false)` means that race
-    /// resolved itself (or the instance is already gone); that is NOT an error,
-    /// unlike the always-Running-at-entry precondition [`finalize`](Self::finalize)
-    /// assumes. When it does transition, this performs the same terminal-state
-    /// event + guaranteed-cleanup agent sweep `finalize` does — the ticket's
+    /// resolved itself (or the instance is already gone); that is NOT an error.
+    /// [`finalize`](Self::finalize) carries the mirror-image guard (only
+    /// writes a terminal status if the instance is still `Running`), so
+    /// whichever of the two writes the terminal status first wins and the
+    /// other becomes a no-op rather than an overwrite. When it does
+    /// transition, this performs the same terminal-state event +
+    /// guaranteed-cleanup agent sweep `finalize` does — the ticket's
     /// "mark failed, finalize" — deliberately not calling `finalize` itself,
     /// which would call [`require_persisted_transition`] and turn the benign
     /// race outcome into a hard error.
@@ -5753,5 +5776,41 @@ test a::flaky ... FAILED
             engine.status("wf-already-done").unwrap().status,
             InstanceStatus::Completed
         );
+    }
+
+    /// The mirror-image race: the stale-timeout sweep wins first and persists
+    /// `Failed`, but the `execute()` future it declared wedged was not
+    /// actually dead — it finishes a moment later and its `spawn_execution`
+    /// task calls `finalize` with `Ok(())`. `finalize`'s terminal write must
+    /// be a no-op here, or the sweep's `Failed` verdict would be silently
+    /// overwritten with `Completed`.
+    #[tokio::test]
+    async fn finalize_does_not_overwrite_a_sweep_that_already_failed_the_instance() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        let started_at = Utc::now() - chrono::Duration::hours(13);
+        let instance = wedged_instance("wf-race", started_at);
+        engine.store_if_absent(instance.clone()).unwrap();
+
+        // The sweep wins the race first and marks the instance Failed.
+        let timed_out = engine.timeout_stale_instance(&instance, 12 * 3600).await.unwrap();
+        assert!(timed_out);
+        assert_eq!(
+            engine.status("wf-race").unwrap().status,
+            InstanceStatus::Failed
+        );
+
+        // The "still-running" execute() future the sweep declared wedged
+        // finishes anyway and its spawn_execution task calls finalize.
+        engine
+            .finalize("wf-race", "/repo", "steward", Ok(()))
+            .await
+            .unwrap();
+
+        // The sweep's Failed verdict must survive, not be overwritten by
+        // finalize's Completed.
+        let after = engine.status("wf-race").unwrap();
+        assert_eq!(after.status, InstanceStatus::Failed);
+        assert!(after.error.unwrap().contains("stale-instance timeout"));
     }
 }
