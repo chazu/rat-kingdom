@@ -72,6 +72,7 @@
 use crate::supervisor::Supervisor;
 use crate::tickets::{NewTicket, Tickets};
 use crate::workflow_exec::{InstanceStatus, OnTimeout, ResolvedRun, WorkflowEngine};
+use chrono::{DateTime, Utc};
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
 use rk_space::Space;
@@ -566,6 +567,24 @@ pub(crate) struct LandingPipeline {
     /// T3 adds (`Space::scan`/`rd`/`out`, §1.3/§1.5) — none of which go
     /// through the queue.
     space: Space,
+}
+
+/// One decision [`LandingPipeline::gate_worktree_sweep_once`] made about a
+/// specific `(repo, target)` gate worktree — returned (rather than just a
+/// count) so `agent.archive`'s `reap_git`/`dry_run` path can report exactly
+/// what it did or would do, mirroring `Supervisor::archive_agents`'s
+/// `reaped` rows.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct GateWorktreeReclaim {
+    pub(crate) repo: String,
+    pub(crate) target: String,
+    /// Why this worktree was chosen: `"age"` (unused past `max_age_days`) or
+    /// `"cap"` (beyond `max_per_repo` most-recently-used targets for this
+    /// repo).
+    pub(crate) reason: &'static str,
+    /// `false` for a `dry_run` pass, when a live queue entry made the key
+    /// ineligible, or when the `git worktree remove` itself failed.
+    pub(crate) reclaimed: bool,
 }
 
 impl LandingPipeline {
@@ -1129,6 +1148,10 @@ impl LandingPipeline {
             let sha = entry.head_sha.clone();
             blocking(move || git_repo.reset_gate_worktree(&gate_dir, &sha)).await?;
         }
+        // Record this reset for `gate_worktree_sweep_once`'s LRU ordering —
+        // AFTER the reset succeeds, so a failed ensure/reset never marks a
+        // worktree "just used" that was not actually touched.
+        self.touch_gate_worktree_marker(&entry.repo_name, &entry.target);
 
         let checks_file = repo_path.join(".rk").join("checks.cue");
         let plan = self.gate_plan(&checks_file, &entry.target, gates)?;
@@ -1247,6 +1270,161 @@ impl LandingPipeline {
             ),
             (verify, Vec::new(), gates.gate_timeout),
         ])
+    }
+
+    /// Sibling marker file recording when `gate_worktree_path(repo, target)`
+    /// was last reset for a landing attempt — `gate_worktree_sweep_once`'s
+    /// LRU signal. Deliberately NOT inside the worktree itself:
+    /// `reset_gate_worktree` runs `git clean -fd` on every reset, which
+    /// would delete an untracked marker living inside the checkout, and a
+    /// `verify` check running arbitrary repo-owned commands should never be
+    /// able to touch retention bookkeeping.
+    fn gate_worktree_marker_path(&self, repo_name: &str, target: &str) -> PathBuf {
+        self.layout
+            .home()
+            .join("gate-worktrees")
+            .join(sanitize_path_component(repo_name))
+            .join(format!("{}.last-used", sanitize_path_component(target)))
+    }
+
+    fn read_gate_worktree_marker(&self, repo_name: &str, target: &str) -> Option<DateTime<Utc>> {
+        let raw =
+            std::fs::read_to_string(self.gate_worktree_marker_path(repo_name, target)).ok()?;
+        DateTime::parse_from_rfc3339(raw.trim())
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    }
+
+    /// Record that `(repo_name, target)`'s gate worktree was just reset for
+    /// a landing attempt. Best-effort: a write failure here only skews
+    /// `gate_worktree_sweep_once`'s LRU ordering, never the gate run itself,
+    /// so it is logged and swallowed rather than propagated.
+    fn touch_gate_worktree_marker(&self, repo_name: &str, target: &str) {
+        let path = self.gate_worktree_marker_path(repo_name, target);
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                warn!(error = %e, ?path, "landing pipeline: failed to create gate worktree marker dir");
+                return;
+            }
+        }
+        if let Err(e) = std::fs::write(&path, Utc::now().to_rfc3339()) {
+            warn!(error = %e, ?path, "landing pipeline: failed to touch gate worktree last-used marker");
+        }
+    }
+
+    /// Reclaim gate worktrees per
+    /// docs/proposals/daemon-native-landing-pipeline.md §5 open question 4:
+    /// enforce `cfg.max_age_days` (LRU by last landing attempt) and
+    /// `cfg.max_per_repo` (a hard cap on how many target worktrees one repo
+    /// may keep warm at once) over every `<home>/gate-worktrees/<repo>/
+    /// <target>` directory found ON DISK — not `LandingQueue::pending_keys`,
+    /// which only sees keys with a currently-queued candidate and would
+    /// miss a target that finished landing days ago and has sat idle since.
+    ///
+    /// A key with any live `LandingQueue` entry (`queued`/`running_gates`/
+    /// `awaiting_review`) is always skipped, dry run or not — the busy
+    /// check this sweep leans on instead of a lock, matching
+    /// `Supervisor::reap_git`'s own "only touch what is provably idle"
+    /// posture for agent worktrees. `dry_run: true` computes the exact same
+    /// eligible set without touching disk; every row comes back with
+    /// `reclaimed: false`.
+    pub(crate) fn gate_worktree_sweep_once(
+        &self,
+        cfg: &rk_core::config::GateWorktreeSweepConfig,
+        dry_run: bool,
+    ) -> Vec<GateWorktreeReclaim> {
+        let root = self.layout.home().join("gate-worktrees");
+        let Ok(repo_dirs) = std::fs::read_dir(&root) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for repo_entry in repo_dirs.flatten() {
+            let repo_path = repo_entry.path();
+            if !repo_path.is_dir() {
+                continue;
+            }
+            let repo_name = repo_entry.file_name().to_string_lossy().to_string();
+            out.extend(self.sweep_repo_gate_worktrees(&repo_name, &repo_path, cfg, dry_run));
+        }
+        out
+    }
+
+    fn sweep_repo_gate_worktrees(
+        &self,
+        repo_name: &str,
+        repo_dir: &Path,
+        cfg: &rk_core::config::GateWorktreeSweepConfig,
+        dry_run: bool,
+    ) -> Vec<GateWorktreeReclaim> {
+        let Ok(entries) = std::fs::read_dir(repo_dir) else {
+            return Vec::new();
+        };
+        // (target, last_used, worktree_path), sorted most-recently-used
+        // first below. A target with no marker yet (raced with its own
+        // first `run_gates`, or predates this feature) sorts as maximally
+        // stale — eligible for the age rule, but still protected by the
+        // busy check the same way a freshly-claimed candidate always is.
+        let mut targets: Vec<(String, DateTime<Utc>, PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                if !path.is_dir() {
+                    return None; // skips sibling `*.last-used` marker files
+                }
+                let target = e.file_name().to_string_lossy().to_string();
+                let last_used = self
+                    .read_gate_worktree_marker(repo_name, &target)
+                    .unwrap_or(DateTime::<Utc>::MIN_UTC);
+                Some((target, last_used, path))
+            })
+            .collect();
+        targets.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let now = Utc::now();
+        let mut out = Vec::new();
+        for (index, (target, last_used, path)) in targets.into_iter().enumerate() {
+            let busy = match self.queue.scan_current(repo_name, Some(&target)) {
+                Ok(live) => !live.is_empty(),
+                // Scan failure: fail closed, treat as busy rather than risk
+                // reclaiming a worktree a candidate might still be using.
+                Err(_) => true,
+            };
+            if busy {
+                continue;
+            }
+            let over_cap = cfg.max_per_repo > 0 && (index as u64) >= cfg.max_per_repo;
+            let stale = cfg.max_age_days > 0
+                && now.signed_duration_since(last_used)
+                    > chrono::Duration::days(cfg.max_age_days as i64);
+            if !over_cap && !stale {
+                continue;
+            }
+            let reason = if over_cap { "cap" } else { "age" };
+            let reclaimed = if dry_run {
+                false
+            } else {
+                match rk_git::Repo::discover(&path).and_then(|repo| repo.remove_worktree(&path)) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(
+                            self.gate_worktree_marker_path(repo_name, &target),
+                        );
+                        info!(repo = %repo_name, target = %target, reason, "landing pipeline: reclaimed gate worktree");
+                        true
+                    }
+                    Err(e) => {
+                        warn!(error = %e, repo = %repo_name, target = %target, "landing pipeline: failed to reclaim gate worktree");
+                        false
+                    }
+                }
+            };
+            out.push(GateWorktreeReclaim {
+                repo: repo_name.to_string(),
+                target,
+                reason,
+                reclaimed,
+            });
+        }
+        out
     }
 }
 
@@ -2649,5 +2827,149 @@ checks: [
 
         let main_after = rev_parse(repo_dir.path(), "main");
         assert_eq!(main_before, main_after, "branch must not have landed");
+    }
+
+    /// Shared setup for the `gate_worktree_sweep_once` tests below: a real
+    /// repo plus a pipeline, with `run_gates` used directly (not the full
+    /// `drain_key`/land path) to create one or more real, git-registered
+    /// gate worktrees without needing an actual `target` branch to exist.
+    fn gate_sweep_fixture(home: &Path, repo_dir: &Path) -> (LandingPipeline, rk_git::Repo, String) {
+        init_repo(repo_dir);
+        write_checks(repo_dir, ALL_PASS_CHECKS);
+        let head_sha = rev_parse(repo_dir, "main");
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home, space);
+        let git_repo = rk_git::Repo::discover(repo_dir).unwrap();
+        (pipeline, git_repo, head_sha)
+    }
+
+    fn gate_sweep_entry(repo_dir: &Path, target: &str, head_sha: &str) -> LandingQueueEntry {
+        LandingQueueEntry {
+            repo_name: "myrepo".into(),
+            repo_path: repo_dir.display().to_string(),
+            branch: "feature".into(),
+            target: target.into(),
+            head_sha: head_sha.into(),
+            diff_class: "trivial".into(),
+            task: "t".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_worktree_sweep_reclaims_stale_worktree_past_max_age() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let (pipeline, git_repo, head_sha) = gate_sweep_fixture(home.path(), repo_dir.path());
+        let gates = GateConfig::default();
+        let entry = gate_sweep_entry(repo_dir.path(), "main", &head_sha);
+        assert!(pipeline.run_gates(&entry, &git_repo, &gates).await.unwrap());
+
+        let gate_dir = pipeline.gate_worktree_path("myrepo", "main");
+        assert!(gate_dir.is_dir());
+
+        // Backdate the marker so it reads as long unused.
+        let marker = pipeline.gate_worktree_marker_path("myrepo", "main");
+        let stale = Utc::now() - chrono::Duration::days(30);
+        std::fs::write(&marker, stale.to_rfc3339()).unwrap();
+
+        let cfg = rk_core::config::GateWorktreeSweepConfig {
+            max_age_days: 7,
+            max_per_repo: 0,
+            ..rk_core::config::GateWorktreeSweepConfig::default()
+        };
+        let reclaims = pipeline.gate_worktree_sweep_once(&cfg, false);
+        assert_eq!(reclaims.len(), 1, "{reclaims:?}");
+        assert_eq!(reclaims[0].reason, "age");
+        assert!(reclaims[0].reclaimed);
+        assert!(!gate_dir.exists(), "gate worktree should have been removed");
+        assert!(!marker.exists(), "marker should have been removed alongside it");
+    }
+
+    #[tokio::test]
+    async fn gate_worktree_sweep_dry_run_reports_without_touching_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let (pipeline, git_repo, head_sha) = gate_sweep_fixture(home.path(), repo_dir.path());
+        let gates = GateConfig::default();
+        let entry = gate_sweep_entry(repo_dir.path(), "main", &head_sha);
+        assert!(pipeline.run_gates(&entry, &git_repo, &gates).await.unwrap());
+
+        let gate_dir = pipeline.gate_worktree_path("myrepo", "main");
+        let marker = pipeline.gate_worktree_marker_path("myrepo", "main");
+        std::fs::write(
+            &marker,
+            (Utc::now() - chrono::Duration::days(30)).to_rfc3339(),
+        )
+        .unwrap();
+
+        let cfg = rk_core::config::GateWorktreeSweepConfig {
+            max_age_days: 7,
+            max_per_repo: 0,
+            ..rk_core::config::GateWorktreeSweepConfig::default()
+        };
+        let reclaims = pipeline.gate_worktree_sweep_once(&cfg, true);
+        assert_eq!(reclaims.len(), 1, "{reclaims:?}");
+        assert!(!reclaims[0].reclaimed);
+        assert!(gate_dir.exists(), "dry run must not touch disk");
+        assert!(marker.exists(), "dry run must not touch disk");
+    }
+
+    #[tokio::test]
+    async fn gate_worktree_sweep_enforces_max_per_repo_cap() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let (pipeline, git_repo, head_sha) = gate_sweep_fixture(home.path(), repo_dir.path());
+        let gates = GateConfig::default();
+
+        for target in ["a", "b", "c"] {
+            let entry = gate_sweep_entry(repo_dir.path(), target, &head_sha);
+            assert!(pipeline.run_gates(&entry, &git_repo, &gates).await.unwrap());
+            // Distinct, strictly increasing last-used timestamps even on
+            // coarse filesystem/clock resolution.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let cfg = rk_core::config::GateWorktreeSweepConfig {
+            max_age_days: 0,
+            max_per_repo: 2,
+            ..rk_core::config::GateWorktreeSweepConfig::default()
+        };
+        let reclaims = pipeline.gate_worktree_sweep_once(&cfg, false);
+        assert_eq!(reclaims.len(), 1, "{reclaims:?}");
+        assert_eq!(reclaims[0].target, "a", "oldest of the three must go");
+        assert_eq!(reclaims[0].reason, "cap");
+        assert!(!pipeline.gate_worktree_path("myrepo", "a").exists());
+        assert!(pipeline.gate_worktree_path("myrepo", "b").exists());
+        assert!(pipeline.gate_worktree_path("myrepo", "c").exists());
+    }
+
+    #[tokio::test]
+    async fn gate_worktree_sweep_never_touches_a_key_with_a_live_queue_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let (pipeline, git_repo, head_sha) = gate_sweep_fixture(home.path(), repo_dir.path());
+        let gates = GateConfig::default();
+        let entry = gate_sweep_entry(repo_dir.path(), "main", &head_sha);
+        assert!(pipeline.run_gates(&entry, &git_repo, &gates).await.unwrap());
+
+        // Backdate the marker so it would be evicted on age alone...
+        let marker = pipeline.gate_worktree_marker_path("myrepo", "main");
+        std::fs::write(
+            &marker,
+            (Utc::now() - chrono::Duration::days(30)).to_rfc3339(),
+        )
+        .unwrap();
+        // ...but a live queue entry for this exact key must still protect it.
+        pipeline.enqueue(entry).unwrap();
+
+        let cfg = rk_core::config::GateWorktreeSweepConfig {
+            max_age_days: 1,
+            max_per_repo: 0,
+            ..rk_core::config::GateWorktreeSweepConfig::default()
+        };
+        let reclaims = pipeline.gate_worktree_sweep_once(&cfg, false);
+        assert!(reclaims.is_empty(), "{reclaims:?}");
+        assert!(pipeline.gate_worktree_path("myrepo", "main").exists());
     }
 }
