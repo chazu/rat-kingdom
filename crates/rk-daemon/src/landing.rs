@@ -2828,4 +2828,148 @@ checks: [
         let main_after = rev_parse(repo_dir.path(), "main");
         assert_eq!(main_before, main_after, "branch must not have landed");
     }
+
+    /// Shared setup for the `gate_worktree_sweep_once` tests below: a real
+    /// repo plus a pipeline, with `run_gates` used directly (not the full
+    /// `drain_key`/land path) to create one or more real, git-registered
+    /// gate worktrees without needing an actual `target` branch to exist.
+    fn gate_sweep_fixture(home: &Path, repo_dir: &Path) -> (LandingPipeline, rk_git::Repo, String) {
+        init_repo(repo_dir);
+        write_checks(repo_dir, ALL_PASS_CHECKS);
+        let head_sha = rev_parse(repo_dir, "main");
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home, space);
+        let git_repo = rk_git::Repo::discover(repo_dir).unwrap();
+        (pipeline, git_repo, head_sha)
+    }
+
+    fn gate_sweep_entry(repo_dir: &Path, target: &str, head_sha: &str) -> LandingQueueEntry {
+        LandingQueueEntry {
+            repo_name: "myrepo".into(),
+            repo_path: repo_dir.display().to_string(),
+            branch: "feature".into(),
+            target: target.into(),
+            head_sha: head_sha.into(),
+            diff_class: "trivial".into(),
+            task: "t".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_worktree_sweep_reclaims_stale_worktree_past_max_age() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let (pipeline, git_repo, head_sha) = gate_sweep_fixture(home.path(), repo_dir.path());
+        let gates = GateConfig::default();
+        let entry = gate_sweep_entry(repo_dir.path(), "main", &head_sha);
+        assert!(pipeline.run_gates(&entry, &git_repo, &gates).await.unwrap());
+
+        let gate_dir = pipeline.gate_worktree_path("myrepo", "main");
+        assert!(gate_dir.is_dir());
+
+        // Backdate the marker so it reads as long unused.
+        let marker = pipeline.gate_worktree_marker_path("myrepo", "main");
+        let stale = Utc::now() - chrono::Duration::days(30);
+        std::fs::write(&marker, stale.to_rfc3339()).unwrap();
+
+        let cfg = rk_core::config::GateWorktreeSweepConfig {
+            max_age_days: 7,
+            max_per_repo: 0,
+            ..rk_core::config::GateWorktreeSweepConfig::default()
+        };
+        let reclaims = pipeline.gate_worktree_sweep_once(&cfg, false);
+        assert_eq!(reclaims.len(), 1, "{reclaims:?}");
+        assert_eq!(reclaims[0].reason, "age");
+        assert!(reclaims[0].reclaimed);
+        assert!(!gate_dir.exists(), "gate worktree should have been removed");
+        assert!(!marker.exists(), "marker should have been removed alongside it");
+    }
+
+    #[tokio::test]
+    async fn gate_worktree_sweep_dry_run_reports_without_touching_disk() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let (pipeline, git_repo, head_sha) = gate_sweep_fixture(home.path(), repo_dir.path());
+        let gates = GateConfig::default();
+        let entry = gate_sweep_entry(repo_dir.path(), "main", &head_sha);
+        assert!(pipeline.run_gates(&entry, &git_repo, &gates).await.unwrap());
+
+        let gate_dir = pipeline.gate_worktree_path("myrepo", "main");
+        let marker = pipeline.gate_worktree_marker_path("myrepo", "main");
+        std::fs::write(
+            &marker,
+            (Utc::now() - chrono::Duration::days(30)).to_rfc3339(),
+        )
+        .unwrap();
+
+        let cfg = rk_core::config::GateWorktreeSweepConfig {
+            max_age_days: 7,
+            max_per_repo: 0,
+            ..rk_core::config::GateWorktreeSweepConfig::default()
+        };
+        let reclaims = pipeline.gate_worktree_sweep_once(&cfg, true);
+        assert_eq!(reclaims.len(), 1, "{reclaims:?}");
+        assert!(!reclaims[0].reclaimed);
+        assert!(gate_dir.exists(), "dry run must not touch disk");
+        assert!(marker.exists(), "dry run must not touch disk");
+    }
+
+    #[tokio::test]
+    async fn gate_worktree_sweep_enforces_max_per_repo_cap() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let (pipeline, git_repo, head_sha) = gate_sweep_fixture(home.path(), repo_dir.path());
+        let gates = GateConfig::default();
+
+        for target in ["a", "b", "c"] {
+            let entry = gate_sweep_entry(repo_dir.path(), target, &head_sha);
+            assert!(pipeline.run_gates(&entry, &git_repo, &gates).await.unwrap());
+            // Distinct, strictly increasing last-used timestamps even on
+            // coarse filesystem/clock resolution.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let cfg = rk_core::config::GateWorktreeSweepConfig {
+            max_age_days: 0,
+            max_per_repo: 2,
+            ..rk_core::config::GateWorktreeSweepConfig::default()
+        };
+        let reclaims = pipeline.gate_worktree_sweep_once(&cfg, false);
+        assert_eq!(reclaims.len(), 1, "{reclaims:?}");
+        assert_eq!(reclaims[0].target, "a", "oldest of the three must go");
+        assert_eq!(reclaims[0].reason, "cap");
+        assert!(!pipeline.gate_worktree_path("myrepo", "a").exists());
+        assert!(pipeline.gate_worktree_path("myrepo", "b").exists());
+        assert!(pipeline.gate_worktree_path("myrepo", "c").exists());
+    }
+
+    #[tokio::test]
+    async fn gate_worktree_sweep_never_touches_a_key_with_a_live_queue_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let (pipeline, git_repo, head_sha) = gate_sweep_fixture(home.path(), repo_dir.path());
+        let gates = GateConfig::default();
+        let entry = gate_sweep_entry(repo_dir.path(), "main", &head_sha);
+        assert!(pipeline.run_gates(&entry, &git_repo, &gates).await.unwrap());
+
+        // Backdate the marker so it would be evicted on age alone...
+        let marker = pipeline.gate_worktree_marker_path("myrepo", "main");
+        std::fs::write(
+            &marker,
+            (Utc::now() - chrono::Duration::days(30)).to_rfc3339(),
+        )
+        .unwrap();
+        // ...but a live queue entry for this exact key must still protect it.
+        pipeline.enqueue(entry).unwrap();
+
+        let cfg = rk_core::config::GateWorktreeSweepConfig {
+            max_age_days: 1,
+            max_per_repo: 0,
+            ..rk_core::config::GateWorktreeSweepConfig::default()
+        };
+        let reclaims = pipeline.gate_worktree_sweep_once(&cfg, false);
+        assert!(reclaims.is_empty(), "{reclaims:?}");
+        assert!(pipeline.gate_worktree_path("myrepo", "main").exists());
+    }
 }
