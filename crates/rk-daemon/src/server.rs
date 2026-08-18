@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::{broadcast, watch};
 use tracing::{debug, info, warn};
 
@@ -1122,6 +1123,21 @@ impl Daemon {
         // reactor/scheduler consumers are listening, resume in-flight instances.
         daemon.engine().resume_rehydrated(resumable_workflows);
 
+        // Registered once, outside the accept loop: `shutdown_signal()` used to
+        // be called fresh inside `tokio::select!` on every iteration, which
+        // re-registers (and, on the branch not chosen, immediately drops and
+        // re-registers) the SIGTERM/SIGINT listeners on every accepted
+        // connection. Under worker-pool pressure (a busy accept loop) that is
+        // needless per-connection syscall overhead, and it opens a real gap:
+        // tokio only delivers a unix signal to a listener that is registered
+        // at the moment the signal arrives, so a signal landing between one
+        // iteration's listener being dropped and the next iteration's being
+        // created is silently lost, leaving the daemon waiting on a second
+        // signal to shut down. Holding the listeners for the lifetime of the
+        // loop closes that gap.
+        let mut term_signal = signal(SignalKind::terminate()).ok();
+        let mut int_signal = signal(SignalKind::interrupt()).ok();
+
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
@@ -1152,7 +1168,7 @@ impl Daemon {
                     info!("shutdown requested");
                     break;
                 }
-                _ = shutdown_signal() => {
+                _ = wait_for_shutdown_signal(&mut term_signal, &mut int_signal) => {
                     info!("signal received, shutting down");
                     break;
                 }
@@ -7027,19 +7043,26 @@ fn last_errno_is_eperm() -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(1)
 }
 
-async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => return std::future::pending().await,
-    };
-    let mut int = match signal(SignalKind::interrupt()) {
-        Ok(s) => s,
-        Err(_) => return std::future::pending().await,
-    };
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
+/// Awaits on listeners created once outside the accept loop (see the call
+/// site in [`RkDaemon::run`]) rather than registering fresh SIGTERM/SIGINT
+/// listeners on every loop iteration. A `None` listener means registration
+/// failed at startup (e.g. the platform has no signal driver installed);
+/// that branch simply never fires rather than panicking or busy-looping.
+async fn wait_for_shutdown_signal(term: &mut Option<Signal>, int: &mut Option<Signal>) {
+    match (term.as_mut(), int.as_mut()) {
+        (Some(term), Some(int)) => {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+        }
+        (Some(term), None) => {
+            term.recv().await;
+        }
+        (None, Some(int)) => {
+            int.recv().await;
+        }
+        (None, None) => std::future::pending().await,
     }
 }
 
