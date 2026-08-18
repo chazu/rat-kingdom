@@ -36,8 +36,33 @@ repo: {
 		remoteBranch: "{{branch}}"
 		deleteSource: true
 	}
+
+	landing: {
+		protectedPaths: "(^|/)(\\.github|\\.rk|migrations)/"
+		maxDiffFiles:   50
+		maxDiffLines:   2000
+		gateTimeout:    "60m"
+		reviewTimeout:  "15m"
+		reviewMaxWait:  "45m"
+	}
 }
 ```
+
+`landing` is the daemon-native landing pipeline's per-repo gate policy (see
+[Steward and trust](#steward-and-trust) below) — versioned and digest-activated
+exactly like `delivery`, not a separate config surface. The values shown are
+the built-in defaults (same names, same defaults the pre-cutover
+`steward.cue` workflow hardcoded as params), so an activated policy that
+omits `landing` entirely behaves identically to these defaults; only set the
+fields you want to change. `protectedPaths` is an ERE matched against
+`git diff --name-only <target>...HEAD`; a hit holds the branch for a human.
+`maxDiffFiles`/`maxDiffLines` bound the diff a branch may auto-merge with
+(`0` disables that budget). `gateTimeout` bounds the repo's real `verify`
+check; `reviewTimeout` bounds the wait for a reviewer's verdict before
+treating it as a STOP-equivalent hold; `reviewMaxWait` is the hard ceiling the
+wait extends to while the reviewer is confirmed still alive past
+`reviewTimeout` (a merely slow reviewer is not abandoned at `reviewTimeout`
+alone).
 
 `work.branch` supports `{{agent}}`, `{{task}}`, `{{repo}}`, and `{{role}}`.
 `work.worktree` supports the same placeholders and is relative to Rat Kingdom's
@@ -70,18 +95,46 @@ for forge review.
 
 ## Steward and trust
 
-The shipped global `steward` workflow is a daemon-managed landing algorithm. A
-reviewer approval flows directly into delivery without a separate human gate,
-and the completion event carries the daemon-authored target branch into the
-workflow. The activated repository policy decides what delivery means for that
-repository.
+Every completed rat's branch is triaged by a daemon-managed landing algorithm,
+the **steward**: a reviewer verdict (or, for a doc-only/trivial diff or a
+cache hit, no review at all) flows directly into delivery without a separate
+human gate, gated by the `landing` policy above plus the repo's real `verify`
+check. As of the steward remediation's Phase 3/4 cutover
+(`docs/reactor.md`, "Shipped reaction: the steward and the landing pipeline"),
+this triage runs two ways, and they are authorized differently:
+
+- **Daemon-native landing pipeline (`action: "land"` trigger, live).**
+  `LandingPipeline` (`crates/rk-daemon/src/landing.rs`) calls
+  `Supervisor::land` directly — never through the workflow engine — so the
+  automated-landing exception described below (`automated_landing_workflows`,
+  `require_approval_for_landing`) **does not apply to it at all**. For a repo
+  whose installed triggers include an `action: "land"` entry, that trigger's
+  own existence and match predicate is the sole unattended-landing
+  authorization; the activated `landing` policy (protected paths, diff
+  budget, timeouts) is the only per-repo tuning available. This is the
+  intended end state, but narrowing/removing the two config fields below
+  (steward remediation Phase 4, item 4) is not yet done
+  (TKT-01M048ASY8MDB5DVV5VG3WRM47) — until then the fields keep working, but
+  only for the workflow-driven path.
+- **Workflow-driven mega-workflow (`run: "steward"` trigger, pre-cutover
+  reference).** The `land` workflow step this trigger's spawned instance
+  reaches is subject to the exception below, unchanged. This is the original
+  design; nothing installs it by default anymore, but it remains valid to run
+  instead of the daemon-native path (never both at once — see
+  `docs/reactor.md`).
+
+### The `automated_landing_workflows` / `require_approval_for_landing` exception (workflow-driven path only)
 
 Only the installed global workflow receives the configured automated-landing
-exception. A repository-local workflow with the same name cannot inherit that
-authority. `agent-base` authorizes the daemon-authored base for a managed
-steward run; a fixed target authorizes only that exact target. Manual workflows
-and explicit `open_pr` steps retain the normal approval and target-allowlist
-checks.
+exception (`policy.automated_landing_workflows`, default `["steward"]`). A
+repository-local workflow with the same name cannot inherit that authority. A
+`land` step also checks `policy.require_approval_for_landing`, unless the
+workflow is in the exception list. `agent-base` authorizes the daemon-authored
+base for a managed steward run; a fixed target authorizes only that exact
+target. Manual workflows and explicit `open_pr` steps retain the normal
+approval and target-allowlist checks. Both fields are read only in
+`crates/rk-daemon/src/workflow_exec.rs`, so they have no effect on the
+daemon-native landing pipeline (see above).
 
 ## Legacy registrations
 
