@@ -11,6 +11,7 @@ mod repo_cmds;
 mod space_cmds;
 mod ticket_cmds;
 mod top;
+mod trigger_cmds;
 mod workflow_cmds;
 
 use agent_cmds::print_pruned_instance;
@@ -187,6 +188,14 @@ enum Command {
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
+    },
+    /// Install and audit deployed `#Trigger` definitions (global and
+    /// repo-local), so a source-of-truth check can catch a stale trigger left
+    /// behind by a manual copy — e.g. after a swap like the daemon-native
+    /// landing pipeline cutover (docs/proposals/daemon-native-landing-pipeline.md §6).
+    Trigger {
+        #[command(subcommand)]
+        command: TriggerCommand,
     },
     /// Approve a workflow instance parked at an approval gate (lets it merge).
     Approve(WorkflowDecisionArgs),
@@ -541,6 +550,31 @@ enum WorkflowCommand {
         #[arg(long, default_value = ".")]
         repo: String,
         /// Override the source directory (defaults to `<repo>/examples/workflows`).
+        #[arg(long)]
+        source_dir: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TriggerCommand {
+    /// Install a .cue definition into the managed global triggers directory,
+    /// or a repository's `.rk/triggers.cue` (the reactor only ever reads
+    /// that one fixed repo-local filename, so `--repo` always targets it
+    /// regardless of the source file's own name).
+    Install {
+        source: String,
+        /// Install into this repository's `.rk/triggers.cue`; omit for
+        /// global install.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Compare deployed trigger definitions with the repository's trigger
+    /// sources, flagging a deployed copy that no longer matches any shipped
+    /// source (stale/unmanaged) or matches under a different name (drifted).
+    Drift {
+        #[arg(long, default_value = ".")]
+        repo: String,
+        /// Override the source directory (defaults to `<repo>/examples`).
         #[arg(long)]
         source_dir: Option<String>,
     },
@@ -1213,6 +1247,39 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Trigger { command } => match command {
+            TriggerCommand::Install { source, repo } => {
+                let target = trigger_cmds::install(&layout, &source, repo.as_deref())?;
+                if cli.json {
+                    println!("{}", json!({"installed": target}));
+                } else {
+                    println!("installed {}", target.display());
+                }
+            }
+            TriggerCommand::Drift { repo, source_dir } => {
+                let report = trigger_cmds::drift(&layout, &repo, source_dir.as_deref())?;
+                if cli.json {
+                    println!("{}", serde_json::to_string(&report)?);
+                } else if report.rows.is_empty() {
+                    println!("trigger drift: no deployed definitions found");
+                } else {
+                    for row in &report.rows {
+                        println!("{:<10} {}", row.status, row.target);
+                    }
+                    if report.drifted == 0 {
+                        println!("trigger drift: clean");
+                    } else {
+                        println!(
+                            "trigger drift: {} definition(s) need attention",
+                            report.drifted
+                        );
+                    }
+                }
+                if report.drifted > 0 {
+                    anyhow::bail!("trigger definitions are not synchronized");
+                }
+            }
+        },
         Command::Approve(args) => decide(&layout, args, true, cli.json).await?,
         Command::Reject(args) => decide(&layout, args, false, cli.json).await?,
         Command::Peers => {

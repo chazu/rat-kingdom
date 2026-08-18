@@ -671,7 +671,12 @@ queue-to-workflow migration).
 
 ### 6.5 Known gaps (file as follow-up tickets, do not fix inline here)
 
-- No automated drift/parity check (`rk workflow drift`-equivalent) exists yet — §6.3 is manual.
+- ~~No automated drift/parity check (`rk workflow drift`-equivalent) exists yet~~ — `rk trigger
+  install`/`rk trigger drift` now exist (TKT-01M048ASYPEM94FZY73TT33QE2) and answer "is a deployed
+  trigger file still backed by a shipped source" (catches exactly the leave-the-old-file-behind
+  hazard §6.2.3 warns about). They do NOT verify behavioral parity between the old and new
+  pipeline outcomes — §6.3's four manual checks are still required before trusting a swap
+  unattended.
 - `LandingQueue` has no attempt-counter backstop analogous to the reactor's `MAX_FIRE_ATTEMPTS`:
   a candidate whose processing keeps erroring (not gate-failing — an actual `Err`, e.g. a corrupt
   gate worktree) is retried every poll cycle indefinitely rather than escalating after N attempts.
