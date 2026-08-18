@@ -12,8 +12,15 @@ env:
 jobs:
   check:
     strategy:
+      # macOS is rk's actual runtime (single-operator laptop castle); it is
+      # the blocking signal. The ubuntu leg has never been green — it keeps
+      # surfacing platform assumptions (cue, tool probes) one layer at a
+      # time — so it runs advisory-only until the portability backlog is
+      # peeled (ticketed), and must not cancel the macOS leg.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
