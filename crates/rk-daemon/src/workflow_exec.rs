@@ -1200,7 +1200,7 @@ impl WorkflowEngine {
         for instance in stale {
             let effective_secs = instance
                 .stale_timeout_secs
-                .unwrap_or_else(|| default_timeout.as_secs());
+                .unwrap_or(default_timeout.as_secs());
             match self.timeout_stale_instance(&instance, effective_secs).await {
                 Ok(true) => {
                     timed_out += 1;
