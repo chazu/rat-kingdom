@@ -2938,7 +2938,26 @@ impl Daemon {
                 .get("assignee")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let agent = assignee.as_deref().and_then(|name| self.supervisor.status(name));
+            let agent = assignee.as_deref().and_then(|name| self.supervisor.status(name)).or_else(|| {
+                // A ticket with no `assignee` is not necessarily ownerless: a
+                // drain claim writes `assignee` only after its spawn returns
+                // (drain.rs), so a ticket in the gap between claim and that
+                // write — or one left behind by a daemon predating that
+                // write — can still have a live rat working it. `task ==
+                // ticket id` is the same identity both the drain and the CLI
+                // spawn path (agent_cmds.rs) key on, so it is a reliable
+                // fallback match. Only tried when `assignee` is absent: a
+                // ticket that names a dead/gone assignee must not be
+                // rescued by an unrelated live agent that happens to share
+                // its task.
+                if assignee.is_some() {
+                    return None;
+                }
+                self.supervisor
+                    .list()
+                    .into_iter()
+                    .find(|a| a.state.is_live() && a.task.as_deref() == Some(ticket.identity.as_str()))
+            });
             if agent.as_ref().is_some_and(|a| a.state.is_live()) {
                 continue;
             }
@@ -7365,12 +7384,21 @@ mod ticket_reopen_sweep_tests {
     /// staleness by injecting a future `now` into the sweep itself rather
     /// than by faking the record's timestamp.
     fn daemon_with_agent(name: &str, state: AgentState) -> (tempfile::TempDir, Daemon) {
+        daemon_with_agent_task(name, state, "ticket-reopen-sweep-test")
+    }
+
+    /// Like [`daemon_with_agent`] but with a caller-chosen `task`, for the
+    /// no-assignee fallback tests: a drain spawn keys `task` to the ticket id
+    /// (`SpawnParams` in drain.rs), which is exactly what the sweep's
+    /// fallback match uses in place of a missing `assignee`.
+    fn daemon_with_agent_task(name: &str, state: AgentState, task: &str) -> (tempfile::TempDir, Daemon) {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::at(dir.path());
         layout.ensure().unwrap();
         let now = chrono::Utc::now();
         let record = AgentRecord {
             name: name.into(),
+            spawn: None,
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),
@@ -7378,7 +7406,7 @@ mod ticket_reopen_sweep_tests {
             model: None,
             repo_root: PathBuf::from("/tmp/repo"),
             repo_name: "repo".into(),
-            task: Some("ticket-reopen-sweep-test".into()),
+            task: Some(task.into()),
             branch: Some(format!("rat/{name}/task")),
             worktree: Some(PathBuf::from(format!("/tmp/worktree/{name}"))),
             target_branch: "main".into(),
@@ -7507,6 +7535,65 @@ mod ticket_reopen_sweep_tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::at(dir.path());
         let daemon = Daemon::new(layout, &Config::default()).unwrap();
+        let id = in_progress_ticket(&daemon, None).await;
+
+        let past_window = chrono::Utc::now() + chrono::Duration::minutes(20);
+        let reopened = daemon.ticket_reopen_sweep_at(past_window).await;
+
+        assert_eq!(reopened, 1);
+        let ticket = daemon.tickets.get(&id).unwrap().unwrap();
+        assert_eq!(ticket.payload["status"], json!("open"));
+    }
+
+    /// B9-rework: a drain-claimed ticket has no `assignee` in the gap before
+    /// the drain's post-spawn write lands (or on a daemon that predates that
+    /// write), but its live rat's `task` still equals the ticket id. The
+    /// sweep's fallback match must find that live owner and leave the ticket
+    /// alone, even far past the stale window — otherwise every drain-owned
+    /// live ticket gets reopened and double-dispatched on the first sweep.
+    #[tokio::test]
+    async fn a_null_assignee_ticket_with_a_live_task_match_is_never_touched() {
+        // Placeholder task at creation time — the real ticket id does not
+        // exist until after the ticket is created, so the fixture's task is
+        // patched to match it below (mirrors a real drain: the agent is
+        // spawned with `task = ticket.identity` from the start, but the test
+        // fixture cannot know that id in advance).
+        let (dir, daemon) = daemon_with_agent_task("Drain-Owned-1", AgentState::Running, "tbd");
+        let id = in_progress_ticket(&daemon, None).await;
+
+        let mut records: HashMap<String, AgentRecord> =
+            serde_json::from_slice(&std::fs::read(dir.path().join("agents.json")).unwrap())
+                .unwrap();
+        for record in records.values_mut() {
+            record.task = Some(id.clone());
+        }
+        std::fs::write(
+            dir.path().join("agents.json"),
+            serde_json::to_vec(&records).unwrap(),
+        )
+        .unwrap();
+        let daemon = Daemon::new(Layout::at(dir.path()), &Config::default()).unwrap();
+
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(2);
+        let reopened = daemon.ticket_reopen_sweep_at(far_future).await;
+
+        assert_eq!(reopened, 0);
+        let ticket = daemon.tickets.get(&id).unwrap().unwrap();
+        assert_eq!(ticket.payload["status"], json!("in_progress"));
+    }
+
+    /// B9-rework: a null-assignee ticket with NO live agent whose task
+    /// matches it (the genuinely orphaned case — e.g. the assignee's write
+    /// never landed and its rat is gone) must still reopen after the stale
+    /// window: the fallback match must not make every null-assignee ticket
+    /// immortal, only ones a live rat can actually be traced to.
+    #[tokio::test]
+    async fn a_null_assignee_ticket_with_no_live_task_match_still_reopens() {
+        let (_dir, daemon) = daemon_with_agent_task(
+            "Unrelated-Live-1",
+            AgentState::Running,
+            "some-other-task-entirely",
+        );
         let id = in_progress_ticket(&daemon, None).await;
 
         let past_window = chrono::Utc::now() + chrono::Duration::minutes(20);

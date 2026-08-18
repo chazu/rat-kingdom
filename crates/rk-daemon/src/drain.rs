@@ -248,6 +248,29 @@ impl Drain {
             match self.supervisor.spawn_async(params, max_wip).await {
                 Ok(record) => {
                     info!(ticket = %ticket.identity, agent = %record.name, "drain dispatched ready ticket");
+                    // Record the assignee only — never the status — mirroring
+                    // the CLI spawn path (agent_cmds.rs): a fast rat can
+                    // already have driven the ticket to `done` before this
+                    // write lands, and this must not clobber that. Without
+                    // this, the B9 orphaned-ticket sweep (server.rs) has no
+                    // assignee to check liveness against and reopens a
+                    // drain-owned, still-live ticket after its staleness
+                    // window — see the sweep's live-agent-by-task fallback,
+                    // which exists precisely to tolerate a ticket that
+                    // predates this write.
+                    if let Err(e) = self
+                        .tickets
+                        .update(
+                            &ticket.identity,
+                            crate::tickets::TicketChanges {
+                                assignee: Some(record.name.clone()),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                    {
+                        warn!(ticket = %ticket.identity, agent = %record.name, error = %e, "drain: failed to record ticket assignee");
+                    }
                     spawned += 1;
                     slots -= 1;
                     // Charge this repo's partition so a second ticket for the
