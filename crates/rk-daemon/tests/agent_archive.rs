@@ -47,6 +47,31 @@ async fn connect(layout: &Layout) -> Client {
     panic!("daemon did not come up");
 }
 
+/// Start a daemon against `layout` and connect to it, retrying the whole
+/// start (not just the reconnect) on a transient loss of the singleton
+/// lock — reproduced under parallel `cargo test` load, where this same
+/// process can be running several other tests' daemons concurrently and one
+/// of them can still be a few OS scheduler ticks from fully releasing its
+/// `flock` when this one tries to bind. A plain reconnect loop can never
+/// recover from that: once `Daemon::run()` loses the race for the lock it
+/// returns immediately without ever listening, so nothing will ever answer
+/// the socket no matter how long `connect` polls it.
+async fn start_daemon(layout: &Layout) -> Client {
+    for _ in 0..20 {
+        let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+        let handle = tokio::spawn(daemon.run());
+        // A daemon that wins the bind runs its accept loop forever, so this
+        // handle deliberately never resolves in the success case — the
+        // timeout is just a generous grace window to catch the failure case,
+        // which in every observed instance resolves in well under 50ms.
+        match tokio::time::timeout(Duration::from_millis(200), handle).await {
+            Err(_) => return connect(layout).await, // still running: bind succeeded
+            Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await, // fast exit: retry
+        }
+    }
+    panic!("daemon repeatedly lost the singleton-lock race against {layout:?}");
+}
+
 /// ONE fake harness for the whole binary, branching on the task name: a
 /// `hang-*` task stays `running` forever (the live-agent guardrail needs a real
 /// running rat), anything else commits real work and reports a Claude-style
@@ -146,9 +171,7 @@ async fn archive_hides_terminal_records_and_round_trips() {
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
     let layout = Layout::at(home.path());
-    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
-    let _handle = tokio::spawn(daemon.run());
-    let mut client = connect(&layout).await;
+    let mut client = start_daemon(&layout).await;
 
     // A rat that finishes and is left standing (state Completed). Carries a
     // parent and a workflow instance so we can prove lineage survives, and
@@ -276,9 +299,7 @@ async fn before_threshold_spares_fresh_records() {
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
     let layout = Layout::at(home.path());
-    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
-    let _handle = tokio::spawn(daemon.run());
-    let mut client = connect(&layout).await;
+    let mut client = start_daemon(&layout).await;
 
     let name = spawn(&mut client, repo_dir.path(), "fresh-1", json!({})).await;
     wait_for_state(&mut client, &name, "completed").await;
@@ -321,9 +342,7 @@ async fn live_and_orphaned_records_are_never_archived() {
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
     let layout = Layout::at(home.path());
-    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
-    let handle = tokio::spawn(daemon.run());
-    let mut client = connect(&layout).await;
+    let mut client = start_daemon(&layout).await;
 
     let live = spawn(&mut client, repo_dir.path(), "hang-orphan-1", json!({})).await;
     wait_for_state(&mut client, &live, "running").await;
@@ -338,10 +357,7 @@ async fn live_and_orphaned_records_are_never_archived() {
     // Restart the daemon against the same home: the running rat becomes
     // Orphaned, the state `rk respawn` exists for.
     client.call("stop", json!({})).await.ok();
-    let _ = handle.await;
-    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
-    let _handle = tokio::spawn(daemon.run());
-    let mut client = connect(&layout).await;
+    let mut client = start_daemon(&layout).await;
     let status = client
         .call("agent.status", json!({"name": live}))
         .await
@@ -370,9 +386,7 @@ async fn reap_git_reclaims_merged_branches_and_refuses_unmerged_ones() {
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
     let layout = Layout::at(home.path());
-    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
-    let _handle = tokio::spawn(daemon.run());
-    let mut client = connect(&layout).await;
+    let mut client = start_daemon(&layout).await;
 
     // Two rats that finish but are never dismissed, so both keep their
     // worktree and branch — exactly the leftovers an operator prunes by hand.
@@ -477,9 +491,7 @@ async fn reap_logs_deletes_archived_transcripts_and_spares_retained_ones() {
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
     let layout = Layout::at(home.path());
-    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
-    let _handle = tokio::spawn(daemon.run());
-    let mut client = connect(&layout).await;
+    let mut client = start_daemon(&layout).await;
 
     // One rat that settles (archivable) and one still running (structurally
     // never archivable). Both narrate, so both have a transcript.
