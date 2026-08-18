@@ -200,6 +200,7 @@ async fn castle_wide_respawn_rate_cap_holds_the_excess() {
         respawn_max_attempts: 5,
         respawn_backoff_secs: 0,
         respawn_rate_cap_per_hour: 2,
+        ..SupervisorConfig::default()
     });
     tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
