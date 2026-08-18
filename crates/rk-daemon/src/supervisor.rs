@@ -475,6 +475,18 @@ pub struct Supervisor {
     registry: Mutex<Registry>,
     /// Live control handles (not persisted; gone after restart).
     controls: Mutex<HashMap<String, SessionControl>>,
+    /// Identity of the process session currently behind `controls[name]`, one
+    /// fresh [`rk_core::id::SpawnId`] per `harness.launch` call. Deliberately
+    /// NOT `AgentRecord.spawn`/`created_at`: a manual `rk respawn` of a
+    /// `Completed` record intentionally reuses that record's generation
+    /// (`respawn_mode`'s comment on `let generation = updated.created_at;`),
+    /// so a generation-keyed check cannot tell the predecessor process from
+    /// its respawned successor. This map can, because a respawn overwrites
+    /// the entry with a new token — giving
+    /// [`kill_lingering_after_done`](Self::kill_lingering_after_done) a key
+    /// that actually changes across a respawn instead of a stale check with
+    /// stale data.
+    session_tokens: Mutex<HashMap<String, rk_core::id::SpawnId>>,
     space: Space,
     /// Shared with the server so ticket-lifecycle writes serialize on one lock.
     tickets: Arc<crate::tickets::Tickets>,
@@ -520,6 +532,23 @@ pub struct Supervisor {
     /// agents already running. In-memory: a fresh daemon process always
     /// starts unpaused, so a rollover can never leave a *future* daemon stuck.
     dispatch_paused: AtomicBool,
+    /// `[supervisor] done_kill_grace_secs` (seam 7): how long a harness
+    /// process gets to exit on its own after a clean `rk done` before
+    /// [`schedule_done_kill`](Supervisor::schedule_done_kill) SIGKILLs it.
+    /// An `AtomicU64`, not a config struct held on `Supervisor`, because it
+    /// must be read in real time from the event-handling path (mirrors
+    /// `min_free_disk_gb` above) rather than only on a periodic sweep tick.
+    done_kill_grace_secs: AtomicU64,
+    /// Push channels for automated recovery actions this supervisor
+    /// announces (kill-at-`rk done` today). Set once by `Daemon::new`'s
+    /// config-loading path via [`set_sinks`](Supervisor::set_sinks) —
+    /// bare/test constructors default to an empty registry, so the durable
+    /// announce tuple still gets written but nothing fans out.
+    sinks: Mutex<rk_core::notify::SinkRegistry>,
+    /// Rate-cap bookkeeping shared across this supervisor's recovery
+    /// announcements (`RecoveryAnnouncer` state must persist across calls to
+    /// cap correctly — see `recovery.rs`).
+    announcer: crate::recovery::RecoveryAnnouncer,
 }
 
 /// How far one agent generation has got through reporting its completion.
@@ -719,6 +748,7 @@ impl Supervisor {
             default_agent: defaults.profile,
             registry: Mutex::new(registry),
             controls: Mutex::new(HashMap::new()),
+            session_tokens: Mutex::new(HashMap::new()),
             space,
             tickets,
             pricing,
@@ -734,6 +764,11 @@ impl Supervisor {
             merge_queue: MergeQueue::default(),
             min_free_disk_gb: AtomicU64::new(0),
             dispatch_paused: AtomicBool::new(false),
+            done_kill_grace_secs: AtomicU64::new(
+                rk_core::config::SupervisorConfig::default().done_kill_grace_secs,
+            ),
+            sinks: Mutex::new(rk_core::notify::SinkRegistry::default()),
+            announcer: crate::recovery::RecoveryAnnouncer::new(),
         })
     }
 
@@ -756,6 +791,22 @@ impl Supervisor {
 
     pub fn dispatch_paused(&self) -> bool {
         self.dispatch_paused.load(Ordering::Relaxed)
+    }
+
+    /// Wire the `[[notify.sinks]]` fan-out for this supervisor's automated
+    /// recovery announcements. Applied by `Daemon::new` from config, same
+    /// pattern as [`set_min_free_disk_gb`](Supervisor::set_min_free_disk_gb)
+    /// — bare/test constructors never call this, so their announcements
+    /// still write the durable tuple but push to no channel.
+    pub fn set_sinks(&self, sinks: rk_core::notify::SinkRegistry) {
+        *self.sinks.lock().unwrap_or_else(|p| p.into_inner()) = sinks;
+    }
+
+    /// Set `[supervisor] done_kill_grace_secs`. Applied by `Daemon::new` from
+    /// config, same pattern as
+    /// [`set_min_free_disk_gb`](Supervisor::set_min_free_disk_gb).
+    pub fn set_done_kill_grace_secs(&self, secs: u64) {
+        self.done_kill_grace_secs.store(secs, Ordering::Relaxed);
     }
 
     /// The per-agent transcript store (for `agent.log` reads and `--follow`).
@@ -1032,8 +1083,7 @@ impl Supervisor {
                 record.pid = session.pid;
             })?
             .ok_or_else(|| rk_core::Error::other("spawn journal row vanished"))?;
-        self.lock_controls()
-            .insert(name.clone(), session.control.clone());
+        let session_token = self.track_session(&name, session.control.clone());
 
         self.emit_event(
             &repo_name,
@@ -1065,7 +1115,7 @@ impl Supervisor {
         let generation = record.created_at;
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                supervisor.handle_event(&name, generation, event);
+                supervisor.handle_event(&name, generation, session_token, event);
             }
         });
 
@@ -1378,8 +1428,10 @@ impl Supervisor {
                 r.stderr_tail = None;
             })?
             .ok_or_else(|| rk_core::Error::other("record vanished"))?;
-        self.lock_controls()
-            .insert(name.to_string(), session.control.clone());
+        // Overwrites whatever token the predecessor session registered, so a
+        // grace timer armed for that session can no longer match this one
+        // (see `session_tokens` on `Supervisor`).
+        let session_token = self.track_session(name, session.control.clone());
 
         self.emit_event(
             &updated.repo_name,
@@ -1419,7 +1471,7 @@ impl Supervisor {
         let generation = updated.created_at;
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                supervisor.handle_event(&owned, generation, event);
+                supervisor.handle_event(&owned, generation, session_token, event);
             }
         });
         Ok(updated)
@@ -1518,8 +1570,17 @@ impl Supervisor {
 
     /// `generation` is the agent record's `created_at`, captured once when the
     /// event loop is wired up: transcript writes are keyed on the generation, not
-    /// the name, so a line can never land in a namesake's file.
-    fn handle_event(self: &Arc<Self>, name: &str, generation: DateTime<Utc>, event: HarnessEvent) {
+    /// the name, so a line can never land in a namesake's file. `session` is
+    /// this specific process launch's token (see `session_tokens` on
+    /// `Supervisor`) — unlike `generation`, it changes across a respawn even
+    /// though the two share the same record.
+    fn handle_event(
+        self: &Arc<Self>,
+        name: &str,
+        generation: DateTime<Utc>,
+        session: rk_core::id::SpawnId,
+        event: HarnessEvent,
+    ) {
         match event {
             HarnessEvent::Started { session_id } => {
                 let _ = self.lock_registry().update(name, |r| {
@@ -1576,6 +1637,14 @@ impl Supervisor {
                     if claim.publish {
                         info!(agent = name, is_error, "agent completed");
                         self.route_completion(&record, is_error, claim.declared_done, diff);
+                        // Seam 7: only a positively-declared, clean `rk done`
+                        // arms the post-completion kill grace — a turn that
+                        // merely errored out (`is_error`) leaves the record
+                        // `Failed`, not `Completed`, and stays reachable by
+                        // the respawn sweep instead.
+                        if !is_error && claim.declared_done {
+                            self.schedule_done_kill(name.to_string(), generation, session);
+                        }
                     } else {
                         info!(
                             agent = name,
@@ -2947,6 +3016,103 @@ impl Supervisor {
         }
     }
 
+    /// Seam 7 (strategic-review B5): arm a one-shot grace timer the moment a
+    /// generation's clean `rk done` publishes. `sweep()` only ever looks at
+    /// `is_live()` agents, so once this record is `Completed` its process —
+    /// interactive harnesses stay alive between turns — is otherwise never
+    /// checked again; nothing else kills it. `generation` pins this timer to
+    /// the record it fired on; `session` (B5 rework) pins it to the exact
+    /// process launch — a manual `rk respawn` during the grace window keeps
+    /// `generation` (see `respawn_mode`'s comment on why) but gets a fresh
+    /// `session` token, so it cannot be shot out from under it by a stale
+    /// timer armed for the process it replaced.
+    fn schedule_done_kill(
+        self: &Arc<Self>,
+        name: String,
+        generation: DateTime<Utc>,
+        session: rk_core::id::SpawnId,
+    ) {
+        let this = Arc::clone(self);
+        let grace_secs = self.done_kill_grace_secs.load(Ordering::Relaxed).max(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(grace_secs)).await;
+            this.kill_lingering_after_done(&name, generation, session, grace_secs)
+                .await;
+        });
+    }
+
+    /// The grace timer's payoff: if a process is STILL tracked under `name`
+    /// for the SAME generation AND session that armed the timer, it did not
+    /// exit on its own within the grace window — SIGKILL its whole process
+    /// group. A clean exit within the window already removed the control
+    /// handle (see the `Exited` arm of [`handle_event`](Supervisor::handle_event)),
+    /// so that path is a no-op here, matching the "clean-exit path
+    /// unaffected" acceptance criterion. The `session` check (not `generation`
+    /// alone) is what makes a respawn during the grace window safe: a respawn
+    /// reuses the record's generation but registers a new session token, so a
+    /// timer armed for the predecessor no longer matches.
+    async fn kill_lingering_after_done(
+        self: &Arc<Self>,
+        name: &str,
+        generation: DateTime<Utc>,
+        session: rk_core::id::SpawnId,
+        grace_secs: u64,
+    ) {
+        let record = match self.lock_registry().get(name) {
+            Some(r) if r.created_at == generation => r.clone(),
+            _ => return, // dismissed, or already gone — not our process
+        };
+        if self.lock_session_tokens().get(name) != Some(&session) {
+            return; // respawned since — a new session now owns this name
+        }
+        if !self.lock_controls().contains_key(name) {
+            return; // exited on its own within the grace window
+        }
+        let notice = rk_core::notify::EscalationNotice::new(
+            name,
+            "kill-process-group",
+            rk_core::notify::Severity::Warn,
+            record.repo_name.clone(),
+            name,
+            format!(
+                "{name}'s harness process was still running {grace_secs}s after a clean \
+                 `rk done` — SIGKILLing its process group"
+            ),
+        )
+        .with_ref("task", record.task.clone().unwrap_or_default());
+        let outcome = self.announcer.announce(
+            &self.space,
+            &self.sinks.lock().unwrap_or_else(|p| p.into_inner()),
+            crate::recovery::RecoveryAction {
+                kind: "kill-process-group".to_string(),
+                instance: "supervisor".to_string(),
+                notice,
+            },
+            // 20/hour: generous enough that a genuine multi-agent lingering
+            // episode is fully visible, tight enough that a pathological
+            // fleet-wide loop cannot turn this into a notification storm.
+            crate::recovery::RateCap::per_hour(20),
+        );
+        match outcome {
+            Ok(outcome) if !outcome.held() => {
+                let control = self.lock_controls().remove(name);
+                if let Some(control) = control {
+                    warn!(
+                        agent = name,
+                        grace_secs, "harness still running past grace after `rk done` — SIGKILLing"
+                    );
+                    let _ = control.hard_kill().await;
+                }
+            }
+            // Rate-held: the escalation still went out (at raised severity,
+            // explaining why) — the action itself must NOT proceed. Leave
+            // the control handle in place so a later sweep/dismiss can still
+            // reach this process normally.
+            Ok(_) => {}
+            Err(e) => warn!(agent = name, error = %e, "failed to announce done-kill"),
+        }
+    }
+
     pub async fn steer(&self, name: &str, message: &str) -> rk_core::Result<()> {
         let control = self.lock_controls().get(name).cloned();
         if let Some(control) = control {
@@ -4311,6 +4477,27 @@ impl Supervisor {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }
+    }
+
+    fn lock_session_tokens(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, rk_core::id::SpawnId>> {
+        match self.session_tokens.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// Register a freshly launched session's control handle under `name`,
+    /// stamping a fresh per-session token alongside it — the key
+    /// [`kill_lingering_after_done`](Self::kill_lingering_after_done) needs to
+    /// tell a respawned session apart from the one a grace timer was armed
+    /// for, since both share the same `AgentRecord` generation.
+    fn track_session(&self, name: &str, control: SessionControl) -> rk_core::id::SpawnId {
+        let token = rk_core::id::SpawnId::new();
+        self.lock_controls().insert(name.to_string(), control);
+        self.lock_session_tokens().insert(name.to_string(), token);
+        token
     }
 
     fn lock_sweep_state(&self) -> std::sync::MutexGuard<'_, HashMap<String, SweepState>> {

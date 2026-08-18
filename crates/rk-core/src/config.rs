@@ -628,6 +628,14 @@ pub struct SupervisorConfig {
     /// After the first (soft) flag steers the rat, how long to wait before
     /// escalating to a kill if it is STILL flagged. Prefer steer-then-wait.
     pub kill_grace_secs: u64,
+    /// Grace window after a clean `rk done` before a still-lingering harness
+    /// process is SIGKILLed (seam 7, strategic-review B5): `sweep()` only
+    /// ever looks at `is_live()` agents, so a `Completed` record's process —
+    /// interactive harnesses stay alive between turns — is otherwise never
+    /// checked again. Long enough for the transcript to flush / the harness
+    /// to exit on its own; short enough that a runaway process left behind
+    /// by `rk done` does not sit burning tokens indefinitely.
+    pub done_kill_grace_secs: u64,
     /// Self-healing respawn: when true, the same sweep auto-`respawn`s agents
     /// that crashed out of their run (Orphaned by a daemon restart, or Failed)
     /// instead of leaving them for a manual `rk respawn`. Shipped enabled
@@ -671,6 +679,7 @@ impl Default for SupervisorConfig {
             stuck_after_secs: 600,
             burn_usd_per_min: 4.0,
             kill_grace_secs: 600,
+            done_kill_grace_secs: 60,
             respawn_enabled: true,
             respawn_max_attempts: 3,
             respawn_backoff_secs: 300,
