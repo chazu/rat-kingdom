@@ -248,6 +248,58 @@ fn nightly_self_improve_chains_groom_drain_refine() {
 }
 
 #[test]
+fn refine_prompts_task_requires_failure_boundary_classification() {
+    use rk_workflow::Step;
+    // Proposal 0013: an unclassified "recurring pain" reading lets an overnight
+    // refine pass mistake infrastructure/model/workflow-policy/repository-gate
+    // failures for a role-prompt defect and write a speculative prompt patch.
+    // Both copies of the refine-prompts task description must fail closed:
+    // require evidence the prompt caused the failure, and route everything
+    // else to a ticket instead of a proposal.
+    let standalone = rk_workflow::load(&examples_dir().join("prompt-refine.cue"), &HashMap::new())
+        .unwrap_or_else(|e| panic!("prompt-refine.cue failed to load: {e}"));
+    let Step::Spawn(standalone_refine) = &standalone.steps[0] else {
+        panic!("prompt-refine.cue must open with the refine spawn");
+    };
+    assert_eq!(standalone_refine.task.title, "refine-prompts");
+
+    let nightly = rk_workflow::load(
+        &examples_dir().join("nightly-self-improve.cue"),
+        &HashMap::new(),
+    )
+    .unwrap();
+    let nightly_refine = nightly
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Spawn(sp) => Some(sp),
+            _ => None,
+        })
+        .next_back()
+        .expect("nightly-self-improve.cue must end with the refine spawn");
+    assert_eq!(nightly_refine.task.title, "refine-prompts");
+
+    for (name, description) in [
+        ("prompt-refine.cue", &standalone_refine.task.description),
+        ("nightly-self-improve.cue", &nightly_refine.task.description),
+    ] {
+        let description = description
+            .as_deref()
+            .unwrap_or_else(|| panic!("{name} refine task must have a description"));
+        assert!(
+            description.contains("Classify each failure before proposing a prompt change"),
+            "{name} refine task must require classifying the failure boundary before \
+             proposing a prompt change"
+        );
+        assert!(
+            description.contains("do not write a speculative prompt proposal"),
+            "{name} refine task must forbid speculative prompt proposals for \
+             infrastructure/workflow/gate failures"
+        );
+    }
+}
+
+#[test]
 fn fanout_and_nightly_examples_carry_a_budget_cap() {
     // Every unattended fan-out / overnight example must scope spend to ONE run
     // via a per-instance budget cap (#WorkflowBudget), not lean on the
