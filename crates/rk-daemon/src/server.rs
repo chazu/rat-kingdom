@@ -1343,13 +1343,9 @@ impl Daemon {
                         .stream_factory_events(write, filter, boundary, rx)
                         .await;
                 }
-                Outcome::LogFollow {
-                    response,
-                    agent,
-                    generation,
-                } => {
+                Outcome::LogFollow { response, spawn } => {
                     write_response(&mut write, &response).await?;
-                    return self.stream_log(write, agent, generation).await;
+                    return self.stream_log(write, spawn).await;
                 }
             }
         }
@@ -2056,19 +2052,24 @@ impl Daemon {
         }))
     }
 
-    /// Push `agent`'s new transcript entries as they land, until the client goes
-    /// away. The backlog was already sent as the `agent.log` reply; this is the
-    /// live tail (there may be a momentary overlap of one boundary entry).
+    /// Push the resolved generation's new transcript entries as they land,
+    /// until the client goes away. The backlog was already sent as the
+    /// `agent.log` reply; this is the live tail (there may be a momentary
+    /// overlap of one boundary entry).
+    ///
+    /// Matches on `SpawnId` alone (E5, docs/2026-08-17-tkt-c1-generation-identity.md)
+    /// — it cannot collide with a namesake's, so no separate name check is
+    /// needed. `spawn: None` (an unrecorded name) never matches, since nothing
+    /// live can be writing under a name with no registry record.
     async fn stream_log(
         &self,
         mut write: tokio::net::unix::OwnedWriteHalf,
-        agent: String,
-        generation: Option<DateTime<Utc>>,
+        spawn: Option<rk_core::id::SpawnId>,
     ) -> std::io::Result<()> {
         let mut rx = self.supervisor.log().subscribe();
         loop {
             match rx.recv().await {
-                Ok(rec) if rec.agent == agent && Some(rec.generation) == generation => {
+                Ok(rec) if Some(rec.spawn) == spawn => {
                     let note = json!({"method": "log", "params": rec.entry});
                     write_json_line(&mut write, &note).await?;
                 }
@@ -2196,46 +2197,72 @@ impl Daemon {
                     Ok(p) => p,
                     Err(e) => return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, e)),
                 };
-                // A name can have named more than one rat (the TKT-136 archiving
-                // window did that to 24 of them), so resolve which generation is
-                // meant instead of keying the read on the name alone. Default:
-                // the newest, which is what an operator typing a name means.
-                let generations = self.supervisor.log_generations(&params.name);
-                let selected = match params.generation {
-                    Some(n) => match n.checked_sub(1).and_then(|i| generations.get(i)) {
-                        Some(g) => g.clone(),
+                // E4: an exact SpawnId resolves directly, bypassing name
+                // resolution entirely — the one form that can never be
+                // ambiguous. Otherwise fall back to today's name (+ordinal)
+                // resolution: a name can have named more than one rat (the
+                // TKT-136 archiving window did that to 24 of them), so resolve
+                // which generation is meant instead of keying the read on the
+                // name alone. Default: the newest, which is what an operator
+                // typing a bare name means.
+                let (generations, selected) = match params.name.parse::<rk_core::id::SpawnId>() {
+                    Ok(spawn) => match self.supervisor.find_generation_by_spawn(spawn) {
+                        Some(g) => (self.supervisor.log_generations(&g.agent), g),
                         None => {
-                            let msg = format!(
-                                "{} has {} log generation(s); no generation {n} (1 = oldest)",
-                                params.name,
-                                generations.len()
-                            );
+                            let msg = format!("no agent generation with spawn {spawn}");
                             return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, msg));
                         }
                     },
-                    None => generations
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(|| crate::agent_log::Generation::unrecorded(&params.name)),
+                    Err(_) => {
+                        let generations = self.supervisor.log_generations(&params.name);
+                        let selected = match params.generation {
+                            Some(n) => match n.checked_sub(1).and_then(|i| generations.get(i)) {
+                                Some(g) => g.clone(),
+                                None => {
+                                    let msg = format!(
+                                            "{} has {} log generation(s); no generation {n} (1 = oldest)",
+                                            params.name,
+                                            generations.len()
+                                        );
+                                    return Outcome::Reply(Response::err(
+                                        id,
+                                        codes::BAD_PARAMS,
+                                        msg,
+                                    ));
+                                }
+                            },
+                            None => generations.last().cloned().unwrap_or_else(|| {
+                                crate::agent_log::Generation::unrecorded(&params.name)
+                            }),
+                        };
+                        (generations, selected)
+                    }
                 };
+                let ordinal = generations
+                    .iter()
+                    .position(|g| g.spawn == selected.spawn)
+                    .map(|i| i + 1);
                 let backlog = self.supervisor.log().read(&selected, params.tail);
                 let response = Response::ok(
                     id,
                     json!({
                         "entries": backlog,
-                        // How many rats have carried this name, and which one
-                        // this is (1 = oldest; 0 = no record at all), so the
-                        // client can disclose that a name is ambiguous.
+                        // The resolved agent name, how many rats have carried
+                        // it, and which one this is (1 = oldest; 0 = no
+                        // record at all), so the client can disclose that a
+                        // name is ambiguous (and label a spawn-id lookup with
+                        // the name it resolved to).
+                        "agent": selected.agent,
                         "generations": generations.len(),
-                        "generation": params.generation.unwrap_or(generations.len()),
+                        "generation": ordinal.unwrap_or(generations.len()),
+                        "spawn": selected.spawn.map(|s| s.to_string()),
                         "created_at": selected.start,
                     }),
                 );
                 if params.follow {
                     Outcome::LogFollow {
                         response,
-                        agent: params.name,
-                        generation: selected.start,
+                        spawn: selected.spawn,
                     }
                 } else {
                     reply(response)
@@ -6403,19 +6430,21 @@ enum Outcome {
         boundary: Option<u64>,
         rx: broadcast::Receiver<CoordinatorEvent>,
     },
-    /// Reply with the backlog, then stream that agent's new log entries live.
+    /// Reply with the backlog, then stream that generation's new log entries
+    /// live.
     LogFollow {
         response: Response,
-        agent: String,
         /// The generation being followed. Only the newest generation of a name
         /// can still be writing, so following an older one correctly streams
         /// nothing rather than leaking a namesake's live output.
-        generation: Option<DateTime<Utc>>,
+        spawn: Option<rk_core::id::SpawnId>,
     },
 }
 
 #[derive(Deserialize)]
 struct LogParams {
+    /// An agent name, or (E4) an exact `SpawnId` — `rk log` sends whichever the
+    /// operator typed and lets the daemon tell them apart.
     name: String,
     /// Only the last N entries of the backlog (all if unset).
     #[serde(default)]

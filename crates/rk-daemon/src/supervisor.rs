@@ -816,22 +816,51 @@ impl Supervisor {
         &self.log
     }
 
-    /// Every transcript generation of `name`, oldest first, each carrying the
-    /// exclusive upper bound (the next generation's `created_at`) that isolates
-    /// it inside a legacy name-keyed log file.
+    /// Every transcript generation of `name`, oldest first, each carrying its
+    /// [`rk_core::id::SpawnId`] (E3, docs/2026-08-17-tkt-c1-generation-identity.md)
+    /// and the exclusive upper bound (the next generation's `created_at`) that
+    /// isolates it inside a legacy name-keyed log file.
     ///
     /// Empty when no record — live or archived — carries the name. Callers
     /// reading a transcript anyway should fall back to
     /// [`Generation::unrecorded`](crate::agent_log::Generation::unrecorded).
     pub fn log_generations(&self, name: &str) -> Vec<crate::agent_log::Generation> {
-        let starts = self.lock_registry().generations_of(name);
-        starts
+        let records: Vec<AgentRecord> = self
+            .lock_registry()
+            .records_of(name)
+            .into_iter()
+            .cloned()
+            .collect();
+        records
             .iter()
             .enumerate()
-            .map(|(i, &start)| {
-                crate::agent_log::Generation::of(name, start, starts.get(i + 1).copied())
+            .map(|(i, record)| {
+                crate::agent_log::Generation::of(
+                    name,
+                    record.spawn_id(),
+                    record.created_at,
+                    records.get(i + 1).map(|r| r.created_at),
+                )
             })
             .collect()
+    }
+
+    /// Resolve an exact `SpawnId` typed at the `rk log` prompt to the
+    /// generation it names — the E4 "exact form" alongside the existing
+    /// name(+ordinal) resolution. Searches live and archived records (no name
+    /// needed up front, since a bare `SpawnId` already disambiguates).
+    pub fn find_generation_by_spawn(
+        &self,
+        spawn: rk_core::id::SpawnId,
+    ) -> Option<crate::agent_log::Generation> {
+        let name = self
+            .list_all()
+            .into_iter()
+            .find(|r| r.spawn_id() == spawn)?
+            .name;
+        self.log_generations(&name)
+            .into_iter()
+            .find(|g| g.spawn == Some(spawn))
     }
 
     /// Called once the daemon has WON the socket bind — never earlier. A
@@ -1115,9 +1144,10 @@ impl Supervisor {
         let supervisor = Arc::clone(self);
         let mut events = session.events;
         let generation = record.created_at;
+        let spawn = record.spawn_id();
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                supervisor.handle_event(&name, generation, session_token, event);
+                supervisor.handle_event(&name, generation, spawn, session_token, event);
             }
         });
 
@@ -1476,12 +1506,13 @@ impl Supervisor {
         let owned = name.to_string();
         let mut events = session.events;
         // A respawn continues the SAME generation — the record (and its
-        // `created_at`) is reused — so the second run appends to the transcript
-        // the first run started, which is what an operator expects.
+        // `created_at`/`spawn`) is reused — so the second run appends to the
+        // transcript the first run started, which is what an operator expects.
         let generation = updated.created_at;
+        let spawn = updated.spawn_id();
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                supervisor.handle_event(&owned, generation, session_token, event);
+                supervisor.handle_event(&owned, generation, spawn, session_token, event);
             }
         });
         Ok(updated)
@@ -1579,15 +1610,19 @@ impl Supervisor {
     }
 
     /// `generation` is the agent record's `created_at`, captured once when the
-    /// event loop is wired up: transcript writes are keyed on the generation, not
-    /// the name, so a line can never land in a namesake's file. `session` is
-    /// this specific process launch's token (see `session_tokens` on
-    /// `Supervisor`) — unlike `generation`, it changes across a respawn even
-    /// though the two share the same record.
+    /// event loop is wired up: completion-routing bookkeeping (`CompletionState`)
+    /// is keyed on it. `spawn` is that same record's `SpawnId`
+    /// (`AgentRecord::spawn_id`) — the key transcript writes use instead
+    /// (docs/2026-08-17-tkt-c1-generation-identity.md, E-series), so a line can
+    /// never land in a namesake's file. `session` is this specific process
+    /// launch's token (see `session_tokens` on `Supervisor`) — unlike
+    /// `generation`/`spawn`, it changes across a respawn even though all three
+    /// share the same record.
     fn handle_event(
         self: &Arc<Self>,
         name: &str,
         generation: DateTime<Utc>,
+        spawn: rk_core::id::SpawnId,
         session: rk_core::id::SpawnId,
         event: HarnessEvent,
     ) {
@@ -1750,26 +1785,23 @@ impl Supervisor {
             // transcript so the operator can `rk log` a run without --attach.
             HarnessEvent::AssistantText { text } => {
                 self.log
-                    .append(name, generation, crate::agent_log::LogEvent::Text { text });
+                    .append(name, spawn, crate::agent_log::LogEvent::Text { text });
             }
             HarnessEvent::ToolUse { name: tool } => {
-                self.log.append(
-                    name,
-                    generation,
-                    crate::agent_log::LogEvent::Tool { name: tool },
-                );
+                self.log
+                    .append(name, spawn, crate::agent_log::LogEvent::Tool { name: tool });
             }
             HarnessEvent::Retry { attempt, error } => {
                 self.log.append(
                     name,
-                    generation,
+                    spawn,
                     crate::agent_log::LogEvent::Retry { attempt, error },
                 );
             }
             HarnessEvent::Stderr { text } => {
                 self.log.append(
                     name,
-                    generation,
+                    spawn,
                     crate::agent_log::LogEvent::Stderr { text: text.clone() },
                 );
                 let _ = self.lock_registry().update(name, |r| {
@@ -4392,7 +4424,7 @@ impl Supervisor {
     /// `reaped: false` row with a reason, never a failed archive.
     fn reap_log(&self, record: &AgentRecord) -> serde_json::Value {
         let row = |reaped: bool, reason: String| json!({"agent": record.name, "reaped": reaped, "reason": reason});
-        match self.log.delete_for(&record.name, record.created_at) {
+        match self.log.delete_for(&record.name, record.spawn_id()) {
             Ok(true) => row(true, "transcript deleted".into()),
             Ok(false) => row(false, "no transcript on disk".into()),
             Err(e) => row(false, format!("transcript delete failed: {e}")),

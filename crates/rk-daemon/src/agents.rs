@@ -414,8 +414,10 @@ impl Registry {
         })
     }
 
-    /// Every generation of `name` that ever existed, oldest first: the
-    /// `created_at` of each live or archived record carrying it.
+    /// Every record — live or archived — that ever carried `name`, oldest
+    /// first: the full row, not just its `created_at`, so a caller can read
+    /// [`AgentRecord::spawn_id`] off each generation instead of the bare
+    /// timestamp [`generations_of`](Registry::generations_of) exposes.
     ///
     /// Normally one entry — a name is an identity key and
     /// [`reserve_name`](Registry::reserve_name) never recycles. Two entries mean
@@ -426,17 +428,25 @@ impl Registry {
     ///
     /// Deduped by `created_at`: the archive/persist crash window can leave one
     /// generation in both stores, and that is one rat, not two.
-    pub fn generations_of(&self, name: &str) -> Vec<DateTime<Utc>> {
-        let mut generations: Vec<DateTime<Utc>> = self
+    pub fn records_of(&self, name: &str) -> Vec<&AgentRecord> {
+        let mut records: Vec<&AgentRecord> = self
             .agents
             .get(name)
             .into_iter()
             .chain(self.archived.iter().filter(|a| a.name == name))
-            .map(|a| a.created_at)
             .collect();
-        generations.sort_unstable();
-        generations.dedup();
-        generations
+        records.sort_by_key(|a| a.created_at);
+        records.dedup_by_key(|a| a.created_at);
+        records
+    }
+
+    /// Every generation of `name` that ever existed, oldest first: the
+    /// `created_at` of each row [`records_of`](Registry::records_of) returns.
+    pub fn generations_of(&self, name: &str) -> Vec<DateTime<Utc>> {
+        self.records_of(name)
+            .into_iter()
+            .map(|a| a.created_at)
+            .collect()
     }
 
     /// The live registry, oldest first. Archived records are excluded — this is
