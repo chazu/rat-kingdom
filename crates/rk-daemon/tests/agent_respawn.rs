@@ -2,6 +2,7 @@
 //! rat into a real worktree, watch it complete, verify parent routing, dismiss
 //! with merge, and confirm main received the work.
 
+mod fixture;
 mod support;
 
 use rk_core::paths::Layout;
@@ -86,10 +87,15 @@ async fn crashed_agent_is_failed_and_respawnable() {
     }
     assert!(failed, "crash was not detected");
 
-    // Respawn reuses the preserved worktree; this fake completes.
+    // Respawn reuses the preserved worktree; this fake completes. It must
+    // declare `rk done` before its result line — a clean turn that never
+    // does now parks the agent as `Paused` (awaiting resume) rather than
+    // `Completed`, so the wait below would time out.
     std::env::set_var(
         "RK_FAKE_HARNESS_CMD",
-        r#"read -r _p; echo '{"type":"result","subtype":"success","is_error":false,"result":"recovered","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'"#,
+        fixture::with_rk_done(
+            r#"read -r _p; rk_done "recovered"; echo '{"type":"result","subtype":"success","is_error":false,"result":"recovered","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'"#,
+        ),
     );
     client
         .call("agent.respawn", json!({"name": name}))
