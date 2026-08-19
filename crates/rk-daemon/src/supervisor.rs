@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const MIN_PROGRESS_INTERVAL: chrono::Duration = chrono::Duration::seconds(5);
 
@@ -2835,7 +2835,26 @@ impl Supervisor {
             None => Pattern::for_agent_since(Category::Event, "task_done", name, generation),
         };
         match self.space.scan(&pattern) {
-            Ok(tuples) => !tuples.is_empty(),
+            Ok(tuples) => {
+                let found = !tuples.is_empty();
+                // Deliberately logged on every call, not just the negative
+                // case: TKT-01M0BWWY15SH2KCQ99WKPGN9N7 saw this scan come back
+                // empty for a generation whose `rk_done` had, by construction,
+                // already round-tripped the daemon (the fixture's `space.out`
+                // RPC cannot return before the write lands, and the harness
+                // script cannot print its result line before that RPC
+                // returns) — so a genuine miss here is either a spawn/pattern
+                // mismatch or a store inconsistency, and the only way to tell
+                // which is to see `spawn` and `found` together at the moment
+                // it happened, not reconstruct it after the fact.
+                debug!(
+                    agent = name,
+                    spawn = spawn.map(|s| s.to_string()),
+                    found,
+                    "declared_done scan"
+                );
+                found
+            }
             Err(e) => {
                 warn!(error = %e, agent = name, "task_done lookup failed; publishing the turn result anyway");
                 true
