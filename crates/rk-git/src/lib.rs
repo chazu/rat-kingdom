@@ -107,7 +107,9 @@ pub enum PrepareOutcome {
     /// The merge does not apply. Nothing was built and nothing was parked;
     /// not retryable against this pair of tips (though a later target tip may
     /// merge cleanly).
-    Conflict { detail: String },
+    Conflict {
+        detail: String,
+    },
 }
 
 /// Outcome of [`Repo::advance_target_to`] — the compare-and-swap land.
@@ -1297,11 +1299,10 @@ mod tests {
             panic!("expected a clean merge");
         };
         assert_eq!(retry.base, moved_to);
-        assert!(
-            repo.advance_target_to("main", &retry.commit, &retry.base)
-                .unwrap()
-                .advanced()
-        );
+        assert!(repo
+            .advance_target_to("main", &retry.commit, &retry.base)
+            .unwrap()
+            .advanced());
         assert_eq!(repo.rev_parse("refs/heads/main").unwrap(), retry.commit);
     }
 
