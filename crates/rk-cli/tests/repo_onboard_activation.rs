@@ -5,11 +5,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-const COMPLETE: &str = r#"
-echo '{"type":"system","subtype":"init","session_id":"onboarding-activation"}'
+// A clean turn that never calls `rk done` now parks the agent as `Paused`
+// (awaiting resume) rather than `Completed`, so the onboarding session would
+// never reach `state: completed` and every `wait_completed` call below would
+// time out. Declare done exactly the way a real primed onboarder does before
+// reporting the turn — see the identical fix in `daemon_rollover.rs`.
+fn complete_script() -> String {
+    format!(
+        r#"
+echo '{{"type":"system","subtype":"init","session_id":"onboarding-activation"}}'
 read -r _first_message
-echo '{"type":"result","subtype":"success","is_error":false,"result":"assessment complete","session_id":"onboarding-activation","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5}}'
-"#;
+"{}" done "assessment complete" >/dev/null 2>&1 || true
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"assessment complete","session_id":"onboarding-activation","total_cost_usd":0.001,"usage":{{"input_tokens":10,"output_tokens":5}}}}'
+"#,
+        env!("CARGO_BIN_EXE_rk")
+    )
+}
 
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -211,7 +222,7 @@ esac
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn automation_activation_is_explicit_content_bound_and_restart_safe() {
     let home = tempfile::tempdir().unwrap();
-    std::env::set_var("RK_FAKE_HARNESS_CMD", COMPLETE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", complete_script());
     let layout = Layout::at(home.path());
     let daemon_a = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle_a = tokio::spawn(daemon_a.run());

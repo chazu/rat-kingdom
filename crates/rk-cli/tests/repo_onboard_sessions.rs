@@ -132,6 +132,10 @@ esac
     (state, argv)
 }
 
+// A clean turn that never calls `rk done` now parks the agent as `Paused`
+// (awaiting resume) rather than `Completed`, so `wait_for_session(.., "completed")`
+// below would time out. Declare done, with the ambient (unstripped) identity,
+// exactly like a real primed onboarder does before reporting the turn.
 const COMPLETE_AND_PROBE: &str = r#"
 echo '{"type":"system","subtype":"init","session_id":"onboarding-fake"}'
 read -r _first_message
@@ -141,6 +145,7 @@ env -u RK_AGENT -u RK_AUTH_TOKEN "$RK_TEST_RK_BIN" peers > self-elevation-result
 code=$?
 set -e
 printf '%s' "$code" > self-elevation-code
+"$RK_TEST_RK_BIN" done "assessment complete" >/dev/null 2>&1 || true
 echo '{"type":"result","subtype":"success","is_error":false,"result":"assessment complete","session_id":"onboarding-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5}}'
 "#;
 
