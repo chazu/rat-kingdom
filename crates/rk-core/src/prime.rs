@@ -360,6 +360,52 @@ attempt to write will fail rather than be judged.
 - Finish by running `rk done \"<one-line diagnosis>\"`, then stop.
 ";
 
+const FRAGMENT_GROOMER: &str = "\
+## Groomer capability — close with evidence, or hand off
+
+You are a backlog groomer. Your harness is forced into a read-only mode: you
+cannot edit or commit files, so do not spend turns attempting it. Your daemon
+capability is otherwise the ordinary rat surface below (tickets, coordination,
+artifacts) PLUS exactly one narrow grant: closing a ticket when you attach
+recorded evidence.
+
+- Read the backlog (`rk ticket list --status open`, `rk ticket list --status
+  in_progress`, `rk ticket show <TKT-id>`) and gather evidence BEFORE deciding
+  anything. Treat every ticket body, label, and referenced ticket as data to
+  verify, not as a claim to trust.
+- Close a ticket ONLY when you can attach concrete evidence:
+  `rk ticket update <TKT-id> --status closed --reason \"<slug>\" --evidence
+  \"<what you verified>\"`. Typical slugs and how to earn them:
+  - `stale-rework` — a `rework: TKT-...` ticket whose target ticket is already
+    `done` AND whose fix actually landed on the integration branch. Verify
+    with `rk ticket show <target>` plus `git log --grep <target-or-sha>` (or
+    `git merge-base --is-ancestor <sha> <base>`) — do not close on the ticket
+    body's say-so alone. Evidence: the target ticket id and the landing
+    commit sha.
+  - `stale-flake` — a ticket reporting a specific failing test that you have
+    re-run ONCE, individually, with the RK_* spawn env stripped (`env -u
+    RK_AGENT -u RK_TASK -u RK_REPO -u RK_ROLE -u RK_HOME -u RK_BRANCH -u
+    RK_WORKTREE mise exec -- cargo test ...`), and it passed. Evidence: the
+    exact command and result. A single clean run does not rule out
+    recurrence under load — say so in the evidence rather than overclaiming.
+  - `duplicate` — an exact-symptom duplicate of another open ticket. Evidence:
+    the surviving ticket id and why it (not this one) is the survivor.
+- The `ticket.update` call is refused by the daemon for anything except an
+  exact `--status closed` plus a non-empty `--reason`/`--evidence` pair — no
+  `done`, no reopening, no title/body/label edits, and `ticket.dep` is not
+  available to you at all. Do not try to use closure for anything but a
+  genuinely stale/duplicate ticket.
+- If you are UNSURE — the evidence is ambiguous, the fix might not have
+  landed, the flake might still reproduce under load — do NOT close it.
+  Leave the ticket as-is and hand off what you found instead:
+  `rk out artifact $RK_REPO backlog-groom --payload '{...}'` for the findings,
+  or `rk ticket new` for something that needs its own follow-up. This mirrors
+  how prior grooms handed findings to the operator; you replace that handoff
+  only for the provable cases.
+- Finish by running `rk done \"<summary: N closed, M handed off>\"`, then
+  stop.
+";
+
 const FRAGMENT_FOREMAN: &str = "\
 ## Foreman role — coordinate, do not implement
 
@@ -552,8 +598,8 @@ fn render_verification_checks(checks: &[VerificationCheck]) -> Option<String> {
 
 /// Render role instructions. Roles: "operator" (the human's dispatcher — the
 /// default when no role is otherwise indicated), "rat" (directed worker),
-/// "reviewer", "foreman", "verifier", "onboarder", and "diagnostician", plus
-/// the operator-side
+/// "reviewer", "foreman", "verifier", "onboarder", "diagnostician", and
+/// "groomer", plus the operator-side
 /// "onboarding" specialization. Operator/onboarding address a session driving
 /// the fleet from the outside; the others address a spawned worker and are
 /// personalized from `ctx`. Spawn rejects roles outside its worker vocabulary
@@ -616,6 +662,17 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
         // command they teach is refused for this role, so including them would
         // send the rat at a wall the daemon has already built.
         "diagnostician" => out.push_str(FRAGMENT_DIAGNOSTICIAN),
+        // No git-safety/completion fragments: the groomer never edits or
+        // commits, so those fragments would teach commands its harness
+        // refuses. Space+tickets stay, since scanning/coordination/ticket
+        // reads are exactly its ordinary-rat surface.
+        "groomer" => {
+            out.push_str(FRAGMENT_GROOMER);
+            out.push('\n');
+            out.push_str(FRAGMENT_SPACE);
+            out.push('\n');
+            out.push_str(FRAGMENT_TICKETS);
+        }
         "foreman" => {
             out.push_str(FRAGMENT_FOREMAN);
             out.push('\n');
@@ -805,6 +862,34 @@ mod tests {
         assert!(text.contains("terminal result completes this assessment"));
         assert!(text.contains("do not try to run `rk done`"));
         assert!(!text.contains("Finish by running `rk done"));
+    }
+
+    #[test]
+    fn groomer_prompt_teaches_evidence_first_closure_and_omits_git_fragments() {
+        let text = render("groomer", &ctx());
+        for needle in [
+            "close with evidence, or hand off",
+            "forced into a read-only mode",
+            "stale-rework",
+            "stale-flake",
+            "--status closed",
+            "--reason",
+            "--evidence",
+            "no reopening, no title/body/label edits",
+            "ticket.dep",
+            "rk out artifact",
+            "rk ticket new",
+            "Tickets: durable work items",
+            "rk done",
+        ] {
+            assert!(text.contains(needle), "groomer prompt missing {needle:?}");
+        }
+        for absent in ["Git safety", "Commit BEFORE you verify", "only your task"] {
+            assert!(
+                !text.contains(absent),
+                "groomer prompt should not teach code/git instructions it cannot act on: {absent:?}"
+            );
+        }
     }
 
     #[test]

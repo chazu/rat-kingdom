@@ -17,6 +17,19 @@
 //! is the general-purpose read-only worker that workflow dispatch can spawn for
 //! diagnosis. The onboarder additionally reaches the onboarding-session methods
 //! that own its report; that is the only per-role difference.
+//!
+//! [`GROOMER_ROLE`] is a different shape entirely and is deliberately NOT one
+//! of the [`is_read_only_role`] roles: it keeps the ordinary rat's daemon
+//! surface (it can file tickets, write artifacts/obstacles/needs, and scan the
+//! tuplespace to gather evidence) but has its harness forced into the same
+//! non-writing mode as the roles above — a backlog groom mutates the ticket
+//! store, not a worktree, so it never needs to edit or commit. On top of that
+//! ordinary surface it gets exactly one additional grant a rat does not have:
+//! [`groomer_can_close_ticket`] narrowly allows `ticket.update` to close a
+//! ticket when the request carries recorded evidence. See `server.rs`
+//! `authorize_reasoned` for where that grant is wired in (alongside the
+//! foreman's own narrow grant), and `handle_ticket_update` for the audit event
+//! every groomer closure writes.
 
 use serde_json::Value;
 
@@ -28,9 +41,22 @@ use crate::proto::Request;
 /// worktree like any rat, but cannot write to either.
 pub const DIAGNOSTICIAN_ROLE: &str = "diagnostician";
 
-/// Roles whose capability is forced narrower than an ordinary rat's.
+/// Backlog groomer: ordinary rat daemon surface, harness forced read-only, plus
+/// one narrow extra grant to close a ticket with recorded evidence.
+pub const GROOMER_ROLE: &str = "groomer";
+
+/// Roles whose *daemon* capability is forced narrower than an ordinary rat's
+/// (a strict RPC allowlist, not just a harness sandbox). [`GROOMER_ROLE`] is
+/// harness-sandboxed the same way but is NOT here — it keeps the ordinary
+/// surface plus one extra grant, so it must not collapse into this allowlist.
 pub fn is_read_only_role(role: &str) -> bool {
     matches!(role, ONBOARDER_ROLE | DIAGNOSTICIAN_ROLE)
+}
+
+/// Roles whose harness is forced into a non-writing mode, regardless of what
+/// their daemon RPC surface looks like. A superset of [`is_read_only_role`].
+pub fn forces_read_only_harness(role: &str) -> bool {
+    is_read_only_role(role) || role == GROOMER_ROLE
 }
 
 /// Harness mode for a read-only role. Fails closed on an unknown harness: a
@@ -79,6 +105,38 @@ pub fn method_allowed(role: &str, req: &Request) -> bool {
     }
 }
 
+/// A groomer's `ticket.update` must be exactly `{id, status: "closed",
+/// reason: {reason, evidence}}` — no other field present (labels included:
+/// `add_labels`/`remove_labels` are tolerated only when empty, since the
+/// client always sends them). This is deliberately an allowlist over the
+/// wire shape, not a denylist, so a new `TicketChanges` field is refused by
+/// default rather than by remembering to add it here. Called from
+/// `server.rs` `authorize_reasoned`, not from [`method_allowed`] above —
+/// [`GROOMER_ROLE`] is not a read-only-allowlist role, see the module doc.
+pub fn groomer_can_close_ticket(params: &Value) -> bool {
+    let Some(obj) = params.as_object() else {
+        return false;
+    };
+    let shape_ok = obj.iter().all(|(key, value)| match key.as_str() {
+        "id" | "status" | "reason" => true,
+        "add_labels" | "remove_labels" => value.as_array().is_none_or(|arr| arr.is_empty()),
+        _ => false,
+    });
+    if !shape_ok {
+        return false;
+    }
+    if obj.get("status").and_then(Value::as_str) != Some("closed") {
+        return false;
+    }
+    let non_empty_str = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    let reason = obj.get("reason");
+    non_empty_str(reason.and_then(|r| r.get("reason")))
+        && non_empty_str(reason.and_then(|r| r.get("evidence")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,8 +157,62 @@ mod tests {
     fn both_read_only_roles_share_the_enforcement() {
         assert!(is_read_only_role(ONBOARDER_ROLE));
         assert!(is_read_only_role(DIAGNOSTICIAN_ROLE));
-        for role in ["rat", "reviewer", "foreman", "verifier"] {
+        for role in ["rat", "reviewer", "foreman", "verifier", GROOMER_ROLE] {
             assert!(!is_read_only_role(role), "{role} must keep full capability");
+        }
+    }
+
+    #[test]
+    fn groomer_harness_is_sandboxed_but_daemon_surface_is_not_the_strict_allowlist() {
+        assert!(forces_read_only_harness(GROOMER_ROLE));
+        assert!(forces_read_only_harness(ONBOARDER_ROLE));
+        assert!(forces_read_only_harness(DIAGNOSTICIAN_ROLE));
+        assert!(!forces_read_only_harness("rat"));
+        // method_allowed is the strict read-only-role allowlist; a groomer
+        // must not be routed through it, or it would lose ticket.new /
+        // space.out for its own hand-off fallback.
+        for method in ["ticket.new", "ticket.list", "ticket.get"] {
+            assert!(
+                !method_allowed(GROOMER_ROLE, &req("rat-1", method, json!({}))),
+                "{method} must not be granted via the read-only allowlist for groomer"
+            );
+        }
+    }
+
+    #[test]
+    fn groomer_can_close_ticket_requires_exact_shape_and_evidence() {
+        let good = json!({"id": "TKT-1", "status": "closed",
+            "reason": {"reason": "stale-rework", "evidence": "TKT-2 done"}});
+        assert!(groomer_can_close_ticket(&good));
+
+        let good_with_empty_labels = json!({"id": "TKT-1", "status": "closed",
+            "reason": {"reason": "stale-rework", "evidence": "TKT-2 done"},
+            "add_labels": [], "remove_labels": []});
+        assert!(groomer_can_close_ticket(&good_with_empty_labels));
+
+        for bad in [
+            json!({"id": "TKT-1", "status": "done",
+                "reason": {"reason": "x", "evidence": "y"}}),
+            json!({"id": "TKT-1", "status": "open",
+                "reason": {"reason": "x", "evidence": "y"}}),
+            json!({"id": "TKT-1", "status": "closed"}),
+            json!({"id": "TKT-1", "status": "closed", "reason": {"reason": "x"}}),
+            json!({"id": "TKT-1", "status": "closed", "reason": {"evidence": "y"}}),
+            json!({"id": "TKT-1", "status": "closed",
+                "reason": {"reason": "", "evidence": "y"}}),
+            json!({"id": "TKT-1", "status": "closed",
+                "reason": {"reason": "x", "evidence": "  "}}),
+            json!({"id": "TKT-1", "status": "closed",
+                "reason": {"reason": "x", "evidence": "y"}, "title": "new title"}),
+            json!({"id": "TKT-1", "status": "closed",
+                "reason": {"reason": "x", "evidence": "y"}, "add_labels": ["frozen"]}),
+            json!({"id": "TKT-1", "status": "closed",
+                "reason": {"reason": "x", "evidence": "y"}, "parent": "TKT-9"}),
+        ] {
+            assert!(
+                !groomer_can_close_ticket(&bad),
+                "must be refused: {bad}"
+            );
         }
     }
 

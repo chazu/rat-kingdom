@@ -149,7 +149,7 @@ enum Command {
     /// Print role instructions for the system. Defaults to the `operator` role
     /// unless RK_ROLE (set on spawned rats) indicates otherwise.
     Prime {
-        /// Role to render: operator | onboarding | rat | reviewer | foreman | verifier | onboarder. Overrides RK_ROLE.
+        /// Role to render: operator | onboarding | rat | reviewer | foreman | verifier | onboarder | diagnostician | groomer. Overrides RK_ROLE.
         #[arg(long)]
         role: Option<String>,
     },
@@ -776,7 +776,7 @@ async fn decide(
     Ok(())
 }
 
-const PRIME_ROLES: [&str; 8] = [
+const PRIME_ROLES: [&str; 9] = [
     "operator",
     "onboarding",
     "rat",
@@ -785,6 +785,7 @@ const PRIME_ROLES: [&str; 8] = [
     "verifier",
     "onboarder",
     "diagnostician",
+    "groomer",
 ];
 
 fn print_prime(role: String, json_output: bool) -> Result<()> {
