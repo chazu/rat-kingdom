@@ -3237,6 +3237,15 @@ impl Daemon {
             })
             .filter(|task| !task.is_empty())
             .collect();
+        // Landing-awareness, part 2 (probes O8/O17, TKT-01M0CTC4DYBRX6P5X2NPEZF0EZ):
+        // `landed_tickets` above only covers the terminal case. A ticket
+        // whose rat went non-live (paused, killed, orphaned) WHILE its
+        // branch is still queued for landing — `Queued`, `RunningGates`, or
+        // `AwaitingReview` — has no live agent and no `landing_processed`
+        // marker yet, so without this it sails through both guards and gets
+        // reopened once `stale_after` elapses. Drain then dispatches a
+        // duplicate rat onto work that is already in flight toward landing.
+        let queued_tickets = crate::landing::tasks_in_landing_queue(&self.space);
         let sinks = crate::reactor::sink_factory().registry(
             self.notify_config
                 .resolved(self.reactor_config.notify_escalations),
@@ -3248,6 +3257,14 @@ impl Daemon {
                 // Already delivered — leave it `in_progress` for a real
                 // dismiss (or the fuller landing-driven ticket transition,
                 // E1/E2) to close, rather than reopening onto a duplicate.
+                continue;
+            }
+            if queued_tickets.contains(&ticket.identity) {
+                // Branch is queued/gating/awaiting review — the owning rat
+                // going non-live here is expected (it may have already
+                // exited after handing off to the landing pipeline), not
+                // abandonment. Leave it for the pipeline to reach a terminal
+                // outcome (landed, or handed back for a real retry).
                 continue;
             }
             let assignee = ticket

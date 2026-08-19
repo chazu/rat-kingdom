@@ -86,8 +86,10 @@ use tracing::{info, warn};
 
 /// Identity of a durably-queued landing candidate (`Furniture`, scoped to the
 /// repo it belongs to) — the T2 counterpart to the reactor's
-/// `reactor_queued_fire` (`crates/rk-daemon/src/reactor.rs`).
-const LANDING_QUEUE_IDENTITY: &str = "landing_queue_entry";
+/// `reactor_queued_fire` (`crates/rk-daemon/src/reactor.rs`). `pub(crate)` so
+/// [`tasks_in_landing_queue`] can be called from `Server`/`Supervisor` —
+/// mirrors [`LANDING_PROCESSED_IDENTITY`]'s visibility below.
+pub(crate) const LANDING_QUEUE_IDENTITY: &str = "landing_queue_entry";
 
 /// Identity of the durable `work_key = (repo, branch, head_sha)` dedup
 /// marker (`Furniture`, scoped to the repo), written by
@@ -99,6 +101,33 @@ const LANDING_QUEUE_IDENTITY: &str = "landing_queue_entry";
 /// `payload.task`, not by work key) before reopening an `in_progress`
 /// ticket whose branch already landed — TKT-01M0C663BZ86SMA2PVMFP5QJ8D.
 pub(crate) const LANDING_PROCESSED_IDENTITY: &str = "landing_processed";
+
+/// Task ids (ticket identities, by fleet convention) with a branch currently
+/// sitting anywhere in the landing pipeline — `Queued`, `RunningGates`, or
+/// `AwaitingReview`. No status check is needed: a `landing_queue_entry`
+/// tuple exists for exactly as long as its candidate is non-terminal —
+/// [`LandingQueue::remove`] deletes it the moment [`LandingPipeline::process_entry`]
+/// reaches a terminal [`LandingOutcome`] — so mere presence answers the
+/// question. One unscoped scan, same shape as the `landing_processed` probe
+/// the reopen sweep already runs (`Server::ticket_reopen_sweep_at`): a
+/// ticket whose branch is still in flight here must be treated the same way
+/// as one that already landed — left alone by the reopen sweep, and not
+/// closed by an unrelated duplicate's dismiss (TKT-01M0CTC4DYBRX6P5X2NPEZF0EZ,
+/// probes O8/O17).
+pub(crate) fn tasks_in_landing_queue(space: &Space) -> std::collections::HashSet<String> {
+    space
+        .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|t| {
+            t.payload
+                .get("task")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|task| !task.is_empty())
+        .collect()
+}
 
 /// The two gates that guard every landing attempt regardless of tier —
 /// `examples/workflows/steward.cue`'s `_gates` block, POLICY (#19) and

@@ -3796,10 +3796,27 @@ impl Supervisor {
         // ancestor-equivalent of target), and that must not read as this
         // rat having delivered the ticket's work
         // (TKT-01M0C663BZ86SMA2PVMFP5QJ8D).
+        //
+        // Landing-awareness (probes O8/O17, TKT-01M0CTC4DYBRX6P5X2NPEZF0EZ):
+        // a NON-empty duplicate can still race the canonical delivery — the
+        // real rat's branch may still be `Queued`/`RunningGates`/
+        // `AwaitingReview` in the daemon-native landing pipeline when this
+        // dismiss's own (unrelated) merge lands and would otherwise close
+        // the ticket out from under it. Consult queue membership by task,
+        // not by this dismiss's own branch identity: it is the ticket's
+        // outstanding pipeline entry that must gate the close, regardless of
+        // which branch this particular dismiss happened to merge.
         if delivery.merged && !delivery.content_free {
             if let Some(task) = &record.task {
                 if task.starts_with(crate::tickets::ID_PREFIX) {
-                    if let Err(e) = self.tickets.set_status(task, "closed").await {
+                    if crate::landing::tasks_in_landing_queue(&self.space).contains(task) {
+                        warn!(
+                            ticket = %task,
+                            agent = %name,
+                            "dismiss merged but ticket's branch is still queued for landing; \
+                             leaving ticket in_progress for the pipeline to close"
+                        );
+                    } else if let Err(e) = self.tickets.set_status(task, "closed").await {
                         warn!(ticket = %task, error = %e, "failed to close ticket on dismiss");
                     }
                 }
