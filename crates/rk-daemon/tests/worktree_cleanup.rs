@@ -57,6 +57,8 @@ fn scratch_repo(dir: &Path) {
 ///   for.
 /// - `noop-*`: does nothing (no writes, no commits) — a branch identical to
 ///   base, so it is both trivially merged AND clean.
+/// - `hang-*`: stays `running` forever — the live-agent guardrail needs a
+///   real running rat to prove against (mirrors agent_archive.rs's FAKE).
 /// - anything else: commits real work, then reports success — ordinary
 ///   "finished but never dismissed" leftovers.
 const FAKE: &str = r#"
@@ -70,6 +72,11 @@ case "$RK_TASK" in
   noop-*)
     echo '{"type":"system","subtype":"init","session_id":"fake-noop"}'
     echo '{"type":"result","subtype":"success","is_error":false,"result":"nothing to do","session_id":"fake-noop","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+    ;;
+  hang-*)
+    echo '{"type":"system","subtype":"init","session_id":"fake-hang"}'
+    echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"settling in"}]}}'
+    sleep 300
     ;;
   *)
     echo "gnawed by $RK_AGENT for task $RK_TASK" > gnawed.txt
@@ -400,6 +407,7 @@ async fn periodic_sweep_reclaims_a_leaked_worktree() {
         // direct `agent.spawn`); left off to keep the test's assertion
         // attributable to the periodic loop alone.
         finalize_cleanup_enabled: false,
+        ..rk_core::config::WorktreeSweepConfig::default()
     });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
@@ -422,6 +430,221 @@ async fn periodic_sweep_reclaims_a_leaked_worktree() {
         }
     }
     panic!("periodic worktree sweep never reclaimed {worktree:?}");
+}
+
+/// O12 (docs/2026-08-18-drain-probe-log.md), periodic-sweep half: the
+/// `[worktree_sweep]` loop reaps a terminal agent's regenerable build
+/// artifacts (`target/`) within one sweep interval REGARDLESS of merge
+/// state, while a live agent's `target/` is left completely untouched. A
+/// probe day accumulated 231 GB of terminal rats' `target/` dirs because the
+/// sweep only ever reclaimed worktrees wholesale for MERGED branches; an
+/// unmerged branch's build output is exactly as regenerable and must not
+/// have to wait on a merge that may never come.
+#[tokio::test]
+async fn periodic_sweep_reaps_terminal_artifacts_regardless_of_merge_state() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    let layout = Layout::at(home.path());
+    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
+        enabled: true,
+        interval_secs: 1,
+        after_days: 0,
+        finalize_cleanup_enabled: false,
+        ..rk_core::config::WorktreeSweepConfig::default()
+    });
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let live = spawn(
+        &mut client,
+        repo_dir.path(),
+        "hang-sweep-artifacts-1",
+        json!({}),
+    )
+    .await;
+    wait_for_state(&mut client, &live, "running").await;
+
+    // Commits real work, so the branch diverges from base and is never
+    // merged by anything in this test — the case `reap_git` refuses.
+    let stranded = spawn(&mut client, repo_dir.path(), "sweep-artifacts-1", json!({})).await;
+    wait_for_state(&mut client, &stranded, "completed").await;
+
+    let agents = list(&mut client, json!({})).await;
+    let rec = |name: &str| agents.iter().find(|a| a["name"] == name).cloned().unwrap();
+    let live_worktree = PathBuf::from(rec(&live)["worktree"].as_str().unwrap());
+    let stranded_rec = rec(&stranded);
+    let stranded_worktree = PathBuf::from(stranded_rec["worktree"].as_str().unwrap());
+    let stranded_branch = stranded_rec["branch"].as_str().unwrap().to_string();
+
+    for wt in [&live_worktree, &stranded_worktree] {
+        std::fs::create_dir_all(wt.join("target/debug")).unwrap();
+        std::fs::write(wt.join("target/debug/build-marker"), b"binary").unwrap();
+    }
+
+    // Never dismissed or pruned by the test — only the periodic sweep touches it.
+    let mut reaped = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if !stranded_worktree.join("target").exists() {
+            reaped = true;
+            break;
+        }
+    }
+    assert!(
+        reaped,
+        "periodic sweep never reaped {stranded_worktree:?}/target within the interval"
+    );
+    assert!(
+        stranded_worktree.exists(),
+        "artifact reap must never remove the (unmerged) worktree itself"
+    );
+    let branches = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir.path())
+        .args(["branch", "--list", "--format=%(refname:short)"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&branches.stdout)
+            .lines()
+            .any(|b| b == stranded_branch),
+        "artifact reap must never delete an unmerged branch"
+    );
+    assert!(
+        live_worktree.join("target").exists(),
+        "a live agent's build artifacts must never be touched by the periodic sweep"
+    );
+}
+
+/// Rework of TKT-01M0BH4ZW5DDF8F6J3TTBCFH70 item 1: artifact reap must not
+/// wait on `after_days`. The test above pins the mechanism with
+/// `after_days: 0`, which can't distinguish "reaped immediately" from
+/// "reaped once the (already-elapsed) cutoff passed" — it would pass even if
+/// artifact reap were still wired through the age-gated `archive_agents`
+/// path. This one runs the SHIPPED DEFAULT `WorktreeSweepConfig` (whose
+/// `after_days` is 3) and proves a `target/` dir is gone well within one
+/// sweep interval regardless — the exact default-config gap the reviewer
+/// flagged: a newly terminal agent's build artifacts must not stand for
+/// `after_days` before the first sweep even looks at them.
+#[tokio::test]
+async fn periodic_sweep_reaps_artifacts_immediately_under_default_after_days() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    let layout = Layout::at(home.path());
+    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
+        enabled: true,
+        interval_secs: 1,
+        finalize_cleanup_enabled: false,
+        // Deliberately NOT overridden: this is the shipped default (3 days),
+        // which must not gate the artifact reap below.
+        ..rk_core::config::WorktreeSweepConfig::default()
+    });
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let name = spawn(
+        &mut client,
+        repo_dir.path(),
+        "sweep-artifacts-default-1",
+        json!({}),
+    )
+    .await;
+    wait_for_state(&mut client, &name, "completed").await;
+
+    let agents = list(&mut client, json!({})).await;
+    let rec = agents.iter().find(|a| a["name"] == name).unwrap();
+    let worktree = PathBuf::from(rec["worktree"].as_str().unwrap());
+
+    std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
+    std::fs::write(worktree.join("target/debug/build-marker"), b"binary").unwrap();
+
+    let mut reaped = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if !worktree.join("target").exists() {
+            reaped = true;
+            break;
+        }
+    }
+    assert!(
+        reaped,
+        "periodic sweep never reaped {worktree:?}/target under the default (after_days: 3) config \
+         within the interval — artifact reap must not be gated by the archiving cutoff"
+    );
+    assert!(
+        worktree.exists(),
+        "artifact reap must never remove the worktree itself"
+    );
+}
+
+/// Rework of TKT-01M0BH4ZW5DDF8F6J3TTBCFH70 item 2: an `artifact_paths` entry
+/// that resolves to the worktree root itself (`.`) must be rejected the same
+/// way an absolute path or a `..` segment already is — `reap_artifacts`'s
+/// path-safety check previously only caught empty/absolute/`..` paths, so a
+/// misconfigured `.` would `remove_dir_all` the ENTIRE worktree (source,
+/// git state, everything), not just a regenerable build directory.
+#[tokio::test]
+async fn periodic_sweep_rejects_artifact_path_that_resolves_to_worktree_root() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    let layout = Layout::at(home.path());
+    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
+        enabled: true,
+        interval_secs: 1,
+        after_days: 0,
+        finalize_cleanup_enabled: false,
+        artifact_paths: vec![".".to_string()],
+        ..rk_core::config::WorktreeSweepConfig::default()
+    });
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let name = spawn(
+        &mut client,
+        repo_dir.path(),
+        "sweep-artifacts-root-1",
+        json!({}),
+    )
+    .await;
+    wait_for_state(&mut client, &name, "completed").await;
+
+    let agents = list(&mut client, json!({})).await;
+    let rec = agents.iter().find(|a| a["name"] == name).unwrap();
+    let worktree = PathBuf::from(rec["worktree"].as_str().unwrap());
+    assert!(worktree.exists());
+    assert!(
+        worktree.join("gnawed.txt").exists(),
+        "fake harness should have committed a source file"
+    );
+
+    // Give the periodic sweep several ticks to (wrongly) act on the unsafe
+    // path before asserting nothing was touched.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    assert!(
+        worktree.exists(),
+        "an artifact_paths entry resolving to the worktree root must never delete the worktree"
+    );
+    assert!(
+        worktree.join("gnawed.txt").exists(),
+        "an artifact_paths entry resolving to the worktree root must never touch source/git state: {worktree:?}"
+    );
+    assert!(
+        worktree.join(".git").exists(),
+        "worktree git state must be untouched by a rejected artifact path"
+    );
 }
 
 /// TKT item 3 (DISK PRESSURE GUARD): a spawn is refused before it creates a
@@ -471,5 +694,78 @@ async fn spawn_refused_when_disk_floor_breached() {
     assert!(
         kinds.contains(&"disk_pressure".to_string()),
         "disk-pressure obstacle posted: {kinds:?}"
+    );
+}
+
+/// O12 (docs/2026-08-18-drain-probe-log.md): a disk-floor refusal must not be
+/// silent. The `rk inbox` obstacle row above existed before this ticket and
+/// still needed an operator to go looking — this pins the fix, that the
+/// refusal ALSO goes out through the same `RecoveryAnnouncer` machinery every
+/// other automated recovery action uses (respawn, kill-process-group), so it
+/// reaches the configured notification sinks. The first refusal in a rolling
+/// hour announces normally; a second refusal in the same window is rate-held
+/// (raised severity, "HELD" in the text) rather than silently dropped —
+/// "silence is earned later, not shipped now" applies here exactly as much
+/// as it does to `respawn_sweep`.
+#[tokio::test]
+async fn disk_floor_refusal_announces_through_the_recovery_sinks() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    daemon.set_min_free_disk_gb(1_000_000_000);
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    for _ in 0..2 {
+        let _ = client
+            .call(
+                "agent.spawn",
+                json!({"repo": repo_dir.path().to_string_lossy(), "task": "disk-announce-1", "harness": "fake"}),
+            )
+            .await;
+    }
+
+    let events = client
+        .call(
+            "space.scan",
+            json!({"category": "event", "identity": "recovery_action"}),
+        )
+        .await
+        .unwrap();
+    let rows: Vec<Value> = events["tuples"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| t["payload"]["action_kind"] == "disk-floor")
+        .collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "both refusals announce (silence is never the fallback): {rows:?}"
+    );
+
+    let first_text = rows[0]["payload"]["notice"]["text"].as_str().unwrap_or("");
+    assert!(
+        first_text.contains("GB"),
+        "the announcement names free/floor GB: {first_text}"
+    );
+    assert_eq!(
+        rows[0]["payload"]["held"],
+        json!(false),
+        "the first refusal in the rolling hour must not be held"
+    );
+    assert_eq!(
+        rows[1]["payload"]["held"],
+        json!(true),
+        "a second refusal within the same rolling hour must be rate-held, not silent"
+    );
+    let second_text = rows[1]["payload"]["notice"]["text"].as_str().unwrap_or("");
+    assert!(
+        second_text.contains("rate cap hit"),
+        "a held escalation still explains why: {second_text}"
     );
 }

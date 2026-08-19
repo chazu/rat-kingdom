@@ -3032,21 +3032,46 @@ impl Daemon {
     }
 
     /// One pass of the periodic worktree-leak sweep (`[worktree_sweep]`):
-    /// archive terminal agent records untouched for at least `after_days` and
-    /// reclaim their git leftovers — worktree and local branch — wherever the
-    /// branch has already landed or is gone. The automated counterpart to `rk
-    /// prune --reap-git`; every removal is still gated by
-    /// [`Supervisor::reap_git`]'s merged-or-gone-AND-clean-worktree checks, so
-    /// this can run unattended without risking anyone's uncommitted or
-    /// unmerged work. Returns the number of worktrees actually reclaimed.
+    /// reclaim every still-live terminal agent's regenerable build artifacts
+    /// immediately (no age cutoff — see
+    /// [`reap_terminal_artifacts`](crate::supervisor::Supervisor::reap_terminal_artifacts)),
+    /// then separately archive terminal agent records untouched for at least
+    /// `after_days` and reclaim their git leftovers — worktree and local
+    /// branch — wherever the branch has already landed or is gone. The
+    /// automated counterpart to `rk prune --reap-git`/`--reap-artifacts`;
+    /// every git removal is still gated by [`Supervisor::reap_git`]'s
+    /// merged-or-gone-AND-clean-worktree checks, so this can run unattended
+    /// without risking anyone's uncommitted or unmerged work. Returns the
+    /// number of worktrees actually reclaimed (git only — artifact reaps are
+    /// partial removals within a worktree, not a worktree reclaim).
+    ///
+    /// The artifact reap deliberately does NOT wait on `after_days`: that
+    /// cutoff answers "has this record been idle long enough to archive",
+    /// which has nothing to do with whether its `target/` dir is safe to
+    /// delete — it always is, the moment the agent goes terminal. Gating
+    /// artifact reap on the same cutoff (as the archive-time reap below still
+    /// does, for records that only clear the cutoff there) is exactly the O12
+    /// (2026-08-18 drain probe) bug: a newly terminal agent's `target/` stood
+    /// for up to the default `after_days: 3` before the first sweep touched
+    /// it.
     ///
     /// [`Supervisor::reap_git`]: crate::supervisor::Supervisor
     fn worktree_sweep_once(&self) -> usize {
+        let artifact_reap = crate::supervisor::Reap {
+            git: false,
+            logs: false,
+            artifact_paths: self.worktree_sweep_config.artifact_paths.clone(),
+            artifact_paths_by_repo: self.worktree_sweep_config.artifact_paths_by_repo.clone(),
+        };
+        self.supervisor.reap_terminal_artifacts(&artifact_reap);
+
         let cutoff = chrono::Utc::now()
             - chrono::Duration::days(self.worktree_sweep_config.after_days as i64);
         let reap = crate::supervisor::Reap {
             git: true,
             logs: false,
+            artifact_paths: self.worktree_sweep_config.artifact_paths.clone(),
+            artifact_paths_by_repo: self.worktree_sweep_config.artifact_paths_by_repo.clone(),
         };
         match self.supervisor.archive_agents(cutoff, false, reap) {
             Ok(value) => value["reaped"]
@@ -5669,6 +5694,16 @@ impl Daemon {
         let reap = crate::supervisor::Reap {
             git: params.reap_git,
             logs: params.reap_logs,
+            artifact_paths: if params.reap_artifacts {
+                self.worktree_sweep_config.artifact_paths.clone()
+            } else {
+                Vec::new()
+            },
+            artifact_paths_by_repo: if params.reap_artifacts {
+                self.worktree_sweep_config.artifact_paths_by_repo.clone()
+            } else {
+                HashMap::new()
+            },
         };
         let supervisor = Arc::clone(&self.supervisor);
         let engine = self.engine();
@@ -6761,6 +6796,11 @@ struct AgentArchiveParams {
     reap_git: bool,
     /// Also delete each archived agent's transcript file. One-way.
     reap_logs: bool,
+    /// Also delete each archived agent's regenerable build-artifact paths
+    /// (`[worktree_sweep] artifact_paths`/`artifact_paths_by_repo`, e.g.
+    /// `target`) from its worktree — regardless of merge state, unlike
+    /// `reap_git`.
+    reap_artifacts: bool,
 }
 
 /// Which slice of the instance store `workflow.list` returns. Defaults (both

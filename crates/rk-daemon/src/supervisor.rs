@@ -714,12 +714,37 @@ impl MergeQueue {
 /// has nothing to defer to. Folding them together would mean either deleting
 /// the transcript of the very rat whose branch was kept back for a closer look,
 /// or never reaping the transcript of a rat that had no branch at all.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Reap {
     /// The worktree and local branch — merged branches only.
     pub git: bool,
     /// The generation's transcript file under `agent-logs/`. One-way.
     pub logs: bool,
+    /// Regenerable build-artifact paths (relative to a worktree root) to
+    /// delete from EVERY archived record's worktree, terminal state
+    /// regardless of merge outcome — unlike `git` above, there is no
+    /// merged-or-gone gate, because an unmerged branch's build output is
+    /// exactly as regenerable as a merged one's. Empty disables artifact
+    /// reaping (the default, so a bare `Reap` stays a total no-op).
+    pub artifact_paths: Vec<String>,
+    /// Per-repo override of `artifact_paths`, keyed by repo name — a repo
+    /// with an entry here uses THAT list instead (not merged with it).
+    pub artifact_paths_by_repo: HashMap<String, Vec<String>>,
+}
+
+impl Reap {
+    /// The paths to reap for one record's repo: its per-repo override if one
+    /// is configured, else the fleet-wide default.
+    fn artifact_paths_for(&self, repo: &str) -> &[String] {
+        self.artifact_paths_by_repo
+            .get(repo)
+            .map(Vec::as_slice)
+            .unwrap_or(&self.artifact_paths)
+    }
+
+    fn reaps_artifacts(&self) -> bool {
+        !self.artifact_paths.is_empty() || !self.artifact_paths_by_repo.is_empty()
+    }
 }
 
 impl Supervisor {
@@ -2190,6 +2215,40 @@ impl Supervisor {
             floor_gb, "disk floor breached — refusing spawn"
         );
         self.emit_disk_pressure_obstacle(repo, available, floor_bytes);
+        // O12 (docs/2026-08-18-drain-probe-log.md): a disk-floor refusal used
+        // to be visible only via `rk inbox`'s obstacle row, so a stalled
+        // drain went unnoticed for hours. Route through the same
+        // announce-mode machinery every other automated recovery action
+        // uses (`RecoveryAnnouncer`), naming free/floor GB, capped to the
+        // first refusal per rolling hour so a stuck drain does not turn a
+        // sustained breach into a notification storm — the cap raises
+        // severity and keeps announcing instead of going silent, matching
+        // `respawn_sweep`'s "silence is earned later, not shipped now".
+        let notice = EscalationNotice::new(
+            "placeholder",
+            "disk-floor",
+            Severity::Warn,
+            repo.to_string(),
+            self.layout.home().display().to_string(),
+            format!(
+                "spawn refused: only {available_gb:.1} GB free under {} — below the \
+                 configured floor of {floor_gb} GB ([disk] min_free_gb)",
+                self.layout.home().display()
+            ),
+        )
+        .with_action("free disk under RK_HOME, e.g. `rk prune --reap-git --reap-artifacts`, or raise [disk] min_free_gb");
+        if let Err(e) = self.announcer.announce(
+            &self.space,
+            &self.sinks.lock().unwrap_or_else(|p| p.into_inner()),
+            crate::recovery::RecoveryAction {
+                kind: "disk-floor".into(),
+                instance: "supervisor".into(),
+                notice,
+            },
+            crate::recovery::RateCap::per_hour(1),
+        ) {
+            warn!(error = %e, "failed to announce disk-floor refusal");
+        }
         Err(rk_core::Error::other(format!(
             "refusing to spawn: only {available_gb:.1} GB free under {} — below the \
              configured floor of {floor_gb} GB ([disk] min_free_gb)",
@@ -4404,11 +4463,20 @@ impl Supervisor {
         } else {
             Vec::new()
         };
+        let reaped_artifacts: Vec<serde_json::Value> = if reap.reaps_artifacts() {
+            archived
+                .iter()
+                .map(|r| self.reap_artifacts(r, reap.artifact_paths_for(&r.repo_name)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         info!(
             count = archived.len(),
             cutoff = %cutoff,
             reaped = done(&reaped),
             reaped_logs = done(&reaped_logs),
+            reaped_artifacts = done(&reaped_artifacts),
             "archived terminal agent records"
         );
         Ok(json!({
@@ -4417,6 +4485,7 @@ impl Supervisor {
             "agents": archived,
             "reaped": reaped,
             "reaped_logs": reaped_logs,
+            "reaped_artifacts": reaped_artifacts,
         }))
     }
 
@@ -4492,6 +4561,94 @@ impl Supervisor {
             detail.push(format!("branch {branch} already gone"));
         }
         row(true, detail.join("; "))
+    }
+
+    /// Reclaim EVERY still-live terminal record's regenerable build
+    /// artifacts right now, with no age cutoff — the immediate counterpart to
+    /// the artifact-reap [`archive_agents`] also performs on records that
+    /// have already crossed its `after_days` cutoff. O12 (2026-08-18 drain
+    /// probe): shipping artifact reap only inside `archive_agents` meant a
+    /// newly terminal agent's `target/` stood untouched for up to
+    /// `after_days` (default 3) before the first sweep even looked at it —
+    /// exactly the silent-231GB accumulation this exists to close. A record
+    /// that later actually archives just gets reaped again here first,
+    /// idempotently (`reap_artifacts` no-ops once nothing named remains).
+    ///
+    /// [`archive_agents`]: Self::archive_agents
+    pub fn reap_terminal_artifacts(&self, reap: &Reap) -> Vec<serde_json::Value> {
+        if !reap.reaps_artifacts() {
+            return Vec::new();
+        }
+        self.lock_registry()
+            .terminal()
+            .into_iter()
+            .map(|r| self.reap_artifacts(r, reap.artifact_paths_for(&r.repo_name)))
+            .collect()
+    }
+
+    /// Reclaim one archived agent's regenerable build artifacts — e.g.
+    /// `target` — from its worktree, regardless of merge state. Unlike
+    /// [`reap_git`](Self::reap_git) there is no merged-or-gone gate: an
+    /// unmerged branch's build output is exactly as regenerable as a merged
+    /// one's, and only the paths in `paths` are ever removed, so the source
+    /// tree, git history, and any uncommitted edits elsewhere in the worktree
+    /// stay completely untouched. Reachable via [`archive_agents`] (archived
+    /// records) and [`reap_terminal_artifacts`](Self::reap_terminal_artifacts)
+    /// (any still-live terminal record) — both require the record to already
+    /// be terminal (Completed/Failed/Dismissed); a live agent's worktree is
+    /// never a candidate.
+    ///
+    /// Each entry in `paths` is a literal worktree-relative path (not a shell
+    /// glob); entries that are empty, absolute, contain a `..` segment, or
+    /// resolve to the worktree root itself (`.`, `./`, or equivalent — every
+    /// segment empty or `.`) are skipped defensively rather than resolved,
+    /// since nothing about this reap should ever be able to reach outside —
+    /// or BE — the worktree.
+    ///
+    /// Best-effort in the same shape as `reap_git`/`reap_log`: a failure is a
+    /// `reaped: false` row with a reason, never a failed archive.
+    fn reap_artifacts(&self, record: &AgentRecord, paths: &[String]) -> serde_json::Value {
+        let row = |reaped: bool, reason: String| json!({"agent": record.name, "reaped": reaped, "reason": reason});
+        let Some(worktree) = &record.worktree else {
+            return row(false, "no worktree recorded".into());
+        };
+        if !worktree.exists() {
+            return row(false, "worktree already gone".into());
+        }
+        let mut removed = Vec::new();
+        for rel in paths {
+            let resolves_to_root = rel.split('/').all(|seg| seg.is_empty() || seg == ".");
+            if rel.is_empty()
+                || rel.starts_with('/')
+                || rel.split('/').any(|seg| seg == "..")
+                || resolves_to_root
+            {
+                warn!(
+                    agent = %record.name,
+                    path = %rel,
+                    "worktree artifact sweep: skipping unsafe path"
+                );
+                continue;
+            }
+            let target = worktree.join(rel);
+            if !target.exists() {
+                continue;
+            }
+            let result = if target.is_dir() {
+                std::fs::remove_dir_all(&target)
+            } else {
+                std::fs::remove_file(&target)
+            };
+            match result {
+                Ok(()) => removed.push(rel.clone()),
+                Err(e) => return row(false, format!("failed to remove {rel}: {e}")),
+            }
+        }
+        if removed.is_empty() {
+            row(true, "no matching artifact paths present".into())
+        } else {
+            row(true, format!("removed: {}", removed.join(", ")))
+        }
     }
 
     /// Reclaim one archived agent's transcript: the `agent-logs/` file its own
