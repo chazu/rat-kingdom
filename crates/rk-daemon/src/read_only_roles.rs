@@ -209,10 +209,7 @@ mod tests {
             json!({"id": "TKT-1", "status": "closed",
                 "reason": {"reason": "x", "evidence": "y"}, "parent": "TKT-9"}),
         ] {
-            assert!(
-                !groomer_can_close_ticket(&bad),
-                "must be refused: {bad}"
-            );
+            assert!(!groomer_can_close_ticket(&bad), "must be refused: {bad}");
         }
     }
 

@@ -71,6 +71,13 @@ burn detection, stale-instance timeout, ticket reopen, announce sinks).*
   decision just became security-relevant rather than hygienic. Gruyere-8
   working the inventory/fix ticket now.
 
+- **O16** (T+17h): the empty-branch-reads-merged flaw's third surfacing:
+  Acorn-8 failed with an empty branch, and B3's merged-branch guard read
+  empty (tip==fork==ancestor) as "already merged" and suppressed the
+  respawn. Same predicate root as O7 (empty landings) and the done-gate
+  refusals — one E1 fix (commit-count-aware delivery records) retires all
+  three. Ticket recycles via the reopen sweep; no operator action.
+
 ## Day-1 summary (T+~15h)
 
 **Volume:** 44 agents (39 rats, 5 reviewers), ~$144 recorded spend (true

@@ -84,7 +84,10 @@ async fn groomer_keeps_the_ordinary_surface_but_only_closes_tickets_with_evidenc
         .unwrap();
 
     let rework = operator
-        .call("ticket.new", json!({"title": format!("rework: {target_id}")}))
+        .call(
+            "ticket.new",
+            json!({"title": format!("rework: {target_id}")}),
+        )
         .await
         .unwrap();
     let rework_id = rework["ticket"]["identity"].as_str().unwrap().to_string();
@@ -126,10 +129,7 @@ async fn groomer_keeps_the_ordinary_surface_but_only_closes_tickets_with_evidenc
         .await
         .expect("a groomer must be able to read a single ticket");
     groomer
-        .call(
-            "ticket.new",
-            json!({"title": "follow-up filed by groomer"}),
-        )
+        .call("ticket.new", json!({"title": "follow-up filed by groomer"}))
         .await
         .expect("a groomer must retain the ordinary ticket.new grant");
     groomer
@@ -148,14 +148,8 @@ async fn groomer_keeps_the_ordinary_surface_but_only_closes_tickets_with_evidenc
         ("workflow.run", json!({"name": "steward"})),
         ("repo.add", json!({"path": "/tmp"})),
         ("ticket.dep", json!({"id": rework_id, "dep": target_id})),
-        (
-            "ticket.update",
-            json!({"id": rework_id, "status": "done"}),
-        ),
-        (
-            "ticket.update",
-            json!({"id": rework_id, "status": "open"}),
-        ),
+        ("ticket.update", json!({"id": rework_id, "status": "done"})),
+        ("ticket.update", json!({"id": rework_id, "status": "open"})),
         (
             "ticket.update",
             json!({"id": rework_id, "title": "sneak in a title change"}),

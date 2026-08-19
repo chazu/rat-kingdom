@@ -7792,9 +7792,7 @@ mod groomer_ticket_update_tests {
         let (_dir, daemon) = test_daemon_with_named_role("groomer-1", GROOMER_ROLE);
         let ticket = daemon
             .tickets
-            .create(
-                serde_json::from_value::<NewTicket>(json!({"title": "rework: TKT-x"})).unwrap(),
-            )
+            .create(serde_json::from_value::<NewTicket>(json!({"title": "rework: TKT-x"})).unwrap())
             .await
             .unwrap();
         let id = ticket.identity.clone();
@@ -7830,9 +7828,7 @@ mod groomer_ticket_update_tests {
         let (_dir, daemon) = test_daemon_with_named_role("groomer-1", GROOMER_ROLE);
         let ticket = daemon
             .tickets
-            .create(
-                serde_json::from_value::<NewTicket>(json!({"title": "no evidence"})).unwrap(),
-            )
+            .create(serde_json::from_value::<NewTicket>(json!({"title": "no evidence"})).unwrap())
             .await
             .unwrap();
         let id = ticket.identity.clone();
