@@ -16,9 +16,8 @@
 
 use super::{EscalationNotice, NotificationSink, Severity};
 use crate::config::SinkConfig;
+use crate::exec::run_piped;
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
@@ -66,10 +65,6 @@ impl NotificationSink for LogSink {
 /// How long a [`CommandSink`] child gets before it is killed, when the table
 /// does not say.
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
-
-/// How often the bounded wait polls the child. Small enough that a fast script
-/// does not visibly stall the reactor cycle, large enough not to spin.
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Run an operator-configured program per notice.
 ///
@@ -179,30 +174,14 @@ impl NotificationSink for CommandSink {
 
     fn deliver(&self, notice: &EscalationNotice) -> crate::Result<()> {
         let payload = serde_json::to_vec(notice)?;
-        let mut child = Command::new(&self.program)
-            .arg(notice.title())
-            .arg(notice.body())
-            .envs(Self::env(notice))
-            .stdin(Stdio::piped())
-            // Both output streams go to null on purpose. A piped stream we are
-            // not draining while we poll `try_wait` deadlocks the moment the
-            // child fills the 64K pipe buffer — which is exactly the hang the
-            // timeout exists to prevent, arriving through the back door. A
-            // script that wants its diagnostics kept should log them itself.
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| crate::Error::other(format!("could not run `{}`: {e}", self.program)))?;
-
-        // Broken pipe here is normal: a script that ignores stdin closes it.
-        // The notice is small, but a child that never reads while we write more
-        // than a pipe buffer would block us, so this is best-effort by design.
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(&payload);
-        }
-
-        let status = wait_bounded(&mut child, self.timeout)
-            .map_err(|e| crate::Error::other(format!("`{}` {e}", self.program)))?;
+        let args = [notice.title(), notice.body()];
+        let status = run_piped(
+            &self.program,
+            &args,
+            &Self::env(notice),
+            &payload,
+            self.timeout,
+        )?;
         if !status.success() {
             return Err(crate::Error::other(format!(
                 "`{}` exited {}",
@@ -214,27 +193,6 @@ impl NotificationSink for CommandSink {
             )));
         }
         Ok(())
-    }
-}
-
-/// Wait for `child`, killing it past `timeout`. `std::process::Child` has no
-/// timed wait, and an unbounded one on the reactor's escalation path is how a
-/// wedged notifier stalls dispatch for every repo.
-fn wait_bounded(child: &mut Child, timeout: Duration) -> crate::Result<ExitStatus> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(crate::Error::other(format!(
-                "timed out after {}s and was killed",
-                timeout.as_secs()
-            )));
-        }
-        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
