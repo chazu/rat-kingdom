@@ -582,7 +582,8 @@ impl Tickets {
         .await
     }
 
-    /// Open tickets whose every dependency is done/closed — actionable right now.
+    /// Open tickets whose every dependency has a durable delivery record —
+    /// actionable right now. Status alone is not proof that work landed.
     pub fn ready(&self, scope: Option<String>) -> rk_core::Result<Vec<Tuple>> {
         let by_id = self.all_by_id()?;
         let mut ready: Vec<Tuple> = by_id
@@ -606,7 +607,7 @@ impl Tickets {
         Ok(Some(
             deps_of(ticket)
                 .into_iter()
-                .filter(|d| by_id.get(d).is_some_and(|dep| !is_done(dep)))
+                .filter(|d| by_id.get(d).is_some_and(|dep| !is_delivered(dep)))
                 .collect(),
         ))
     }
@@ -656,7 +657,7 @@ impl Tickets {
             .await?
             .ok_or_else(|| rk_core::Error::other(format!("no such ticket: {id}")))?;
 
-        let was_done = is_done(&existing);
+        let was_delivered = is_delivered(&existing);
         let mut payload = existing.payload.clone();
         let obj = payload
             .as_object_mut()
@@ -666,15 +667,15 @@ impl Tickets {
 
         let updated = with_payload(existing, payload);
         self.space.out(updated.clone())?;
-        // Emit a `ticket_closed` event on the non-terminal → terminal edge — the
-        // moment a ticket's dependents can unblock (TKT-56). A reactor trigger
+        // Emit a `ticket_closed` event on the undelivered → delivered edge —
+        // the moment a ticket's dependents can unblock (TKT-56). A reactor trigger
         // matching this event hands the now-ready backlog to a drain workflow,
         // turning the dependency DAG into a self-advancing pipeline instead of
         // one that waits for the next drain sweep. Only the crossing edge fires
         // (a done→closed re-close, or a non-status edit, does not), so a closed
         // ticket's dependents are announced exactly once. Best-effort: a failed
         // emit never fails the status change that already landed.
-        if is_done(&updated) && !was_done {
+        if is_delivered(&updated) && !was_delivered {
             self.emit_ticket_closed(&updated);
         }
         Ok(updated)
@@ -755,19 +756,13 @@ fn valid_transition(previous: &str, next: &str) -> bool {
     }
 }
 
-fn is_done(ticket: &Tuple) -> bool {
-    matches!(
-        ticket.payload.get("status").and_then(Value::as_str),
-        Some("done") | Some("closed")
-    )
-}
-
-/// Blocked = has a dependency that exists and is not yet done/closed. A missing
+/// Blocked = has a dependency that exists and has no durable delivery record.
+/// A missing
 /// dependency (deleted ticket) does not block.
 fn is_blocked(ticket: &Tuple, by_id: &HashMap<String, Tuple>) -> bool {
     deps_of(ticket)
         .iter()
-        .any(|d| by_id.get(d).is_some_and(|dep| !is_done(dep)))
+        .any(|d| by_id.get(d).is_some_and(|dep| !is_delivered(dep)))
 }
 
 /// Can `target` be reached from `start` by following depends_on edges?
@@ -1143,8 +1138,19 @@ mod tests {
             vec![a.identity.clone()]
         );
 
-        // Finish a → b becomes ready.
+        // A status-only finish is not delivery and cannot unblock b.
         set_status(&t, &a.identity, "done").await;
+        assert!(t.ready(None).unwrap().is_empty());
+        assert_eq!(
+            t.blockers(&b.identity).unwrap().unwrap(),
+            vec![a.identity.clone()]
+        );
+
+        // Recording the land is the one transition that makes a dependency
+        // satisfied, so ready and blockers change together.
+        t.record_delivery(&a.identity, &record("abc123"))
+            .await
+            .unwrap();
         let ready: Vec<_> = t
             .ready(None)
             .unwrap()
@@ -1229,18 +1235,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closing_a_ticket_emits_a_ticket_closed_event() {
+    async fn only_delivery_emits_a_ticket_closed_event() {
         let (t, space) = tickets_with_space();
         let a = t.create(new("x", "myrepo", None)).await.unwrap();
         assert!(closed_events(&space).is_empty(), "no event before close");
 
         set_status(&t, &a.identity, "done").await;
+        assert!(
+            closed_events(&space).is_empty(),
+            "status without delivery must not unblock dependents"
+        );
+        t.record_delivery(&a.identity, &record("abc123"))
+            .await
+            .unwrap();
         let events = closed_events(&space);
-        assert_eq!(events.len(), 1, "closing emits exactly one event");
+        assert_eq!(events.len(), 1, "delivery emits exactly one event");
         let ev = &events[0];
         assert_eq!(ev.scope, "myrepo", "event is scoped to the ticket's repo");
         assert_eq!(ev.payload["ticket"], json!(a.identity));
-        assert_eq!(ev.payload["status"], json!("done"));
+        assert_eq!(ev.payload["status"], json!("closed"));
     }
 
     #[tokio::test]
@@ -1258,15 +1271,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn re_closing_a_done_ticket_does_not_re_emit() {
+    async fn status_changes_before_delivery_do_not_emit() {
         let (t, space) = tickets_with_space();
         let a = t.create(new("x", "myrepo", None)).await.unwrap();
-        set_status(&t, &a.identity, "done").await; // non-terminal → done: emits
-        set_status(&t, &a.identity, "closed").await; // done → closed: no re-emit
+        set_status(&t, &a.identity, "done").await;
+        set_status(&t, &a.identity, "closed").await;
         assert_eq!(
             closed_events(&space).len(),
-            1,
-            "the terminal edge fires once; a done→closed re-close is silent"
+            0,
+            "neither done nor closed satisfies a dependency without delivery"
         );
     }
 
