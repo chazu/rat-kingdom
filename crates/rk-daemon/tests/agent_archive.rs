@@ -477,8 +477,7 @@ async fn reap_artifacts_reclaims_terminal_worktrees_regardless_of_merge_state() 
     let live_worktree =
         std::path::PathBuf::from(pick(&agents, "name", &live)["worktree"].as_str().unwrap());
     let stranded_rec = pick(&agents, "name", &stranded);
-    let stranded_worktree =
-        std::path::PathBuf::from(stranded_rec["worktree"].as_str().unwrap());
+    let stranded_worktree = std::path::PathBuf::from(stranded_rec["worktree"].as_str().unwrap());
     let stranded_branch = stranded_rec["branch"].as_str().unwrap().to_string();
 
     // Simulate a cargo build in both worktrees.
@@ -490,7 +489,10 @@ async fn reap_artifacts_reclaims_terminal_worktrees_regardless_of_merge_state() 
     }
 
     let result = client
-        .call("agent.archive", json!({"all": true, "reap_artifacts": true}))
+        .call(
+            "agent.archive",
+            json!({"all": true, "reap_artifacts": true}),
+        )
         .await
         .unwrap();
     assert_eq!(result["count"], 1, "the running agent must not be archived");
