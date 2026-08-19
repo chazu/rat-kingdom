@@ -36,8 +36,21 @@ pub enum AgentState {
     /// (`Completed`), or when the process goes away (`Failed`, via the `Exited`
     /// handler) — so a genuinely dead agent still terminalizes promptly, and
     /// only a *live* process holds a slot.
+    ///
+    /// The paused/failed boundary is decided by liveness alone, never by
+    /// whether `rk done` was declared: a `Paused` record whose process then
+    /// exits becomes `Failed` regardless (the `Exited` handler treats
+    /// `Paused` as just another live state to terminalize), and a `Running`
+    /// record that dies mid-turn is `Failed` too, `rk done` or not. A
+    /// declared-but-dead generation and an undeclared-but-dead one land in
+    /// the same place; only "is the process still there to resume" tells
+    /// `Paused` apart from `Failed`.
     Paused,
     Completed,
+    /// The process is gone and nothing will resume it. Reached from any live
+    /// state ([`is_live`](AgentState::is_live)) whose harness never
+    /// terminalized cleanly with `rk done` — see the discriminator note on
+    /// [`Paused`](AgentState::Paused).
     Failed,
     Dismissed,
     /// The daemon restarted while this agent was running; its process is gone

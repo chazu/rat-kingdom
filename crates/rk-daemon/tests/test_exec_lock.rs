@@ -62,10 +62,17 @@ echo '{"type":"system","subtype":"init","session_id":"tel-fake"}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"did the work","session_id":"tel-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
-/// Records how many concurrent invocations were ever alive at once (`peak`)
-/// into `$RK_CHECK_MARKER_DIR`, via a non-atomic read-increment-write —
-/// exactly the shape of race that reveals a missing mutual exclusion.
-const CONTENDED_COMMAND: &str = r#"n=$(( $(cat "$RK_CHECK_MARKER_DIR/count" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$RK_CHECK_MARKER_DIR/count"; peak=$(cat "$RK_CHECK_MARKER_DIR/peak" 2>/dev/null || echo 0); if [ "$n" -gt "$peak" ]; then echo "$n" > "$RK_CHECK_MARKER_DIR/peak"; fi; sleep 0.4; n2=$(( $(cat "$RK_CHECK_MARKER_DIR/count") - 1 )); echo "$n2" > "$RK_CHECK_MARKER_DIR/count""#;
+/// Records whether two invocations were alive at once (`peak`) in
+/// `$RK_CHECK_MARKER_DIR`. Each process owns an atomic marker file and waits
+/// briefly for its sibling, so unlocked checks rendezvous even under a busy
+/// workspace test run. A locked check times out of the rendezvous alone,
+/// removes its marker, and only then allows the next invocation to enter.
+///
+/// The old read-increment-write counter could lose an increment when both
+/// shells wrote it concurrently, while its fixed sleep could miss overlap
+/// when the workspace was heavily loaded. Those were properties of the test,
+/// not of `TestExecLock`.
+const CONTENDED_COMMAND: &str = r#"marker="$RK_CHECK_MARKER_DIR/active.$$"; : > "$marker"; i=0; while [ "$i" -lt 40 ]; do active=$(find "$RK_CHECK_MARKER_DIR" -type f -name 'active.*' | wc -l | tr -d ' '); if [ "$active" -ge 2 ]; then echo 2 > "$RK_CHECK_MARKER_DIR/peak"; break; fi; i=$((i + 1)); sleep 0.05; done; if [ ! -f "$RK_CHECK_MARKER_DIR/peak" ]; then echo 1 > "$RK_CHECK_MARKER_DIR/peak"; fi; rm -f "$marker""#;
 
 fn checks_cue(shared_cargo_target: bool) -> String {
     format!(

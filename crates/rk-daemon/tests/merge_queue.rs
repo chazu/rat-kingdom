@@ -14,6 +14,7 @@
 //! the queue closes. The assertion (all N merged) is deterministic *with* the
 //! queue and flaky *without* it.
 
+mod fixture;
 mod support;
 
 use rk_core::paths::Layout;
@@ -40,15 +41,22 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 // Each rat writes a distinct per-agent file (so merges never conflict) and
-// reports a clean success.
-const WORKING_FAKE: &str = r#"
+// reports a clean success. Declares `rk done` before its result line: a
+// clean turn that never does now parks the agent as `Paused` (awaiting
+// resume) rather than `Completed`, which every rat here is waited on for.
+fn working_fake() -> String {
+    fixture::with_rk_done(
+        r#"
 read -r _prompt
 echo "work by $RK_AGENT for $RK_TASK" > "work-$RK_AGENT.txt"
 git add . >/dev/null 2>&1
 git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
 echo '{"type":"system","subtype":"init","session_id":"mq-fake"}'
+rk_done "done"
 echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"mq-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
-"#;
+"#,
+    )
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_dismisses_all_merge_into_main() {
@@ -63,7 +71,7 @@ async fn concurrent_dismisses_all_merge_into_main() {
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", working_fake());
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());

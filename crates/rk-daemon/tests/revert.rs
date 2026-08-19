@@ -5,6 +5,7 @@
 //! The anchor is cleared on success so a second revert errors instead of
 //! reverting the revert.
 
+mod fixture;
 mod support;
 
 use rk_core::paths::Layout;
@@ -49,14 +50,31 @@ fn scratch_repo(dir: &Path) {
 }
 
 /// Fake harness: commits a file in its worktree, reports a clean success.
-const WORKING_FAKE: &str = r#"
+/// Declares `rk done` before its result line: a clean turn that never does
+/// now parks the agent as `Paused` (awaiting resume) rather than `Completed`,
+/// which every test here waits on.
+///
+/// `RK_FAKE_HARNESS_CMD` is process-global, and this binary's two tests run
+/// concurrently, so neither test may ever `remove_var` it: doing so at the
+/// end of one test can unset the fake mid-flight for the other test's still-
+/// spawning agent, which then falls back to a different default script and
+/// never reaches the state either test is waiting on (TKT-88 — mirrors the
+/// same precaution in fleet_budget.rs/merge_queue.rs/pr_mode.rs). Both tests
+/// set the identical value, so leaving it set for the whole process is
+/// harmless.
+fn working_fake() -> String {
+    fixture::with_rk_done(
+        r#"
 read -r _prompt
 echo "bad work by $RK_AGENT for $RK_TASK" > regression.txt
 git add regression.txt >/dev/null 2>&1
 git -c user.email=rat@x -c user.name=Rat commit -q -m "rat work: $RK_TASK"
 echo '{"type":"system","subtype":"init","session_id":"revert-fake"}'
+rk_done "done"
 echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"revert-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
-"#;
+"#,
+    )
+}
 
 /// Spawn a ticket-dispatched rat, wait for completion, dismiss (auto-merge).
 /// Returns (agent name, ticket id).
@@ -117,7 +135,7 @@ async fn revert_undoes_merge_reopens_ticket_and_emits_fact() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", working_fake());
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
@@ -180,8 +198,6 @@ async fn revert_undoes_merge_reopens_ticket_and_emits_fact() {
     // the revert.
     let again = client.call("agent.revert", json!({"name": &name})).await;
     assert!(again.is_err(), "second revert must error");
-
-    std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
 #[tokio::test]
@@ -190,7 +206,7 @@ async fn revert_block_reopens_ticket_blocked_and_never_merged_errors() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", working_fake());
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
@@ -244,6 +260,4 @@ async fn revert_block_reopens_ticket_blocked_and_never_merged_errors() {
     assert_eq!(dismissed["merged"], false);
     let denied = client.call("agent.revert", json!({"name": &held})).await;
     assert!(denied.is_err(), "revert of a never-merged agent must error");
-
-    std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }

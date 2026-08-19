@@ -9,6 +9,7 @@
 //! the PR fork instead.
 
 use rk_core::config::ReviewSweepConfig;
+mod fixture;
 mod support;
 
 use rk_core::paths::Layout;
@@ -36,15 +37,23 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
-// The rat writes a per-agent file, commits it on its branch, and reports clean.
-const WORKING_FAKE: &str = r#"
+// The rat writes a per-agent file, commits it on its branch, and reports
+// clean. Declares `rk done` before its result line: a clean turn that never
+// does now parks the agent as `Paused` (awaiting resume) rather than
+// `Completed`, which every test here waits on.
+fn working_fake() -> String {
+    fixture::with_rk_done(
+        r#"
 read -r _prompt
 echo "work by $RK_AGENT for $RK_TASK" > "work-$RK_AGENT.txt"
 git add . >/dev/null 2>&1
 git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
 echo '{"type":"system","subtype":"init","session_id":"pr-fake"}'
+rk_done "done"
 echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"pr-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
-"#;
+"#,
+    )
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pr_mode_dismiss_opens_pr_and_keeps_branch() {
@@ -70,7 +79,7 @@ async fn pr_mode_dismiss_opens_pr_and_keeps_branch() {
     git(repo_path, &["push", "-u", "origin", "main"]);
     let base_head = git(repo_path, &["rev-parse", "main"]).trim().to_string();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", working_fake());
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
@@ -238,7 +247,7 @@ async fn review_sweep_clears_awaiting_review_on_forge_merge_without_a_pull() {
     git(repo_path, &["push", "-u", "origin", "main"]);
     let base_head = git(repo_path, &["rev-parse", "main"]).trim().to_string();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", working_fake());
     let layout = Layout::at(home.path());
     let space = Space::open_in_memory().unwrap();
     let mut daemon = Daemon::with_space_for_tests(

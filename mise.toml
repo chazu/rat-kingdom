@@ -37,7 +37,10 @@ description = "Run the workspace test suite"
 # daemon then refuses operator-only methods (workflow.run, agent.spawn, ...)
 # with `forbidden`. So the suite passes for a human and fails for every rat
 # running the very command its completion protocol demands. Tracked: TKT-182.
-run = "env -u RK_AGENT cargo test --workspace"
+# `--no-fail-fast` reports every failing integration-test binary in one run;
+# compilation errors still stop before tests, and any test failure still makes
+# the task fail.
+run = "env -u RK_AGENT cargo test --workspace --no-fail-fast"
 
 [tasks.verify]
 description = "Build, test, and lint — the checks a rat must pass before `rk done`"
@@ -49,7 +52,7 @@ description = "Build, test, and lint — the checks a rat must pass before `rk d
 run = """
 cargo fmt --all --check
 cargo build --workspace
-env -u RK_AGENT cargo test --workspace
+env -u RK_AGENT cargo test --workspace --no-fail-fast
 cargo clippy --workspace --all-targets -- -D warnings
 """
 

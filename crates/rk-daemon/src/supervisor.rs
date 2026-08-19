@@ -1931,8 +1931,7 @@ impl Supervisor {
                             // workflow `wait`/`evaluate` has to be able to tell a
                             // rat that produced nothing from one that ran (TKT-147).
                             r.crashed = true;
-                            let base =
-                                format!("process exited (code {code:?}) without completing");
+                            let base = format!("process exited (code {code:?}) without completing");
                             // A starved/misconfigured harness (rate limit, queueing,
                             // auth refresh, model unavailable) can produce zero
                             // protocol output and die silently — stderr is the only
@@ -2478,7 +2477,10 @@ impl Supervisor {
     /// [`would_exceed_budget`](Self::would_exceed_budget): a resource refusal
     /// must escalate wherever it is decided. The rate cap, not silence, is what
     /// keeps a per-cycle poll from spamming.
-    pub fn would_refuse_for_resources(&self, repo: &str) -> Option<crate::machine::ResourceRefusal> {
+    pub fn would_refuse_for_resources(
+        &self,
+        repo: &str,
+    ) -> Option<crate::machine::ResourceRefusal> {
         match self.refusing_resource(repo) {
             Ok(refusal) => refusal,
             // A sampling failure (e.g. statvfs on a vanished path) must not
@@ -5710,9 +5712,13 @@ mod respawn_tests {
         );
 
         // Now the process really is gone.
-        sup.handle_event("Nibble", generation, spawn, spawn, HarnessEvent::Exited {
-            code: Some(0),
-        });
+        sup.handle_event(
+            "Nibble",
+            generation,
+            spawn,
+            spawn,
+            HarnessEvent::Exited { code: Some(0) },
+        );
         let dead = sup.status("Nibble").unwrap();
         assert_eq!(
             dead.state,

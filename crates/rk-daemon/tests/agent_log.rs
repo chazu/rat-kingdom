@@ -7,6 +7,7 @@
 //! rats serves each of them separately.
 
 use chrono::{DateTime, TimeDelta, Utc};
+mod fixture;
 mod support;
 
 use rk_core::paths::Layout;
@@ -19,13 +20,23 @@ use support::connect;
 /// A fake rat that narrates: one prose chunk, one tool call, then completes.
 /// These `assistant`/`tool_use` events are exactly what `handle_event` used to
 /// throw away.
-const CHATTY_FAKE: &str = r#"
+///
+/// A clean turn that never calls `rk done` now parks the agent as `Paused`
+/// (awaiting resume) rather than `Completed`, so `agent never completed`
+/// below would fire. Declare done via `fixture::with_rk_done` before the
+/// result line, exactly as a real primed rat does.
+fn chatty_fake() -> String {
+    fixture::with_rk_done(
+        r#"
 read -r _prompt
 echo '{"type":"system","subtype":"init","session_id":"fake-log"}'
 echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"planning the gnaw"}]}}'
 echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","id":"t1","input":{}}]}}'
+rk_done "done"
 echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"fake-log","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
-"#;
+"#,
+    )
+}
 
 #[tokio::test]
 async fn supervisor_persists_transcript_and_log_serves_it() {
@@ -33,7 +44,7 @@ async fn supervisor_persists_transcript_and_log_serves_it() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", CHATTY_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", chatty_fake());
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());

@@ -172,16 +172,14 @@ checks: [
         t.await.unwrap();
     }
 
-    // Wait for the durable queue to fully drain — the authoritative signal
-    // that every candidate reached a terminal outcome (`LandingPipeline::
-    // process_next` only removes an entry's tuple once `process_entry`
-    // returns). The live daemon's reactor (dispatch) and landing-pipeline
-    // (drain) loops both run on their own background ticks, so this is
-    // polled rather than awaited directly. A candidate's file can already be
-    // visible in `repo_dir`'s working tree mid-`land()`, before its queue
-    // tuple is removed — polling file existence instead of queue-emptiness
-    // would race that window, so the queue is the thing to wait on.
-    let mut queue_empty = false;
+    // Wait for every artifact AND the durable queue to be empty. Queue
+    // emptiness alone is not sufficient: immediately after the concurrent
+    // spawns finish, the reactor may not have converted any harness result
+    // into a queue entry yet, so the queue is briefly empty before the burst
+    // even starts. Conversely, artifact existence alone can race the window
+    // inside `land()` before `process_next` removes the completed entry.
+    // Requiring both closes both sides of the race.
+    let mut burst_complete = false;
     for _ in 0..600 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let queue = client
@@ -191,14 +189,20 @@ checks: [
             )
             .await
             .unwrap();
-        if queue["tuples"].as_array().unwrap().is_empty() {
-            queue_empty = true;
+        let all_landed = (0..N).all(|i| {
+            repo_dir
+                .path()
+                .join(format!("docs/note-burst{i}.md"))
+                .exists()
+        });
+        if queue["tuples"].as_array().unwrap().is_empty() && all_landed {
+            burst_complete = true;
             break;
         }
     }
     assert!(
-        queue_empty,
-        "landing queue did not fully drain within the wait budget"
+        burst_complete,
+        "not every burst candidate landed and left the queue within the wait budget"
     );
 
     let landed: Vec<bool> = (0..N)

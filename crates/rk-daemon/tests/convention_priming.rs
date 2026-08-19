@@ -3,6 +3,7 @@
 //! quorum-promoted norm actually reaches (and binds) the rat — it does not rely
 //! on the rat choosing to `rk scan convention`.
 
+mod fixture;
 mod support;
 
 use rk_core::paths::Layout;
@@ -48,14 +49,24 @@ fn scratch_repo(dir: &Path) {
 
 /// Fake harness that captures the system prompt it was primed with into a
 /// committed file, so the test can read back exactly what the rat received.
-const CAPTURE_PRIME: &str = r#"
+///
+/// A clean turn that never calls `rk done` now parks the agent as `Paused`
+/// (awaiting resume) rather than `Completed`, so `agent never completed`
+/// below would fire. Declare done via `fixture::with_rk_done` before the
+/// result line, exactly as a real primed rat does.
+fn capture_prime() -> String {
+    fixture::with_rk_done(
+        r#"
 read -r _prompt
 printf '%s' "$RK_FAKE_SYSTEM_PROMPT" > primed.txt
 git add primed.txt >/dev/null 2>&1
 git -c user.email=rat@x -c user.name=Rat commit -q -m "capture prime"
 echo '{"type":"system","subtype":"init","session_id":"fake-prime"}'
+rk_done "captured prime"
 echo '{"type":"result","subtype":"success","is_error":false,"result":"captured prime","session_id":"fake-prime","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
-"#;
+"#,
+    )
+}
 
 #[tokio::test]
 async fn promoted_convention_reaches_spawned_rat_prompt() {
@@ -63,7 +74,7 @@ async fn promoted_convention_reaches_spawned_rat_prompt() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", CAPTURE_PRIME);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", capture_prime());
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
@@ -176,7 +187,7 @@ async fn repo_named_checks_reach_spawned_rat_prompt() {
         &["commit", "-m", "declare verification check"],
     );
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", CAPTURE_PRIME);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", capture_prime());
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());

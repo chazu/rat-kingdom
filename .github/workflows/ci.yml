@@ -39,4 +39,4 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets
       - name: test
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast

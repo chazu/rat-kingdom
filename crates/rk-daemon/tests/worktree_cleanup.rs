@@ -13,6 +13,7 @@
 //! unattended; and a spawn is refused (with an inbox obstacle) once free disk
 //! drops below the configured floor.
 
+mod fixture;
 mod support;
 
 use rk_core::paths::Layout;
@@ -61,16 +62,26 @@ fn scratch_repo(dir: &Path) {
 ///   real running rat to prove against (mirrors agent_archive.rs's FAKE).
 /// - anything else: commits real work, then reports success — ordinary
 ///   "finished but never dismissed" leftovers.
-const FAKE: &str = r#"
+///
+/// Every completing branch declares `rk done` before its result line: a
+/// clean turn that never does now parks the agent as `Paused` (awaiting
+/// resume) rather than `Completed`, which every non-`hang-*` wait here is
+/// keyed on. `hang-*` deliberately never does, since it models a rat that is
+/// still running.
+fn fake() -> String {
+    fixture::with_rk_done(
+        r#"
 read -r _prompt
 case "$RK_TASK" in
   dirty-*)
     echo "uncommitted" > dirty.txt
     echo '{"type":"system","subtype":"init","session_id":"fake-dirty"}'
+    rk_done "left dirty"
     echo '{"type":"result","subtype":"success","is_error":false,"result":"left dirty","session_id":"fake-dirty","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
     ;;
   noop-*)
     echo '{"type":"system","subtype":"init","session_id":"fake-noop"}'
+    rk_done "nothing to do"
     echo '{"type":"result","subtype":"success","is_error":false,"result":"nothing to do","session_id":"fake-noop","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
     ;;
   hang-*)
@@ -83,10 +94,13 @@ case "$RK_TASK" in
     git add gnawed.txt >/dev/null 2>&1
     git -c user.email=rat@x -c user.name=Rat commit -q -m "rat work: $RK_TASK"
     echo '{"type":"system","subtype":"init","session_id":"fake-work"}'
+    rk_done "committed gnawed.txt"
     echo '{"type":"result","subtype":"success","is_error":false,"result":"committed gnawed.txt","session_id":"fake-work","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
     ;;
 esac
-"#;
+"#,
+    )
+}
 
 async fn spawn(client: &mut Client, repo: &Path, task: &str, extra: Value) -> String {
     let mut params = json!({
@@ -206,7 +220,7 @@ async fn finalize_dismisses_agents_the_workflow_never_dismissed() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = init_workflow_repo();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     // Bare/test daemons default this off (TKT-01M04N6W4X47KMXDA6MH0WPH8H
@@ -270,7 +284,7 @@ async fn finalize_sweep_parks_a_dirty_worktree() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = init_workflow_repo();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
@@ -342,7 +356,7 @@ async fn reap_git_leaves_a_dirty_worktree_standing() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
@@ -396,7 +410,7 @@ async fn periodic_sweep_reclaims_a_leaked_worktree() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
@@ -446,7 +460,7 @@ async fn periodic_sweep_reaps_terminal_artifacts_regardless_of_merge_state() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
@@ -473,8 +487,19 @@ async fn periodic_sweep_reaps_terminal_artifacts_regardless_of_merge_state() {
     let stranded = spawn(&mut client, repo_dir.path(), "sweep-artifacts-1", json!({})).await;
     wait_for_state(&mut client, &stranded, "completed").await;
 
-    let agents = list(&mut client, json!({})).await;
-    let rec = |name: &str| agents.iter().find(|a| a["name"] == name).cloned().unwrap();
+    // `include_archived`: this test's own `after_days: 0` also makes the
+    // record eligible for the SAME sweep's archive half (worktree_sweep_once
+    // reaps artifacts immediately, then separately archives anything past the
+    // cutoff), so by the time this reads back the record it may already have
+    // been archived — orthogonal to what this test is actually verifying.
+    let agents = list(&mut client, json!({"include_archived": true})).await;
+    let rec = |name: &str| {
+        agents
+            .iter()
+            .find(|a| a["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("no record for {name} in {agents:?}"))
+    };
     let live_worktree = PathBuf::from(rec(&live)["worktree"].as_str().unwrap());
     let stranded_rec = rec(&stranded);
     let stranded_worktree = PathBuf::from(stranded_rec["worktree"].as_str().unwrap());
@@ -536,7 +561,7 @@ async fn periodic_sweep_reaps_artifacts_immediately_under_default_after_days() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
@@ -597,7 +622,7 @@ async fn periodic_sweep_rejects_artifact_path_that_resolves_to_worktree_root() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
