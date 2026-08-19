@@ -1772,6 +1772,15 @@ impl Supervisor {
         session: rk_core::id::SpawnId,
         event: HarnessEvent,
     ) {
+        // A harness that speaks again has resumed the turn it paused on.
+        // `Completed`/`Exited` are excluded because they decide their own
+        // state below (a fresh pause, a completion, or a death).
+        if !matches!(
+            event,
+            HarnessEvent::Completed { .. } | HarnessEvent::Exited { .. }
+        ) {
+            self.resume_if_paused(name);
+        }
         match event {
             HarnessEvent::Started { session_id } => {
                 let _ = self.lock_registry().update(name, |r| {
@@ -1801,11 +1810,34 @@ impl Supervisor {
                 session_id,
             } => {
                 let diff = self.diff_summary_for(name);
+                // The claim is decided BEFORE the state write, because it is
+                // what the state write depends on: a clean turn that nothing
+                // proves is the last one is a PAUSE, not a completion. The
+                // record is read first only to supply `claim_completion`'s
+                // identity arguments — a name with no record cannot be updated
+                // either, so nothing is claimed for one.
+                let Some(pre) = self.status(name) else {
+                    warn!(agent = name, "completion event for an unknown agent");
+                    return;
+                };
+                let claim = self.claim_completion(
+                    name,
+                    generation,
+                    pre.spawn,
+                    is_error,
+                    uses_harness_terminal_completion(&pre.role, &pre.harness),
+                );
                 let updated = self.lock_registry().update(name, |r| {
                     r.state = if is_error {
                         AgentState::Failed
-                    } else {
+                    } else if claim.publish {
                         AgentState::Completed
+                    } else {
+                        // Turn boundary without a `rk done`, process still
+                        // alive: awaiting resume. Held live so drain keeps its
+                        // slot, the reopen sweep keeps its ticket, and no
+                        // reaper mistakes an interruption for a finish.
+                        AgentState::Paused
                     };
                     r.result = Some(result.clone());
                     if usage.total() > 0 {
@@ -1820,13 +1852,6 @@ impl Supervisor {
                     }
                 });
                 if let Ok(Some(record)) = updated {
-                    let claim = self.claim_completion(
-                        name,
-                        generation,
-                        record.spawn,
-                        is_error,
-                        uses_harness_terminal_completion(&record.role, &record.harness),
-                    );
                     if claim.publish {
                         info!(agent = name, is_error, "agent completed");
                         self.route_completion(&record, is_error, claim.declared_done, diff);
@@ -1841,8 +1866,10 @@ impl Supervisor {
                     } else {
                         info!(
                             agent = name,
+                            state = ?record.state,
                             "harness returned control without a `rk done`; holding the turn \
-                             result back rather than publishing it as the completion"
+                             result back rather than publishing it as the completion, and \
+                             parking the agent as awaiting-resume rather than finished"
                         );
                     }
                 }
@@ -1852,27 +1879,47 @@ impl Supervisor {
                 self.lock_controls().remove(name);
                 let updated = self.lock_registry().update(name, |r| {
                     r.pid = None;
+                    // A paused agent is live, but it is not mid-turn: its
+                    // harness DID report, the result was merely withheld for
+                    // want of a `rk done`. So it terminalizes here like any
+                    // other live record — the process is gone, nothing will
+                    // resume it — but it must not be marked `crashed`, and its
+                    // withheld turn text must survive: that text is exactly
+                    // what `flush_withheld_completion` is about to publish.
+                    let paused = r.state == AgentState::Paused;
                     // Exit without a Completed event = crash/kill.
                     if r.state.is_live() {
                         r.state = AgentState::Failed;
-                        // The one place that knows the harness never reported a
-                        // verdict for this generation, so no `harness_result`
-                        // exists or ever will. Recorded as data rather than
-                        // left to be inferred from the result string, because a
-                        // workflow `wait`/`evaluate` has to be able to tell a
-                        // rat that produced nothing from one that ran (TKT-147).
-                        r.crashed = true;
-                        let base = format!("process exited (code {code:?}) without completing");
-                        // A starved/misconfigured harness (rate limit, queueing,
-                        // auth refresh, model unavailable) can produce zero
-                        // protocol output and die silently — stderr is the only
-                        // trace of why, so fold its tail into the published
-                        // result rather than leaving this message as the whole
-                        // story wherever `result` is read (inbox, harness_result).
-                        r.result = Some(match r.stderr_snippet() {
-                            Some(snippet) => format!("{base} — stderr: {snippet}"),
-                            None => base,
-                        });
+                        // ...except for a PAUSED record, which is live but not
+                        // mid-turn. Its harness did report; the result was
+                        // merely withheld for want of a `rk done`. It still
+                        // terminalizes (the process is gone, nothing will
+                        // resume it), but the two crash markers below are both
+                        // false for it: a verdict WAS reported, and the
+                        // withheld turn text is exactly what
+                        // `flush_withheld_completion` is about to publish, so
+                        // overwriting `result` here would destroy it.
+                        if !paused {
+                            // The one place that knows the harness never reported a
+                            // verdict for this generation, so no `harness_result`
+                            // exists or ever will. Recorded as data rather than
+                            // left to be inferred from the result string, because a
+                            // workflow `wait`/`evaluate` has to be able to tell a
+                            // rat that produced nothing from one that ran (TKT-147).
+                            r.crashed = true;
+                            let base =
+                                format!("process exited (code {code:?}) without completing");
+                            // A starved/misconfigured harness (rate limit, queueing,
+                            // auth refresh, model unavailable) can produce zero
+                            // protocol output and die silently — stderr is the only
+                            // trace of why, so fold its tail into the published
+                            // result rather than leaving this message as the whole
+                            // story wherever `result` is read (inbox, harness_result).
+                            r.result = Some(match r.stderr_snippet() {
+                                Some(snippet) => format!("{base} — stderr: {snippet}"),
+                                None => base,
+                            });
+                        }
                     }
                     // Consumes the floor even when a `Completed` event already
                     // did (a harmless no-op then), so a budget-killed agent
@@ -1960,6 +2007,35 @@ impl Supervisor {
                     crate::agents::append_stderr_tail(&mut r.stderr_tail, &text);
                 });
             }
+        }
+    }
+
+    /// Lift a [`Paused`](AgentState::Paused) record back to `Running` — the
+    /// harness has produced output again, so the turn it parked on has resumed.
+    ///
+    /// Called for every harness event except `Completed`/`Exited`, which decide
+    /// their own state. Reads before it writes: `Registry::update` persists
+    /// synchronously, and this runs on chatty per-token event paths
+    /// (`AssistantText`, `ToolUse`) that deliberately do not touch the registry
+    /// at all — an unconditional update would turn each of them into a disk
+    /// write.
+    fn resume_if_paused(&self, name: &str) {
+        let paused = self
+            .lock_registry()
+            .get(name)
+            .is_some_and(|r| r.state == AgentState::Paused);
+        if !paused {
+            return;
+        }
+        let updated = self.lock_registry().update(name, |r| {
+            // Re-checked under the write lock: another event may have
+            // terminalized the record between the read above and here.
+            if r.state == AgentState::Paused {
+                r.state = AgentState::Running;
+            }
+        });
+        if matches!(&updated, Ok(Some(r)) if r.state == AgentState::Running) {
+            info!(agent = name, "paused agent resumed");
         }
     }
 

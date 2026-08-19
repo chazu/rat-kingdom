@@ -4433,7 +4433,10 @@ impl Daemon {
             crate::agents::AgentState::Spawning => {
                 crate::onboarding_sessions::OnboardingSessionState::Starting
             }
-            crate::agents::AgentState::Running => {
+            // A paused agent is still a running session: its process is alive
+            // and the next steer resumes it. Reporting it `Completed` here
+            // would close an onboarding session mid-flight.
+            crate::agents::AgentState::Running | crate::agents::AgentState::Paused => {
                 crate::onboarding_sessions::OnboardingSessionState::Running
             }
             crate::agents::AgentState::Completed => {
