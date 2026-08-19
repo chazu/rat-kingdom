@@ -14,6 +14,16 @@ use std::process::Command;
 use std::time::Duration;
 use support::connect;
 
+/// `RK_FAKE_HARNESS_CMD` is process-global (`std::env::set_var`), and cargo
+/// runs this file's `#[tokio::test]`s concurrently within one process by
+/// default. This file got away with that for a long time because its
+/// original two tests both pointed the var at the same `WORKING_FAKE`
+/// script — a second, differently-scripted test (content-free branch,
+/// TKT-01M0C663BZ86SMA2PVMFP5QJ8D) can otherwise have another test's
+/// concurrent `set_var` overwrite its harness mid-spawn, exactly the race
+/// `ticket_done_binding.rs`'s own `HARNESS_ENV_LOCK` guards against.
+static HARNESS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .arg("-C")
@@ -61,6 +71,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"committed 
 
 #[tokio::test]
 async fn spawn_complete_route_dismiss_merge() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
@@ -168,6 +179,7 @@ async fn spawn_complete_route_dismiss_merge() {
 /// straight from `open` to `closed`.
 #[tokio::test]
 async fn ticket_dispatched_rat_closes_its_ticket() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
@@ -230,6 +242,97 @@ async fn ticket_dispatched_rat_closes_its_ticket() {
     assert_eq!(dismissed["merged"], true);
     let t = client.call("ticket.get", json!({"id": id})).await.unwrap();
     assert_eq!(t["ticket"]["payload"]["status"], "closed");
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+/// A fake harness that exits without ever touching the worktree or
+/// declaring itself done — models a rat dispatched onto a ticket whose real
+/// work already landed elsewhere and finds nothing left to do (Emmental-8,
+/// which reported `is_error=true declared_done=false diff_files=0
+/// diff_lines=0`, per TKT-01M0C663BZ86SMA2PVMFP5QJ8D). Not calling `rk_done`
+/// means this also exercises the intended code path in isolation: the
+/// unrelated C3 completion-time gate (`ticket_delivered`,
+/// supervisor.rs:3060) only runs `if !is_error`, so a `rk_done`-calling
+/// (clean) fixture here would mark the ticket `done` at harness-completion
+/// time — before dismiss ever runs — for the same "empty branch reads
+/// merged" reason this ticket's fix targets, but at a different call site
+/// this ticket does not touch.
+const NO_OP_FAKE: &str = r#"
+read -r _prompt
+echo '{"type":"system","subtype":"init","session_id":"fake-noop"}'
+echo '{"type":"result","subtype":"error","is_error":true,"result":"nothing to do","session_id":"fake-noop","total_cost_usd":0.001,"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
+"#;
+
+/// TKT-01M0C663BZ86SMA2PVMFP5QJ8D: `dismiss`'s "a merged ticket-rat closes
+/// its ticket for good" rule must not fire for a rat whose branch carried no
+/// content over its target. A `merge --no-ff` of an already-up-to-date
+/// branch cleanly reports `merged: true` (`advance_via_worktree` moves the
+/// target ref onto its own current commit) even though nothing was actually
+/// delivered — the same shape a duplicate rat's branch has when it is
+/// dispatched onto a ticket whose real work already landed under it, so its
+/// dismiss must not be mistaken for that ticket's delivery.
+#[tokio::test]
+async fn ticket_dispatched_rat_with_content_free_branch_does_not_close_its_ticket() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(NO_OP_FAKE));
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let ticket = client
+        .call(
+            "ticket.new",
+            json!({"title": "already delivered elsewhere", "scope": "svc"}),
+        )
+        .await
+        .unwrap();
+    let id = ticket["ticket"]["identity"].as_str().unwrap().to_string();
+
+    let spawned = client
+        .call(
+            "agent.spawn",
+            json!({
+                "repo": repo_dir.path().to_string_lossy(),
+                "task": id,
+                "harness": "fake",
+            }),
+        )
+        .await
+        .unwrap();
+    let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if client
+            .call("agent.status", json!({"name": name}))
+            .await
+            .unwrap()["agent"]["state"]
+            == "completed"
+        {
+            break;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Dismiss "merges" (the branch is already up to date with its target,
+    // so the merge is a clean no-op that still reports `merged: true`) but
+    // must NOT close the ticket — nothing was actually delivered.
+    let dismissed = client
+        .call("agent.dismiss", json!({"name": name}))
+        .await
+        .unwrap();
+    assert_eq!(dismissed["merged"], true, "detail: {}", dismissed["detail"]);
+    let t = client.call("ticket.get", json!({"id": id})).await.unwrap();
+    assert_eq!(
+        t["ticket"]["payload"]["status"], "open",
+        "a content-free branch merging on dismiss must not read as ticket delivery: {t}"
+    );
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }

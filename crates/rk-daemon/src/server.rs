@@ -3169,6 +3169,41 @@ impl Daemon {
         if in_progress.is_empty() {
             return 0;
         }
+        // Landing-awareness (TKT-01M0C663BZ86SMA2PVMFP5QJ8D): a ticket whose
+        // branch already landed must never be reopened just because its rat
+        // went terminal without being dismissed — the async
+        // steward-review flow leaves exactly that gap (O14: the harness's
+        // own `rk done` finds the branch not yet merged and refuses to close
+        // the ticket, so it sits `in_progress` until this sweep or a real
+        // dismiss touches it). Reopening it dispatches a duplicate rat onto
+        // already-delivered work, and that duplicate's own zero-diff dismiss
+        // can then coincidentally close the ticket for the wrong reason
+        // (`Self::maybe_close_ticket_on_dismiss`). `landing_processed` is
+        // keyed by `(repo, branch, head_sha)` — the wrong shape for "does
+        // this ticket have a landed outcome" — so read `payload.task`
+        // instead, which the reactor's landing-trigger dispatch (`reactor.rs`)
+        // populates from the completing rat's own `task` (== ticket id by
+        // fleet convention). One unscoped scan up front, not one probe per
+        // ticket: `landing_processed` is a `Furniture` event with no
+        // per-ticket index, same tradeoff `build()`'s `branch_landed` scan
+        // already makes for `rk inbox`.
+        let landed_tickets: std::collections::HashSet<String> = self
+            .space
+            .scan(
+                &Pattern::category(Category::Event)
+                    .identity(crate::landing::LANDING_PROCESSED_IDENTITY),
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.payload.get("outcome").and_then(Value::as_str) == Some("landed"))
+            .filter_map(|t| {
+                t.payload
+                    .get("task")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|task| !task.is_empty())
+            .collect();
         let sinks = crate::reactor::sink_factory().registry(
             self.notify_config
                 .resolved(self.reactor_config.notify_escalations),
@@ -3176,6 +3211,12 @@ impl Daemon {
         let announcer = crate::recovery::RecoveryAnnouncer::new();
         let mut reopened = 0usize;
         for ticket in in_progress {
+            if landed_tickets.contains(&ticket.identity) {
+                // Already delivered — leave it `in_progress` for a real
+                // dismiss (or the fuller landing-driven ticket transition,
+                // E1/E2) to close, rather than reopening onto a duplicate.
+                continue;
+            }
             let assignee = ticket
                 .payload
                 .get("assignee")
@@ -8255,5 +8296,74 @@ mod ticket_reopen_sweep_tests {
         assert!(!performed);
         let ticket = daemon.tickets.get(&id).unwrap().unwrap();
         assert_eq!(ticket.payload["status"], json!("done"));
+    }
+
+    /// TKT-01M0C663BZ86SMA2PVMFP5QJ8D: the O14 gap left by the async
+    /// steward-review flow — `rk done` finds the branch not yet merged and
+    /// refuses to close the ticket (the C3 delivery-mode gate), so the
+    /// ticket sits `in_progress` with its rat gone terminal. The sweep must
+    /// not treat that as ownerless-and-abandoned when a `landing_processed`
+    /// event proves the branch landed after the rat went terminal —
+    /// reopening it dispatches a duplicate rat onto already-delivered work.
+    #[tokio::test]
+    async fn a_ticket_whose_branch_already_landed_is_not_reopened() {
+        let (_dir, daemon) = daemon_with_agent("Clover-Alike", AgentState::Completed);
+        let id = in_progress_ticket(&daemon, Some("Clover-Alike")).await;
+
+        let landed = Tuple::new(
+            Category::Event,
+            "some-repo".to_string(),
+            "landing_processed".to_string(),
+            "daemon".to_string(),
+            json!({
+                "branch": "rat/clover-alike/tkt",
+                "target": "main",
+                "head_sha": "ccad32f",
+                "task": id,
+                "outcome": "landed",
+            }),
+        )
+        .with_lifecycle(Lifecycle::Furniture);
+        daemon.space.out(landed).unwrap();
+
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(2);
+        let reopened = daemon.ticket_reopen_sweep_at(far_future).await;
+
+        assert_eq!(reopened, 0);
+        let ticket = daemon.tickets.get(&id).unwrap().unwrap();
+        assert_eq!(ticket.payload["status"], json!("in_progress"));
+    }
+
+    /// A ticket whose only `landing_processed` marker recorded a NON-landed
+    /// terminal outcome (gate-held, rework-filed, escalated) must still
+    /// reopen normally — landing-awareness is specifically about a landed
+    /// branch, not about "this ticket's work key was ever processed".
+    #[tokio::test]
+    async fn a_ticket_with_a_non_landed_processing_marker_still_reopens() {
+        let (_dir, daemon) = daemon_with_agent("GateHeld-1", AgentState::Failed);
+        let id = in_progress_ticket(&daemon, Some("GateHeld-1")).await;
+
+        let held = Tuple::new(
+            Category::Event,
+            "some-repo".to_string(),
+            "landing_processed".to_string(),
+            "daemon".to_string(),
+            json!({
+                "branch": "rat/gateheld-1/tkt",
+                "target": "main",
+                "head_sha": "deadbee",
+                "task": id,
+                "outcome": "gate-held",
+            }),
+        )
+        .with_lifecycle(Lifecycle::Furniture);
+        daemon.space.out(held).unwrap();
+
+        let past_window = chrono::Utc::now() + chrono::Duration::minutes(20);
+        let reopened = daemon.ticket_reopen_sweep_at(past_window).await;
+
+        assert_eq!(reopened, 1);
+        let ticket = daemon.tickets.get(&id).unwrap().unwrap();
+        assert_eq!(ticket.payload["status"], json!("open"));
     }
 }
