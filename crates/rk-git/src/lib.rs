@@ -2139,7 +2139,13 @@ mod tests {
         let clone = dir.path().join("forge-clone");
         run(
             dir.path(),
-            &["clone", &bare.to_string_lossy(), &clone.to_string_lossy()],
+            &[
+                "clone",
+                "--branch",
+                "main",
+                &bare.to_string_lossy(),
+                &clone.to_string_lossy(),
+            ],
         );
         run(&clone, &["config", "user.email", "forge@example.com"]);
         run(&clone, &["config", "user.name", "Forge"]);

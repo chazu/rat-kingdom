@@ -28,18 +28,35 @@ fn make_executable(path: &Path) {
 }
 
 fn run(rk: &Path, home: &Path, source: &Path, args: &[&str]) -> Output {
-    Command::new(rk)
-        .args(args)
-        .env("HOME", home)
-        .env("RK_MCP_SOURCE", source)
-        .env_remove("RK_HOME")
-        .env_remove("RK_AGENT")
-        .env_remove("RK_AUTH_TOKEN")
-        .env_remove("RK_TASK")
-        .env_remove("RK_REPO")
-        .env_remove("RK_ROLE")
-        .output()
-        .unwrap()
+    let mut last_busy = None;
+    for _ in 0..50 {
+        let result = Command::new(rk)
+            .args(args)
+            .env("HOME", home)
+            .env("RK_MCP_SOURCE", source)
+            .env_remove("RK_HOME")
+            .env_remove("RK_AGENT")
+            .env_remove("RK_AUTH_TOKEN")
+            .env_remove("RK_TASK")
+            .env_remove("RK_REPO")
+            .env_remove("RK_ROLE")
+            .output();
+        match result {
+            Ok(output) => return output,
+            // Linux may briefly reject an executable immediately after this
+            // fixture copies it. Retry only that platform-level condition.
+            Err(error) if error.raw_os_error() == Some(26) => {
+                last_busy = Some(error);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("failed to run {}: {error}", rk.display()),
+        }
+    }
+    panic!(
+        "{} remained busy after fixture copy: {}",
+        rk.display(),
+        last_busy.unwrap()
+    )
 }
 
 fn json_output(output: &Output) -> Value {

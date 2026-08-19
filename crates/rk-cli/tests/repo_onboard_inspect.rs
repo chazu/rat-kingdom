@@ -29,12 +29,7 @@ fn repository() -> tempfile::TempDir {
     git(dir.path(), &["config", "user.name", "Test"]);
     std::fs::write(
         dir.path().join("README.md"),
-        "# Fixture\n\nVerify with `mise run verify`.\n\n```sh\nmise run verify\n```\n",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.path().join("mise.toml"),
-        "[tasks.verify]\nrun = \"cargo test\"\n",
+        "# Fixture\n\nVerify with `cargo test`.\n\n```sh\ncargo test\n```\n",
     )
     .unwrap();
     git(dir.path(), &["add", "."]);

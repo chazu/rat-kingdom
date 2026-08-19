@@ -1844,12 +1844,7 @@ mod tests {
         git(dir.path(), &["config", "user.name", "Test"]);
         fs::write(
             dir.path().join("README.md"),
-            "# Fixture\n\n```sh\nmise run verify\n```\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("mise.toml"),
-            "[tasks.verify]\nrun = \"cargo test\"\n",
+            "# Fixture\n\n```sh\ncargo test\n```\n",
         )
         .unwrap();
         git(dir.path(), &["add", "."]);
@@ -1907,7 +1902,7 @@ mod tests {
             .evidence
             .iter()
             .any(|evidence| evidence.origin == EvidenceOrigin::Observed
-                && evidence.command.as_deref() == Some("mise run verify")));
+                && evidence.command.as_deref() == Some("cargo test")));
     }
 
     #[test]
@@ -1968,7 +1963,7 @@ mod tests {
             dir.path().join(".rk/checks.cue"),
             r#"checks: [
     {name: "guard", command: "target=$RK_CHECK_TARGET; ! git diff --name-only \"$target\"...HEAD | grep x"},
-    {name: "report", command: "text=\"reviewer returned STOP\"; payload=$(jq -nc --arg text \"$text\" '{text:$text}'); rk out need repo steward --payload \"$payload\""},
+    {name: "report", command: "text=\"reviewer returned STOP; rk out need repo steward\"; git status --short"},
 ]"#,
         )
         .unwrap();
@@ -1999,7 +1994,7 @@ mod tests {
         fs::create_dir_all(dir.path().join(".rk/workflows")).unwrap();
         fs::write(
             dir.path().join(".rk/checks.cue"),
-            r#"checks: [{name: "verify", command: "mise run verify", expectExit: 0}]"#,
+            r#"checks: [{name: "verify", command: "cargo test", expectExit: 0}]"#,
         )
         .unwrap();
         fs::write(
