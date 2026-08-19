@@ -829,12 +829,20 @@ nothing, so confirming it's gone is not optional.
 ```bash
 rk trigger install examples/triggers-landing-pipeline.cue
 rk trigger drift --repo .          # flags a deployed copy no current source backs
+rk trigger conflicts --repo .      # flags active triggers sharing one match predicate
 ```
 
 `rk trigger install --repo <repo>` always targets `<repo>/.rk/triggers.cue`
 regardless of the source file's own name — the reactor only ever reads that
 one fixed repo-local path (`Reactor::trigger_files`), never a directory of
 many, unlike the global `~/.rat-kingdom/triggers/` deployment.
+
+`rk trigger conflicts` catches a hazard `drift` cannot: two *active* trigger
+definitions (global directory plus this repo's `.rk/triggers.cue`) that
+share an identical `match` predicate, so both fire on every matching tuple —
+double-dispatching even when each deployed file is individually "clean" per
+`drift`'s digest check (e.g. a retired trigger left deployed alongside its
+replacement, both matching the same `harness_result` predicate).
 
 Configure in `config.toml`:
 

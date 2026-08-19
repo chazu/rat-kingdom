@@ -144,6 +144,78 @@ pub fn drift(layout: &Layout, repo: &str, source_dir: Option<&str>) -> Result<Dr
     Ok(DriftReport { rows, drifted })
 }
 
+#[derive(Debug, Serialize)]
+pub struct ConflictEntry {
+    pub name: String,
+    pub file: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConflictGroup {
+    #[serde(rename = "match")]
+    pub matcher: rk_workflow::TriggerMatch,
+    pub triggers: Vec<ConflictEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConflictsReport {
+    pub groups: Vec<ConflictGroup>,
+}
+
+/// Flag every group of >1 active trigger sharing an identical `match`
+/// predicate. `drift` only tells you a deployed file matches its source; it
+/// says nothing about whether a *sibling* deployed file's predicate collides
+/// with it. Two triggers matching the same tuple both fire in full on every
+/// match, double-dispatching — the hazard named by
+/// docs/proposals/daemon-native-landing-pipeline.md §6.2 step 3 (e.g. the
+/// retired `steward-on-completion` left deployed alongside its replacement
+/// `steward-landing-on-completion`, both matching the identical
+/// `harness_result` predicate).
+///
+/// Scans the same active set the reactor itself dispatches from
+/// (`Reactor::trigger_files`): every global `~/.rat-kingdom/triggers/*.cue`
+/// file plus this one repo's `.rk/triggers.cue`, if present.
+pub fn conflicts(layout: &Layout, repo: &str) -> Result<ConflictsReport> {
+    let repo = PathBuf::from(repo)
+        .canonicalize()
+        .with_context(|| format!("cannot read repository {repo}"))?;
+
+    let mut files = rk_workflow::definitions(&layout.triggers_dir());
+    let repo_local = repo.join(".rk").join(REPO_LOCAL_FILENAME);
+    if repo_local.exists() {
+        files.push(repo_local);
+    }
+
+    let mut groups: Vec<ConflictGroup> = Vec::new();
+    for file in &files {
+        let triggers = rk_workflow::load_triggers(file)
+            .with_context(|| format!("parse {}", file.display()))?;
+        for trigger in triggers {
+            let entry = ConflictEntry {
+                name: trigger.name,
+                file: file.display().to_string(),
+            };
+            match groups
+                .iter_mut()
+                .find(|group| group.matcher == trigger.matcher)
+            {
+                Some(group) => group.triggers.push(entry),
+                None => groups.push(ConflictGroup {
+                    matcher: trigger.matcher,
+                    triggers: vec![entry],
+                }),
+            }
+        }
+    }
+
+    groups.retain(|group| group.triggers.len() > 1);
+    for group in &mut groups {
+        group.triggers.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    groups.sort_by(|a, b| a.triggers[0].name.cmp(&b.triggers[0].name));
+    Ok(ConflictsReport { groups })
+}
+
 fn drift_row(label: &str, target: &Path, source: Option<&PathBuf>) -> DriftRow {
     let target_digest = match digest(target) {
         Ok(d) => d,
@@ -306,5 +378,77 @@ mod tests {
         let report = drift(&layout, repo.path().to_str().unwrap(), None).unwrap();
         assert_eq!(report.drifted, 1);
         assert!(report.rows.iter().any(|row| row.status == "missing"));
+    }
+
+    #[test]
+    fn conflicts_flags_global_and_repo_local_triggers_sharing_a_predicate() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        fs::create_dir_all(layout.triggers_dir()).unwrap();
+        // The exact double-dispatch hazard this closes: a retired trigger
+        // left deployed globally alongside its repo-local replacement,
+        // both matching the identical harness_result predicate.
+        fs::write(
+            layout.triggers_dir().join("steward-on-completion.cue"),
+            "triggers: [{name: \"steward-on-completion\", match: {category: \"event\", identity: \"harness_result\"}, run: \"steward\"}]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(repo.path().join(".rk")).unwrap();
+        fs::write(
+            repo.path().join(".rk").join("triggers.cue"),
+            "triggers: [{name: \"steward-landing-on-completion\", match: {category: \"event\", identity: \"harness_result\"}, action: \"land\"}]\n",
+        )
+        .unwrap();
+
+        let report = conflicts(&layout, repo.path().to_str().unwrap()).unwrap();
+        assert_eq!(report.groups.len(), 1);
+        let names: Vec<&str> = report.groups[0]
+            .triggers
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["steward-landing-on-completion", "steward-on-completion"]
+        );
+    }
+
+    #[test]
+    fn conflicts_is_clean_when_predicates_differ() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        fs::create_dir_all(layout.triggers_dir()).unwrap();
+        fs::write(
+            layout.triggers_dir().join("a.cue"),
+            "triggers: [{name: \"a\", match: {category: \"event\", identity: \"one\"}, run: \"a-wf\"}]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(repo.path().join(".rk")).unwrap();
+        fs::write(
+            repo.path().join(".rk").join("triggers.cue"),
+            "triggers: [{name: \"b\", match: {category: \"event\", identity: \"two\"}, run: \"b-wf\"}]\n",
+        )
+        .unwrap();
+
+        let report = conflicts(&layout, repo.path().to_str().unwrap()).unwrap();
+        assert!(report.groups.is_empty());
+    }
+
+    #[test]
+    fn conflicts_ignores_repo_with_no_local_trigger_file() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        fs::create_dir_all(layout.triggers_dir()).unwrap();
+        fs::write(
+            layout.triggers_dir().join("a.cue"),
+            "triggers: [{name: \"a\", match: {category: \"event\", identity: \"one\"}, run: \"a-wf\"}]\n",
+        )
+        .unwrap();
+
+        let report = conflicts(&layout, repo.path().to_str().unwrap()).unwrap();
+        assert!(report.groups.is_empty());
     }
 }

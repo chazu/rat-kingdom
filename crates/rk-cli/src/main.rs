@@ -578,6 +578,14 @@ enum TriggerCommand {
         #[arg(long)]
         source_dir: Option<String>,
     },
+    /// Flag active triggers (global directory plus this repo's
+    /// `.rk/triggers.cue`) whose `match` predicates are identical — two such
+    /// triggers double-dispatch on every matching tuple, even when each
+    /// deployed file is individually "clean" per `drift`.
+    Conflicts {
+        #[arg(long, default_value = ".")]
+        repo: String,
+    },
 }
 
 #[derive(Args)]
@@ -1276,6 +1284,28 @@ async fn main() -> Result<()> {
                 }
                 if report.drifted > 0 {
                     anyhow::bail!("trigger definitions are not synchronized");
+                }
+            }
+            TriggerCommand::Conflicts { repo } => {
+                let report = trigger_cmds::conflicts(&layout, &repo)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string(&report)?);
+                } else if report.groups.is_empty() {
+                    println!("trigger conflicts: none");
+                } else {
+                    for group in &report.groups {
+                        println!("{}", serde_json::to_string(&group.matcher)?);
+                        for trigger in &group.triggers {
+                            println!("  {:<40} {}", trigger.name, trigger.file);
+                        }
+                    }
+                    println!(
+                        "trigger conflicts: {} predicate(s) shared by more than one trigger",
+                        report.groups.len()
+                    );
+                }
+                if !report.groups.is_empty() {
+                    anyhow::bail!("multiple triggers share an identical match predicate");
                 }
             }
         },

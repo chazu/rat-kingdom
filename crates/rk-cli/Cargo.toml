@@ -15,6 +15,7 @@ path = "src/main.rs"
 rk-core.workspace = true
 rk-daemon.workspace = true
 rk-mux.workspace = true
+rk-workflow.workspace = true
 
 anyhow.workspace = true
 futures.workspace = true
