@@ -261,6 +261,76 @@ mod tests {
         );
     }
 
+    /// Simulates the leak this exists to close: an ungraceful runtime
+    /// teardown (daemon shutdown, aborted supervisor task, or — as here — a
+    /// test process's own runtime dropping) with the harness child's session
+    /// still live and never explicitly killed. `kill_on_drop` alone only
+    /// reaches the `bash -c` wrapper's own pid; a grandchild it backgrounds
+    /// is untouched unless the whole process group is signalled, which is
+    /// what `runner::ProcessGroupGuard` now guarantees on every drop path.
+    #[test]
+    fn dropped_session_kills_the_whole_process_group_not_just_the_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "RK_FAKE_HARNESS_CMD".to_string(),
+            format!("sleep 600 & echo $! > {}; wait", shell_escape(&pid_file)),
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let _session = FakeHarness
+                .launch(&LaunchSpec {
+                    cwd: dir.path().to_path_buf(),
+                    env,
+                    ..Default::default()
+                })
+                .unwrap();
+            // Give the fake harness a moment to background the grandchild and
+            // write its pid, then let this scope end — `_session` drops here,
+            // but the task inside `runner::launch` that actually owns `child`
+            // is detached (its JoinHandle was discarded), so this alone does
+            // NOT reproduce the leak; the runtime drop below does.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !pid_file.exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "grandchild pid file never appeared"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        // Deliberately no `session.control.kill()`/`interrupt()` call: this
+        // must exercise the implicit drop path, not the explicit signal path.
+        // Dropping the runtime forcibly drops every task still running on
+        // it, including the detached task that owns `child`.
+        drop(runtime);
+        // Give the group-kill signal a moment to land and the OS to actually
+        // reap the process, not just mark it a zombie still visible to
+        // `kill(pid, 0)`.
+        std::thread::sleep(Duration::from_millis(300));
+
+        let pid_text = std::fs::read_to_string(&pid_file).unwrap();
+        let grandchild_pid: i32 = pid_text.trim().parse().unwrap();
+        assert!(
+            !process_is_alive(grandchild_pid),
+            "grandchild `sleep` survived runtime teardown"
+        );
+    }
+
+    /// SAFETY: signal 0 only probes liveness/permission; it affects nothing.
+    fn process_is_alive(pid: i32) -> bool {
+        extern "C" {
+            #[link_name = "kill"]
+            fn libc_kill(pid: i32, sig: i32) -> i32;
+        }
+        unsafe { libc_kill(pid, 0) == 0 }
+    }
+
     /// Minimal single-quoting for embedding a path in the fake harness's bash
     /// one-liner (paths here are always `tempfile::tempdir()` output).
     fn shell_escape(path: &std::path::Path) -> String {
