@@ -148,9 +148,9 @@ pub struct AgentRecord {
     #[serde(default)]
     pub attach_target: Option<String>,
     pub pid: Option<u32>,
-    /// Merge commit a Direct-mode dismiss landed on the target — the anchor
-    /// `rk revert` revert-merges. Cleared once reverted, so a second revert
-    /// errors instead of reverting the revert.
+    /// Merge commit the landing pipeline recorded for this agent's branch —
+    /// the anchor `rk revert` revert-merges. Cleared once reverted, so a
+    /// second revert errors instead of reverting the revert.
     #[serde(default)]
     pub merge_commit: Option<String>,
     pub state: AgentState,

@@ -7,6 +7,36 @@ use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use std::time::Duration;
 
+/// Install the stack-neutral named checks every gated landing test repo must
+/// explicitly own. The commands are intentionally trivial: individual tests
+/// exercise workflow behavior, while this registry proves the landing queue
+/// resolved policy by name instead of inventing a raw command fallback.
+#[allow(dead_code)]
+pub fn install_passing_landing_checks(repo: &std::path::Path) {
+    let rk_dir = repo.join(".rk");
+    std::fs::create_dir_all(&rk_dir).unwrap();
+    std::fs::write(
+        rk_dir.join("checks.cue"),
+        r#"checks: [
+    {name: "steward-protected-paths", command: "true", timeout: "30s"},
+    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "verify", command: "true", timeout: "30s"},
+]
+"#,
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    };
+    run(&["add", ".rk/checks.cue"]);
+    run(&["commit", "-m", "test: register landing checks"]);
+}
+
 /// Poll for a daemon at `layout` to come up and connect as operator.
 ///
 /// Was previously copy-pasted into ~40 test files with varying retry budgets

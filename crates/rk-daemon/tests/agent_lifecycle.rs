@@ -55,6 +55,7 @@ fn scratch_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_passing_landing_checks(dir);
 }
 
 /// Fake harness script: does real git work in its cwd (the worktree), then
@@ -155,12 +156,24 @@ async fn spawn_complete_route_dismiss_merge() {
     assert_eq!(parent_msg["tuples"][0]["payload"]["child"], name);
     assert_eq!(parent_msg["tuples"][0]["payload"]["is_error"], false);
 
-    // Dismiss merges the rat's branch into main.
+    // Dismiss only stops and cleans up; landing is a separate gated action.
     let dismissed = client
         .call("agent.dismiss", json!({"name": name}))
         .await
         .unwrap();
-    assert_eq!(dismissed["merged"], true, "detail: {}", dismissed["detail"]);
+    assert_eq!(
+        dismissed["merged"], false,
+        "detail: {}",
+        dismissed["detail"]
+    );
+    let landed = client
+        .call(
+            "repo.land",
+            json!({"repo": repo_dir.path(), "branch": branch, "target": "main"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(landed["merged"], true, "detail: {}", landed["detail"]);
 
     let files = git_out(repo_dir.path(), &["ls-tree", "--name-only", "main"]);
     assert!(files.contains("gnawed.txt"), "main has the rat's work");
@@ -212,6 +225,7 @@ async fn ticket_dispatched_rat_closes_its_ticket() {
         .await
         .unwrap();
     let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+    let branch = spawned["agent"]["branch"].as_str().unwrap().to_string();
 
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -233,18 +247,25 @@ async fn ticket_dispatched_rat_closes_its_ticket() {
         "a clean completion must not mark a merge-mode ticket done before its branch merges"
     );
 
-    // Dismiss with merge closes it for good — straight from `open`, never
-    // having passed through `done`.
+    // Dismiss preserves it; the separate gated landing closes it for good.
     let dismissed = client
         .call("agent.dismiss", json!({"name": name}))
         .await
         .unwrap();
-    assert_eq!(dismissed["merged"], true);
+    assert_eq!(dismissed["merged"], false);
+    let landed = client
+        .call(
+            "repo.land",
+            json!({"repo": repo_dir.path(), "branch": branch, "target": "main"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(landed["merged"], true);
     let t = client.call("ticket.get", json!({"id": id})).await.unwrap();
     assert_eq!(t["ticket"]["payload"]["status"], "closed");
     assert_eq!(
-        t["ticket"]["payload"]["delivery"]["merge_commit"], dismissed["merge_commit"],
-        "dismiss writes the same durable delivery proof as the landing pipeline"
+        t["ticket"]["payload"]["delivery"]["merge_commit"], landed["merge_commit"],
+        "the landing pipeline writes the durable delivery proof"
     );
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
@@ -331,7 +352,11 @@ async fn ticket_dispatched_rat_with_content_free_branch_does_not_close_its_ticke
         .call("agent.dismiss", json!({"name": name}))
         .await
         .unwrap();
-    assert_eq!(dismissed["merged"], true, "detail: {}", dismissed["detail"]);
+    assert_eq!(
+        dismissed["merged"], false,
+        "detail: {}",
+        dismissed["detail"]
+    );
     let t = client.call("ticket.get", json!({"id": id})).await.unwrap();
     assert_eq!(
         t["ticket"]["payload"]["status"], "open",
@@ -435,7 +460,11 @@ async fn ticket_with_a_queued_landing_entry_is_not_closed_on_dismiss() {
         .call("agent.dismiss", json!({"name": name}))
         .await
         .unwrap();
-    assert_eq!(dismissed["merged"], true, "detail: {}", dismissed["detail"]);
+    assert_eq!(
+        dismissed["merged"], false,
+        "detail: {}",
+        dismissed["detail"]
+    );
     let t = client.call("ticket.get", json!({"id": id})).await.unwrap();
     assert_eq!(
         t["ticket"]["payload"]["status"], "open",

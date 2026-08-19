@@ -747,6 +747,47 @@ impl Repo {
         }))
     }
 
+    /// Build several source branches onto one pinned target tip, producing a
+    /// single parked candidate for one shared gate run. Branch order is
+    /// caller-defined and therefore deterministic. A conflict abandons the
+    /// whole candidate; callers may bisect the ordered slice and retry.
+    pub fn prepare_merge_batch(
+        &self,
+        branches: &[String],
+        target: &str,
+    ) -> rk_core::Result<PrepareOutcome> {
+        if branches.is_empty() {
+            return Err(rk_core::Error::other("cannot prepare an empty merge batch"));
+        }
+        for branch in branches {
+            self.validate_local_branch(branch, "merge source")?;
+        }
+        self.validate_local_branch(target, "merge target")?;
+        let base = self.rev_parse(&format!("refs/heads/{target}"))?;
+        let built = self.in_temp_worktree(&base, |tmp| {
+            for branch in branches {
+                let message = format!("merge {branch} into {target} [rk batch]");
+                if let Err(error) = git_in(tmp, &["merge", "--no-ff", "-m", &message, branch]) {
+                    return Ok(Err(format!(
+                        "merge conflict or failure in {branch}: {error}"
+                    )));
+                }
+            }
+            Ok(Ok(git_in(tmp, &["rev-parse", "HEAD"])?.trim().to_string()))
+        })?;
+        let commit = match built {
+            Ok(commit) => commit,
+            Err(detail) => return Ok(PrepareOutcome::Conflict { detail }),
+        };
+        let candidate_ref = format!("{CANDIDATE_REF_PREFIX}{commit}");
+        self.git(&["update-ref", &candidate_ref, &commit])?;
+        Ok(PrepareOutcome::Prepared(PreparedMerge {
+            commit,
+            base,
+            candidate_ref,
+        }))
+    }
+
     /// Compare-and-swap `target` onto an already-built commit: advance the ref
     /// to `commit` **iff** it still points at `expected`.
     ///
@@ -821,6 +862,16 @@ impl Repo {
         }
         let _ = self.git(&["update-ref", "-d", candidate_ref]);
         Ok(())
+    }
+
+    pub fn candidate_refs(&self) -> rk_core::Result<Vec<String>> {
+        let output = self.git(&["for-each-ref", "--format=%(refname)", CANDIDATE_REF_PREFIX])?;
+        Ok(output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 
     /// Push `branch` to `remote`, setting upstream (`-u`). Returns git's
@@ -1246,7 +1297,11 @@ mod tests {
         let wt = dir.join(format!("wt-{agent}"));
         let branch = agent_branch(agent, task);
         repo.create_worktree(&wt, &branch, "main").unwrap();
-        std::fs::write(wt.join("feature.txt"), "cheese\n").unwrap();
+        // Keep independently-created fixture commits distinct even when git
+        // assigns them the same second-level timestamp. Otherwise two sibling
+        // branches can receive the same commit SHA and make ancestry tests
+        // report that landing one also landed the other.
+        std::fs::write(wt.join(format!("feature-{agent}-{task}.txt")), "cheese\n").unwrap();
         run(&wt, &["add", "."]);
         run(&wt, &["commit", "-m", "add feature"]);
         branch
@@ -1291,7 +1346,10 @@ mod tests {
         let gate_saw = repo
             .git(&["ls-tree", "-r", "--name-only", &tested])
             .unwrap();
-        assert!(gate_saw.contains("feature.txt"), "gate saw: {gate_saw}");
+        assert!(
+            gate_saw.contains("feature-thistle-cas.txt"),
+            "gate saw: {gate_saw}"
+        );
         assert!(gate_saw.contains("README.md"), "gate saw: {gate_saw}");
 
         let outcome = repo

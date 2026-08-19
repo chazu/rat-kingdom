@@ -41,7 +41,7 @@ plus the reviewer-death family):
   sweep reclaims its ticket, a duplicate rat is dispatched. Same shape
   kills reviews outright: the review workflow sees `is_error: true` for a
   reviewer that was doing exactly the right thing.
-- The reopen sweep and the dismiss-time ticket-closer are **landing
+- The reopen sweep and the legacy dismiss-time ticket-closer are **landing
   blind**: they read agent liveness, not landing-queue membership, so
   every ticket whose branch queues longer than the window recycles.
 - An **empty branch reads as "merged"** — surfacing four separate times
@@ -63,11 +63,10 @@ plus the reviewer-death family):
   answered from that record, not from live branch refs (branches are
   deleted on land) — and never from branch *existence*.
 - **Commit-count awareness** in every delivery predicate: an empty
-  branch is not a delivery, for landing, respawn suppression, done-gating,
-  or dismissal closure.
-- **Landing-aware sweeps**: reopen and dismiss-close consult the landing
-  queue; a ticket with a queued branch is never reopened or auto-closed
-  by a duplicate.
+  branch is not a delivery, for landing, respawn suppression, or done-gating.
+- **Landing-aware sweep and lifecycle split**: reopen consults the landing
+  queue, while dismissal never closes tickets or delivers branches; a ticket
+  with queued work is never reopened or auto-closed by a duplicate.
 - **Reviewer liveness**: a reviewer that pauses is not a failure; a
   reviewer that exits without a verdict escalates as a distinct,
   retryable outcome rather than a dead-end hold.
@@ -89,8 +88,8 @@ held thirteen branches.
 
 - New CAS primitive advancing a target to a *pre-tested* commit; hard
   invariant that landed SHA == tested SHA.
-- All merge-mode landings (including dismiss-time merges and operator
-  landings) go through the one queue. Operators get a fast lane, never a
+- All merge-mode landings (automatic, workflow, and operator submissions) go
+  through the one queue. Operators get a fast lane, never a
   bypass.
 - Batch several queued branches into one gate run; bisect on failure.
   This is the throughput answer (mu is postponed).
@@ -98,6 +97,15 @@ held thirteen branches.
   terminal hold on a green branch.
 - In-flight gate runs survive daemon rollover (or are re-enqueued on
   startup) instead of being recorded as failures.
+
+Implemented 2026-08-19: merge candidates are parked durably with their tested
+SHA/base/ref; compatible bursts batch up to eight branches and recursively
+bisect on failure; stale CAS results are announced and requeued at the tail;
+startup sweeps orphaned candidate refs. `dismiss` is now lifecycle-only and
+preserves its branch. Workflow `dismiss`/`dismiss_all` retain their explicit
+delivery intent by composing cleanup with a separate queue submission. The
+operator command is `rk land`; its `--force --reason` escape hatch is audited
+and inbox-visible. Missing named checks produce a durable `no-gate` hold.
 
 *Stack neutrality: the gate runs the repo's **named** canonical check
 list from its policy. rat-kingdom's list (build/test/clippy/fmt) is

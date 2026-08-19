@@ -120,6 +120,7 @@ async fn dismiss_all_only_clean_merges_clean_parks_failed() {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_passing_landing_checks(repo_dir.path());
 
     let repo_name = repo_dir
         .path()
@@ -239,6 +240,7 @@ async fn dismiss_all_merges_every_fanout_branch() {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_passing_landing_checks(repo_dir.path());
 
     let repo_name = repo_dir
         .path()

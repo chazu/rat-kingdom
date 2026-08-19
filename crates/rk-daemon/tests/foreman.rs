@@ -1,6 +1,7 @@
 //! End-to-end foreman flow: a workflow spawns a foreman, the foreman spawns a
-//! worker, receives the daemon-routed completion message, dismisses the worker
-//! into its integration branch, and the workflow lands that branch on main.
+//! worker, receives the daemon-routed completion message, and dismisses it.
+//! Dismissal preserves the child's branch; it cannot smuggle un-gated child
+//! work into the foreman's later landing.
 
 mod fixture;
 
@@ -35,6 +36,7 @@ fn scratch_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_passing_landing_checks(dir);
 }
 
 const WORKFLOW: &str = r#"
@@ -144,7 +146,10 @@ fi
         .output()
         .unwrap();
     let files = String::from_utf8_lossy(&files.stdout);
-    assert!(files.lines().any(|line| line == "child.txt"));
+    assert!(
+        !files.lines().any(|line| line == "child.txt"),
+        "dismissed child work must not bypass the landing queue"
+    );
 
     let agents = client
         .call("agent.list", json!({"include_archived": true}))
@@ -159,6 +164,21 @@ fi
         .iter()
         .find(|row| row["task"] == "child-task")
         .unwrap_or_else(|| panic!("worker record not found in {agents}"));
+    let worker_branch = worker["branch"].as_str().unwrap();
+    let branch_exists = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir.path())
+        .args([
+            "show-ref",
+            "--verify",
+            &format!("refs/heads/{worker_branch}"),
+        ])
+        .status()
+        .unwrap();
+    assert!(
+        branch_exists.success(),
+        "dismissed child branch must survive"
+    );
     assert_eq!(worker["parent"], foreman["name"]);
     assert_eq!(worker["workflow_instance"], instance);
 

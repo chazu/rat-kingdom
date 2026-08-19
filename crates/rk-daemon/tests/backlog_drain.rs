@@ -73,6 +73,7 @@ async fn backlog_drain_fans_out_and_joins() {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_passing_landing_checks(repo_dir.path());
 
     // Tickets are scoped by repo *name* — the worktree dir basename, which is
     // what the fan-out query resolves the repo path to.

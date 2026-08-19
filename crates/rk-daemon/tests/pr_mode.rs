@@ -1,5 +1,5 @@
-//! TKT-65: PR-mode dismiss. A repo registered with `merge_mode = pr` must,
-//! on dismiss, push the rat's branch and open a pull request against the base
+//! TKT-65: PR-mode landing. A repo registered with `merge_mode = pr` must,
+//! on explicit land, push the rat's branch and open a pull request against the base
 //! rather than merging it — leaving the branch standing for review, reporting
 //! `{merged: false, pr_opened: true}`, and never touching the base branch.
 //!
@@ -130,9 +130,19 @@ async fn pr_mode_dismiss_opens_pr_and_keeps_branch() {
     }
     assert!(done, "rat {name} never completed");
 
-    // Dismiss: PR mode pushes + opens a PR, never merges or deletes the branch.
-    let res = client
+    let dismissed = client
         .call("agent.dismiss", json!({"name": name}))
+        .await
+        .unwrap();
+    assert_eq!(
+        dismissed["pr_opened"], false,
+        "dismiss never delivers: {dismissed}"
+    );
+    let res = client
+        .call(
+            "repo.land",
+            json!({"repo": repo_path, "branch": &branch, "target": "main"}),
+        )
         .await
         .unwrap();
     assert_eq!(res["merged"], false, "PR mode must not merge: {res}");
@@ -282,7 +292,7 @@ async fn review_sweep_clears_awaiting_review_on_forge_merge_without_a_pull() {
         .await
         .unwrap();
 
-    // Spawn a rat, wait for its commit, dismiss to open the PR (branch pushed).
+    // Spawn a rat, wait for its commit, dismiss, then explicitly open the PR.
     let spawned = client
         .call(
             "agent.spawn",
@@ -305,8 +315,16 @@ async fn review_sweep_clears_awaiting_review_on_forge_merge_without_a_pull() {
         }
     }
     assert!(done, "rat {name} never completed");
-    let res = client
+    let dismissed = client
         .call("agent.dismiss", json!({"name": name}))
+        .await
+        .unwrap();
+    assert_eq!(dismissed["pr_opened"], false);
+    let res = client
+        .call(
+            "repo.land",
+            json!({"repo": repo_path, "branch": &branch, "target": "main"}),
+        )
         .await
         .unwrap();
     assert_eq!(res["pr_opened"], true, "PR mode must open a PR: {res}");

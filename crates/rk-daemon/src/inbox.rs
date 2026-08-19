@@ -285,7 +285,7 @@ pub fn build(
         });
     }
 
-    // Open pull/merge requests: a PR-mode `dismiss`/`land` pushed a branch and
+    // Open pull/merge requests: a PR-mode landing pushed a branch and
     // opened a PR (a `pull_request_opened` event), then completed — so nothing
     // else in this queue tracks it. Surface each so a pushed branch is visible
     // attention, never silently forgotten, carrying the forge URL to review it.

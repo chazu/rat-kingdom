@@ -140,6 +140,7 @@ fn init_repo(dir: &Path, barrier: &Path, from_instance: bool) {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_passing_landing_checks(dir);
     let wf_dir = dir.join(".rk").join("workflows");
     std::fs::create_dir_all(&wf_dir).unwrap();
     let src = WORKFLOW

@@ -1765,10 +1765,27 @@ impl WorkflowEngine {
                         rk_core::Error::other("dismiss step with no active agent")
                     })?;
                     let expected_spawn = ctx.active_agent_spawn;
-                    let outcome = self
+                    let landing = self.supervisor.status(&agent).and_then(|record| {
+                        record
+                            .branch
+                            .map(|branch| (record.repo_root, branch, record.target_branch))
+                    });
+                    let dismissed = self
                         .supervisor
-                        .dismiss_checked(&agent, expected_spawn, dismiss.no_merge)
+                        .dismiss_checked(&agent, expected_spawn, true)
                         .await?;
+                    let outcome = if dismiss.no_merge {
+                        dismissed
+                    } else {
+                        let (repo_root, branch, target) = landing.ok_or_else(|| {
+                            rk_core::Error::other(
+                                "dismiss-and-land step resolved no branch to submit",
+                            )
+                        })?;
+                        self.supervisor
+                            .land(&repo_root, &branch, &target, false)
+                            .await?
+                    };
                     self.update(id, |i| {
                         i.context.previous_result = Some(outcome.clone());
                         i.context.awaited = Vec::new();
@@ -2740,26 +2757,26 @@ impl WorkflowEngine {
 
     /// Dismiss every agent in the fan-out set in parallel — the fan-out
     /// counterpart to a single `dismiss` over `active_agent`. Each agent is
-    /// merged (unless `no_merge`) and cleaned up concurrently, then the caller
-    /// clears the fan-out set. Aggregates into `{count, merged, parked, errors,
-    /// all_merged, results}`. A hard dismiss failure (e.g. a git error — a
-    /// merge *conflict* is a clean `merged: false`, not an error) fails the
-    /// step, symmetric to how `wait_all` fails on a timeout.
+    /// cleaned up and, unless `no_merge`, its preserved branch is separately
+    /// submitted to the landing queue. The caller then clears the fan-out set.
+    /// Aggregates into `{count, merged, parked, errors, all_merged, results}`.
+    /// A hard cleanup or landing failure fails the step, symmetric to how
+    /// `wait_all` fails on a timeout.
     ///
     /// When `dismiss_all.only_clean` is set, this reads the preceding
-    /// `wait_all` aggregate (`previous_result`) and merges *only* the branches
+    /// `wait_all` aggregate (`previous_result`) and lands *only* the branches
     /// of rats that finished clean (`is_error: false`), parking every failed
-    /// rat's branch with `no_merge` for review instead of failing the whole
+    /// rat's branch for review instead of failing the whole
     /// batch. A branch parked because its rat failed is counted in `parked`
-    /// (distinct from a `merged: false` merge *conflict*), and `all_merged`
+    /// (distinct from a `merged: false` landing result), and `all_merged`
     /// stays `merged == count`, so a following `evaluate {all_merged: true}`
     /// still surfaces the failure in `rk inbox` — but only after the clean
-    /// branches have already merged. `only_clean` requires a preceding
+    /// branches have already landed. `only_clean` requires a preceding
     /// `wait_all` (its per-agent results supply the clean/failed signal); it
     /// fails the step if none is present rather than silently merging all.
     ///
     /// As with [`join`](Self::join), only a missing `for_each` (`None`) fails
-    /// here; an empty fan-out merges nothing and aggregates to `count: 0,
+    /// here; an empty fan-out lands nothing and aggregates to `count: 0,
     /// all_merged: true` (TKT-170). The `only_clean` check still runs first, so
     /// a `dismiss_all` that wants a `wait_all` it never got is caught on a quiet
     /// night too, rather than lying dormant until a night with tickets in it.
@@ -2771,14 +2788,14 @@ impl WorkflowEngine {
     ) -> rk_core::Result<Value> {
         let fanout = fanout.ok_or_else(|| {
             rk_core::Error::other(
-                "dismiss_all step with no preceding for_each: there is no fan-out to merge",
+                "dismiss_all step with no preceding for_each: there is no fan-out to clean up",
             )
         })?;
         // With only_clean, the per-agent no_merge is driven by the preceding
         // wait_all's results: an agent is parked (no_merge=true) unless its
         // harness_result reported is_error:false. Without a preceding wait_all
         // there is no clean/failed signal, so the flag is meaningless — fail
-        // rather than silently merge everything.
+        // rather than silently land everything.
         let clean = if dismiss_all.only_clean {
             let agg = previous_result.ok_or_else(|| {
                 rk_core::Error::other(
@@ -2805,24 +2822,39 @@ impl WorkflowEngine {
             None
         };
         if fanout.is_empty() {
-            info!("dismiss_all over an empty fan-out; nothing to merge");
+            info!("dismiss_all over an empty fan-out; nothing to clean up or land");
         }
-        // Dismiss all branches concurrently: each dismissal kills its child and
-        // merges its branch independently, so serializing them would waste the
-        // whole point of a fan-out.
+        // Clean up all agents concurrently, then submit each eligible branch
+        // independently; the landing pipeline serializes same-target updates.
         let mut set = tokio::task::JoinSet::new();
         for fa in fanout {
             let supervisor = Arc::clone(&self.supervisor);
             let agent = fa.agent.clone();
             let spawn = fa.spawn;
+            let landing = supervisor.status(&agent).and_then(|record| {
+                record
+                    .branch
+                    .map(|branch| (record.repo_root, branch, record.target_branch))
+            });
             // Base no_merge from the step, plus: under only_clean, park (don't
-            // merge) any agent not in the clean set.
+            // land) any agent not in the clean set.
             let parked = clean
                 .as_ref()
                 .is_some_and(|clean| !clean.contains(&fa.agent));
             let no_merge = dismiss_all.no_merge || parked;
             set.spawn(async move {
-                let outcome = supervisor.dismiss_checked(&agent, spawn, no_merge).await;
+                let outcome = match supervisor.dismiss_checked(&agent, spawn, true).await {
+                    Ok(dismissed) if no_merge => Ok(dismissed),
+                    Ok(_) => match landing {
+                        Some((repo_root, branch, target)) => {
+                            supervisor.land(&repo_root, &branch, &target, false).await
+                        }
+                        None => Err(rk_core::Error::other(
+                            "dismiss_all could not resolve a branch to submit",
+                        )),
+                    },
+                    Err(error) => Err(error),
+                };
                 (agent, parked, outcome)
             });
         }
@@ -4577,7 +4609,7 @@ fn step_label(step: &Step) -> String {
             if d.no_merge {
                 "dismiss (no merge)".into()
             } else {
-                "dismiss (merge)".into()
+                "dismiss + land".into()
             }
         }
         Step::Gate(g) => match (&g.duration, &g.timeout) {
@@ -5457,7 +5489,7 @@ test a::flaky ... FAILED
                 (3, 0, "read event/workflow_approval.approved → verdict"),
                 (4, 0, "when verdict"),
                 (4, 1, "case true:"),
-                (4, 2, "dismiss (merge)"),
+                (4, 2, "dismiss + land"),
                 (4, 1, "default:"),
                 (4, 2, "dismiss (no merge)"),
                 (4, 2, "stop — rejected"),

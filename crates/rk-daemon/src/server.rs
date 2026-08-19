@@ -931,6 +931,23 @@ impl Daemon {
             });
         }
 
+        // Install the merge-mode landing seam even when the background
+        // reactor is disabled: explicit workflow/operator `land` calls still
+        // enter and synchronously drive this queue.
+        let daemon_landing = daemon.landing();
+        let registered_paths: Vec<std::path::PathBuf> = daemon
+            .repos
+            .lock()
+            .map(|repos| repos.list().into_iter().map(|repo| repo.path).collect())
+            .unwrap_or_default();
+        let reclaimed_candidates = daemon_landing.sweep_orphaned_candidate_refs(registered_paths);
+        if reclaimed_candidates > 0 {
+            info!(
+                reclaimed_candidates,
+                "reclaimed orphaned landing candidate refs"
+            );
+        }
+
         // Reactor loop: fire registered #Trigger workflows on matching tuples.
         // The lossy feed is only a wake signal; a durable cursor scan is the
         // source of truth, so no event is missed even when the feed drops it.
@@ -950,7 +967,7 @@ impl Daemon {
                 // enqueue. Always wired when the reactor itself is enabled —
                 // inert (nothing to dispatch) unless a repo actually installs
                 // a "land" trigger.
-                .with_landing(daemon.landing())
+                .with_landing(Arc::clone(&daemon_landing))
                 // Escalation push channels. Empty config resolves to the
                 // historical herdr-only registry, so an existing castle sees no
                 // change; adding a `[[notify.sinks]]` table adds a channel with
@@ -1010,7 +1027,7 @@ impl Daemon {
             // `reactor_config.enabled` flag rather than a new config knob: with
             // no `action: "land"` trigger installed, `run_cycle` finds nothing
             // queued and is a cheap no-op.
-            let landing = daemon.landing();
+            let landing = Arc::clone(&daemon_landing);
             let mut landing_feed = daemon.space.subscribe();
             let mut landing_shutdown = daemon.shutdown_tx.subscribe();
             let landing_interval = Duration::from_secs(daemon.reactor_config.interval_secs.max(1));
@@ -1239,13 +1256,15 @@ impl Daemon {
     /// `request_review`).
     fn landing(&self) -> Arc<crate::landing::LandingPipeline> {
         Arc::clone(self.landing.get_or_init(|| {
-            Arc::new(crate::landing::LandingPipeline::new(
+            let pipeline = Arc::new(crate::landing::LandingPipeline::new(
                 self.space.clone(),
                 Arc::clone(&self.supervisor),
                 self.engine(),
                 Arc::clone(&self.tickets),
                 self.layout.clone(),
-            ))
+            ));
+            self.supervisor.set_landing_pipeline(&pipeline);
+            pipeline
         }))
     }
 
@@ -1445,6 +1464,7 @@ impl Daemon {
                 | "agent.unarchive"
                 | "agent.revert"
                 | "repo.add"
+                | "repo.land"
                 | "repo.remove"
                 | "repo.onboard.start"
                 | "repo.onboard.propose"
@@ -2516,6 +2536,38 @@ impl Daemon {
                 })
             }
             "repo.add" => reply(self.handle_repo_add(req).await),
+            "repo.land" => {
+                let params: RepoLandParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
+                    }
+                };
+                let result = if params.force {
+                    self.supervisor
+                        .land_force(
+                            std::path::Path::new(&params.repo),
+                            &params.branch,
+                            &params.target,
+                            params.keep_branch,
+                            params.reason.as_deref().unwrap_or_default(),
+                        )
+                        .await
+                } else {
+                    self.supervisor
+                        .land(
+                            std::path::Path::new(&params.repo),
+                            &params.branch,
+                            &params.target,
+                            params.keep_branch,
+                        )
+                        .await
+                };
+                reply(match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
+                })
+            }
             "repo.list" => reply(match self.repos.lock() {
                 Ok(reg) => Response::ok(id, json!({"repos": reg.list()})),
                 Err(_) => Response::err(id, codes::INTERNAL, "repo registry lock poisoned"),
@@ -2649,7 +2701,7 @@ impl Daemon {
             Ok(t) => t,
             Err(e) => return Err(e),
         };
-        // Open PRs/MRs: a PR-mode dismiss/land emits a `pull_request_opened`
+        // Open PRs/MRs: a PR-mode landing emits a `pull_request_opened`
         // event, then the run completes — nothing else tracks the pushed branch.
         let pull_requests =
             match scan(Pattern::category(Category::Event).identity("pull_request_opened")) {
@@ -3235,11 +3287,9 @@ impl Daemon {
         // went terminal without being dismissed — the async
         // steward-review flow leaves exactly that gap (O14: the harness's
         // own `rk done` finds the branch not yet merged and refuses to close
-        // the ticket, so it sits `in_progress` until this sweep or a real
-        // dismiss touches it). Reopening it dispatches a duplicate rat onto
-        // already-delivered work, and that duplicate's own zero-diff dismiss
-        // can then coincidentally close the ticket for the wrong reason
-        // (`Self::maybe_close_ticket_on_dismiss`). `landing_processed` is
+        // the ticket, so it sits `in_progress` until the landing pipeline
+        // records delivery). Reopening it dispatches a duplicate rat onto
+        // already-delivered work. `landing_processed` is
         // keyed by `(repo, branch, head_sha)` — the wrong shape for "does
         // this ticket have a landed outcome" — so read `payload.task`
         // instead, which the reactor's landing-trigger dispatch (`reactor.rs`)
@@ -3282,9 +3332,8 @@ impl Daemon {
         let mut reopened = 0usize;
         for ticket in in_progress {
             if landed_tickets.contains(&ticket.identity) {
-                // Already delivered — leave it `in_progress` for a real
-                // dismiss (or the fuller landing-driven ticket transition,
-                // E1/E2) to close, rather than reopening onto a duplicate.
+                // Already delivered — leave it for the landing-driven ticket
+                // transition to close rather than reopening onto a duplicate.
                 continue;
             }
             if queued_tickets.contains(&ticket.identity) {
@@ -6958,6 +7007,23 @@ struct DismissParams {
     name: String,
     #[serde(default)]
     no_merge: bool,
+}
+
+#[derive(Deserialize)]
+struct RepoLandParams {
+    repo: String,
+    branch: String,
+    #[serde(default = "default_main_branch")]
+    target: String,
+    #[serde(default)]
+    keep_branch: bool,
+    #[serde(default)]
+    force: bool,
+    reason: Option<String>,
+}
+
+fn default_main_branch() -> String {
+    "main".to_string()
 }
 
 #[derive(Deserialize)]

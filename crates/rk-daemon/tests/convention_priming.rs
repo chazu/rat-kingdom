@@ -128,6 +128,7 @@ async fn promoted_convention_reaches_spawned_rat_prompt() {
         .await
         .unwrap();
     let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+    let branch = spawned["agent"]["branch"].as_str().unwrap().to_string();
 
     let mut completed = false;
     for _ in 0..100 {
@@ -143,12 +144,64 @@ async fn promoted_convention_reaches_spawned_rat_prompt() {
     }
     assert!(completed, "agent never completed");
 
-    // Merge the captured prompt onto main and read it back.
+    // Dismiss, then separately submit the captured prompt through the gate.
     let dismissed = client
         .call("agent.dismiss", json!({"name": name}))
         .await
         .unwrap();
-    assert_eq!(dismissed["merged"], true, "detail: {}", dismissed["detail"]);
+    assert_eq!(
+        dismissed["merged"], false,
+        "detail: {}",
+        dismissed["detail"]
+    );
+    let refused = client
+        .call(
+            "repo.land",
+            json!({
+                "repo": repo_dir.path(),
+                "branch": branch,
+                "target": "main",
+                "force": true,
+                "reason": "",
+            }),
+        )
+        .await;
+    assert!(refused
+        .unwrap_err()
+        .to_string()
+        .contains("forced landing requires a non-empty --reason"));
+    let landed = client
+        .call(
+            "repo.land",
+            json!({
+                "repo": repo_dir.path(),
+                "branch": branch,
+                "target": "main",
+                "force": true,
+                "reason": "test fixture needs to inspect the captured prompt",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(landed["merged"], true, "detail: {}", landed["detail"]);
+    for category in ["event", "need"] {
+        let rows = client
+            .call(
+                "space.scan",
+                json!({
+                    "category": category,
+                    "scope": repo_scope,
+                    "identity": "forced_landing",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows["tuples"].as_array().map(Vec::len),
+            Some(1),
+            "forced landing must leave one durable {category} row: {rows}"
+        );
+    }
 
     let primed = git_out(repo_dir.path(), &["show", "main:primed.txt"]);
     assert!(
@@ -205,6 +258,7 @@ async fn repo_named_checks_reach_spawned_rat_prompt() {
         .await
         .unwrap();
     let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+    let branch = spawned["agent"]["branch"].as_str().unwrap().to_string();
 
     let mut completed = false;
     for _ in 0..100 {
@@ -222,6 +276,19 @@ async fn repo_named_checks_reach_spawned_rat_prompt() {
 
     client
         .call("agent.dismiss", json!({"name": name}))
+        .await
+        .unwrap();
+    client
+        .call(
+            "repo.land",
+            json!({
+                "repo": repo_dir.path(),
+                "branch": branch,
+                "target": "main",
+                "force": true,
+                "reason": "test fixture needs to inspect the captured prompt",
+            }),
+        )
         .await
         .unwrap();
     let primed = git_out(repo_dir.path(), &["show", "main:primed.txt"]);

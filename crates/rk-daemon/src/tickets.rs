@@ -390,8 +390,8 @@ impl Tickets {
     ///
     /// Deliberately bypasses [`valid_transition`]: a land is ground truth
     /// about the world, not a workflow request, so it must be recordable from
-    /// ANY prior status — including a ticket already `closed` by a
-    /// dismiss-time closer that had no merge commit to record. Idempotent by
+    /// ANY prior status — including legacy tickets already marked terminal
+    /// without a merge commit. Idempotent by
     /// merge commit: re-recording the same commit rewrites the same record and
     /// does not re-emit `ticket_closed` (the [`edit`] close-edge guard already
     /// fires only on the non-terminal → terminal crossing).
@@ -892,8 +892,8 @@ mod tests {
         assert!(!t.clear_delivery(&id, "open").await.unwrap());
     }
 
-    /// A land is ground truth, so it must record from any prior status —
-    /// including a ticket a dismiss-time closer already closed with no commit.
+    /// A land is ground truth, so it must record from any prior status,
+    /// including a legacy ticket already closed without a delivery record.
     #[tokio::test]
     async fn recording_delivery_works_from_an_already_closed_ticket() {
         let t = tickets();

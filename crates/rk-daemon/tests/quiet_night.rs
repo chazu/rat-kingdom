@@ -45,6 +45,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_passing_landing_checks(dir);
 }
 
 async fn await_terminal(client: &mut Client, id: &str) -> serde_json::Value {

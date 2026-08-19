@@ -969,8 +969,8 @@ mod tests {
             " ✔  2. wait"
         );
         assert_eq!(
-            timeline_line(&row(1, 2, "dismiss (merge)"), 1, "running"),
-            " ▶         dismiss (merge)"
+            timeline_line(&row(1, 2, "dismiss + land"), 1, "running"),
+            " ▶         dismiss + land"
         );
     }
 }
