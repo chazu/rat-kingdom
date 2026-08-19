@@ -5672,6 +5672,7 @@ test a::flaky ... FAILED
             on_timeout: OnTimeout::Fail,
             environment_policy: rk_workflow::CheckEnvironmentPolicy::StripRkSpawn,
             retry_on_fail: 0,
+            shared_cargo_target: false,
         };
         let timeout = Duration::from_secs(5);
 
@@ -5718,6 +5719,7 @@ test a::flaky ... FAILED
             on_timeout: OnTimeout::Fail,
             environment_policy: rk_workflow::CheckEnvironmentPolicy::StripRkSpawn,
             retry_on_fail: 0,
+            shared_cargo_target: false,
         };
         let timeout = Duration::from_secs(5);
 
@@ -5770,6 +5772,7 @@ test a::flaky ... FAILED
             on_timeout: OnTimeout::Fail,
             environment_policy: rk_workflow::CheckEnvironmentPolicy::StripRkSpawn,
             retry_on_fail: 0,
+            shared_cargo_target: false,
         };
         let timeout = Duration::from_secs(5);
 
