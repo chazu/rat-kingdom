@@ -30,6 +30,7 @@ pub struct Config {
     pub instance_timeout_sweep: InstanceTimeoutSweepConfig,
     pub ticket_reopen_sweep: TicketReopenSweepConfig,
     pub disk: DiskConfig,
+    pub machine: MachineConfig,
     pub drain: DrainConfig,
     pub evaporation: EvaporationConfig,
     pub ingest: IngestConfig,
@@ -730,6 +731,25 @@ impl Default for DiskConfig {
             shared_cargo_target: true,
         }
     }
+}
+
+/// Machine-load admission guard, the CPU half of the scarce-resource signal
+/// `[disk] min_free_gb` supplies the storage half of. Both are sampled together
+/// and evaluated together (`rk_daemon::machine`), so a refusal for either
+/// reason reports both numbers.
+///
+/// Unlike the disk floor this defaults to DISABLED, and deliberately so: a
+/// castle running a fleet of build-heavy rats sits at a high load average as
+/// its normal, healthy operating state, so a shipped default would refuse
+/// legitimate work on day one. The dial exists for an operator who has measured
+/// their own machine's cliff.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct MachineConfig {
+    /// Refuse a spawn when the 1-minute load average divided by the CPU count
+    /// exceeds this. Normalised per CPU so one value is portable across
+    /// castles of different sizes. Zero (the default) disables the guard.
+    pub max_load_per_cpu: f64,
 }
 
 /// Supervisor liveness/burn-rate sweep. A periodic pass over live headless rats
