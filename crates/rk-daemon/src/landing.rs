@@ -2112,7 +2112,10 @@ workflow: {
             "landed ticket must reach a terminal state without an operator"
         );
         let record = crate::tickets::delivery_of(&stored).expect("delivery record");
-        assert_eq!(record.merge_commit, result["merge_commit"].as_str().unwrap());
+        assert_eq!(
+            record.merge_commit,
+            result["merge_commit"].as_str().unwrap()
+        );
         assert_eq!(record.target, "main");
 
         // The acceptance case the old branch-ref inference got wrong: landing
