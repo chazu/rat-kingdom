@@ -191,6 +191,17 @@ async fn a_mid_flight_turn_is_not_published_as_the_completion() {
     // The rat runs `rk done`, then finishes its turn. `task_done` is written
     // once per generation by the rat itself, so it — unlike the harness's
     // per-turn result — cannot duplicate.
+    //
+    // Written by hand here rather than through `rk-fixture-done` (the fake
+    // harness never runs it on this path), so it must carry `spawn` itself —
+    // `declared_done` keys on it whenever the live record has one (every
+    // record does, C1/S3a, docs/2026-08-17-tkt-c1-generation-identity.md), and
+    // a payload missing the field would never match.
+    let status = client
+        .call("agent.status", json!({"name": agent}))
+        .await
+        .unwrap();
+    let spawn = status["agent"]["spawn"].clone();
     client
         .call(
             "space.out",
@@ -198,7 +209,7 @@ async fn a_mid_flight_turn_is_not_published_as_the_completion() {
                 "category": "event",
                 "scope": repo,
                 "identity": "task_done",
-                "payload": {"agent": agent, "task": "multi-turn", "summary": "done"},
+                "payload": {"agent": agent, "task": "multi-turn", "summary": "done", "spawn": spawn},
             }),
         )
         .await
