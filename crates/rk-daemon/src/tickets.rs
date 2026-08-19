@@ -823,6 +823,108 @@ mod tests {
         }
     }
 
+    fn record(commit: &str) -> DeliveryRecord {
+        DeliveryRecord {
+            merge_commit: commit.into(),
+            branch: "rat/x/tkt-1".into(),
+            target: "main".into(),
+            landed_at: "2026-08-19T00:00:00Z".into(),
+        }
+    }
+
+    /// The headline acceptance: a landed ticket reaches a terminal state with
+    /// no operator action, and carries the merge commit that proves it.
+    #[tokio::test]
+    async fn recording_delivery_closes_the_ticket_and_stores_the_merge_commit() {
+        let t = tickets();
+        let id = t.create(new("work", "repo", None)).await.unwrap().identity;
+        set_status(&t, &id, "in_progress").await;
+
+        t.record_delivery(&id, &record("abc123")).await.unwrap();
+
+        let stored = t.get(&id).unwrap().unwrap();
+        assert_eq!(
+            stored.payload.get("status").and_then(Value::as_str),
+            Some("closed")
+        );
+        assert!(is_delivered(&stored));
+        assert_eq!(t.delivery(&id).unwrap().unwrap().merge_commit, "abc123");
+    }
+
+    /// The record is what "is it delivered" reads — NOT branch existence. This
+    /// test holds no branch at all: nothing in the predicate may consult one.
+    #[tokio::test]
+    async fn delivery_reads_from_the_record_not_from_a_branch_ref() {
+        let t = tickets();
+        let id = t.create(new("work", "repo", None)).await.unwrap().identity;
+        assert!(!is_delivered(&t.get(&id).unwrap().unwrap()));
+
+        t.record_delivery(&id, &record("deadbeef")).await.unwrap();
+
+        // Deleting the branch is exactly what landing does next; the record is
+        // untouched by it, so the ticket still reads delivered.
+        let stored = t.get(&id).unwrap().unwrap();
+        assert!(is_delivered(&stored));
+        assert_eq!(delivery_of(&stored).unwrap().branch, "rat/x/tkt-1");
+    }
+
+    /// A ticket marked `closed` without a land does NOT read as delivered —
+    /// the "approved but never merged" class (TKT-18/46/147).
+    #[tokio::test]
+    async fn a_closed_ticket_without_a_land_is_not_delivered() {
+        let t = tickets();
+        let id = t.create(new("work", "repo", None)).await.unwrap().identity;
+        set_status(&t, &id, "closed").await;
+        assert!(!is_delivered(&t.get(&id).unwrap().unwrap()));
+        assert!(t.delivery(&id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reverting_clears_the_delivery_record_and_reopens() {
+        let t = tickets();
+        let id = t.create(new("work", "repo", None)).await.unwrap().identity;
+        t.record_delivery(&id, &record("abc123")).await.unwrap();
+
+        assert!(t.clear_delivery(&id, "open").await.unwrap());
+
+        let stored = t.get(&id).unwrap().unwrap();
+        assert!(!is_delivered(&stored));
+        assert_eq!(
+            stored.payload.get("status").and_then(Value::as_str),
+            Some("open")
+        );
+        // Nothing left to clear on a second revert.
+        assert!(!t.clear_delivery(&id, "open").await.unwrap());
+    }
+
+    /// A land is ground truth, so it must record from any prior status —
+    /// including a ticket a dismiss-time closer already closed with no commit.
+    #[tokio::test]
+    async fn recording_delivery_works_from_an_already_closed_ticket() {
+        let t = tickets();
+        let id = t.create(new("work", "repo", None)).await.unwrap().identity;
+        set_status(&t, &id, "closed").await;
+
+        t.record_delivery(&id, &record("abc123")).await.unwrap();
+
+        assert!(is_delivered(&t.get(&id).unwrap().unwrap()));
+    }
+
+    /// Re-landing the same commit must not announce a second close, or every
+    /// dependent of the ticket re-fires.
+    #[tokio::test]
+    async fn re_recording_the_same_delivery_does_not_re_emit_a_close() {
+        let (t, space) = tickets_with_space();
+        let id = t.create(new("work", "repo", None)).await.unwrap().identity;
+        t.record_delivery(&id, &record("abc123")).await.unwrap();
+        assert_eq!(closed_events(&space).len(), 1);
+
+        t.record_delivery(&id, &record("abc123")).await.unwrap();
+
+        assert_eq!(closed_events(&space).len(), 1);
+        assert!(is_delivered(&t.get(&id).unwrap().unwrap()));
+    }
+
     #[tokio::test]
     async fn ids_are_unique_and_prefixed() {
         let t = tickets();
