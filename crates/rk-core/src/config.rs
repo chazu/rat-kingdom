@@ -673,6 +673,21 @@ pub struct DiskConfig {
     /// Minimum free space (GB) required under `RK_HOME` before a spawn may
     /// proceed. Zero disables the guard.
     pub min_free_gb: u64,
+    /// When true, a spawned agent's `CARGO_TARGET_DIR` points at
+    /// `<RK_HOME>/cargo-target-cache/<repo>` (one shared build cache per repo)
+    /// instead of that worktree's own `target/`. Root-caused by
+    /// TKT-01M04D1QDBNCF0T0D0EHRVNJV5: with a per-worktree `target/`, disk
+    /// usage multiplies by the number of concurrently live worktrees on a
+    /// repo (60+ observed, 3-7 GB each) until `cargo test --workspace` fails
+    /// mid-run on ENOSPC even though nothing is actually leaked. Sharing the
+    /// cache trades that multiplication for cargo's own target-dir file lock
+    /// serializing overlapping builds — slower under heavy concurrency, but
+    /// never a hard failure the way running out of disk is. Defaults true for
+    /// a real deployment (`Daemon::new`); a bare `Supervisor` built directly
+    /// by a test defaults false ([`Self::shared_cargo_target`] is only wired
+    /// in from config), so existing tests asserting exact `agent_env` output
+    /// are unaffected.
+    pub shared_cargo_target: bool,
 }
 
 impl Default for DiskConfig {
@@ -681,7 +696,10 @@ impl Default for DiskConfig {
         // incident write-up: comfortably above the daemon's own working-set
         // (space.db, logs, in-flight worktrees) so a refusal always leaves
         // enough room for the daemon itself to keep operating.
-        Self { min_free_gb: 10 }
+        Self {
+            min_free_gb: 10,
+            shared_cargo_target: true,
+        }
     }
 }
 

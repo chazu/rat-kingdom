@@ -540,6 +540,12 @@ pub struct Supervisor {
     /// [`set_min_free_disk_gb`](Supervisor::set_min_free_disk_gb), so this
     /// safety feature cannot spuriously fail spawns on a tight CI disk.
     min_free_disk_gb: AtomicU64,
+    /// `[disk] shared_cargo_target` (default false here), applied by
+    /// `Daemon::new` from config. Mirrors [`min_free_disk_gb`](Self::min_free_disk_gb):
+    /// a bare `Supervisor` built by a test stays on each worktree's own
+    /// `target/` unless it opts in via
+    /// [`set_shared_cargo_target`](Supervisor::set_shared_cargo_target).
+    shared_cargo_target: AtomicBool,
     /// Set by `daemon.pause_dispatch` (`rk daemon rollover`'s drain step);
     /// gates admission in [`spawn`](Self::spawn) only — it does not touch
     /// agents already running. In-memory: a fresh daemon process always
@@ -777,6 +783,7 @@ impl Supervisor {
             log,
             merge_queue: MergeQueue::default(),
             min_free_disk_gb: AtomicU64::new(0),
+            shared_cargo_target: AtomicBool::new(false),
             dispatch_paused: AtomicBool::new(false),
             done_kill_grace_secs: AtomicU64::new(
                 rk_core::config::SupervisorConfig::default().done_kill_grace_secs,
@@ -791,6 +798,13 @@ impl Supervisor {
     /// the supervisor is shared behind an `Arc` from construction onward.
     pub fn set_min_free_disk_gb(&self, gb: u64) {
         self.min_free_disk_gb.store(gb, Ordering::Relaxed);
+    }
+
+    /// Set `[disk] shared_cargo_target`. Applied by `Daemon::new` from
+    /// config, same pattern as
+    /// [`set_min_free_disk_gb`](Supervisor::set_min_free_disk_gb).
+    pub fn set_shared_cargo_target(&self, enabled: bool) {
+        self.shared_cargo_target.store(enabled, Ordering::Relaxed);
     }
 
     /// Pause or resume new-agent admission ([`spawn`](Self::spawn)). Used by
@@ -4523,6 +4537,15 @@ impl Supervisor {
         }
         env.insert("RK_BASE".into(), base.to_string());
         env.insert("RK_WORKTREE".into(), worktree.display().to_string());
+        if self.shared_cargo_target.load(Ordering::Relaxed) {
+            env.insert(
+                "CARGO_TARGET_DIR".into(),
+                self.layout
+                    .cargo_target_cache_dir(repo_name)
+                    .display()
+                    .to_string(),
+            );
+        }
         if let Some(instance) = workflow_instance {
             env.insert("RK_WORKFLOW_INSTANCE".into(), instance.to_string());
         }
@@ -4917,6 +4940,52 @@ mod respawn_tests {
         );
 
         assert_eq!(env.get("RK_BASE").map(String::as_str), Some("integration"));
+    }
+
+    #[test]
+    fn agent_env_omits_shared_target_dir_by_default() {
+        let home = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let env = sup.agent_env(
+            "Nibble",
+            "rat",
+            "repo",
+            "task",
+            Some("rat/nibble/task"),
+            "main",
+            Path::new("/tmp/nibble-worktree"),
+            None,
+        );
+
+        assert!(env.get("CARGO_TARGET_DIR").is_none());
+    }
+
+    #[test]
+    fn agent_env_shares_cargo_target_dir_per_repo_when_enabled() {
+        let home = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        sup.set_shared_cargo_target(true);
+        let env = sup.agent_env(
+            "Nibble",
+            "rat",
+            "repo",
+            "task",
+            Some("rat/nibble/task"),
+            "main",
+            Path::new("/tmp/nibble-worktree"),
+            None,
+        );
+
+        assert_eq!(
+            env.get("CARGO_TARGET_DIR").map(String::as_str),
+            Some(
+                Layout::at(home.path())
+                    .cargo_target_cache_dir("repo")
+                    .display()
+                    .to_string()
+            )
+            .as_deref(),
+        );
     }
 
     #[test]
