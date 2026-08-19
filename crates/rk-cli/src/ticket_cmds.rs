@@ -46,6 +46,16 @@ pub struct ListArgs {
 }
 
 #[derive(Args)]
+pub struct ReopenArgs {
+    /// Ticket id (for example, TKT-01J...).
+    pub id: String,
+    /// Reopen as `blocked` instead of `open`, holding it out of the
+    /// auto-dispatch backlog until a human looks at it.
+    #[arg(long)]
+    pub block: bool,
+}
+
+#[derive(Args)]
 pub struct UpdateArgs {
     /// Ticket id (for example, TKT-01J...).
     pub id: String,
@@ -328,6 +338,25 @@ pub async fn update(layout: &Layout, args: UpdateArgs, as_json: bool) -> Result<
     } else {
         println!(
             "updated {} — status {}",
+            ticket["identity"].as_str().unwrap_or("?"),
+            ticket["payload"]["status"].as_str().unwrap_or("?")
+        );
+    }
+    Ok(())
+}
+
+pub async fn reopen(layout: &Layout, args: ReopenArgs, as_json: bool) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let status = if args.block { "blocked" } else { "open" };
+    let result = client
+        .call("ticket.reopen", json!({ "id": args.id, "status": status }))
+        .await?;
+    let ticket = &result["ticket"];
+    if as_json {
+        println!("{ticket}");
+    } else {
+        println!(
+            "reopened {} — status {}",
             ticket["identity"].as_str().unwrap_or("?"),
             ticket["payload"]["status"].as_str().unwrap_or("?")
         );

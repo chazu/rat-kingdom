@@ -1466,6 +1466,7 @@ impl Daemon {
                 | "sync.peers"
                 | "ticket.update"
                 | "ticket.dep"
+                | "ticket.reopen"
         ) {
             return (true, "");
         }
@@ -2534,6 +2535,7 @@ impl Daemon {
             "ticket.get" => reply(self.handle_ticket_get(req)),
             "ticket.update" => reply(self.handle_ticket_update(req).await),
             "ticket.dep" => reply(self.handle_ticket_dep(req).await),
+            "ticket.reopen" => reply(self.handle_ticket_reopen(req).await),
             "ticket.ready" => reply(self.handle_ticket_ready(req)),
             other => reply(Response::err(
                 id,
@@ -4513,6 +4515,56 @@ impl Daemon {
         };
         match result {
             Ok(ticket) => Response::ok(req.id, json!({"ticket": ticket})),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    /// Explicit operator-only recovery: move a `done` (or `closed`) ticket
+    /// back to `open`/`blocked`. The state machine (`valid_transition`)
+    /// refuses `done -> in_progress` and any backwards move out of `closed`
+    /// on an ordinary `ticket.update` — this is the one door back, gated to
+    /// operator/foreman-equivalent callers by the same `authorize_reasoned`
+    /// list that covers `ticket.update`/`ticket.dep`, so an agent cannot
+    /// demote its own ticket out from under a reviewer. Every reopen through
+    /// this door is announced as a `ticket_reopened` event, mirroring the
+    /// `ticket_closed` audit trail `Tickets::edit` already emits on the
+    /// forward edge.
+    async fn handle_ticket_reopen(&self, req: Request) -> Response {
+        let params: TicketReopenParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let previous_status = match self.tickets.get(&params.id) {
+            Ok(Some(t)) => t
+                .payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("open")
+                .to_string(),
+            Ok(None) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    format!("no such ticket: {}", params.id),
+                )
+            }
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        let status = params.status.as_deref().unwrap_or("open");
+        match self.tickets.reopen(&params.id, status).await {
+            Ok(ticket) => {
+                self.emit_event(
+                    &ticket.scope,
+                    "ticket_reopened",
+                    json!({
+                        "ticket": ticket.identity,
+                        "from_status": previous_status,
+                        "to_status": status,
+                        "by": req.caller,
+                    }),
+                );
+                Response::ok(req.id, json!({"ticket": ticket}))
+            }
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
     }
@@ -6861,6 +6913,15 @@ struct TicketUpdateParams {
 struct GroomReason {
     reason: String,
     evidence: String,
+}
+
+#[derive(Deserialize)]
+struct TicketReopenParams {
+    id: String,
+    /// Target status: "open" or "blocked" (defaults to "open"). Validated by
+    /// `Tickets::reopen` itself.
+    #[serde(default)]
+    status: Option<String>,
 }
 
 fn parse_params<T: serde::de::DeserializeOwned>(params: &Value) -> Result<T, String> {
