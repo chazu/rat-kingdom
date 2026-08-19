@@ -7,6 +7,7 @@
 //! so the cause is visible in `agent.status` and the `agent-failed` inbox row
 //! without an operator ever needing `--attach`.
 
+mod fixture;
 mod support;
 
 use rk_core::paths::Layout;
@@ -37,12 +38,21 @@ fn scratch_repo(dir: &std::path::Path) {
 /// `mid_flight_result.rs`), because `RK_FAKE_HARNESS_CMD` is process-global
 /// and the tests in this binary run concurrently — setting it to two
 /// different values per test would race.
-const FAKE: &str = r#"
+/// The `narrate` branch declares `rk done` before its result line: a clean
+/// turn that never does now parks the agent as `Paused` (awaiting resume)
+/// rather than `Completed`, which the test waits on. The other branches all
+/// exit nonzero without ever reporting, so they are unaffected.
+fn fake() -> String {
+    fixture::with_rk_done(RAW_FAKE)
+}
+
+const RAW_FAKE: &str = r#"
 read -r _prompt
 case "$RK_TASK" in
   narrate)
     echo 'warming up model cache' >&2
     echo '{"type":"system","subtype":"init","session_id":"fake-stderr"}'
+    rk_done "done"
     echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"fake-stderr","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
     ;;
   silent-death)
@@ -80,7 +90,7 @@ async fn stderr_lines_are_tagged_in_the_agent_log() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
@@ -136,7 +146,7 @@ async fn silent_death_folds_stderr_into_the_published_result() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
@@ -214,7 +224,7 @@ async fn stderr_ordering_never_races_exited() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
@@ -283,7 +293,7 @@ async fn respawn_clears_the_previous_generations_stderr_tail() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());

@@ -6,6 +6,7 @@
 //! the cap is a standing guardrail on current/concurrent spend rather than a
 //! cumulative lifetime ceiling (TKT-40).
 
+mod fixture;
 mod support;
 
 use rk_core::paths::Layout;
@@ -43,16 +44,21 @@ fn git(dir: &Path, args: &[&str]) {
 ///
 /// - `*oneshot*`: self-report a $0.50 authoritative cost via a `result`
 ///   message and EXIT — the agent flips to `Completed`, so under the live-only
-///   rule its spend must drop off the tally.
+///   rule its spend must drop off the tally. Declares `rk done` first: a clean
+///   turn that never does now parks the agent as `Paused` (still live) rather
+///   than `Completed`, which would wrongly keep its spend in the tally.
 /// - anything else: emit ONE high-token Usage event (haiku: 200k in + 40k out
 ///   ≈ $0.40, over the $0.30 cap) to record cost, then `sleep 120` to stay
 ///   `Running` (a usage event keeps state=Running; only a result would flip it
 ///   to Completed). One such live rat alone puts the fleet over the cap.
-const SPENDER_FAKE: &str = r#"
+fn spender_fake() -> String {
+    fixture::with_rk_done(
+        r#"
 read -r _prompt
 echo '{"type":"system","subtype":"init","session_id":"spender-1"}'
 case "$RK_FAKE_PROMPT" in
   *oneshot*)
+    rk_done "done"
     echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"spender-1","total_cost_usd":0.5,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
     ;;
   *)
@@ -60,7 +66,9 @@ case "$RK_FAKE_PROMPT" in
     sleep 120
     ;;
 esac
-"#;
+"#,
+    )
+}
 
 fn init_repo(dir: &Path) {
     git(dir, &["init", "-b", "main"]);
@@ -127,7 +135,7 @@ async fn fleet_cap_refuses_dispatch_once_hit() {
     let repo_dir = tempfile::tempdir().unwrap();
     init_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", SPENDER_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", spender_fake());
     let (_layout, mut client) = spawn_daemon(home.path()).await;
     let repo = repo_dir.path().to_string_lossy().to_string();
 
@@ -194,7 +202,7 @@ async fn dismissed_agent_drops_off_fleet_tally() {
     let repo_dir = tempfile::tempdir().unwrap();
     init_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", SPENDER_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", spender_fake());
     let (_layout, mut client) = spawn_daemon(home.path()).await;
     let repo = repo_dir.path().to_string_lossy().to_string();
 
@@ -266,7 +274,7 @@ async fn completed_agent_drops_off_fleet_tally() {
     let repo_dir = tempfile::tempdir().unwrap();
     init_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", SPENDER_FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", spender_fake());
     let (_layout, mut client) = spawn_daemon(home.path()).await;
     let repo = repo_dir.path().to_string_lossy().to_string();
 
