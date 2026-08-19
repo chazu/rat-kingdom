@@ -46,10 +46,7 @@ async fn reopen_moves_a_done_ticket_back_to_open_refuses_agents_and_leaves_an_ev
     // The state machine's own guard: a plain update can never demote a done
     // ticket back into the active pipeline.
     let refused_update = operator
-        .call(
-            "ticket.update",
-            json!({"id": id, "status": "in_progress"}),
-        )
+        .call("ticket.update", json!({"id": id, "status": "in_progress"}))
         .await;
     assert!(
         refused_update.is_err(),

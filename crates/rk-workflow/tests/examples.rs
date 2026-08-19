@@ -346,9 +346,10 @@ fn action_approval_smoke_target_is_a_harmless_noop() {
     assert_eq!(spawn.role, "rat");
 
     assert!(
-        workflow.steps.iter().any(
-            |s| matches!(s, Step::Dismiss(d) if d.no_merge)
-        ),
+        workflow
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::Dismiss(d) if d.no_merge)),
         "the smoke target must dismiss with noMerge — it must never merge a branch"
     );
     assert!(

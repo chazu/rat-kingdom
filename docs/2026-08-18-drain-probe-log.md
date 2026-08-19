@@ -78,6 +78,17 @@ burn detection, stale-instance timeout, ticket reopen, announce sinks).*
   refusals — one E1 fix (commit-count-aware delivery records) retires all
   three. Ticket recycles via the reopen sweep; no operator action.
 
+- **O17** (day 2): fleet-diagnosed its own race (Remy-9, $3.38) and
+  **corrected the operator's hypothesis**: claim IS an atomic CAS
+  (tickets.rs:355-373) — no scan window. Actual chain: reopen sweep
+  (landing-unaware) wrongly reopens a delivered ticket → drain correctly
+  claims → duplicate rat's EMPTY no-op merge at dismissal trips the
+  dismiss-time ticket-closer (supervisor.rs:3557), which accepts any
+  merged:true as delivery. Fourth appearance of empty-branch-reads-merged;
+  every specimen in this log's re-dispatch saga reduces to reopen-sweep
+  landing-blindness + that one predicate. Two fixes retire the whole
+  class.
+
 ## Day-1 summary (T+~15h)
 
 **Volume:** 44 agents (39 rats, 5 reviewers), ~$144 recorded spend (true

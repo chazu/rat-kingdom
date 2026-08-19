@@ -66,10 +66,7 @@ async fn budget_killed_terminal_record_keeps_the_true_cost() {
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
 
-    std::env::set_var(
-        "RK_FAKE_HARNESS_CMD",
-        RUNAWAY_THEN_UNDERREPORTS_ON_KILL,
-    );
+    std::env::set_var("RK_FAKE_HARNESS_CMD", RUNAWAY_THEN_UNDERREPORTS_ON_KILL);
     let layout = Layout::at(home.path());
     let space = Space::open_in_memory().unwrap();
     let daemon = Daemon::with_space_for_tests(
