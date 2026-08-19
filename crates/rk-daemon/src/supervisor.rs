@@ -104,6 +104,15 @@ struct BranchDelivery {
     pr_url: Option<String>,
     branch_deleted: bool,
     detail: String,
+    /// True iff a `Merge`/`MergePush` delivery's source branch carried zero
+    /// file/line changes over `target` at the point it diverged
+    /// (`Repo::diff_stat(target, branch)` before the merge moves `target`).
+    /// A dismiss whose branch is content-free this way did not deliver its
+    /// ticket's work even though the merge itself reports `merged: true` —
+    /// most often a duplicate rat dispatched onto a ticket whose real branch
+    /// already landed (TKT-01M0C663BZ86SMA2PVMFP5QJ8D). Left `false` (never
+    /// checked) for `PushBranch`/`Pr` deliveries, which don't set `merged`.
+    content_free: bool,
 }
 
 fn default_permission_mode(harness: &str) -> &'static str {
@@ -3307,6 +3316,22 @@ impl Supervisor {
             DeliveryMode::Merge | DeliveryMode::MergePush => {
                 let outcome = {
                     let _merge_guard = self.merge_queue.acquire(repo.root(), &target).await;
+                    // Measured BEFORE the merge moves `target`: `diff_stat`'s
+                    // `target...branch` symmetric range is exactly "what did
+                    // `branch` add since it diverged from `target`", so a
+                    // branch that forked after its ticket's real work already
+                    // landed reads as empty here regardless of what the merge
+                    // itself reports.
+                    let stat = {
+                        let repo = repo.clone();
+                        let branch = branch.to_string();
+                        let target = target.clone();
+                        blocking_io("repository policy pre-merge diff stat", move || {
+                            repo.diff_stat(&target, &branch)
+                        })
+                        .await?
+                    };
+                    delivery.content_free = stat.files.is_empty() && stat.lines == 0;
                     let repo = repo.clone();
                     let branch = branch.to_string();
                     let target = target.clone();
@@ -3554,8 +3579,14 @@ impl Supervisor {
                 r.merge_commit = delivery.merge_commit.clone();
             }
         })?;
-        // A merged ticket-rat closes its ticket for good.
-        if delivery.merged {
+        // A merged ticket-rat closes its ticket for good — unless its branch
+        // carried no content over the target (`content_free`): a duplicate
+        // rat dispatched onto a ticket whose real branch already landed also
+        // technically "merges" on dismiss (its branch is already an
+        // ancestor-equivalent of target), and that must not read as this
+        // rat having delivered the ticket's work
+        // (TKT-01M0C663BZ86SMA2PVMFP5QJ8D).
+        if delivery.merged && !delivery.content_free {
             if let Some(task) = &record.task {
                 if task.starts_with(crate::tickets::ID_PREFIX) {
                     if let Err(e) = self.tickets.set_status(task, "closed").await {

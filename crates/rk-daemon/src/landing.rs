@@ -94,8 +94,11 @@ const LANDING_QUEUE_IDENTITY: &str = "landing_queue_entry";
 /// [`LandingPipeline::process_entry`] on every terminal outcome. Probed by
 /// [`LandingPipeline::enqueue`] before writing a new queue tuple, so a
 /// redelivered completion for an already-fully-processed candidate is
-/// dropped rather than reprocessed (design doc §2.6).
-const LANDING_PROCESSED_IDENTITY: &str = "landing_processed";
+/// dropped rather than reprocessed (design doc §2.6). `pub(crate)` so
+/// `Server::ticket_reopen_sweep_at` can also probe it directly (by
+/// `payload.task`, not by work key) before reopening an `in_progress`
+/// ticket whose branch already landed — TKT-01M0C663BZ86SMA2PVMFP5QJ8D.
+pub(crate) const LANDING_PROCESSED_IDENTITY: &str = "landing_processed";
 
 /// The two gates that guard every landing attempt regardless of tier —
 /// `examples/workflows/steward.cue`'s `_gates` block, POLICY (#19) and
