@@ -1,14 +1,17 @@
 //! Phase 4: budget enforcement — a runaway (fake) rat crosses its cost cap
 //! and is warned, then killed, with obstacle tuples for the coordinator.
 
+mod support;
+
 use rk_core::paths::Layout;
-use rk_daemon::{Client, Daemon};
+use rk_daemon::Daemon;
 use rk_ledger::Budget;
 use rk_space::Space;
 use serde_json::json;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+use support::connect;
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -22,16 +25,6 @@ fn git(dir: &Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-}
-
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(c) = Client::connect_as_operator(layout).await {
-            return c;
-        }
-    }
-    panic!("daemon did not come up");
 }
 
 /// A runaway fake: emits growing usage forever (haiku pricing: 1e-6/in,

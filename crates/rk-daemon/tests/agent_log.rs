@@ -7,21 +7,14 @@
 //! rats serves each of them separately.
 
 use chrono::{DateTime, TimeDelta, Utc};
+mod support;
+
 use rk_core::paths::Layout;
 use rk_daemon::agents::{AgentRecord, AgentState, Registry};
-use rk_daemon::{Client, Daemon};
+use rk_daemon::Daemon;
 use serde_json::json;
 use std::time::Duration;
-
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(c) = Client::connect_as_operator(layout).await {
-            return c;
-        }
-    }
-    panic!("daemon never came up");
-}
+use support::connect;
 
 /// A fake rat that narrates: one prose chunk, one tool call, then completes.
 /// These `assistant`/`tool_use` events are exactly what `handle_event` used to

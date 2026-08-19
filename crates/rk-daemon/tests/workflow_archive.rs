@@ -10,12 +10,15 @@
 //! running one never does, the run itself survives the move, the clear holds
 //! across a restart, and the whole thing round-trips back.
 
+mod support;
+
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+use support::connect;
 
 /// One `wait` with nothing to wait for: fails inline ("wait step with no active
 /// agent"), so the instance settles `Failed` with no harness in play.
@@ -74,16 +77,6 @@ fn init_repo() -> tempfile::TempDir {
     std::fs::write(wf_dir.join("works.cue"), WORKS).unwrap();
     std::fs::write(wf_dir.join("parks.cue"), PARKS).unwrap();
     repo
-}
-
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(c) = Client::connect_as_operator(layout).await {
-            return c;
-        }
-    }
-    panic!("daemon did not come up");
 }
 
 async fn run(client: &mut Client, repo: &Path, name: &str) -> String {

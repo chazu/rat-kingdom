@@ -6,6 +6,8 @@
 
 use rk_core::config::ReactorConfig;
 use rk_core::id::RecordId;
+mod support;
+
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Pattern, Tuple, FULL_STRENGTH};
 use rk_daemon::reactor::{Reactor, REACTOR_INSTANCE};
@@ -13,13 +15,14 @@ use rk_daemon::repos::{RepoRecord, RepoRegistry};
 use rk_daemon::supervisor::Supervisor;
 use rk_daemon::tickets::{NewTicket, Tickets};
 use rk_daemon::workflow_exec::{InstanceStatus, Selection, WorkflowEngine};
-use rk_daemon::{Client, Daemon};
+use rk_daemon::Daemon;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
+use support::connect;
 
 const WORKING_FAKE: &str = r#"
 read -r _prompt
@@ -1926,16 +1929,6 @@ async fn escalation_notify_can_be_disabled() {
         0,
         "the push is off, so no notification marker is written"
     );
-}
-
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(c) = Client::connect_as_operator(layout).await {
-            return c;
-        }
-    }
-    panic!("daemon did not come up");
 }
 
 // --- Resolution backlinks (TKT-28) ----------------------------------------

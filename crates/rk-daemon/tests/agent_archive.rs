@@ -7,12 +7,15 @@
 //! never do, cost/usage/lineage survives the move, and the whole thing
 //! round-trips back through `agent.unarchive`.
 
+mod support;
+
 use rk_core::paths::Layout;
-use rk_daemon::{Client, Daemon};
+use rk_daemon::Client;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+use support::start_daemon;
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -35,54 +38,6 @@ fn scratch_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
-}
-
-// Exponential backoff capped at 5s total: under full-workspace `cargo test`
-// contention (many real daemon subprocesses starting concurrently) a fixed
-// 1s budget was observed to time out even though the daemon came up shortly
-// after, so this trades a slower failure mode for tolerance of scheduler lag
-// on shared machines.
-async fn connect(layout: &Layout) -> Client {
-    let mut delay = Duration::from_millis(20);
-    let max_delay = Duration::from_millis(200);
-    let deadline = Duration::from_secs(5);
-    let mut waited = Duration::ZERO;
-    loop {
-        tokio::time::sleep(delay).await;
-        waited += delay;
-        if let Ok(c) = Client::connect_as_operator(layout).await {
-            return c;
-        }
-        if waited >= deadline {
-            panic!("daemon did not come up");
-        }
-        delay = (delay * 2).min(max_delay);
-    }
-}
-
-/// Start a daemon against `layout` and connect to it, retrying the whole
-/// start (not just the reconnect) on a transient loss of the singleton
-/// lock — reproduced under parallel `cargo test` load, where this same
-/// process can be running several other tests' daemons concurrently and one
-/// of them can still be a few OS scheduler ticks from fully releasing its
-/// `flock` when this one tries to bind. A plain reconnect loop can never
-/// recover from that: once `Daemon::run()` loses the race for the lock it
-/// returns immediately without ever listening, so nothing will ever answer
-/// the socket no matter how long `connect` polls it.
-async fn start_daemon(layout: &Layout) -> Client {
-    for _ in 0..20 {
-        let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
-        let handle = tokio::spawn(daemon.run());
-        // A daemon that wins the bind runs its accept loop forever, so this
-        // handle deliberately never resolves in the success case — the
-        // timeout is just a generous grace window to catch the failure case,
-        // which in every observed instance resolves in well under 50ms.
-        match tokio::time::timeout(Duration::from_millis(200), handle).await {
-            Err(_) => return connect(layout).await, // still running: bind succeeded
-            Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await, // fast exit: retry
-        }
-    }
-    panic!("daemon repeatedly lost the singleton-lock race against {layout:?}");
 }
 
 /// ONE fake harness for the whole binary, branching on the task name: a

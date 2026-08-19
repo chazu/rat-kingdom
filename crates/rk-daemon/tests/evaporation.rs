@@ -5,20 +5,12 @@
 //! to an Ephemeral lifetime carrying strength, and re-issuing the same trail
 //! reinforces it in place rather than appending a duplicate.
 
-use rk_core::paths::Layout;
-use rk_daemon::{Client, Daemon};
-use serde_json::json;
-use std::time::Duration;
+mod support;
 
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..100 {
-        if let Ok(c) = Client::connect_as_operator(layout).await {
-            return c;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("daemon never came up");
-}
+use rk_core::paths::Layout;
+use rk_daemon::Daemon;
+use serde_json::json;
+use support::connect;
 
 #[tokio::test]
 async fn claim_reinforcement_refreshes_in_place_without_duplicating() {

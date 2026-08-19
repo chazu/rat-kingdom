@@ -18,12 +18,15 @@
 
 mod fixture;
 
+mod support;
+
 use rk_core::paths::Layout;
-use rk_daemon::{Client, Daemon};
+use rk_daemon::Daemon;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+use support::connect;
 
 // Guards the process-global PATH/RK_FAKE_HARNESS_CMD mutation below across
 // this file's tests, mirroring the HARNESS_ENV_LOCK pattern used elsewhere
@@ -52,16 +55,6 @@ fn scratch_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
-}
-
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(c) = Client::connect_as_operator(layout).await {
-            return c;
-        }
-    }
-    panic!("daemon did not come up");
 }
 
 /// Real `git` binary, resolved before PATH is shimmed so the shim has

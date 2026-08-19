@@ -7,20 +7,13 @@
 //! so the cause is visible in `agent.status` and the `agent-failed` inbox row
 //! without an operator ever needing `--attach`.
 
+mod support;
+
 use rk_core::paths::Layout;
-use rk_daemon::{Client, Daemon};
+use rk_daemon::Daemon;
 use serde_json::json;
 use std::time::Duration;
-
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(c) = Client::connect_as_operator(layout).await {
-            return c;
-        }
-    }
-    panic!("daemon never came up");
-}
+use support::connect;
 
 fn scratch_repo(dir: &std::path::Path) {
     let git = |args: &[&str]| {

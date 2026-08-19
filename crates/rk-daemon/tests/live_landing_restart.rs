@@ -16,12 +16,15 @@
 //! on-disk layout that gets killed and replaced by a second `Daemon::new`
 //! over the SAME home — nothing here calls into `rk-daemon`'s internals
 //! directly.
+mod support;
+
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+use support::connect;
 
 mod fixture;
 
@@ -99,16 +102,6 @@ fn init_repo(dir: &Path) {
     std::fs::write(rk_dir.join("checks.cue"), CHECKS).unwrap();
     git(dir, &["add", ".rk/checks.cue"]);
     git(dir, &["commit", "-m", "add checks registry"]);
-}
-
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..200 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(c) = Client::connect_as_operator(layout).await {
-            return c;
-        }
-    }
-    panic!("daemon did not come up");
 }
 
 fn test_config() -> rk_core::config::Config {
