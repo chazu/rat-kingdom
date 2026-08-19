@@ -2,9 +2,10 @@
 // as ONE workflow so a single schedule fires it under a single single-flight
 // lock. It runs three phases back to back, in the order the backlog wants them:
 //
-//   1. GROOM   — decompose / dedupe / tag the ticket backlog (mutates the ticket
-//                store; nothing to merge). Runs first so phase 2 drains a
-//                freshly-groomed queue.
+//   1. GROOM   — decompose oversized tickets and flag duplicates/stale items,
+//                then a groomer closes exactly what it can back with recorded
+//                evidence (mutates the ticket store; nothing to merge). Runs
+//                first so phase 2 drains a freshly-groomed queue.
 //   2. DRAIN   — fan out one rat per ready ticket, run them in parallel, join,
 //                then merge every clean branch in one sweep — the throughput dial.
 //   3. REFINE  — mine the night's obstacle/need tuples and failed runs and
@@ -65,7 +66,10 @@ workflow: {
 		// Grooming mutates the ticket store, not the worktree, so it dismisses
 		// with noMerge. There is deliberately no evaluate gate here: a groom
 		// hiccup is low-stakes and must NOT abort the night — the drain should
-		// still run against whatever ready tickets exist.
+		// still run against whatever ready tickets exist. A second spawn hands
+		// what the first found to a groomer, which closes exactly the
+		// stale/duplicate tickets it can back with recorded evidence — same
+		// two-step split as the à la carte backlog-groom workflow.
 		{
 			type: "spawn"
 			role: "rat"
@@ -75,9 +79,36 @@ workflow: {
 					Read the open backlog:  rk ticket list --status open
 					For each oversized ticket, decompose it:
 					  rk ticket new "<sub>" --parent <TKT-id>
-					Merge duplicates (note the survivor in each), and flag stale items.
-					Do NOT start any ticket. Record what you changed:
-					  rk out artifact $RK_REPO backlog-groom --payload '{"decomposed": N, "deduped": M}'
+					Note duplicate clusters (with a recommended survivor) and any ticket
+					that looks stale, but do NOT close or start any ticket yourself —
+					ticket.update is not available to this role. Record what you found:
+					  rk out artifact $RK_REPO backlog-groom --payload '{"decomposed": N, "duplicates": [...], "stale_candidates": [...]}'
+					Report done.
+					"""
+			}
+		},
+		{type: "wait", timeout: "20m"},
+		{type: "dismiss", noMerge: true},
+		{
+			type: "spawn"
+			role: "groomer"
+			task: {
+				title: "close-evidence-backed-tickets"
+				description: """
+					Read the open and in_progress backlog, including anything the prior
+					decompose/flag pass recorded (rk scan artifact $RK_REPO backlog-groom).
+					For each candidate, gather evidence before acting:
+					- rework: TKT-... tickets — verify with `rk ticket show <target>` that
+					  the target is done AND its fix actually landed (git log --grep or
+					  git merge-base --is-ancestor against the integration branch).
+					- Reported test failures — re-run the named test ONCE with the RK_*
+					  spawn env stripped and confirm it now passes.
+					- Duplicate clusters — confirm the exact same symptom and pick the
+					  survivor with the most complete root-cause analysis.
+					Close ONLY what you can back with evidence:
+					  rk ticket update <TKT-id> --status closed --reason "<stale-rework|stale-flake|duplicate>" --evidence "<what you verified>"
+					Leave anything ambiguous open and hand it off instead:
+					  rk out artifact $RK_REPO backlog-groom --payload '{"closed": N, "handed_off": M}'
 					Report done.
 					"""
 			}
