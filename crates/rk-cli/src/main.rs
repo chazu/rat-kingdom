@@ -447,6 +447,12 @@ enum TicketCommand {
         /// The dependency to remove.
         dep: String,
     },
+    /// Explicitly move a `done` or `closed` ticket back to the backlog.
+    /// Operator/foreman-authorized only — an agent caller is refused, and
+    /// the move is announced as a `ticket_reopened` event. Ordinary `rk
+    /// ticket update --status ...` can never do this: the state machine
+    /// refuses `done -> in_progress` and any backwards move out of `closed`.
+    Reopen(ticket_cmds::ReopenArgs),
 }
 
 #[derive(Subcommand)]
@@ -1371,6 +1377,7 @@ async fn main() -> Result<()> {
             TicketCommand::Undep { id, dep } => {
                 ticket_cmds::dep(&layout, id, dep, true, cli.json).await?
             }
+            TicketCommand::Reopen(args) => ticket_cmds::reopen(&layout, args, cli.json).await?,
         },
     }
 

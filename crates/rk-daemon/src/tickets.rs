@@ -414,8 +414,12 @@ impl Tickets {
         Ok(in_progress)
     }
 
-    /// Reopen a closed ticket as an explicit recovery action (used by
-    /// `rk revert`). Ordinary updates cannot move a closed ticket backwards.
+    /// Reopen a `done` or `closed` ticket as an explicit recovery action
+    /// (used by `rk revert` and the operator/steward-only `rk ticket
+    /// reopen`). Ordinary updates cannot move a ticket backwards out of
+    /// either terminal state — [`valid_transition`] only allows `done` ->
+    /// `closed` — so this is the sole path back to the backlog once a
+    /// ticket has landed there, regardless of which terminal state it is in.
     pub async fn reopen(&self, id: &str, status: &str) -> rk_core::Result<Tuple> {
         if !matches!(status, "open" | "blocked") {
             return Err(rk_core::Error::other(format!(
@@ -861,6 +865,26 @@ mod tests {
             ..Default::default()
         };
         assert!(t.update(&a.identity, ordinary).await.is_err());
+        t.reopen(&a.identity, "open").await.unwrap();
+        assert_eq!(
+            t.get(&a.identity).unwrap().unwrap().payload["status"],
+            "open"
+        );
+    }
+
+    #[tokio::test]
+    async fn done_tickets_require_explicit_reopen() {
+        let t = tickets();
+        let a = t.create(new("x", "system", None)).await.unwrap();
+        set_status(&t, &a.identity, "done").await;
+        let ordinary = TicketChanges {
+            status: Some("in_progress".into()),
+            ..Default::default()
+        };
+        assert!(
+            t.update(&a.identity, ordinary).await.is_err(),
+            "done -> in_progress must stay refused via plain update"
+        );
         t.reopen(&a.identity, "open").await.unwrap();
         assert_eq!(
             t.get(&a.identity).unwrap().unwrap().payload["status"],
