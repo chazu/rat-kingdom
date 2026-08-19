@@ -421,7 +421,10 @@ mod tests {
     #[test]
     fn sampling_a_real_path_reads_disk_and_reports_cpus() {
         let signal = MachineSignal::sample(Path::new(".")).expect("sample");
-        assert!(signal.free_disk_bytes > 0, "a live filesystem has free space");
+        assert!(
+            signal.free_disk_bytes > 0,
+            "a live filesystem has free space"
+        );
         assert!(signal.cpus >= 1);
     }
 }
