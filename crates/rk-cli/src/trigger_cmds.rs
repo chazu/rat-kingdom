@@ -104,9 +104,26 @@ pub fn drift(layout: &Layout, repo: &str, source_dir: Option<&str>) -> Result<Dr
     }
 
     let repo_local = repo.join(".rk").join(REPO_LOCAL_FILENAME);
+    // Repo-local always deploys under the fixed filename regardless of the
+    // source's own name (see `install`), so a plain name lookup only finds
+    // it when the source happens to also be named `triggers.cue`. Fall back
+    // to identifying the source by content: whichever candidate's digest
+    // matches the deployed copy is the one that produced it. If neither
+    // matches, we genuinely cannot attribute the deployed file to a source.
+    let repo_local_source: Option<&PathBuf> = if repo_local.exists() {
+        sources
+            .get(std::ffi::OsStr::new(REPO_LOCAL_FILENAME))
+            .or_else(|| {
+                let deployed_digest = digest(&repo_local).ok()?;
+                sources
+                    .values()
+                    .find(|src| digest(src).ok().as_deref() == Some(deployed_digest.as_str()))
+            })
+    } else {
+        None
+    };
     if repo_local.exists() {
-        let source = sources.get(std::ffi::OsStr::new(REPO_LOCAL_FILENAME));
-        rows.push(drift_row("repo-local", &repo_local, source));
+        rows.push(drift_row("repo-local", &repo_local, repo_local_source));
     }
 
     // Global and repo-local are fallback layers, not two required copies of
@@ -114,7 +131,7 @@ pub fn drift(layout: &Layout, repo: &str, source_dir: Option<&str>) -> Result<Dr
     // a global nor a repo-local deployment sharing its filename.
     for (name, source) in &sources {
         let deployed = layout.triggers_dir().join(name).exists()
-            || (name.as_os_str() == REPO_LOCAL_FILENAME && repo_local.exists());
+            || repo_local_source.is_some_and(|matched| matched == source);
         if !deployed {
             let target = if name.as_os_str() == REPO_LOCAL_FILENAME {
                 repo_local.clone()
@@ -137,10 +154,13 @@ pub fn drift(layout: &Layout, repo: &str, source_dir: Option<&str>) -> Result<Dr
     }
 
     rows.sort_by(|a, b| a.target.cmp(&b.target));
-    let drifted = rows
-        .iter()
-        .filter(|row| row.status == "drifted" || row.status == "missing")
-        .count();
+    // A deployed file with no attributable source ("unmanaged") is exactly
+    // the stale-copy hazard this tool exists to catch (a leftover trigger
+    // still matching a live predicate) — it must fail the check, not just
+    // "drifted" (content mismatch against a known source) or "missing"
+    // (source ships but nothing is deployed). Anything short of "clean"
+    // (including an "unreadable: ..." digest failure) needs attention.
+    let drifted = rows.iter().filter(|row| row.status != "clean").count();
     Ok(DriftReport { rows, drifted })
 }
 
@@ -378,6 +398,76 @@ mod tests {
         let report = drift(&layout, repo.path().to_str().unwrap(), None).unwrap();
         assert_eq!(report.drifted, 1);
         assert!(report.rows.iter().any(|row| row.status == "missing"));
+    }
+
+    #[test]
+    fn repo_local_install_then_drift_round_trips_clean_for_a_renamed_source() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let source_dir = repo.path().join("examples");
+        fs::create_dir_all(&source_dir).unwrap();
+        // The source is not named `triggers.cue` — repo-local install still
+        // normalizes it to the fixed target filename, so a name-only lookup
+        // in drift must not misreport this as unmanaged plus a spurious
+        // "missing" row for the source it was actually installed from.
+        let source = source_dir.join("triggers-landing-pipeline.cue");
+        fs::write(
+            &source,
+            "triggers: [{name: \"steward-landing-on-completion\", action: \"land\"}]\n",
+        )
+        .unwrap();
+        let layout = Layout::at(home.path());
+        install(
+            &layout,
+            source.to_str().unwrap(),
+            Some(repo.path().to_str().unwrap()),
+        )
+        .unwrap();
+
+        let report = drift(&layout, repo.path().to_str().unwrap(), None).unwrap();
+        assert_eq!(report.drifted, 0, "rows: {:?}", report.rows);
+        assert!(report
+            .rows
+            .iter()
+            .any(|row| row.target.starts_with("repo-local:") && row.status == "clean"));
+        assert!(!report.rows.iter().any(|row| row.status == "missing"));
+        assert!(!report.rows.iter().any(|row| row.status == "unmanaged"));
+    }
+
+    #[test]
+    fn drift_exit_relevant_count_flags_unmanaged_stale_copy_alongside_a_clean_trigger() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let source_dir = repo.path().join("examples");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("triggers.cue");
+        fs::write(&source, "triggers: []\n").unwrap();
+        let layout = Layout::at(home.path());
+        install(&layout, source.to_str().unwrap(), None).unwrap();
+
+        // A leftover deployed trigger with no corresponding source anymore —
+        // exactly the double-dispatch hazard this tool exists to catch.
+        fs::write(
+            layout.triggers_dir().join("steward-on-completion.cue"),
+            "triggers: [{name: \"steward-on-completion\"}]\n",
+        )
+        .unwrap();
+
+        let report = drift(&layout, repo.path().to_str().unwrap(), None).unwrap();
+        assert!(
+            report.rows.iter().any(|row| row.status == "clean"),
+            "rows: {:?}",
+            report.rows
+        );
+        assert!(
+            report.rows.iter().any(|row| row.status == "unmanaged"),
+            "rows: {:?}",
+            report.rows
+        );
+        assert_eq!(
+            report.drifted, 1,
+            "a clean trigger alongside an unmanaged stale copy must still fail the check"
+        );
     }
 
     #[test]
