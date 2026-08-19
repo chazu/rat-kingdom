@@ -741,6 +741,67 @@ timeout_secs = "30"
   delivery history, and what lets the `herdr` sink alone honour the pre-sink-
   registry marker key for upgrade continuity.
 
+## Lifecycle hooks
+
+Where the escalation notification above is one hardwired reaction to one
+tuple shape, lifecycle hooks are the general, operator-configured form: run a
+program whenever a tuple satisfies one of a fixed vocabulary of lifecycle
+events, at castle or repo scope. Loaded and dispatched exactly like
+[triggers](#anatomy-of-a-trigger) — same fan-in, same `cue` shell-out
+discipline, same file-stamp cache — but a hook's program is a side effect of
+the event, never a state change the reactor is answerable for, so a failing
+hook degrades exactly like the escalation push above: logged, rate-capped
+announced, and never able to stall the cycle or fail the triggering
+operation.
+
+- **Vocabulary.** `agent_spawned`, `agent_completed`, `agent_failed`,
+  `agent_dismissed`, `branch_landed`, `gate_failed`, `escalation_raised` (see
+  `hook_event_for_tuple` in `crates/rk-daemon/src/reactor.rs` for the exact
+  tuple each maps from — `agent_completed`/`agent_failed` are both the one
+  `harness_result` event, split on its `is_error` field).
+- **Scopes.** Castle-level hooks live at `<home>/hooks/*.cue` — a directory no
+  rat has filesystem or RPC access to, the same absence-of-capability that
+  already keeps `<home>/triggers/*.cue` operator-only. Repo-level hooks live
+  at `<repo>/.rk/hooks.cue`, read from the *registered* checkout the daemon
+  only advances on a landed (reviewed, merged) branch, mirroring
+  `.rk/triggers.cue`'s trust boundary. Neither has an RPC method that writes
+  it, so a rat cannot register a hook by any path.
+- **Repo scoping is additive, not overriding.** An explicit `hook.repo` field
+  always wins; otherwise a repo-local hook file scopes to the repo it was
+  discovered in; a castle-level hook with neither fires for every repo's
+  matching event. A castle hook and a same-event repo hook both fire for that
+  repo — "repo extends castle," the same fan-in relationship triggers already
+  have, not a same-name override.
+- **Payload.** The event tuple as JSON on stdin, plus `RK_HOOK_NAME`,
+  `_EVENT`, `_TUPLE`, `_SCOPE`, `_IDENTITY`, `_INSTANCE`, and — when the tuple
+  carries an `agent` field and the event is one of the three agent-terminal
+  ones (`agent_completed`/`_failed`/`_dismissed`) — `RK_HOOK_AGENT` and
+  `RK_HOOK_TRANSCRIPT_PATH` (that generation's own `agent-logs/*.jsonl` file,
+  via `Supervisor::latest_transcript_path`), so an archive hook can ship the
+  transcript deliberately rather than a personal Claude hook egressing it
+  unconditionally (see `TKT-01M0B8H18Z7FC5CB906AGC6KNF`, the incident this
+  feature answers).
+- **Execution.** `rk_core::exec::run_piped` — the same spawn/stdin/bounded-
+  wait primitive `notify::sinks::CommandSink` uses, extracted so there is one
+  out-of-process execution path in the daemon, not two. `hook.timeoutSecs`
+  bounds the child (default 10s); a program is exec'd directly, not a shell
+  line, for the same injection-avoidance reason `[[notify.sinks]]`'s command
+  sink is.
+- **Idempotency and failure.** One dispatch per `(hook, tuple)`, sharing the
+  triggers' `already_fired`/`reactor_fired` marker ledger under a `hook:`-
+  prefixed key. A failing or wedged hook is always logged
+  (`tracing::warn!`); a `hook_command_failed` obstacle is additionally written
+  at most once per ten minutes *per hook name*, so a hook that matches every
+  completion in a busy repo cannot flood `rk inbox` with one obstacle per
+  tuple.
+- **Not (yet) onboarding-gated.** Unlike a brand-new repo's first
+  `.rk/triggers.cue`, landing a change to `.rk/hooks.cue` on an
+  *already-registered* repo takes effect the moment the daemon's registered
+  checkout advances (ordinary review + merge), the same as any other trigger
+  file edit — there is no separate onboarding-proposal step specific to
+  hooks. See `TKT-01M0BV4Z1Z48ENFE37PWWP846P`'s follow-up ticket if stricter,
+  proposal-gated activation for hook files specifically is ever wanted.
+
 ## Built-in reaction: resolution backlinks
 
 The third built-in turns solved walls into **institutional memory as a living,

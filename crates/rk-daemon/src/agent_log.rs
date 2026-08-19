@@ -322,6 +322,20 @@ impl AgentLog {
             .join(format!("{}.{}.jsonl", sanitize(agent), stamp(start)))
     }
 
+    /// Where one generation's transcript file lives on disk, for a caller
+    /// (a lifecycle hook dispatch) that needs the path itself rather than the
+    /// parsed entries `read` returns. Spawn-keyed generations resolve to the
+    /// [`SpawnId`]-named file; pre-cutover generations fall back to the
+    /// legacy timestamp-windowed name.
+    pub fn transcript_path(&self, generation: &Generation) -> Option<PathBuf> {
+        if let Some(spawn) = generation.spawn {
+            return Some(self.path_for(&generation.agent, spawn));
+        }
+        generation
+            .start
+            .map(|s| self.timestamp_path(&generation.agent, s))
+    }
+
     /// Where transcripts lived before the file was keyed on a generation at
     /// all: read-only history, never appended to again.
     fn legacy_path(&self, agent: &str) -> PathBuf {

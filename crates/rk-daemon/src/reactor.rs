@@ -37,10 +37,10 @@ use rk_core::paths::Layout;
 use rk_core::sdlc::{alert_diagnostic_text_is_unsafe, ConfiguredSourceName, SignalSourcePrincipal};
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, SYSTEM_SCOPE};
 use rk_space::Space;
-use rk_workflow::{Trigger, TriggerAction};
+use rk_workflow::{Hook, Trigger, TriggerAction};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -82,6 +82,16 @@ const FIRE_ATTEMPT_IDENTITY: &str = "reactor_fire_attempt";
 /// param, a rate cap that never clears) to a handful of cycles instead of
 /// forever, while still tolerating a transient blip that clears on its own.
 const MAX_FIRE_ATTEMPTS: u32 = 5;
+/// Bound on a lifecycle hook's child before it is killed, when the hook does
+/// not say its own `timeoutSecs`. Mirrors `[[notify.sinks]]`'s command sink
+/// default.
+const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 10;
+/// Minimum gap between two `hook_command_failed` obstacles for the SAME hook
+/// name: a wedged/misconfigured hook that fires on every completion in a
+/// repo must not flood `rk inbox` with one obstacle per tuple. The failure is
+/// still logged via `tracing::warn!` on every attempt regardless of this cap
+/// — only the durable announcement is rate-capped.
+const HOOK_FAIL_ANNOUNCE_COOLDOWN_SECS: u64 = 600;
 
 /// A loaded trigger plus where it came from (a repo-local file defaults its
 /// target repo to that repo; a global-dir trigger has no default repo).
@@ -91,8 +101,22 @@ struct Loaded {
     source_repo: Option<String>,
 }
 
+/// A loaded hook plus where it came from — same shape as [`Loaded`], and the
+/// same meaning: a repo-local `.rk/hooks.cue` file's hooks default-scope to
+/// that repo (see [`hook_scope_matches`]), a castle-level `<home>/hooks/*.cue`
+/// hook has no default repo and fires for every repo unless it names one
+/// explicitly.
+#[derive(Clone)]
+struct LoadedHook {
+    hook: Hook,
+    source_repo: Option<String>,
+}
+
 /// One candidate trigger file and the repo it belongs to (`None` = global dir).
 type TriggerFile = (PathBuf, Option<String>);
+/// One candidate hook file and the repo it belongs to (`None` = global dir).
+/// Same shape as [`TriggerFile`] so [`file_stamps`] serves both fan-ins.
+type HookFile = (PathBuf, Option<String>);
 
 /// A change-detection stamp for one trigger file: its path, owning repo, and
 /// `(mtime, len)`. Reloading the parsed triggers (a `cue` shell-out per file)
@@ -106,6 +130,13 @@ type FileStamp = (PathBuf, Option<String>, Option<SystemTime>, Option<u64>);
 struct TriggerCache {
     stamps: Vec<FileStamp>,
     triggers: Vec<Loaded>,
+}
+
+/// Parsed hooks plus the file stamps they were parsed from — the hook-fan-in
+/// counterpart of [`TriggerCache`].
+struct HookCache {
+    stamps: Vec<FileStamp>,
+    hooks: Vec<LoadedHook>,
 }
 
 struct AlertDiagnosisContext {
@@ -147,6 +178,14 @@ pub struct Reactor {
     /// stamp changes (see [`TriggerCache`]). Skips the `cue` shell-outs on every
     /// steady-state wake.
     trigger_cache: Mutex<Option<TriggerCache>>,
+    /// Parsed lifecycle hooks cached across cycles — the hook-fan-in
+    /// counterpart of `trigger_cache`.
+    hook_cache: Mutex<Option<HookCache>>,
+    /// Last time a `hook_command_failed` obstacle was announced, per hook
+    /// name — the debounce [`Self::announce_hook_failure`] reads. In-memory
+    /// like `fires`: a storm of hook failures is a live-daemon phenomenon,
+    /// and a restart legitimately resets the window.
+    hook_fail_announced: Mutex<HashMap<String, Instant>>,
     /// The relevant-category populations observed at the end of the previous
     /// cycle: `(promote_pop, coalesce_pop)`. `None` before the first cycle. The
     /// whole-store recomputes (quorum promotion, obstacle coalescence) run only
@@ -291,6 +330,8 @@ impl Reactor {
             queue_seq: Mutex::new(None),
             fires: Mutex::new(HashMap::new()),
             trigger_cache: Mutex::new(None),
+            hook_cache: Mutex::new(None),
+            hook_fail_announced: Mutex::new(HashMap::new()),
             last_pops: Mutex::new(None),
             landing: None,
             sinks,
@@ -354,6 +395,7 @@ impl Reactor {
         // dropped as the cursor advances past it.
         let registry = RepoRegistry::load(&self.layout.home().join("repos.json"))?;
         let triggers = self.cached_triggers(&registry);
+        let hooks = self.cached_hooks(&registry);
 
         let mut fired = 0usize;
         let mut retryable_failure = false;
@@ -368,6 +410,12 @@ impl Reactor {
             if let Err(e) = self.notify_escalation(tuple) {
                 warn!(tuple = %tuple.id, error = %e, "reactor escalation notify failed");
             }
+            // Castle/repo lifecycle hooks (TKT-01M0BV4Z1Z48ENFE37PWWP846P):
+            // an operator-configured program per event, entirely best-effort
+            // like the escalation push above — a wedged or missing hook
+            // program is logged and rate-capped-announced internally, never
+            // able to fail this cycle or pin the cursor.
+            self.dispatch_hooks(tuple, &hooks);
             if let Err(e) = self.react_to_sdlc_ci_transition(tuple) {
                 retryable_failure = true;
                 warn!(tuple = %tuple.id, error = %e, "reactor SDLC CI reaction failed");
@@ -2214,6 +2262,201 @@ impl Reactor {
         out
     }
 
+    /// The ordered candidate hook files this cycle — same fan-in shape as
+    /// [`Self::trigger_files`]: every global `<home>/hooks/*.cue` definition
+    /// (no source repo) then each registered repo's existing
+    /// `.rk/hooks.cue` (source repo = that repo).
+    fn hook_files(&self, registry: &RepoRegistry) -> Vec<HookFile> {
+        let mut files: Vec<HookFile> = rk_workflow::definitions(&self.layout.hooks_dir())
+            .into_iter()
+            .map(|file| (file, None))
+            .collect();
+        for repo in registry.list() {
+            let file = repo.path.join(".rk").join("hooks.cue");
+            if file.exists() {
+                files.push((file, Some(repo.name.clone())));
+            }
+        }
+        files
+    }
+
+    /// Parse the candidate hook files, reusing the cached parse when none of
+    /// their stamps changed — the hook counterpart of
+    /// [`Self::cached_triggers`].
+    fn cached_hooks(&self, registry: &RepoRegistry) -> Vec<LoadedHook> {
+        let files = self.hook_files(registry);
+        let stamps = file_stamps(&files);
+        {
+            let cache = self.hook_cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(c) = cache.as_ref() {
+                if c.stamps == stamps {
+                    return c.hooks.clone();
+                }
+            }
+        }
+        let hooks = self.load_all_hooks(&files);
+        let mut cache = self.hook_cache.lock().unwrap_or_else(|p| p.into_inner());
+        *cache = Some(HookCache {
+            stamps,
+            hooks: hooks.clone(),
+        });
+        hooks
+    }
+
+    /// Load and parse the given hook files (the `cue` shell-out per file). A
+    /// malformed file is logged and skipped, never fatal — the reactor cycle
+    /// must not stall because one hook file has a typo.
+    fn load_all_hooks(&self, files: &[HookFile]) -> Vec<LoadedHook> {
+        let mut out = Vec::new();
+        for (file, source_repo) in files {
+            match rk_workflow::load_hooks(file) {
+                Ok(hs) => out.extend(hs.into_iter().map(|hook| LoadedHook {
+                    hook,
+                    source_repo: source_repo.clone(),
+                })),
+                Err(e) => {
+                    warn!(file = %file.display(), error = %e, "reactor: bad hook file")
+                }
+            }
+        }
+        out
+    }
+
+    /// React to every loaded hook matching `tuple`'s lifecycle event. Never
+    /// returns an error and never sets the cycle's `retryable_failure` flag —
+    /// a hook is a side effect of an event, not a durable state change the
+    /// reactor must guarantee happened, so a wedged program degrades to a
+    /// logged-and-announced failure exactly like [`Self::notify_escalation`].
+    fn dispatch_hooks(&self, tuple: &Tuple, hooks: &[LoadedHook]) {
+        if hooks.is_empty() {
+            return;
+        }
+        let Some(event) = hook_event_for_tuple(tuple) else {
+            return;
+        };
+        for loaded in hooks {
+            let hook = &loaded.hook;
+            if !hook.events.iter().any(|e| e == event) {
+                continue;
+            }
+            if !hook_scope_matches(hook, loaded.source_repo.as_deref(), &tuple.scope) {
+                continue;
+            }
+            // Idempotency: one dispatch per (hook, tuple) for the marker's
+            // life, reusing the same durable `reactor_fired` ledger triggers
+            // use — the `hook:` prefix keeps the key namespace disjoint from
+            // trigger keys (`{trigger.name}@{tuple.id}`), since a hook name
+            // can never itself start with `hook:` (schema-constrained to
+            // `^[a-z][a-z0-9-]*$`).
+            let key = format!("hook:{}@{}", hook.name, tuple.id);
+            match self.already_fired(&key) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(hook = %hook.name, tuple = %tuple.id, error = %e, "reactor hook dedup check failed");
+                    continue;
+                }
+            }
+            self.run_hook(hook, event, tuple);
+            if let Err(e) = self.mark_fired_key(&key, &hook.name, &tuple.id.to_string(), "fired") {
+                warn!(hook = %hook.name, tuple = %tuple.id, error = %e, "reactor failed to record hook fire marker");
+            }
+        }
+    }
+
+    /// Run one hook's program for one matched event. The event tuple lands on
+    /// stdin as JSON; `RK_HOOK_*` env carries the same information
+    /// structured, plus `RK_HOOK_TRANSCRIPT_PATH` for an agent-terminal event
+    /// so an archive hook can ship the generation's transcript deliberately.
+    /// Delegates the actual spawn/timeout/kill to
+    /// [`rk_core::exec::run_piped`] — the same primitive
+    /// `notify::sinks::CommandSink` uses, so there is exactly one
+    /// out-of-process execution path in the daemon, not two.
+    fn run_hook(&self, hook: &Hook, event: &str, tuple: &Tuple) {
+        let timeout = Duration::from_secs(hook.timeout_secs.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS));
+        let mut envs = BTreeMap::from([
+            ("RK_HOOK_NAME".to_string(), hook.name.clone()),
+            ("RK_HOOK_EVENT".to_string(), event.to_string()),
+            ("RK_HOOK_TUPLE".to_string(), tuple.id.to_string()),
+            ("RK_HOOK_SCOPE".to_string(), tuple.scope.clone()),
+            ("RK_HOOK_IDENTITY".to_string(), tuple.identity.clone()),
+            ("RK_HOOK_INSTANCE".to_string(), tuple.instance.clone()),
+        ]);
+        if let Some(agent) = tuple.payload.get("agent").and_then(Value::as_str) {
+            envs.insert("RK_HOOK_AGENT".to_string(), agent.to_string());
+            if is_agent_terminal_event(event) {
+                if let Some(path) = self
+                    .supervisor
+                    .as_ref()
+                    .and_then(|s| s.latest_transcript_path(agent))
+                {
+                    envs.insert(
+                        "RK_HOOK_TRANSCRIPT_PATH".to_string(),
+                        path.to_string_lossy().into_owned(),
+                    );
+                }
+            }
+        }
+        let payload = serde_json::to_vec(tuple).unwrap_or_default();
+        let args = [event.to_string()];
+        match rk_core::exec::run_piped(&hook.command, &args, &envs, &payload, timeout) {
+            Ok(status) if status.success() => {
+                info!(hook = %hook.name, event, tuple = %tuple.id, "reactor ran lifecycle hook");
+            }
+            Ok(status) => self.announce_hook_failure(
+                hook,
+                event,
+                tuple,
+                &format!(
+                    "exited {}",
+                    status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "by signal".into())
+                ),
+            ),
+            Err(e) => self.announce_hook_failure(hook, event, tuple, &e.to_string()),
+        }
+    }
+
+    /// Log every hook failure, but durably announce (write a `hook_command_failed`
+    /// obstacle) at most once per [`HOOK_FAIL_ANNOUNCE_COOLDOWN_SECS`] per hook
+    /// name — a wedged or misconfigured hook that matches every completion in a
+    /// busy repo must not flood `rk inbox` with one obstacle per tuple.
+    fn announce_hook_failure(&self, hook: &Hook, event: &str, tuple: &Tuple, reason: &str) {
+        warn!(hook = %hook.name, event, tuple = %tuple.id, reason, "reactor lifecycle hook failed");
+        let now = Instant::now();
+        let should_announce = {
+            let mut announced = self
+                .hook_fail_announced
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let cooldown = Duration::from_secs(HOOK_FAIL_ANNOUNCE_COOLDOWN_SECS);
+            let due = announced
+                .get(&hook.name)
+                .is_none_or(|last| now.duration_since(*last) >= cooldown);
+            if due {
+                announced.insert(hook.name.clone(), now);
+            }
+            due
+        };
+        if !should_announce {
+            return;
+        }
+        let _ = self.space.out(Tuple::new(
+            Category::Obstacle,
+            SYSTEM_SCOPE,
+            "hook_command_failed",
+            REACTOR_INSTANCE,
+            json!({
+                "hook": hook.name,
+                "event": event,
+                "tuple": tuple.id.to_string(),
+                "reason": reason,
+            }),
+        ));
+    }
+
     fn excluded(&self, trigger: &Trigger, tuple: &Tuple) -> bool {
         tuple.instance == REACTOR_INSTANCE
             || self
@@ -2378,6 +2621,75 @@ fn file_stamps(files: &[TriggerFile]) -> Vec<FileStamp> {
             (path.clone(), repo.clone(), mtime, len)
         })
         .collect()
+}
+
+/// Map a landed tuple onto the lifecycle-hook event vocabulary it satisfies,
+/// if any (see `#Event` in `hooks-schema.cue`). `None` means no hook can ever
+/// match this tuple — most of the tuple stream (ordinary artifacts, needs,
+/// claims, etc.) falls here.
+///
+/// | hook event         | tuple                                                    |
+/// |---------------------|----------------------------------------------------------|
+/// | `agent_spawned`     | `Event` / `agent_spawned`                                 |
+/// | `agent_completed`   | `Event` / `harness_result` with `is_error: false`         |
+/// | `agent_failed`      | `Event` / `harness_result` with `is_error: true`          |
+/// | `agent_dismissed`   | `Event` / `agent_dismissed`                                |
+/// | `branch_landed`     | `Event` / `branch_landed`                                  |
+/// | `gate_failed`       | `Artifact` / `gate-failure`                                |
+/// | `escalation_raised` | `Need` / `steward` (the built-in escalation identity)      |
+fn hook_event_for_tuple(tuple: &Tuple) -> Option<&'static str> {
+    match (tuple.category, tuple.identity.as_str()) {
+        (Category::Event, "agent_spawned") => Some("agent_spawned"),
+        (Category::Event, "harness_result") => {
+            let is_error = tuple
+                .payload
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(if is_error {
+                "agent_failed"
+            } else {
+                "agent_completed"
+            })
+        }
+        (Category::Event, "agent_dismissed") => Some("agent_dismissed"),
+        (Category::Event, "branch_landed") => Some("branch_landed"),
+        (Category::Artifact, "gate-failure") => Some("gate_failed"),
+        (Category::Need, identity) if identity == STEWARD_ESCALATION_IDENTITY => {
+            Some("escalation_raised")
+        }
+        _ => None,
+    }
+}
+
+/// Whether an event carries a specific agent generation whose transcript a
+/// hook might want ([`Reactor::run_hook`]'s `RK_HOOK_TRANSCRIPT_PATH`).
+/// `escalation_raised`/`gate_failed`/`agent_spawned`/`branch_landed` are
+/// repo/branch-scoped, not one generation's terminal narration, so they are
+/// deliberately excluded even though some also carry an `agent` payload
+/// field.
+fn is_agent_terminal_event(event: &str) -> bool {
+    matches!(
+        event,
+        "agent_completed" | "agent_failed" | "agent_dismissed"
+    )
+}
+
+/// Whether `hook` reacts to a tuple scoped to `tuple_scope`: an explicit
+/// `hook.repo` always wins; otherwise a repo-local hook file (`source_repo`)
+/// scopes to the repo it was discovered in; a castle-level hook (neither set)
+/// has no scope at all and fires for every repo's matching event. This is the
+/// "repo overrides/extends castle" half of the acceptance criteria — additive
+/// fan-in, the same relationship `.rk/triggers.cue` already has with
+/// `<home>/triggers/*.cue`, not a same-name override.
+fn hook_scope_matches(hook: &Hook, source_repo: Option<&str>, tuple_scope: &str) -> bool {
+    if let Some(repo) = &hook.repo {
+        return repo == tuple_scope;
+    }
+    match source_repo {
+        Some(repo) => repo == tuple_scope,
+        None => true,
+    }
 }
 
 /// Normalise an obstacle/need report into a stable topic key: lowercase, keep
