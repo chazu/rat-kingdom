@@ -1223,7 +1223,8 @@ mod tests {
         // Preparing does not land: main is untouched while the gate runs.
         assert_eq!(repo.rev_parse("main").unwrap(), candidate.base);
 
-        // The "gate": inspect the candidate's tree. It is reachable purely
+        // The "gate": read the tree a checkout of the candidate would give,
+        // proving it really is the merged result. It is reachable purely
         // because prepare parked it — nothing else points at it yet.
         assert_eq!(
             repo.rev_parse(&candidate.candidate_ref).unwrap(),
@@ -1231,9 +1232,10 @@ mod tests {
         );
         let tested = repo.rev_parse(&candidate.commit).unwrap();
         let gate_saw = repo
-            .git(&["show", "--format=", "--name-only", &tested])
+            .git(&["ls-tree", "-r", "--name-only", &tested])
             .unwrap();
-        assert!(gate_saw.contains("feature.txt"));
+        assert!(gate_saw.contains("feature.txt"), "gate saw: {gate_saw}");
+        assert!(gate_saw.contains("README.md"), "gate saw: {gate_saw}");
 
         let outcome = repo
             .advance_target_to("main", &candidate.commit, &candidate.base)
