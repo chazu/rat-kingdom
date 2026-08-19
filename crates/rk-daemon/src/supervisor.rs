@@ -5542,6 +5542,147 @@ mod respawn_tests {
         assert!(!ordinary.declared_done);
     }
 
+    /// Probe O6/O8, RAT path: a rat whose harness returns control at a turn
+    /// boundary without an `rk done` is PAUSED, not `Completed` — and paused is
+    /// live, so it keeps its drain slot and its ticket.
+    ///
+    /// The two acceptance criteria are asserted through the exact predicate
+    /// each consumer uses: `drain.rs` counts WIP over `state.is_live()`, and
+    /// `Server::ticket_reopen_sweep_once` skips a ticket whose assignee
+    /// `state.is_live()`. Before this state existed both read `Completed` —
+    /// the slot was freed and the ticket recycled onto a duplicate rat while
+    /// the original was still working.
+    #[test]
+    fn a_turn_that_ends_without_rk_done_pauses_the_rat_rather_than_completing_it() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.state = AgentState::Running;
+        let generation = rec.created_at;
+        let spawn = rec.spawn_id();
+        sup.lock_registry().insert(rec).unwrap();
+
+        sup.handle_event(
+            "Nibble",
+            generation,
+            spawn,
+            spawn,
+            HarnessEvent::Completed {
+                result: "still waiting on the check to finish".into(),
+                is_error: false,
+                usage: TokenUsage::default(),
+                cost_usd: None,
+                session_id: None,
+            },
+        );
+
+        let paused = sup.status("Nibble").unwrap();
+        assert_eq!(
+            paused.state,
+            AgentState::Paused,
+            "a clean turn with no `rk done` is a pause, not a completion"
+        );
+        assert!(
+            paused.state.is_live(),
+            "paused must be live: drain WIP and the ticket-reopen sweep both key on is_live()"
+        );
+        assert!(
+            !paused.state.is_archivable(),
+            "a paused agent is still working; archiving it would hide live work"
+        );
+        assert!(
+            !paused.crashed_without_reporting(),
+            "a paused agent has not left the fleet, so a workflow `wait` must keep waiting on it"
+        );
+        assert_eq!(
+            paused.result.as_deref(),
+            Some("still waiting on the check to finish"),
+            "the withheld turn text is kept for the eventual flush"
+        );
+
+        // The next harness event proves the turn resumed.
+        sup.handle_event(
+            "Nibble",
+            generation,
+            spawn,
+            spawn,
+            HarnessEvent::ToolUse {
+                name: "Bash".into(),
+            },
+        );
+        assert_eq!(sup.status("Nibble").unwrap().state, AgentState::Running);
+    }
+
+    /// Probe O6/O8, REVIEWER path: a reviewer that pauses must not fail its
+    /// review workflow, and a genuinely dead one must still terminalize.
+    ///
+    /// `WorkflowExec::abandoned` is the gate that fails a waiting step early;
+    /// it fires on `crashed_without_reporting()`. While paused that is false,
+    /// so the review keeps waiting rather than hard-failing a reviewer that was
+    /// proceeding correctly. Once the process actually exits, the record
+    /// terminalizes promptly to `Failed` — but WITHOUT the crash markers, since
+    /// the harness did report: the withheld turn text survives for
+    /// `flush_withheld_completion` to publish instead of being overwritten by
+    /// the "exited without completing" placeholder.
+    #[test]
+    fn a_paused_reviewer_survives_its_wait_and_a_dead_one_terminalizes_promptly() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.role = "reviewer".into();
+        rec.state = AgentState::Running;
+        rec.usage.output = 4_000;
+        let generation = rec.created_at;
+        let spawn = rec.spawn_id();
+        sup.lock_registry().insert(rec).unwrap();
+
+        sup.handle_event(
+            "Nibble",
+            generation,
+            spawn,
+            spawn,
+            HarnessEvent::Completed {
+                result: "reading the diff; verdict still pending".into(),
+                is_error: false,
+                usage: TokenUsage::default(),
+                cost_usd: None,
+                session_id: None,
+            },
+        );
+        let paused = sup.status("Nibble").unwrap();
+        assert_eq!(paused.state, AgentState::Paused);
+        assert!(
+            !paused.crashed_without_reporting(),
+            "a paused reviewer has not abandoned its wait; the review must not be failed for it"
+        );
+
+        // Now the process really is gone.
+        sup.handle_event("Nibble", generation, spawn, spawn, HarnessEvent::Exited {
+            code: Some(0),
+        });
+        let dead = sup.status("Nibble").unwrap();
+        assert_eq!(
+            dead.state,
+            AgentState::Failed,
+            "a genuinely dead agent must reach a terminal state promptly, not linger paused"
+        );
+        assert!(
+            !dead.state.is_live(),
+            "a dead agent must release its drain slot"
+        );
+        assert!(
+            !dead.crashed,
+            "the harness DID report for a paused record; `crashed` means it never did"
+        );
+        assert_eq!(
+            dead.result.as_deref(),
+            Some("reading the diff; verdict still pending"),
+            "the withheld turn text is what gets published; it must not be overwritten"
+        );
+    }
+
     fn record(repo: &Path, branch: Option<&str>) -> AgentRecord {
         let now = Utc::now();
         AgentRecord {

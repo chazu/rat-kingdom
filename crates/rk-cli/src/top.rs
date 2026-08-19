@@ -290,6 +290,9 @@ fn state_style(state: &str) -> Style {
     match state {
         "running" => Style::default().fg(Color::Green),
         "spawning" => Style::default().fg(Color::Cyan),
+        // Live but parked at a turn boundary — coloured apart from both
+        // `running` (not burning) and `completed` (not finished).
+        "paused" => Style::default().fg(Color::Yellow),
         "completed" => Style::default().fg(Color::DarkGray),
         "dismissed" => Style::default().fg(Color::DarkGray),
         "failed" => Style::default().fg(Color::Red),
