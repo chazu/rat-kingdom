@@ -974,7 +974,7 @@ async fn steward_trigger_fires_on_rat_completion_not_reviewer() {
             "myrepo",
             "harness_result",
             "test-castle",
-            json!({"agent": "reviewer-1", "role": "reviewer", "branch": "rat/x/rev"}),
+            json!({"agent": "reviewer-1", "role": "reviewer", "branch": "rat/x/rev", "spawn": rk_core::id::SpawnId::new().to_string()}),
         ))
         .unwrap();
     assert_eq!(
@@ -990,7 +990,7 @@ async fn steward_trigger_fires_on_rat_completion_not_reviewer() {
             "myrepo",
             "harness_result",
             "test-castle",
-            json!({"agent": "rat-1", "role": "rat", "branch": "rat/x/work"}),
+            json!({"agent": "rat-1", "role": "rat", "branch": "rat/x/work", "spawn": rk_core::id::SpawnId::new().to_string()}),
         ))
         .unwrap();
     assert_eq!(
@@ -1042,7 +1042,7 @@ async fn steward_trigger_resolves_real_repo_for_system_scoped_ticket_completion(
             "myrepo",
             "harness_result",
             "test-castle",
-            json!({"agent": "rat-1", "role": "rat", "branch": "rat/x/work"}),
+            json!({"agent": "rat-1", "role": "rat", "branch": "rat/x/work", "spawn": rk_core::id::SpawnId::new().to_string()}),
         ))
         .unwrap();
     assert_eq!(
@@ -1098,6 +1098,7 @@ async fn non_main_land_target_is_reported_main_is_not() {
                 "role": "rat",
                 "branch": "rat/basil-4/rework",
                 "target": "rat/camembert-4/tkt-9",
+                "spawn": rk_core::id::SpawnId::new().to_string(),
             }),
         ))
         .unwrap();
@@ -1155,6 +1156,7 @@ async fn non_main_land_target_is_reported_main_is_not() {
                 "role": "rat",
                 "branch": "rat/basil-5/work",
                 "target": "main",
+                "spawn": rk_core::id::SpawnId::new().to_string(),
             }),
         ))
         .unwrap();
@@ -1222,7 +1224,9 @@ async fn trigger_param_over_an_absent_payload_field_falls_back_to_the_workflow_d
     let space = rk_space::Space::open_in_memory().unwrap();
     let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
 
-    // No "tag" field in this payload at all.
+    // No "tag" field in this payload at all — and, deliberately, no "spawn"
+    // either: this doubles as the legacy/pre-C3 completion shape, which stays
+    // durable in the space forever and must not crash a trigger fire.
     space
         .out(Tuple::new(
             Category::Event,

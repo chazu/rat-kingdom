@@ -167,6 +167,15 @@ async fn activated_policy_controls_names_target_and_remote_delivery() {
         completion["payload"]["target"], "main",
         "completion must carry the daemon-authored agent base"
     );
+    // C3 (docs/2026-08-17-tkt-c1-generation-identity.md): the producer side
+    // of the spawn-keyed join — a real completion must carry the minted
+    // generation id, not just the display name.
+    assert!(
+        completion["payload"]["spawn"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "harness_result must carry the completing generation's spawn id: {completion:?}"
+    );
     let delivered = client
         .call("agent.dismiss", json!({"name": agent}))
         .await

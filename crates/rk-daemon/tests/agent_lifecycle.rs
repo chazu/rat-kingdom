@@ -116,6 +116,13 @@ async fn spawn_complete_route_dismiss_merge() {
         .unwrap();
     assert_eq!(events["tuples"].as_array().unwrap().len(), 1);
     let payload = &events["tuples"][0]["payload"];
+    // C3 (docs/2026-08-17-tkt-c1-generation-identity.md): the producer side
+    // of the spawn-keyed join — a real completion must carry the minted
+    // generation id, not just the display name.
+    assert!(
+        payload["spawn"].as_str().is_some_and(|s| !s.is_empty()),
+        "harness_result must carry the completing generation's spawn id: {payload:?}"
+    );
     // Review-tiering fields (TKT-01M036N1RT74H6NPRH5FMM8A6T): head_sha is the
     // branch tip the fake rat produced; the one-file, one-line commit
     // classifies as trivial.

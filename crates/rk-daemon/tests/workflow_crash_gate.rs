@@ -238,11 +238,13 @@ async fn a_result_the_crashed_rat_could_not_have_produced_is_rejected() {
     // Wait for the rat to exist, then plant a clean result under its name —
     // after its record's `created_at`, so it passes the generation floor.
     let mut doomed = String::new();
+    let mut doomed_spawn = String::new();
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(20)).await;
         let agents = client.call("agent.list", json!({})).await.unwrap();
         if let Some(first) = agents["agents"].as_array().and_then(|a| a.first()) {
             doomed = first["name"].as_str().unwrap().to_string();
+            doomed_spawn = first["spawn"].as_str().unwrap_or_default().to_string();
             break;
         }
     }
@@ -257,6 +259,13 @@ async fn a_result_the_crashed_rat_could_not_have_produced_is_rejected() {
                 "identity": "harness_result",
                 "payload": {
                     "agent": doomed,
+                    // The doomed rat's OWN spawn id (docs/2026-08-17-tkt-c1-
+                    // generation-identity.md §3G, G5): even a plant that
+                    // matches down to the spawn-keyed join, not merely the
+                    // name+floor one, must still fail the liveness proof
+                    // below — that proof is orthogonal to which key found
+                    // the tuple.
+                    "spawn": doomed_spawn,
                     "role": "rat",
                     "task": "do-the-thing",
                     "is_error": false,

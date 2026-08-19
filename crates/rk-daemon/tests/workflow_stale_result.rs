@@ -211,6 +211,93 @@ async fn wait_ignores_a_predecessors_harness_result() {
     );
 }
 
+/// Spawn-keyed twin of `wait_ignores_a_predecessors_harness_result`
+/// (docs/2026-08-17-tkt-c1-generation-identity.md §3G, G2). The test above
+/// proves the name+floor fallback (`Pattern::for_agent_since`) still works
+/// unchanged — that is the dual-key compat proof. This proves the stronger
+/// claim `Pattern::for_spawn` makes: even a namesake tuple planted AFTER the
+/// live rat's own floor (so the TKT-146 floor alone would NOT exclude it)
+/// cannot satisfy `wait` once the rat carries a minted `SpawnId`, because the
+/// planted tuple names a different generation's id.
+#[tokio::test]
+async fn wait_ignores_a_namesake_tuple_with_a_different_spawn_planted_after_the_floor() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_name = init_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(SLOW_FAKE));
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let id = run_workflow(&mut client, repo_dir.path()).await;
+
+    // Wait for the real rat to exist (and have minted its SpawnId) before the
+    // 3s SLOW_FAKE sleep elapses, so the planted tuple below lands after its
+    // record's own floor.
+    let (name, spawn) = {
+        let mut found = None;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let listed = agents(&mut client).await;
+            if let Some(a) = listed.first() {
+                if let Some(spawn) = a["spawn"].as_str() {
+                    found = Some((a["name"].as_str().unwrap().to_string(), spawn.to_string()));
+                    break;
+                }
+            }
+        }
+        found.expect("the workflow never spawned a rat with a minted spawn id")
+    };
+
+    // A namesake tuple from a fabricated, different generation — planted
+    // AFTER the real rat's floor, wearing its exact name. Under a
+    // floor-only (name+`after_id`) predicate this would satisfy `wait`.
+    let foreign_spawn = rk_core::id::SpawnId::new();
+    assert_ne!(foreign_spawn.to_string(), spawn, "sanity: ids must differ");
+    client
+        .call(
+            "space.out",
+            json!({
+                "category": "event",
+                "scope": repo_name,
+                "identity": "harness_result",
+                "payload": {
+                    "agent": name,
+                    "spawn": foreign_spawn.to_string(),
+                    "role": "rat",
+                    "task": "some-other-generations-task",
+                    "is_error": false,
+                    "result": "STALE result from a different generation of the same name",
+                    "cost_usd": 0.5,
+                    "tokens": 1234,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+
+    let status = await_instance(&mut client, &id).await;
+    assert_eq!(status, "completed", "instance {id} should complete");
+
+    let listed = agents(&mut client).await;
+    assert_eq!(listed.len(), 1, "one rat should have run, got: {listed:?}");
+    let rat = &listed[0];
+    assert_eq!(rat["name"].as_str().unwrap(), name);
+
+    // The rat's OWN result, not the foreign-spawn plant.
+    let result = rat["result"].as_str().unwrap_or("");
+    assert!(
+        result.contains("FRESH"),
+        "the rat's own result should be recorded, got: {result:?}"
+    );
+    assert!(
+        !result.contains("STALE"),
+        "the foreign-spawn tuple must not have satisfied wait: {result:?}"
+    );
+}
+
 /// The root cause, one layer down: archiving a terminal record must not return
 /// its name to the pool. A name is stamped into durable tuples, agent logs,
 /// branches and worktree paths that outlive the record, so recycling it makes
