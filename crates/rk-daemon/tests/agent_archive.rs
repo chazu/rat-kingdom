@@ -37,14 +37,27 @@ fn scratch_repo(dir: &Path) {
     git(dir, &["commit", "-m", "init"]);
 }
 
+// Exponential backoff capped at 5s total: under full-workspace `cargo test`
+// contention (many real daemon subprocesses starting concurrently) a fixed
+// 1s budget was observed to time out even though the daemon came up shortly
+// after, so this trades a slower failure mode for tolerance of scheduler lag
+// on shared machines.
 async fn connect(layout: &Layout) -> Client {
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut delay = Duration::from_millis(20);
+    let max_delay = Duration::from_millis(200);
+    let deadline = Duration::from_secs(5);
+    let mut waited = Duration::ZERO;
+    loop {
+        tokio::time::sleep(delay).await;
+        waited += delay;
         if let Ok(c) = Client::connect_as_operator(layout).await {
             return c;
         }
+        if waited >= deadline {
+            panic!("daemon did not come up");
+        }
+        delay = (delay * 2).min(max_delay);
     }
-    panic!("daemon did not come up");
 }
 
 /// Start a daemon against `layout` and connect to it, retrying the whole
