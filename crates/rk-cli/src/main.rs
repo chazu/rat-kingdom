@@ -304,8 +304,8 @@ enum RepoOnboardCommand {
         /// Stable onboarding session id.
         session: String,
         /// Proposal kind: repo_file (including `.rk/repo.cue`), castle_config,
-        /// registration, workflow_activation, trigger_activation, or
-        /// schedule_activation.
+        /// registration, workflow_activation, trigger_activation,
+        /// schedule_activation, or hook_activation.
         #[arg(long)]
         kind: String,
         /// Human-readable proposal title.
@@ -318,8 +318,8 @@ enum RepoOnboardCommand {
         #[arg(long)]
         target: String,
         /// Action: write_repo_file, change_castle_config,
-        /// register_repository, activate_workflow, activate_trigger, or
-        /// activate_schedule.
+        /// register_repository, activate_workflow, activate_trigger,
+        /// activate_schedule, or activate_hook.
         #[arg(long)]
         action: String,
         /// Exact reviewable unified diff or configuration delta.
