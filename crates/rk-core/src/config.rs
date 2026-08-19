@@ -590,6 +590,24 @@ pub struct WorktreeSweepConfig {
     /// failures, each passing standalone). Tests that specifically cover
     /// this guarantee opt back in explicitly via `set_worktree_sweep_config`.
     pub finalize_cleanup_enabled: bool,
+    /// Regenerable build-artifact paths (relative to a worktree root, e.g.
+    /// `target` for a cargo workspace) reclaimed from EVERY terminal agent's
+    /// worktree — Completed/Failed/Dismissed — regardless of merge state.
+    /// Unlike the git reclaim above, an unmerged branch's build output is
+    /// exactly as regenerable as a merged one's: only these named paths are
+    /// removed, never the worktree, branch, or any source/git state. Empty
+    /// disables artifact reaping entirely. Root-caused by the 2026-08-18 O12
+    /// incident (docs/2026-08-18-drain-probe-log.md): a probe day left 231 GB
+    /// of terminal rats' `target/` dirs standing because the sweep only
+    /// reclaimed MERGED branches' worktrees wholesale, tripping `[disk]
+    /// min_free_gb` and silently stalling drain.
+    pub artifact_paths: Vec<String>,
+    /// Per-repo override of `artifact_paths`, keyed by repo name — a repo
+    /// with an entry here uses THAT list instead of `artifact_paths` (not
+    /// merged with it), for repos whose build tool leaves a differently
+    /// named cache (`node_modules`, `.venv`, ...).
+    #[serde(default)]
+    pub artifact_paths_by_repo: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Default for WorktreeSweepConfig {
@@ -603,6 +621,8 @@ impl Default for WorktreeSweepConfig {
             interval_secs: 3600,
             after_days: 3,
             finalize_cleanup_enabled: true,
+            artifact_paths: vec!["target".to_string()],
+            artifact_paths_by_repo: std::collections::HashMap::new(),
         }
     }
 }
