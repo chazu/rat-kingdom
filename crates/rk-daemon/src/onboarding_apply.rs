@@ -415,6 +415,19 @@ pub(crate) fn validate_automation_file(
                 schedules.len()
             ))
         }
+        OnboardingAutomationKind::Hook => {
+            let hooks = rk_workflow::load_hooks_str(&source)?;
+            if hooks.is_empty() {
+                return Err(rk_core::Error::other(format!(
+                    "{} contains no hooks",
+                    path.display()
+                )));
+            }
+            Ok(format!(
+                "hook schema validation passed for {} definition(s)",
+                hooks.len()
+            ))
+        }
     }
 }
 
@@ -426,6 +439,7 @@ fn automation_validator(kind: OnboardingAutomationKind) -> &'static str {
         OnboardingAutomationKind::Schedule => {
             "rk_workflow::load_schedules_str + rk_daemon::cron::Cron::parse"
         }
+        OnboardingAutomationKind::Hook => "rk_workflow::load_hooks_str",
     }
 }
 

@@ -360,6 +360,30 @@ async fn automation_activation_is_explicit_content_bound_and_restart_safe() {
         json!([schedule["id"].clone()])
     );
 
+    // A hook activation proposal validates against the same #Hook CUE schema
+    // the reactor's lifecycle-hook dispatch loads, exactly like trigger and
+    // schedule activation above.
+    let hook_repo = repository("onboard-hook");
+    let hook_start = start_session(&mut operator, hook_repo.path()).await;
+    let hook_session = hook_start["session"]["id"].as_str().unwrap().to_string();
+    let hook_source = r#"hooks: [{
+	name: "onboarded-hook"
+	events: ["branch_landed"]
+	command: "/usr/local/bin/rk-hook"
+}]
+"#;
+    let hook = stage(
+        &mut operator,
+        &hook_session,
+        "hook_activation",
+        "activate_hook",
+        ".rk/hooks.cue",
+        hook_source,
+    )
+    .await;
+    assert_eq!(hook["validation_results"][0]["automation_kind"], "hook");
+    assert!(!hook_repo.path().join(".rk/hooks.cue").exists());
+
     // Uncommitted edits in the staged worktree are not silently ignored even
     // though activation would read the approved commit rather than those
     // bytes. The operator must restore or repropose the changed content.
