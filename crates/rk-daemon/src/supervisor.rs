@@ -554,6 +554,13 @@ pub struct Supervisor {
     /// [`set_min_free_disk_gb`](Supervisor::set_min_free_disk_gb), so this
     /// safety feature cannot spuriously fail spawns on a tight CI disk.
     min_free_disk_gb: AtomicU64,
+    /// `[machine] max_load_per_cpu` (0 = disabled), the CPU half of the
+    /// scarce-resource signal. Stored as the raw bits of an `f64` in an
+    /// `AtomicU64` (there is no stable `AtomicF64`) for the same reason
+    /// [`min_free_disk_gb`](Self::min_free_disk_gb) is atomic: it is read on
+    /// the hot admission path and set once from config, so a lock would be
+    /// pure contention. Mirrors that field's default-disabled stance.
+    max_load_per_cpu_bits: AtomicU64,
     /// `[disk] shared_cargo_target` (default false here), applied by
     /// `Daemon::new` from config. Mirrors [`min_free_disk_gb`](Self::min_free_disk_gb):
     /// a bare `Supervisor` built by a test stays on each worktree's own
@@ -875,6 +882,7 @@ impl Supervisor {
             merge_queue: MergeQueue::default(),
             test_exec_lock: TestExecLock::default(),
             min_free_disk_gb: AtomicU64::new(0),
+            max_load_per_cpu_bits: AtomicU64::new(0f64.to_bits()),
             shared_cargo_target: AtomicBool::new(false),
             dispatch_paused: AtomicBool::new(false),
             done_kill_grace_secs: AtomicU64::new(
@@ -890,6 +898,22 @@ impl Supervisor {
     /// the supervisor is shared behind an `Arc` from construction onward.
     pub fn set_min_free_disk_gb(&self, gb: u64) {
         self.min_free_disk_gb.store(gb, Ordering::Relaxed);
+    }
+
+    /// Set the `[machine] max_load_per_cpu` ceiling (0 = disabled). Applied by
+    /// `Daemon::new` from config, same pattern as
+    /// [`set_min_free_disk_gb`](Supervisor::set_min_free_disk_gb).
+    pub fn set_max_load_per_cpu(&self, per_cpu: f64) {
+        self.max_load_per_cpu_bits
+            .store(per_cpu.to_bits(), Ordering::Relaxed);
+    }
+
+    /// The currently configured physical-capacity floors, as one value.
+    pub fn machine_floors(&self) -> crate::machine::MachineFloors {
+        crate::machine::MachineFloors {
+            min_free_disk_gb: self.min_free_disk_gb.load(Ordering::Relaxed),
+            max_load_per_cpu: f64::from_bits(self.max_load_per_cpu_bits.load(Ordering::Relaxed)),
+        }
     }
 
     /// Set `[disk] shared_cargo_target`. Applied by `Daemon::new` from
@@ -2300,80 +2324,135 @@ impl Supervisor {
     /// both single spawns and workflow fan-out funnel through here before any
     /// worktree/branch/name is allocated.
     fn check_disk_floor(&self, repo: &str) -> rk_core::Result<()> {
-        let floor_gb = self.min_free_disk_gb.load(Ordering::Relaxed);
-        if floor_gb == 0 {
-            return Ok(());
+        match self.refusing_resource(repo)? {
+            Some(refusal) => Err(rk_core::Error::other(refusal.message(self.layout.home()))),
+            None => Ok(()),
         }
-        let floor_bytes = floor_gb.saturating_mul(BYTES_PER_GB);
-        let available = disk_free_bytes(self.layout.home())?;
-        if available >= floor_bytes {
-            return Ok(());
+    }
+
+    /// Sample this castle's physical capacity and, if a floor is breached,
+    /// make the refusal **loud** before returning it: an obstacle tuple for
+    /// `rk inbox` and an escalation through the notification sinks.
+    ///
+    /// P3a (probe note O12): this is the one place a resource refusal is
+    /// minted, so there is exactly one code path to audit for silence. Every
+    /// caller — the authoritative guard in `spawn`, and the drain's
+    /// pre-claim preflight — gets the announcement for free, which is the
+    /// whole point: the probe's silent stall happened because the *preflight*
+    /// path never reached the announcing code.
+    ///
+    /// Announcing from a preflight polled every drain cycle is safe precisely
+    /// because of the rate cap: `RateCap::per_hour(1)` per resource kind, so a
+    /// sustained breach announces once an hour rather than once a cycle. The
+    /// cap holds-and-raises rather than silencing (see `recovery.rs`), which
+    /// is the same "silence is earned later, not shipped now" stance
+    /// `respawn_sweep` takes.
+    fn refusing_resource(
+        &self,
+        repo: &str,
+    ) -> rk_core::Result<Option<crate::machine::ResourceRefusal>> {
+        let floors = self.machine_floors();
+        if floors.disabled() {
+            return Ok(None);
         }
-        let available_gb = available as f64 / BYTES_PER_GB as f64;
+        let signal = crate::machine::MachineSignal::sample(self.layout.home())?;
+        let Some(refusal) = floors.evaluate(&signal) else {
+            return Ok(None);
+        };
         warn!(
-            available_gb,
-            floor_gb, "disk floor breached — refusing spawn"
+            kind = refusal.kind.class(),
+            detail = %refusal.detail,
+            "machine floor breached — refusing spawn"
         );
-        self.emit_disk_pressure_obstacle(repo, available, floor_bytes);
-        // O12 (docs/2026-08-18-drain-probe-log.md): a disk-floor refusal used
-        // to be visible only via `rk inbox`'s obstacle row, so a stalled
-        // drain went unnoticed for hours. Route through the same
-        // announce-mode machinery every other automated recovery action
-        // uses (`RecoveryAnnouncer`), naming free/floor GB, capped to the
-        // first refusal per rolling hour so a stuck drain does not turn a
-        // sustained breach into a notification storm — the cap raises
-        // severity and keeps announcing instead of going silent, matching
-        // `respawn_sweep`'s "silence is earned later, not shipped now".
+        self.emit_resource_pressure_obstacle(repo, &refusal, &floors);
         let notice = EscalationNotice::new(
             "placeholder",
-            "disk-floor",
+            refusal.kind.class(),
             Severity::Warn,
             repo.to_string(),
             self.layout.home().display().to_string(),
-            format!(
-                "spawn refused: only {available_gb:.1} GB free under {} — below the \
-                 configured floor of {floor_gb} GB ([disk] min_free_gb)",
-                self.layout.home().display()
-            ),
+            refusal.message(self.layout.home()),
         )
-        .with_action("free disk under RK_HOME, e.g. `rk prune --reap-git --reap-artifacts`, or raise [disk] min_free_gb");
+        .with_action(refusal.action.clone());
         if let Err(e) = self.announcer.announce(
             &self.space,
             &self.sinks.lock().unwrap_or_else(|p| p.into_inner()),
             crate::recovery::RecoveryAction {
-                kind: "disk-floor".into(),
+                // Keyed per resource kind so a sustained disk breach's rate cap
+                // cannot swallow a distinct, newly-arrived load breach.
+                kind: refusal.kind.class().into(),
                 instance: "supervisor".into(),
                 notice,
             },
             crate::recovery::RateCap::per_hour(1),
         ) {
-            warn!(error = %e, "failed to announce disk-floor refusal");
+            warn!(error = %e, "failed to announce resource refusal");
         }
-        Err(rk_core::Error::other(format!(
-            "refusing to spawn: only {available_gb:.1} GB free under {} — below the \
-             configured floor of {floor_gb} GB ([disk] min_free_gb)",
-            self.layout.home().display()
-        )))
+        Ok(Some(refusal))
+    }
+
+    /// Read-only-ish preflight for the continuous-drain autoscaler: is the
+    /// machine currently out of a resource? Lets drain skip *before* claiming a
+    /// ticket, rather than claiming it and stranding it `in_progress` when the
+    /// authoritative guard in `spawn` refuses (the generic error arm leaves the
+    /// claim standing — one ticket lost per cycle, which is how O12's stall
+    /// quietly ate the backlog).
+    ///
+    /// Deliberately NOT side-effect free, unlike
+    /// [`would_exceed_budget`](Self::would_exceed_budget): a resource refusal
+    /// must escalate wherever it is decided. The rate cap, not silence, is what
+    /// keeps a per-cycle poll from spamming.
+    pub fn would_refuse_for_resources(&self, repo: &str) -> Option<crate::machine::ResourceRefusal> {
+        match self.refusing_resource(repo) {
+            Ok(refusal) => refusal,
+            // A sampling failure (e.g. statvfs on a vanished path) must not
+            // wedge dispatch: the authoritative guard inside `spawn` re-runs
+            // this and will surface the error there.
+            Err(e) => {
+                warn!(error = %e, "machine signal unavailable; leaving admission to spawn");
+                None
+            }
+        }
     }
 
     /// Companion to [`emit_dispatch_obstacle`](Self::emit_dispatch_obstacle):
     /// same `Category::Obstacle` shape, surfaced by `rk inbox`, but for a
-    /// disk-pressure refusal rather than a budget one.
-    fn emit_disk_pressure_obstacle(&self, repo: &str, available_bytes: u64, floor_bytes: u64) {
+    /// physical-resource refusal rather than a budget one.
+    ///
+    /// Reports the WHOLE signal, not just the resource that tripped: the
+    /// probe's post-mortem was slowed by having a disk figure with no
+    /// contemporaneous load figure beside it.
+    fn emit_resource_pressure_obstacle(
+        &self,
+        repo: &str,
+        refusal: &crate::machine::ResourceRefusal,
+        floors: &crate::machine::MachineFloors,
+    ) {
+        let signal = &refusal.signal;
         let tuple = Tuple::new(
             Category::Obstacle,
             repo.to_string(),
-            "disk-pressure".to_string(),
+            refusal.kind.obstacle_identity().to_string(),
             self.castle.clone(),
             json!({
-                "type": "disk_pressure",
-                "available_bytes": available_bytes,
-                "floor_bytes": floor_bytes,
+                "type": refusal.kind.obstacle_type(),
+                "detail": refusal.detail,
+                "action": refusal.action,
                 "path": self.layout.home().display().to_string(),
+                // Storage half of the signal. `available_bytes`/`floor_bytes`
+                // keep their original names — `rk inbox` and the operator's
+                // muscle memory both already know them.
+                "available_bytes": signal.free_disk_bytes,
+                "floor_bytes": floors.min_free_disk_gb.saturating_mul(crate::machine::BYTES_PER_GB),
+                // CPU half.
+                "load_1m": signal.load_1m,
+                "load_per_cpu": signal.load_per_cpu(),
+                "cpus": signal.cpus,
+                "max_load_per_cpu": floors.max_load_per_cpu,
             }),
         );
         if let Err(e) = self.space.out(tuple.into_trail(DEFAULT_TRAIL_TTL)) {
-            warn!(error = %e, "failed to emit disk pressure obstacle");
+            warn!(error = %e, "failed to emit resource pressure obstacle");
         }
     }
 
@@ -5034,34 +5113,6 @@ fn process_info(pid: u32) -> Option<ProcessInfo> {
         process_group,
         cwd,
     })
-}
-
-const BYTES_PER_GB: u64 = 1024 * 1024 * 1024;
-
-/// Bytes of free space available to the current (non-root) user on the
-/// filesystem containing `path` — `f_bavail`, not the possibly-larger
-/// root-only `f_bfree`, matching what `df` reports as "available" and the
-/// number that actually bounds a new worktree checkout.
-#[cfg(unix)]
-fn disk_free_bytes(path: &std::path::Path) -> rk_core::Result<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|e| {
-        rk_core::Error::other(format!("disk floor check: invalid path {path:?}: {e}"))
-    })?;
-    // SAFETY: statvfs writes into a single stack-allocated struct owned for
-    // the duration of this call; the C string it reads from outlives the call.
-    unsafe {
-        let mut stat: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
-            return Err(rk_core::Error::other(format!(
-                "disk floor check: statvfs({}) failed: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
-    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]

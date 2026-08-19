@@ -203,6 +203,29 @@ impl Drain {
             if self.supervisor.would_exceed_budget(&ticket.scope) {
                 continue;
             }
+            // Preflight the MACHINE (P3a, probe note O12). Without this, a
+            // tripped disk floor is discovered only by the authoritative guard
+            // inside `spawn` — i.e. *after* the claim — and lands in the
+            // generic error arm below, which leaves the ticket stranded
+            // `in_progress` and breaks the cycle. That is how the probe's
+            // silent stall ate the backlog: one ticket quietly orphaned per
+            // cycle, with drain outwardly "just not dispatching".
+            //
+            // Unlike the budget preflight this one is not silent — the refusal
+            // escalates through the notification sinks (rate-capped to one per
+            // resource kind per hour, so a per-cycle poll cannot spam). `break`
+            // rather than `continue`: free disk and load average are properties
+            // of the castle, not of a repo, so no other candidate in this cycle
+            // could fare any better.
+            if let Some(refusal) = self.supervisor.would_refuse_for_resources(&ticket.scope) {
+                warn!(
+                    ticket = %ticket.identity,
+                    kind = refusal.kind.class(),
+                    detail = %refusal.detail,
+                    "drain: machine floor breached; dispatching nothing this cycle"
+                );
+                break;
+            }
             // Route this ticket to a cost tier from its labels/priority and
             // resolve the harness/model/permissions the same way the workflow
             // fan-out does. Done *before* the claim so a config error (unknown
@@ -291,6 +314,24 @@ impl Drain {
                         warn!(ticket = %ticket.identity, error = %reopen_err, "drain: failed to reopen ticket after fleet-wip refusal; ticket left in_progress");
                     }
                     info!(ticket = %ticket.identity, "drain spawn refused by fleet-wip cap; ticket reopened, stopping cycle");
+                    break;
+                }
+                Err(e) if crate::machine::is_resource_refusal(&e) => {
+                    // The machine ran out of disk (or went over the load
+                    // ceiling) between our preflight above and the
+                    // authoritative guard inside `spawn`. Like the fleet-WIP
+                    // case and unlike a config error, this ticket is READY
+                    // WORK, not broken work — stranding it `in_progress`
+                    // silently shrinks the backlog by one ticket per cycle for
+                    // as long as the pressure lasts, which is exactly the
+                    // damage O12 did. Put it back for the next cycle.
+                    //
+                    // `spawn` has already announced the refusal through the
+                    // sinks, so this arm deliberately adds no second escalation.
+                    if let Err(reopen_err) = self.tickets.reopen(&ticket.identity, "open").await {
+                        warn!(ticket = %ticket.identity, error = %reopen_err, "drain: failed to reopen ticket after resource refusal; ticket left in_progress");
+                    }
+                    warn!(ticket = %ticket.identity, error = %e, "drain spawn refused by machine floor; ticket reopened, stopping cycle");
                     break;
                 }
                 Err(e) => {
