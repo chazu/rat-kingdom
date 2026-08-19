@@ -3020,6 +3020,8 @@ impl Daemon {
         let reap = crate::supervisor::Reap {
             git: true,
             logs: false,
+            artifact_paths: self.worktree_sweep_config.artifact_paths.clone(),
+            artifact_paths_by_repo: self.worktree_sweep_config.artifact_paths_by_repo.clone(),
         };
         match self.supervisor.archive_agents(cutoff, false, reap) {
             Ok(value) => value["reaped"]
@@ -5601,6 +5603,16 @@ impl Daemon {
         let reap = crate::supervisor::Reap {
             git: params.reap_git,
             logs: params.reap_logs,
+            artifact_paths: if params.reap_artifacts {
+                self.worktree_sweep_config.artifact_paths.clone()
+            } else {
+                Vec::new()
+            },
+            artifact_paths_by_repo: if params.reap_artifacts {
+                self.worktree_sweep_config.artifact_paths_by_repo.clone()
+            } else {
+                HashMap::new()
+            },
         };
         let supervisor = Arc::clone(&self.supervisor);
         let engine = self.engine();
@@ -6691,6 +6703,11 @@ struct AgentArchiveParams {
     reap_git: bool,
     /// Also delete each archived agent's transcript file. One-way.
     reap_logs: bool,
+    /// Also delete each archived agent's regenerable build-artifact paths
+    /// (`[worktree_sweep] artifact_paths`/`artifact_paths_by_repo`, e.g.
+    /// `target`) from its worktree — regardless of merge state, unlike
+    /// `reap_git`.
+    reap_artifacts: bool,
 }
 
 /// Which slice of the instance store `workflow.list` returns. Defaults (both

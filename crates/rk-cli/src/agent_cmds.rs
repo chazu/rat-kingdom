@@ -87,6 +87,12 @@ pub struct PruneArgs {
     /// loses one.
     #[arg(long)]
     pub reap_logs: bool,
+    /// Also delete each archived agent's regenerable build-artifact paths
+    /// (`target` by default; see `[worktree_sweep]`) from its worktree —
+    /// regardless of merge state, unlike `--reap-git`. Source, git history,
+    /// and the worktree itself are never touched.
+    #[arg(long)]
+    pub reap_artifacts: bool,
 }
 
 #[derive(Args)]
@@ -374,6 +380,7 @@ pub async fn prune(layout: &Layout, args: PruneArgs, as_json: bool) -> Result<()
                 "dry_run": args.dry_run,
                 "reap_git": args.reap_git,
                 "reap_logs": args.reap_logs,
+                "reap_artifacts": args.reap_artifacts,
             }),
         )
         .await?;
@@ -428,7 +435,11 @@ pub async fn prune(layout: &Layout, args: PruneArgs, as_json: bool) -> Result<()
     }
     // Both reap passes report the same row shape, so print them the same way;
     // only the leading tag says which artifact a row is about.
-    for (kind, rows) in [("git", "reaped"), ("log", "reaped_logs")] {
+    for (kind, rows) in [
+        ("git", "reaped"),
+        ("log", "reaped_logs"),
+        ("artifacts", "reaped_artifacts"),
+    ] {
         for r in result[rows].as_array().cloned().unwrap_or_default() {
             println!(
                 "  {kind} {:<8} {:<12} {}",

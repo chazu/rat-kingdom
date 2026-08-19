@@ -473,6 +473,103 @@ async fn reap_git_reclaims_merged_branches_and_refuses_unmerged_ones() {
     );
 }
 
+/// O12 (docs/2026-08-18-drain-probe-log.md): `--reap-artifacts` reclaims a
+/// terminal agent's regenerable build artifacts (default: `target`)
+/// REGARDLESS of merge state — unlike `--reap-git`, an unmerged branch's
+/// build output is exactly as regenerable as a merged one's. A running
+/// agent's artifacts are never touched, and only the named artifact path is
+/// removed: the worktree, branch, and every other file survive.
+#[tokio::test]
+async fn reap_artifacts_reclaims_terminal_worktrees_regardless_of_merge_state() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    let layout = Layout::at(home.path());
+    let mut client = start_daemon(&layout).await;
+
+    // A live agent — its worktree must never be touched by any reap pass.
+    let live = spawn(&mut client, repo_dir.path(), "hang-artifacts-1", json!({})).await;
+    wait_for_state(&mut client, &live, "running").await;
+
+    // A terminal agent whose branch is NEVER merged — the exact case
+    // `reap_git` refuses and leaves standing, but whose `target/` is exactly
+    // as regenerable as a merged branch's.
+    let stranded = spawn(&mut client, repo_dir.path(), "artifacts-1", json!({})).await;
+    wait_for_state(&mut client, &stranded, "completed").await;
+
+    let pick = |rows: &[Value], key: &str, want: &str| -> Value {
+        rows.iter()
+            .find(|r| r[key] == want)
+            .cloned()
+            .unwrap_or_else(|| panic!("no row for {want} in {rows:?}"))
+    };
+    let agents = list(&mut client, json!({})).await;
+    let live_worktree =
+        std::path::PathBuf::from(pick(&agents, "name", &live)["worktree"].as_str().unwrap());
+    let stranded_rec = pick(&agents, "name", &stranded);
+    let stranded_worktree =
+        std::path::PathBuf::from(stranded_rec["worktree"].as_str().unwrap());
+    let stranded_branch = stranded_rec["branch"].as_str().unwrap().to_string();
+
+    // Simulate a cargo build in both worktrees.
+    for wt in [&live_worktree, &stranded_worktree] {
+        std::fs::create_dir_all(wt.join("target/debug")).unwrap();
+        std::fs::write(wt.join("target/debug/build-marker"), b"binary").unwrap();
+        // A sibling file that must never be touched by an artifact-only reap.
+        std::fs::write(wt.join("keepme.txt"), b"source, not artifact").unwrap();
+    }
+
+    let result = client
+        .call("agent.archive", json!({"all": true, "reap_artifacts": true}))
+        .await
+        .unwrap();
+    assert_eq!(result["count"], 1, "the running agent must not be archived");
+
+    let reaped = result["reaped_artifacts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let row = pick(&reaped, "agent", &stranded);
+    assert_eq!(row["reaped"], json!(true), "{}", row["reason"]);
+    assert!(
+        row["reason"].as_str().unwrap_or("").contains("target"),
+        "reason names what was removed: {}",
+        row["reason"]
+    );
+
+    assert!(
+        !stranded_worktree.join("target").exists(),
+        "the terminal (though unmerged) agent's target/ must be reaped"
+    );
+    assert!(
+        stranded_worktree.join("keepme.txt").exists(),
+        "artifact reap must never touch source files"
+    );
+    assert!(
+        stranded_worktree.exists(),
+        "artifact reap must never remove the worktree itself"
+    );
+    let branches = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir.path())
+        .args(["branch", "--list", "--format=%(refname:short)"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&branches.stdout)
+            .lines()
+            .any(|b| b == stranded_branch),
+        "artifact reap must never delete the branch"
+    );
+
+    assert!(
+        live_worktree.join("target").exists(),
+        "a live agent's build artifacts must never be touched"
+    );
+}
+
 /// `--reap-logs` (TKT-162) reclaims the last artifact an archived rat leaves
 /// behind: its `agent-logs/` transcript. Each file is a bounded ring, but the
 /// COUNT grew once per rat forever.
