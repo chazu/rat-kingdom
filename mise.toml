@@ -41,7 +41,13 @@ run = "env -u RK_AGENT cargo test --workspace"
 
 [tasks.verify]
 description = "Build, test, and lint — the checks a rat must pass before `rk done`"
+# Mirrors .github/workflows/ci.yml step-for-step (fmt, clippy --all-targets,
+# test) so one profile means one thing: a local `mise run verify` pass implies
+# a CI pass, not just a build+test pass. Previously verify ran neither
+# `cargo fmt --check` nor clippy against test/bench targets, so CI and
+# reviewers caught fmt/clippy issues verify had already reported clean.
 run = """
+cargo fmt --all --check
 cargo build --workspace
 env -u RK_AGENT cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
