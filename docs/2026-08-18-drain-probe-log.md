@@ -89,6 +89,21 @@ burn detection, stale-instance timeout, ticket reopen, announce sinks).*
   landing-blindness + that one predicate. Two fixes retire the whole
   class.
 
+- **O18** (close-out) — **CORRECTED**: initially recorded as "queued
+  landing entries do not survive a rollover" after five branches sat
+  queued with no gate run and an idle fleet. That diagnosis was WRONG:
+  minutes later the pipeline landed an older queued branch unaided, so
+  the queue survived the restart and was simply working through a deep
+  serial backlog (each entry = spawn reviewer + full gate run, minutes
+  each, one at a time). The operator hand-landed five branches that
+  would have landed on their own given time — an unnecessary
+  intervention, and a caution for the epic: **queue depth is invisible**
+  (`rk inbox` shows escalations, not pending entries), which is what made
+  a slow queue look like a dead one. Real finding: expose landing-queue
+  depth and per-entry age in status/inbox, and treat the serial gate as
+  the throughput constraint P2's batching addresses. P2d's scope stays
+  as filed (in-flight gate runs), priority restored to normal.
+
 ## Day-1 summary (T+~15h)
 
 **Volume:** 44 agents (39 rats, 5 reviewers), ~$144 recorded spend (true
