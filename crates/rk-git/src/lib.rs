@@ -305,6 +305,17 @@ impl Repo {
         self.branch_exists(branch) && self.advanced_past(branch, target)
     }
 
+    /// Whether `branch` contains at least one commit after its recorded
+    /// creation point. The fork commit is durable caller state; unlike a
+    /// merge-base computed after the fact, it does not collapse to the branch
+    /// tip after a legitimate fast-forward merge.
+    pub fn branch_has_commits_since(&self, branch: &str, fork_point: &str) -> bool {
+        let Ok(head) = self.rev_parse(branch) else {
+            return false;
+        };
+        head != fork_point && self.is_ancestor(fork_point, branch)
+    }
+
     /// Resolve `rev` (a branch name, sha, or any revision `git` accepts) to its
     /// full commit sha.
     ///
@@ -2018,6 +2029,26 @@ mod tests {
         assert!(
             !repo.branch_verified_merged(&branch, "main"),
             "an empty branch must not read as verifiably merged"
+        );
+    }
+
+    #[test]
+    fn recorded_fork_point_distinguishes_empty_from_fast_forward_merged() {
+        let (dir, repo) = scratch_repo();
+        let fork = repo.rev_parse("main").unwrap();
+        let empty = empty_branch(dir.path(), &repo, "empty", "task-empty");
+        assert!(!repo.branch_has_commits_since(&empty, &fork));
+
+        let work = commit_on_branch(dir.path(), &repo, "worker", "task-work");
+        assert!(repo.branch_has_commits_since(&work, &fork));
+        run(repo.root(), &["merge", "--ff-only", &work]);
+        assert_eq!(
+            repo.rev_parse("main").unwrap(),
+            repo.rev_parse(&work).unwrap()
+        );
+        assert!(
+            repo.branch_has_commits_since(&work, &fork),
+            "the durable fork remains distinct after target fast-forwards to head"
         );
     }
 

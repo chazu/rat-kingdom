@@ -855,6 +855,7 @@ mod tests {
             repo_name: "repo".into(),
             task: Some("TKT-9".into()),
             branch: Some(format!("rat/{name}/tkt-9")),
+            fork_point: None,
             worktree: Some(format!("/tmp/wt/{name}").into()),
             target_branch: "main".into(),
             parent: None,

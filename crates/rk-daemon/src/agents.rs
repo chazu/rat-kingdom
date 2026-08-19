@@ -125,6 +125,11 @@ pub struct AgentRecord {
     pub repo_name: String,
     pub task: Option<String>,
     pub branch: Option<String>,
+    /// Commit the branch was cut from. Paired with the branch head at handoff
+    /// time, this proves the branch carried at least one commit even after a
+    /// forge fast-forward makes target and branch refs identical.
+    #[serde(default)]
+    pub fork_point: Option<String>,
     pub worktree: Option<PathBuf>,
     /// Merge target on dismissal.
     pub target_branch: String,
@@ -754,6 +759,7 @@ mod tests {
             repo_name: "repo".into(),
             task: Some(".rk-1".into()),
             branch: Some(format!("rat/{name}/rk-1")),
+            fork_point: None,
             worktree: Some(format!("/tmp/wt/{name}").into()),
             target_branch: "main".into(),
             parent: None,

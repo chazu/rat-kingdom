@@ -284,6 +284,7 @@ fn terminal_record(name: &str, created_at: DateTime<Utc>) -> AgentRecord {
         repo_name: "repo".into(),
         task: Some(format!("task-for-{created_at}")),
         branch: None,
+        fork_point: None,
         worktree: None,
         target_branch: "main".into(),
         parent: None,

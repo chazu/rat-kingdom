@@ -742,6 +742,7 @@ mod tests {
             repo_name: "repo".into(),
             task: Some(name.into()),
             branch: Some(format!("rat/{name}")),
+            fork_point: None,
             worktree: None,
             target_branch: "main".into(),
             parent: parent.map(str::to_string),

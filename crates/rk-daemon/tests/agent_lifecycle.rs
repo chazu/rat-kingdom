@@ -242,6 +242,10 @@ async fn ticket_dispatched_rat_closes_its_ticket() {
     assert_eq!(dismissed["merged"], true);
     let t = client.call("ticket.get", json!({"id": id})).await.unwrap();
     assert_eq!(t["ticket"]["payload"]["status"], "closed");
+    assert_eq!(
+        t["ticket"]["payload"]["delivery"]["merge_commit"], dismissed["merge_commit"],
+        "dismiss writes the same durable delivery proof as the landing pipeline"
+    );
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }

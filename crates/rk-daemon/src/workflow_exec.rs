@@ -5832,6 +5832,7 @@ test a::flaky ... FAILED
             repo_name: "repo".into(),
             task: Some("t".into()),
             branch: Some("rat/nibble/t".into()),
+            fork_point: None,
             worktree: Some(PathBuf::from("/repo")),
             target_branch: "main".into(),
             parent: None,

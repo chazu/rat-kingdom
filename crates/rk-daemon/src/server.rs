@@ -2888,7 +2888,7 @@ impl Daemon {
         &self,
         event_sets: &[&[Tuple]],
     ) -> rk_core::Result<HashSet<(String, String)>> {
-        let events: Vec<(String, String, String)> = event_sets
+        let events: Vec<(String, String, String, bool)> = event_sets
             .iter()
             .flat_map(|s| s.iter())
             .filter_map(|t| {
@@ -2898,7 +2898,23 @@ impl Daemon {
                     .get("target")
                     .and_then(|v| v.as_str())
                     .unwrap_or("main");
-                Some((t.scope.clone(), branch.to_string(), target.to_string()))
+                let content_proven = if t.identity == "pull_request_opened" {
+                    match (
+                        t.payload.get("fork_point").and_then(Value::as_str),
+                        t.payload.get("head_sha").and_then(Value::as_str),
+                    ) {
+                        (Some(fork), Some(head)) => !fork.is_empty() && head != fork,
+                        _ => false,
+                    }
+                } else {
+                    t.payload.get("content_free").and_then(Value::as_bool) == Some(false)
+                };
+                Some((
+                    t.scope.clone(),
+                    branch.to_string(),
+                    target.to_string(),
+                    content_proven,
+                ))
             })
             .collect();
         // Resolve scopes to paths once, under the registry lock, then release it
@@ -2910,7 +2926,7 @@ impl Daemon {
                 .repos
                 .lock()
                 .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
-            for (scope, _, _) in &events {
+            for (scope, _, _, _) in &events {
                 if !paths.contains_key(scope) {
                     if let Some(rec) = reg.get(scope) {
                         paths.insert(scope.clone(), rec.path.clone());
@@ -2968,7 +2984,7 @@ impl Daemon {
         }
         // Still-open (scope, branch) -> target, deduped (a re-land repeats the
         // event for one branch; target is stable per branch).
-        let mut pending: std::collections::HashMap<(String, String), String> =
+        let mut pending: std::collections::HashMap<(String, String), (String, bool)> =
             std::collections::HashMap::new();
         for t in &open {
             let Some(branch) = t.payload.get("branch").and_then(|v| v.as_str()) else {
@@ -2984,7 +3000,14 @@ impl Daemon {
                 .and_then(|v| v.as_str())
                 .unwrap_or("main")
                 .to_string();
-            pending.insert(key, target);
+            let content_proven = match (
+                t.payload.get("fork_point").and_then(Value::as_str),
+                t.payload.get("head_sha").and_then(Value::as_str),
+            ) {
+                (Some(fork), Some(head)) => !fork.is_empty() && head != fork,
+                _ => false,
+            };
+            pending.insert(key, (target, content_proven));
         }
         if pending.is_empty() {
             return 0;
@@ -2992,8 +3015,10 @@ impl Daemon {
         // Group by scope so each repo is fetched exactly once per cycle.
         let mut by_scope: std::collections::HashMap<String, Vec<(String, String)>> =
             std::collections::HashMap::new();
-        for ((scope, branch), target) in pending {
-            by_scope.entry(scope).or_default().push((branch, target));
+        for ((scope, branch), (target, content_proven)) in pending {
+            if content_proven {
+                by_scope.entry(scope).or_default().push((branch, target));
+            }
         }
         // Resolve scopes to repo paths once, under the registry lock, then
         // release it before shelling out to git.
@@ -6444,7 +6469,7 @@ impl Daemon {
 }
 
 fn cleared_branches_for_paths(
-    events: Vec<(String, String, String)>,
+    events: Vec<(String, String, String, bool)>,
     paths: HashMap<String, std::path::PathBuf>,
 ) -> HashSet<(String, String)> {
     let mut cleared = HashSet::new();
@@ -6452,7 +6477,10 @@ fn cleared_branches_for_paths(
     // carries several events (a retried land, a re-push), and the answer cannot
     // differ between them.
     let mut asked: HashSet<(String, String)> = HashSet::new();
-    for (scope, branch, target) in events {
+    for (scope, branch, target, content_proven) in events {
+        if !content_proven {
+            continue;
+        }
         let key = (scope.clone(), branch.clone());
         if !asked.insert(key.clone()) {
             continue;
@@ -6468,6 +6496,63 @@ fn cleared_branches_for_paths(
         }
     }
     cleared
+}
+
+#[cfg(test)]
+mod branch_clear_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(repo: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn review_clear_requires_durable_proof_that_the_branch_carried_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-b", "main"]);
+        git(repo, &["config", "user.email", "r@x"]);
+        git(repo, &["config", "user.name", "R"]);
+        std::fs::write(repo.join("f"), "base\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "base"]);
+        git(repo, &["branch", "empty", "main"]);
+
+        let paths = HashMap::from([("repo".to_string(), repo.to_path_buf())]);
+        let cleared = cleared_branches_for_paths(
+            vec![("repo".into(), "empty".into(), "main".into(), false)],
+            paths,
+        );
+        assert!(
+            cleared.is_empty(),
+            "an empty branch equals main but must stay surfaced without content proof"
+        );
+
+        git(repo, &["checkout", "-b", "work", "main"]);
+        std::fs::write(repo.join("g"), "work\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "work"]);
+        git(repo, &["checkout", "main"]);
+        git(repo, &["merge", "--ff-only", "work"]);
+        let paths = HashMap::from([("repo".to_string(), repo.to_path_buf())]);
+        let cleared = cleared_branches_for_paths(
+            vec![("repo".into(), "work".into(), "main".into(), true)],
+            paths,
+        );
+        assert!(cleared.contains(&("repo".into(), "work".into())));
+    }
 }
 
 fn max_cursor(left: Option<u64>, right: Option<u64>) -> Option<u64> {
@@ -7759,6 +7844,7 @@ mod authorize_reasoned_tests {
             repo_name: "repo".into(),
             task: Some("auth-reason-test".into()),
             branch: Some("rat/invalid-rat/auth-reason-test".into()),
+            fork_point: None,
             worktree: Some(PathBuf::from("/tmp/worktree/invalid-rat")),
             target_branch: "main".into(),
             parent: None,
@@ -8156,6 +8242,7 @@ mod ticket_reopen_sweep_tests {
             repo_name: "repo".into(),
             task: Some(task.into()),
             branch: Some(format!("rat/{name}/task")),
+            fork_point: None,
             worktree: Some(PathBuf::from(format!("/tmp/worktree/{name}"))),
             target_branch: "main".into(),
             parent: None,

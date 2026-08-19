@@ -765,6 +765,7 @@ mod tests {
             repo_name: "rat-kingdom".into(),
             task: Some("do work".into()),
             branch: None,
+            fork_point: None,
             worktree: None,
             target_branch: "main".into(),
             parent: None,

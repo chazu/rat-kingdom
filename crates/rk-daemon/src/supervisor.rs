@@ -264,6 +264,7 @@ struct SpawnJournal<'a> {
     repo_name: &'a str,
     name: String,
     branch: String,
+    fork_point: String,
     worktree: PathBuf,
     target_branch: String,
     harness: String,
@@ -285,6 +286,7 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
         repo_name: journal.repo_name.to_string(),
         task: Some(journal.params.task.clone()),
         branch: Some(journal.branch),
+        fork_point: Some(journal.fork_point),
         worktree: Some(journal.worktree),
         target_branch: journal.target_branch,
         parent: journal.params.parent.clone(),
@@ -341,6 +343,7 @@ fn ticket_undelivered_reason(
     repo: &Repo,
     branch: &str,
     target: &str,
+    fork_point: Option<&str>,
     gate_push_branch: bool,
 ) -> Option<String> {
     match policy.delivery.mode {
@@ -358,7 +361,11 @@ fn ticket_undelivered_reason(
             }
         }
         DeliveryMode::PushBranch if gate_push_branch => {
-            if repo.remote_branch_merged_or_gone(branch, target, &policy.delivery.remote) {
+            let carries_work =
+                fork_point.is_some_and(|fork| repo.branch_has_commits_since(branch, fork));
+            if carries_work
+                && repo.remote_branch_merged_or_gone(branch, target, &policy.delivery.remote)
+            {
                 None
             } else {
                 Some(format!(
@@ -380,6 +387,7 @@ async fn ticket_delivered(
     repo_root: PathBuf,
     branch: String,
     target: String,
+    fork_point: Option<String>,
     gate_push_branch: bool,
 ) -> rk_core::Result<()> {
     blocking_io("ticket delivery gate", move || {
@@ -395,7 +403,14 @@ async fn ticket_delivered(
             ))
         })?;
         let policy = resolve_repository_policy(&home, &repo);
-        match ticket_undelivered_reason(&policy, &repo, &branch, &target, gate_push_branch) {
+        match ticket_undelivered_reason(
+            &policy,
+            &repo,
+            &branch,
+            &target,
+            fork_point.as_deref(),
+            gate_push_branch,
+        ) {
             None => Ok(()),
             Some(reason) => Err(rk_core::Error::other(reason)),
         }
@@ -1120,6 +1135,10 @@ impl Supervisor {
             None => repo_policy.delivery_target(&repo.current_branch()?),
         };
         let instruction_base = self.instruction_base(&params.role, &target_branch, &repo);
+        // Capture before creating the branch. Unlike a later merge-base read,
+        // this remains the original fork even after a forge fast-forwards the
+        // target to the branch tip.
+        let fork_point = repo.rev_parse(&target_branch)?;
 
         // Resolve the harness before journaling so an unknown adapter never
         // leaves a durable failed row. After this point every side effect has a
@@ -1186,6 +1205,7 @@ impl Supervisor {
             repo_name: &repo_name,
             name: name.clone(),
             branch: branch.clone(),
+            fork_point,
             worktree: worktree.clone(),
             target_branch: target_branch.clone(),
             harness: effective.harness.clone(),
@@ -3520,6 +3540,7 @@ impl Supervisor {
                     let repo_root = record.repo_root.clone();
                     let branch = record.branch.clone();
                     let target = record.target_branch.clone();
+                    let fork_point = record.fork_point.clone();
                     tokio::spawn(async move {
                         // Bind `done` to delivery per delivery-mode policy
                         // (TKT-01M08HB566GFBZVMDKZ8DT1ES0 / strategic-review
@@ -3538,7 +3559,8 @@ impl Supervisor {
                         // has nothing to gate on and proceeds as before.
                         let gate = match branch {
                             Some(branch) => {
-                                ticket_delivered(home, repo_root, branch, target, false).await
+                                ticket_delivered(home, repo_root, branch, target, fork_point, false)
+                                    .await
                             }
                             None => Ok(()),
                         };
@@ -3738,6 +3760,15 @@ impl Supervisor {
             .cloned()
     }
 
+    fn recorded_fork_point(&self, repo_root: &std::path::Path, branch: &str) -> Option<String> {
+        self.lock_registry()
+            .list_all()
+            .into_iter()
+            .filter(|r| r.repo_root == repo_root && r.branch.as_deref() == Some(branch))
+            .max_by_key(|r| r.created_at)
+            .and_then(|r| r.fork_point.clone())
+    }
+
     /// Refuse an explicit `done` (steward/operator `rk ticket update --status
     /// done`) on a ticket whose branch has not actually landed per its repo's
     /// delivery-mode policy — closing the "approved but never merged" class
@@ -3780,6 +3811,7 @@ impl Supervisor {
             record.repo_root.clone(),
             branch,
             record.target_branch.clone(),
+            record.fork_point.clone(),
             true,
         )
         .await
@@ -4019,6 +4051,10 @@ impl Supervisor {
         let repo =
             blocking_io("dismiss repo discovery", move || Repo::discover(&repo_path)).await?;
         let policy = self.repository_policy(&repo);
+        let handoff_head = record
+            .branch
+            .as_deref()
+            .and_then(|branch| repo.rev_parse(branch).ok());
         let mut delivery = BranchDelivery {
             target: record.target_branch.clone(),
             remote: policy.delivery.remote,
@@ -4101,8 +4137,25 @@ impl Supervisor {
                             "dismiss merged but ticket's branch is still queued for landing; \
                              leaving ticket in_progress for the pipeline to close"
                         );
-                    } else if let Err(e) = self.tickets.set_status(task, "closed").await {
-                        warn!(ticket = %task, error = %e, "failed to close ticket on dismiss");
+                    } else if let (Some(commit), Some(branch)) =
+                        (delivery.merge_commit.as_ref(), record.branch.as_ref())
+                    {
+                        let landed = crate::tickets::DeliveryRecord {
+                            merge_commit: commit.clone(),
+                            branch: branch.clone(),
+                            target: delivery.target.clone(),
+                            landed_at: Utc::now().to_rfc3339(),
+                        };
+                        if let Err(e) = self.tickets.record_delivery(task, &landed).await {
+                            warn!(ticket = %task, error = %e, "failed to record ticket delivery on dismiss");
+                        }
+                    } else {
+                        warn!(
+                            ticket = %task,
+                            agent = %name,
+                            "dismiss reported a non-empty merge without a merge commit/branch; \
+                             refusing to close the ticket without durable delivery proof"
+                        );
                     }
                 }
             }
@@ -4152,6 +4205,8 @@ impl Supervisor {
                 json!({
                     "agent": name,
                     "branch": &record.branch,
+                    "fork_point": &record.fork_point,
+                    "head_sha": &handoff_head,
                     "target": &delivery.target,
                     "remote": &delivery.remote,
                     "remote_branch": &delivery.remote_branch,
@@ -4394,6 +4449,8 @@ impl Supervisor {
         let repo_path = repo_root.to_path_buf();
         let repo = blocking_io("land repo discovery", move || Repo::discover(&repo_path)).await?;
         let repo_name = repo.name();
+        let fork_point = self.recorded_fork_point(repo.root(), branch);
+        let head_sha = repo.rev_parse(branch).ok();
         let delivery = self
             .deliver_branch(&repo, &repo_name, branch, target, keep_branch)
             .await?;
@@ -4426,6 +4483,8 @@ impl Supervisor {
                 "pull_request_opened",
                 json!({
                     "branch": branch,
+                    "fork_point": fork_point,
+                    "head_sha": head_sha,
                     "target": result.get("target"),
                     "remote": result.get("remote"),
                     "remote_branch": result.get("remote_branch"),
@@ -4471,6 +4530,8 @@ impl Supervisor {
         })
         .await?;
         let repo_name = repo.name();
+        let fork_point = self.recorded_fork_point(repo.root(), branch);
+        let head_sha = repo.rev_parse(branch).ok();
         let policy = self.repository_policy(&repo);
         let remote = policy.delivery.remote.clone();
         let remote_branch = policy.remote_branch(branch, target, &repo_name);
@@ -4507,6 +4568,8 @@ impl Supervisor {
                 "pull_request_opened",
                 json!({
                     "branch": branch,
+                    "fork_point": fork_point,
+                    "head_sha": head_sha,
                     "target": target,
                     "remote": result.get("remote"),
                     "remote_branch": result.get("remote_branch"),
@@ -5603,6 +5666,7 @@ mod respawn_tests {
             repo_name: "repo",
             name: "Nibble".into(),
             branch: "rat/nibble/task".into(),
+            fork_point: "base".into(),
             worktree: repo_dir.path().join("worktree"),
             target_branch: "integration".into(),
             harness: "fake".into(),
@@ -5659,6 +5723,7 @@ mod respawn_tests {
             repo_name: "repo",
             name: "Nibble".into(),
             branch: "rat/nibble/task".into(),
+            fork_point: "base".into(),
             worktree: repo_dir.path().join("worktree"),
             target_branch: "main".into(),
             harness: worker.harness,
@@ -5917,6 +5982,7 @@ mod respawn_tests {
             repo_name: "repo".into(),
             task: Some("t".into()),
             branch: branch.map(String::from),
+            fork_point: None,
             worktree: Some(repo.to_path_buf()),
             target_branch: "main".into(),
             parent: None,
@@ -6015,12 +6081,28 @@ mod respawn_tests {
         git(p, &["checkout", "-b", "nowork", "main"]);
         git(p, &["checkout", "main"]);
         let repo = Repo::discover(p).unwrap();
+        let fork_point = repo.rev_parse("main").unwrap();
 
         let merge_policy = rk_workflow::RepositoryPolicy::default();
         assert_eq!(merge_policy.delivery.mode, DeliveryMode::Merge);
         assert!(
-            ticket_undelivered_reason(&merge_policy, &repo, "nowork", "main", true).is_some(),
+            ticket_undelivered_reason(&merge_policy, &repo, "nowork", "main", None, true).is_some(),
             "an empty branch must not read as delivered under merge mode"
+        );
+
+        let mut push_policy = merge_policy.clone();
+        push_policy.delivery.mode = DeliveryMode::PushBranch;
+        assert!(
+            ticket_undelivered_reason(
+                &push_policy,
+                &repo,
+                "nowork",
+                "main",
+                Some(&fork_point),
+                true,
+            )
+            .is_some(),
+            "a missing remote ref must not make a never-diverged branch read delivered"
         );
 
         // A branch that actually made a commit still hasn't merged yet, so it
@@ -6033,7 +6115,7 @@ mod respawn_tests {
         git(p, &["checkout", "main"]);
         let repo = Repo::discover(p).unwrap();
         assert!(
-            ticket_undelivered_reason(&merge_policy, &repo, "work", "main", true).is_some(),
+            ticket_undelivered_reason(&merge_policy, &repo, "work", "main", None, true).is_some(),
             "unmerged real work is also not yet delivered"
         );
 
@@ -6042,7 +6124,7 @@ mod respawn_tests {
         git(p, &["merge", "--no-ff", "-m", "merge", "work"]);
         let repo = Repo::discover(p).unwrap();
         assert!(
-            ticket_undelivered_reason(&merge_policy, &repo, "work", "main", true).is_none(),
+            ticket_undelivered_reason(&merge_policy, &repo, "work", "main", None, true).is_none(),
             "a genuinely merged branch must clear the done-gate"
         );
     }
