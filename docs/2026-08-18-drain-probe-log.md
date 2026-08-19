@@ -54,6 +54,37 @@ burn detection, stale-instance timeout, ticket reopen, announce sinks).*
 - Non-empty landings vs the ≥3/day bar: 1, with several branches still
   in review — pace determined by the serial gate, as the epic predicted.
 
+## Day-1 summary (T+~15h)
+
+**Volume:** 44 agents (39 rats, 5 reviewers), ~$144 recorded spend (true
+spend somewhat higher — the cost-books bug, whose fix drain itself
+delivered today, under-reports terminal costs). 32 commits reached main.
+~12 substantive tickets delivered incl. all 3 probe tickets, the
+startup-race flake retirement, gate-worktree retention, schedulable
+shutdown, SpawnId migration slices, and 4 e2e test suites. Open backlog:
+19 (mostly blocked/decision items).
+
+**Pre-registered criteria:** ≥3 non-empty landings/day — **met** (~10,
+though roughly half needed operator hand-landing due to two systemic
+false-red windows). Silent-stall audit — **one true silent stall class
+found** (disk-floor spawn refusal, O12): drain stopped with no signal.
+Interventions — **~15, classified**; dominant classes: landing recovery
+(false-reds: rollover-killed gates, lint-window, disk-floor — ~7),
+duplicate-dispatch control (O8 — ~5), grooming/reconciliation (~3).
+
+**The headline:** worker-loop + recovery machinery are production-solid
+(zero unrecovered crashes; B3 respawn validated twice; runaway/burn never
+fired falsely). The landing pipeline is the fragile organ — every
+intervention class traces to it or to state ambiguity feeding it. This
+inverts nothing in the epic but sharpens its priority order:
+**E2 (merge queue, no-bypass, full-environment profile) > O6/O8 state
+fixes > E1 delivery bars > E4 disk-aware arbitration > everything else.**
+
+**Fleet self-organization observed:** stale-ticket self-grooming (~$1
+each), a rat detecting duplicate program trees via claims/artifacts
+before duplicating (needed operator judgment to resolve — rk-king
+evidence), first organic ballot use (quorum unreachable at 2-WIP).
+
 ## Interventions
 
 *(operator/steward actions that autonomous machinery should eventually own —
@@ -67,6 +98,7 @@ classified as: dispatch / recovery / review / landing / grooming / other)*
 | T+6.5h | recovery | O8 went systemic (3rd re-dispatch: Dart-8 onto Sooty's landed-pending ticket) — interrupted the freshest duplicate, raised ticket_reopen_sweep.stale_after_secs 900→7200 (above landing latency), rollover. Duplicate spend incurred: ~$3-4 across Swipe/Filch/Dart | epic: reopen sweep must check landing-queue membership, not just agent liveness; reopen window must exceed observed landing p95 |
 | T+8.5h | landing | closed the O8/O10 arc for the inventory ticket: original (Ash) paused → re-dispatched → duplicate (Swipe) completed EMPTY → original's gate rollover-killed (false red) → duplicate's gate hit the F214KDE7 flake → operator hand-landed the original (docs-only) and cleared both escalations. One ticket, five failure modes, ~$4 total | every link in this chain already has an epic owner (O6 state, O8 reopen, O10 rollover-gates, flake ticket, E2 queue) |
 | T+9h | recovery | **O12: the probe day filled the disk** — 231 GB of worktree target/ dirs left 8.5 GB free, tripping the daemon's 10 GB spawn floor: gate verifies failed with disk-floor panics (read as test failures, holding Filch's branch), fresh spawn-refills silently stopped, and the earlier "disk exhaustion" ticket Tunnel-8 closed did not prevent it. Reclaimed 240 GB by deleting terminal rats' target/ dirs; rollover tests green after; hand-landed Filch (CUE-only). | worktree sweep must reap build artifacts of terminal agents (not just merged branches) — the F214KDE7 flake and "machine-load" flakes are plausibly this same disk/load pathology; epic E4's machine-signal must include disk |
+| T+11h | landing | **O13/self-inflicted: operator hand-merge (Burrow) validated with cargo check but not clippy left a -D-warnings lint on main — every subsequent gate run failed on it** (two branches falsely held; one mis-attributed fix ticket filed then closed). The phase-2 review's "nobody reviews the operator" finding, demonstrated by the operator within 24h of reading it. Fixed lint, landed the falsely-held branches, full verify running | E2: operators go through the gate, no bypass — now with a first-party incident as evidence |
 | T+3h | landing/CI | CI-red onion layer 3: ubuntu runner lacks `cue`; product_to_code e2e can never have passed there (masked by fmt, then clippy failures). Fixed via self-skip-when-tooling-absent (02a4b49) | canonical profile must pin the FULL environment (toolchain + external tools), not just commands — epic E2 |
 
 - **O3** (T+0.5h): first drain cycle complete — Peppercorn-8 ($1.05) and
