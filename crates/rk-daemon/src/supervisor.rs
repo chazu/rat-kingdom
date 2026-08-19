@@ -3645,6 +3645,21 @@ impl Supervisor {
     /// strategic-review C4). A ticket with no dispatched branch (or an
     /// unresolvable repo) has nothing to gate on and is left unaffected.
     pub(crate) async fn require_ticket_delivered(&self, task: &str) -> rk_core::Result<()> {
+        // The durable delivery record wins outright (P1b). It is written by
+        // the landing pipeline at land time and survives the branch deletion
+        // that landing performs, so a ticket that genuinely shipped still
+        // reads delivered here — where the branch-ref fallback below would
+        // see a missing ref and refuse. Only fall through to git when no
+        // record exists (a ticket landed before this field, or delivered by a
+        // path that predates the pipeline).
+        if self
+            .tickets
+            .delivery(task)
+            .map(|d| d.is_some())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
         let Some(record) = self.latest_task_record(task) else {
             return Ok(());
         };
@@ -4175,10 +4190,21 @@ impl Supervisor {
             if let Some(task) = &record.task {
                 if task.starts_with(crate::tickets::ID_PREFIX) {
                     let status = if block { "blocked" } else { "open" };
-                    match self.tickets.reopen(task, status).await {
-                        Ok(_) => ticket_status = Some(status),
+                    // Clear the durable delivery record first (P1b). Reopening
+                    // the status alone is not enough: the record is what every
+                    // "is it delivered" question now reads, so a reverted merge
+                    // that left it standing would keep claiming the work
+                    // shipped while the commit is no longer in the target.
+                    match self.tickets.clear_delivery(task, status).await {
+                        Ok(true) => ticket_status = Some(status),
+                        Ok(false) => match self.tickets.reopen(task, status).await {
+                            Ok(_) => ticket_status = Some(status),
+                            Err(e) => {
+                                warn!(ticket = %task, error = %e, "failed to reopen ticket on revert");
+                            }
+                        },
                         Err(e) => {
-                            warn!(ticket = %task, error = %e, "failed to reopen ticket on revert");
+                            warn!(ticket = %task, error = %e, "failed to clear delivery on revert");
                         }
                     }
                 }
@@ -4253,6 +4279,13 @@ impl Supervisor {
             "delivered": delivery.delivered,
             "merged": delivery.merged,
             "merge_commit": delivery.merge_commit,
+            // Surfaced so the landing pipeline can refuse to write a delivery
+            // record for a branch that added nothing over its target: an empty
+            // merge is not a delivery, and closing a ticket on one is exactly
+            // the duplicate-no-op-merge failure TKT-01M0C663BZ86SMA2PVMFP5QJ8D
+            // describes. `dismiss` already gates its ticket close on this;
+            // `land` withheld it from callers.
+            "content_free": delivery.content_free,
             "pushed": delivery.pushed,
             "pr_opened": delivery.pr_opened,
             "pr_url": delivery.pr_url,

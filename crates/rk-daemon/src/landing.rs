@@ -795,6 +795,7 @@ impl LandingPipeline {
                     false,
                 )
                 .await?;
+            self.record_delivery(entry, &result).await;
             let outcome = LandingOutcome::Landed(result);
             self.mark_processed(entry, &outcome)?;
             return Ok(outcome);
@@ -1005,6 +1006,7 @@ impl LandingPipeline {
                         false,
                     )
                     .await?;
+                self.record_delivery(entry, &result).await;
                 Ok(LandingOutcome::Landed(result))
             }
             "REWORK" => Ok(LandingOutcome::ReworkFiled(
@@ -1026,6 +1028,64 @@ impl LandingPipeline {
                 );
                 Ok(LandingOutcome::Escalated(self.escalate(entry, text)?))
             }
+        }
+    }
+
+    /// Write the durable delivery record onto `entry`'s ticket and close it
+    /// (P1b). Called from every successful-land path in this module, which is
+    /// the whole fix: nothing used to close a ticket after a land, so
+    /// delivered work sat `in_progress` indefinitely while every later "is it
+    /// delivered" question fell back to a live branch ref that the land had
+    /// just deleted.
+    ///
+    /// Skipped — deliberately, not as an error — when the merge produced no
+    /// merge commit (`merged: false`, a conflict the queue will surface) or
+    /// when the branch was `content_free` (an empty branch is not a delivery).
+    /// Best-effort: the merge already happened and is durable in git, so a
+    /// failure to annotate the ticket is logged and never turned into a
+    /// landing failure that would strand the queue entry.
+    ///
+    /// Stack-neutral by construction: the record is a merge commit sha plus
+    /// the branch and target it landed on. No build tooling is consulted and
+    /// no language convention is assumed.
+    async fn record_delivery(&self, entry: &LandingQueueEntry, result: &Value) {
+        if !entry.task.starts_with(crate::tickets::ID_PREFIX) {
+            return;
+        }
+        if result.get("content_free").and_then(Value::as_bool) == Some(true) {
+            info!(
+                task = %entry.task,
+                branch = %entry.branch,
+                "land added nothing over target; not recording a delivery"
+            );
+            return;
+        }
+        let Some(merge_commit) = result
+            .get("merge_commit")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
+        else {
+            return;
+        };
+        let record = crate::tickets::DeliveryRecord {
+            merge_commit: merge_commit.to_string(),
+            branch: entry.branch.clone(),
+            target: entry.target.clone(),
+            landed_at: Utc::now().to_rfc3339(),
+        };
+        match self.tickets.record_delivery(&entry.task, &record).await {
+            Ok(_) => info!(
+                task = %entry.task,
+                merge_commit,
+                target = %entry.target,
+                "recorded delivery and closed ticket"
+            ),
+            Err(e) => warn!(
+                task = %entry.task,
+                merge_commit,
+                error = %e,
+                "landed but failed to record delivery on the ticket"
+            ),
         }
     }
 
@@ -1983,6 +2043,161 @@ workflow: {
             .scan(&Pattern::category(Category::Event).identity(LANDING_NON_MAIN_TARGET_IDENTITY))
             .unwrap()
             .is_empty());
+    }
+
+    /// P1b end-to-end: a successful land writes the merge commit onto the
+    /// ticket and closes it, with no operator action. Before this, nothing
+    /// closed a ticket post-land and delivery was inferred from a branch ref
+    /// the land had just deleted (probe O14/O16).
+    #[tokio::test]
+    async fn landing_records_the_merge_commit_on_the_ticket_and_closes_it() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+        std::fs::write(repo_dir.path().join("docs").join("note.md"), "note\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "docs: add note"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let ticket = pipeline
+            .tickets
+            .create(crate::tickets::NewTicket {
+                title: "add note".into(),
+                body: None,
+                scope: Some("docs-repo".into()),
+                parent: None,
+                priority: "normal".into(),
+                labels: vec![],
+                depends_on: vec![],
+                created_by: None,
+                coalesce_key: None,
+            })
+            .await
+            .unwrap();
+        pipeline
+            .tickets
+            .set_status(&ticket.identity, "in_progress")
+            .await
+            .unwrap();
+
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "docs-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha,
+                diff_class: "doc-only".into(),
+                task: ticket.identity.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let outcomes = pipeline.drain_key("docs-repo", "main").await.unwrap();
+        let LandingOutcome::Landed(result) = &outcomes[0] else {
+            panic!("expected Landed, got {:?}", outcomes[0]);
+        };
+        assert_eq!(result["merged"], true, "result: {result}");
+
+        let stored = pipeline.tickets.get(&ticket.identity).unwrap().unwrap();
+        assert_eq!(
+            stored.payload.get("status").and_then(Value::as_str),
+            Some("closed"),
+            "landed ticket must reach a terminal state without an operator"
+        );
+        let record = crate::tickets::delivery_of(&stored).expect("delivery record");
+        assert_eq!(
+            record.merge_commit,
+            result["merge_commit"].as_str().unwrap()
+        );
+        assert_eq!(record.target, "main");
+
+        // The acceptance case the old branch-ref inference got wrong: landing
+        // DELETED the branch as part of the land, so any predicate reading the
+        // ref would now say "not delivered". Assert the ref really is gone,
+        // then assert the ticket still reads delivered from the record alone.
+        let refs = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir.path())
+            .args(["branch", "--list", "feature"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&refs.stdout).trim().is_empty(),
+            "landing is expected to delete the branch; the record is what survives"
+        );
+        assert!(crate::tickets::is_delivered(&stored));
+    }
+
+    /// An empty branch is not a delivery: a duplicate rat dispatched onto a
+    /// ticket whose real work already landed also "merges" cleanly, and that
+    /// must not close the ticket on its behalf
+    /// (TKT-01M0C663BZ86SMA2PVMFP5QJ8D).
+    #[tokio::test]
+    async fn an_empty_branch_land_records_no_delivery() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        // Branched from main and never committed anything: nothing to deliver.
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let ticket = pipeline
+            .tickets
+            .create(crate::tickets::NewTicket {
+                title: "empty".into(),
+                body: None,
+                scope: Some("docs-repo".into()),
+                parent: None,
+                priority: "normal".into(),
+                labels: vec![],
+                depends_on: vec![],
+                created_by: None,
+                coalesce_key: None,
+            })
+            .await
+            .unwrap();
+        pipeline
+            .tickets
+            .set_status(&ticket.identity, "in_progress")
+            .await
+            .unwrap();
+
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "docs-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha,
+                diff_class: "doc-only".into(),
+                task: ticket.identity.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        pipeline.drain_key("docs-repo", "main").await.unwrap();
+
+        let stored = pipeline.tickets.get(&ticket.identity).unwrap().unwrap();
+        assert!(
+            !crate::tickets::is_delivered(&stored),
+            "an empty branch must not read as a delivery"
+        );
+        assert_eq!(
+            stored.payload.get("status").and_then(Value::as_str),
+            Some("in_progress"),
+            "an empty land must not close the ticket"
+        );
     }
 
     /// A candidate landing on a target other than `"main"` — e.g. a
