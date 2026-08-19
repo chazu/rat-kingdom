@@ -54,6 +54,23 @@ burn detection, stale-instance timeout, ticket reopen, announce sinks).*
 - Non-empty landings vs the ≥3/day bar: 1, with several branches still
   in review — pace determined by the serial gate, as the epic predicted.
 
+- **O14** (T+16h): **C3's done-binding has no back-half under async
+  landing — tickets can never reach `done` automatically.** A rat's
+  `rk done` fires while its branch is still queued (unmerged), the
+  delivery gate refuses the status flip, the ticket stays `in_progress`
+  forever — and when the landing later succeeds, nothing retries. Every
+  completed ticket then re-enters the reopen/re-dispatch cycle at the
+  window boundary. 14 tickets in this state simultaneously observed.
+  Epic fix (E1/E2): the landing pipeline marks the task's ticket done on
+  successful land — delivery-bound done needs a delivery-driven writer.
+- **O15** (T+16h): a rat filed a SECURITY ticket: the operator's Claude
+  SessionEnd hook (aka/archive push), inherited into every rat harness,
+  egresses rat transcripts and a pass-derived token to the operator's
+  archive server on every rat session end. First-party evidence for the
+  blocked rat-session-config curation program (KAF8KSBE tree) — that
+  decision just became security-relevant rather than hygienic. Gruyere-8
+  working the inventory/fix ticket now.
+
 ## Day-1 summary (T+~15h)
 
 **Volume:** 44 agents (39 rats, 5 reviewers), ~$144 recorded spend (true

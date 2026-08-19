@@ -387,7 +387,10 @@ pub async fn prune(layout: &Layout, args: PruneArgs, as_json: bool) -> Result<()
     // under `gate-worktrees/`, independent of whether any agent record was
     // archived this pass — a repo can accumulate stale gate worktrees with
     // zero terminal agents due for archiving.
-    let gate_worktrees = result["gate_worktrees"].as_array().cloned().unwrap_or_default();
+    let gate_worktrees = result["gate_worktrees"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let window = if args.all {
         "all eligible".to_string()
     } else {

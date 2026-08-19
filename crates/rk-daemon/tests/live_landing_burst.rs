@@ -209,7 +209,12 @@ checks: [
     );
 
     let landed: Vec<bool> = (0..N)
-        .map(|i| repo_dir.path().join(format!("docs/note-burst{i}.md")).exists())
+        .map(|i| {
+            repo_dir
+                .path()
+                .join(format!("docs/note-burst{i}.md"))
+                .exists()
+        })
         .collect();
     assert!(
         landed.iter().all(|&l| l),

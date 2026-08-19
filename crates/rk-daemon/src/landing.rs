@@ -2927,7 +2927,10 @@ checks: [
         assert_eq!(reclaims[0].reason, "age");
         assert!(reclaims[0].reclaimed);
         assert!(!gate_dir.exists(), "gate worktree should have been removed");
-        assert!(!marker.exists(), "marker should have been removed alongside it");
+        assert!(
+            !marker.exists(),
+            "marker should have been removed alongside it"
+        );
     }
 
     #[tokio::test]
