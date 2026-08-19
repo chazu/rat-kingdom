@@ -32,6 +32,13 @@ fn worktree_metadata_guard() -> MutexGuard<'static, ()> {
 
 pub const PROTECTED_BRANCHES: [&str; 4] = ["main", "master", "develop", "HEAD"];
 
+/// Ref namespace parking [`Repo::prepare_merge`] candidates. A candidate merge
+/// commit is unreachable from any branch for the whole gate run; parking it
+/// under a ref is what keeps `git gc` from collecting the very tree the gate
+/// is testing. Deliberately outside `refs/heads/` so candidates never appear
+/// as branches to `git branch`, a push, or the daemon's own branch scans.
+pub const CANDIDATE_REF_PREFIX: &str = "refs/rk/candidates/";
+
 /// A repository root (the main checkout, not a worktree).
 #[derive(Debug, Clone)]
 pub struct Repo {
@@ -53,6 +60,95 @@ pub struct MergeOutcome {
     /// revert commit for [`Repo::revert_merge`]). `None` when nothing landed.
     pub commit: Option<String>,
     pub detail: String,
+}
+
+/// A merge commit that has been **built but not landed**: the exact tree a
+/// gate should test, and the exact commit [`Repo::advance_target_to`] will
+/// land if the gate passes.
+///
+/// This is the missing half of "test the merge, land the tested tree".
+/// [`Repo::merge_branch`] always builds a *fresh* merge commit at land time,
+/// so a gate that tested anything earlier — the branch tip, or a merge built
+/// for the gate — cannot land what it tested; the commit that actually lands
+/// carries a green receipt it never earned. Preparing the merge first makes
+/// the tested sha and the landed sha the same object.
+///
+/// Purely git: no build system, language, or check runner is implied. What a
+/// gate *does* with [`PreparedMerge::commit`] is the caller's policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedMerge {
+    /// The candidate merge commit — the sha to test, and the sha to land.
+    pub commit: String,
+    /// The `target` tip this merge was built on. Doubles as the
+    /// expected-parent guard for the compare-and-swap that lands it: if the
+    /// target has moved off `base`, the candidate was tested against a tree
+    /// that is no longer what landing would produce.
+    pub base: String,
+    /// Full ref name (under [`CANDIDATE_REF_PREFIX`]) keeping `commit`
+    /// reachable until it lands or is discarded. Pass to
+    /// [`Repo::discard_candidate`] when done.
+    pub candidate_ref: String,
+}
+
+impl PreparedMerge {
+    /// Whether merging changed nothing — `branch` was already contained in
+    /// `target`, so git produced no merge commit and `commit == base`.
+    /// Landing this is a no-op, not a delivery; callers gating on "did this
+    /// deliver" should treat it as empty rather than as a successful merge.
+    pub fn is_empty(&self) -> bool {
+        self.commit == self.base
+    }
+}
+
+/// Outcome of [`Repo::prepare_merge`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepareOutcome {
+    Prepared(PreparedMerge),
+    /// The merge does not apply. Nothing was built and nothing was parked;
+    /// not retryable against this pair of tips (though a later target tip may
+    /// merge cleanly).
+    Conflict { detail: String },
+}
+
+/// Outcome of [`Repo::advance_target_to`] — the compare-and-swap land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdvanceOutcome {
+    /// The target ref now points at exactly `commit`.
+    Advanced { commit: String },
+    /// The target moved off the expected parent, so the swap was refused.
+    /// **Nothing landed and nothing was lost**: the candidate is still parked
+    /// under its ref. Retryable — rebuild the candidate on `actual` and gate
+    /// again.
+    Stale { expected: String, actual: String },
+}
+
+impl AdvanceOutcome {
+    pub fn advanced(&self) -> bool {
+        matches!(self, AdvanceOutcome::Advanced { .. })
+    }
+
+    /// Whether the caller may sensibly try again. A stale target is the one
+    /// contended-but-healthy outcome; everything else surfaces as `Err`.
+    pub fn retryable(&self) -> bool {
+        matches!(self, AdvanceOutcome::Stale { .. })
+    }
+
+    /// The landed commit, or `None` when nothing landed.
+    pub fn commit(&self) -> Option<&str> {
+        match self {
+            AdvanceOutcome::Advanced { commit } => Some(commit),
+            AdvanceOutcome::Stale { .. } => None,
+        }
+    }
+
+    pub fn detail(&self) -> String {
+        match self {
+            AdvanceOutcome::Advanced { commit } => format!("advanced to {commit}"),
+            AdvanceOutcome::Stale { expected, actual } => {
+                format!("target moved from {expected} to {actual}; candidate not landed")
+            }
+        }
+    }
 }
 
 /// The remote host kind, inferred from an `origin` URL. Decides how a PR/MR
@@ -498,27 +594,11 @@ impl Repo {
         success_detail: String,
     ) -> rk_core::Result<MergeOutcome> {
         self.validate_local_branch(target, "merge target")?;
-        let seq = MERGE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = self
-            .root
-            .join(".git")
-            .join(format!("rk-merge-{}-{}", std::process::id(), seq));
-        // Detached checkout of target — never conflicts with existing checkouts.
-        {
-            let _metadata = worktree_metadata_guard();
-            self.git(&[
-                "worktree",
-                "add",
-                "--detach",
-                &tmp.to_string_lossy(),
-                target,
-            ])?;
-        }
-        let result = (|| -> rk_core::Result<MergeOutcome> {
+        self.in_temp_worktree(target, |tmp| {
             let target_before = self.git(&["rev-parse", &format!("refs/heads/{target}")])?;
-            match op(&tmp) {
+            match op(tmp) {
                 Ok(()) => {
-                    let new_commit = git_in(&tmp, &["rev-parse", "HEAD"])?;
+                    let new_commit = git_in(tmp, &["rev-parse", "HEAD"])?;
                     let target_now = self.git(&["rev-parse", &format!("refs/heads/{target}")])?;
                     if target_now.trim() != target_before.trim() {
                         return Ok(MergeOutcome {
@@ -540,13 +620,161 @@ impl Repo {
                     detail: format!("{op_name} conflict or failure: {e}"),
                 }),
             }
-        })();
-        // Always clean up the temp worktree.
+        })
+    }
+
+    /// Run `op` in a throwaway detached worktree checked out at `rev`, tearing
+    /// the worktree down afterwards whatever `op` did. Detached so it never
+    /// conflicts with an existing checkout of the same branch.
+    fn in_temp_worktree<T>(
+        &self,
+        rev: &str,
+        op: impl FnOnce(&Path) -> rk_core::Result<T>,
+    ) -> rk_core::Result<T> {
+        let seq = MERGE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = self
+            .root
+            .join(".git")
+            .join(format!("rk-merge-{}-{}", std::process::id(), seq));
+        {
+            let _metadata = worktree_metadata_guard();
+            self.git(&["worktree", "add", "--detach", &tmp.to_string_lossy(), rev])?;
+        }
+        let result = op(&tmp);
         {
             let _metadata = worktree_metadata_guard();
             let _ = self.git(&["worktree", "remove", "--force", &tmp.to_string_lossy()]);
         }
         result
+    }
+
+    /// Build the merge of `branch` into `target` **without landing it**, and
+    /// park the result so it survives until a gate has run on it.
+    ///
+    /// Together with [`advance_target_to`](Repo::advance_target_to) this is
+    /// the "test the merge, land the tested tree" primitive:
+    ///
+    /// ```text
+    /// prepare_merge(branch, target) -> PreparedMerge { commit, base }
+    ///     run the repo's named checks against `commit`
+    /// advance_target_to(target, commit, base) -> Advanced { commit }
+    /// ```
+    ///
+    /// The landed sha is the sha the gate ran on, by construction — the merge
+    /// is built once and never rebuilt. Contrast
+    /// [`merge_branch`](Repo::merge_branch), which builds a fresh merge commit
+    /// at land time: nothing a gate tested beforehand is what it lands.
+    ///
+    /// The candidate is built in a detached worktree pinned to the target tip
+    /// read at entry, so a target that moves mid-build cannot silently change
+    /// what was merged; the resulting [`PreparedMerge::base`] then fails the
+    /// swap, which is the intended retryable outcome.
+    ///
+    /// Nothing here knows or cares what language the repo is written in.
+    pub fn prepare_merge(&self, branch: &str, target: &str) -> rk_core::Result<PrepareOutcome> {
+        self.validate_local_branch(branch, "merge source")?;
+        self.validate_local_branch(target, "merge target")?;
+        let base = self.rev_parse(&format!("refs/heads/{target}"))?;
+        let message = format!("merge {branch} into {target} [rk]");
+        // Built against `base` (the sha), not `target` (the name): pinning the
+        // worktree to the sha we will guard on closes the window where the
+        // target moves between the read and the checkout.
+        let built = self.in_temp_worktree(&base, |tmp| {
+            if let Err(e) = git_in(tmp, &["merge", "--no-ff", "-m", &message, branch]) {
+                return Ok(Err(format!("merge conflict or failure: {e}")));
+            }
+            Ok(Ok(git_in(tmp, &["rev-parse", "HEAD"])?.trim().to_string()))
+        })?;
+        let commit = match built {
+            Ok(commit) => commit,
+            Err(detail) => return Ok(PrepareOutcome::Conflict { detail }),
+        };
+        // Park it before returning. Until this ref exists the merge commit is
+        // reachable from nothing at all, and the temp worktree that held it is
+        // already gone.
+        let candidate_ref = format!("{CANDIDATE_REF_PREFIX}{commit}");
+        self.git(&["update-ref", &candidate_ref, &commit])?;
+        Ok(PrepareOutcome::Prepared(PreparedMerge {
+            commit,
+            base,
+            candidate_ref,
+        }))
+    }
+
+    /// Compare-and-swap `target` onto an already-built commit: advance the ref
+    /// to `commit` **iff** it still points at `expected`.
+    ///
+    /// This is the landing half of the pre-tested-merge protocol. It builds
+    /// nothing — the tree it lands is exactly the object `commit` names, which
+    /// is what makes "landed sha == tested sha" an invariant rather than a
+    /// hope.
+    ///
+    /// A target that has moved off `expected` yields
+    /// [`AdvanceOutcome::Stale`]: a clean, retryable outcome that lands
+    /// nothing, loses nothing, and leaves the candidate parked for a rebuild.
+    /// Errors are reserved for genuine faults and for misuse — notably a
+    /// `commit` that does not descend from `expected`, which would silently
+    /// discard whatever is on the target rather than build on it.
+    pub fn advance_target_to(
+        &self,
+        target: &str,
+        commit: &str,
+        expected: &str,
+    ) -> rk_core::Result<AdvanceOutcome> {
+        self.validate_local_branch(target, "advance target")?;
+        // Resolve both through git so a caller may pass any revision, and so
+        // a nonexistent one is an error here rather than a confusing no-op.
+        let commit = self.rev_parse(commit)?;
+        let expected = self.rev_parse(expected)?;
+        if commit != expected && !self.is_ancestor(&expected, &commit) {
+            return Err(rk_core::Error::other(format!(
+                "refusing to advance {target}: {commit} does not descend from {expected}"
+            )));
+        }
+        let tip = self.rev_parse(&format!("refs/heads/{target}"))?;
+        if tip != expected {
+            return Ok(AdvanceOutcome::Stale {
+                expected,
+                actual: tip,
+            });
+        }
+        if commit == expected {
+            // Already there. Idempotent: a retry after a successful advance
+            // whose caller lost the answer must not look like a failure.
+            return Ok(AdvanceOutcome::Advanced { commit });
+        }
+        match self.advance_target(target, &commit, &expected) {
+            Ok(()) => Ok(AdvanceOutcome::Advanced { commit }),
+            Err(e) => {
+                // The read above is not the guard — git's own old-value check
+                // (`update-ref`'s third argument, or `merge --ff-only`'s
+                // refusal) is, and it can reject a swap that looked fine
+                // microseconds earlier. Re-read to tell a lost race from a
+                // real fault instead of reporting every contention as an error.
+                let now = self.rev_parse(&format!("refs/heads/{target}"))?;
+                if now == expected {
+                    return Err(e);
+                }
+                Ok(AdvanceOutcome::Stale {
+                    expected,
+                    actual: now,
+                })
+            }
+        }
+    }
+
+    /// Drop a candidate's parking ref, letting git collect the commit if
+    /// nothing else reaches it. Call after landing a candidate or abandoning
+    /// one. Idempotent; refuses any ref outside [`CANDIDATE_REF_PREFIX`], so
+    /// it can never be turned into a branch-deleting primitive.
+    pub fn discard_candidate(&self, candidate_ref: &str) -> rk_core::Result<()> {
+        if !candidate_ref.starts_with(CANDIDATE_REF_PREFIX) {
+            return Err(rk_core::Error::other(format!(
+                "not a candidate ref: {candidate_ref:?}"
+            )));
+        }
+        let _ = self.git(&["update-ref", "-d", candidate_ref]);
+        Ok(())
     }
 
     /// Push `branch` to `remote`, setting upstream (`-u`). Returns git's
@@ -976,6 +1204,161 @@ mod tests {
         run(&wt, &["add", "."]);
         run(&wt, &["commit", "-m", "add feature"]);
         branch
+    }
+
+    /// The acceptance property: the sha a gate ran on is the sha that lands.
+    /// Stands in for the gate with an assertion over the prepared commit's own
+    /// tree — deliberately no build tooling, since the primitive must hold for
+    /// a repo of any language.
+    #[test]
+    fn landed_sha_equals_the_sha_the_gate_ran_on() {
+        let (dir, repo) = scratch_repo();
+        let branch = commit_on_branch(dir.path(), &repo, "thistle", "cas");
+        let PrepareOutcome::Prepared(candidate) = repo.prepare_merge(&branch, "main").unwrap()
+        else {
+            panic!("expected a clean merge");
+        };
+        assert!(!candidate.is_empty(), "branch had a commit to merge");
+        assert_eq!(candidate.base, repo.rev_parse("refs/heads/main").unwrap());
+        // Preparing does not land: main is untouched while the gate runs.
+        assert_eq!(repo.rev_parse("main").unwrap(), candidate.base);
+
+        // The "gate": inspect the candidate's tree. It is reachable purely
+        // because prepare parked it — nothing else points at it yet.
+        assert_eq!(
+            repo.rev_parse(&candidate.candidate_ref).unwrap(),
+            candidate.commit
+        );
+        let tested = repo.rev_parse(&candidate.commit).unwrap();
+        let gate_saw = repo
+            .git(&["show", "--format=", "--name-only", &tested])
+            .unwrap();
+        assert!(gate_saw.contains("feature.txt"));
+
+        let outcome = repo
+            .advance_target_to("main", &candidate.commit, &candidate.base)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            AdvanceOutcome::Advanced {
+                commit: tested.clone()
+            }
+        );
+        // The invariant.
+        assert_eq!(repo.rev_parse("refs/heads/main").unwrap(), tested);
+        assert!(repo.branch_verified_merged(&branch, "main"));
+
+        repo.discard_candidate(&candidate.candidate_ref).unwrap();
+        assert!(repo.rev_parse(&candidate.candidate_ref).is_err());
+        // Discarding the parking ref does not unland the commit.
+        assert_eq!(repo.rev_parse("refs/heads/main").unwrap(), tested);
+    }
+
+    #[test]
+    fn advance_refuses_a_moved_target_and_stays_retryable() {
+        let (dir, repo) = scratch_repo();
+        let branch = commit_on_branch(dir.path(), &repo, "thistle", "stale");
+        let PrepareOutcome::Prepared(candidate) = repo.prepare_merge(&branch, "main").unwrap()
+        else {
+            panic!("expected a clean merge");
+        };
+
+        // Someone else lands on main while our gate is running.
+        let other = commit_on_branch(dir.path(), &repo, "nibble", "race");
+        assert!(repo.merge_branch(&other, "main").unwrap().merged);
+        let moved_to = repo.rev_parse("refs/heads/main").unwrap();
+        assert_ne!(moved_to, candidate.base);
+
+        let outcome = repo
+            .advance_target_to("main", &candidate.commit, &candidate.base)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            AdvanceOutcome::Stale {
+                expected: candidate.base.clone(),
+                actual: moved_to.clone(),
+            }
+        );
+        assert!(outcome.retryable() && !outcome.advanced());
+        assert_eq!(outcome.commit(), None);
+        // Nothing landed: main still carries only the other rat's merge.
+        assert_eq!(repo.rev_parse("refs/heads/main").unwrap(), moved_to);
+        assert!(!repo.branch_verified_merged(&branch, "main"));
+        // Nothing lost: the candidate is still parked, so a retry can rebuild.
+        assert_eq!(
+            repo.rev_parse(&candidate.candidate_ref).unwrap(),
+            candidate.commit
+        );
+
+        // The retry: rebuild on the new tip and land that.
+        let PrepareOutcome::Prepared(retry) = repo.prepare_merge(&branch, "main").unwrap() else {
+            panic!("expected a clean merge");
+        };
+        assert_eq!(retry.base, moved_to);
+        assert!(
+            repo.advance_target_to("main", &retry.commit, &retry.base)
+                .unwrap()
+                .advanced()
+        );
+        assert_eq!(repo.rev_parse("refs/heads/main").unwrap(), retry.commit);
+    }
+
+    #[test]
+    fn advance_rejects_a_commit_that_would_discard_the_target() {
+        let (dir, repo) = scratch_repo();
+        let base = repo.rev_parse("refs/heads/main").unwrap();
+        // A branch commit is not a descendant of main's tip once main moves on.
+        let sibling = commit_on_branch(dir.path(), &repo, "thistle", "sibling");
+        let other = commit_on_branch(dir.path(), &repo, "nibble", "onward");
+        assert!(repo.merge_branch(&other, "main").unwrap().merged);
+        let tip = repo.rev_parse("refs/heads/main").unwrap();
+
+        let err = repo
+            .advance_target_to("main", &sibling, &tip)
+            .expect_err("a non-descendant would discard the target's history");
+        assert!(err.to_string().contains("does not descend"));
+        assert_eq!(repo.rev_parse("refs/heads/main").unwrap(), tip);
+
+        // Advancing to the expected parent itself is a no-op, not an error:
+        // the caller may retry a swap whose answer it lost.
+        assert_eq!(
+            repo.advance_target_to("main", &tip, &tip).unwrap(),
+            AdvanceOutcome::Advanced { commit: tip }
+        );
+        // A guard naming a commit that never was still resolves-or-errors
+        // rather than landing anything.
+        assert!(repo.advance_target_to("main", &base, &base).is_ok());
+    }
+
+    #[test]
+    fn prepare_merge_reports_conflict_without_touching_the_target() {
+        let (dir, repo) = scratch_repo();
+        // Two branches editing the same file at the same place.
+        let wt = dir.path().join("wt-conflict");
+        let branch = agent_branch("thistle", "conflict");
+        repo.create_worktree(&wt, &branch, "main").unwrap();
+        std::fs::write(wt.join("README.md"), "# theirs\n").unwrap();
+        run(&wt, &["commit", "-am", "theirs"]);
+
+        run(dir.path(), &["checkout", "main"]);
+        std::fs::write(dir.path().join("README.md"), "# ours\n").unwrap();
+        run(dir.path(), &["commit", "-am", "ours"]);
+        let before = repo.rev_parse("refs/heads/main").unwrap();
+
+        let outcome = repo.prepare_merge(&branch, "main").unwrap();
+        assert!(matches!(outcome, PrepareOutcome::Conflict { .. }));
+        assert_eq!(repo.rev_parse("refs/heads/main").unwrap(), before);
+    }
+
+    #[test]
+    fn discard_candidate_refuses_refs_outside_its_namespace() {
+        let (_dir, repo) = scratch_repo();
+        let tip = repo.rev_parse("refs/heads/main").unwrap();
+        assert!(repo.discard_candidate("refs/heads/main").is_err());
+        assert_eq!(repo.rev_parse("refs/heads/main").unwrap(), tip);
+        // Idempotent within its own namespace.
+        repo.discard_candidate(&format!("{CANDIDATE_REF_PREFIX}{tip}"))
+            .unwrap();
     }
 
     #[test]
