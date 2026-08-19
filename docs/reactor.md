@@ -422,21 +422,26 @@ step's branch) wants its own landing pass to review-and-land onto that same
 feature branch, not skip past it to `main` — the feature branch is then landed
 to `main` as a whole once complete.
 
-**Known visibility gap.** Before the cutover, `note_non_main_land_target`
-(`crates/rk-daemon/src/reactor.rs`) fired a repo-scoped
-`reactor_non_main_land_target` event whenever a workflow-firing trigger's
-interpolated `params.target` was not `"main"`, and `rk workflow list` appended
-`target=<branch>` to that instance — both ways an operator could see a
-completed steward had landed somewhere other than `main`. `fire_land_action`
-does not call `note_non_main_land_target` at all (that call site is specific
-to the workflow-firing path), and the zero-agent-spawn fast paths (step 4
-above) have no workflow instance for `rk workflow list` to annotate either.
-**A non-`main` land through the daemon-native pipeline is currently invisible
-by both of the old mechanisms.** `rk scan event <repo>` for `branch_landed`
-tuples (`Supervisor::land`'s own event, which always carries `target`) is the
-only current way to notice. This regression is not fixed here — flagged for a
-follow-up ticket rather than patched inline (see the completion artifact for
-this validation task).
+**Visibility parity with the reactor path.** Before the cutover,
+`note_non_main_land_target` (`crates/rk-daemon/src/reactor.rs`) fired a
+repo-scoped `reactor_non_main_land_target` event whenever a workflow-firing
+trigger's interpolated `params.target` was not `"main"`, and `rk workflow
+list` appended `target=<branch>` to that instance — both ways an operator
+could see a completed steward had landed somewhere other than `main`.
+`fire_land_action` never called `note_non_main_land_target` (that call site
+is specific to the workflow-firing path), and the zero-agent-spawn fast paths
+(step 4 above) never had a workflow instance for `rk workflow list` to
+annotate either — so a non-`main` land through the daemon-native pipeline was
+invisible by both of the old mechanisms
+(TKT-01M0B71D9B51SV5AG95VR1A4ST). This is now fixed:
+`LandingPipeline::note_non_main_land_target` (`crates/rk-daemon/src/landing.rs`)
+mirrors the reactor helper's shape and is called from every
+`Supervisor::land` call site in the pipeline — the doc-only/trivial fast path
+and the `APPROVE` verdict-routing arm — emitting a repo-scoped
+`landing_non_main_land_target` event whenever the resolved `entry.target` is
+not `"main"`. `rk scan event <repo>` for `branch_landed` tuples
+(`Supervisor::land`'s own event, which always carries `target`) remains a
+valid way to notice too, but is no longer the only one.
 
 If you want base-chained completions reviewed but held for an explicit
 decision instead of auto-landed, override `target` in a repo-local trigger
