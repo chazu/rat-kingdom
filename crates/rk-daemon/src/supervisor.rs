@@ -876,7 +876,10 @@ impl Supervisor {
 
     /// Acquire the shared-target-dir test-execution lock for `repo`. See
     /// [`TestExecLock`] for what this serializes and why.
-    pub(crate) async fn acquire_test_exec_lock(&self, repo: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    pub(crate) async fn acquire_test_exec_lock(
+        &self,
+        repo: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
         self.test_exec_lock.acquire(repo).await
     }
 
