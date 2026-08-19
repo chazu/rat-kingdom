@@ -136,7 +136,7 @@ fn usd_to_micro(usd: f64) -> Option<u64> {
 fn is_settled(state: AgentState) -> bool {
     matches!(
         state,
-        AgentState::Completed | AgentState::Failed | AgentState::Dismissed
+        AgentState::Completed | AgentState::Failed | AgentState::Stopped | AgentState::Dismissed
     )
 }
 

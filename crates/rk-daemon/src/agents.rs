@@ -52,6 +52,11 @@ pub enum AgentState {
     /// terminalized cleanly with `rk done` — see the discriminator note on
     /// [`Paused`](AgentState::Paused).
     Failed,
+    /// Deliberately terminated by an operator or a hard budget guard. Unlike
+    /// [`Failed`](AgentState::Failed), this is not a crash and is never
+    /// eligible for automatic respawn. The preserved worktree/branch may
+    /// still be resumed explicitly with `rk respawn`.
+    Stopped,
     Dismissed,
     /// The daemon restarted while this agent was running; its process is gone
     /// but worktree/branch/session are preserved for respawn.
@@ -85,7 +90,10 @@ impl AgentState {
     pub fn is_archivable(self) -> bool {
         matches!(
             self,
-            AgentState::Completed | AgentState::Failed | AgentState::Dismissed
+            AgentState::Completed
+                | AgentState::Failed
+                | AgentState::Stopped
+                | AgentState::Dismissed
         )
     }
 }
@@ -201,6 +209,7 @@ impl AgentRecord {
         self.crashed
             || (!self.state.is_live()
                 && self.state != AgentState::Completed
+                && self.state != AgentState::Stopped
                 && self.session_id.is_none()
                 && self.usage.total() == 0)
     }
@@ -816,6 +825,10 @@ mod tests {
         assert!(!ran("Squeak", AgentState::Failed).crashed_without_reporting());
         assert!(!ran("Gnaw", AgentState::Completed).crashed_without_reporting());
         assert!(!ran("Remy", AgentState::Dismissed).crashed_without_reporting());
+        assert!(
+            !record("Stop", AgentState::Stopped).crashed_without_reporting(),
+            "a deliberate stop is terminal but is not a crash"
+        );
         // Nor a live one that simply has not reported yet.
         assert!(!record("Twitch", AgentState::Running).crashed_without_reporting());
     }

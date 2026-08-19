@@ -673,6 +673,10 @@ enum RespawnDecision {
     Escalate,
 }
 
+fn is_auto_respawn_candidate(record: &AgentRecord) -> bool {
+    matches!(record.state, AgentState::Orphaned | AgentState::Failed)
+}
+
 /// Serializes merges to the same target branch — the land / merge queue.
 ///
 /// Both the steward's `land` step and `dismiss`/`dismiss_all` merge branches
@@ -1844,6 +1848,26 @@ impl Supervisor {
                     warn!(agent = name, "completion event for an unknown agent");
                     return;
                 };
+                // A deliberate stop wins races with a final harness event.
+                // SIGINT/SIGTERM can prompt an adapter to flush a `Completed`
+                // event before its process exits; accepting that event as a
+                // normal completion would erase the terminal cause and could
+                // make an unfinished run look successful.
+                if pre.state == AgentState::Stopped {
+                    let _ = self.lock_registry().update(name, |r| {
+                        if usage.total() > 0 {
+                            r.usage = usage;
+                        }
+                        if let Some(cost) = cost_usd {
+                            r.cost_usd = cost;
+                        }
+                        self.apply_budget_stop_floor(&r.name, &mut r.cost_usd, &mut r.usage);
+                        if session_id.is_some() {
+                            r.session_id = session_id.clone();
+                        }
+                    });
+                    return;
+                }
                 let claim = self.claim_completion(
                     name,
                     generation,
@@ -2088,9 +2112,31 @@ impl Supervisor {
                 }
             }
             BudgetAction::Stop => {
+                // `Usage` can arrive more than once after the cap is crossed.
+                // The durable state is the idempotency guard: one transition,
+                // one escalation, one kill.
+                if record.state == AgentState::Stopped {
+                    return;
+                }
                 warn!(agent = %record.name, cost = record.cost_usd, tokens = record.usage.total(), "budget cap hit — stopping agent");
+                let detail = self.budget_stop_detail(record);
+                let mut newly_stopped = false;
+                let stopped = self.lock_registry().update(&record.name, |r| {
+                    if r.state.is_live() {
+                        newly_stopped = true;
+                        r.state = AgentState::Stopped;
+                        r.crashed = false;
+                        r.result = Some(detail.clone());
+                    }
+                });
+                if !newly_stopped
+                    || !matches!(stopped, Ok(Some(ref r)) if r.state == AgentState::Stopped)
+                {
+                    return;
+                }
                 self.emit_obstacle_for_budget(record, "exceeded");
                 self.note_budget_stop_floor(record);
+                self.announce_budget_stop(record, &detail);
                 let control = self.lock_controls().remove(&record.name);
                 if let Some(control) = control {
                     tokio::spawn(async move {
@@ -2098,6 +2144,44 @@ impl Supervisor {
                     });
                 }
             }
+        }
+    }
+
+    fn budget_stop_detail(&self, record: &AgentRecord) -> String {
+        format!(
+            "budget stop: spent ${:.2} / ${:.2} cap; {} / {} token cap",
+            record.cost_usd,
+            self.budget.max_usd,
+            record.usage.total(),
+            self.budget.max_tokens
+        )
+    }
+
+    fn announce_budget_stop(&self, record: &AgentRecord, detail: &str) {
+        let notice = EscalationNotice::new(
+            "placeholder",
+            "budget-stop",
+            Severity::Critical,
+            record.repo_name.clone(),
+            record.name.clone(),
+            detail.to_string(),
+        )
+        .with_action(format!(
+            "Review the cap and work on branch {}; explicitly `rk respawn {}` only if continuation is warranted",
+            record.branch.as_deref().unwrap_or("-"),
+            record.name
+        ));
+        if let Err(e) = self.announcer.announce(
+            &self.space,
+            &self.sinks.lock().unwrap_or_else(|p| p.into_inner()),
+            crate::recovery::RecoveryAction {
+                kind: "budget-stop".into(),
+                instance: "supervisor".into(),
+                notice,
+            },
+            crate::recovery::RateCap::unlimited(),
+        ) {
+            warn!(agent = %record.name, error = %e, "failed to announce budget stop");
         }
     }
 
@@ -2862,7 +2946,7 @@ impl Supervisor {
             .lock_registry()
             .list()
             .into_iter()
-            .filter(|r| matches!(r.state, AgentState::Orphaned | AgentState::Failed))
+            .filter(|r| is_auto_respawn_candidate(r))
             .cloned()
             .collect();
 
@@ -3600,7 +3684,32 @@ impl Supervisor {
             .get(name)
             .cloned()
             .ok_or_else(|| rk_core::Error::other(format!("{name} has no live session")))?;
-        control.interrupt().await
+        let prior = self
+            .status(name)
+            .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
+        if !prior.state.is_live() {
+            return Err(rk_core::Error::other(format!("{name} is not running")));
+        }
+        self.lock_registry().update(name, |r| {
+            if r.state.is_live() {
+                r.state = AgentState::Stopped;
+                r.crashed = false;
+                r.result = Some("interrupted deliberately by operator".into());
+            }
+        })?;
+        if let Err(error) = control.interrupt().await {
+            // If signal delivery itself failed, restore the exact live state
+            // the operator observed. A concurrently-arrived terminal event is
+            // left alone by the state guard.
+            let _ = self.lock_registry().update(name, |r| {
+                if r.state == AgentState::Stopped {
+                    r.state = prior.state;
+                    r.result = prior.result.clone();
+                }
+            });
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Resolve the activated repository policy, translating legacy registry
@@ -6245,6 +6354,83 @@ mod respawn_tests {
             sup.decide_respawn(&rec, now + chrono::Duration::seconds(999), &cfg),
             RespawnDecision::Wait
         ));
+    }
+
+    #[test]
+    fn deliberate_stops_are_not_auto_respawn_candidates_but_crashes_are() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+
+        let mut stopped = record(repo.path(), Some("main"));
+        stopped.state = AgentState::Stopped;
+        stopped.result = Some("interrupted deliberately by operator".into());
+        stopped.crashed = false;
+        assert!(!is_auto_respawn_candidate(&stopped));
+        assert_ne!(stopped.state, AgentState::Failed);
+
+        let mut crashed = stopped.clone();
+        crashed.state = AgentState::Failed;
+        crashed.crashed = true;
+        assert!(is_auto_respawn_candidate(&crashed));
+
+        let mut orphaned = stopped;
+        orphaned.state = AgentState::Orphaned;
+        assert!(is_auto_respawn_candidate(&orphaned));
+    }
+
+    #[test]
+    fn budget_stop_is_terminal_and_announced_exactly_once() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let tickets = Arc::new(crate::tickets::Tickets::new(
+            Space::open_in_memory().unwrap(),
+            "castle".into(),
+        ));
+        let sup = Arc::new(
+            Supervisor::new(
+                Layout::at(home.path()),
+                "castle".into(),
+                "fake".into(),
+                Budget {
+                    max_usd: 20.0,
+                    max_tokens: 100_000,
+                    warn_at: 0.8,
+                },
+                FleetBudget::default(),
+                Space::open_in_memory().unwrap(),
+                tickets,
+            )
+            .unwrap(),
+        );
+        let mut rec = record(repo.path(), Some("main"));
+        rec.state = AgentState::Running;
+        rec.cost_usd = 20.25;
+        rec.usage.input = 100_001;
+        sup.lock_registry().insert(rec.clone()).unwrap();
+
+        sup.enforce_budget(&rec);
+        // A duplicate over-cap usage observation must not emit or kill twice.
+        sup.enforce_budget(&rec);
+
+        let stopped = sup.status(&rec.name).unwrap();
+        assert_eq!(stopped.state, AgentState::Stopped);
+        assert!(!stopped.crashed);
+        assert!(stopped.state.is_archivable());
+        let actions = sup
+            .space
+            .scan(
+                &Pattern::category(Category::Event)
+                    .identity(crate::recovery::RECOVERY_ACTION_IDENTITY),
+            )
+            .unwrap();
+        assert_eq!(actions.len(), 1, "budget stop must escalate exactly once");
+        let notice = &actions[0].payload["notice"];
+        assert_eq!(notice["class"], json!("budget-stop"));
+        let text = notice["text"].as_str().unwrap();
+        assert!(text.contains("$20.25 / $20.00 cap"));
+        assert!(text.contains("100001 / 100000 token cap"));
+        assert!(!is_auto_respawn_candidate(&stopped));
     }
 
     fn spawn_params(repo: &Path, task: &str) -> SpawnParams {

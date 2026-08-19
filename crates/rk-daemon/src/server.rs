@@ -4462,7 +4462,9 @@ impl Daemon {
             crate::agents::AgentState::Completed => {
                 crate::onboarding_sessions::OnboardingSessionState::Completed
             }
-            crate::agents::AgentState::Failed | crate::agents::AgentState::Dismissed => {
+            crate::agents::AgentState::Failed
+            | crate::agents::AgentState::Stopped
+            | crate::agents::AgentState::Dismissed => {
                 crate::onboarding_sessions::OnboardingSessionState::Failed
             }
             crate::agents::AgentState::Orphaned => {
