@@ -11,6 +11,19 @@ use tokio::process::Command;
 
 pub struct ClaudeHarness;
 
+/// Anthropic-hosted account connectors (Gmail/Calendar/Drive) are bound to
+/// whatever Claude account is authenticated on the host, not to this rat's
+/// task. They carry live read/write access to the operator's real inbox,
+/// calendar, and files and are not declared in any project/user mcp.json, so
+/// there is no config-side lever to scope them — deny them at the CLI level
+/// on every spawn instead. Server names match the `mcp__<server>__<tool>`
+/// tool-name prefixes these connectors register under.
+const DENIED_MCP_SERVERS: &[&str] = &[
+    "mcp__claude_ai_Gmail",
+    "mcp__claude_ai_Google_Calendar",
+    "mcp__claude_ai_Google_Drive",
+];
+
 fn permission_args(permission_mode: Option<&str>) -> Vec<String> {
     match permission_mode {
         Some("bypassPermissions") | Some("danger-full-access") => {
@@ -19,6 +32,36 @@ fn permission_args(permission_mode: Option<&str>) -> Vec<String> {
         Some(mode) => vec!["--permission-mode".into(), mode.into()],
         None => Vec::new(),
     }
+}
+
+fn launch_args(spec: &LaunchSpec) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--input-format",
+        "stream-json",
+        "--verbose",
+        "--disallowedTools",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    args.extend(DENIED_MCP_SERVERS.iter().map(|s| s.to_string()));
+    if let Some(system) = &spec.system_prompt {
+        args.push("--append-system-prompt".into());
+        args.push(system.clone());
+    }
+    args.extend(permission_args(spec.permission_mode.as_deref()));
+    if let Some(model) = &spec.model {
+        args.push("--model".into());
+        args.push(model.clone());
+    }
+    if let Some(session) = &spec.resume_session {
+        args.push("--resume".into());
+        args.push(session.clone());
+    }
+    args
 }
 
 impl Harness for ClaudeHarness {
@@ -38,24 +81,7 @@ impl Harness for ClaudeHarness {
 
     fn launch(&self, spec: &LaunchSpec) -> rk_core::Result<HarnessSession> {
         let mut cmd = Command::new("claude");
-        cmd.args([
-            "-p",
-            "--output-format",
-            "stream-json",
-            "--input-format",
-            "stream-json",
-            "--verbose",
-        ]);
-        if let Some(system) = &spec.system_prompt {
-            cmd.args(["--append-system-prompt", system]);
-        }
-        cmd.args(permission_args(spec.permission_mode.as_deref()));
-        if let Some(model) = &spec.model {
-            cmd.args(["--model", model]);
-        }
-        if let Some(session) = &spec.resume_session {
-            cmd.args(["--resume", session]);
-        }
+        cmd.args(launch_args(spec));
         cmd.current_dir(&spec.cwd);
         cmd.envs(&spec.env);
 
@@ -241,5 +267,24 @@ mod tests {
             permission_args(Some("acceptEdits")),
             vec!["--permission-mode", "acceptEdits"]
         );
+    }
+
+    #[test]
+    fn launch_always_denies_account_connectors() {
+        let spec = LaunchSpec {
+            prompt: "do the task".into(),
+            permission_mode: Some("bypassPermissions".into()),
+            model: Some("claude-x".into()),
+            resume_session: Some("sess-1".into()),
+            ..Default::default()
+        };
+        let args = launch_args(&spec);
+        let idx = args
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .expect("--disallowedTools must always be present");
+        for (offset, server) in DENIED_MCP_SERVERS.iter().enumerate() {
+            assert_eq!(args[idx + 1 + offset], *server);
+        }
     }
 }
