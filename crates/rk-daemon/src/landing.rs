@@ -1227,6 +1227,7 @@ impl LandingPipeline {
                 on_timeout: OnTimeout::Fail,
                 environment_policy: check.environment_policy,
                 retry_on_fail: 0,
+                shared_cargo_target: check.shared_cargo_target,
             };
             let outcome = self
                 .engine
@@ -1780,6 +1781,7 @@ workflow: {
             on_timeout: OnTimeout::Fail,
             environment_policy: rk_workflow::CheckEnvironmentPolicy::StripRkSpawn,
             retry_on_fail: 0,
+            shared_cargo_target: false,
         };
         let result = engine
             .run_check_in(

@@ -131,6 +131,20 @@ impl Layout {
         self.home.join("worktrees")
     }
 
+    /// Shared `CARGO_TARGET_DIR` for every worktree of `repo`. Each rat
+    /// worktree is a separate git worktree (separate filesystem tree), so a
+    /// bare `target/` inside it is never shared with siblings — N concurrent
+    /// worktrees of the same repo each carry their own multi-GB build cache,
+    /// which is what drove the fleet root filesystem to ENOSPC under 60+
+    /// concurrent worktrees (TKT-01M04D1QDBNCF0T0D0EHRVNJV5). Pointing
+    /// `CARGO_TARGET_DIR` here instead lets cargo's own fingerprinting and
+    /// target-dir file lock do the sharing across worktrees on the same repo,
+    /// trading disk multiplication for lock contention on overlapping builds
+    /// — a standard shared-cache tradeoff, not a correctness risk.
+    pub fn cargo_target_cache_dir(&self, repo: &str) -> PathBuf {
+        self.home.join("cargo-target-cache").join(repo)
+    }
+
     pub fn workflows_dir(&self) -> PathBuf {
         self.home.join("workflows")
     }

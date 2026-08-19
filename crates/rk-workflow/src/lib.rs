@@ -846,6 +846,19 @@ pub struct Check {
     /// checks so the verification report can preserve it.
     #[serde(default)]
     pub toolchain: Option<String>,
+    /// Whether this check contends for the shared `CARGO_TARGET_DIR`
+    /// (`[disk] shared_cargo_target`, TKT-01M04D1QDBNCF0T0D0EHRVNJV5) and must
+    /// therefore be serialized against every other same-repo check/agent that
+    /// also sets this (TKT-01M0CFA1RX36SJ7DV4YWGHQ9BT). Cargo's own
+    /// target-dir lock only covers a single invocation's build phase, not the
+    /// gap between resolving a test binary's path and exec'ing it — two
+    /// concurrent builds against the same shared dir can still race a stale
+    /// binary out from under each other there. Only a check that actually
+    /// builds/tests Rust against the shared cache (like `verify`) should set
+    /// this; an unrelated fast check (a git diff-scope gate) must not pay for
+    /// contention it never causes. Default false, opt-in per check.
+    #[serde(default, rename = "sharedCargoTarget")]
+    pub shared_cargo_target: bool,
 }
 
 /// Load and validate every `#Check` in one repo's `checks.cue` registry.
@@ -2420,6 +2433,20 @@ checks: [
             CheckEnvironmentPolicy::StripRkSpawn
         );
         assert_eq!(checks[1].toolchain.as_deref(), Some("mise rust@1.95.0"));
+    }
+
+    #[test]
+    fn shared_cargo_target_defaults_false_and_parses_true() {
+        let source = r#"
+checks: [
+    {name: "fast", command: "true"},
+    {name: "verify", command: "cargo test", sharedCargoTarget: true},
+]
+"#;
+        let checks = load_checks_str(source).unwrap();
+        assert_eq!(checks.len(), 2);
+        assert!(!checks[0].shared_cargo_target, "unset defaults to false");
+        assert!(checks[1].shared_cargo_target);
     }
 
     #[test]

@@ -11,6 +11,7 @@ checks: [
 		timeout:           "60m"
 		environmentPolicy: "strip_rk_spawn"
 		toolchain:         "mise rust@1.95.0"
+		sharedCargoTarget: true
 	},
 	{
 		name: "steward-protected-paths"

@@ -1,5 +1,9 @@
 [build]
-# Keep direct `cargo` invocations disk-safe too. Do not create per-agent target
-# directories. Cargo's normal shared `target/` cache is the single build cache.
+# Keep direct `cargo` invocations disk-safe too. For rat-spawned agents, the
+# real sharing is CARGO_TARGET_DIR set per-repo by the daemon
+# ([disk] shared_cargo_target, see crates/rk-daemon/src/supervisor.rs
+# agent_env) — this file can't express that since target-dir here would
+# resolve relative to whichever worktree cargo runs in. A manual/human
+# `cargo`/`mise run verify` invocation still uses this worktree's own target/.
 incremental = false
 jobs = 4

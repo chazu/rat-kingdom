@@ -288,6 +288,9 @@ impl Daemon {
             .set_min_free_disk_gb(config.disk.min_free_gb);
         daemon
             .supervisor
+            .set_shared_cargo_target(config.disk.shared_cargo_target);
+        daemon
+            .supervisor
             .set_done_kill_grace_secs(config.supervisor.done_kill_grace_secs);
         daemon.supervisor.set_sinks(
             crate::reactor::sink_factory()
@@ -413,6 +416,11 @@ impl Daemon {
     #[doc(hidden)]
     pub fn set_min_free_disk_gb(&self, gb: u64) {
         self.supervisor.set_min_free_disk_gb(gb);
+    }
+
+    #[doc(hidden)]
+    pub fn set_shared_cargo_target(&self, enabled: bool) {
+        self.supervisor.set_shared_cargo_target(enabled);
     }
 
     #[doc(hidden)]
