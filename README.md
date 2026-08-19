@@ -827,13 +827,14 @@ window_secs = 60         # rolling rate-cap window
 max_fires = 20           # default per-trigger cap; a #Trigger may lower it
 marker_ttl_secs = 604800  # idempotency marker lifetime
 exclude_instances = []    # authors never reacted to (besides "reactor")
-notify_escalations = true # desktop-push a steward escalation via herdr; false = inbox-only
+notify_escalations = true # false = hard kill switch, zero notification sinks, inbox-only
 ```
 
 - **Active escalation push.** When the steward escalates a `STOP`/unknown
-  verdict as a `need` (identity `steward`), a built-in reaction fires a desktop
-  notification via herdr so the operator is pushed at, not only queued in
-  `rk inbox`. A no-op when no herdr server is running.
+  verdict as a `need` (identity `steward`), a built-in reaction fans it out
+  through every configured **notification sink**, so the operator is pushed
+  at, not only queued in `rk inbox`. Which channels see it is config, not code
+  — see [Notification sinks](#notification-sinks) below.
 - **Open ballots reach the operator.** `rk suggest` proposes a norm and the
   reactor promotes it to a permanent `convention` at `quorum` distinct
   endorsers — but nothing announced that a vote was open, so proposals decayed
@@ -846,6 +847,51 @@ notify_escalations = true # desktop-push a steward escalation via herdr; false =
 
 See `docs/reactor.md` for the full design (why scan-is-truth, the three
 re-entrancy guards, first-boot backlog skipping).
+
+### Notification sinks
+
+Escalation delivery is a config table, not a hardwired call. An escalation
+source builds a channel-agnostic notice and hands it to the sink registry,
+which fans it out to every `[[notify.sinks]]` entry that accepts it:
+
+```toml
+[[notify.sinks]]
+kind = "herdr"                          # desktop push (rk-mux)
+
+[[notify.sinks]]
+name = "ops-chat"                       # defaults to the kind if unset
+kind = "command"                        # shell out to an operator script
+classes = ["steward-escalation"]        # empty = every class
+min_severity = "warn"                   # info (default) | warn | critical
+
+[notify.sinks.options]
+command = "/usr/local/bin/rk-notify-chat"
+timeout_secs = "30"
+```
+
+- **Built-in kinds:** `herdr` (the historical desktop push), `log` (writes the
+  notice through `tracing` at its severity — zero options, cannot fail to be
+  installed, the honest default on a headless castle), and `command` (execs an
+  operator program with the notice on argv, as `RK_NOTICE_*` env vars, and as
+  JSON on stdin — the escape hatch for a chat webhook, phone push, or a script
+  that drives `rk`). A repo/embedder can register further kinds; an unknown
+  `kind` in a table is skipped and logged, never fatal.
+- **Back-compat.** `[[notify.sinks]]` is empty by default, which is *not* "no
+  notifications" — it means "use the built-in default", so a castle that never
+  heard of this section keeps the one herdr sink it always had.
+  `[reactor].notify_escalations = false` predates sinks entirely and stays a
+  hard kill switch: it drops to zero sinks regardless of what
+  `[[notify.sinks]]` says. Any non-empty `[[notify.sinks]]` list is the
+  operator's list, verbatim — adding a second channel is one more table, no
+  code change anywhere.
+- **Dedup.** Markers are per-`(tuple, sink)`, so adding a channel does not
+  inherit another channel's "already pushed" state. The `herdr` sink also
+  honours the pre-sink-registry marker key, so upgrading mid-flight does not
+  re-pop a notification that already fired.
+- **Best-effort.** A sink that errors, hangs, or is not installed produces a
+  logged delivery failure and nothing else — the escalation is already durable
+  in the tuplespace and ranked by `rk inbox`, so a dead channel degrades to the
+  passive queue rather than blocking the reactor cycle.
 
 ## Scheduler (cron)
 

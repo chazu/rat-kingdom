@@ -375,9 +375,8 @@ three deterministic checks.
    - `REWORK` → `Tickets::create` a follow-up ticket directly, hold the
      branch;
    - `STOP` / unrecognized verdict → `Space::out` a `need` tuple directly
-     (ranked into `rk inbox` *and* pushed to the operator's desktop by the
-     [escalation-notify built-in](#built-in-reaction-escalation-notification)),
-     hold the branch;
+     (ranked into `rk inbox` *and* pushed through every configured
+     [notification sink](#notification-sinks)), hold the branch;
    - a failing or timed-out gate → a durable `gate-failure` artifact + a
      `need`, hold the branch.
 
@@ -659,21 +658,83 @@ converged-on wall into durable, closable work.
 The third built-in turns a steward escalation into an **active** operator push.
 The steward already surfaces a `STOP`/unknown verdict as a `need` (identity
 `steward`) that `rk inbox` ranks — a *passive* queue the operator polls. This
-built-in adds a desktop notification (via `HerdrMux::notify`, herdr's
-`notification show`) the moment such a `need` lands, so a human is pinged when a
-branch needs a merge decision instead of only on their next inbox check.
+built-in builds a channel-agnostic `EscalationNotice` the moment such a `need`
+lands and fans it out through the [`SinkRegistry`](#notification-sinks), so a
+human is pushed at instead of only finding it on their next inbox check.
 
 - The discriminator is `category = need` **and** `identity = "steward"`. A rat's
   own `rk need` keys on its agent name, so an ordinary help request is left on
   the inbox queue and never pops a notification.
-- It fires **at most once per need tuple**, guarded by the same durable
-  idempotency marker (`Event/reactor_fired`) the trigger path uses — an
-  at-least-once re-scan never double-pops. A reinforced escalation keeps its id
-  below the cursor and is never re-seen, so a repeat push only happens after the
-  old `need` evaporates and a fresh one is written (the intended de-spam).
-- It **degrades to a no-op** when no herdr server is reachable, so a headless
-  castle is unaffected. Set `notify_escalations = false` to keep escalations
-  purely on the passive `rk inbox` queue.
+- Delivery is per `(need tuple, sink)`, each guarded by its own durable
+  idempotency marker (`notify-escalation@<tuple>@<sink>`, `Event/reactor_fired`
+  underneath) — an at-least-once re-scan never double-pops any one channel, and
+  a channel added later starts fresh rather than inheriting another channel's
+  "already delivered" state. The `herdr` sink additionally honours the
+  pre-registry marker key (`notify-escalation@<tuple>`), so a daemon upgraded
+  mid-flight does not re-pop a notice it already showed. A reinforced
+  escalation keeps its id below the cursor and is never re-seen, so a repeat
+  push only happens after the old `need` evaporates and a fresh one is written
+  (the intended de-spam).
+- Each sink is independently best-effort: a dead or unreachable channel (no
+  herdr server running, a `command` sink's program missing) produces a logged
+  failure and nothing else. The escalation is already durable and ranked on
+  `rk inbox` regardless, so one sink's outage never suppresses another's
+  delivery or stalls the reactor cycle. Set `notify_escalations = false` to
+  keep escalations purely on the passive `rk inbox` queue — a hard kill switch
+  that empties the sink list outright, independent of `[[notify.sinks]]`.
+
+### Notification sinks
+
+Which channels an escalation reaches is `[[notify.sinks]]` config, not a
+property of the call site (`crates/rk-core/src/notify.rs`). An escalation
+source builds one channel-agnostic `EscalationNotice` and hands it to
+`SinkRegistry::fan_out`; the registry — built once at reactor construction from
+resolved config — decides which configured sinks accept it and delivers to
+each independently.
+
+```toml
+[[notify.sinks]]
+kind = "herdr"                          # desktop push (rk-mux, the historical default)
+
+[[notify.sinks]]
+name = "ops-chat"                       # dedup/registry key; defaults to kind if unset
+kind = "command"                        # shell out to an operator program
+classes = ["steward-escalation"]        # notice classes this sink accepts; empty = all
+min_severity = "warn"                   # info (default) | warn | critical
+
+[notify.sinks.options]
+command = "/usr/local/bin/rk-notify-chat"
+timeout_secs = "30"
+```
+
+- **Kinds.** `herdr` (desktop push via `HerdrMux::notify`, registered in
+  `rk-daemon`'s `sink_factory` since `rk-mux` cannot be reached from
+  `rk-core`), `log` (emits through `tracing` at the notice's severity — no
+  options, cannot fail to install, the useful second sink on a headless
+  castle), and `command` (execs `options.command` directly — not a shell line
+  — with the notice as `<title> <body>` on argv, `RK_NOTICE_TITLE`/`_BODY`/
+  `_TEXT`/`_CLASS`/`_SEVERITY`/`_SCOPE`/`_SUBJECT`/`_TUPLE`/`_ACTION` plus
+  `RK_NOTICE_REF_<KEY>` per ref in the environment, and the full notice as JSON
+  on stdin; bounded by `options.timeout_secs`, default 10s, past which the
+  child is killed and the delivery reported failed). Registering a new kind is
+  one `SinkFactory::with_kind` call — no change to the reactor or any
+  escalation source. An unknown `kind` in a table is skipped and logged
+  (`error!`, since a channel the operator believes in but which never built is
+  a silent loss of every future escalation on it), never fatal to the daemon.
+- **Back-compat mapping (`NotifyConfig::resolved`).** `notify_escalations =
+  false` ⇒ zero sinks, full stop — that bool predates this section and stays a
+  hard kill switch rather than silently losing its meaning to config the
+  operator never wrote. An empty `[[notify.sinks]]` (the default — unset is
+  not the same as "no notifications") ⇒ exactly the historical behaviour,
+  expressed as one default `herdr` sink. Any non-empty `[[notify.sinks]]` ⇒ the
+  operator's list, verbatim: a second channel is a table, not a patch.
+- **Filtering.** A sink accepts a notice when it is `enabled` (default true),
+  its `classes` list is empty or contains the notice's `class`, and the notice's
+  `severity` is at or above `min_severity`.
+- **Markers are per-`(tuple, sink)`.** See the discriminator note above — this
+  is what lets a second sink be added without inheriting the first sink's
+  delivery history, and what lets the `herdr` sink alone honour the pre-sink-
+  registry marker key for upgrade continuity.
 
 ## Built-in reaction: resolution backlinks
 
@@ -732,8 +793,11 @@ marker_ttl_secs = 604800  # idempotency-marker lifetime (one week)
 exclude_instances = []    # authors never reacted to, besides "reactor"
 quorum = 3                # distinct endorsers that promote a suggestion; 0 = off
 coalesce_quorum = 3       # distinct reporters that coalesce a wall into a ticket; 0 = off
-notify_escalations = true # desktop-push a steward escalation via herdr; false = inbox-only
+notify_escalations = true # false = hard kill switch, zero notification sinks, inbox-only
 ```
+
+See [Notification sinks](#notification-sinks) for `[[notify.sinks]]`, the
+per-channel table that decides *which* channels a `true` here actually reaches.
 
 ## Where it lives
 
