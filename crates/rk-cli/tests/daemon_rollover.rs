@@ -33,6 +33,16 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
+/// These tests spawn against a `tempfile::tempdir()` `RK_HOME`, whose free
+/// disk space depends on wherever the test runner's temp filesystem lives —
+/// on a constrained CI disk that can already be under the default `[disk]
+/// min_free_gb = 10` floor, which then refuses every spawn before rollover
+/// is even exercised. Disable the guard for these tests; they cover rollover
+/// behavior, not disk-pressure refusal (that's `worktree_cleanup.rs`).
+fn disable_disk_floor(home: &Path) {
+    std::fs::write(home.join("config.toml"), "[disk]\nmin_free_gb = 0\n").unwrap();
+}
+
 fn scratch_repo(dir: &Path) {
     git(dir, &["init", "-b", "main"]);
     git(dir, &["config", "user.email", "rat@example.com"]);
@@ -59,6 +69,7 @@ fn json_stdout(out: &std::process::Output) -> Value {
 #[test]
 fn rollover_parks_a_live_rat_and_it_respawns() {
     let home = tempfile::tempdir().unwrap();
+    disable_disk_floor(home.path());
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
@@ -177,6 +188,7 @@ fn rollover_parks_a_live_rat_and_it_respawns() {
 #[test]
 fn rollover_refuses_new_dispatch_while_draining() {
     let home = tempfile::tempdir().unwrap();
+    disable_disk_floor(home.path());
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
