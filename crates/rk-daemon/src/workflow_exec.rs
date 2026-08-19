@@ -193,6 +193,58 @@ enum RunOutcome {
     TimedOut,
 }
 
+/// Decode a `spawn_check_child` outcome into the flat tuple `run_check_in`
+/// tracks. Factored out so a retried outcome (the shared cargo target-dir
+/// contention retry, and the initial attempt) decode identically.
+fn decode_run_outcome(
+    outcome: RunOutcome,
+    command: &str,
+    resolved: &ResolvedRun,
+) -> (i64, String, bool, String, bool, bool) {
+    match outcome {
+        RunOutcome::Completed {
+            status,
+            stdout,
+            stdout_truncated,
+            stderr,
+            stderr_truncated,
+        } => (
+            status.code().unwrap_or(-1) as i64,
+            String::from_utf8_lossy(&stdout).into_owned(),
+            stdout_truncated,
+            String::from_utf8_lossy(&stderr).into_owned(),
+            stderr_truncated,
+            false,
+        ),
+        RunOutcome::TimedOut => (
+            TIMEOUT_EXIT,
+            String::new(),
+            false,
+            format!(
+                "run step: `{command}` timed out after {} and was killed",
+                resolved.timeout
+            ),
+            false,
+            true,
+        ),
+    }
+}
+
+/// Matches only the shared `CARGO_TARGET_DIR` cross-process contention
+/// signature (docs/2026-08-19-tkt-hot-scan-target-dir-contention.md): a
+/// build artifact resolved by one process gets pruned by a concurrent
+/// `cargo build` in another worktree before this process can exec it.
+/// Deliberately narrow -- a real compile error or test failure must never
+/// match this and get a free retry.
+fn is_cargo_target_contention_signature(stdout: &str, stderr: &str) -> bool {
+    let hits = |s: &str| {
+        s.contains("could not execute process")
+            && s.contains("(never executed)")
+            && s.contains("No such file or directory (os error 2)")
+    };
+    hits(stdout) || hits(stderr)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Instance {
     pub id: String,
@@ -2917,34 +2969,44 @@ impl WorkflowEngine {
             // output is genuinely gone (the reader tasks are aborted with the
             // child), so stderr carries the explanation instead of a lie about
             // what the suite printed.
-            let (exit, stdout, stdout_truncated, stderr, stderr_truncated, timed_out) =
-                match outcome {
-                    RunOutcome::Completed {
-                        status,
-                        stdout,
-                        stdout_truncated,
-                        stderr,
-                        stderr_truncated,
-                    } => (
-                        status.code().unwrap_or(-1) as i64,
-                        String::from_utf8_lossy(&stdout).into_owned(),
-                        stdout_truncated,
-                        String::from_utf8_lossy(&stderr).into_owned(),
-                        stderr_truncated,
-                        false,
-                    ),
-                    RunOutcome::TimedOut => (
-                        TIMEOUT_EXIT,
-                        String::new(),
-                        false,
-                        format!(
-                            "run step: `{command}` timed out after {} and was killed",
-                            resolved.timeout
-                        ),
-                        false,
-                        true,
-                    ),
-                };
+            let (
+                mut exit,
+                mut stdout,
+                mut stdout_truncated,
+                mut stderr,
+                mut stderr_truncated,
+                mut timed_out,
+            ) = decode_run_outcome(outcome, command, resolved);
+            // TKT-01M0CF9PG9NHHM0ZTFKDW6BVBV: under the shared
+            // `CARGO_TARGET_DIR` (`[disk] shared_cargo_target`), a concurrent
+            // `cargo build` in another worktree can prune a test binary
+            // between this process resolving its path and execing it,
+            // producing exactly this "could not execute process ... (never
+            // executed) ... No such file or directory (os error 2)" text.
+            // That's cross-process contention, not a real failure of the code
+            // under test (docs/2026-08-19-tkt-hot-scan-target-dir-contention.md
+            // option 2), so it gets exactly one free retry here — ahead of,
+            // and independent from, the configured `retry_on_fail` flaky-retry
+            // loop below, so it fires even when `retry_on_fail` is 0. Scoped
+            // tightly to this exact signature so a real compile error or test
+            // failure is never retried.
+            if !timed_out && exit != 0 && is_cargo_target_contention_signature(&stdout, &stderr) {
+                info!(
+                    agent = %agent, command = %command,
+                    "run step hit shared cargo target-dir contention signature, retrying once"
+                );
+                let retry_outcome = self
+                    .spawn_check_child(command, dir, resolved, agent, env, timeout)
+                    .await?;
+                (
+                    exit,
+                    stdout,
+                    stdout_truncated,
+                    stderr,
+                    stderr_truncated,
+                    timed_out,
+                ) = decode_run_outcome(retry_outcome, command, resolved);
+            }
             // The routable three-way summary. `exit` alone cannot express it:
             // a suite may exit 124 on its own, and "did not finish" calls for
             // a different hand-off than "finished and said no".
@@ -5521,6 +5583,157 @@ test a::flaky ... FAILED
         assert_eq!(failures[0].payload["agent"], json!("daemon"));
         assert_eq!(failures[0].payload["verdict"], json!("fail"));
         assert_eq!(failures[0].payload["exit"], json!(3));
+    }
+
+    /// TKT-01M0CF9PG9NHHM0ZTFKDW6BVBV: a shared `CARGO_TARGET_DIR`
+    /// cross-process contention failure (see
+    /// docs/2026-08-19-tkt-hot-scan-target-dir-contention.md) gets exactly
+    /// one free retry, ahead of and independent from `retry_on_fail`, so it
+    /// fires even at the historical default of 0.
+    #[tokio::test]
+    async fn run_check_in_retries_once_on_cargo_target_contention_signature_then_passes() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        let bare_gate_dir = tempfile::tempdir().unwrap();
+
+        let resolved = ResolvedRun {
+            command: "if [ -f retried ]; then exit 0; else touch retried; \
+                      echo 'could not execute process `/tmp/hot_scan-deadbeef` (never executed)' 1>&2; \
+                      echo 'Caused by: No such file or directory (os error 2)' 1>&2; \
+                      exit 101; fi"
+                .into(),
+            cwd: None,
+            expect_exit: Some(0),
+            timeout: "5s".into(),
+            on_timeout: OnTimeout::Fail,
+            environment_policy: rk_workflow::CheckEnvironmentPolicy::StripRkSpawn,
+            retry_on_fail: 0,
+        };
+        let timeout = Duration::from_secs(5);
+
+        let result = engine
+            .run_check_in(
+                "inst-contention-retry",
+                "/repo/daemon-gate",
+                "daemon",
+                bare_gate_dir.path(),
+                &resolved.command,
+                &resolved,
+                &[],
+                timeout,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["verdict"], json!("pass"));
+        assert_eq!(result["exit"], json!(0));
+        assert!(
+            result.get("retries").is_none(),
+            "the contention retry must not populate the flaky `retry_on_fail` history: {result:?}"
+        );
+    }
+
+    /// The contention signature retries exactly once — a second consecutive
+    /// hit still records a gate failure rather than retrying forever.
+    #[tokio::test]
+    async fn run_check_in_retries_exactly_once_on_contention_signature_then_records_gate_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        let space = engine.space.clone();
+        let bare_gate_dir = tempfile::tempdir().unwrap();
+
+        let resolved = ResolvedRun {
+            command: "n=$(cat count 2>/dev/null || echo 0); n=$((n+1)); echo $n > count; \
+                      echo 'could not execute process `/tmp/hot_scan-deadbeef` (never executed): No such file or directory (os error 2)' 1>&2; \
+                      exit 101"
+                .into(),
+            cwd: None,
+            expect_exit: Some(0),
+            timeout: "5s".into(),
+            on_timeout: OnTimeout::Fail,
+            environment_policy: rk_workflow::CheckEnvironmentPolicy::StripRkSpawn,
+            retry_on_fail: 0,
+        };
+        let timeout = Duration::from_secs(5);
+
+        let err = engine
+            .run_check_in(
+                "inst-contention-exhausted",
+                "/repo/daemon-gate",
+                "daemon",
+                bare_gate_dir.path(),
+                &resolved.command,
+                &resolved,
+                &[],
+                timeout,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exited 101"));
+
+        let count: u32 = std::fs::read_to_string(bare_gate_dir.path().join("count"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(count, 2, "expected exactly one retry (2 total executions)");
+
+        let failures = space
+            .scan(&Pattern::category(Category::Artifact).identity("gate-failure"))
+            .unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].payload["exit"], json!(101));
+    }
+
+    /// A real failure — no contention signature in its output — must never
+    /// get the free retry; it fails on the first attempt like today.
+    #[tokio::test]
+    async fn run_check_in_does_not_retry_a_genuine_failure_that_lacks_the_contention_signature() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        let bare_gate_dir = tempfile::tempdir().unwrap();
+
+        let resolved = ResolvedRun {
+            command: "n=$(cat count 2>/dev/null || echo 0); n=$((n+1)); echo $n > count; \
+                      echo 'assertion failed: left == right' 1>&2; \
+                      exit 101"
+                .into(),
+            cwd: None,
+            expect_exit: Some(0),
+            timeout: "5s".into(),
+            on_timeout: OnTimeout::Fail,
+            environment_policy: rk_workflow::CheckEnvironmentPolicy::StripRkSpawn,
+            retry_on_fail: 0,
+        };
+        let timeout = Duration::from_secs(5);
+
+        let err = engine
+            .run_check_in(
+                "inst-genuine-fail",
+                "/repo/daemon-gate",
+                "daemon",
+                bare_gate_dir.path(),
+                &resolved.command,
+                &resolved,
+                &[],
+                timeout,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exited 101"));
+
+        let count: u32 = std::fs::read_to_string(bare_gate_dir.path().join("count"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "a real failure must not get the contention free retry"
+        );
     }
 
     /// TKT-146, closed for the SEQUENTIAL path
