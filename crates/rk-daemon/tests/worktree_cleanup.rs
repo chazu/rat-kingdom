@@ -102,7 +102,7 @@ esac
     )
 }
 
-async fn spawn(client: &mut Client, repo: &Path, task: &str, extra: Value) -> String {
+async fn spawn_record(client: &mut Client, repo: &Path, task: &str, extra: Value) -> Value {
     let mut params = json!({
         "repo": repo.to_string_lossy(),
         "task": task,
@@ -113,7 +113,14 @@ async fn spawn(client: &mut Client, repo: &Path, task: &str, extra: Value) -> St
         map.insert(k, v);
     }
     let spawned = client.call("agent.spawn", params).await.unwrap();
-    spawned["agent"]["name"].as_str().unwrap().to_string()
+    spawned["agent"].clone()
+}
+
+async fn spawn(client: &mut Client, repo: &Path, task: &str, extra: Value) -> String {
+    spawn_record(client, repo, task, extra).await["name"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 async fn wait_for_state(client: &mut Client, name: &str, want: &str) {
@@ -428,12 +435,11 @@ async fn periodic_sweep_reclaims_a_leaked_worktree() {
 
     // A clean, trivially-merged (never diverged from base) leftover — exactly
     // the leaked-worktree scenario the sweep exists to reclaim.
-    let name = spawn(&mut client, repo_dir.path(), "noop-1", json!({})).await;
+    let spawned = spawn_record(&mut client, repo_dir.path(), "noop-1", json!({})).await;
+    let name = spawned["name"].as_str().unwrap().to_string();
+    let worktree = PathBuf::from(spawned["worktree"].as_str().unwrap());
     wait_for_state(&mut client, &name, "completed").await;
 
-    let agents = list(&mut client, json!({})).await;
-    let rec = agents.iter().find(|a| a["name"] == name).unwrap();
-    let worktree = PathBuf::from(rec["worktree"].as_str().unwrap());
     assert!(worktree.exists());
 
     // Never dismissed or pruned by the test — only the periodic sweep touches it.
@@ -636,18 +642,17 @@ async fn periodic_sweep_rejects_artifact_path_that_resolves_to_worktree_root() {
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
 
-    let name = spawn(
+    let spawned = spawn_record(
         &mut client,
         repo_dir.path(),
         "sweep-artifacts-root-1",
         json!({}),
     )
     .await;
+    let name = spawned["name"].as_str().unwrap().to_string();
+    let worktree = PathBuf::from(spawned["worktree"].as_str().unwrap());
     wait_for_state(&mut client, &name, "completed").await;
 
-    let agents = list(&mut client, json!({})).await;
-    let rec = agents.iter().find(|a| a["name"] == name).unwrap();
-    let worktree = PathBuf::from(rec["worktree"].as_str().unwrap());
     assert!(worktree.exists());
     assert!(
         worktree.join("gnawed.txt").exists(),
