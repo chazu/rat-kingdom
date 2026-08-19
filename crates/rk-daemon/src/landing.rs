@@ -795,6 +795,7 @@ impl LandingPipeline {
                     false,
                 )
                 .await?;
+            self.record_delivery(entry, &result).await;
             let outcome = LandingOutcome::Landed(result);
             self.mark_processed(entry, &outcome)?;
             return Ok(outcome);
@@ -1005,6 +1006,7 @@ impl LandingPipeline {
                         false,
                     )
                     .await?;
+                self.record_delivery(entry, &result).await;
                 Ok(LandingOutcome::Landed(result))
             }
             "REWORK" => Ok(LandingOutcome::ReworkFiled(
@@ -1026,6 +1028,64 @@ impl LandingPipeline {
                 );
                 Ok(LandingOutcome::Escalated(self.escalate(entry, text)?))
             }
+        }
+    }
+
+    /// Write the durable delivery record onto `entry`'s ticket and close it
+    /// (P1b). Called from every successful-land path in this module, which is
+    /// the whole fix: nothing used to close a ticket after a land, so
+    /// delivered work sat `in_progress` indefinitely while every later "is it
+    /// delivered" question fell back to a live branch ref that the land had
+    /// just deleted.
+    ///
+    /// Skipped — deliberately, not as an error — when the merge produced no
+    /// merge commit (`merged: false`, a conflict the queue will surface) or
+    /// when the branch was `content_free` (an empty branch is not a delivery).
+    /// Best-effort: the merge already happened and is durable in git, so a
+    /// failure to annotate the ticket is logged and never turned into a
+    /// landing failure that would strand the queue entry.
+    ///
+    /// Stack-neutral by construction: the record is a merge commit sha plus
+    /// the branch and target it landed on. No build tooling is consulted and
+    /// no language convention is assumed.
+    async fn record_delivery(&self, entry: &LandingQueueEntry, result: &Value) {
+        if !entry.task.starts_with(crate::tickets::ID_PREFIX) {
+            return;
+        }
+        if result.get("content_free").and_then(Value::as_bool) == Some(true) {
+            info!(
+                task = %entry.task,
+                branch = %entry.branch,
+                "land added nothing over target; not recording a delivery"
+            );
+            return;
+        }
+        let Some(merge_commit) = result
+            .get("merge_commit")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
+        else {
+            return;
+        };
+        let record = crate::tickets::DeliveryRecord {
+            merge_commit: merge_commit.to_string(),
+            branch: entry.branch.clone(),
+            target: entry.target.clone(),
+            landed_at: Utc::now().to_rfc3339(),
+        };
+        match self.tickets.record_delivery(&entry.task, &record).await {
+            Ok(_) => info!(
+                task = %entry.task,
+                merge_commit,
+                target = %entry.target,
+                "recorded delivery and closed ticket"
+            ),
+            Err(e) => warn!(
+                task = %entry.task,
+                merge_commit,
+                error = %e,
+                "landed but failed to record delivery on the ticket"
+            ),
         }
     }
 
