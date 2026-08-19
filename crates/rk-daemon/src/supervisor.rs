@@ -846,6 +846,16 @@ impl Supervisor {
             .collect()
     }
 
+    /// The transcript file of `name`'s most recent generation — live or
+    /// archived. `None` when no record carries the name, which a lifecycle
+    /// hook dispatch (agent_completed/failed/dismissed) treats as "no
+    /// transcript to ship," not an error: an agent that never narrated still
+    /// completes.
+    pub fn latest_transcript_path(&self, name: &str) -> Option<PathBuf> {
+        let start = self.log_generations(name).last()?.start?;
+        Some(self.log.transcript_path(name, start))
+    }
+
     /// Called once the daemon has WON the socket bind — never earlier. A
     /// Daemon that loses the bind race must not touch shared registry state.
     pub fn on_daemon_started(&self) {

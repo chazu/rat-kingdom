@@ -259,6 +259,13 @@ impl AgentLog {
             .join(format!("{}.{}.jsonl", sanitize(agent), stamp(generation)))
     }
 
+    /// Where one generation's transcript file lives on disk, for a caller
+    /// (a lifecycle hook dispatch) that needs the path itself rather than the
+    /// parsed entries `read` returns.
+    pub fn transcript_path(&self, agent: &str, generation: DateTime<Utc>) -> PathBuf {
+        self.path_for(agent, generation)
+    }
+
     /// Where transcripts lived before the file was keyed on a generation:
     /// read-only history, never appended to again.
     fn legacy_path(&self, agent: &str) -> PathBuf {
