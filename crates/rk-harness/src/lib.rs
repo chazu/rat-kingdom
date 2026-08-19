@@ -229,6 +229,32 @@ pub(crate) mod runner {
         pub steer_line: Option<fn(&str) -> String>,
     }
 
+    /// Guarantees a harness child's WHOLE process group dies, not just the
+    /// PID `kill_on_drop` reaches. The child is spawned with
+    /// `.process_group(0)` (below) so grandchildren it backgrounds share its
+    /// group; `child` itself is only ever dropped inside the detached task
+    /// spawned by `launch`, so this guard travels with it into that task.
+    /// Disarmed once `child.wait()` resolves — by then the child has exited
+    /// on its own and the group is (or is about to be) empty, so a group-kill
+    /// there would just race a legitimately finished process. Any other way
+    /// that task's future stops running (an ungraceful daemon shutdown, a
+    /// panicking/aborted supervisor task, or a tokio runtime tearing down
+    /// with the task still pending) drops the guard still armed, reaching
+    /// grandchildren `kill_on_drop` alone cannot (TKT-01M0BX1CT23QHZHMRXNRFD8QBV).
+    struct ProcessGroupGuard(Option<u32>);
+
+    impl ProcessGroupGuard {
+        fn disarm(&mut self) {
+            self.0 = None;
+        }
+    }
+
+    impl Drop for ProcessGroupGuard {
+        fn drop(&mut self) {
+            crate::send_group_signal(self.0, crate::SIGKILL);
+        }
+    }
+
     pub fn launch(mut wiring: Wiring) -> rk_core::Result<HarnessSession> {
         // Only pipe stdin for steerable adapters: a piped-but-idle stdin makes
         // some CLIs (codex exec) block waiting for EOF before starting.
@@ -250,6 +276,7 @@ pub(crate) mod runner {
             .kill_on_drop(true);
         let mut child = wiring.command.spawn()?;
         let pid = child.id();
+        let mut group_guard = ProcessGroupGuard(pid);
 
         let stdout = child
             .stdout
@@ -386,6 +413,7 @@ pub(crate) mod runner {
                     None
                 }
             };
+            group_guard.disarm();
             // Join the stderr drain before publishing `Exited`: it sends on a
             // clone of the same channel from an independent task, so without
             // this the final stderr line(s) can race `Exited` onto the wire
