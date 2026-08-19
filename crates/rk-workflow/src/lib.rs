@@ -15,6 +15,7 @@ use std::process::{Command, Stdio};
 const SCHEMA: &str = include_str!("schema.cue");
 const TRIGGER_SCHEMA: &str = include_str!("triggers-schema.cue");
 const SCHEDULE_SCHEMA: &str = include_str!("schedules-schema.cue");
+const HOOK_SCHEMA: &str = include_str!("hooks-schema.cue");
 const CHECK_SCHEMA: &str = include_str!("checks-schema.cue");
 const REPOSITORY_POLICY_SCHEMA: &str = include_str!("repository-policy-schema.cue");
 
@@ -1346,6 +1347,44 @@ pub fn load_schedules_str(source: &str) -> rk_core::Result<Vec<Schedule>> {
     Ok(schedules)
 }
 
+/// A castle- or repo-level lifecycle hook: run a program when a matching
+/// event tuple lands (agent spawned/completed/failed/dismissed, a branch
+/// lands, a gate fails, an escalation is raised). Loaded from `#Hook` CUE
+/// definitions, validated against the embedded hook schema exactly as
+/// triggers/schedules are.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Hook {
+    pub name: String,
+    /// Lifecycle events this hook reacts to (see `#Event` in the schema).
+    pub events: Vec<String>,
+    /// Program to run — exec'd directly, not a shell line (same discipline as
+    /// `[[notify.sinks]]`'s command sink).
+    pub command: String,
+    #[serde(default, rename = "timeoutSecs")]
+    pub timeout_secs: Option<u64>,
+    /// Registered repo this hook is scoped to; falls back to the tuple's
+    /// scope / the hook file's own repo at dispatch time, same as a
+    /// [`Trigger`]'s `repo`.
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+/// Load and validate every `#Hook` in one CUE file.
+pub fn load_hooks(file: &Path) -> rk_core::Result<Vec<Hook>> {
+    let source = std::fs::read_to_string(file)
+        .map_err(|e| rk_core::Error::other(format!("read {}: {e}", file.display())))?;
+    load_hooks_str(&source)
+}
+
+/// Load hooks from source text (see [`load_hooks`]).
+pub fn load_hooks_str(source: &str) -> rk_core::Result<Vec<Hook>> {
+    let source = schema_with_source(HOOK_SCHEMA, source);
+    let json = cue_export_stdin(&source, "hooks")?;
+    let hooks: Vec<Hook> = serde_json::from_str(&json)
+        .map_err(|e| rk_core::Error::other(format!("hooks JSON did not match schema: {e}")))?;
+    Ok(hooks)
+}
+
 /// Validate a workflow's syntax and schema without resolving its runtime
 /// parameters. The definition and embedded schema are sent to `cue` on stdin,
 /// so inspection does not create a temporary package or write beside the
@@ -2295,6 +2334,61 @@ schedules: [
     fn schedule_empty_cron_is_a_cue_error() {
         let bad = r#"schedules: [{name: "x", cron: "", run: "w"}]"#;
         let err = load_schedules_str(bad).unwrap_err();
+        assert!(err.to_string().contains("cue export failed"), "{err}");
+    }
+
+    const HOOKS: &str = r#"
+hooks: [
+    {
+        name: "archive-transcripts"
+        events: ["agent_completed", "agent_failed"]
+        command: "/usr/local/bin/rk-archive"
+        timeoutSecs: 30
+    },
+    {
+        name: "land-ping"
+        events: ["branch_landed"]
+        command: "/usr/local/bin/rk-ping"
+        repo: "rat-kingdom"
+    },
+]
+"#;
+
+    #[test]
+    fn loads_hooks_via_cue() {
+        let hooks = load_hooks_str(HOOKS).unwrap();
+        assert_eq!(hooks.len(), 2);
+        let first = &hooks[0];
+        assert_eq!(first.name, "archive-transcripts");
+        assert_eq!(
+            first.events,
+            vec!["agent_completed".to_string(), "agent_failed".to_string()]
+        );
+        assert_eq!(first.command, "/usr/local/bin/rk-archive");
+        assert_eq!(first.timeout_secs, Some(30));
+        assert_eq!(first.repo, None);
+        assert_eq!(hooks[1].repo.as_deref(), Some("rat-kingdom"));
+        assert_eq!(hooks[1].timeout_secs, None);
+    }
+
+    #[test]
+    fn hook_bad_name_is_a_cue_error() {
+        let bad = r#"hooks: [{name: "Bad Name", events: ["branch_landed"], command: "w"}]"#;
+        let err = load_hooks_str(bad).unwrap_err();
+        assert!(err.to_string().contains("cue export failed"), "{err}");
+    }
+
+    #[test]
+    fn hook_empty_events_is_a_cue_error() {
+        let bad = r#"hooks: [{name: "x", events: [], command: "w"}]"#;
+        let err = load_hooks_str(bad).unwrap_err();
+        assert!(err.to_string().contains("cue export failed"), "{err}");
+    }
+
+    #[test]
+    fn hook_unknown_event_is_a_cue_error() {
+        let bad = r#"hooks: [{name: "x", events: ["not_a_real_event"], command: "w"}]"#;
+        let err = load_hooks_str(bad).unwrap_err();
         assert!(err.to_string().contains("cue export failed"), "{err}");
     }
 

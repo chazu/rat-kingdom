@@ -147,6 +147,14 @@ impl Layout {
         self.home.join("schedules")
     }
 
+    /// Global `#Hook` definitions dir (`<home>/hooks/*.cue`). Repo-local hooks
+    /// live at `<repo>/.rk/hooks.cue` instead. Operator-authored automation
+    /// only: no RPC method writes here, and a rat's worktree is never this
+    /// directory, mirroring `triggers_dir`'s trust boundary.
+    pub fn hooks_dir(&self) -> PathBuf {
+        self.home.join("hooks")
+    }
+
     /// Create the directories the daemon needs at startup.
     pub fn ensure(&self) -> crate::Result<()> {
         for dir in [self.home.clone(), self.log_dir(), self.worktrees_dir()] {
@@ -200,6 +208,7 @@ mod tests {
         let l = Layout::at("/tmp/rk-test");
         assert_eq!(l.socket_path(), PathBuf::from("/tmp/rk-test/rk.sock"));
         assert_eq!(l.db_path(), PathBuf::from("/tmp/rk-test/space.db"));
+        assert_eq!(l.hooks_dir(), PathBuf::from("/tmp/rk-test/hooks"));
         assert!(l.config_file().starts_with(l.home()));
     }
 
