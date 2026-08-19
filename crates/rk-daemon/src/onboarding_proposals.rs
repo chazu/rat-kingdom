@@ -24,6 +24,7 @@ pub enum OnboardingProposalKind {
     WorkflowActivation,
     TriggerActivation,
     ScheduleActivation,
+    HookActivation,
 }
 
 impl OnboardingProposalKind {
@@ -35,6 +36,7 @@ impl OnboardingProposalKind {
             Self::WorkflowActivation => "workflow_activation",
             Self::TriggerActivation => "trigger_activation",
             Self::ScheduleActivation => "schedule_activation",
+            Self::HookActivation => "hook_activation",
         }
     }
 }
@@ -54,6 +56,7 @@ pub enum OnboardingProposalAction {
     ActivateWorkflow,
     ActivateTrigger,
     ActivateSchedule,
+    ActivateHook,
 }
 
 impl OnboardingProposalAction {
@@ -65,6 +68,7 @@ impl OnboardingProposalAction {
             Self::ActivateWorkflow => "activate_workflow",
             Self::ActivateTrigger => "activate_trigger",
             Self::ActivateSchedule => "activate_schedule",
+            Self::ActivateHook => "activate_hook",
         }
     }
 }
@@ -191,6 +195,7 @@ impl OnboardingProposalDraft {
                 | OnboardingProposalKind::WorkflowActivation
                 | OnboardingProposalKind::TriggerActivation
                 | OnboardingProposalKind::ScheduleActivation
+                | OnboardingProposalKind::HookActivation
         ) {
             self.target_path = canonical_repo_target(&self.target_path)?;
         }
@@ -290,6 +295,7 @@ pub enum OnboardingAutomationKind {
     Workflow,
     Trigger,
     Schedule,
+    Hook,
 }
 
 impl std::fmt::Display for OnboardingAutomationKind {
@@ -299,6 +305,7 @@ impl std::fmt::Display for OnboardingAutomationKind {
             Self::Workflow => "workflow",
             Self::Trigger => "trigger",
             Self::Schedule => "schedule",
+            Self::Hook => "hook",
         })
     }
 }
@@ -521,6 +528,7 @@ impl OnboardingProposal {
             (OnboardingProposalKind::ScheduleActivation, _) => {
                 Some(OnboardingAutomationKind::Schedule)
             }
+            (OnboardingProposalKind::HookActivation, _) => Some(OnboardingAutomationKind::Hook),
             (
                 OnboardingProposalKind::RepoFile
                 | OnboardingProposalKind::CastleConfig
@@ -663,6 +671,9 @@ fn validate_kind_action(
         ) | (
             OnboardingProposalKind::ScheduleActivation,
             OnboardingProposalAction::ActivateSchedule
+        ) | (
+            OnboardingProposalKind::HookActivation,
+            OnboardingProposalAction::ActivateHook
         )
     );
     if !valid {
@@ -695,6 +706,9 @@ fn validate_automation_target(
             OnboardingProposalKind::ScheduleActivation,
             OnboardingProposalAction::ActivateSchedule,
         ) => target == ".rk/schedules.cue",
+        (OnboardingProposalKind::HookActivation, OnboardingProposalAction::ActivateHook) => {
+            target == ".rk/hooks.cue"
+        }
         _ => true,
     };
     if valid {
