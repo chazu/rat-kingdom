@@ -2595,9 +2595,28 @@ checks: [
                 let pipeline = Arc::clone(&pipeline);
                 async move { pipeline.run_cycle().await }
             });
-            // Give claim_next time to run and the gate's `sleep 0.4` time to
-            // genuinely be mid-flight, well before it would finish.
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            // Poll until the candidate is durably claimed and mid-gate before
+            // aborting — a fixed sleep is not a reliable proxy for "the
+            // gate's `sleep 0.4` is genuinely mid-flight" under scheduler
+            // contention from the rest of the workspace suite (TKT-01M0C8PJ7AQ7TQ4WV7SCYJ9Y7F).
+            let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let pending = space
+                    .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                    .unwrap();
+                if pending.len() == 1 {
+                    let status: LandingEntryStatus =
+                        serde_json::from_value(pending[0].payload["status"].clone()).unwrap();
+                    if status == LandingEntryStatus::RunningGates {
+                        break;
+                    }
+                }
+                assert!(
+                    tokio::time::Instant::now() < poll_deadline,
+                    "candidate never reached RunningGates before the gate finished"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             handle.abort();
             let _ = handle.await;
 
