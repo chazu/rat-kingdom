@@ -144,6 +144,29 @@ async fn supervisor_persists_transcript_and_log_serves_it() {
         files[0]
     );
 
+    // E4: an exact spawn id resolves the same generation directly, without
+    // going through name (+ordinal) resolution at all.
+    let spawn = spawned["agent"]["spawn"].as_str().unwrap().to_string();
+    let by_spawn = client
+        .call("agent.log", json!({"name": spawn}))
+        .await
+        .unwrap();
+    assert_eq!(by_spawn["entries"], log["entries"], "same transcript");
+    assert_eq!(
+        by_spawn["agent"].as_str(),
+        Some(name.as_str()),
+        "the reply discloses which name the spawn id resolved to"
+    );
+
+    // An unknown spawn id is a parameter error, not a silent empty transcript.
+    let bad_spawn = client
+        .call(
+            "agent.log",
+            json!({"name": rk_core::id::SpawnId::new().to_string()}),
+        )
+        .await;
+    assert!(bad_spawn.is_err(), "no agent carries that spawn id");
+
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 

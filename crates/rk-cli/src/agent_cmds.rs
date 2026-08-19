@@ -91,7 +91,8 @@ pub struct PruneArgs {
 
 #[derive(Args)]
 pub struct LogArgs {
-    /// Agent name.
+    /// Agent name, or an exact spawn id (`rk status` / `--json` show it) for
+    /// the one rat it names, no ambiguity possible.
     pub name: String,
     /// Stream new entries live as the agent produces them.
     #[arg(long, short)]
@@ -100,7 +101,8 @@ pub struct LogArgs {
     #[arg(long, short = 'n')]
     pub tail: Option<usize>,
     /// Which rat of this name to read, 1 = oldest (default: the newest). Only
-    /// matters for the handful of names that named two rats.
+    /// matters for the handful of names that named two rats; ignored when
+    /// `name` is a spawn id.
     #[arg(long, short = 'g')]
     pub generation: Option<usize>,
 }
@@ -647,16 +649,20 @@ pub async fn log(layout: &Layout, args: LogArgs, as_json: bool) -> Result<()> {
 /// Showing the newest silently would read as "this is the whole history of that
 /// name", which for those names it is not. `None` = nothing worth saying; the
 /// caller prints to stderr so piping the transcript stays clean.
+///
+/// Uses the response's resolved `agent` field, not the `name` the operator
+/// typed — those differ when `name` was a spawn id (E4).
 fn generation_note(result: &Value, name: &str, as_json: bool) -> Option<String> {
     let total = result["generations"].as_u64().unwrap_or(0);
     if as_json || total <= 1 {
         return None;
     }
+    let agent = result["agent"].as_str().unwrap_or(name);
     let shown = result["generation"].as_u64().unwrap_or(total);
     let spawned = result["created_at"].as_str().unwrap_or("?");
     Some(format!(
-        "note: {total} rats have been named {name}; showing #{shown} (spawned {spawned}). \
-         `rk log {name} --generation N` for another (1 = oldest)."
+        "note: {total} rats have been named {agent}; showing #{shown} (spawned {spawned}). \
+         `rk log {agent} --generation N` for another (1 = oldest)."
     ))
 }
 
