@@ -466,7 +466,13 @@ async fn periodic_sweep_reaps_terminal_artifacts_regardless_of_merge_state() {
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
 
-    let live = spawn(&mut client, repo_dir.path(), "hang-sweep-artifacts-1", json!({})).await;
+    let live = spawn(
+        &mut client,
+        repo_dir.path(),
+        "hang-sweep-artifacts-1",
+        json!({}),
+    )
+    .await;
     wait_for_state(&mut client, &live, "running").await;
 
     // Commits real work, so the branch diverges from base and is never
@@ -551,7 +557,13 @@ async fn periodic_sweep_reaps_artifacts_immediately_under_default_after_days() {
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
 
-    let name = spawn(&mut client, repo_dir.path(), "sweep-artifacts-default-1", json!({})).await;
+    let name = spawn(
+        &mut client,
+        repo_dir.path(),
+        "sweep-artifacts-default-1",
+        json!({}),
+    )
+    .await;
     wait_for_state(&mut client, &name, "completed").await;
 
     let agents = list(&mut client, json!({})).await;
@@ -606,7 +618,13 @@ async fn periodic_sweep_rejects_artifact_path_that_resolves_to_worktree_root() {
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
 
-    let name = spawn(&mut client, repo_dir.path(), "sweep-artifacts-root-1", json!({})).await;
+    let name = spawn(
+        &mut client,
+        repo_dir.path(),
+        "sweep-artifacts-root-1",
+        json!({}),
+    )
+    .await;
     wait_for_state(&mut client, &name, "completed").await;
 
     let agents = list(&mut client, json!({})).await;
@@ -752,9 +770,7 @@ async fn disk_floor_refusal_announces_through_the_recovery_sinks() {
         json!(true),
         "a second refusal within the same rolling hour must be rate-held, not silent"
     );
-    let second_text = rows[1]["payload"]["notice"]["text"]
-        .as_str()
-        .unwrap_or("");
+    let second_text = rows[1]["payload"]["notice"]["text"].as_str().unwrap_or("");
     assert!(
         second_text.contains("rate cap hit"),
         "a held escalation still explains why: {second_text}"

@@ -4545,9 +4545,7 @@ impl Supervisor {
     /// Best-effort in the same shape as `reap_git`/`reap_log`: a failure is a
     /// `reaped: false` row with a reason, never a failed archive.
     fn reap_artifacts(&self, record: &AgentRecord, paths: &[String]) -> serde_json::Value {
-        let row = |reaped: bool, reason: String| {
-            json!({"agent": record.name, "reaped": reaped, "reason": reason})
-        };
+        let row = |reaped: bool, reason: String| json!({"agent": record.name, "reaped": reaped, "reason": reason});
         let Some(worktree) = &record.worktree else {
             return row(false, "no worktree recorded".into());
         };
@@ -4556,9 +4554,7 @@ impl Supervisor {
         }
         let mut removed = Vec::new();
         for rel in paths {
-            let resolves_to_root = rel
-                .split('/')
-                .all(|seg| seg.is_empty() || seg == ".");
+            let resolves_to_root = rel.split('/').all(|seg| seg.is_empty() || seg == ".");
             if rel.is_empty()
                 || rel.starts_with('/')
                 || rel.split('/').any(|seg| seg == "..")
