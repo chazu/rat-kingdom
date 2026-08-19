@@ -484,6 +484,12 @@ pub async fn done(layout: &Layout, args: DoneArgs, as_json: bool) -> Result<()> 
     let mut payload = json!({
         "task": task,
         "agent": agent,
+        // `Pattern::for_spawn`'s join key (C1/S3a,
+        // docs/2026-08-17-tkt-c1-generation-identity.md). Optional: RK_SPAWN
+        // is only set once the daemon mints one at spawn (C6), so a `rk done`
+        // run under an unmigrated daemon still resolves via the name+floor
+        // fallback instead of writing a null field a reader would trip on.
+        "spawn": std::env::var("RK_SPAWN").ok(),
         "branch": std::env::var("RK_BRANCH").ok(),
         "parent": std::env::var("RK_PARENT").ok(),
         "workflow_instance": std::env::var("RK_WORKFLOW_INSTANCE").ok(),
