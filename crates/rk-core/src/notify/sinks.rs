@@ -18,7 +18,7 @@ use super::{EscalationNotice, NotificationSink, Severity};
 use crate::config::SinkConfig;
 use crate::exec::run_piped;
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 /// The `kind` [`LogSink`] answers to.
@@ -199,6 +199,7 @@ impl NotificationSink for CommandSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn notice() -> EscalationNotice {
         EscalationNotice::new(
