@@ -180,9 +180,14 @@ fn normalize_inputs(
         let harness = Some(agent.harness.clone());
         let model = agent.model.clone();
         let observed_at_ms = agent.updated_at.timestamp_millis();
-        // Stable per-generation run id: name + creation instant. Names are not
-        // recycled, so this is unique across generations.
-        let run_id = format!("{}:{}", agent.name, agent.created_at.timestamp_millis());
+        // Stable per-generation run id (docs/2026-08-17-tkt-c1-generation-identity.md,
+        // consumer F4): keyed on the generation join key rather than the raw
+        // instant. Keep `name` in the composite even though the id alone is
+        // globally unique for a real (minted) spawn — a pre-migration record's
+        // id is a *synthetic*, time-only fallback (`SpawnId::synthetic_for`,
+        // zero random bits), so two legacy records created in the same
+        // millisecond would otherwise collide and silently merge into one run.
+        let run_id = format!("{}:{}", agent.name, agent.spawn_id());
 
         let base = |source_id: String,
                     source_family: OutcomeEvidenceKind,
@@ -1231,6 +1236,26 @@ mod tests {
         assert_eq!(
             source_count(&all, "AgentRecord")["active_source_count"],
             json!(2)
+        );
+    }
+
+    #[test]
+    fn run_id_stays_distinct_for_legacy_agents_sharing_a_creation_instant() {
+        // docs/2026-08-17-tkt-c1-generation-identity.md consumer F4: a
+        // pre-migration record (`spawn: None`) falls back to
+        // `SpawnId::synthetic_for(created_at)`, which has zero random bits —
+        // two such records minted in the same millisecond produce the SAME
+        // synthetic id. `inputs()` builds exactly that: "rat-1" and "rat-2"
+        // both carry `created_at: Utc.timestamp_opt(1_000, 0)`. The run id
+        // must still tell them apart, or this fixture (and any real fleet
+        // burst that lands two legacy rats in one millisecond) silently
+        // merges two distinct runs into one source.
+        let at = Utc.timestamp_opt(2_000, 0).unwrap();
+        let response = scorecards_response(&inputs(), &FactoryAnalyticsRequest::default(), at);
+        assert_eq!(
+            source_count(&response, "AgentRecord")["active_source_count"],
+            json!(2),
+            "two same-instant legacy agents must not collapse into one run"
         );
     }
 

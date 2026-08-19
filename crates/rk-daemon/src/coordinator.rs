@@ -288,7 +288,10 @@ pub struct DescendantRollup {
 #[derive(Debug, Clone, Serialize)]
 pub struct MiddleRatSummary {
     pub agent: String,
-    pub generation: chrono::DateTime<chrono::Utc>,
+    /// The generation join key (docs/2026-08-17-tkt-c1-generation-identity.md,
+    /// consumer F5), not `agent.created_at` — `agent` alone is a name, and a
+    /// name is not an identity.
+    pub generation: rk_core::id::SpawnId,
     pub role: String,
     pub workflow_instance: Option<String>,
     pub coordinator: Option<String>,
@@ -528,7 +531,7 @@ fn middle_rat_summary(
         && (chrono::Utc::now() - last_meaningful_update).num_minutes() >= 15;
     MiddleRatSummary {
         agent: agent.name.clone(),
-        generation: agent.created_at,
+        generation: agent.spawn_id(),
         role: agent.role.clone(),
         workflow_instance: agent.workflow_instance.clone(),
         coordinator: agent.coordinator.clone(),
@@ -812,6 +815,13 @@ mod tests {
         let snapshot = hierarchical_snapshot(&[workflow], &agents, &[], &filter);
         assert_eq!(snapshot.workflows.len(), 1);
         assert_eq!(snapshot.middle_rats.len(), 1);
+        // docs/2026-08-17-tkt-c1-generation-identity.md consumer F5: the
+        // summary's join key is the agent's SpawnId, not its raw created_at.
+        assert_eq!(
+            snapshot.middle_rats[0].generation,
+            agents[0].spawn_id(),
+            "MiddleRatSummary.generation must be the foreman's spawn id"
+        );
         let rollup = &snapshot.middle_rats[0].rollup;
         assert_eq!(rollup.total, 2);
         assert_eq!(rollup.running, 1);
