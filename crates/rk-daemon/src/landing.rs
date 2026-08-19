@@ -128,6 +128,18 @@ const REVIEW_ARTIFACT_IDENTITY: &str = "review";
 /// call instead of a shelled-out `rk out need` (§1.5).
 const STEWARD_NEED_IDENTITY: &str = "steward";
 
+/// Identity of the visibility event emitted when a candidate is about to
+/// land on a target other than `"main"`. Mirrors
+/// `Reactor::note_non_main_land_target`'s `reactor_non_main_land_target`
+/// (`crates/rk-daemon/src/reactor.rs`), which only covers the `action:
+/// "workflow"` firing path — this pipeline's `action: "land"` candidates
+/// (`Reactor::fire_land_action`) never go through that path, and this
+/// pipeline's own zero-agent-spawn fast paths (doc-only/trivial diff,
+/// verdict-cache hit) never create a workflow instance for `rk workflow
+/// list` to annotate either, so without this a non-main land here is
+/// otherwise silent (TKT-01M0B71D9B51SV5AG95VR1A4ST).
+const LANDING_NON_MAIN_TARGET_IDENTITY: &str = "landing_non_main_land_target";
+
 /// Name of the shrunk, review-only workflow definition (design doc §2.5) —
 /// `examples/workflows/steward-review.cue`. [`LandingPipeline::request_review`]
 /// invokes it programmatically on a verdict-cache miss; it is never
@@ -770,6 +782,7 @@ impl LandingPipeline {
             return Ok(outcome);
         }
         if matches!(entry.diff_class.as_str(), "doc-only" | "trivial") {
+            self.note_non_main_land_target(entry);
             let result = self
                 .supervisor
                 .land(
@@ -979,6 +992,7 @@ impl LandingPipeline {
         };
         match verdict.as_str() {
             "APPROVE" => {
+                self.note_non_main_land_target(entry);
                 let result = self
                     .supervisor
                     .land(
@@ -1048,6 +1062,43 @@ impl LandingPipeline {
         );
         self.space.out(tuple.clone())?;
         Ok(tuple)
+    }
+
+    /// A candidate about to land on a target other than `"main"` is
+    /// otherwise invisible in this pipeline: it never creates a workflow
+    /// instance for `rk workflow list` to annotate, so an operator scanning
+    /// `rk inbox`/`rk workflow list` cannot tell it apart from a landing to
+    /// `main`. Mirrors `Reactor::note_non_main_land_target`'s shape (same
+    /// scope, same `text`/`target`/`branch` fields) for the reactor's
+    /// `action: "workflow"` path; this is the `action: "land"` counterpart,
+    /// called from every `Supervisor::land` call site in this module.
+    fn note_non_main_land_target(&self, entry: &LandingQueueEntry) {
+        if entry.target.is_empty() || entry.target == "main" {
+            return;
+        }
+        let text = format!(
+            "landing pipeline will land {} on non-main target {}",
+            entry.branch, entry.target
+        );
+        warn!(
+            repo = %entry.repo_name,
+            branch = %entry.branch,
+            target = %entry.target,
+            task = %entry.task,
+            "landing pipeline landing onto a non-main target"
+        );
+        let _ = self.space.out(Tuple::new(
+            Category::Event,
+            entry.repo_name.clone(),
+            LANDING_NON_MAIN_TARGET_IDENTITY,
+            "daemon",
+            json!({
+                "text": text,
+                "target": entry.target,
+                "branch": entry.branch,
+                "task": entry.task,
+            }),
+        ));
     }
 
     /// Drain every candidate currently queued for `(repo_name, target)`,
@@ -1920,6 +1971,76 @@ workflow: {
             .scan(&Pattern::category(Category::Event).identity("agent_spawned"))
             .unwrap()
             .is_empty());
+
+        // Landing on "main" must never produce a non-main-target visibility
+        // event (TKT-01M0B71D9B51SV5AG95VR1A4ST).
+        assert!(space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_NON_MAIN_TARGET_IDENTITY))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A candidate landing on a target other than `"main"` — e.g. a
+    /// rework/chained rat's own `--base`, the same inheritance the reactor's
+    /// `note_non_main_land_target` test covers for the `action: "workflow"`
+    /// path (`crates/rk-daemon/tests/reactor.rs`,
+    /// `non_main_land_target_is_reported_main_is_not`) — must produce a
+    /// visible `landing_non_main_land_target` event even though this
+    /// zero-agent-spawn fast path never creates a workflow instance for `rk
+    /// workflow list` to annotate (TKT-01M0B71D9B51SV5AG95VR1A4ST).
+    #[tokio::test]
+    async fn doc_only_completion_on_non_main_target_emits_visibility_event() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        git(repo_dir.path(), &["checkout", "-b", "base"]);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+        std::fs::write(repo_dir.path().join("docs").join("note.md"), "note\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "docs: add note"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "base"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "docs-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "base".into(),
+                head_sha,
+                diff_class: "doc-only".into(),
+                task: "add note".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let outcomes = pipeline.drain_key("docs-repo", "base").await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let LandingOutcome::Landed(result) = &outcomes[0] else {
+            panic!("expected Landed, got {:?}", outcomes[0]);
+        };
+        assert_eq!(result["merged"], true, "result: {result}");
+
+        let events = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_NON_MAIN_TARGET_IDENTITY))
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "a non-main target must produce exactly one visibility event"
+        );
+        assert_eq!(events[0].scope, "docs-repo");
+        assert_eq!(events[0].payload["target"], "base");
+        assert_eq!(events[0].payload["branch"], "feature");
+        assert_eq!(events[0].payload["task"], "add note");
+        assert_eq!(
+            events[0].payload["text"],
+            "landing pipeline will land feature on non-main target base"
+        );
     }
 
     #[tokio::test]
@@ -2106,6 +2227,61 @@ workflow: {
         assert!(listing.contains("src.rs"), "listing: {listing}");
 
         no_spawns(&space);
+    }
+
+    /// The APPROVE routing arm (`LandingPipeline::route_verdict`) is a
+    /// second, independent `Supervisor::land` call site from the doc-only
+    /// fast path — this proves the non-main visibility event fires there
+    /// too, not just on the fast path (TKT-01M0B71D9B51SV5AG95VR1A4ST).
+    #[tokio::test]
+    async fn approved_review_on_non_main_target_emits_visibility_event() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        git(repo_dir.path(), &["checkout", "-b", "base"]);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "base"]);
+
+        let space = Space::open_in_memory().unwrap();
+        space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
+
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "code-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "base".into(),
+                head_sha,
+                diff_class: "large".into(),
+                task: "add src".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let outcomes = pipeline.drain_key("code-repo", "base").await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let LandingOutcome::Landed(result) = &outcomes[0] else {
+            panic!("expected Landed, got {:?}", outcomes[0]);
+        };
+        assert_eq!(result["merged"], true, "result: {result}");
+
+        let events = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_NON_MAIN_TARGET_IDENTITY))
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "a non-main target must produce exactly one visibility event"
+        );
+        assert_eq!(events[0].scope, "code-repo");
+        assert_eq!(events[0].payload["target"], "base");
+        assert_eq!(events[0].payload["branch"], "feature");
     }
 
     #[tokio::test]
