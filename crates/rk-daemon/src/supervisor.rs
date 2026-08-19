@@ -5033,7 +5033,7 @@ mod respawn_tests {
             None,
         );
 
-        assert!(env.get("CARGO_TARGET_DIR").is_none());
+        assert!(!env.contains_key("CARGO_TARGET_DIR"));
     }
 
     #[test]
