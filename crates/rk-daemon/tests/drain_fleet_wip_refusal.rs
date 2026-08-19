@@ -46,10 +46,28 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
+// `FAST_FAKE` never touches the worktree — it exists to race the admission
+// TOCTOU cheaply, not to exercise delivery. Under the default "merge"
+// delivery mode a ticket only reaches `done` once its branch is actually
+// merged (TKT-01M08HB566GFBZVMDKZ8DT1ES0's C3 gate), which nothing here ever
+// does. Activate "push-branch" instead: the routed-completion gate never
+// checks push-branch delivery, so a clean `rk_done` alone closes the ticket —
+// see continuous_drain.rs's `PUSH_BRANCH_POLICY` for the full rationale
+// (TKT-01M0CTC4DPFV7Q2642AZH354BV).
+const PUSH_BRANCH_POLICY: &str = r#"
+repo: {
+    delivery: {
+        mode: "push-branch"
+    }
+}
+"#;
+
 fn init_repo(dir: &Path) {
     git(dir, &["init", "-b", "main"]);
     git(dir, &["config", "user.email", "r@x"]);
     git(dir, &["config", "user.name", "R"]);
+    std::fs::create_dir_all(dir.join(".rk")).unwrap();
+    std::fs::write(dir.join(".rk/repo.cue"), PUSH_BRANCH_POLICY).unwrap();
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);

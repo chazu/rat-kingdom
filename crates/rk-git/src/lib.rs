@@ -173,14 +173,21 @@ impl Repo {
     /// happens locally when the operator pulls the merge (or a Direct-mode
     /// fast-forward advances the target). No network, no forge API: a pure
     /// read over local refs, matching the use-git-directly PR-mode decision.
-    /// Commit-count aware via [`advanced_past`](Repo::advanced_past): a
-    /// branch that still exists but never diverged from `target` (zero
-    /// commits) is neither merged nor gone, so it stays surfaced.
+    ///
+    /// NOT commit-count aware, deliberately: a genuine fast-forward (target
+    /// had no other commits since the branch forked) leaves `target`
+    /// pointing at exactly `branch`'s tip, which is indistinguishable here
+    /// from a branch that never diverged at all — [`advanced_past`] would
+    /// misread a real FF-merged PR as still-open. Callers that need to
+    /// exclude the never-diverged case (crash-vs-delivered) use a check with
+    /// more context than a bare ref pair — see
+    /// [`branch_verified_merged`](Repo::branch_verified_merged), which is
+    /// safe here only because its caller's merges are always `--no-ff`.
     pub fn branch_merged_or_gone(&self, branch: &str, target: &str) -> bool {
         if !self.branch_exists(branch) {
             return true;
         }
-        self.advanced_past(branch, target)
+        self.is_ancestor(branch, target)
     }
 
     /// Whether `branch` has *verifiably* merged into `target`: it still
@@ -283,17 +290,16 @@ impl Repo {
     /// local pull. Pure read over `refs/remotes/*`; run `fetch_prune` first. An
     /// unresolvable `<remote>/<target>` (never fetched) yields "not merged", so
     /// the awaiting-review row stays — the same fail-toward-surfacing direction
-    /// as the local check. Commit-count aware via
-    /// [`advanced_past`](Repo::advanced_past): a pushed branch that never
-    /// diverged from `target` is not "merged or gone" either — a rat that
-    /// opened a PR/pushed a branch with nothing on it must not read as
-    /// forge-merged.
+    /// as the local check. NOT commit-count aware, same reasoning as
+    /// [`branch_merged_or_gone`](Repo::branch_merged_or_gone): a forge merge
+    /// is very often a fast-forward, which is indistinguishable here from a
+    /// branch that never diverged.
     pub fn remote_branch_merged_or_gone(&self, branch: &str, target: &str, remote: &str) -> bool {
         let remote_branch = format!("{remote}/{branch}");
         if !self.remote_ref_exists(&remote_branch) {
             return true;
         }
-        self.advanced_past(&remote_branch, &format!("{remote}/{target}"))
+        self.is_ancestor(&remote_branch, &format!("{remote}/{target}"))
     }
 
     /// Whether a remote-tracking ref `<remote>/<name>` exists locally (i.e. the
@@ -1620,26 +1626,6 @@ mod tests {
     }
 
     #[test]
-    fn branch_merged_or_gone_false_for_a_branch_that_never_diverged() {
-        // Commit-count awareness (TKT-01M0CTC4DPFV7Q2642AZH354BV): a branch
-        // cut from `main` and never touched trivially satisfies
-        // `is_ancestor(branch, main)` — it IS main's fork point — but it was
-        // never merged and carries no delivery. It must stay surfaced, not
-        // auto-clear as if a forge merge/delete had dealt with it.
-        let (dir, repo) = scratch_repo();
-        let branch = empty_branch(dir.path(), &repo, "pip", "task-empty");
-        assert!(repo.branch_exists(&branch));
-        assert!(
-            repo.is_ancestor(&branch, "main"),
-            "sanity: an untouched branch's tip is trivially an ancestor of its fork point"
-        );
-        assert!(
-            !repo.branch_merged_or_gone(&branch, "main"),
-            "an empty, never-diverged branch must not read as merged or gone"
-        );
-    }
-
-    #[test]
     fn branch_verified_merged_false_for_a_branch_that_never_diverged() {
         let (dir, repo) = scratch_repo();
         let branch = empty_branch(dir.path(), &repo, "nibbles", "task-empty");
@@ -1722,25 +1708,6 @@ mod tests {
         run(repo.root(), &["push", "origin", "--delete", &branch]);
         repo.fetch_prune("origin", Duration::from_secs(30)).unwrap();
         assert!(repo.remote_branch_merged_or_gone(&branch, "main", "origin"));
-    }
-
-    #[test]
-    fn remote_branch_merged_or_gone_false_for_a_pushed_branch_that_never_diverged() {
-        // Same commit-count-awareness regression as the local check, over
-        // the remote-tracking path: a pushed-but-empty branch (opened a PR
-        // with no commits, say) must not read as forge-merged just because
-        // it never diverged from origin/main.
-        let (dir, repo) = scratch_repo();
-        let _bare = bare_remote(dir.path(), "plain-remote", &repo, false);
-        let branch = empty_branch(dir.path(), &repo, "pip", "task-empty");
-        run(repo.root(), &["push", "origin", "main"]);
-        repo.push_branch(&branch, "origin").unwrap();
-        repo.fetch_prune("origin", Duration::from_secs(30)).unwrap();
-
-        assert!(
-            !repo.remote_branch_merged_or_gone(&branch, "main", "origin"),
-            "an empty, never-diverged pushed branch must not read as merged or gone"
-        );
     }
 
     #[test]

@@ -2862,14 +2862,19 @@ impl Supervisor {
     }
 
     /// The merged-branch guardrail: true if this agent's work already landed
-    /// (so a respawn would redo merged work) or its branch is gone (nothing
-    /// to resume). Delegates to [`Repo::branch_merged_or_gone`], which is
-    /// commit-count aware: a branch that merely equals its target (an agent
-    /// that crashed before committing anything: tip == base) is neither
-    /// merged nor gone, so it respawns rather than being skipped — the
-    /// transient crash we most want auto-respawn to catch. Fail-safe: an
-    /// unresolvable repo reads as "not merged" so we never wrongly skip a
-    /// recoverable agent.
+    /// (so a respawn would redo merged work) or its branch is gone (nothing to
+    /// resume). "Merged" here is precise — the branch is *strictly behind* its
+    /// target: contained in it yet the target has advanced past it. That
+    /// deliberately excludes a branch that merely equals its target (an agent
+    /// that crashed before committing anything: tip == base), which is exactly
+    /// the transient crash we most want to auto-respawn — a plain
+    /// "is-ancestor" test would mis-skip it. An unmerged branch (commits not in
+    /// target) is not an ancestor, so it respawns. Fail-safe: an unresolvable
+    /// repo reads as "not merged" so we never wrongly skip a recoverable agent.
+    /// Not delegated to [`Repo::branch_merged_or_gone`] (which must stay
+    /// FF-tolerant for its other callers): this call site's target only ever
+    /// advances via `rk`'s own `--no-ff` `merge_branch`, so the strict check
+    /// is safe here specifically.
     fn branch_already_merged(&self, record: &AgentRecord) -> bool {
         let Some(branch) = record.branch.as_deref() else {
             return false;
@@ -2877,7 +2882,11 @@ impl Supervisor {
         let Ok(repo) = Repo::discover(&record.repo_root) else {
             return false;
         };
-        repo.branch_merged_or_gone(branch, &record.target_branch)
+        if !repo.branch_exists(branch) {
+            return true; // gone: the worktree can't be resumed onto it.
+        }
+        let target = &record.target_branch;
+        repo.is_ancestor(branch, target) && !repo.is_ancestor(target, branch)
     }
 
     /// Escalate an exhausted crash-loop to a human: emit a `need` tuple (which
@@ -5556,9 +5565,15 @@ mod respawn_tests {
     /// Commit-count awareness at the done-gate call site
     /// (TKT-01M0CTC4DPFV7Q2642AZH354BV): a branch that never diverged from
     /// its target trivially satisfies `is_ancestor`, so a naive check would
-    /// let `rk done` through for a rat that committed nothing. The gate must
-    /// refuse it, both for merge-mode (`branch_verified_merged`) and
-    /// push-branch mode (`remote_branch_merged_or_gone`).
+    /// let `rk done` through for a rat that committed nothing. The
+    /// merge-mode gate (`branch_verified_merged`) refuses it: rk's own
+    /// merges are always `--no-ff`, so there is no legitimate
+    /// fast-forward case to protect here. The push-branch gate
+    /// (`remote_branch_merged_or_gone`) is deliberately NOT fixed the same
+    /// way — a forge merge is very often a fast-forward, indistinguishable
+    /// from "never diverged" from ref state alone; see
+    /// `Repo::remote_branch_merged_or_gone`'s doc comment. That gap is
+    /// tracked as a follow-up rather than fixed here unsafely.
     #[test]
     fn ticket_undelivered_reason_refuses_an_empty_branch() {
         let repo_dir = tempfile::tempdir().unwrap();
@@ -5573,25 +5588,6 @@ mod respawn_tests {
         assert!(
             ticket_undelivered_reason(&merge_policy, &repo, "nowork", "main", true).is_some(),
             "an empty branch must not read as delivered under merge mode"
-        );
-
-        // Push-branch mode reads the remote-tracking ref, so the empty branch
-        // needs an actual push (and fetch) to exercise
-        // `remote_branch_merged_or_gone` rather than the separate
-        // never-pushed "gone" path.
-        let bare = p.join("origin.git");
-        git(p, &["init", "--bare", &bare.to_string_lossy()]);
-        git(p, &["remote", "add", "origin", &bare.to_string_lossy()]);
-        git(p, &["push", "origin", "main"]);
-        git(p, &["push", "origin", "nowork"]);
-        repo.fetch_prune("origin", std::time::Duration::from_secs(30))
-            .unwrap();
-
-        let mut push_policy = rk_workflow::RepositoryPolicy::default();
-        push_policy.delivery.mode = DeliveryMode::PushBranch;
-        assert!(
-            ticket_undelivered_reason(&push_policy, &repo, "nowork", "main", true).is_some(),
-            "an empty, pushed-but-never-diverged branch must not read as delivered under push-branch mode"
         );
 
         // A branch that actually made a commit still hasn't merged yet, so it
