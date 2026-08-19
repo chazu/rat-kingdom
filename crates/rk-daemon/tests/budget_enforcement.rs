@@ -83,8 +83,8 @@ async fn runaway_rat_is_warned_then_stopped_at_the_cap() {
         .unwrap();
     let name = spawned["agent"]["name"].as_str().unwrap().to_string();
 
-    // Wait for the budget stop: the agent ends up failed (killed without
-    // completing) with cost >= the cap.
+    // Wait for the budget stop: deliberate budget termination has its own
+    // terminal state (not a respawn-eligible crash) with cost >= the cap.
     let mut stopped = false;
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -93,7 +93,7 @@ async fn runaway_rat_is_warned_then_stopped_at_the_cap() {
             .await
             .unwrap();
         let state = status["agent"]["state"].as_str().unwrap_or("");
-        if state == "failed" {
+        if state == "stopped" {
             assert!(
                 status["agent"]["cost_usd"].as_f64().unwrap() >= 1.0,
                 "stopped at/after the cap"

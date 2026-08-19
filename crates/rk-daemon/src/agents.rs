@@ -52,6 +52,11 @@ pub enum AgentState {
     /// terminalized cleanly with `rk done` — see the discriminator note on
     /// [`Paused`](AgentState::Paused).
     Failed,
+    /// Deliberately terminated by an operator or a hard budget guard. Unlike
+    /// [`Failed`](AgentState::Failed), this is not a crash and is never
+    /// eligible for automatic respawn. The preserved worktree/branch may
+    /// still be resumed explicitly with `rk respawn`.
+    Stopped,
     Dismissed,
     /// The daemon restarted while this agent was running; its process is gone
     /// but worktree/branch/session are preserved for respawn.
@@ -85,7 +90,10 @@ impl AgentState {
     pub fn is_archivable(self) -> bool {
         matches!(
             self,
-            AgentState::Completed | AgentState::Failed | AgentState::Dismissed
+            AgentState::Completed
+                | AgentState::Failed
+                | AgentState::Stopped
+                | AgentState::Dismissed
         )
     }
 }
@@ -117,6 +125,11 @@ pub struct AgentRecord {
     pub repo_name: String,
     pub task: Option<String>,
     pub branch: Option<String>,
+    /// Commit the branch was cut from. Paired with the branch head at handoff
+    /// time, this proves the branch carried at least one commit even after a
+    /// forge fast-forward makes target and branch refs identical.
+    #[serde(default)]
+    pub fork_point: Option<String>,
     pub worktree: Option<PathBuf>,
     /// Merge target on dismissal.
     pub target_branch: String,
@@ -135,9 +148,9 @@ pub struct AgentRecord {
     #[serde(default)]
     pub attach_target: Option<String>,
     pub pid: Option<u32>,
-    /// Merge commit a Direct-mode dismiss landed on the target — the anchor
-    /// `rk revert` revert-merges. Cleared once reverted, so a second revert
-    /// errors instead of reverting the revert.
+    /// Merge commit the landing pipeline recorded for this agent's branch —
+    /// the anchor `rk revert` revert-merges. Cleared once reverted, so a
+    /// second revert errors instead of reverting the revert.
     #[serde(default)]
     pub merge_commit: Option<String>,
     pub state: AgentState,
@@ -201,6 +214,7 @@ impl AgentRecord {
         self.crashed
             || (!self.state.is_live()
                 && self.state != AgentState::Completed
+                && self.state != AgentState::Stopped
                 && self.session_id.is_none()
                 && self.usage.total() == 0)
     }
@@ -745,6 +759,7 @@ mod tests {
             repo_name: "repo".into(),
             task: Some(".rk-1".into()),
             branch: Some(format!("rat/{name}/rk-1")),
+            fork_point: None,
             worktree: Some(format!("/tmp/wt/{name}").into()),
             target_branch: "main".into(),
             parent: None,
@@ -816,6 +831,10 @@ mod tests {
         assert!(!ran("Squeak", AgentState::Failed).crashed_without_reporting());
         assert!(!ran("Gnaw", AgentState::Completed).crashed_without_reporting());
         assert!(!ran("Remy", AgentState::Dismissed).crashed_without_reporting());
+        assert!(
+            !record("Stop", AgentState::Stopped).crashed_without_reporting(),
+            "a deliberate stop is terminal but is not a crash"
+        );
         // Nor a live one that simply has not reported yet.
         assert!(!record("Twitch", AgentState::Running).crashed_without_reporting());
     }

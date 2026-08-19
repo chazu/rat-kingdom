@@ -43,10 +43,33 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
+// This suite's fake harness (`SLOW_FAKE`) never touches the worktree — it
+// exists purely to exercise the WIP-capped scheduler cheaply, not delivery.
+// Under the default "merge" delivery mode a ticket only reaches `done` once
+// its branch is actually merged (TKT-01M08HB566GFBZVMDKZ8DT1ES0's C3 gate,
+// see `ticket_done_binding.rs`), which nothing here ever does — these tests
+// never dismiss. Activate "push-branch" instead: the routed-completion gate
+// (`ticket_delivered`, `gate_push_branch: false`) never checks push-branch
+// delivery at all, so a clean `rk_done` alone is enough to close the ticket,
+// same as this suite always assumed. Before commit-count awareness landed
+// (TKT-01M0CTC4DPFV7Q2642AZH354BV), the default merge-mode gate happened to
+// let an empty branch through too — this suite was unknowingly relying on
+// that bug rather than on real delivery, which is exactly the class that fix
+// closes.
+const PUSH_BRANCH_POLICY: &str = r#"
+repo: {
+    delivery: {
+        mode: "push-branch"
+    }
+}
+"#;
+
 fn init_repo(dir: &Path) {
     git(dir, &["init", "-b", "main"]);
     git(dir, &["config", "user.email", "r@x"]);
     git(dir, &["config", "user.name", "R"]);
+    std::fs::create_dir_all(dir.join(".rk")).unwrap();
+    std::fs::write(dir.join(".rk/repo.cue"), PUSH_BRANCH_POLICY).unwrap();
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);

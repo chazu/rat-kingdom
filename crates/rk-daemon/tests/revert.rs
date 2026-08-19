@@ -47,6 +47,7 @@ fn scratch_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_passing_landing_checks(dir);
 }
 
 /// Fake harness: commits a file in its worktree, reports a clean success.
@@ -100,6 +101,7 @@ async fn merge_one_rat(client: &mut Client, repo: &Path) -> (String, String) {
         .await
         .unwrap();
     let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+    let branch = spawned["agent"]["branch"].as_str().unwrap().to_string();
 
     let mut completed = false;
     for _ in 0..200 {
@@ -119,12 +121,24 @@ async fn merge_one_rat(client: &mut Client, repo: &Path) -> (String, String) {
         .call("agent.dismiss", json!({"name": &name}))
         .await
         .unwrap();
-    assert_eq!(dismissed["merged"], true, "detail: {}", dismissed["detail"]);
+    assert_eq!(
+        dismissed["merged"], false,
+        "detail: {}",
+        dismissed["detail"]
+    );
+    let landed = client
+        .call(
+            "repo.land",
+            json!({"repo": repo, "branch": branch, "target": "main"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(landed["merged"], true, "detail: {}", landed["detail"]);
     assert!(
-        dismissed["merge_commit"]
+        landed["merge_commit"]
             .as_str()
             .is_some_and(|c| !c.is_empty()),
-        "dismiss records the merge commit"
+        "gated land records the merge commit"
     );
     (name, ticket_id)
 }

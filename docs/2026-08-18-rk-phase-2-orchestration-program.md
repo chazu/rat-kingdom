@@ -51,8 +51,8 @@ squash merges deadlocked the bar ladder.
 
 **Corrected:**
 
-- **Durable delivery record, not live refs.** At land time the pipeline (or
-  dismiss, or the operator fast-lane) records `merge_commit` (or the
+- **Durable delivery record, not live refs.** At land time the pipeline
+  (including the operator fast-lane) records `merge_commit` (or the
   cherry-pick/squash result SHA) **on the ticket**. The `merged` bar is
   `is_ancestor(recorded_commit, target)`. `rk revert` explicitly clears the
   record (bar-clearing is an event, never inferred).
@@ -96,8 +96,9 @@ box — a hard ceiling of ~3 landings/hour.
   expected_parent)`. The gate merges (branch, target), tests THAT tree,
   and on pass advances the target to the tested commit. **Hard invariant,
   asserted in the receipt: landed SHA == tested SHA.**
-- **One queue, no second writers.** Dismiss/`dismiss_all` merge-mode
-  deliveries enqueue into the same landing queue. Operator landings get a
+- **One queue, no second writers.** Lifecycle `dismiss` itself never delivers;
+  workflow `dismiss`/`dismiss_all` compose cleanup with an explicit queue
+  submission. Operator landings get a
   **fast lane** (front of queue, same gate) — priority, not bypass.
 - **Batching is the economics answer** (not mu, not retries): the gate may
   test N queued branches as one octopus/serial merge; on failure, bisect

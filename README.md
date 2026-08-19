@@ -55,7 +55,8 @@ rk status Whisker            # one rat in detail
 rk log Whisker               # its transcript (prose, tool calls, retries); -f to follow
 rk watch                     # live tuple stream — the system's inner monologue
 rk steer Whisker "also check CONTRIBUTING.md"   # mid-session guidance
-rk dismiss Whisker           # stop + merge its branch + clean up
+rk dismiss Whisker           # stop + preserve its branch + clean up
+rk land rat/whisker/fix-readme --repo .  # gate and deliver that branch
 rk revert Whisker            # undo a bad auto-merge: revert the landed commit, reopen the ticket
 rk cost                      # per-agent token/cost rollup (lifetime, archived included)
 rk cost --fleet              # fleet/repo spend vs configured budget caps
@@ -118,7 +119,12 @@ them (`--reap-git --reap-logs`) when you want everything reclaimed.
 
 Spawn options: `--harness claude|codex|jcode|fake`, `--model`, `--role
 rat|reviewer`, `--base <branch>`, `--parent <agent>` (completion routing),
-`--permission-mode`, `--no-merge` on dismiss, `--attach` (below). `rk status`
+`--permission-mode`, `--attach` (below). `rk dismiss` now only stops the rat,
+removes its worktree, and preserves its branch; it never lands code (`--no-merge`
+is retained as compatibility spelling). Use `rk land <branch> --repo <path>` for
+the named-check landing queue. The emergency bypass is deliberately loud:
+`rk land <branch> --force --reason '<why>'`; it writes an audit event and an
+inbox-visible need. `rk status`
 shows the effective harness, model, and permission mode recorded for the
 generation.
 
@@ -486,15 +492,14 @@ ticket, resolves the repo from the ticket's scope, and flips the ticket to
 rk spawn --ticket TKT-<id>         # no hand-written --task/--prompt/--repo needed
 ```
 
-The ticket's lifecycle then closes itself: when the rat finishes (its `rk done`,
-or the harness's own completion for a rat that forgets), the ticket moves to
-`done` — which **automatically unblocks any dependents** — and merging it on
-`rk dismiss` moves it to `closed`. A rat that errors leaves its ticket
-`in_progress` for inspection.
+The ticket's lifecycle then closes itself when the landing pipeline records a
+successful delivery; that durable record is what **automatically unblocks any
+dependents**. A clean rat completion whose branch has not landed remains
+`in_progress`, as does a rat that errors, so neither can claim shipped work.
 
-If an unattended auto-merge turns out bad, `rk revert <agent>` is the undo:
-it revert-merges the commit that dismissal landed (recorded on the agent's
-record), reopens the ticket to `open` (`--block` for `blocked`, holding it
+If an unattended landing turns out bad, `rk revert <agent>` is the undo:
+it revert-merges the commit recorded on the agent's record, reopens the ticket
+to `open` (`--block` for `blocked`, holding it
 out of the auto-dispatch backlog), and leaves a `fact` tuple recording what
 was undone. History stays intact — the revert is a new commit, not a rewrite.
 
@@ -698,7 +703,7 @@ workflow: {
         {type: "spawn", role: "reviewer", agent: "cheap", model: "o4-mini",
          task: {title: "review", description: "Branch: {{ctx.activeBranch}}"}},
         {type: "wait"},
-        {type: "dismiss"},                                // merges active agent
+        {type: "dismiss"},                                // cleanup, then queued land
     ]
     aspects: [   // cross-cutting: splice steps around matches at load time
         {match: {type: "spawn", role: "rat"},
@@ -981,7 +986,8 @@ rk steer Whisker "try the other approach"   # works from outside too
 ```
 
 The daemon still owns the worktree/branch/registry; completion is the rat's
-own `rk done`, and dismissal closes the pane and merges as usual. Without
+own `rk done`, and dismissal closes the pane while preserving the branch.
+Submit delivery separately with `rk land`. Without
 herdr, everything runs headless — but you are not blind to a headless rat:
 `rk log <name>` replays its transcript (assistant prose, tool calls, retries)
 and `rk log <name> --follow` streams it live, persisted as a bounded per-agent

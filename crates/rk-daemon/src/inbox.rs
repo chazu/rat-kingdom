@@ -285,7 +285,7 @@ pub fn build(
         });
     }
 
-    // Open pull/merge requests: a PR-mode `dismiss`/`land` pushed a branch and
+    // Open pull/merge requests: a PR-mode landing pushed a branch and
     // opened a PR (a `pull_request_opened` event), then completed — so nothing
     // else in this queue tracks it. Surface each so a pushed branch is visible
     // attention, never silently forgotten, carrying the forge URL to review it.
@@ -855,6 +855,7 @@ mod tests {
             repo_name: "repo".into(),
             task: Some("TKT-9".into()),
             branch: Some(format!("rat/{name}/tkt-9")),
+            fork_point: None,
             worktree: Some(format!("/tmp/wt/{name}").into()),
             target_branch: "main".into(),
             parent: None,

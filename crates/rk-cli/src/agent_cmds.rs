@@ -138,9 +138,30 @@ pub struct ProgressArgs {
 pub struct DismissArgs {
     /// Agent name.
     pub name: String,
-    /// Preserve the branch instead of merging.
+    /// Deprecated compatibility flag; dismiss always preserves the branch.
     #[arg(long)]
     pub no_merge: bool,
+}
+
+#[derive(Args)]
+pub struct LandArgs {
+    /// Local branch to submit to the landing queue.
+    pub branch: String,
+    /// Repository checkout (defaults to the current directory).
+    #[arg(long, default_value = ".")]
+    pub repo: String,
+    /// Target branch.
+    #[arg(long, default_value = "main")]
+    pub target: String,
+    /// Preserve the source branch after successful delivery.
+    #[arg(long)]
+    pub keep_branch: bool,
+    /// Emergency escape hatch: skip the queue and named gates.
+    #[arg(long, requires = "reason")]
+    pub force: bool,
+    /// Required audit reason for --force.
+    #[arg(long, requires = "force")]
+    pub reason: Option<String>,
 }
 
 #[derive(Args)]
@@ -760,8 +781,44 @@ pub async fn dismiss(layout: &Layout, args: DismissArgs, as_json: bool) -> Resul
     Ok(())
 }
 
-/// Undo a bad auto-merge: revert-merge the commit a dismissal landed and put
-/// the agent's ticket back on the backlog.
+pub async fn land(layout: &Layout, args: LandArgs, as_json: bool) -> Result<()> {
+    let repo = std::fs::canonicalize(&args.repo)?;
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call(
+            "repo.land",
+            json!({
+                "repo": repo,
+                "branch": args.branch,
+                "target": args.target,
+                "keep_branch": args.keep_branch,
+                "force": args.force,
+                "reason": args.reason,
+            }),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else if args.force {
+        println!(
+            "FORCED ungated landing {} -> {} — {}",
+            args.branch,
+            args.target,
+            result["detail"].as_str().unwrap_or("completed")
+        );
+    } else {
+        println!(
+            "gated landing {} -> {} — {}",
+            args.branch,
+            args.target,
+            result["detail"].as_str().unwrap_or("completed")
+        );
+    }
+    Ok(())
+}
+
+/// Undo a bad landing: revert its recorded merge commit and put the agent's
+/// ticket back on the backlog.
 pub async fn revert(layout: &Layout, args: RevertArgs, as_json: bool) -> Result<()> {
     let mut client = Client::connect_or_spawn(layout).await?;
     let result = client

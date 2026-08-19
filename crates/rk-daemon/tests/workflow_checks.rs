@@ -46,6 +46,9 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"did the wo
 /// exists in the worktree and carries its own inline `expectExit: 0` gate.
 const CHECKS: &str = r#"
 checks: [
+    {name: "steward-protected-paths", command: "true", timeout: "30s"},
+    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "verify", command: "true", timeout: "30s"},
     {name: "worktree-has-work", command: "test -f work-{{ctx.activeAgent}}.txt", expectExit: 0, timeout: "30s"},
     {name: "check-inputs-arrive", command: "test \"$RK_CHECK_TASK\" = env-1 && test -n \"$RK_CHECK_AGENT\"", expectExit: 0, timeout: "30s"},
 ]
@@ -110,6 +113,7 @@ fn init_repo(repo: &Path) {
     std::fs::write(repo.join("README.md"), "# x\n").unwrap();
     git(repo, &["add", "."]);
     git(repo, &["commit", "-m", "init"]);
+    support::install_passing_landing_checks(repo);
 }
 
 fn write_def(repo: &Path, name: &str, src: &str) {

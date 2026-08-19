@@ -534,6 +534,7 @@ mod tests {
                 repo_name: "repo".into(),
                 task: Some("tkt-1".into()),
                 branch: Some(format!("rat/{name}/tkt-1")),
+                fork_point: None,
                 worktree: Some(format!("/tmp/wt/{name}").into()),
                 target_branch: "main".into(),
                 parent: None,

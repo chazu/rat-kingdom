@@ -1,6 +1,7 @@
 //! The supervisor: spawn rats into worktrees, pump their harness events into
 //! the registry and tuplespace, route completions up the spawn tree, and
-//! merge their work on dismissal.
+//! preserve their work on dismissal, and route delivery through the landing
+//! pipeline.
 
 use crate::agents::{AgentProgress, AgentRecord, AgentState, Registry};
 use crate::onboarding_sessions::{onboarding_branch, onboarding_worktree, ONBOARDER_ROLE};
@@ -22,7 +23,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use tracing::{debug, info, warn};
 
 const MIN_PROGRESS_INTERVAL: chrono::Duration = chrono::Duration::seconds(5);
@@ -75,7 +76,7 @@ impl DiffSummary {
 /// Bucket a diff by size and shape. `doc-only` requires at least one changed
 /// file (an empty diff is `trivial`, not `doc-only`) with every path either a
 /// markdown file or under a `docs/` directory at any depth.
-fn classify_diff(files: &[String], lines: u64) -> &'static str {
+pub(crate) fn classify_diff(files: &[String], lines: u64) -> &'static str {
     if !files.is_empty() && files.iter().all(|f| is_doc_path(f)) {
         "doc-only"
     } else if files.len() <= DIFF_TRIVIAL_MAX_FILES && lines <= DIFF_TRIVIAL_MAX_LINES {
@@ -264,6 +265,7 @@ struct SpawnJournal<'a> {
     repo_name: &'a str,
     name: String,
     branch: String,
+    fork_point: String,
     worktree: PathBuf,
     target_branch: String,
     harness: String,
@@ -285,6 +287,7 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
         repo_name: journal.repo_name.to_string(),
         task: Some(journal.params.task.clone()),
         branch: Some(journal.branch),
+        fork_point: Some(journal.fork_point),
         worktree: Some(journal.worktree),
         target_branch: journal.target_branch,
         parent: journal.params.parent.clone(),
@@ -341,6 +344,7 @@ fn ticket_undelivered_reason(
     repo: &Repo,
     branch: &str,
     target: &str,
+    fork_point: Option<&str>,
     gate_push_branch: bool,
 ) -> Option<String> {
     match policy.delivery.mode {
@@ -358,7 +362,11 @@ fn ticket_undelivered_reason(
             }
         }
         DeliveryMode::PushBranch if gate_push_branch => {
-            if repo.remote_branch_merged_or_gone(branch, target, &policy.delivery.remote) {
+            let carries_work =
+                fork_point.is_some_and(|fork| repo.branch_has_commits_since(branch, fork));
+            if carries_work
+                && repo.remote_branch_merged_or_gone(branch, target, &policy.delivery.remote)
+            {
                 None
             } else {
                 Some(format!(
@@ -380,6 +388,7 @@ async fn ticket_delivered(
     repo_root: PathBuf,
     branch: String,
     target: String,
+    fork_point: Option<String>,
     gate_push_branch: bool,
 ) -> rk_core::Result<()> {
     blocking_io("ticket delivery gate", move || {
@@ -395,7 +404,14 @@ async fn ticket_delivered(
             ))
         })?;
         let policy = resolve_repository_policy(&home, &repo);
-        match ticket_undelivered_reason(&policy, &repo, &branch, &target, gate_push_branch) {
+        match ticket_undelivered_reason(
+            &policy,
+            &repo,
+            &branch,
+            &target,
+            fork_point.as_deref(),
+            gate_push_branch,
+        ) {
             None => Ok(()),
             Some(reason) => Err(rk_core::Error::other(reason)),
         }
@@ -540,9 +556,13 @@ pub struct Supervisor {
     /// Bounded per-agent transcript (assistant text / tool calls / retries),
     /// so the operator can `rk log` a run instead of being blind to it.
     log: crate::agent_log::AgentLog,
-    /// Serializes concurrent land/dismiss merges to the same target branch so
-    /// unattended auto-merges never interleave and lose a branch (TKT-51).
+    /// Serializes direct delivery, exact-candidate advancement, and reverts to
+    /// the same target branch so concurrent ref updates cannot lose work.
     merge_queue: MergeQueue,
+    /// Installed by `Daemon::landing` after both sides exist. Weak avoids an
+    /// Arc cycle (`LandingPipeline` already owns its `Supervisor`). In a live
+    /// daemon, merge-mode `land` fails closed if this seam is absent.
+    landing_pipeline: Mutex<Option<Weak<crate::landing::LandingPipeline>>>,
     /// Serializes a repo-registered check's test-execution phase against
     /// every other same-repo check opted into `sharedCargoTarget` (TKT-01M0CFA1RX36SJ7DV4YWGHQ9BT).
     /// Only ever contended when [`shared_cargo_target`](Self::shared_cargo_target)
@@ -673,16 +693,20 @@ enum RespawnDecision {
     Escalate,
 }
 
+fn is_auto_respawn_candidate(record: &AgentRecord) -> bool {
+    matches!(record.state, AgentState::Orphaned | AgentState::Failed)
+}
+
 /// Serializes merges to the same target branch — the land / merge queue.
 ///
-/// Both the steward's `land` step and `dismiss`/`dismiss_all` merge branches
-/// into `main` (or any base) concurrently and unattended. Without
-/// serialization two auto-merges racing on the same target interleave: each
+/// Landing and revert operations can update `main` (or any base) concurrently
+/// and unattended. Without serialization two updates racing on the same target
+/// interleave: each
 /// merges in its own detached worktree captured from the target ref *before*
 /// the other advanced it, so the compare-and-swap in [`Repo::merge_branch`]
 /// bounces the loser to a silent `merged: false` and its branch is left
 /// unmerged (the root cause of the "done ticket never in main" gap). A
-/// per-`(repo, target)` FIFO lock makes every land/dismiss to a given target
+/// per-`(repo, target)` FIFO lock makes every update to a given target
 /// take its turn on the *freshly-updated* target, so each merge either applies
 /// cleanly or is a genuine conflict — never a lost race. Merges to distinct
 /// targets keep separate locks and still run concurrently.
@@ -880,6 +904,7 @@ impl Supervisor {
             completions: Mutex::new(HashMap::new()),
             log,
             merge_queue: MergeQueue::default(),
+            landing_pipeline: Mutex::new(None),
             test_exec_lock: TestExecLock::default(),
             min_free_disk_gb: AtomicU64::new(0),
             max_load_per_cpu_bits: AtomicU64::new(0f64.to_bits()),
@@ -1116,6 +1141,10 @@ impl Supervisor {
             None => repo_policy.delivery_target(&repo.current_branch()?),
         };
         let instruction_base = self.instruction_base(&params.role, &target_branch, &repo);
+        // Capture before creating the branch. Unlike a later merge-base read,
+        // this remains the original fork even after a forge fast-forwards the
+        // target to the branch tip.
+        let fork_point = repo.rev_parse(&target_branch)?;
 
         // Resolve the harness before journaling so an unknown adapter never
         // leaves a durable failed row. After this point every side effect has a
@@ -1182,6 +1211,7 @@ impl Supervisor {
             repo_name: &repo_name,
             name: name.clone(),
             branch: branch.clone(),
+            fork_point,
             worktree: worktree.clone(),
             target_branch: target_branch.clone(),
             harness: effective.harness.clone(),
@@ -1844,6 +1874,26 @@ impl Supervisor {
                     warn!(agent = name, "completion event for an unknown agent");
                     return;
                 };
+                // A deliberate stop wins races with a final harness event.
+                // SIGINT/SIGTERM can prompt an adapter to flush a `Completed`
+                // event before its process exits; accepting that event as a
+                // normal completion would erase the terminal cause and could
+                // make an unfinished run look successful.
+                if pre.state == AgentState::Stopped {
+                    let _ = self.lock_registry().update(name, |r| {
+                        if usage.total() > 0 {
+                            r.usage = usage;
+                        }
+                        if let Some(cost) = cost_usd {
+                            r.cost_usd = cost;
+                        }
+                        self.apply_budget_stop_floor(&r.name, &mut r.cost_usd, &mut r.usage);
+                        if session_id.is_some() {
+                            r.session_id = session_id.clone();
+                        }
+                    });
+                    return;
+                }
                 let claim = self.claim_completion(
                     name,
                     generation,
@@ -2088,9 +2138,31 @@ impl Supervisor {
                 }
             }
             BudgetAction::Stop => {
+                // `Usage` can arrive more than once after the cap is crossed.
+                // The durable state is the idempotency guard: one transition,
+                // one escalation, one kill.
+                if record.state == AgentState::Stopped {
+                    return;
+                }
                 warn!(agent = %record.name, cost = record.cost_usd, tokens = record.usage.total(), "budget cap hit — stopping agent");
+                let detail = self.budget_stop_detail(record);
+                let mut newly_stopped = false;
+                let stopped = self.lock_registry().update(&record.name, |r| {
+                    if r.state.is_live() {
+                        newly_stopped = true;
+                        r.state = AgentState::Stopped;
+                        r.crashed = false;
+                        r.result = Some(detail.clone());
+                    }
+                });
+                if !newly_stopped
+                    || !matches!(stopped, Ok(Some(ref r)) if r.state == AgentState::Stopped)
+                {
+                    return;
+                }
                 self.emit_obstacle_for_budget(record, "exceeded");
                 self.note_budget_stop_floor(record);
+                self.announce_budget_stop(record, &detail);
                 let control = self.lock_controls().remove(&record.name);
                 if let Some(control) = control {
                     tokio::spawn(async move {
@@ -2098,6 +2170,44 @@ impl Supervisor {
                     });
                 }
             }
+        }
+    }
+
+    fn budget_stop_detail(&self, record: &AgentRecord) -> String {
+        format!(
+            "budget stop: spent ${:.2} / ${:.2} cap; {} / {} token cap",
+            record.cost_usd,
+            self.budget.max_usd,
+            record.usage.total(),
+            self.budget.max_tokens
+        )
+    }
+
+    fn announce_budget_stop(&self, record: &AgentRecord, detail: &str) {
+        let notice = EscalationNotice::new(
+            "placeholder",
+            "budget-stop",
+            Severity::Critical,
+            record.repo_name.clone(),
+            record.name.clone(),
+            detail.to_string(),
+        )
+        .with_action(format!(
+            "Review the cap and work on branch {}; explicitly `rk respawn {}` only if continuation is warranted",
+            record.branch.as_deref().unwrap_or("-"),
+            record.name
+        ));
+        if let Err(e) = self.announcer.announce(
+            &self.space,
+            &self.sinks.lock().unwrap_or_else(|p| p.into_inner()),
+            crate::recovery::RecoveryAction {
+                kind: "budget-stop".into(),
+                instance: "supervisor".into(),
+                notice,
+            },
+            crate::recovery::RateCap::unlimited(),
+        ) {
+            warn!(agent = %record.name, error = %e, "failed to announce budget stop");
         }
     }
 
@@ -2862,7 +2972,7 @@ impl Supervisor {
             .lock_registry()
             .list()
             .into_iter()
-            .filter(|r| matches!(r.state, AgentState::Orphaned | AgentState::Failed))
+            .filter(|r| is_auto_respawn_candidate(r))
             .cloned()
             .collect();
 
@@ -3028,6 +3138,10 @@ impl Supervisor {
     /// "is-ancestor" test would mis-skip it. An unmerged branch (commits not in
     /// target) is not an ancestor, so it respawns. Fail-safe: an unresolvable
     /// repo reads as "not merged" so we never wrongly skip a recoverable agent.
+    /// Not delegated to [`Repo::branch_merged_or_gone`] (which must stay
+    /// FF-tolerant for its other callers): this call site's target only ever
+    /// advances via `rk`'s own `--no-ff` `merge_branch`, so the strict check
+    /// is safe here specifically.
     fn branch_already_merged(&self, record: &AgentRecord) -> bool {
         let Some(branch) = record.branch.as_deref() else {
             return false;
@@ -3432,6 +3546,7 @@ impl Supervisor {
                     let repo_root = record.repo_root.clone();
                     let branch = record.branch.clone();
                     let target = record.target_branch.clone();
+                    let fork_point = record.fork_point.clone();
                     tokio::spawn(async move {
                         // Bind `done` to delivery per delivery-mode policy
                         // (TKT-01M08HB566GFBZVMDKZ8DT1ES0 / strategic-review
@@ -3450,7 +3565,8 @@ impl Supervisor {
                         // has nothing to gate on and proceeds as before.
                         let gate = match branch {
                             Some(branch) => {
-                                ticket_delivered(home, repo_root, branch, target, false).await
+                                ticket_delivered(home, repo_root, branch, target, fork_point, false)
+                                    .await
                             }
                             None => Ok(()),
                         };
@@ -3596,7 +3712,32 @@ impl Supervisor {
             .get(name)
             .cloned()
             .ok_or_else(|| rk_core::Error::other(format!("{name} has no live session")))?;
-        control.interrupt().await
+        let prior = self
+            .status(name)
+            .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
+        if !prior.state.is_live() {
+            return Err(rk_core::Error::other(format!("{name} is not running")));
+        }
+        self.lock_registry().update(name, |r| {
+            if r.state.is_live() {
+                r.state = AgentState::Stopped;
+                r.crashed = false;
+                r.result = Some("interrupted deliberately by operator".into());
+            }
+        })?;
+        if let Err(error) = control.interrupt().await {
+            // If signal delivery itself failed, restore the exact live state
+            // the operator observed. A concurrently-arrived terminal event is
+            // left alone by the state guard.
+            let _ = self.lock_registry().update(name, |r| {
+                if r.state == AgentState::Stopped {
+                    r.state = prior.state;
+                    r.result = prior.result.clone();
+                }
+            });
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Resolve the activated repository policy, translating legacy registry
@@ -3612,6 +3753,56 @@ impl Supervisor {
         resolve_repository_policy(self.layout.home(), repo)
     }
 
+    pub(crate) fn set_landing_pipeline(&self, pipeline: &Arc<crate::landing::LandingPipeline>) {
+        *self
+            .landing_pipeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Arc::downgrade(pipeline));
+    }
+
+    fn landing_pipeline(&self) -> Option<Arc<crate::landing::LandingPipeline>> {
+        self.landing_pipeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    fn task_for_branch(&self, repo_root: &std::path::Path, branch: &str) -> Option<String> {
+        self.lock_registry()
+            .list_all()
+            .into_iter()
+            .filter(|r| r.repo_root == repo_root && r.branch.as_deref() == Some(branch))
+            .max_by_key(|r| r.created_at)
+            .and_then(|r| r.task.clone())
+    }
+
+    fn record_merge_for_branch(
+        &self,
+        repo_root: &std::path::Path,
+        branch: &str,
+        result: &serde_json::Value,
+    ) {
+        let Some(commit) = result
+            .get("merge_commit")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let name = self
+            .lock_registry()
+            .list_all()
+            .into_iter()
+            .filter(|r| r.repo_root == repo_root && r.branch.as_deref() == Some(branch))
+            .max_by_key(|r| r.created_at)
+            .map(|r| r.name.clone());
+        if let Some(name) = name {
+            let _ = self.lock_registry().update(&name, |record| {
+                record.merge_commit = Some(commit.to_string())
+            });
+        }
+    }
+
     /// The most recent agent generation (live or archived) dispatched against
     /// ticket `task`, if any — used to resolve the branch/repo a ticket's
     /// `done` transition is checked against (TKT-01M08HB566GFBZVMDKZ8DT1ES0 /
@@ -3623,6 +3814,15 @@ impl Supervisor {
             .filter(|r| r.task.as_deref() == Some(task))
             .max_by_key(|r| r.created_at)
             .cloned()
+    }
+
+    fn recorded_fork_point(&self, repo_root: &std::path::Path, branch: &str) -> Option<String> {
+        self.lock_registry()
+            .list_all()
+            .into_iter()
+            .filter(|r| r.repo_root == repo_root && r.branch.as_deref() == Some(branch))
+            .max_by_key(|r| r.created_at)
+            .and_then(|r| r.fork_point.clone())
     }
 
     /// Refuse an explicit `done` (steward/operator `rk ticket update --status
@@ -3641,6 +3841,21 @@ impl Supervisor {
     /// strategic-review C4). A ticket with no dispatched branch (or an
     /// unresolvable repo) has nothing to gate on and is left unaffected.
     pub(crate) async fn require_ticket_delivered(&self, task: &str) -> rk_core::Result<()> {
+        // The durable delivery record wins outright (P1b). It is written by
+        // the landing pipeline at land time and survives the branch deletion
+        // that landing performs, so a ticket that genuinely shipped still
+        // reads delivered here — where the branch-ref fallback below would
+        // see a missing ref and refuse. Only fall through to git when no
+        // record exists (a ticket landed before this field, or delivered by a
+        // path that predates the pipeline).
+        if self
+            .tickets
+            .delivery(task)
+            .map(|d| d.is_some())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
         let Some(record) = self.latest_task_record(task) else {
             return Ok(());
         };
@@ -3652,6 +3867,7 @@ impl Supervisor {
             record.repo_root.clone(),
             branch,
             record.target_branch.clone(),
+            record.fork_point.clone(),
             true,
         )
         .await
@@ -3812,10 +4028,10 @@ impl Supervisor {
         Ok(delivery)
     }
 
-    /// Dismiss: stop the session if live, then reconcile the branch with its
-    /// target per the repo's merge mode — a `Direct` merge into the target (and
-    /// branch delete on success), or a `Pr` push + opened pull/merge request
-    /// that leaves the branch standing for review. Always removes the worktree.
+    /// Dismiss: stop the session if live and remove its worktree. The branch
+    /// is always preserved. Agent lifecycle and code delivery are deliberately
+    /// separate acts; callers that want delivery must invoke `land`, which
+    /// enters the gated landing queue.
     pub async fn dismiss(&self, name: &str, no_merge: bool) -> rk_core::Result<serde_json::Value> {
         self.dismiss_inner(name, no_merge, false, None).await
     }
@@ -3893,7 +4109,7 @@ impl Supervisor {
         let policy = self.repository_policy(&repo);
         let mut delivery = BranchDelivery {
             target: record.target_branch.clone(),
-            remote: policy.delivery.remote,
+            remote: policy.delivery.remote.clone(),
             detail: "no delivery requested".into(),
             ..BranchDelivery::default()
         };
@@ -3925,43 +4141,16 @@ impl Supervisor {
             if no_merge {
                 delivery.detail = format!("branch {branch} preserved (--no-merge)");
             } else {
-                delivery = self
-                    .deliver_branch(
-                        &repo,
-                        &record.repo_name,
-                        branch,
-                        &record.target_branch,
-                        false,
-                    )
-                    .await?;
+                delivery.detail = format!(
+                    "branch {branch} preserved; dismissal never lands code — submit it with the gated land command"
+                );
             }
         }
 
         self.lock_registry().update(name, |r| {
             r.state = AgentState::Dismissed;
             r.pid = None;
-            // Record the landed merge commit as the `rk revert` anchor; a
-            // no-merge or PR-mode dismiss leaves any prior record untouched.
-            if delivery.merge_commit.is_some() {
-                r.merge_commit = delivery.merge_commit.clone();
-            }
         })?;
-        // A merged ticket-rat closes its ticket for good — unless its branch
-        // carried no content over the target (`content_free`): a duplicate
-        // rat dispatched onto a ticket whose real branch already landed also
-        // technically "merges" on dismiss (its branch is already an
-        // ancestor-equivalent of target), and that must not read as this
-        // rat having delivered the ticket's work
-        // (TKT-01M0C663BZ86SMA2PVMFP5QJ8D).
-        if delivery.merged && !delivery.content_free {
-            if let Some(task) = &record.task {
-                if task.starts_with(crate::tickets::ID_PREFIX) {
-                    if let Err(e) = self.tickets.set_status(task, "closed").await {
-                        warn!(ticket = %task, error = %e, "failed to close ticket on dismiss");
-                    }
-                }
-            }
-        }
         self.emit_event(
             &record.repo_name,
             "agent_dismissed",
@@ -3995,24 +4184,6 @@ impl Supervisor {
                     "workflow_instance": record.workflow_instance,
                     "agent": record.name,
                     "generation": record.created_at,
-                }),
-            );
-        }
-        // A PR-mode dismiss hands the branch off for review rather than merging;
-        // surface that as its own event so the inbox / steward can pick it up.
-        if delivery.pr_opened {
-            self.emit_event(
-                &record.repo_name,
-                "pull_request_opened",
-                json!({
-                    "agent": name,
-                    "branch": &record.branch,
-                    "target": &delivery.target,
-                    "remote": &delivery.remote,
-                    "remote_branch": &delivery.remote_branch,
-                    "url": &delivery.pr_url,
-                    "detail": &delivery.detail,
-                    "parent": &record.parent,
                 }),
             );
         }
@@ -4074,7 +4245,7 @@ impl Supervisor {
     /// dismiss each one now, so its worktree is reclaimed even when the
     /// per-arm CUE steps that were supposed to do it never ran.
     ///
-    /// Always dismisses with `no_merge: true`: this is a cleanup guarantee,
+    /// Passes the legacy `no_merge: true` spelling for clarity: this is a cleanup guarantee,
     /// not a normal completion path, and the workflow that spawned these
     /// agents already decided (by failing, or by completing without an
     /// explicit dismiss) not to route them through its own merge logic — a
@@ -4120,11 +4291,11 @@ impl Supervisor {
         results
     }
 
-    /// Revert a dismissed agent's landed merge — the undo for an unattended
-    /// auto-merge that turned out bad (steward/drain landed it, then main
+    /// Revert an agent branch's recorded landing — the undo for an unattended
+    /// delivery that turned out bad (steward/drain landed it, then main
     /// broke). Revert-merges the merge commit recorded on the agent's record
-    /// at dismiss time (CAS-safe, through the same per-target merge queue as
-    /// land/dismiss), reopens the agent's ticket (`open`, or `blocked` with
+    /// by the landing path (serialized through the same per-target ref lock),
+    /// reopens the agent's ticket (`open`, or `blocked` with
     /// `block` to hold it out of the auto-dispatch backlog), and emits a
     /// `fact` tuple recording what was undone. A revert conflict or a target
     /// moved mid-revert is a clean `reverted: false`, mirroring merge; an
@@ -4145,7 +4316,7 @@ impl Supervisor {
 
         let repo_path = record.repo_root.clone();
         let repo = blocking_io("revert repo discovery", move || Repo::discover(&repo_path)).await?;
-        // Same per-target merge queue as land/dismiss: the revert takes its
+        // Same per-target ref lock as landing: the revert takes its
         // turn so it never races a concurrent auto-merge into this target.
         let outcome = {
             let _merge_guard = self
@@ -4171,10 +4342,21 @@ impl Supervisor {
             if let Some(task) = &record.task {
                 if task.starts_with(crate::tickets::ID_PREFIX) {
                     let status = if block { "blocked" } else { "open" };
-                    match self.tickets.reopen(task, status).await {
-                        Ok(_) => ticket_status = Some(status),
+                    // Clear the durable delivery record first (P1b). Reopening
+                    // the status alone is not enough: the record is what every
+                    // "is it delivered" question now reads, so a reverted merge
+                    // that left it standing would keep claiming the work
+                    // shipped while the commit is no longer in the target.
+                    match self.tickets.clear_delivery(task, status).await {
+                        Ok(true) => ticket_status = Some(status),
+                        Ok(false) => match self.tickets.reopen(task, status).await {
+                            Ok(_) => ticket_status = Some(status),
+                            Err(e) => {
+                                warn!(ticket = %task, error = %e, "failed to reopen ticket on revert");
+                            }
+                        },
                         Err(e) => {
-                            warn!(ticket = %task, error = %e, "failed to reopen ticket on revert");
+                            warn!(ticket = %task, error = %e, "failed to clear delivery on revert");
                         }
                     }
                 }
@@ -4213,10 +4395,9 @@ impl Supervisor {
     }
 
     /// Land a NAMED branch into a target — the explicit `{branch, target}`
-    /// counterpart to [`dismiss`](Self::dismiss), which reconciles an agent's
-    /// branch with its own base. Names neither an agent nor a worktree.
+    /// delivery operation. Names neither an agent nor a worktree.
     ///
-    /// Routes on the repo's merge mode, exactly like `dismiss`:
+    /// Routes on the repo's merge mode:
     /// - **Direct** — merge through a detached worktree (CAS-safe, touching no
     ///   live checkout). A merge conflict or a target that moved mid-merge is a
     ///   clean `merged: false`, not an error, so a workflow can gate on the
@@ -4228,6 +4409,142 @@ impl Supervisor {
     /// - **Pr** — push the branch and open a pull/merge request against the
     ///   target, leaving the branch standing (`keep_branch` is implied) and
     ///   `merged: false`. A push failure is a clean `pr_opened: false`.
+    pub(crate) async fn land_prepared(
+        &self,
+        repo_root: &std::path::Path,
+        branch: &str,
+        target: &str,
+        keep_branch: bool,
+        candidate: &rk_git::PreparedMerge,
+    ) -> rk_core::Result<serde_json::Value> {
+        let repo_path = repo_root.to_path_buf();
+        let repo = blocking_io("prepared land repo discovery", move || {
+            Repo::discover(&repo_path)
+        })
+        .await?;
+        let repo_name = repo.name();
+        let policy = self.repository_policy(&repo);
+        let effective_target = policy.delivery_target(target);
+        if effective_target != target {
+            return Err(rk_core::Error::other(format!(
+                "prepared landing target mismatch: candidate was built for {target}, policy resolved {effective_target}"
+            )));
+        }
+        if !matches!(
+            policy.delivery.mode,
+            DeliveryMode::Merge | DeliveryMode::MergePush
+        ) {
+            return Err(rk_core::Error::other(format!(
+                "prepared landing requires merge or merge-push delivery mode, found {:?}",
+                policy.delivery.mode
+            )));
+        }
+
+        let advance = {
+            let _merge_guard = self.merge_queue.acquire(repo.root(), target).await;
+            let repo = repo.clone();
+            let target = target.to_string();
+            let commit = candidate.commit.clone();
+            let base = candidate.base.clone();
+            blocking_io("prepared landing compare-and-swap", move || {
+                repo.advance_target_to(&target, &commit, &base)
+            })
+            .await?
+        };
+        if let rk_git::AdvanceOutcome::Stale { expected, actual } = advance {
+            return Ok(json!({
+                "branch": branch,
+                "target": target,
+                "delivered": false,
+                "merged": false,
+                "stale": true,
+                "tested_sha": candidate.commit,
+                "expected_target_sha": expected,
+                "actual_target_sha": actual,
+                "detail": "target moved after gates; candidate must be rebuilt and retested",
+            }));
+        }
+
+        let mut delivery = BranchDelivery {
+            target: target.to_string(),
+            remote: policy.delivery.remote.clone(),
+            merged: true,
+            merge_commit: Some(candidate.commit.clone()),
+            content_free: candidate.is_empty(),
+            detail: format!("advanced {target} to pre-tested merge {}", candidate.commit),
+            ..BranchDelivery::default()
+        };
+        repo.discard_candidate(&candidate.candidate_ref)?;
+        if policy.delivery.mode == DeliveryMode::MergePush {
+            let repo = repo.clone();
+            let target_to_push = target.to_string();
+            let remote_to_push = delivery.remote.clone();
+            match blocking_io("prepared landing target push", move || {
+                repo.push_branch_as(&target_to_push, &target_to_push, &remote_to_push)
+            })
+            .await
+            {
+                Ok(output) => {
+                    delivery.pushed = true;
+                    delivery.detail = format!(
+                        "{}; pushed {target} to {}: {}",
+                        delivery.detail,
+                        delivery.remote,
+                        output.trim()
+                    );
+                }
+                Err(error) => {
+                    delivery.detail = format!(
+                        "{}; local merge succeeded but push to {}/{} failed: {error}",
+                        delivery.detail, delivery.remote, target
+                    );
+                }
+            }
+        }
+        delivery.delivered = policy.delivery.mode == DeliveryMode::Merge || delivery.pushed;
+        if delivery.delivered && policy.delivery.delete_source && !keep_branch {
+            let repo = repo.clone();
+            let source = branch.to_string();
+            match blocking_io("prepared landing branch deletion", move || {
+                repo.delete_branch(&source)
+            })
+            .await
+            {
+                Ok(()) => delivery.branch_deleted = true,
+                Err(error) => warn!(
+                    branch,
+                    error = %error,
+                    "prepared delivery succeeded but source branch could not be deleted"
+                ),
+            }
+        }
+        let result = json!({
+            "branch": branch,
+            "target": delivery.target,
+            "remote": delivery.remote,
+            "delivered": delivery.delivered,
+            "merged": delivery.merged,
+            "merge_commit": delivery.merge_commit,
+            "tested_sha": candidate.commit,
+            "content_free": delivery.content_free,
+            "pushed": delivery.pushed,
+            "pr_opened": false,
+            "detail": delivery.detail,
+            "branch_deleted": delivery.branch_deleted,
+            "stale": false,
+        });
+        self.emit_event(&repo_name, "branch_landed", result.clone());
+        info!(
+            branch,
+            target,
+            tested_sha = %candidate.commit,
+            delivered = delivery.delivered,
+            pushed = delivery.pushed,
+            "landed exact pre-tested merge"
+        );
+        Ok(result)
+    }
+
     pub async fn land(
         &self,
         repo_root: &std::path::Path,
@@ -4238,6 +4555,27 @@ impl Supervisor {
         let repo_path = repo_root.to_path_buf();
         let repo = blocking_io("land repo discovery", move || Repo::discover(&repo_path)).await?;
         let repo_name = repo.name();
+        let fork_point = self.recorded_fork_point(repo.root(), branch);
+        let head_sha = repo.rev_parse(branch).ok();
+        let policy = self.repository_policy(&repo);
+        if matches!(
+            policy.delivery.mode,
+            DeliveryMode::Merge | DeliveryMode::MergePush
+        ) {
+            if let Some(pipeline) = self.landing_pipeline() {
+                let task = self.task_for_branch(repo.root(), branch);
+                let result = pipeline
+                    .submit_manual(repo.root(), branch, target, keep_branch, task)
+                    .await?;
+                self.record_merge_for_branch(repo.root(), branch, &result);
+                return Ok(result);
+            }
+            if !cfg!(test) {
+                return Err(rk_core::Error::other(
+                    "merge-mode landing pipeline is unavailable; refusing an untested direct merge",
+                ));
+            }
+        }
         let delivery = self
             .deliver_branch(&repo, &repo_name, branch, target, keep_branch)
             .await?;
@@ -4249,6 +4587,13 @@ impl Supervisor {
             "delivered": delivery.delivered,
             "merged": delivery.merged,
             "merge_commit": delivery.merge_commit,
+            // Surfaced so the landing pipeline can refuse to write a delivery
+            // record for a branch that added nothing over its target: an empty
+            // merge is not a delivery, and closing a ticket on one is exactly
+            // the duplicate-no-op-merge failure TKT-01M0C663BZ86SMA2PVMFP5QJ8D
+            // describes. `dismiss` already gates its ticket close on this;
+            // `land` withheld it from callers.
+            "content_free": delivery.content_free,
             "pushed": delivery.pushed,
             "pr_opened": delivery.pr_opened,
             "pr_url": delivery.pr_url,
@@ -4263,6 +4608,8 @@ impl Supervisor {
                 "pull_request_opened",
                 json!({
                     "branch": branch,
+                    "fork_point": fork_point,
+                    "head_sha": head_sha,
                     "target": result.get("target"),
                     "remote": result.get("remote"),
                     "remote_branch": result.get("remote_branch"),
@@ -4281,6 +4628,78 @@ impl Supervisor {
             branch_deleted = delivery.branch_deleted,
             "land"
         );
+        Ok(result)
+    }
+
+    /// Deliberate operator escape hatch for an emergency ungated landing.
+    /// Normal callers must use `land`, which enqueues. This path requires a
+    /// human reason and emits both an audit event and an inbox-visible need.
+    pub async fn land_force(
+        &self,
+        repo_root: &std::path::Path,
+        branch: &str,
+        target: &str,
+        keep_branch: bool,
+        reason: &str,
+    ) -> rk_core::Result<serde_json::Value> {
+        if reason.trim().is_empty() {
+            return Err(rk_core::Error::other(
+                "forced landing requires a non-empty --reason",
+            ));
+        }
+        let repo_path = repo_root.to_path_buf();
+        let repo = blocking_io("forced land repo discovery", move || {
+            Repo::discover(&repo_path)
+        })
+        .await?;
+        let repo_name = repo.name();
+        let delivery = self
+            .deliver_branch(&repo, &repo_name, branch, target, keep_branch)
+            .await?;
+        let result = json!({
+            "branch": branch,
+            "target": delivery.target,
+            "remote": delivery.remote,
+            "remote_branch": delivery.remote_branch,
+            "delivered": delivery.delivered,
+            "merged": delivery.merged,
+            "merge_commit": delivery.merge_commit,
+            "content_free": delivery.content_free,
+            "pushed": delivery.pushed,
+            "pr_opened": delivery.pr_opened,
+            "pr_url": delivery.pr_url,
+            "detail": delivery.detail,
+            "branch_deleted": delivery.branch_deleted,
+            "forced": true,
+            "reason": reason,
+        });
+        self.record_merge_for_branch(repo.root(), branch, &result);
+        self.emit_event(&repo_name, "branch_landed", result.clone());
+        self.emit_event(
+            &repo_name,
+            "forced_landing",
+            json!({
+                "branch": branch,
+                "target": target,
+                "reason": reason,
+                "merge_commit": result.get("merge_commit"),
+                "text": format!("operator forced ungated landing of {branch} onto {target}: {reason}"),
+            }),
+        );
+        let _ = self.space.out(Tuple::new(
+            Category::Need,
+            repo_name.clone(),
+            "forced_landing",
+            "daemon",
+            json!({
+                "agent": "operator",
+                "branch": branch,
+                "target": target,
+                "reason": reason,
+                "text": format!("UNGATED landing was forced: {branch} -> {target}: {reason}"),
+            }),
+        ));
+        warn!(repo = %repo_name, branch, target, reason, "operator forced ungated landing");
         Ok(result)
     }
 
@@ -4308,6 +4727,8 @@ impl Supervisor {
         })
         .await?;
         let repo_name = repo.name();
+        let fork_point = self.recorded_fork_point(repo.root(), branch);
+        let head_sha = repo.rev_parse(branch).ok();
         let policy = self.repository_policy(&repo);
         let remote = policy.delivery.remote.clone();
         let remote_branch = policy.remote_branch(branch, target, &repo_name);
@@ -4344,6 +4765,8 @@ impl Supervisor {
                 "pull_request_opened",
                 json!({
                     "branch": branch,
+                    "fork_point": fork_point,
+                    "head_sha": head_sha,
                     "target": target,
                     "remote": result.get("remote"),
                     "remote_branch": result.get("remote_branch"),
@@ -5440,6 +5863,7 @@ mod respawn_tests {
             repo_name: "repo",
             name: "Nibble".into(),
             branch: "rat/nibble/task".into(),
+            fork_point: "base".into(),
             worktree: repo_dir.path().join("worktree"),
             target_branch: "integration".into(),
             harness: "fake".into(),
@@ -5496,6 +5920,7 @@ mod respawn_tests {
             repo_name: "repo",
             name: "Nibble".into(),
             branch: "rat/nibble/task".into(),
+            fork_point: "base".into(),
             worktree: repo_dir.path().join("worktree"),
             target_branch: "main".into(),
             harness: worker.harness,
@@ -5754,6 +6179,7 @@ mod respawn_tests {
             repo_name: "repo".into(),
             task: Some("t".into()),
             branch: branch.map(String::from),
+            fork_point: None,
             worktree: Some(repo.to_path_buf()),
             target_branch: "main".into(),
             parent: None,
@@ -5830,6 +6256,127 @@ mod respawn_tests {
 
         // (e) No branch recorded => not merged (fail-safe, respawn preflight handles it).
         assert!(!sup.branch_already_merged(&record(p, None)));
+    }
+
+    /// Commit-count awareness at the done-gate call site
+    /// (TKT-01M0CTC4DPFV7Q2642AZH354BV): a branch that never diverged from
+    /// its target trivially satisfies `is_ancestor`, so a naive check would
+    /// let `rk done` through for a rat that committed nothing. The
+    /// merge-mode gate (`branch_verified_merged`) refuses it: rk's own
+    /// merges are always `--no-ff`, so there is no legitimate
+    /// fast-forward case to protect here. The push-branch gate
+    /// (`remote_branch_merged_or_gone`) is deliberately NOT fixed the same
+    /// way — a forge merge is very often a fast-forward, indistinguishable
+    /// from "never diverged" from ref state alone; see
+    /// `Repo::remote_branch_merged_or_gone`'s doc comment. That gap is
+    /// tracked as a follow-up rather than fixed here unsafely.
+    #[test]
+    fn ticket_undelivered_reason_refuses_an_empty_branch() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let p = repo_dir.path();
+        init_repo(p);
+        git(p, &["checkout", "-b", "nowork", "main"]);
+        git(p, &["checkout", "main"]);
+        let repo = Repo::discover(p).unwrap();
+        let fork_point = repo.rev_parse("main").unwrap();
+
+        let merge_policy = rk_workflow::RepositoryPolicy::default();
+        assert_eq!(merge_policy.delivery.mode, DeliveryMode::Merge);
+        assert!(
+            ticket_undelivered_reason(&merge_policy, &repo, "nowork", "main", None, true).is_some(),
+            "an empty branch must not read as delivered under merge mode"
+        );
+
+        let mut push_policy = merge_policy.clone();
+        push_policy.delivery.mode = DeliveryMode::PushBranch;
+        assert!(
+            ticket_undelivered_reason(
+                &push_policy,
+                &repo,
+                "nowork",
+                "main",
+                Some(&fork_point),
+                true,
+            )
+            .is_some(),
+            "a missing remote ref must not make a never-diverged branch read delivered"
+        );
+
+        // A branch that actually made a commit still hasn't merged yet, so it
+        // is refused too — confirming the fix doesn't also refuse real,
+        // pending work as "empty".
+        git(p, &["checkout", "-b", "work", "main"]);
+        std::fs::write(p.join("g"), "1\n").unwrap();
+        git(p, &["add", "g"]);
+        git(p, &["commit", "-m", "work"]);
+        git(p, &["checkout", "main"]);
+        let repo = Repo::discover(p).unwrap();
+        assert!(
+            ticket_undelivered_reason(&merge_policy, &repo, "work", "main", None, true).is_some(),
+            "unmerged real work is also not yet delivered"
+        );
+
+        // Once genuinely merged (target advances past the branch), the gate
+        // clears.
+        git(p, &["merge", "--no-ff", "-m", "merge", "work"]);
+        let repo = Repo::discover(p).unwrap();
+        assert!(
+            ticket_undelivered_reason(&merge_policy, &repo, "work", "main", None, true).is_none(),
+            "a genuinely merged branch must clear the done-gate"
+        );
+    }
+
+    /// Lifecycle cleanup is never delivery: even a content-free duplicate
+    /// whose branch already matches the target must not close a ticket merely
+    /// because the agent was dismissed.
+    #[tokio::test]
+    async fn dismiss_never_closes_a_ticket_for_a_content_free_duplicate_branch() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let sup = supervisor(home.path());
+        let p = repo_dir.path();
+
+        let ticket = sup
+            .tickets
+            .create(crate::tickets::NewTicket {
+                title: "test".into(),
+                body: None,
+                scope: None,
+                parent: None,
+                priority: "normal".into(),
+                labels: vec![],
+                depends_on: vec![],
+                created_by: None,
+                coalesce_key: None,
+            })
+            .await
+            .unwrap();
+        let task_id = ticket.identity.clone();
+        sup.tickets
+            .set_status(&task_id, "in_progress")
+            .await
+            .unwrap();
+
+        // A duplicate branch cut from main with no commits — already
+        // ancestor-equivalent of target, exactly the trivial no-op-merge case.
+        git(p, &["checkout", "-b", "dup", "main"]);
+        git(p, &["checkout", "main"]);
+
+        let mut rec = record(p, Some("dup"));
+        rec.name = "Duplicate".into();
+        rec.task = Some(task_id.clone());
+        rec.worktree = None; // nothing to tear down for this test
+        sup.lock_registry().insert(rec).unwrap();
+
+        sup.dismiss("Duplicate", false).await.unwrap();
+
+        let ticket = sup.tickets.get(&task_id).unwrap().unwrap();
+        assert_ne!(
+            ticket.payload["status"],
+            json!("closed"),
+            "a content-free duplicate merge must not close the ticket"
+        );
     }
 
     /// The TKT-146 scenario, closed structurally
@@ -6083,6 +6630,83 @@ mod respawn_tests {
             sup.decide_respawn(&rec, now + chrono::Duration::seconds(999), &cfg),
             RespawnDecision::Wait
         ));
+    }
+
+    #[test]
+    fn deliberate_stops_are_not_auto_respawn_candidates_but_crashes_are() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+
+        let mut stopped = record(repo.path(), Some("main"));
+        stopped.state = AgentState::Stopped;
+        stopped.result = Some("interrupted deliberately by operator".into());
+        stopped.crashed = false;
+        assert!(!is_auto_respawn_candidate(&stopped));
+        assert_ne!(stopped.state, AgentState::Failed);
+
+        let mut crashed = stopped.clone();
+        crashed.state = AgentState::Failed;
+        crashed.crashed = true;
+        assert!(is_auto_respawn_candidate(&crashed));
+
+        let mut orphaned = stopped;
+        orphaned.state = AgentState::Orphaned;
+        assert!(is_auto_respawn_candidate(&orphaned));
+    }
+
+    #[test]
+    fn budget_stop_is_terminal_and_announced_exactly_once() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let tickets = Arc::new(crate::tickets::Tickets::new(
+            Space::open_in_memory().unwrap(),
+            "castle".into(),
+        ));
+        let sup = Arc::new(
+            Supervisor::new(
+                Layout::at(home.path()),
+                "castle".into(),
+                "fake".into(),
+                Budget {
+                    max_usd: 20.0,
+                    max_tokens: 100_000,
+                    warn_at: 0.8,
+                },
+                FleetBudget::default(),
+                Space::open_in_memory().unwrap(),
+                tickets,
+            )
+            .unwrap(),
+        );
+        let mut rec = record(repo.path(), Some("main"));
+        rec.state = AgentState::Running;
+        rec.cost_usd = 20.25;
+        rec.usage.input = 100_001;
+        sup.lock_registry().insert(rec.clone()).unwrap();
+
+        sup.enforce_budget(&rec);
+        // A duplicate over-cap usage observation must not emit or kill twice.
+        sup.enforce_budget(&rec);
+
+        let stopped = sup.status(&rec.name).unwrap();
+        assert_eq!(stopped.state, AgentState::Stopped);
+        assert!(!stopped.crashed);
+        assert!(stopped.state.is_archivable());
+        let actions = sup
+            .space
+            .scan(
+                &Pattern::category(Category::Event)
+                    .identity(crate::recovery::RECOVERY_ACTION_IDENTITY),
+            )
+            .unwrap();
+        assert_eq!(actions.len(), 1, "budget stop must escalate exactly once");
+        let notice = &actions[0].payload["notice"];
+        assert_eq!(notice["class"], json!("budget-stop"));
+        let text = notice["text"].as_str().unwrap();
+        assert!(text.contains("$20.25 / $20.00 cap"));
+        assert!(text.contains("100001 / 100000 token cap"));
+        assert!(!is_auto_respawn_candidate(&stopped));
     }
 
     fn spawn_params(repo: &Path, task: &str) -> SpawnParams {

@@ -295,6 +295,7 @@ fn state_style(state: &str) -> Style {
         "paused" => Style::default().fg(Color::Yellow),
         "completed" => Style::default().fg(Color::DarkGray),
         "dismissed" => Style::default().fg(Color::DarkGray),
+        "stopped" => Style::default().fg(Color::DarkGray),
         "failed" => Style::default().fg(Color::Red),
         "orphaned" => Style::default().fg(Color::Magenta),
         _ => Style::default(),

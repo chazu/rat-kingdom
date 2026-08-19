@@ -693,7 +693,7 @@ async fn dispatch_retries_after_a_missing_repo_is_registered() {
     assert_eq!(reactor.run_cycle().unwrap(), 1);
 }
 
-/// Dependency-unblock auto-dispatch (TKT-56): closing a ticket emits a
+/// Dependency-unblock auto-dispatch (TKT-56): recording delivery emits a
 /// `ticket_closed` event, and a reactor trigger matching it hands the newly-ready
 /// backlog to a drain workflow. Here TKT-2 depends on TKT-1; closing TKT-1 makes
 /// TKT-2 ready AND fires the drain — the DAG advances itself with no operator and
@@ -741,9 +741,20 @@ async fn closing_a_ticket_dispatches_its_newly_ready_dependent() {
         "dependent is blocked while its dep is open"
     );
 
-    // Close the dep. That emits `ticket_closed`, and the next reactor cycle fires
+    // Record delivery. That emits `ticket_closed`, and the next reactor cycle fires
     // the drain — the dependent is now ready to be picked up.
-    tickets.set_status(&a.identity, "done").await.unwrap();
+    tickets
+        .record_delivery(
+            &a.identity,
+            &rk_daemon::tickets::DeliveryRecord {
+                merge_commit: "delivered-sha".into(),
+                branch: "rat/root".into(),
+                target: "main".into(),
+                landed_at: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
     assert!(
         tickets
             .ready(Some("myrepo".into()))

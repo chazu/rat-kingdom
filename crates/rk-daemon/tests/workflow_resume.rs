@@ -71,6 +71,7 @@ fn init_repo() -> tempfile::TempDir {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_passing_landing_checks(repo_dir.path());
 
     let wf_dir = repo_dir.path().join(".rk").join("workflows");
     std::fs::create_dir_all(&wf_dir).unwrap();

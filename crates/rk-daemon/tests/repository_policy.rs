@@ -92,6 +92,7 @@ async fn activated_policy_controls_names_target_and_remote_delivery() {
     std::fs::write(repo.join("README.md"), "# policy test\n").unwrap();
     git(repo, &["add", "."]);
     git(repo, &["commit", "-m", "init"]);
+    support::install_passing_landing_checks(repo);
     git(repo, &["push", "-u", "origin", "main"]);
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
@@ -176,8 +177,16 @@ async fn activated_policy_controls_names_target_and_remote_delivery() {
             .is_some_and(|s| !s.is_empty()),
         "harness_result must carry the completing generation's spawn id: {completion:?}"
     );
-    let delivered = client
+    let dismissed = client
         .call("agent.dismiss", json!({"name": agent}))
+        .await
+        .unwrap();
+    assert_eq!(dismissed["delivered"], false);
+    let delivered = client
+        .call(
+            "repo.land",
+            json!({"repo": repo, "branch": branch, "target": "main"}),
+        )
         .await
         .unwrap();
     assert_eq!(delivered["delivered"], true, "{delivered}");
@@ -231,6 +240,7 @@ async fn merge_push_delivers_the_agents_feature_base_to_the_remote() {
     std::fs::write(repo.join("README.md"), "# merge push\n").unwrap();
     git(repo, &["add", "."]);
     git(repo, &["commit", "-m", "init"]);
+    support::install_passing_landing_checks(repo);
     git(repo, &["branch", "feature/integration"]);
     git(repo, &["push", "-u", "origin", "main"]);
     git(repo, &["push", "-u", "origin", "feature/integration"]);
@@ -259,6 +269,7 @@ async fn merge_push_delivers_the_agents_feature_base_to_the_remote() {
         .await
         .unwrap();
     let agent = spawned["agent"]["name"].as_str().unwrap().to_string();
+    let branch = spawned["agent"]["branch"].as_str().unwrap().to_string();
     assert_eq!(spawned["agent"]["target_branch"], "feature/integration");
     for _ in 0..200 {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -271,8 +282,16 @@ async fn merge_push_delivers_the_agents_feature_base_to_the_remote() {
             break;
         }
     }
-    let delivered = client
+    let dismissed = client
         .call("agent.dismiss", json!({"name": agent}))
+        .await
+        .unwrap();
+    assert_eq!(dismissed["delivered"], false);
+    let delivered = client
+        .call(
+            "repo.land",
+            json!({"repo": repo, "branch": branch, "target": "feature/integration"}),
+        )
         .await
         .unwrap();
     assert_eq!(delivered["delivered"], true, "{delivered}");

@@ -15,7 +15,7 @@ use rk_core::action::canonical_digest;
 use rk_core::id::RecordId;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
 use rk_space::Space;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -33,6 +33,44 @@ pub const STATUSES: &[&str] = &[
 ];
 
 pub(crate) const ID_PREFIX: &str = "TKT-";
+
+/// Payload key holding a ticket's durable delivery record — the answer to
+/// "did this ticket ship", written once by the landing pipeline at land time
+/// (P1b). Before this existed, delivery was inferred from live branch refs,
+/// which landing itself deletes: a landed ticket's branch is gone, so the
+/// inference read "not delivered" and the ticket sat `in_progress` forever
+/// (probe O14/O16, 14 tickets observed at once). The record is git + rk state
+/// only — a merge commit sha and the branch/target it landed on — so it
+/// carries no assumption about the repo's language or build system.
+pub const DELIVERY_FIELD: &str = "delivery";
+
+/// The durable proof that a ticket's work reached its target branch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryRecord {
+    /// The merge commit the land produced. This is the whole point of the
+    /// record: it stays true after the branch ref is deleted.
+    pub merge_commit: String,
+    /// The branch that landed (kept for provenance/debugging; never read as
+    /// a liveness signal — the ref is typically gone by the time anyone asks).
+    pub branch: String,
+    /// The branch it landed ON.
+    pub target: String,
+    #[serde(default)]
+    pub landed_at: String,
+}
+
+/// Read a ticket tuple's delivery record, if it carries one.
+pub fn delivery_of(ticket: &Tuple) -> Option<DeliveryRecord> {
+    serde_json::from_value(ticket.payload.get(DELIVERY_FIELD)?.clone()).ok()
+}
+
+/// THE delivery predicate: has this ticket's work actually landed? Answered
+/// from the durable record alone — never from branch existence, and never
+/// from a ticket merely being marked `done` (the "approved but never merged"
+/// class, TKT-18/46/147).
+pub fn is_delivered(ticket: &Tuple) -> bool {
+    delivery_of(ticket).is_some_and(|d| !d.merge_commit.is_empty())
+}
 
 fn system_scope() -> String {
     rk_core::tuple::SYSTEM_SCOPE.to_string()
@@ -345,6 +383,64 @@ impl Tickets {
         .await
     }
 
+    /// Record a successful land on the ticket and close it in the same write
+    /// (P1b). This is the post-landing writer the pipeline previously lacked:
+    /// the merge commit becomes the durable delivery record, and the ticket
+    /// reaches a terminal state without an operator touching it.
+    ///
+    /// Deliberately bypasses [`valid_transition`]: a land is ground truth
+    /// about the world, not a workflow request, so it must be recordable from
+    /// ANY prior status — including legacy tickets already marked terminal
+    /// without a merge commit. Idempotent by
+    /// merge commit: re-recording the same commit rewrites the same record and
+    /// does not re-emit `ticket_closed` (the [`edit`] close-edge guard already
+    /// fires only on the non-terminal → terminal crossing).
+    ///
+    /// [`edit`]: Self::edit
+    pub async fn record_delivery(
+        &self,
+        id: &str,
+        record: &DeliveryRecord,
+    ) -> rk_core::Result<Tuple> {
+        let _guard = self.lock.lock().await;
+        let value = serde_json::to_value(record)
+            .map_err(|e| rk_core::Error::other(format!("delivery record: {e}")))?;
+        self.edit(id, move |obj| {
+            obj.insert(DELIVERY_FIELD.into(), value);
+            obj.insert("status".into(), json!("closed"));
+        })
+        .await
+    }
+
+    /// Drop a ticket's delivery record and reopen it at `status` — the revert
+    /// half of [`record_delivery`]. A reverted merge must stop reading as
+    /// delivered, otherwise the work is durably lost: the branch is gone AND
+    /// the record would still claim it shipped. Returns `false` if the ticket
+    /// does not exist or carried no record to clear.
+    ///
+    /// [`record_delivery`]: Self::record_delivery
+    pub async fn clear_delivery(&self, id: &str, status: &str) -> rk_core::Result<bool> {
+        let _guard = self.lock.lock().await;
+        let Some(existing) = self.get(id)? else {
+            return Ok(false);
+        };
+        if delivery_of(&existing).is_none() {
+            return Ok(false);
+        }
+        let status = status.to_string();
+        self.edit(id, move |obj| {
+            obj.remove(DELIVERY_FIELD);
+            obj.insert("status".into(), json!(status));
+        })
+        .await?;
+        Ok(true)
+    }
+
+    /// The delivery record for `id`, if it exists and has landed.
+    pub fn delivery(&self, id: &str) -> rk_core::Result<Option<DeliveryRecord>> {
+        Ok(self.get(id)?.as_ref().and_then(delivery_of))
+    }
+
     /// Atomically claim an open ticket for a backlog-drain: compare-and-set
     /// `open` → `in_progress`. Returns `true` if this call won the claim (the
     /// ticket existed, was `open`, and is now `in_progress`), `false` if it was
@@ -486,7 +582,8 @@ impl Tickets {
         .await
     }
 
-    /// Open tickets whose every dependency is done/closed — actionable right now.
+    /// Open tickets whose every dependency has a durable delivery record —
+    /// actionable right now. Status alone is not proof that work landed.
     pub fn ready(&self, scope: Option<String>) -> rk_core::Result<Vec<Tuple>> {
         let by_id = self.all_by_id()?;
         let mut ready: Vec<Tuple> = by_id
@@ -510,7 +607,7 @@ impl Tickets {
         Ok(Some(
             deps_of(ticket)
                 .into_iter()
-                .filter(|d| by_id.get(d).is_some_and(|dep| !is_done(dep)))
+                .filter(|d| by_id.get(d).is_some_and(|dep| !is_delivered(dep)))
                 .collect(),
         ))
     }
@@ -560,7 +657,7 @@ impl Tickets {
             .await?
             .ok_or_else(|| rk_core::Error::other(format!("no such ticket: {id}")))?;
 
-        let was_done = is_done(&existing);
+        let was_delivered = is_delivered(&existing);
         let mut payload = existing.payload.clone();
         let obj = payload
             .as_object_mut()
@@ -570,15 +667,15 @@ impl Tickets {
 
         let updated = with_payload(existing, payload);
         self.space.out(updated.clone())?;
-        // Emit a `ticket_closed` event on the non-terminal → terminal edge — the
-        // moment a ticket's dependents can unblock (TKT-56). A reactor trigger
+        // Emit a `ticket_closed` event on the undelivered → delivered edge —
+        // the moment a ticket's dependents can unblock (TKT-56). A reactor trigger
         // matching this event hands the now-ready backlog to a drain workflow,
         // turning the dependency DAG into a self-advancing pipeline instead of
         // one that waits for the next drain sweep. Only the crossing edge fires
         // (a done→closed re-close, or a non-status edit, does not), so a closed
         // ticket's dependents are announced exactly once. Best-effort: a failed
         // emit never fails the status change that already landed.
-        if is_done(&updated) && !was_done {
+        if is_delivered(&updated) && !was_delivered {
             self.emit_ticket_closed(&updated);
         }
         Ok(updated)
@@ -659,19 +756,13 @@ fn valid_transition(previous: &str, next: &str) -> bool {
     }
 }
 
-fn is_done(ticket: &Tuple) -> bool {
-    matches!(
-        ticket.payload.get("status").and_then(Value::as_str),
-        Some("done") | Some("closed")
-    )
-}
-
-/// Blocked = has a dependency that exists and is not yet done/closed. A missing
+/// Blocked = has a dependency that exists and has no durable delivery record.
+/// A missing
 /// dependency (deleted ticket) does not block.
 fn is_blocked(ticket: &Tuple, by_id: &HashMap<String, Tuple>) -> bool {
     deps_of(ticket)
         .iter()
-        .any(|d| by_id.get(d).is_some_and(|dep| !is_done(dep)))
+        .any(|d| by_id.get(d).is_some_and(|dep| !is_delivered(dep)))
 }
 
 /// Can `target` be reached from `start` by following depends_on edges?
@@ -725,6 +816,108 @@ mod tests {
             created_by: None,
             coalesce_key: None,
         }
+    }
+
+    fn record(commit: &str) -> DeliveryRecord {
+        DeliveryRecord {
+            merge_commit: commit.into(),
+            branch: "rat/x/tkt-1".into(),
+            target: "main".into(),
+            landed_at: "2026-08-19T00:00:00Z".into(),
+        }
+    }
+
+    /// The headline acceptance: a landed ticket reaches a terminal state with
+    /// no operator action, and carries the merge commit that proves it.
+    #[tokio::test]
+    async fn recording_delivery_closes_the_ticket_and_stores_the_merge_commit() {
+        let t = tickets();
+        let id = t.create(new("work", "repo", None)).await.unwrap().identity;
+        set_status(&t, &id, "in_progress").await;
+
+        t.record_delivery(&id, &record("abc123")).await.unwrap();
+
+        let stored = t.get(&id).unwrap().unwrap();
+        assert_eq!(
+            stored.payload.get("status").and_then(Value::as_str),
+            Some("closed")
+        );
+        assert!(is_delivered(&stored));
+        assert_eq!(t.delivery(&id).unwrap().unwrap().merge_commit, "abc123");
+    }
+
+    /// The record is what "is it delivered" reads — NOT branch existence. This
+    /// test holds no branch at all: nothing in the predicate may consult one.
+    #[tokio::test]
+    async fn delivery_reads_from_the_record_not_from_a_branch_ref() {
+        let t = tickets();
+        let id = t.create(new("work", "repo", None)).await.unwrap().identity;
+        assert!(!is_delivered(&t.get(&id).unwrap().unwrap()));
+
+        t.record_delivery(&id, &record("deadbeef")).await.unwrap();
+
+        // Deleting the branch is exactly what landing does next; the record is
+        // untouched by it, so the ticket still reads delivered.
+        let stored = t.get(&id).unwrap().unwrap();
+        assert!(is_delivered(&stored));
+        assert_eq!(delivery_of(&stored).unwrap().branch, "rat/x/tkt-1");
+    }
+
+    /// A ticket marked `closed` without a land does NOT read as delivered —
+    /// the "approved but never merged" class (TKT-18/46/147).
+    #[tokio::test]
+    async fn a_closed_ticket_without_a_land_is_not_delivered() {
+        let t = tickets();
+        let id = t.create(new("work", "repo", None)).await.unwrap().identity;
+        set_status(&t, &id, "closed").await;
+        assert!(!is_delivered(&t.get(&id).unwrap().unwrap()));
+        assert!(t.delivery(&id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reverting_clears_the_delivery_record_and_reopens() {
+        let t = tickets();
+        let id = t.create(new("work", "repo", None)).await.unwrap().identity;
+        t.record_delivery(&id, &record("abc123")).await.unwrap();
+
+        assert!(t.clear_delivery(&id, "open").await.unwrap());
+
+        let stored = t.get(&id).unwrap().unwrap();
+        assert!(!is_delivered(&stored));
+        assert_eq!(
+            stored.payload.get("status").and_then(Value::as_str),
+            Some("open")
+        );
+        // Nothing left to clear on a second revert.
+        assert!(!t.clear_delivery(&id, "open").await.unwrap());
+    }
+
+    /// A land is ground truth, so it must record from any prior status,
+    /// including a legacy ticket already closed without a delivery record.
+    #[tokio::test]
+    async fn recording_delivery_works_from_an_already_closed_ticket() {
+        let t = tickets();
+        let id = t.create(new("work", "repo", None)).await.unwrap().identity;
+        set_status(&t, &id, "closed").await;
+
+        t.record_delivery(&id, &record("abc123")).await.unwrap();
+
+        assert!(is_delivered(&t.get(&id).unwrap().unwrap()));
+    }
+
+    /// Re-landing the same commit must not announce a second close, or every
+    /// dependent of the ticket re-fires.
+    #[tokio::test]
+    async fn re_recording_the_same_delivery_does_not_re_emit_a_close() {
+        let (t, space) = tickets_with_space();
+        let id = t.create(new("work", "repo", None)).await.unwrap().identity;
+        t.record_delivery(&id, &record("abc123")).await.unwrap();
+        assert_eq!(closed_events(&space).len(), 1);
+
+        t.record_delivery(&id, &record("abc123")).await.unwrap();
+
+        assert_eq!(closed_events(&space).len(), 1);
+        assert!(is_delivered(&t.get(&id).unwrap().unwrap()));
     }
 
     #[tokio::test]
@@ -945,8 +1138,19 @@ mod tests {
             vec![a.identity.clone()]
         );
 
-        // Finish a → b becomes ready.
+        // A status-only finish is not delivery and cannot unblock b.
         set_status(&t, &a.identity, "done").await;
+        assert!(t.ready(None).unwrap().is_empty());
+        assert_eq!(
+            t.blockers(&b.identity).unwrap().unwrap(),
+            vec![a.identity.clone()]
+        );
+
+        // Recording the land is the one transition that makes a dependency
+        // satisfied, so ready and blockers change together.
+        t.record_delivery(&a.identity, &record("abc123"))
+            .await
+            .unwrap();
         let ready: Vec<_> = t
             .ready(None)
             .unwrap()
@@ -1031,18 +1235,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closing_a_ticket_emits_a_ticket_closed_event() {
+    async fn only_delivery_emits_a_ticket_closed_event() {
         let (t, space) = tickets_with_space();
         let a = t.create(new("x", "myrepo", None)).await.unwrap();
         assert!(closed_events(&space).is_empty(), "no event before close");
 
         set_status(&t, &a.identity, "done").await;
+        assert!(
+            closed_events(&space).is_empty(),
+            "status without delivery must not unblock dependents"
+        );
+        t.record_delivery(&a.identity, &record("abc123"))
+            .await
+            .unwrap();
         let events = closed_events(&space);
-        assert_eq!(events.len(), 1, "closing emits exactly one event");
+        assert_eq!(events.len(), 1, "delivery emits exactly one event");
         let ev = &events[0];
         assert_eq!(ev.scope, "myrepo", "event is scoped to the ticket's repo");
         assert_eq!(ev.payload["ticket"], json!(a.identity));
-        assert_eq!(ev.payload["status"], json!("done"));
+        assert_eq!(ev.payload["status"], json!("closed"));
     }
 
     #[tokio::test]
@@ -1060,15 +1271,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn re_closing_a_done_ticket_does_not_re_emit() {
+    async fn status_changes_before_delivery_do_not_emit() {
         let (t, space) = tickets_with_space();
         let a = t.create(new("x", "myrepo", None)).await.unwrap();
-        set_status(&t, &a.identity, "done").await; // non-terminal → done: emits
-        set_status(&t, &a.identity, "closed").await; // done → closed: no re-emit
+        set_status(&t, &a.identity, "done").await;
+        set_status(&t, &a.identity, "closed").await;
         assert_eq!(
             closed_events(&space).len(),
-            1,
-            "the terminal edge fires once; a done→closed re-close is silent"
+            0,
+            "neither done nor closed satisfies a dependency without delivery"
         );
     }
 

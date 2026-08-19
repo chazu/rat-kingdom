@@ -284,6 +284,7 @@ pub struct DescendantRollup {
     pub paused: usize,
     pub completed: usize,
     pub failed: usize,
+    pub stopped: usize,
     pub orphaned: usize,
     pub dismissed: usize,
     pub blocked: usize,
@@ -490,6 +491,7 @@ fn middle_rat_summary(
             AgentState::Paused => rollup.paused += 1,
             AgentState::Completed => rollup.completed += 1,
             AgentState::Failed => rollup.failed += 1,
+            AgentState::Stopped => rollup.stopped += 1,
             AgentState::Orphaned => rollup.orphaned += 1,
             AgentState::Dismissed => rollup.dismissed += 1,
         }
@@ -740,6 +742,7 @@ mod tests {
             repo_name: "repo".into(),
             task: Some(name.into()),
             branch: Some(format!("rat/{name}")),
+            fork_point: None,
             worktree: None,
             target_branch: "main".into(),
             parent: parent.map(str::to_string),

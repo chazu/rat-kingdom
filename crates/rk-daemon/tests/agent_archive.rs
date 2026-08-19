@@ -39,6 +39,7 @@ fn scratch_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_passing_landing_checks(dir);
 }
 
 /// ONE fake harness for the whole binary, branching on the task name: a
@@ -173,7 +174,10 @@ async fn archive_hides_terminal_records_and_round_trips() {
         .call("agent.dismiss", json!({"name": gone}))
         .await
         .unwrap();
-    assert_eq!(dismissed["merged"], true, "detail: {}", dismissed["detail"]);
+    assert_eq!(
+        dismissed["merged"], false,
+        "dismiss must preserve the branch"
+    );
 
     // Spend recorded before the archive, to compare against afterwards.
     let spend_before = instance_spend(&mut client, "wf-archive")

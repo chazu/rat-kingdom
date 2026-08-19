@@ -1,5 +1,5 @@
 //! TKT-51: the serialized land / merge queue. Several rats finish on the same
-//! base and are dismissed *concurrently*; every branch must land in `main`.
+//! base and are submitted *concurrently*; every branch must land in `main`.
 //!
 //! Before the per-target merge queue, concurrent auto-merges raced: each merged
 //! in a detached worktree captured from the target ref *before* another merge
@@ -59,7 +59,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","ses
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_dismisses_all_merge_into_main() {
+async fn concurrent_gated_landings_all_merge_into_main() {
     const N: usize = 5;
 
     let home = tempfile::tempdir().unwrap();
@@ -70,6 +70,7 @@ async fn concurrent_dismisses_all_merge_into_main() {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_passing_landing_checks(repo_dir.path());
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", working_fake());
     let layout = Layout::at(home.path());
@@ -78,7 +79,7 @@ async fn concurrent_dismisses_all_merge_into_main() {
     let mut client = connect(&layout).await;
 
     // Spawn N rats, all forked off main.
-    let mut names = Vec::with_capacity(N);
+    let mut agents = Vec::with_capacity(N);
     for i in 0..N {
         let spawned = client
             .call(
@@ -91,11 +92,14 @@ async fn concurrent_dismisses_all_merge_into_main() {
             )
             .await
             .unwrap();
-        names.push(spawned["agent"]["name"].as_str().unwrap().to_string());
+        agents.push((
+            spawned["agent"]["name"].as_str().unwrap().to_string(),
+            spawned["agent"]["branch"].as_str().unwrap().to_string(),
+        ));
     }
 
     // Wait for every rat to finish its commit (registry state, no pane polling).
-    for name in &names {
+    for (name, _) in &agents {
         let mut done = false;
         for _ in 0..200 {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -111,17 +115,27 @@ async fn concurrent_dismisses_all_merge_into_main() {
         assert!(done, "rat {name} never completed");
     }
 
-    // Fire all N dismisses concurrently, each on its own connection, so the
-    // daemon merges them into `main` at the same time — exactly the unattended
-    // race the queue must serialize.
+    // Dismissal itself never lands. Preserve every branch, then fire all N
+    // explicit gated land submissions concurrently.
+    for (name, _) in &agents {
+        let dismissed = client
+            .call("agent.dismiss", json!({"name": name}))
+            .await
+            .unwrap();
+        assert_eq!(dismissed["merged"], false);
+    }
     let mut handles = Vec::with_capacity(N);
-    for name in names {
+    for (_, branch) in agents {
         let layout = layout.clone();
+        let repo = repo_dir.path().to_path_buf();
         handles.push(tokio::spawn(async move {
             let mut c = Client::connect_as_operator(&layout).await.unwrap();
-            c.call("agent.dismiss", json!({"name": name}))
-                .await
-                .unwrap()
+            c.call(
+                "repo.land",
+                json!({"repo": repo, "branch": branch, "target": "main"}),
+            )
+            .await
+            .unwrap()
         }));
     }
 
@@ -136,7 +150,7 @@ async fn concurrent_dismisses_all_merge_into_main() {
     }
     assert_eq!(
         merged, N,
-        "every concurrent dismiss must merge into main; details: {details:?}"
+        "every concurrent gated landing must merge into main; details: {details:?}"
     );
 
     // main carries every rat's work file, and every rat branch was deleted.
