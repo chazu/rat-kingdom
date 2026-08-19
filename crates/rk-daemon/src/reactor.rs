@@ -2358,8 +2358,7 @@ impl Reactor {
                 }
             }
             self.run_hook(hook, event, tuple);
-            if let Err(e) = self.mark_fired_key(&key, &hook.name, &tuple.id.to_string(), "fired")
-            {
+            if let Err(e) = self.mark_fired_key(&key, &hook.name, &tuple.id.to_string(), "fired") {
                 warn!(hook = %hook.name, tuple = %tuple.id, error = %e, "reactor failed to record hook fire marker");
             }
         }
@@ -2670,7 +2669,10 @@ fn hook_event_for_tuple(tuple: &Tuple) -> Option<&'static str> {
 /// deliberately excluded even though some also carry an `agent` payload
 /// field.
 fn is_agent_terminal_event(event: &str) -> bool {
-    matches!(event, "agent_completed" | "agent_failed" | "agent_dismissed")
+    matches!(
+        event,
+        "agent_completed" | "agent_failed" | "agent_dismissed"
+    )
 }
 
 /// Whether `hook` reacts to a tuple scoped to `tuple_scope`: an explicit

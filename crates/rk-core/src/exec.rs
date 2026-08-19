@@ -121,14 +121,8 @@ mod tests {
     fn run_piped_reports_a_nonzero_exit_via_status_not_err() {
         let dir = tempfile::tempdir().unwrap();
         let program = script(dir.path(), "broken", "exit 3");
-        let status = run_piped(
-            &program,
-            &[],
-            &BTreeMap::new(),
-            b"",
-            Duration::from_secs(5),
-        )
-        .unwrap();
+        let status =
+            run_piped(&program, &[], &BTreeMap::new(), b"", Duration::from_secs(5)).unwrap();
         assert!(!status.success());
         assert_eq!(status.code(), Some(3));
     }
@@ -152,14 +146,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let program = script(dir.path(), "hang", "sleep 60");
         let started = Instant::now();
-        let err = run_piped(
-            &program,
-            &[],
-            &BTreeMap::new(),
-            b"",
-            Duration::from_secs(1),
-        )
-        .expect_err("a hung child must not win");
+        let err = run_piped(&program, &[], &BTreeMap::new(), b"", Duration::from_secs(1))
+            .expect_err("a hung child must not win");
         assert!(err.to_string().contains("timed out"), "{err}");
         assert!(
             started.elapsed() < Duration::from_secs(30),
