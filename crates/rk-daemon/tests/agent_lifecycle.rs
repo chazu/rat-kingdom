@@ -11,6 +11,16 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+/// `RK_FAKE_HARNESS_CMD` is process-global (`std::env::set_var`), and cargo
+/// runs this file's `#[tokio::test]`s concurrently within one process by
+/// default. This file got away with that for a long time because its
+/// original two tests both pointed the var at the same `WORKING_FAKE`
+/// script — a second, differently-scripted test (content-free branch,
+/// TKT-01M0C663BZ86SMA2PVMFP5QJ8D) can otherwise have another test's
+/// concurrent `set_var` overwrite its harness mid-spawn, exactly the race
+/// `ticket_done_binding.rs`'s own `HARNESS_ENV_LOCK` guards against.
+static HARNESS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .arg("-C")
@@ -68,6 +78,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"committed 
 
 #[tokio::test]
 async fn spawn_complete_route_dismiss_merge() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
@@ -168,6 +179,7 @@ async fn spawn_complete_route_dismiss_merge() {
 /// straight from `open` to `closed`.
 #[tokio::test]
 async fn ticket_dispatched_rat_closes_its_ticket() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
@@ -262,6 +274,7 @@ echo '{"type":"result","subtype":"error","is_error":true,"result":"nothing to do
 /// dismiss must not be mistaken for that ticket's delivery.
 #[tokio::test]
 async fn ticket_dispatched_rat_with_content_free_branch_does_not_close_its_ticket() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
