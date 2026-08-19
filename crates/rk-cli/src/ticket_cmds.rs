@@ -76,6 +76,15 @@ pub struct UpdateArgs {
     /// subsystem thaws.
     #[arg(long = "remove-label")]
     pub remove_labels: Vec<String>,
+    /// Short reason slug for a groomer closure (e.g. `stale-rework`,
+    /// `stale-flake`). Required together with --evidence for a groomer's
+    /// `--status closed`; ignored by an ordinary update.
+    #[arg(long)]
+    pub reason: Option<String>,
+    /// Evidence backing --reason (a target ticket id, commit sha, or test-run
+    /// result). Required together with --reason.
+    #[arg(long)]
+    pub evidence: Option<String>,
 }
 
 pub async fn new(layout: &Layout, args: NewArgs, as_json: bool) -> Result<()> {
@@ -304,6 +313,13 @@ pub async fn update(layout: &Layout, args: UpdateArgs, as_json: bool) -> Result<
     }
     if !args.remove_labels.is_empty() {
         params["remove_labels"] = json!(args.remove_labels);
+    }
+    match (args.reason, args.evidence) {
+        (Some(reason), Some(evidence)) => {
+            params["reason"] = json!({ "reason": reason, "evidence": evidence });
+        }
+        (None, None) => {}
+        _ => bail!("--reason and --evidence must be given together"),
     }
     let result = client.call("ticket.update", params).await?;
     let ticket = &result["ticket"];

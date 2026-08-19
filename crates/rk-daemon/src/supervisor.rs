@@ -4,7 +4,7 @@
 
 use crate::agents::{AgentProgress, AgentRecord, AgentState, Registry};
 use crate::onboarding_sessions::{onboarding_branch, onboarding_worktree, ONBOARDER_ROLE};
-use crate::read_only_roles::{is_read_only_role, DIAGNOSTICIAN_ROLE};
+use crate::read_only_roles::{forces_read_only_harness, DIAGNOSTICIAN_ROLE, GROOMER_ROLE};
 use chrono::{DateTime, Utc};
 use rk_core::config::SupervisorConfig;
 use rk_core::notify::{EscalationNotice, Severity, SinkRegistry};
@@ -144,10 +144,11 @@ fn effective_agent_config(
     default_agent: &AgentProfile,
     params: &SpawnParams,
 ) -> rk_core::Result<EffectiveAgentConfig> {
-    // A read-only role is an assessment boundary: global worker defaults must
-    // never widen it. Explicit harness/model selection remains available, while
-    // the permission mode is forced by role.
-    if is_read_only_role(&params.role) {
+    // A read-only-harness role is an assessment (or, for the groomer, an
+    // evidence-closure) boundary: global worker defaults must never widen it.
+    // Explicit harness/model selection remains available, while the
+    // permission mode is forced by role.
+    if forces_read_only_harness(&params.role) {
         let harness = params
             .harness
             .clone()
@@ -208,13 +209,19 @@ fn validate_permission_mode(harness: &str, permission_mode: &str) -> rk_core::Re
 pub fn validate_role(role: &str) -> rk_core::Result<()> {
     if matches!(
         role,
-        "rat" | "reviewer" | "foreman" | "verifier" | ONBOARDER_ROLE | DIAGNOSTICIAN_ROLE
+        "rat"
+            | "reviewer"
+            | "foreman"
+            | "verifier"
+            | ONBOARDER_ROLE
+            | DIAGNOSTICIAN_ROLE
+            | GROOMER_ROLE
     ) {
         Ok(())
     } else {
         Err(rk_core::Error::other(format!(
             "unknown agent role {role:?}; expected rat, reviewer, foreman, verifier, \
-             onboarder, or diagnostician"
+             onboarder, diagnostician, or groomer"
         )))
     }
 }
@@ -222,7 +229,7 @@ pub fn validate_role(role: &str) -> rk_core::Result<()> {
 /// Read-only roles are assessment-only. Their filesystem boundary is enforced
 /// by the harness rather than by prompt prose, and callers cannot override it.
 fn permission_mode(role: &str, harness: &str) -> rk_core::Result<String> {
-    if !is_read_only_role(role) {
+    if !forces_read_only_harness(role) {
         return Ok(default_permission_mode(harness).into());
     }
     crate::read_only_roles::permission_mode(harness)
@@ -4124,6 +4131,11 @@ impl Supervisor {
             .is_some_and(|record| record.role == "foreman" && record.state.is_live())
     }
 
+    pub fn is_groomer(&self, name: &str) -> bool {
+        self.status(name)
+            .is_some_and(|record| record.role == GROOMER_ROLE && record.state.is_live())
+    }
+
     pub fn is_reporting_boundary(&self, name: &str) -> bool {
         self.status(name)
             .is_some_and(|record| is_reporting_boundary(&record))
@@ -4919,7 +4931,15 @@ mod respawn_tests {
 
     #[test]
     fn roles_and_onboarder_sandbox_are_explicit() {
-        for role in ["rat", "reviewer", "foreman", "verifier", "onboarder"] {
+        for role in [
+            "rat",
+            "reviewer",
+            "foreman",
+            "verifier",
+            "onboarder",
+            "diagnostician",
+            "groomer",
+        ] {
             validate_role(role).unwrap();
         }
         assert!(validate_role("onbaorder").is_err());
@@ -4936,6 +4956,7 @@ mod respawn_tests {
             permission_mode("rat", "codex").unwrap(),
             "danger-full-access"
         );
+        assert_eq!(permission_mode("groomer", "codex").unwrap(), "read-only");
     }
 
     #[test]

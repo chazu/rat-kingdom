@@ -1466,14 +1466,17 @@ impl Daemon {
                     | "agent.interrupt"
                     | "agent.steer"
             );
-        (
-            foreman_allowed,
-            if foreman_allowed {
-                ""
-            } else {
-                "operator_only_method"
-            },
-        )
+        // A groomer gets exactly one grant from this operator-only list: a
+        // ticket.update whose wire shape proves it is a closure carrying
+        // recorded evidence. ticket.dep and every other method here (spawn,
+        // repo.add, workflow.run, ...) stay refused. handle_ticket_update
+        // re-checks the shape and writes the audit event; this is only the
+        // wire-level gate.
+        let groomer_allowed = req.method == "ticket.update"
+            && self.supervisor.is_groomer(&req.caller)
+            && crate::read_only_roles::groomer_can_close_ticket(&req.params);
+        let allowed = foreman_allowed || groomer_allowed;
+        (allowed, if allowed { "" } else { "operator_only_method" })
     }
 
     /// Enforced capability profile for the onboarding role. This is
@@ -4419,8 +4422,65 @@ impl Daemon {
                 return Response::err(req.id, codes::INTERNAL, e.to_string());
             }
         }
+        // The wire-level allowlist (`read_only_roles::method_allowed`) already
+        // proved a groomer's request is exactly {id, status: "closed",
+        // reason: {reason, evidence}} before this handler runs. Re-check the
+        // shape here anyway — belt and suspenders — so a future change to that
+        // allowlist cannot silently widen groomer capability without also
+        // breaking the audit trail this handler is responsible for writing.
+        let groom_audit = if self.supervisor.is_groomer(&req.caller) {
+            let Some(reason) = params.reason.as_ref() else {
+                return Response::err(
+                    req.id,
+                    codes::FORBIDDEN,
+                    "groomer ticket.update requires a reason payload",
+                );
+            };
+            if params.changes.status.as_deref() != Some("closed") {
+                return Response::err(
+                    req.id,
+                    codes::FORBIDDEN,
+                    "groomer ticket.update may only close a ticket",
+                );
+            }
+            let prior_status = match self.tickets.get(&params.id) {
+                Ok(Some(ticket)) => ticket
+                    .payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("open")
+                    .to_string(),
+                Ok(None) => {
+                    return Response::err(
+                        req.id,
+                        codes::INTERNAL,
+                        format!("no such ticket: {}", params.id),
+                    )
+                }
+                Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+            };
+            Some((prior_status, reason.reason.clone(), reason.evidence.clone()))
+        } else {
+            None
+        };
         match self.tickets.update(&params.id, params.changes).await {
-            Ok(ticket) => Response::ok(req.id, json!({"ticket": ticket})),
+            Ok(ticket) => {
+                if let Some((prior_status, reason, evidence)) = groom_audit {
+                    self.emit_event(
+                        &ticket.scope,
+                        "ticket-groomed",
+                        json!({
+                            "ticket": params.id,
+                            "prior_status": prior_status,
+                            "new_status": "closed",
+                            "reason": reason,
+                            "evidence": evidence,
+                            "groomer": req.caller,
+                        }),
+                    );
+                }
+                Response::ok(req.id, json!({"ticket": ticket}))
+            }
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
     }
@@ -6775,6 +6835,16 @@ struct TicketUpdateParams {
     id: String,
     #[serde(flatten)]
     changes: crate::tickets::TicketChanges,
+    /// Evidence for a groomer's closure — see `read_only_roles::method_allowed`.
+    /// Ignored for any other caller.
+    #[serde(default)]
+    reason: Option<GroomReason>,
+}
+
+#[derive(Deserialize)]
+struct GroomReason {
+    reason: String,
+    evidence: String,
 }
 
 fn parse_params<T: serde::de::DeserializeOwned>(params: &Value) -> Result<T, String> {
@@ -7439,12 +7509,19 @@ mod authorize_reasoned_tests {
     }
 
     fn test_daemon_with_role(role: &str) -> (tempfile::TempDir, Daemon) {
+        test_daemon_with_named_role("invalid-rat", role)
+    }
+
+    pub(super) fn test_daemon_with_named_role(
+        name: &str,
+        role: &str,
+    ) -> (tempfile::TempDir, Daemon) {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::at(dir.path());
         layout.ensure().unwrap();
         let now = chrono::Utc::now();
         let record = AgentRecord {
-            name: "invalid-rat".into(),
+            name: name.into(),
             spawn: None,
             role: role.into(),
             coordination: None,
@@ -7569,6 +7646,218 @@ mod authorize_reasoned_tests {
         let (allowed, reason) = daemon.authorize_reasoned(&request, &origin);
         assert!(allowed);
         assert_eq!(reason, "");
+    }
+
+    fn groomer_origin() -> PeerOrigin {
+        let mut supervised = std::collections::HashSet::new();
+        supervised.insert("invalid-rat".to_string());
+        PeerOrigin {
+            pid_observed: true,
+            supervised_agents: supervised,
+        }
+    }
+
+    fn groomer_close_req(auth: &str, params: Value) -> Request {
+        Request {
+            id: "1".into(),
+            method: "ticket.update".into(),
+            auth: auth.into(),
+            caller: "invalid-rat".into(),
+            client_version: None,
+            params,
+        }
+    }
+
+    #[test]
+    fn groomer_evidence_backed_closure_is_allowed_with_no_reason() {
+        let (_dir, daemon) = test_daemon_with_role(crate::read_only_roles::GROOMER_ROLE);
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "invalid-rat");
+        let request = groomer_close_req(
+            &token,
+            json!({"id": "TKT-1", "status": "closed",
+                "reason": {"reason": "stale-rework", "evidence": "TKT-2 done"}}),
+        );
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
+        assert!(allowed);
+        assert_eq!(reason, "");
+    }
+
+    #[test]
+    fn groomer_closure_without_evidence_is_operator_only() {
+        let (_dir, daemon) = test_daemon_with_role(crate::read_only_roles::GROOMER_ROLE);
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "invalid-rat");
+        let request = groomer_close_req(&token, json!({"id": "TKT-1", "status": "closed"}));
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
+        assert!(!allowed);
+        assert_eq!(reason, "operator_only_method");
+    }
+
+    #[test]
+    fn groomer_cannot_reopen_or_mark_done() {
+        let (_dir, daemon) = test_daemon_with_role(crate::read_only_roles::GROOMER_ROLE);
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "invalid-rat");
+        for status in ["open", "done", "in_progress"] {
+            let request = groomer_close_req(
+                &token,
+                json!({"id": "TKT-1", "status": status,
+                    "reason": {"reason": "x", "evidence": "y"}}),
+            );
+            let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
+            assert!(!allowed, "status {status} must be refused");
+            assert_eq!(reason, "operator_only_method");
+        }
+    }
+
+    #[test]
+    fn groomer_cannot_reach_ticket_dep() {
+        let (_dir, daemon) = test_daemon_with_role(crate::read_only_roles::GROOMER_ROLE);
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "invalid-rat");
+        let request = Request {
+            id: "1".into(),
+            method: "ticket.dep".into(),
+            auth: token,
+            caller: "invalid-rat".into(),
+            client_version: None,
+            params: json!({"id": "TKT-1", "dep": "TKT-2"}),
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
+        assert!(!allowed);
+        assert_eq!(reason, "operator_only_method");
+    }
+
+    #[test]
+    fn an_ordinary_rat_cannot_close_a_ticket_even_with_evidence() {
+        let (_dir, daemon) = test_daemon_with_role("rat");
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "invalid-rat");
+        let request = groomer_close_req(
+            &token,
+            json!({"id": "TKT-1", "status": "closed",
+                "reason": {"reason": "stale-rework", "evidence": "TKT-2 done"}}),
+        );
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
+        assert!(!allowed);
+        assert_eq!(reason, "operator_only_method");
+    }
+}
+
+#[cfg(test)]
+mod groomer_ticket_update_tests {
+    //! `handle_ticket_update`'s own shape check and audit event, exercised
+    //! directly (bypassing the wire) the way `authorize_reasoned_tests` above
+    //! exercises the auth gate. Both layers are meant to agree; these tests
+    //! pin the handler's half — closing writes exactly one `ticket-groomed`
+    //! event, and the handler itself refuses a malformed groomer request even
+    //! though the auth gate would already have caught it first.
+    use super::authorize_reasoned_tests::test_daemon_with_named_role;
+    use super::*;
+    use crate::read_only_roles::GROOMER_ROLE;
+    use crate::tickets::NewTicket;
+
+    fn ticket_update_req(caller: &str, params: Value) -> Request {
+        Request {
+            id: "1".into(),
+            method: "ticket.update".into(),
+            auth: String::new(),
+            caller: caller.into(),
+            client_version: None,
+            params,
+        }
+    }
+
+    #[tokio::test]
+    async fn groomer_closure_writes_one_audit_event_and_closes_the_ticket() {
+        let (_dir, daemon) = test_daemon_with_named_role("groomer-1", GROOMER_ROLE);
+        let ticket = daemon
+            .tickets
+            .create(
+                serde_json::from_value::<NewTicket>(json!({"title": "rework: TKT-x"})).unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = ticket.identity.clone();
+
+        let response = daemon
+            .handle_ticket_update(ticket_update_req(
+                "groomer-1",
+                json!({"id": id, "status": "closed",
+                    "reason": {"reason": "stale-rework", "evidence": "TKT-target done at abc123"}}),
+            ))
+            .await;
+        assert!(response.error.is_none(), "{response:?}");
+
+        let updated = daemon.tickets.get(&id).unwrap().unwrap();
+        assert_eq!(updated.payload["status"], "closed");
+
+        let events = daemon
+            .space
+            .scan(&Pattern::category(Category::Event).identity("ticket-groomed"))
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let payload = &events[0].payload;
+        assert_eq!(payload["ticket"], id);
+        assert_eq!(payload["prior_status"], "open");
+        assert_eq!(payload["new_status"], "closed");
+        assert_eq!(payload["reason"], "stale-rework");
+        assert_eq!(payload["evidence"], "TKT-target done at abc123");
+        assert_eq!(payload["groomer"], "groomer-1");
+    }
+
+    #[tokio::test]
+    async fn groomer_request_without_reason_is_refused_by_the_handler_too() {
+        let (_dir, daemon) = test_daemon_with_named_role("groomer-1", GROOMER_ROLE);
+        let ticket = daemon
+            .tickets
+            .create(
+                serde_json::from_value::<NewTicket>(json!({"title": "no evidence"})).unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = ticket.identity.clone();
+
+        let response = daemon
+            .handle_ticket_update(ticket_update_req(
+                "groomer-1",
+                json!({"id": id, "status": "closed"}),
+            ))
+            .await;
+        assert!(response.error.is_some());
+
+        let untouched = daemon.tickets.get(&id).unwrap().unwrap();
+        assert_eq!(untouched.payload["status"], "open");
+        let events = daemon
+            .space
+            .scan(&Pattern::category(Category::Event).identity("ticket-groomed"))
+            .unwrap();
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn non_groomer_closure_writes_no_audit_event() {
+        let (_dir, daemon) = test_daemon_with_named_role("rat-1", "rat");
+        let ticket = daemon
+            .tickets
+            .create(
+                serde_json::from_value::<NewTicket>(json!({"title": "ordinary close"})).unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = ticket.identity.clone();
+
+        let response = daemon
+            .handle_ticket_update(ticket_update_req(
+                "operator",
+                json!({"id": id, "status": "closed"}),
+            ))
+            .await;
+        assert!(response.error.is_none(), "{response:?}");
+        let events = daemon
+            .space
+            .scan(&Pattern::category(Category::Event).identity("ticket-groomed"))
+            .unwrap();
+        assert!(
+            events.is_empty(),
+            "an ordinary/operator closure must not be misattributed as a groomer audit: {events:?}"
+        );
     }
 }
 
