@@ -7,6 +7,7 @@
 //! never do, cost/usage/lineage survives the move, and the whole thing
 //! round-trips back through `agent.unarchive`.
 
+mod fixture;
 mod support;
 
 use rk_core::paths::Layout;
@@ -52,7 +53,16 @@ fn scratch_repo(dir: &Path) {
 ///
 /// Both branches narrate one line of prose, so every rat here leaves a
 /// transcript on disk for `--reap-logs` to have an opinion about.
-const FAKE: &str = r#"
+///
+/// A clean turn that never calls `rk done` now parks the agent as `Paused`
+/// (awaiting resume) rather than `Completed`, so every `wait_for_state(...,
+/// "completed")` below would time out. The `*` branch declares done via
+/// `fixture::with_rk_done` before its result line, exactly as a real primed
+/// rat does; `hang-*` deliberately never does, since it models a rat that is
+/// still running.
+fn fake() -> String {
+    fixture::with_rk_done(
+        r#"
 read -r _prompt
 case "$RK_TASK" in
   hang-*)
@@ -66,10 +76,13 @@ case "$RK_TASK" in
     git -c user.email=rat@x -c user.name=Rat commit -q -m "rat work: $RK_TASK"
     echo '{"type":"system","subtype":"init","session_id":"fake-archive"}'
     echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"gnawed it"}]}}'
+    rk_done "committed gnawed.txt"
     echo '{"type":"result","subtype":"success","is_error":false,"result":"committed gnawed.txt","session_id":"fake-archive","total_cost_usd":0.002,"usage":{"input_tokens":50,"output_tokens":25,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
     ;;
 esac
-"#;
+"#,
+    )
+}
 
 async fn spawn(client: &mut Client, repo: &Path, task: &str, extra: Value) -> String {
     let mut params = json!({
@@ -137,7 +150,7 @@ async fn archive_hides_terminal_records_and_round_trips() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let mut client = start_daemon(&layout).await;
 
@@ -265,7 +278,7 @@ async fn before_threshold_spares_fresh_records() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let mut client = start_daemon(&layout).await;
 
@@ -308,7 +321,7 @@ async fn live_and_orphaned_records_are_never_archived() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let mut client = start_daemon(&layout).await;
 
@@ -352,7 +365,7 @@ async fn reap_git_reclaims_merged_branches_and_refuses_unmerged_ones() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let mut client = start_daemon(&layout).await;
 
@@ -453,7 +466,7 @@ async fn reap_artifacts_reclaims_terminal_worktrees_regardless_of_merge_state() 
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let mut client = start_daemon(&layout).await;
 
@@ -556,7 +569,7 @@ async fn reap_logs_deletes_archived_transcripts_and_spares_retained_ones() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let mut client = start_daemon(&layout).await;
 
