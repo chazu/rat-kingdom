@@ -42,4 +42,12 @@ checks: [...#Check]
 	// Human-readable repository-owned toolchain description captured in
 	// onboarding verification evidence (for example "mise rust@1.95.0").
 	toolchain?: string
+
+	// Whether this check contends for the shared `CARGO_TARGET_DIR`
+	// ([disk] shared_cargo_target) and must be serialized against every other
+	// same-repo check/agent that also sets this. Only a check that actually
+	// builds/tests Rust against the shared cache (like `verify`) should set
+	// this — an unrelated fast check must not pay for contention it never
+	// causes. Defaults false.
+	sharedCargoTarget?: bool
 }

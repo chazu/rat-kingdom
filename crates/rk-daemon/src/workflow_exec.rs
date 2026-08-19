@@ -101,6 +101,13 @@ pub(crate) struct ResolvedRun {
     /// Extra attempts on a non-"pass" verdict. Step-only, like `on_timeout` —
     /// never inherited from a named check.
     pub(crate) retry_on_fail: u32,
+    /// Whether this run contends for the shared `CARGO_TARGET_DIR` and must
+    /// be serialized in [`WorkflowEngine::run_check_in`] against every other
+    /// same-repo run/check that also sets this
+    /// ([`Check::shared_cargo_target`](rk_workflow::Check::shared_cargo_target),
+    /// TKT-01M0CFA1RX36SJ7DV4YWGHQ9BT). Always false for a raw `command` —
+    /// only a repo-registered named check can opt in.
+    pub(crate) shared_cargo_target: bool,
 }
 
 /// What a blown `run` wall-clock bound does to the instance (TKT-169).
@@ -140,6 +147,12 @@ impl OnTimeout {
 /// exit 124 on its own, which is exactly why the result also carries the
 /// unambiguous `timed_out` / `verdict` fields for routing.
 const TIMEOUT_EXIT: i64 = 124;
+
+/// Exit code reported when a check never ran at all because it could not
+/// acquire the shared-target-dir test-execution lock (`TestExecLock`) within
+/// its own declared timeout. Distinct from [`TIMEOUT_EXIT`], which means the
+/// command itself started and was killed — this means it never started.
+const LOCK_TIMEOUT_EXIT: i64 = -2;
 
 /// Pause between a failed attempt and a `retryOnFail` retry. Fixed rather than
 /// configurable: this exists to ride out a transient condition (machine load,
@@ -2896,6 +2909,50 @@ impl WorkflowEngine {
         timeout: Duration,
         previous_result: Option<&Value>,
     ) -> rk_core::Result<Value> {
+        // Serialize this check's entire run (every retry attempt) against
+        // every other same-repo check also opted into `sharedCargoTarget`,
+        // when `[disk] shared_cargo_target` actually has agents sharing one
+        // CARGO_TARGET_DIR per repo (TKT-01M0CFA1RX36SJ7DV4YWGHQ9BT). Held
+        // for the rest of this function's scope — including every early
+        // return below — and dropped on exit, so the next queued check only
+        // ever proceeds once this one is fully done touching the shared dir.
+        // Bounded by this check's own timeout: if the queue is deep enough
+        // that a check cannot even START within its own declared budget,
+        // that is as good as it failing outright — fail closed rather than
+        // let the wait grow unbounded.
+        let _test_exec_guard = if resolved.shared_cargo_target
+            && self.supervisor.shared_cargo_target_enabled()
+        {
+            match tokio::time::timeout(timeout, self.supervisor.acquire_test_exec_lock(repo)).await
+            {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    let stderr = format!(
+                        "run step: `{command}` did not acquire the shared CARGO_TARGET_DIR \
+                         test-execution lock for repo `{repo}` within {timeout:?} — queued \
+                         behind other same-repo checks that also set sharedCargoTarget"
+                    );
+                    self.record_gate_failure(
+                        id,
+                        repo,
+                        agent,
+                        command,
+                        LOCK_TIMEOUT_EXIT,
+                        "fail",
+                        false,
+                        "",
+                        false,
+                        &stderr,
+                        false,
+                        &[],
+                    );
+                    return Err(rk_core::Error::other(stderr));
+                }
+            }
+        } else {
+            None
+        };
+
         // Extra attempts on a non-"pass" verdict, for a check already
         // characterized as flaky for reasons outside the code under test
         // (TKT-01M02AMKD24WZVVMARJPXKYKSW). 0 retries is the historical
@@ -3294,6 +3351,10 @@ impl WorkflowEngine {
                     on_timeout,
                     environment_policy: rk_workflow::CheckEnvironmentPolicy::Inherit,
                     retry_on_fail: run.retry_on_fail,
+                    // A raw command is an unvetted workflow-def string, never
+                    // the repo's own registered check — it never opts into
+                    // the shared target-dir lock.
+                    shared_cargo_target: false,
                 })
             }
             (None, Some(name)) => {
@@ -3318,6 +3379,7 @@ impl WorkflowEngine {
                     on_timeout,
                     environment_policy: check.environment_policy,
                     retry_on_fail: run.retry_on_fail,
+                    shared_cargo_target: check.shared_cargo_target,
                 })
             }
         }
@@ -5430,6 +5492,7 @@ test a::flaky ... FAILED
             on_timeout: OnTimeout::Fail,
             environment_policy: rk_workflow::CheckEnvironmentPolicy::StripRkSpawn,
             retry_on_fail: 0,
+            shared_cargo_target: false,
         };
         let env = vec![("RK_CHECK_MARK".to_string(), "gate".to_string())];
         let timeout = Duration::from_secs(5);
@@ -5495,6 +5558,7 @@ test a::flaky ... FAILED
             on_timeout: OnTimeout::Fail,
             environment_policy: rk_workflow::CheckEnvironmentPolicy::StripRkSpawn,
             retry_on_fail: 0,
+            shared_cargo_target: false,
         };
         let timeout = Duration::from_secs(5);
 
