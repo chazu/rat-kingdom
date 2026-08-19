@@ -2595,9 +2595,43 @@ checks: [
                 let pipeline = Arc::clone(&pipeline);
                 async move { pipeline.run_cycle().await }
             });
-            // Give claim_next time to run and the gate's `sleep 0.4` time to
-            // genuinely be mid-flight, well before it would finish.
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            // Poll for `claim_next`'s own status write rather than sleeping a
+            // fixed guess: `claim_next` durably flips the entry to
+            // `RunningGates` before any gate subprocess runs (landing.rs
+            // `claim_next`), so this only waits on that single space write —
+            // independent of how long the two `true` gates and the `verify`
+            // check's git subprocess spawns take. A fixed sleep here raced
+            // those subprocess spawns under full-workspace `cargo test`
+            // contention: slow enough that `claim_next` (and thus the
+            // `RunningGates` transition) hadn't run yet by the time the fixed
+            // sleep elapsed, failing the assertion below.
+            let mut status = None;
+            for _ in 0..400 {
+                let pending = space
+                    .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                    .unwrap();
+                if let Some(tuple) = pending.first() {
+                    let parsed: LandingEntryStatus =
+                        serde_json::from_value(tuple.payload["status"].clone()).unwrap();
+                    if parsed == LandingEntryStatus::RunningGates {
+                        status = Some(parsed);
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                status,
+                Some(LandingEntryStatus::RunningGates),
+                "claim_next never transitioned the candidate to RunningGates"
+            );
+            // Best-effort only, not load-bearing for the assertions above or
+            // below: a short extra wait so the abort is more likely to land
+            // during the `verify` gate's real `sleep 0.4` rather than right
+            // after `claim_next`, matching this test's documented "genuinely
+            // still running" scenario. Far short of the 400ms floor, so it
+            // never risks the gate sequence completing first.
+            tokio::time::sleep(Duration::from_millis(50)).await;
             handle.abort();
             let _ = handle.await;
 
