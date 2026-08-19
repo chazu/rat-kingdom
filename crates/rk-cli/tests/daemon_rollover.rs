@@ -121,11 +121,19 @@ fn rollover_parks_a_live_rat_and_it_respawns() {
 
     // Roll over: a short wait timeout so it parks the still-sleeping rat
     // instead of waiting the full 60s out. The fresh daemon gets a
-    // fast-completing script so the respawn is observable quickly.
+    // fast-completing script so the respawn is observable quickly. It must
+    // call `rk done` before reporting its turn — a clean turn with no `rk
+    // done` now parks the agent as `Paused` (awaiting resume) rather than
+    // `Completed`, so a script that merely echoes a result and exits would
+    // terminalize as `Failed` instead of the `Completed` this test asserts.
     let rollover_out = rk(home.path())
         .env(
             "RK_FAKE_HARNESS_CMD",
-            r#"echo '{"type":"result","subtype":"success","is_error":false,"result":"resumed after rollover","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'"#,
+            format!(
+                r#"{} done "resumed after rollover" >/dev/null 2>&1 || true
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"resumed after rollover","usage":{{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}'"#,
+                env!("CARGO_BIN_EXE_rk")
+            ),
         )
         .args(["--json", "daemon", "rollover", "--wait-secs", "1"])
         .output()
