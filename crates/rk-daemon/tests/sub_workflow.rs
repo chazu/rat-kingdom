@@ -60,6 +60,10 @@ rk_done "work done"   # a rat that never declares done fails (TKT-175)
 echo '{"type":"result","subtype":"success","is_error":false,"result":"did the work","session_id":"wf-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
+// Tests in this binary run in parallel and all install this same process-global
+// fake. Never remove RK_FAKE_HARNESS_CMD during a test: doing so races sibling
+// workflows that may still need to spawn their rat.
+
 // The child: a plain build-and-merge. Its final step is `dismiss`, so its
 // ctx.previousResult ends as the dismiss outcome ({merged: true, ...}) — that is
 // the value the parent joins on.
@@ -183,8 +187,6 @@ async fn sub_workflow_runs_child_and_joins_its_result() {
         id,
         "child has its own instance id"
     );
-
-    std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
 #[tokio::test]
@@ -225,7 +227,6 @@ async fn nested_sub_workflow_clears_its_link_only_with_the_top_level_cursor() {
             "completed" => {
                 assert_eq!(status["instance"]["current_step"], 1);
                 assert!(status["instance"]["context"]["active_subworkflow"].is_null());
-                std::env::remove_var("RK_FAKE_HARNESS_CMD");
                 return;
             }
             "failed" => panic!("nested parent failed: {}", status["instance"]["error"]),
@@ -300,8 +301,6 @@ async fn sub_workflow_cycle_fails_closed_at_depth_cap() {
         failed,
         "workflow cycle did not fail closed at the depth cap"
     );
-
-    std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
 const PARKED_CHILD: &str = r#"
