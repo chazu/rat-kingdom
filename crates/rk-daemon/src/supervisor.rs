@@ -498,6 +498,17 @@ pub struct Supervisor {
     fleet_budget: FleetBudget,
     /// Agents already warned about budget (avoid repeat warnings).
     budget_warned: Mutex<std::collections::HashSet<String>>,
+    /// Cost/usage rollup the budget machinery had computed for an agent at
+    /// the moment it decided to hard-stop it, keyed by name. A SIGTERM'd
+    /// harness can still flush a terminal `Completed` event of its own after
+    /// the kill — and that self-reported figure can reflect only the partial
+    /// final turn, not everything already spent. Without a floor, that lower
+    /// number silently overwrites the correct one in the terminal record
+    /// (the `budget_exceeded` obstacle keeps the true figure; the archived
+    /// agent record does not) — a control-loop sensor error, since tier
+    /// routing and cost analytics read the terminal record. Consumed (and
+    /// removed) the first time this generation reaches a terminal event.
+    budget_stop_floor: Mutex<HashMap<String, (f64, TokenUsage)>>,
     /// Fleet/repo scopes already warned at dispatch (avoid repeat obstacles).
     fleet_warned: Mutex<std::collections::HashSet<String>>,
     /// Per-agent liveness-sweep bookkeeping (burn-rate deltas + flag episodes).
@@ -757,6 +768,7 @@ impl Supervisor {
             budget,
             fleet_budget,
             budget_warned: Mutex::new(std::collections::HashSet::new()),
+            budget_stop_floor: Mutex::new(HashMap::new()),
             fleet_warned: Mutex::new(std::collections::HashSet::new()),
             sweep_state: Mutex::new(HashMap::new()),
             respawn_state: Mutex::new(HashMap::new()),
@@ -1633,6 +1645,7 @@ impl Supervisor {
                     if let Some(cost) = cost_usd {
                         r.cost_usd = cost;
                     }
+                    self.apply_budget_stop_floor(&r.name, &mut r.cost_usd, &mut r.usage);
                     if session_id.is_some() {
                         r.session_id = session_id.clone();
                     }
@@ -1692,6 +1705,11 @@ impl Supervisor {
                             None => base,
                         });
                     }
+                    // Consumes the floor even when a `Completed` event already
+                    // did (a harmless no-op then), so a budget-killed agent
+                    // that never reports a `Completed` at all still lands its
+                    // true cost/usage on the terminal record.
+                    self.apply_budget_stop_floor(&r.name, &mut r.cost_usd, &mut r.usage);
                 });
                 // The process is gone, so no further turn can follow: a turn
                 // result held back for want of a `rk done` is now provably this
@@ -1807,6 +1825,7 @@ impl Supervisor {
             BudgetAction::Stop => {
                 warn!(agent = %record.name, cost = record.cost_usd, tokens = record.usage.total(), "budget cap hit — stopping agent");
                 self.emit_obstacle_for_budget(record, "exceeded");
+                self.note_budget_stop_floor(record);
                 let control = self.lock_controls().remove(&record.name);
                 if let Some(control) = control {
                     tokio::spawn(async move {
@@ -1822,6 +1841,41 @@ impl Supervisor {
         match self.budget_warned.lock() {
             Ok(mut set) => set.insert(name.to_string()),
             Err(p) => p.into_inner().insert(name.to_string()),
+        }
+    }
+
+    /// Snapshot the cost/usage rollup that just justified a budget hard-stop,
+    /// so a terminal event arriving after the kill can't report a lower
+    /// figure than what actually triggered it.
+    fn note_budget_stop_floor(&self, record: &AgentRecord) {
+        let floor = (record.cost_usd, record.usage);
+        match self.budget_stop_floor.lock() {
+            Ok(mut map) => map.insert(record.name.clone(), floor),
+            Err(p) => p.into_inner().insert(record.name.clone(), floor),
+        };
+    }
+
+    /// Consume (remove) the budget-stop floor for `name`, if one was set.
+    fn take_budget_stop_floor(&self, name: &str) -> Option<(f64, TokenUsage)> {
+        match self.budget_stop_floor.lock() {
+            Ok(mut map) => map.remove(name),
+            Err(p) => p.into_inner().remove(name),
+        }
+    }
+
+    /// Raise `cost_usd`/`usage` to at least the budget-stop floor for `name`,
+    /// if this generation was ever hard-stopped by the budget machinery.
+    /// Applied at every terminal transition so whichever event reaches the
+    /// record last — a harness `Completed` or a bare process `Exited` — can
+    /// only ever push the recorded spend up to the true figure, never down.
+    fn apply_budget_stop_floor(&self, name: &str, cost_usd: &mut f64, usage: &mut TokenUsage) {
+        if let Some((floor_cost, floor_usage)) = self.take_budget_stop_floor(name) {
+            if floor_cost > *cost_usd {
+                *cost_usd = floor_cost;
+            }
+            if floor_usage.total() > usage.total() {
+                *usage = floor_usage;
+            }
         }
     }
 
