@@ -1256,8 +1256,17 @@ impl Supervisor {
         // are durable and outlive the rat they name, so an unbounded name
         // search matches a predecessor's completion.
         let since = record.created_at;
+        // Generation-identity migration (C1/S3a, docs/2026-08-17-tkt-c1-
+        // generation-identity.md): key on the minted `SpawnId` when this
+        // generation has one — an equality predicate no namesake can satisfy —
+        // falling back to the name+floor test for a record written before the
+        // migration.
+        let spawn = record.spawn;
         tokio::spawn(async move {
-            let pattern = Pattern::for_agent_since(Category::Event, "task_done", &agent, since);
+            let pattern = match spawn {
+                Some(spawn) => Pattern::for_spawn(Category::Event, "task_done", spawn),
+                None => Pattern::for_agent_since(Category::Event, "task_done", &agent, since),
+            };
             match space
                 .rd(&pattern, std::time::Duration::from_secs(24 * 3600))
                 .await
@@ -1632,6 +1641,7 @@ impl Supervisor {
                     let claim = self.claim_completion(
                         name,
                         generation,
+                        record.spawn,
                         is_error,
                         uses_harness_terminal_completion(&record.role, &record.harness),
                     );
@@ -2693,6 +2703,7 @@ impl Supervisor {
         &self,
         name: &str,
         generation: DateTime<Utc>,
+        spawn: Option<rk_core::id::SpawnId>,
         is_error: bool,
         harness_terminal: bool,
     ) -> TurnClaim {
@@ -2703,7 +2714,7 @@ impl Supervisor {
         // Jcode onboarding runs one headless request with no Bash tool. Its
         // native `done` event is therefore the only safe positive completion
         // signal and, unlike an interactive turn boundary, ends the process.
-        let declared_done = harness_terminal || self.declared_done(name, generation);
+        let declared_done = harness_terminal || self.declared_done(name, generation, spawn);
         let terminal = is_error || declared_done;
         let mut completions = self.lock_completions();
         let state = completions
@@ -2748,11 +2759,27 @@ impl Supervisor {
     /// it, so an unbounded name search here would read a predecessor's `rk done`
     /// as this rat's (TKT-146/TKT-159).
     ///
+    /// Generation-identity migration (C1, docs/2026-08-17-tkt-c1-generation-
+    /// identity.md): `rk done` now stamps `spawn` into the `task_done` payload
+    /// (C2/C6) whenever this generation was minted one, so a record carrying a
+    /// real `SpawnId` keys the read on [`Pattern::for_spawn`] — an equality
+    /// predicate no namesake can satisfy, no floor required. Falls back to the
+    /// name+floor predicate for a record with no minted id (unreachable, or
+    /// written before this migration).
+    ///
     /// Fails OPEN — an unreadable space means "publish", which is the behaviour
     /// that predates this gate. Withholding on a storage error would strand
     /// every workflow waiting on the agent until its step timeout.
-    fn declared_done(&self, name: &str, generation: DateTime<Utc>) -> bool {
-        let pattern = Pattern::for_agent_since(Category::Event, "task_done", name, generation);
+    fn declared_done(
+        &self,
+        name: &str,
+        generation: DateTime<Utc>,
+        spawn: Option<rk_core::id::SpawnId>,
+    ) -> bool {
+        let pattern = match spawn {
+            Some(spawn) => Pattern::for_spawn(Category::Event, "task_done", spawn),
+            None => Pattern::for_agent_since(Category::Event, "task_done", name, generation),
+        };
         match self.space.scan(&pattern) {
             Ok(tuples) => !tuples.is_empty(),
             Err(e) => {
@@ -4389,6 +4416,15 @@ impl Supervisor {
         let mut env = HashMap::new();
         env.insert("RK_HOME".into(), self.layout.home().display().to_string());
         env.insert("RK_AGENT".into(), name.to_string());
+        // Generation-identity migration (C6, docs/2026-08-17-tkt-c1-generation-identity.md):
+        // RK_AGENT stays the display label a rat and every `rk` sugar command
+        // read; RK_SPAWN is the join key `rk done`/`rk out` stamp into their
+        // payloads so a reader can key on `Pattern::for_spawn` instead of a
+        // name+floor test. Absent only if the registry row vanished between
+        // insert and here, which never happens on the live spawn path.
+        if let Some(spawn) = self.status(name).and_then(|r| r.spawn) {
+            env.insert("RK_SPAWN".into(), spawn.to_string());
+        }
         if let Ok(token) = self.layout.agent_auth_token(name) {
             env.insert("RK_AUTH_TOKEN".into(), token);
         }
@@ -4968,16 +5004,16 @@ mod respawn_tests {
         let dir = tempfile::tempdir().unwrap();
         let supervisor = supervisor(dir.path());
         let generation = Utc::now();
-        let claim = supervisor.claim_completion("Jade", generation, false, true);
+        let claim = supervisor.claim_completion("Jade", generation, None, false, true);
         assert!(claim.publish);
         assert!(claim.declared_done);
         assert!(
             !supervisor
-                .claim_completion("Jade", generation, false, true)
+                .claim_completion("Jade", generation, None, false, true)
                 .publish
         );
 
-        let ordinary = supervisor.claim_completion("Whisker", generation, false, false);
+        let ordinary = supervisor.claim_completion("Whisker", generation, None, false, false);
         assert!(!ordinary.publish);
         assert!(!ordinary.declared_done);
     }
@@ -5129,6 +5165,58 @@ mod respawn_tests {
         assert!(
             outcome.is_ok(),
             "the expected generation must not be refused: {outcome:?}"
+        );
+    }
+
+    /// C1 (docs/2026-08-17-tkt-c1-generation-identity.md): `declared_done`
+    /// keys on the minted `SpawnId` once one exists, so a namesake
+    /// predecessor's `task_done` — durable, and unbounded by name alone —
+    /// cannot satisfy the current generation's completion gate. Companion to
+    /// `dismiss_checked_refuses_a_namesake_that_is_not_the_expected_generation`,
+    /// same defect class (TKT-146), the producer side of the read instead of
+    /// the fan-out side.
+    #[test]
+    fn declared_done_keys_on_spawn_and_rejects_a_namesake_predecessors_tuple() {
+        let home = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let generation = Utc::now();
+
+        let predecessor_spawn = rk_core::id::SpawnId::new();
+        let mine_spawn = rk_core::id::SpawnId::new();
+
+        sup.space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "task_done",
+                "castle",
+                json!({"agent": "Nibble", "spawn": predecessor_spawn.to_string()}),
+            ))
+            .unwrap();
+        assert!(
+            !sup.declared_done("Nibble", generation, Some(mine_spawn)),
+            "a namesake predecessor's task_done must not satisfy this generation's gate"
+        );
+
+        sup.space
+            .out(Tuple::new(
+                Category::Event,
+                "repo",
+                "task_done",
+                "castle",
+                json!({"agent": "Nibble", "spawn": mine_spawn.to_string()}),
+            ))
+            .unwrap();
+        assert!(
+            sup.declared_done("Nibble", generation, Some(mine_spawn)),
+            "this generation's own task_done must satisfy the gate"
+        );
+
+        // No minted id (pre-migration record): falls back to the name+floor
+        // predicate, unaffected by either spawn-keyed tuple above.
+        assert!(
+            sup.declared_done("Nibble", generation, None),
+            "the name+floor fallback must still see a task_done written after the floor"
         );
     }
 

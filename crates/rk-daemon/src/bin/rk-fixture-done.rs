@@ -47,6 +47,12 @@ async fn main() {
                     // The field `Pattern::for_agent_since` searches for.
                     // Everything else here is dressing.
                     "agent": env("RK_AGENT"),
+                    // `Pattern::for_spawn`'s join key (C1/S3a, docs/2026-08-17-
+                    // tkt-c1-generation-identity.md). Optional: only set once
+                    // the daemon mints RK_SPAWN (C6), so a fixture run against
+                    // an unmigrated daemon still falls back to the name+floor
+                    // predicate above instead of writing a null field.
+                    "spawn": std::env::var("RK_SPAWN").ok(),
                     "branch": std::env::var("RK_BRANCH").ok(),
                     "summary": std::env::args().nth(1).unwrap_or_else(|| "done".into()),
                 },
