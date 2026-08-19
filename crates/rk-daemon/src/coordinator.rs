@@ -276,6 +276,12 @@ pub struct DescendantRollup {
     pub total: usize,
     pub spawning: usize,
     pub running: usize,
+    /// Live, but parked at a turn boundary without an `rk done` — counted
+    /// separately from `running` so a coordinator can see the difference
+    /// between work in flight and work awaiting a resume, and separately from
+    /// `completed` so a pause is never read as a finish.
+    #[serde(default)]
+    pub paused: usize,
     pub completed: usize,
     pub failed: usize,
     pub orphaned: usize,
@@ -481,6 +487,7 @@ fn middle_rat_summary(
         match descendant.state {
             AgentState::Spawning => rollup.spawning += 1,
             AgentState::Running => rollup.running += 1,
+            AgentState::Paused => rollup.paused += 1,
             AgentState::Completed => rollup.completed += 1,
             AgentState::Failed => rollup.failed += 1,
             AgentState::Orphaned => rollup.orphaned += 1,

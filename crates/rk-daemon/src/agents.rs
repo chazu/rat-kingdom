@@ -15,6 +15,28 @@ use std::path::{Path, PathBuf};
 pub enum AgentState {
     Spawning,
     Running,
+    /// The harness returned control at a turn boundary *without* the agent
+    /// declaring completion (`rk done`), and its process is still alive — so
+    /// another turn can still follow (a steer, or the harness resuming itself).
+    ///
+    /// This is the "awaiting resume" state, and it is deliberately neither
+    /// [`Completed`](AgentState::Completed) nor [`Failed`](AgentState::Failed).
+    /// Before it existed, a rat that paused mid-task (waiting on a slow
+    /// background check) was recorded `Completed`: drain freed its slot, the
+    /// orphaned-ticket sweep saw no live owner and reclaimed its ticket, a
+    /// duplicate rat was dispatched onto the same work, and — for a reviewer —
+    /// the reaper that tore the "finished" agent down turned its withheld
+    /// mid-flight turn into a published `is_error: true`, hard-failing a review
+    /// that was proceeding correctly (probe O6/O8).
+    ///
+    /// A paused agent counts as LIVE ([`is_live`](AgentState::is_live)), which
+    /// is the single predicate drain WIP accounting, the ticket-reopen sweep,
+    /// and the workflow `wait` liveness gate all key on. It leaves this state
+    /// on the next harness event (back to `Running`), at its `rk done`
+    /// (`Completed`), or when the process goes away (`Failed`, via the `Exited`
+    /// handler) — so a genuinely dead agent still terminalizes promptly, and
+    /// only a *live* process holds a slot.
+    Paused,
     Completed,
     Failed,
     Dismissed,
@@ -24,14 +46,27 @@ pub enum AgentState {
 }
 
 impl AgentState {
+    /// Whether this agent still holds a slot: a process exists and more work
+    /// can still come out of it.
+    ///
+    /// [`Paused`](AgentState::Paused) is live for the same reason `Running` is
+    /// — its process is alive and its turn may resume. Every consumer of this
+    /// predicate (drain WIP, the orphaned-ticket reopen sweep, the workflow
+    /// `wait` gate, the burn/stuck sweep, cost rollups) wants that reading:
+    /// a paused rat must not free a slot, lose its ticket to a duplicate, or
+    /// have a result attributed to it that it never published.
     pub fn is_live(self) -> bool {
-        matches!(self, AgentState::Spawning | AgentState::Running)
+        matches!(
+            self,
+            AgentState::Spawning | AgentState::Running | AgentState::Paused
+        )
     }
 
     /// Whether a record in this state may be archived out of the default views.
     ///
-    /// Only the three *settled* terminal states qualify. `Spawning`/`Running`
-    /// are live work, and `Orphaned` is deliberately excluded even though it is
+    /// Only the three *settled* terminal states qualify.
+    /// `Spawning`/`Running`/`Paused` are live work, and `Orphaned` is
+    /// deliberately excluded even though it is
     /// terminal-ish: its worktree/branch/session are preserved precisely so
     /// `rk respawn` (and the respawn sweep) can pick it back up.
     pub fn is_archivable(self) -> bool {
