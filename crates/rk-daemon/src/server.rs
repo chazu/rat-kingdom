@@ -8482,7 +8482,11 @@ mod ticket_reopen_sweep_tests {
 
             assert_eq!(reopened, 0, "status={status}");
             let ticket = daemon.tickets.get(&id).unwrap().unwrap();
-            assert_eq!(ticket.payload["status"], json!("in_progress"), "status={status}");
+            assert_eq!(
+                ticket.payload["status"],
+                json!("in_progress"),
+                "status={status}"
+            );
         }
     }
 
@@ -8511,4 +8515,3 @@ mod ticket_reopen_sweep_tests {
         assert_eq!(ticket.payload["status"], json!("open"));
     }
 }
-
