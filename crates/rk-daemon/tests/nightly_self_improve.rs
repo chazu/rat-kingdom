@@ -9,12 +9,15 @@
 
 mod fixture;
 
+mod support;
+
 use rk_core::paths::Layout;
-use rk_daemon::{Client, Daemon};
+use rk_daemon::Daemon;
 use serde_json::json;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+use support::connect;
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -29,16 +32,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).to_string()
-}
-
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(c) = Client::connect_as_operator(layout).await {
-            return c;
-        }
-    }
-    panic!("daemon did not come up");
 }
 
 // Every spawned rat — groom, each drain rat, and refine — writes a distinct

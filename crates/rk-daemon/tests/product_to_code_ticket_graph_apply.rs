@@ -1,7 +1,10 @@
+mod support;
+
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::{json, Value};
-use std::{path::Path, process::Command, time::Duration};
+use std::{path::Path, process::Command};
+use support::connect;
 
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -30,16 +33,6 @@ fn repository() -> tempfile::TempDir {
     git(dir.path(), &["add", "."]);
     git(dir.path(), &["commit", "-m", "initial"]);
     dir
-}
-
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..100 {
-        if let Ok(client) = Client::connect_as_operator(layout).await {
-            return client;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("daemon did not start");
 }
 
 async fn setup() -> (

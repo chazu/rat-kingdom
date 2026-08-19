@@ -22,10 +22,13 @@
 //! `scripts/convention-quorum-demo.sh`, which needs no compile-time dependency
 //! on the injection code.
 
+mod support;
+
 use rk_core::paths::Layout;
-use rk_daemon::{Client, Daemon};
+use rk_daemon::Daemon;
 use serde_json::{json, Value};
 use std::time::Duration;
+use support::connect;
 
 /// The wire payload `rk suggest '<text>'` writes: a system-scope `Suggestion`
 /// authored by `agent` (so distinct-endorser counting keys off `instance`),
@@ -53,16 +56,6 @@ fn endorse(sug_id: &str, agent: &str) -> Value {
         "instance": agent,
         "payload": {"suggestion": sug_id, "agent": agent},
     })
-}
-
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(c) = Client::connect_as_operator(layout).await {
-            return c;
-        }
-    }
-    panic!("daemon did not come up");
 }
 
 /// The full loop over the wire: three distinct agents propose-and-endorse one

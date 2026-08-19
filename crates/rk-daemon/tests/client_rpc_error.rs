@@ -1,17 +1,9 @@
-use rk_core::paths::Layout;
-use rk_daemon::{Client, ClientRpcError, Daemon};
-use serde_json::{json, Value};
-use std::time::Duration;
+mod support;
 
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(c) = Client::connect_as_operator(layout).await {
-            return c;
-        }
-    }
-    panic!("daemon did not come up");
-}
+use rk_core::paths::Layout;
+use rk_daemon::{ClientRpcError, Daemon};
+use serde_json::{json, Value};
+use support::connect;
 
 #[tokio::test]
 async fn test_client_raw_and_typed_preserve_rpc_error_code() {

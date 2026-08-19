@@ -8,12 +8,15 @@
 
 mod fixture;
 
+mod support;
+
 use rk_core::paths::Layout;
-use rk_daemon::{Client, Daemon};
+use rk_daemon::Daemon;
 use serde_json::json;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+use support::connect;
 
 static HARNESS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -40,16 +43,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).to_string()
-}
-
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(client) = Client::connect_as_operator(layout).await {
-            return client;
-        }
-    }
-    panic!("daemon did not come up");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

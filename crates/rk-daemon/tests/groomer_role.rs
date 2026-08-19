@@ -6,6 +6,8 @@
 //! coverage of the shape check itself; this is the thing that actually
 //! matters: the daemon enforces it for a real caller, not just the function.
 
+mod support;
+
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use rk_ledger::Budget;
@@ -13,7 +15,7 @@ use rk_space::Space;
 use serde_json::json;
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use support::connect;
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -27,16 +29,6 @@ fn git(dir: &Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-}
-
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(c) = Client::connect_as_operator(layout).await {
-            return c;
-        }
-    }
-    panic!("daemon did not come up");
 }
 
 /// Idles so the record stays live while the test drives its identity.
@@ -84,7 +76,10 @@ async fn groomer_keeps_the_ordinary_surface_but_only_closes_tickets_with_evidenc
         .unwrap();
 
     let rework = operator
-        .call("ticket.new", json!({"title": format!("rework: {target_id}")}))
+        .call(
+            "ticket.new",
+            json!({"title": format!("rework: {target_id}")}),
+        )
         .await
         .unwrap();
     let rework_id = rework["ticket"]["identity"].as_str().unwrap().to_string();
@@ -126,10 +121,7 @@ async fn groomer_keeps_the_ordinary_surface_but_only_closes_tickets_with_evidenc
         .await
         .expect("a groomer must be able to read a single ticket");
     groomer
-        .call(
-            "ticket.new",
-            json!({"title": "follow-up filed by groomer"}),
-        )
+        .call("ticket.new", json!({"title": "follow-up filed by groomer"}))
         .await
         .expect("a groomer must retain the ordinary ticket.new grant");
     groomer
@@ -148,14 +140,8 @@ async fn groomer_keeps_the_ordinary_surface_but_only_closes_tickets_with_evidenc
         ("workflow.run", json!({"name": "steward"})),
         ("repo.add", json!({"path": "/tmp"})),
         ("ticket.dep", json!({"id": rework_id, "dep": target_id})),
-        (
-            "ticket.update",
-            json!({"id": rework_id, "status": "done"}),
-        ),
-        (
-            "ticket.update",
-            json!({"id": rework_id, "status": "open"}),
-        ),
+        ("ticket.update", json!({"id": rework_id, "status": "done"})),
+        ("ticket.update", json!({"id": rework_id, "status": "open"})),
         (
             "ticket.update",
             json!({"id": rework_id, "title": "sneak in a title change"}),

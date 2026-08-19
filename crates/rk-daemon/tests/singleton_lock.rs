@@ -9,19 +9,11 @@
 //! This file proves the end-to-end wiring instead: `Daemon::run()` itself
 //! refuses when another daemon already holds the lock for the same home.
 
-use rk_core::paths::Layout;
-use rk_daemon::{Client, Daemon};
-use std::time::Duration;
+mod support;
 
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..200 {
-        if let Ok(c) = Client::connect_as_operator(layout).await {
-            return c;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("daemon never came up");
-}
+use rk_core::paths::Layout;
+use rk_daemon::Daemon;
+use support::connect;
 
 #[tokio::test]
 async fn second_daemon_against_the_same_home_is_refused() {

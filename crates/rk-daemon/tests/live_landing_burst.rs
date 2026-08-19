@@ -28,12 +28,15 @@
 
 mod fixture;
 
+mod support;
+
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::json;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+use support::connect;
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -57,16 +60,6 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
-}
-
-async fn connect(layout: &Layout) -> Client {
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(client) = Client::connect_as_operator(layout).await {
-            return client;
-        }
-    }
-    panic!("daemon did not come up");
 }
 
 /// Every burst candidate touches its own `docs/note-<task>.md` (doc-only —
