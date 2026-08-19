@@ -336,3 +336,107 @@ async fn ticket_dispatched_rat_with_content_free_branch_does_not_close_its_ticke
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
+
+/// TKT-01M0CTC4DYBRX6P5X2NPEZF0EZ (probes O8/O17): the dismiss-time closer
+/// must consult landing-queue membership by task, the same way the reopen
+/// sweep does (`Server::ticket_reopen_sweep_at`) — a ticket whose branch is
+/// still `queued`/`running_gates`/`awaiting_review` in the daemon-native
+/// landing pipeline must not be closed out from under it just because some
+/// dismiss for that same task merges cleanly (a duplicate dispatched onto
+/// the ticket, or the pipeline's own delivery racing this dismiss).
+#[tokio::test]
+async fn ticket_with_a_queued_landing_entry_is_not_closed_on_dismiss() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let ticket = client
+        .call(
+            "ticket.new",
+            json!({"title": "still queued elsewhere", "scope": "svc"}),
+        )
+        .await
+        .unwrap();
+    let id = ticket["ticket"]["identity"].as_str().unwrap().to_string();
+
+    let spawned = client
+        .call(
+            "agent.spawn",
+            json!({
+                "repo": repo_dir.path().to_string_lossy(),
+                "task": id,
+                "harness": "fake",
+            }),
+        )
+        .await
+        .unwrap();
+    let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if client
+            .call("agent.status", json!({"name": name}))
+            .await
+            .unwrap()["agent"]["state"]
+            == "completed"
+        {
+            break;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Simulate the ticket's real branch still sitting mid-pipeline at the
+    // moment this dismiss runs.
+    let repo_scope = repo_dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    client
+        .call(
+            "space.out",
+            json!({
+                "category": "event",
+                "scope": repo_scope,
+                "identity": "landing_queue_entry",
+                "lifecycle": "furniture",
+                "payload": {
+                    "repo_name": repo_scope,
+                    "repo_path": repo_dir.path().to_string_lossy(),
+                    "branch": "rat/some-other-rat/task",
+                    "target": "main",
+                    "head_sha": "deadbeef",
+                    "diff_class": "trivial",
+                    "task": id,
+                    "seq": 1,
+                    "status": "running_gates",
+                    "rev": 0,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Dismiss merges this rat's own branch cleanly, but the ticket's real
+    // work is still mid-pipeline — it must not close.
+    let dismissed = client
+        .call("agent.dismiss", json!({"name": name}))
+        .await
+        .unwrap();
+    assert_eq!(dismissed["merged"], true, "detail: {}", dismissed["detail"]);
+    let t = client.call("ticket.get", json!({"id": id})).await.unwrap();
+    assert_eq!(
+        t["ticket"]["payload"]["status"], "open",
+        "a ticket whose branch is still queued for landing must not close on an unrelated dismiss: {t}"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}

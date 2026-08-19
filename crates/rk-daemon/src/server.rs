@@ -8431,4 +8431,77 @@ mod ticket_reopen_sweep_tests {
         let ticket = daemon.tickets.get(&id).unwrap().unwrap();
         assert_eq!(ticket.payload["status"], json!("open"));
     }
+
+    fn landing_queue_entry_tuple(task: &str, status: &str) -> Tuple {
+        Tuple::new(
+            Category::Event,
+            "some-repo".to_string(),
+            "landing_queue_entry".to_string(),
+            "daemon".to_string(),
+            json!({
+                "repo_name": "some-repo",
+                "repo_path": "/tmp/some-repo",
+                "branch": "rat/queued-owner/tkt",
+                "target": "main",
+                "head_sha": "abc1234",
+                "diff_class": "trivial",
+                "task": task,
+                "seq": 1,
+                "status": status,
+                "rev": 0,
+            }),
+        )
+        .with_lifecycle(Lifecycle::Furniture)
+    }
+
+    /// Probes O8/O17 (TKT-01M0CTC4DYBRX6P5X2NPEZF0EZ): a ticket whose rat
+    /// went non-live (paused, killed, orphaned) while its branch is still
+    /// sitting in the daemon-native landing pipeline — `Queued`,
+    /// `RunningGates`, or `AwaitingReview` — must not be reopened just
+    /// because the stale window elapsed. Unlike `landing_processed`, this
+    /// marker's mere PRESENCE (not any particular `status` value) is what
+    /// matters: the entry only disappears on a terminal outcome.
+    #[tokio::test]
+    async fn a_ticket_whose_branch_is_queued_for_landing_is_not_reopened() {
+        for status in ["queued", "running_gates", "awaiting_review"] {
+            let (_dir, daemon) = daemon_with_agent("Queued-Owner", AgentState::Completed);
+            let id = in_progress_ticket(&daemon, Some("Queued-Owner")).await;
+            daemon
+                .space
+                .out(landing_queue_entry_tuple(&id, status))
+                .unwrap();
+
+            let far_future = chrono::Utc::now() + chrono::Duration::hours(2);
+            let reopened = daemon.ticket_reopen_sweep_at(far_future).await;
+
+            assert_eq!(reopened, 0, "status={status}");
+            let ticket = daemon.tickets.get(&id).unwrap().unwrap();
+            assert_eq!(ticket.payload["status"], json!("in_progress"), "status={status}");
+        }
+    }
+
+    /// A `landing_queue_entry` for a DIFFERENT task must not immunize this
+    /// ticket — only its own branch's queue membership matters. This is also
+    /// the "truly orphaned ticket still reopens" half of the acceptance
+    /// criteria: presence of unrelated landing-pipeline traffic must not
+    /// mask genuine abandonment.
+    #[tokio::test]
+    async fn a_ticket_with_an_unrelated_queue_entry_still_reopens() {
+        let (_dir, daemon) = daemon_with_agent("Orphan-1", AgentState::Failed);
+        let id = in_progress_ticket(&daemon, Some("Orphan-1")).await;
+        daemon
+            .space
+            .out(landing_queue_entry_tuple(
+                "some-other-ticket-entirely",
+                "queued",
+            ))
+            .unwrap();
+
+        let past_window = chrono::Utc::now() + chrono::Duration::minutes(20);
+        let reopened = daemon.ticket_reopen_sweep_at(past_window).await;
+
+        assert_eq!(reopened, 1);
+        let ticket = daemon.tickets.get(&id).unwrap().unwrap();
+        assert_eq!(ticket.payload["status"], json!("open"));
+    }
 }
