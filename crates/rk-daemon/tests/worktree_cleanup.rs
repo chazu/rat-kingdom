@@ -521,6 +521,121 @@ async fn periodic_sweep_reaps_terminal_artifacts_regardless_of_merge_state() {
     );
 }
 
+/// Rework of TKT-01M0BH4ZW5DDF8F6J3TTBCFH70 item 1: artifact reap must not
+/// wait on `after_days`. The test above pins the mechanism with
+/// `after_days: 0`, which can't distinguish "reaped immediately" from
+/// "reaped once the (already-elapsed) cutoff passed" — it would pass even if
+/// artifact reap were still wired through the age-gated `archive_agents`
+/// path. This one runs the SHIPPED DEFAULT `WorktreeSweepConfig` (whose
+/// `after_days` is 3) and proves a `target/` dir is gone well within one
+/// sweep interval regardless — the exact default-config gap the reviewer
+/// flagged: a newly terminal agent's build artifacts must not stand for
+/// `after_days` before the first sweep even looks at them.
+#[tokio::test]
+async fn periodic_sweep_reaps_artifacts_immediately_under_default_after_days() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    let layout = Layout::at(home.path());
+    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
+        enabled: true,
+        interval_secs: 1,
+        finalize_cleanup_enabled: false,
+        // Deliberately NOT overridden: this is the shipped default (3 days),
+        // which must not gate the artifact reap below.
+        ..rk_core::config::WorktreeSweepConfig::default()
+    });
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let name = spawn(&mut client, repo_dir.path(), "sweep-artifacts-default-1", json!({})).await;
+    wait_for_state(&mut client, &name, "completed").await;
+
+    let agents = list(&mut client, json!({})).await;
+    let rec = agents.iter().find(|a| a["name"] == name).unwrap();
+    let worktree = PathBuf::from(rec["worktree"].as_str().unwrap());
+
+    std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
+    std::fs::write(worktree.join("target/debug/build-marker"), b"binary").unwrap();
+
+    let mut reaped = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if !worktree.join("target").exists() {
+            reaped = true;
+            break;
+        }
+    }
+    assert!(
+        reaped,
+        "periodic sweep never reaped {worktree:?}/target under the default (after_days: 3) config \
+         within the interval — artifact reap must not be gated by the archiving cutoff"
+    );
+    assert!(
+        worktree.exists(),
+        "artifact reap must never remove the worktree itself"
+    );
+}
+
+/// Rework of TKT-01M0BH4ZW5DDF8F6J3TTBCFH70 item 2: an `artifact_paths` entry
+/// that resolves to the worktree root itself (`.`) must be rejected the same
+/// way an absolute path or a `..` segment already is — `reap_artifacts`'s
+/// path-safety check previously only caught empty/absolute/`..` paths, so a
+/// misconfigured `.` would `remove_dir_all` the ENTIRE worktree (source,
+/// git state, everything), not just a regenerable build directory.
+#[tokio::test]
+async fn periodic_sweep_rejects_artifact_path_that_resolves_to_worktree_root() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", FAKE);
+    let layout = Layout::at(home.path());
+    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
+        enabled: true,
+        interval_secs: 1,
+        after_days: 0,
+        finalize_cleanup_enabled: false,
+        artifact_paths: vec![".".to_string()],
+        ..rk_core::config::WorktreeSweepConfig::default()
+    });
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let name = spawn(&mut client, repo_dir.path(), "sweep-artifacts-root-1", json!({})).await;
+    wait_for_state(&mut client, &name, "completed").await;
+
+    let agents = list(&mut client, json!({})).await;
+    let rec = agents.iter().find(|a| a["name"] == name).unwrap();
+    let worktree = PathBuf::from(rec["worktree"].as_str().unwrap());
+    assert!(worktree.exists());
+    assert!(
+        worktree.join("gnawed.txt").exists(),
+        "fake harness should have committed a source file"
+    );
+
+    // Give the periodic sweep several ticks to (wrongly) act on the unsafe
+    // path before asserting nothing was touched.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    assert!(
+        worktree.exists(),
+        "an artifact_paths entry resolving to the worktree root must never delete the worktree"
+    );
+    assert!(
+        worktree.join("gnawed.txt").exists(),
+        "an artifact_paths entry resolving to the worktree root must never touch source/git state: {worktree:?}"
+    );
+    assert!(
+        worktree.join(".git").exists(),
+        "worktree git state must be untouched by a rejected artifact path"
+    );
+}
+
 /// TKT item 3 (DISK PRESSURE GUARD): a spawn is refused before it creates a
 /// new worktree once free disk is below the configured floor, and the
 /// refusal surfaces as an inbox obstacle rather than running the disk to zero

@@ -480,6 +480,20 @@ impl Registry {
         eligible
     }
 
+    /// Every still-live (not yet archived) record in a settled terminal state
+    /// (Completed/Failed/Dismissed), with no age cutoff — the artifact-reap
+    /// counterpart to [`archivable`](Self::archivable). `archivable` gates on
+    /// `updated_at < before` because it decides eligibility for the archive
+    /// move itself; a build-artifact reclaim has no such question to ask —
+    /// a `target/` dir is exactly as regenerable one second after the agent
+    /// settled as it is `after_days` later.
+    pub fn terminal(&self) -> Vec<&AgentRecord> {
+        self.agents
+            .values()
+            .filter(|a| a.state.is_archivable())
+            .collect()
+    }
+
     /// Move every [`archivable`](Registry::archivable) record into the archive
     /// store, returning the records as archived (with `archived_at` stamped).
     ///

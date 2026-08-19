@@ -4500,20 +4500,47 @@ impl Supervisor {
         row(true, detail.join("; "))
     }
 
+    /// Reclaim EVERY still-live terminal record's regenerable build
+    /// artifacts right now, with no age cutoff — the immediate counterpart to
+    /// the artifact-reap [`archive_agents`] also performs on records that
+    /// have already crossed its `after_days` cutoff. O12 (2026-08-18 drain
+    /// probe): shipping artifact reap only inside `archive_agents` meant a
+    /// newly terminal agent's `target/` stood untouched for up to
+    /// `after_days` (default 3) before the first sweep even looked at it —
+    /// exactly the silent-231GB accumulation this exists to close. A record
+    /// that later actually archives just gets reaped again here first,
+    /// idempotently (`reap_artifacts` no-ops once nothing named remains).
+    ///
+    /// [`archive_agents`]: Self::archive_agents
+    pub fn reap_terminal_artifacts(&self, reap: &Reap) -> Vec<serde_json::Value> {
+        if !reap.reaps_artifacts() {
+            return Vec::new();
+        }
+        self.lock_registry()
+            .terminal()
+            .into_iter()
+            .map(|r| self.reap_artifacts(r, reap.artifact_paths_for(&r.repo_name)))
+            .collect()
+    }
+
     /// Reclaim one archived agent's regenerable build artifacts — e.g.
     /// `target` — from its worktree, regardless of merge state. Unlike
     /// [`reap_git`](Self::reap_git) there is no merged-or-gone gate: an
     /// unmerged branch's build output is exactly as regenerable as a merged
     /// one's, and only the paths in `paths` are ever removed, so the source
     /// tree, git history, and any uncommitted edits elsewhere in the worktree
-    /// stay completely untouched. Only reachable via [`archive_agents`],
-    /// which requires the record to already be terminal (Completed/Failed/
-    /// Dismissed) — a live agent's worktree is never a candidate.
+    /// stay completely untouched. Reachable via [`archive_agents`] (archived
+    /// records) and [`reap_terminal_artifacts`](Self::reap_terminal_artifacts)
+    /// (any still-live terminal record) — both require the record to already
+    /// be terminal (Completed/Failed/Dismissed); a live agent's worktree is
+    /// never a candidate.
     ///
     /// Each entry in `paths` is a literal worktree-relative path (not a shell
-    /// glob); entries that are empty, absolute, or contain a `..` segment are
-    /// skipped defensively rather than resolved, since nothing about this
-    /// reap should ever be able to reach outside the worktree.
+    /// glob); entries that are empty, absolute, contain a `..` segment, or
+    /// resolve to the worktree root itself (`.`, `./`, or equivalent — every
+    /// segment empty or `.`) are skipped defensively rather than resolved,
+    /// since nothing about this reap should ever be able to reach outside —
+    /// or BE — the worktree.
     ///
     /// Best-effort in the same shape as `reap_git`/`reap_log`: a failure is a
     /// `reaped: false` row with a reason, never a failed archive.
@@ -4529,7 +4556,14 @@ impl Supervisor {
         }
         let mut removed = Vec::new();
         for rel in paths {
-            if rel.is_empty() || rel.starts_with('/') || rel.split('/').any(|seg| seg == "..") {
+            let resolves_to_root = rel
+                .split('/')
+                .all(|seg| seg.is_empty() || seg == ".");
+            if rel.is_empty()
+                || rel.starts_with('/')
+                || rel.split('/').any(|seg| seg == "..")
+                || resolves_to_root
+            {
                 warn!(
                     agent = %record.name,
                     path = %rel,

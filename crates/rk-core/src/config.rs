@@ -571,6 +571,10 @@ pub struct WorktreeSweepConfig {
     pub interval_secs: u64,
     /// A terminal agent record (Completed/Failed/Dismissed) untouched for at
     /// least this many days becomes eligible for archiving + git reclaim.
+    /// Does NOT gate [`artifact_paths`](Self::artifact_paths) reclaim — that
+    /// runs every sweep tick against every still-live terminal record with no
+    /// age cutoff, since a `target/` dir is exactly as regenerable the moment
+    /// its agent goes terminal as it is `after_days` later.
     pub after_days: u64,
     /// Master switch for the finalize-time safety net
     /// (`WorkflowEngine::finalize` → `Supervisor::dismiss_orphaned_instance_agents`):
@@ -592,15 +596,20 @@ pub struct WorktreeSweepConfig {
     pub finalize_cleanup_enabled: bool,
     /// Regenerable build-artifact paths (relative to a worktree root, e.g.
     /// `target` for a cargo workspace) reclaimed from EVERY terminal agent's
-    /// worktree — Completed/Failed/Dismissed — regardless of merge state.
-    /// Unlike the git reclaim above, an unmerged branch's build output is
-    /// exactly as regenerable as a merged one's: only these named paths are
-    /// removed, never the worktree, branch, or any source/git state. Empty
-    /// disables artifact reaping entirely. Root-caused by the 2026-08-18 O12
-    /// incident (docs/2026-08-18-drain-probe-log.md): a probe day left 231 GB
-    /// of terminal rats' `target/` dirs standing because the sweep only
+    /// worktree — Completed/Failed/Dismissed — regardless of merge state AND
+    /// regardless of [`after_days`](Self::after_days): every sweep tick reaps
+    /// these paths from every still-live terminal record immediately, not
+    /// only once a record ages into archiving. Unlike the git reclaim above,
+    /// an unmerged branch's build output is exactly as regenerable as a
+    /// merged one's: only these named paths are removed, never the worktree,
+    /// branch, or any source/git state. Empty disables artifact reaping
+    /// entirely. Root-caused by the 2026-08-18 O12 incident
+    /// (docs/2026-08-18-drain-probe-log.md): a probe day left 231 GB of
+    /// terminal rats' `target/` dirs standing because the sweep only
     /// reclaimed MERGED branches' worktrees wholesale, tripping `[disk]
-    /// min_free_gb` and silently stalling drain.
+    /// min_free_gb` and silently stalling drain — gating the artifact reap on
+    /// the same `after_days` cutoff as archiving would have reproduced that
+    /// exact gap for the default 3-day window.
     pub artifact_paths: Vec<String>,
     /// Per-repo override of `artifact_paths`, keyed by repo name — a repo
     /// with an entry here uses THAT list instead of `artifact_paths` (not
