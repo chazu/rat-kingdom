@@ -2862,15 +2862,14 @@ impl Supervisor {
     }
 
     /// The merged-branch guardrail: true if this agent's work already landed
-    /// (so a respawn would redo merged work) or its branch is gone (nothing to
-    /// resume). "Merged" here is precise — the branch is *strictly behind* its
-    /// target: contained in it yet the target has advanced past it. That
-    /// deliberately excludes a branch that merely equals its target (an agent
-    /// that crashed before committing anything: tip == base), which is exactly
-    /// the transient crash we most want to auto-respawn — a plain
-    /// "is-ancestor" test would mis-skip it. An unmerged branch (commits not in
-    /// target) is not an ancestor, so it respawns. Fail-safe: an unresolvable
-    /// repo reads as "not merged" so we never wrongly skip a recoverable agent.
+    /// (so a respawn would redo merged work) or its branch is gone (nothing
+    /// to resume). Delegates to [`Repo::branch_merged_or_gone`], which is
+    /// commit-count aware: a branch that merely equals its target (an agent
+    /// that crashed before committing anything: tip == base) is neither
+    /// merged nor gone, so it respawns rather than being skipped — the
+    /// transient crash we most want auto-respawn to catch. Fail-safe: an
+    /// unresolvable repo reads as "not merged" so we never wrongly skip a
+    /// recoverable agent.
     fn branch_already_merged(&self, record: &AgentRecord) -> bool {
         let Some(branch) = record.branch.as_deref() else {
             return false;
@@ -2878,11 +2877,7 @@ impl Supervisor {
         let Ok(repo) = Repo::discover(&record.repo_root) else {
             return false;
         };
-        if !repo.branch_exists(branch) {
-            return true; // gone: the worktree can't be resumed onto it.
-        }
-        let target = &record.target_branch;
-        repo.is_ancestor(branch, target) && !repo.is_ancestor(target, branch)
+        repo.branch_merged_or_gone(branch, &record.target_branch)
     }
 
     /// Escalate an exhausted crash-loop to a human: emit a `need` tuple (which
@@ -5556,6 +5551,127 @@ mod respawn_tests {
 
         // (e) No branch recorded => not merged (fail-safe, respawn preflight handles it).
         assert!(!sup.branch_already_merged(&record(p, None)));
+    }
+
+    /// Commit-count awareness at the done-gate call site
+    /// (TKT-01M0CTC4DPFV7Q2642AZH354BV): a branch that never diverged from
+    /// its target trivially satisfies `is_ancestor`, so a naive check would
+    /// let `rk done` through for a rat that committed nothing. The gate must
+    /// refuse it, both for merge-mode (`branch_verified_merged`) and
+    /// push-branch mode (`remote_branch_merged_or_gone`).
+    #[test]
+    fn ticket_undelivered_reason_refuses_an_empty_branch() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let p = repo_dir.path();
+        init_repo(p);
+        git(p, &["checkout", "-b", "nowork", "main"]);
+        git(p, &["checkout", "main"]);
+        let repo = Repo::discover(p).unwrap();
+
+        let merge_policy = rk_workflow::RepositoryPolicy::default();
+        assert_eq!(merge_policy.delivery.mode, DeliveryMode::Merge);
+        assert!(
+            ticket_undelivered_reason(&merge_policy, &repo, "nowork", "main", true).is_some(),
+            "an empty branch must not read as delivered under merge mode"
+        );
+
+        // Push-branch mode reads the remote-tracking ref, so the empty branch
+        // needs an actual push (and fetch) to exercise
+        // `remote_branch_merged_or_gone` rather than the separate
+        // never-pushed "gone" path.
+        let bare = p.join("origin.git");
+        git(p, &["init", "--bare", &bare.to_string_lossy()]);
+        git(p, &["remote", "add", "origin", &bare.to_string_lossy()]);
+        git(p, &["push", "origin", "main"]);
+        git(p, &["push", "origin", "nowork"]);
+        repo.fetch_prune("origin", std::time::Duration::from_secs(30))
+            .unwrap();
+
+        let mut push_policy = rk_workflow::RepositoryPolicy::default();
+        push_policy.delivery.mode = DeliveryMode::PushBranch;
+        assert!(
+            ticket_undelivered_reason(&push_policy, &repo, "nowork", "main", true).is_some(),
+            "an empty, pushed-but-never-diverged branch must not read as delivered under push-branch mode"
+        );
+
+        // A branch that actually made a commit still hasn't merged yet, so it
+        // is refused too — confirming the fix doesn't also refuse real,
+        // pending work as "empty".
+        git(p, &["checkout", "-b", "work", "main"]);
+        std::fs::write(p.join("g"), "1\n").unwrap();
+        git(p, &["add", "g"]);
+        git(p, &["commit", "-m", "work"]);
+        git(p, &["checkout", "main"]);
+        let repo = Repo::discover(p).unwrap();
+        assert!(
+            ticket_undelivered_reason(&merge_policy, &repo, "work", "main", true).is_some(),
+            "unmerged real work is also not yet delivered"
+        );
+
+        // Once genuinely merged (target advances past the branch), the gate
+        // clears.
+        git(p, &["merge", "--no-ff", "-m", "merge", "work"]);
+        let repo = Repo::discover(p).unwrap();
+        assert!(
+            ticket_undelivered_reason(&merge_policy, &repo, "work", "main", true).is_none(),
+            "a genuinely merged branch must clear the done-gate"
+        );
+    }
+
+    /// Commit-count awareness at the dismiss-time ticket-closer
+    /// (TKT-01M0CTC4DPFV7Q2642AZH354BV, building on the `content_free` guard
+    /// from TKT-01M0C663BZ86SMA2PVMFP5QJ8D): a duplicate rat whose branch
+    /// never diverged from the target reports `merged: true` on dismiss (its
+    /// own no-op "merge" trivially succeeds), but must not close a ticket it
+    /// never actually delivered anything for.
+    #[tokio::test]
+    async fn dismiss_does_not_close_a_ticket_for_a_content_free_duplicate_branch() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let sup = supervisor(home.path());
+        let p = repo_dir.path();
+
+        let ticket = sup
+            .tickets
+            .create(crate::tickets::NewTicket {
+                title: "test".into(),
+                body: None,
+                scope: None,
+                parent: None,
+                priority: "normal".into(),
+                labels: vec![],
+                depends_on: vec![],
+                created_by: None,
+                coalesce_key: None,
+            })
+            .await
+            .unwrap();
+        let task_id = ticket.identity.clone();
+        sup.tickets
+            .set_status(&task_id, "in_progress")
+            .await
+            .unwrap();
+
+        // A duplicate branch cut from main with no commits — already
+        // ancestor-equivalent of target, exactly the trivial no-op-merge case.
+        git(p, &["checkout", "-b", "dup", "main"]);
+        git(p, &["checkout", "main"]);
+
+        let mut rec = record(p, Some("dup"));
+        rec.name = "Duplicate".into();
+        rec.task = Some(task_id.clone());
+        rec.worktree = None; // nothing to tear down for this test
+        sup.lock_registry().insert(rec).unwrap();
+
+        sup.dismiss("Duplicate", false).await.unwrap();
+
+        let ticket = sup.tickets.get(&task_id).unwrap().unwrap();
+        assert_ne!(
+            ticket.payload["status"],
+            json!("closed"),
+            "a content-free duplicate merge must not close the ticket"
+        );
     }
 
     /// The TKT-146 scenario, closed structurally
