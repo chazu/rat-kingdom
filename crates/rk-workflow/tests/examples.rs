@@ -320,6 +320,46 @@ fn fanout_and_nightly_examples_carry_a_budget_cap() {
     }
 }
 
+/// TKT-01M08H9QQPJGFS9ET25Q26YSDM (A3): the payload `scripts/rk-action-approval-smoke.py`
+/// proposes/approves/executes through the factory action-approval boundary
+/// weekly. It must stay genuinely harmless (no merge, no branch mutation) —
+/// pin its shape here so a hand-edit that adds real work to it is caught.
+#[test]
+fn action_approval_smoke_target_is_a_harmless_noop() {
+    use rk_workflow::Step;
+
+    let workflow = rk_workflow::load(
+        &examples_dir().join("action-approval-smoke-target.cue"),
+        &HashMap::new(),
+    )
+    .unwrap_or_else(|e| panic!("action-approval-smoke-target.cue failed to load: {e}"));
+
+    assert_eq!(workflow.name, "action-approval-smoke-target");
+    assert!(
+        workflow.params.is_empty(),
+        "the smoke target must need no params: the operator script never supplies any"
+    );
+
+    let Step::Spawn(spawn) = &workflow.steps[0] else {
+        panic!("smoke target must open with a spawn");
+    };
+    assert_eq!(spawn.role, "rat");
+
+    assert!(
+        workflow.steps.iter().any(
+            |s| matches!(s, Step::Dismiss(d) if d.no_merge)
+        ),
+        "the smoke target must dismiss with noMerge — it must never merge a branch"
+    );
+    assert!(
+        !workflow.steps.iter().any(|s| matches!(
+            s,
+            Step::Land(_) | Step::OpenPr(_) | Step::ForEach(_) | Step::DismissAll(_)
+        )),
+        "the smoke target must stay a single harmless spawn, not gain real side effects"
+    );
+}
+
 #[test]
 fn shipped_example_schedules_load() {
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

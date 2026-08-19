@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for scripts/rk-action-approval-smoke.py
+  (TKT-01M08H9QQPJGFS9ET25Q26YSDM, A3). See the OPERATOR SETUP section in
+  that script's docstring before using this.
+
+  Weekly cadence via StartCalendarInterval (Sunday 04:00 local time), not
+  StartInterval: this only needs to run once a week, and StartCalendarInterval
+  survives a sleeping laptop correctly (launchd fires the missed run once on
+  wake rather than needing a multi-day wall-clock counter).
+
+  Copy to ~/Library/LaunchAgents/com.rat-kingdom.action-approval-smoke.plist,
+  replace every REPLACE_ME placeholder with a real absolute path, then:
+    launchctl load ~/Library/LaunchAgents/com.rat-kingdom.action-approval-smoke.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rat-kingdom.action-approval-smoke</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>REPLACE_ME/rat-kingdom/scripts/rk-action-approval-smoke.py</string>
+        <string>--rk-bin</string>
+        <string>REPLACE_ME/.local/bin/rk</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/tmp/rk-action-approval-smoke.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/rk-action-approval-smoke.err.log</string>
+</dict>
+</plist>
