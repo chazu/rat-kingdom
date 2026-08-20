@@ -124,6 +124,22 @@ async fn reviewer_drives_rework_loops_then_merges() {
                     "description": "Fix the login redirect loop",
                     "workTimeout": "60s",
                     "reviewTimeout": "60s",
+                    // The workflow's `read` step (examples/workflows/
+                    // reviewer-drives-rework.cue) has its own internal
+                    // timeout, separate from workTimeout/reviewTimeout above:
+                    // it waits for the reviewer's `rk out artifact` subprocess
+                    // to land and be read back, which is a second process
+                    // spawn + daemon round trip after the reviewer's harness
+                    // turn already completed. Under cargo-test-workspace-wide
+                    // contention that hop can itself take a while even though
+                    // the reviewer generation finished promptly, so it needs
+                    // its own generous budget rather than inheriting
+                    // reviewTimeout's. (TKT-01M0GBC0PK2M52QGB0A4H0PM1F: the
+                    // previous fix only widened the outer poll loop below,
+                    // which cannot help — this internal read step returns a
+                    // hard `failed` well inside any outer window once ITS OWN
+                    // ceiling is hit.)
+                    "readTimeout": "5m",
                     "maxRounds": 3,
                 },
             }),
@@ -133,19 +149,22 @@ async fn reviewer_drives_rework_loops_then_merges() {
     let id = started["instance"]["id"].as_str().unwrap().to_string();
 
     // This run crosses two full review rounds, each carrying its own 60s
-    // workTimeout/reviewTimeout plus a fixed 2m `read` timeout on the verdict
-    // (examples/workflows/reviewer-drives-rework.cue) — those are the
-    // *internal* ceilings the workflow itself is allowed to take. A 30s outer
-    // poll window is tighter than even one of those steps, so under
-    // cargo-test-workspace-wide CPU/disk contention (TKT-01M0D2APS09AXKB4AHAYHCPSPX:
-    // the same class of contention pushes other daemon integration tests past
-    // fixed wait budgets) this loop can give up on a workflow that is still
-    // healthy and simply slow, not stuck. 180s stays well under the ~8m
-    // theoretical sum of every internal ceiling maxing out — which would
-    // itself flip the instance to `failed` and be caught below immediately —
-    // while giving real contention-induced slowdown room to clear.
+    // workTimeout/reviewTimeout plus a 5m `readTimeout` override on the
+    // verdict read (examples/workflows/reviewer-drives-rework.cue) — those
+    // are the *internal* ceilings the workflow itself is allowed to take.
+    // Sequence: initial work(60s) -> round1 review(60s)+read(5m)+rework
+    // work(60s) -> round2 review(60s)+read(5m) = 780s = 13m theoretical worst
+    // case if every internal ceiling maxed out (which would itself flip the
+    // instance to `failed` and be caught below immediately). The outer
+    // window must comfortably EXCEED that sum, not stay under it as the
+    // previous fix did (TKT-01M0GBC0PK2M52QGB0A4H0PM1F) — unlike a step that
+    // fails outright at its ceiling, this loop must tolerate a workflow that
+    // legitimately needs close to its full, now-larger internal budget to
+    // succeed under cargo-test-workspace-wide CPU/disk contention
+    // (TKT-01M0D2APS09AXKB4AHAYHCPSPX). 20 minutes gives real headroom above
+    // the 13m theoretical max.
     let mut completed = false;
-    for _ in 0..1800 {
+    for _ in 0..12000 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let status = client
             .call("workflow.status", json!({"name": id}))

@@ -102,6 +102,13 @@ async fn reviewer_stop_verdict_aborts_the_run() {
                     "taskId": "fix-login",
                     "workTimeout": "60s",
                     "reviewTimeout": "60s",
+                    // See reviewer_drives_rework.rs for why this needs its
+                    // own generous budget separate from reviewTimeout: it
+                    // covers the reviewer's `rk out artifact` subprocess
+                    // landing and being read back, a second process spawn +
+                    // daemon round trip after the reviewer's harness turn
+                    // already completed (TKT-01M0GBC0PK2M52QGB0A4H0PM1F).
+                    "readTimeout": "5m",
                     "maxRounds": 3,
                 },
             }),
@@ -111,19 +118,20 @@ async fn reviewer_stop_verdict_aborts_the_run() {
     let id = started["instance"]["id"].as_str().unwrap().to_string();
 
     // One review round still carries its own 60s workTimeout/reviewTimeout
-    // plus a fixed 2m `read` timeout on the verdict
+    // plus a 5m `readTimeout` override on the verdict read
     // (examples/workflows/reviewer-drives-rework.cue) — internal ceilings the
-    // workflow is allowed to take. A 30s outer poll window is tighter than
-    // even one of those steps, so under cargo-test-workspace-wide CPU/disk
-    // contention (TKT-01M0D2APS09AXKB4AHAYHCPSPX: the same class of
-    // contention pushes other daemon integration tests past fixed wait
-    // budgets) this loop can give up on a workflow that is still healthy and
-    // simply slow, not stuck. 120s stays well under the ~4m theoretical sum
-    // of every internal ceiling maxing out — which would itself flip the
-    // instance to `failed` and be caught below immediately — while giving
-    // real contention-induced slowdown room to clear.
+    // workflow is allowed to take: 60s(work) + 60s(review) + 5m(read) = 420s
+    // = 7m theoretical worst case if every internal ceiling maxed out (which
+    // would itself flip the instance to `failed` and be caught below
+    // immediately). The outer window must comfortably EXCEED that sum, not
+    // stay under it as the previous fix did
+    // (TKT-01M0GBC0PK2M52QGB0A4H0PM1F) — this loop must tolerate a workflow
+    // that legitimately needs close to its full, now-larger internal budget
+    // to finish under cargo-test-workspace-wide CPU/disk contention
+    // (TKT-01M0D2APS09AXKB4AHAYHCPSPX). 12 minutes gives real headroom above
+    // the 7m theoretical max.
     let mut error: Option<String> = None;
-    for _ in 0..1200 {
+    for _ in 0..7200 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let status = client
             .call("workflow.status", json!({"name": id}))
