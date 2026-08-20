@@ -495,7 +495,7 @@ async fn resubmission_with_a_different_task_fails_closed() {
         .await;
     let err = refused.expect_err(
         "retrying the same branch/head under a different task must fail closed, not report \
-         already_processed"
+         already_processed",
     );
     assert!(
         err.to_string().contains(&first_id) && err.to_string().contains(&second_id),
@@ -566,7 +566,7 @@ async fn force_landing_rejects_explicit_task() {
         .await;
     let err = refused.expect_err(
         "--force combined with --task must be refused, not silently land without binding the \
-         ticket"
+         ticket",
     );
     assert!(
         err.to_string().to_lowercase().contains("force")
