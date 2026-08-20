@@ -157,7 +157,7 @@ pub struct LandArgs {
     #[arg(long)]
     pub keep_branch: bool,
     /// Emergency escape hatch: skip the queue and named gates.
-    #[arg(long, requires = "reason")]
+    #[arg(long, requires = "reason", conflicts_with = "task")]
     pub force: bool,
     /// Required audit reason for --force.
     #[arg(long, requires = "force")]
@@ -165,8 +165,9 @@ pub struct LandArgs {
     /// Explicit ticket this submission delivers (e.g. a recovery branch that
     /// carries no agent record of its own). Validated against the ticket
     /// store; must agree with any task an agent record already binds to this
-    /// branch.
-    #[arg(long)]
+    /// branch. Not valid with --force, which bypasses the landing pipeline
+    /// entirely and has nothing to carry the identity through.
+    #[arg(long, conflicts_with = "force")]
     pub task: Option<String>,
 }
 

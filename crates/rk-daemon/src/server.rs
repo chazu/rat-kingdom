@@ -2552,6 +2552,21 @@ impl Daemon {
                         return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
                     }
                 };
+                // `land_force` bypasses the landing pipeline entirely (no
+                // queue, no `Supervisor::resolve_land_task` validation, no
+                // `landing_processed` marker) — it has nothing to carry a
+                // `task` identity through. Silently dropping `--task` here
+                // would look like it bound the ticket when nothing recorded
+                // that; refuse the combination instead of pretending.
+                if params.force && params.task.is_some() {
+                    return Outcome::Reply(Response::err(
+                        id,
+                        codes::BAD_PARAMS,
+                        "--force bypasses the landing pipeline and cannot carry --task identity \
+                         — drop --task, or land without --force so the explicit task is \
+                         validated and recorded",
+                    ));
+                }
                 let result = if params.force {
                     self.supervisor
                         .land_force(
