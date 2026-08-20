@@ -163,10 +163,10 @@ fn delivered_but_open(tickets: &[Tuple]) -> Vec<Violation> {
 /// settled one, and the newest among settled ones. Mirrors
 /// `Registry::get_any`'s resolution without requiring a live `Registry`, so
 /// this stays a pure function over an owned slice.
-fn latest_by<'a>(
-    agents: &'a [AgentRecord],
+fn latest_by(
+    agents: &[AgentRecord],
     key: impl Fn(&AgentRecord) -> Option<&str>,
-) -> HashMap<&'a str, &'a AgentRecord> {
+) -> HashMap<&str, &AgentRecord> {
     let mut map: HashMap<&str, &AgentRecord> = HashMap::new();
     for a in agents {
         let Some(k) = key(a) else { continue };
