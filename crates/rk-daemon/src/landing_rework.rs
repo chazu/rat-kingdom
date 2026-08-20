@@ -1,60 +1,18 @@
-//! Unattended REWORK routing for the daemon-native landing pipeline.
+//! Pure policy and evidence formatting for unattended reviewer REWORK.
 //!
-//! Before this module, a reviewer REWORK verdict was a full stop: the
-//! pipeline preserved the reviewed branch, filed a rework ticket
-//! (`LandingPipeline::file_rework_ticket`), and returned. Nothing dispatched
-//! the ticket, so a human — or a supervising LLM polling `rk ticket list` —
-//! had to notice it and spawn an agent by hand, even when the reviewer had
-//! supplied a precise, bounded correction (the live case that motivated this:
-//! TKT-01M0E8PMWCRKE6WZ4ZNYB6Y6YS filed TKT-01M0ECVY5NVMRC7WQQK1S1ZAAG and
-//! then sat).
-//!
-//! The decision this module owns is deliberately narrow, and it is a
-//! *classification*, not a judgment about the code: does the verdict describe
-//! **delegated-LLM work** (a bounded correction an agent can carry out from
-//! the reviewer's own notes) or **human authority** (a product/policy call, or
-//! a verdict too vague to act on)? That vocabulary is the existing authority
-//! ladder's ([`crate::reconcile::Authority`], `crate::authority`), reused
-//! rather than reinvented: `Orchestrator` means "the fleet may resolve this
-//! unattended", `Human` means "one explicit gate, no dispatch".
-//!
-//! Conservative by construction, in the same spirit as [`crate::authority`]:
-//!
-//! * the classifier FAILS CLOSED — anything it cannot positively recognize as
-//!   a bounded correction is [`Authority::Human`], so a reviewer that writes
-//!   nothing useful, or explicitly asks for a human, never triggers a spawn;
-//! * a repo may narrow the policy ([`ReworkPolicy`]) toward "never dispatch"
-//!   but the caps are hard ceilings, checked before every dispatch;
-//! * the *withheld* path is not silent. It raises exactly one durable
-//!   escalation carrying evidence, the decision being asked for, the blast
-//!   radius, and the exact command that resolves it — see
-//!   [`Withheld::escalation`].
-//!
-//! Everything here is pure: no `Space`, no git, no spawn. The pipeline side
-//! (durable dispatch markers, the spawn itself, and the parent-branch
-//! resubmission after a rework lands) lives in [`crate::landing`], which is
-//! where the idempotency guarantees are enforced.
+//! Only a positively identified bounded correction receives orchestrator
+//! authority; missing, ambiguous, or human-declared work fails closed. Repo
+//! policy can narrow that authority further with attempt and spend ceilings.
+//! Durable markers, spawning, and corrected-parent resubmission remain in
+//! [`crate::landing`].
 
 use crate::reconcile::Authority;
 use serde_json::{json, Value};
 
-/// Identity of the durable per-`(branch, head_sha)` marker recording that a
-/// REWORK verdict was routed — written by the pipeline BEFORE it spawns, and
-/// probed before it routes, so a redelivered completion, a daemon restart, or
-/// a repeated queue scan can never produce a second rework ticket or a second
-/// rework agent for the same reviewed commit. `Furniture`, scoped to the repo,
-/// keyed the same way the review artifact itself is
-/// (`Pattern::for_commit`).
+/// Durable, repo-scoped routing marker written before a rework spawn.
 pub(crate) const REWORK_DISPATCH_IDENTITY: &str = "landing_rework_dispatch";
 
-/// Stable dedupe key for the rework ticket itself. Target and original task
-/// are part of the key: the same branch/head submitted to a different target
-/// or under a different ticket is a different review chain, not a replay.
-///
-/// A free function rather than a [`ReworkContext`] method because the pipeline
-/// files the ticket BEFORE it can build a context (the context needs the
-/// ticket's own identity), so the key has to be derivable from the work key
-/// alone.
+/// Stable ticket dedupe key. Target and task distinguish separate review chains.
 pub(crate) fn ticket_coalesce_key(
     repo: &str,
     branch: &str,
@@ -65,25 +23,14 @@ pub(crate) fn ticket_coalesce_key(
     format!("landing-rework:{repo}:{branch}:{head_sha}:{target}:{task}")
 }
 
-/// Per-repository bounds on unattended rework, resolved from
-/// `rk_workflow::LandingPolicy` (`.rk/repo.cue`, digest-activated like every
-/// other repo policy) — the landing pipeline's `GateConfig` counterpart for
-/// the REWORK arm.
+/// Activated repository bounds for unattended rework.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReworkPolicy {
-    /// Master switch. `false` restores the pre-feature behavior exactly: file
-    /// the ticket, hold the branch, escalate nothing extra.
+    /// `false` files the ticket and holds the branch without dispatching.
     pub(crate) auto_dispatch: bool,
-    /// How many rework agents may be dispatched for one reviewed branch
-    /// across its whole review→rework→re-review chain. `0` disables dispatch
-    /// as surely as `auto_dispatch: false` does.
+    /// Hard ceiling across a review→rework→re-review chain.
     pub(crate) max_attempts: u32,
-    /// Cumulative USD across the original agent and every rework agent in
-    /// this chain. `0` means unlimited, matching the fleet budget convention
-    /// (`rk_ledger::Budget`). Whole dollars: a rework ceiling is a
-    /// coarse "is this still cheap automation" question, and an integer keeps
-    /// `RepositoryPolicy` `Eq` (it is compared for activation-digest
-    /// equality), which a float field would silently take away.
+    /// Whole-dollar chain ceiling; `0` means unlimited and preserves policy `Eq`.
     pub(crate) max_usd: u32,
 }
 
@@ -103,10 +50,7 @@ impl Default for ReworkPolicy {
     }
 }
 
-/// Why a REWORK verdict was NOT dispatched unattended. Carries a stable
-/// machine-readable `code` (so `rk inbox`/analytics can group these without
-/// parsing prose) alongside the human-facing `detail` and the decision the
-/// escalation is actually asking a human to make.
+/// Machine-readable reason and evidence for a withheld dispatch.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Withheld {
     pub(crate) code: &'static str,
@@ -114,51 +58,56 @@ pub(crate) struct Withheld {
     pub(crate) decision: String,
 }
 
+fn human(
+    code: &'static str,
+    detail: impl Into<String>,
+    decision: impl Into<String>,
+) -> (Authority, Option<Withheld>) {
+    (
+        Authority::Human,
+        Some(Withheld {
+            code,
+            detail: detail.into(),
+            decision: decision.into(),
+        }),
+    )
+}
+
+fn withhold(
+    code: &'static str,
+    detail: impl Into<String>,
+    decision: impl Into<String>,
+) -> ReworkRoute {
+    ReworkRoute::Withhold(Withheld {
+        code,
+        detail: detail.into(),
+        decision: decision.into(),
+    })
+}
+
 /// The routing decision for one REWORK verdict.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ReworkRoute {
-    /// Delegated-LLM work, inside every cap: dispatch exactly one rework
-    /// agent. Carries the 1-based attempt number this dispatch will be.
+    /// Dispatch exactly one rework agent at this 1-based attempt.
     Dispatch { attempt: u32 },
-    /// Human authority, or a cap/budget exhausted: file the ticket, hold the
-    /// branch, and raise one durable escalation.
+    /// File the ticket, hold the branch, and raise one durable escalation.
     Withhold(Withheld),
 }
 
-/// Where a REWORK verdict sits on the authority ladder.
-///
-/// FAIL-CLOSED: only a verdict that positively looks like a bounded
-/// correction earns [`Authority::Orchestrator`]. Recognized signals, in
-/// precedence order:
-///
-/// 1. an explicit `authority` field on the review artifact — a reviewer may
-///    always escalate itself by writing `"authority": "human"`, and may never
-///    widen past `orchestrator` (an unrecognized value is treated as `human`,
-///    not ignored, so a typo cannot read as consent);
-/// 2. `decision_required: true` or `bounded: false` — the reviewer saying in
-///    structured form that this is a product/policy call;
-/// 3. otherwise, non-empty `notes`: something concrete for an agent to act
-///    on. Empty or whitespace-only notes are unbounded by definition — there
-///    is nothing to hand a rework agent — so they escalate.
+/// Classify a verdict on the authority ladder, failing closed. Explicit
+/// authority wins, decision flags come next, and non-empty notes are required.
 pub(crate) fn classify_authority(review: Option<&Value>) -> (Authority, Option<Withheld>) {
     let Some(review) = review else {
-        return (
-            Authority::Human,
-            Some(Withheld {
-                code: "no-review-artifact",
-                detail: "the REWORK verdict has no readable review artifact, so there are no \
-                         reviewer notes to hand a rework agent"
-                    .into(),
-                decision: "read the branch yourself and either dispatch a rework agent with \
-                           explicit instructions, or land/abandon the branch"
-                    .into(),
-            }),
+        return human(
+            "no-review-artifact",
+            "the REWORK verdict has no readable review artifact, so there are no reviewer notes \
+             to hand a rework agent",
+            "read the branch yourself and either dispatch a rework agent with explicit \
+             instructions, or land/abandon the branch",
         );
     };
     if let Some(raw) = review.get("authority").and_then(Value::as_str) {
-        // `mechanical` is not a thing a reviewer can ask for here — a rework
-        // is by definition an LLM edit — so it maps to `orchestrator` rather
-        // than being rejected as unknown.
+        // Rework is an LLM edit, so `mechanical` maps to orchestrator.
         let declared = match raw.trim() {
             "orchestrator" | "mechanical" | "delegated" | "agent" | "llm" => {
                 Some(Authority::Orchestrator)
@@ -168,32 +117,24 @@ pub(crate) fn classify_authority(review: Option<&Value>) -> (Authority, Option<W
         };
         match declared {
             Some(Authority::Human) => {
-                return (
-                    Authority::Human,
-                    Some(Withheld {
-                        code: "reviewer-declared-human",
-                        detail: format!(
-                            "the reviewer classified its own REWORK as human authority \
-                             (authority: {raw:?})"
-                        ),
-                        decision: "make the call the reviewer refused to make, then dispatch or \
-                                   abandon"
-                            .into(),
-                    }),
+                return human(
+                    "reviewer-declared-human",
+                    format!(
+                        "the reviewer classified its own REWORK as human authority \
+                         (authority: {raw:?})"
+                    ),
+                    "make the call the reviewer refused to make, then dispatch or abandon",
                 );
             }
             None => {
-                return (
-                    Authority::Human,
-                    Some(Withheld {
-                        code: "unrecognized-authority",
-                        detail: format!(
-                            "the review artifact declares an authority this build does not \
-                             recognize ({raw:?}) — treated as human rather than ignored, so a \
-                             typo cannot read as consent to dispatch"
-                        ),
-                        decision: "correct the reviewer's verdict, then dispatch or abandon".into(),
-                    }),
+                return human(
+                    "unrecognized-authority",
+                    format!(
+                        "the review artifact declares an authority this build does not recognize \
+                         ({raw:?}) — treated as human rather than ignored, so a typo cannot read \
+                         as consent to dispatch"
+                    ),
+                    "correct the reviewer's verdict, then dispatch or abandon",
                 );
             }
             Some(_) => {}
@@ -202,36 +143,26 @@ pub(crate) fn classify_authority(review: Option<&Value>) -> (Authority, Option<W
     if review.get("decision_required").and_then(Value::as_bool) == Some(true)
         || review.get("bounded").and_then(Value::as_bool) == Some(false)
     {
-        return (
-            Authority::Human,
-            Some(Withheld {
-                code: "ambiguous-decision",
-                detail: "the reviewer flagged this REWORK as an open product or policy decision \
-                         rather than a bounded correction"
-                    .into(),
-                decision: "decide the product/policy question, then dispatch or abandon".into(),
-            }),
+        return human(
+            "ambiguous-decision",
+            "the reviewer flagged this REWORK as an open product or policy decision rather than \
+             a bounded correction",
+            "decide the product/policy question, then dispatch or abandon",
         );
     }
     if notes(Some(review)).is_empty() {
-        return (
-            Authority::Human,
-            Some(Withheld {
-                code: "unbounded-verdict",
-                detail: "the REWORK verdict carries no notes, so the correction is not bounded — \
-                         there is nothing to hand a rework agent"
-                    .into(),
-                decision: "read the branch yourself and either dispatch a rework agent with \
-                           explicit instructions, or land/abandon the branch"
-                    .into(),
-            }),
+        return human(
+            "unbounded-verdict",
+            "the REWORK verdict carries no notes, so the correction is not bounded — there is \
+             nothing to hand a rework agent",
+            "read the branch yourself and either dispatch a rework agent with explicit \
+             instructions, or land/abandon the branch",
         );
     }
     (Authority::Orchestrator, None)
 }
 
-/// The reviewer's notes, trimmed. Empty when the artifact has none — the
-/// signal [`classify_authority`] treats as "unbounded".
+/// Trimmed reviewer notes; empty is unbounded.
 pub(crate) fn notes(review: Option<&Value>) -> String {
     review
         .and_then(|r| r.get("notes"))
@@ -241,15 +172,7 @@ pub(crate) fn notes(review: Option<&Value>) -> String {
         .to_string()
 }
 
-/// Decide what to do with one REWORK verdict.
-///
-/// `attempts_used` is how many rework agents this reviewed branch has ALREADY
-/// had dispatched (counted from durable markers, not from memory);
-/// `spent_usd` is the cumulative cost of the original agent plus every rework
-/// agent in the chain. Both caps are checked AFTER the authority
-/// classification so an escalation always names the most specific reason: a
-/// verdict that is both human-authority and over budget reads better as the
-/// former.
+/// Route one verdict. Authority precedes durable attempt and chain-spend caps.
 pub(crate) fn route(
     policy: &ReworkPolicy,
     review: Option<&Value>,
@@ -257,80 +180,64 @@ pub(crate) fn route(
     spent_usd: f64,
 ) -> ReworkRoute {
     if !policy.auto_dispatch {
-        return ReworkRoute::Withhold(Withheld {
-            code: "auto-dispatch-disabled",
-            detail: "this repository's landing policy has reworkAutoDispatch disabled".into(),
-            decision: "dispatch the rework ticket by hand, or enable reworkAutoDispatch in \
-                       .rk/repo.cue"
-                .into(),
-        });
+        return withhold(
+            "auto-dispatch-disabled",
+            "this repository's landing policy has reworkAutoDispatch disabled",
+            "dispatch the rework ticket by hand, or enable reworkAutoDispatch in .rk/repo.cue",
+        );
     }
     if let (Authority::Human, Some(withheld)) = classify_authority(review) {
         return ReworkRoute::Withhold(withheld);
     }
     if attempts_used >= policy.max_attempts {
-        return ReworkRoute::Withhold(Withheld {
-            code: "attempts-exhausted",
-            detail: format!(
+        return withhold(
+            "attempts-exhausted",
+            format!(
                 "this branch has already had {attempts_used} automatic rework attempt(s), at or \
                  over the repository cap of {}",
                 policy.max_attempts
             ),
-            decision: "decide whether this work is converging: dispatch another rework by hand, \
-                       land it, or abandon the branch"
-                .into(),
-        });
+            "decide whether this work is converging: dispatch another rework by hand, land it, \
+             or abandon the branch",
+        );
     }
     if policy.max_usd > 0 && spent_usd >= f64::from(policy.max_usd) {
-        return ReworkRoute::Withhold(Withheld {
-            code: "budget-exhausted",
-            detail: format!(
+        return withhold(
+            "budget-exhausted",
+            format!(
                 "this branch's review/rework chain has already spent ${spent_usd:.2}, at or over \
                  the repository cap of ${}",
                 policy.max_usd
             ),
-            decision: "decide whether this work is worth more spend: dispatch another rework by \
-                       hand, land it, or abandon the branch"
-                .into(),
-        });
+            "decide whether this work is worth more spend: dispatch another rework by hand, land \
+             it, or abandon the branch",
+        );
     }
     ReworkRoute::Dispatch {
         attempt: attempts_used + 1,
     }
 }
 
-/// Everything a rework dispatch or escalation needs to name itself. Built by
-/// the pipeline from the queue entry, the review artifact, and a git
-/// diff-stat.
+/// Exact review-chain identity and evidence used by dispatch and escalation.
 #[derive(Debug, Clone)]
 pub(crate) struct ReworkContext {
     pub(crate) repo: String,
-    /// The REVIEWED branch — the rework agent's base, and the target its own
-    /// branch lands back onto.
+    /// Reviewed branch: the correction's base and merge target.
     pub(crate) branch: String,
-    /// The exact reviewed head. A rework must start from this commit, not
-    /// from the branch name (which may have moved) and never from `main`.
+    /// Exact reviewed head; never silently retargeted to a moved branch.
     pub(crate) head_sha: String,
-    /// Where the reviewed branch was headed before the REWORK — where it is
-    /// resubmitted once the rework lands into it.
+    /// Original target used when the corrected parent is resubmitted.
     pub(crate) target: String,
-    /// The original ticket the reviewed branch was delivering.
     pub(crate) task: String,
-    /// The follow-up ticket filed for this verdict.
     pub(crate) rework_ticket: String,
     pub(crate) notes: String,
-    /// Changed files / changed lines of the reviewed branch against its
-    /// target — the blast radius an escalation must state.
+    /// Reviewed branch blast radius against its target.
     pub(crate) diff_files: u64,
     pub(crate) diff_lines: u64,
 }
 
 impl ReworkContext {
-    /// Full logical dispatch identity. The follow-up ticket is included even
-    /// though it is itself coalesced from the preceding fields: persisting all
-    /// six dimensions makes replay evidence self-contained and prevents a
-    /// malformed/stale ticket association from being treated as the same
-    /// dispatch.
+    /// Full identity, including both original and correction tickets.
     pub(crate) fn dispatch_key(&self) -> String {
         format!(
             "{}\0{}\0{}\0{}\0{}\0{}",
@@ -338,11 +245,7 @@ impl ReworkContext {
         )
     }
 
-    /// The rework agent's task prompt. States the identities on both ends
-    /// (original and rework ticket), pins the exact base commit, quotes the
-    /// reviewer verbatim, and — critically — tells the agent it is landing
-    /// back onto the REVIEWED branch, not onto the original target: the
-    /// pipeline resubmits the corrected parent itself once this lands.
+    /// Pin the correction to the reviewed head and quote the review verbatim.
     pub(crate) fn prompt(&self) -> String {
         format!(
             "A reviewer returned REWORK on branch `{branch}` (exact head {head_sha}), which was \
@@ -370,11 +273,7 @@ impl ReworkContext {
         )
     }
 
-    /// The escalation text for a withheld dispatch — one durable `rk inbox`
-    /// row carrying the four things a human needs to act without reopening
-    /// the whole case: the EVIDENCE (who said what, about which commit), the
-    /// DECISION being asked for, the BLAST RADIUS, and the EXACT command that
-    /// resolves it.
+    /// Evidence-rich human gate: evidence, decision, blast radius, and command.
     pub(crate) fn escalation(&self, withheld: &Withheld) -> String {
         format!(
             "steward: REWORK on {branch} for {task} was NOT auto-dispatched ({code}) — branch \
@@ -405,10 +304,7 @@ impl ReworkContext {
         )
     }
 
-    /// The durable dispatch marker's payload. `branch`/`head_sha` are at the
-    /// top level and spelled exactly so because `Pattern::for_commit` matches
-    /// on those two keys — this is what makes the marker probe a commit-keyed
-    /// lookup rather than a full scan.
+    /// Durable marker payload; top-level branch/head fields support exact probes.
     pub(crate) fn marker_payload(&self, attempt: u32, agent: Option<&str>, state: &str) -> Value {
         json!({
             "dispatch_key": self.dispatch_key(),
@@ -460,113 +356,100 @@ mod tests {
     }
 
     #[test]
-    fn a_bounded_verdict_with_notes_is_delegated() {
-        let (authority, withheld) = classify_authority(Some(&review(json!({}))));
-        assert_eq!(authority, Authority::Orchestrator);
-        assert!(withheld.is_none());
-    }
-
-    #[test]
-    fn a_verdict_with_no_notes_is_unbounded_and_escalates() {
-        let (authority, withheld) = classify_authority(Some(&review(json!({"notes": "   "}))));
-        assert_eq!(authority, Authority::Human);
-        assert_eq!(withheld.unwrap().code, "unbounded-verdict");
-    }
-
-    #[test]
-    fn a_missing_review_artifact_escalates() {
-        let (authority, withheld) = classify_authority(None);
-        assert_eq!(authority, Authority::Human);
-        assert_eq!(withheld.unwrap().code, "no-review-artifact");
-    }
-
-    #[test]
-    fn a_reviewer_may_escalate_itself() {
-        let (authority, withheld) =
-            classify_authority(Some(&review(json!({"authority": "human"}))));
-        assert_eq!(authority, Authority::Human);
-        assert_eq!(withheld.unwrap().code, "reviewer-declared-human");
-    }
-
-    /// A typo must not read as consent — the whole fail-closed point.
-    #[test]
-    fn an_unrecognized_authority_value_escalates_rather_than_being_ignored() {
-        let (authority, withheld) =
-            classify_authority(Some(&review(json!({"authority": "orchestratr"}))));
-        assert_eq!(authority, Authority::Human);
-        assert_eq!(withheld.unwrap().code, "unrecognized-authority");
-    }
-
-    #[test]
-    fn an_open_product_decision_escalates_even_with_notes() {
-        for flag in [
-            json!({"decision_required": true}),
-            json!({"bounded": false}),
-        ] {
-            let (authority, withheld) = classify_authority(Some(&review(flag.clone())));
-            assert_eq!(authority, Authority::Human, "flag: {flag}");
-            assert_eq!(withheld.unwrap().code, "ambiguous-decision");
+    fn classifier_delegates_only_bounded_verdicts_and_fails_closed() {
+        let cases = [
+            (Some(json!({})), Authority::Orchestrator, None),
+            (
+                Some(json!({"notes": "   "})),
+                Authority::Human,
+                Some("unbounded-verdict"),
+            ),
+            (None, Authority::Human, Some("no-review-artifact")),
+            (
+                Some(json!({"authority": "human"})),
+                Authority::Human,
+                Some("reviewer-declared-human"),
+            ),
+            // A typo must not read as consent.
+            (
+                Some(json!({"authority": "orchestratr"})),
+                Authority::Human,
+                Some("unrecognized-authority"),
+            ),
+            (
+                Some(json!({"decision_required": true})),
+                Authority::Human,
+                Some("ambiguous-decision"),
+            ),
+            (
+                Some(json!({"bounded": false})),
+                Authority::Human,
+                Some("ambiguous-decision"),
+            ),
+        ];
+        for (extra, expected_authority, expected_code) in cases {
+            let artifact = extra.map(review);
+            let (authority, withheld) = classify_authority(artifact.as_ref());
+            assert_eq!(authority, expected_authority, "artifact: {artifact:?}");
+            assert_eq!(
+                withheld.as_ref().map(|value| value.code),
+                expected_code,
+                "artifact: {artifact:?}"
+            );
         }
     }
 
     #[test]
-    fn the_default_policy_dispatches_one_bounded_attempt() {
-        let policy = ReworkPolicy::default();
-        assert!(policy.auto_dispatch);
-        assert_eq!(
-            route(&policy, Some(&review(json!({}))), 0, 0.0),
-            ReworkRoute::Dispatch { attempt: 1 }
-        );
+    fn policy_caps_are_hard_ceilings_and_zero_spend_is_unlimited() {
+        let default = ReworkPolicy::default();
+        assert!(default.auto_dispatch);
+        let cases = [
+            (default.clone(), 0, 0.0, None),
+            (
+                default.clone(),
+                default.max_attempts,
+                0.0,
+                Some("attempts-exhausted"),
+            ),
+            (
+                ReworkPolicy {
+                    max_usd: 5,
+                    ..default.clone()
+                },
+                0,
+                5.01,
+                Some("budget-exhausted"),
+            ),
+            (
+                ReworkPolicy {
+                    max_usd: 0,
+                    ..default.clone()
+                },
+                0,
+                9_999.0,
+                None,
+            ),
+            (
+                ReworkPolicy {
+                    auto_dispatch: false,
+                    ..default
+                },
+                0,
+                0.0,
+                Some("auto-dispatch-disabled"),
+            ),
+        ];
+        let artifact = review(json!({}));
+        for (policy, attempts, spent, expected_code) in cases {
+            let actual = route(&policy, Some(&artifact), attempts, spent);
+            match (actual, expected_code) {
+                (ReworkRoute::Dispatch { attempt: 1 }, None) => {}
+                (ReworkRoute::Withhold(value), Some(code)) => assert_eq!(value.code, code),
+                (actual, expected) => panic!("route {actual:?}, expected code {expected:?}"),
+            }
+        }
     }
 
-    #[test]
-    fn the_attempt_cap_is_a_hard_ceiling() {
-        let policy = ReworkPolicy::default();
-        let used = policy.max_attempts;
-        let ReworkRoute::Withhold(withheld) = route(&policy, Some(&review(json!({}))), used, 0.0)
-        else {
-            panic!("expected the attempt cap to withhold at {used} attempts");
-        };
-        assert_eq!(withheld.code, "attempts-exhausted");
-    }
-
-    #[test]
-    fn the_spend_cap_is_a_hard_ceiling_and_zero_means_unlimited() {
-        let capped = ReworkPolicy {
-            max_usd: 5,
-            ..ReworkPolicy::default()
-        };
-        let ReworkRoute::Withhold(withheld) = route(&capped, Some(&review(json!({}))), 0, 5.01)
-        else {
-            panic!("expected the spend cap to withhold");
-        };
-        assert_eq!(withheld.code, "budget-exhausted");
-
-        let unlimited = ReworkPolicy {
-            max_usd: 0,
-            ..ReworkPolicy::default()
-        };
-        assert_eq!(
-            route(&unlimited, Some(&review(json!({}))), 0, 9_999.0),
-            ReworkRoute::Dispatch { attempt: 1 }
-        );
-    }
-
-    #[test]
-    fn disabling_auto_dispatch_restores_the_old_hold() {
-        let policy = ReworkPolicy {
-            auto_dispatch: false,
-            ..ReworkPolicy::default()
-        };
-        let ReworkRoute::Withhold(withheld) = route(&policy, Some(&review(json!({}))), 0, 0.0)
-        else {
-            panic!("expected a disabled policy to withhold");
-        };
-        assert_eq!(withheld.code, "auto-dispatch-disabled");
-    }
-
-    /// The prompt must pin the exact base — the acceptance criterion that
-    /// distinguishes a rework from "re-run the ticket against main".
     #[test]
     fn the_prompt_pins_the_reviewed_branch_and_exact_head() {
         let prompt = ctx().prompt();
