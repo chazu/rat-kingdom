@@ -47,16 +47,22 @@ use serde_json::{json, Value};
 /// (`Pattern::for_commit`).
 pub(crate) const REWORK_DISPATCH_IDENTITY: &str = "landing_rework_dispatch";
 
-/// Stable dedupe key for the rework ticket itself — the reviewed work key, so
-/// `Tickets::create`'s coalesce path returns the SAME ticket for a redelivered
-/// completion instead of minting a second one.
+/// Stable dedupe key for the rework ticket itself. Target and original task
+/// are part of the key: the same branch/head submitted to a different target
+/// or under a different ticket is a different review chain, not a replay.
 ///
 /// A free function rather than a [`ReworkContext`] method because the pipeline
 /// files the ticket BEFORE it can build a context (the context needs the
 /// ticket's own identity), so the key has to be derivable from the work key
 /// alone.
-pub(crate) fn ticket_coalesce_key(repo: &str, branch: &str, head_sha: &str) -> String {
-    format!("landing-rework:{repo}:{branch}:{head_sha}")
+pub(crate) fn ticket_coalesce_key(
+    repo: &str,
+    branch: &str,
+    head_sha: &str,
+    target: &str,
+    task: &str,
+) -> String {
+    format!("landing-rework:{repo}:{branch}:{head_sha}:{target}:{task}")
 }
 
 /// Per-repository bounds on unattended rework, resolved from
@@ -320,6 +326,18 @@ pub(crate) struct ReworkContext {
 }
 
 impl ReworkContext {
+    /// Full logical dispatch identity. The follow-up ticket is included even
+    /// though it is itself coalesced from the preceding fields: persisting all
+    /// six dimensions makes replay evidence self-contained and prevents a
+    /// malformed/stale ticket association from being treated as the same
+    /// dispatch.
+    pub(crate) fn dispatch_key(&self) -> String {
+        format!(
+            "{}\0{}\0{}\0{}\0{}\0{}",
+            self.repo, self.branch, self.head_sha, self.target, self.task, self.rework_ticket
+        )
+    }
+
     /// The rework agent's task prompt. States the identities on both ends
     /// (original and rework ticket), pins the exact base commit, quotes the
     /// reviewer verbatim, and — critically — tells the agent it is landing
@@ -393,6 +411,7 @@ impl ReworkContext {
     /// lookup rather than a full scan.
     pub(crate) fn marker_payload(&self, attempt: u32, agent: Option<&str>, state: &str) -> Value {
         json!({
+            "dispatch_key": self.dispatch_key(),
             "branch": self.branch,
             "head_sha": self.head_sha,
             "repo": self.repo,
@@ -585,10 +604,18 @@ mod tests {
     }
 
     #[test]
-    fn the_ticket_coalesce_key_is_the_reviewed_work_key() {
+    fn the_ticket_coalesce_key_names_the_whole_review_chain() {
         assert_eq!(
-            ticket_coalesce_key("code-repo", "feature", "abc123"),
-            "landing-rework:code-repo:feature:abc123"
+            ticket_coalesce_key("code-repo", "feature", "abc123", "main", "TKT-1"),
+            "landing-rework:code-repo:feature:abc123:main:TKT-1"
         );
+    }
+
+    #[test]
+    fn dispatch_key_includes_original_and_rework_ticket() {
+        let key = ctx().dispatch_key();
+        for component in ["code-repo", "feature", "abc123", "main", "TKT-1", "TKT-2"] {
+            assert!(key.split('\0').any(|part| part == component), "{key:?}");
+        }
     }
 }
