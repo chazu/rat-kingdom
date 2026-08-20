@@ -164,6 +164,21 @@ fn default_rework_max_usd() -> u32 {
     25
 }
 
+/// Per-repository regenerable build-artifact paths (relative to a worktree
+/// root, e.g. `target` for a cargo workspace, `node_modules` for an npm one)
+/// the daemon's worktree sweep reclaims from every terminal agent's worktree
+/// — Completed/Failed/Dismissed, any merge state. STACK NEUTRALITY: the
+/// daemon itself has no built-in notion of what any language's build
+/// directory is called, so this defaults to empty (reap nothing) and each
+/// repo declares its own list here, the same way `LandingPolicy` moved the
+/// gate knobs out of hardcoded workflow CUE into versioned, digest-activated
+/// policy instead of embedding one repo's conventions in daemon code.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReapPolicy {
+    #[serde(default, rename = "artifactPaths")]
+    pub artifact_paths: Vec<String>,
+}
+
 /// Versioned repository behavior activated into the daemon's repo registry.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryPolicy {
@@ -173,6 +188,8 @@ pub struct RepositoryPolicy {
     pub delivery: DeliveryPolicy,
     #[serde(default)]
     pub landing: LandingPolicy,
+    #[serde(default)]
+    pub reap: ReapPolicy,
 }
 
 impl RepositoryPolicy {
@@ -1045,6 +1062,22 @@ fn validate_repository_policy(policy: &RepositoryPolicy) -> rk_core::Result<()> 
         "repo.landing.reviewMaxWait",
         &policy.landing.review_max_wait,
     )?;
+    for rel in &policy.reap.artifact_paths {
+        let path = Path::new(rel);
+        let resolves_to_root = rel.split('/').all(|seg| seg.is_empty() || seg == ".");
+        if rel.trim().is_empty()
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            || resolves_to_root
+        {
+            return Err(rk_core::Error::other(format!(
+                "repo.reap.artifactPaths entry {rel:?} must be a non-empty worktree-relative \
+                 path that does not escape or resolve to the worktree root"
+            )));
+        }
+    }
     Ok(())
 }
 

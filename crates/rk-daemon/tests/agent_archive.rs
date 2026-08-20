@@ -459,20 +459,42 @@ async fn reap_git_reclaims_merged_branches_and_refuses_unmerged_ones() {
 }
 
 /// O12 (docs/2026-08-18-drain-probe-log.md): `--reap-artifacts` reclaims a
-/// terminal agent's regenerable build artifacts (default: `target`)
-/// REGARDLESS of merge state — unlike `--reap-git`, an unmerged branch's
-/// build output is exactly as regenerable as a merged one's. A running
-/// agent's artifacts are never touched, and only the named artifact path is
-/// removed: the worktree, branch, and every other file survive.
+/// terminal agent's regenerable build artifacts (this repo declares `target`
+/// through its activated `.rk/repo.cue` `reap.artifactPaths` — the daemon
+/// itself has no built-in notion of what any language's build directory is
+/// called) REGARDLESS of merge state — unlike `--reap-git`, an unmerged
+/// branch's build output is exactly as regenerable as a merged one's. A
+/// running agent's artifacts are never touched, and only the named artifact
+/// path is removed: the worktree, branch, and every other file survive.
 #[tokio::test]
 async fn reap_artifacts_reclaims_terminal_worktrees_regardless_of_merge_state() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
+    // STACK NEUTRALITY (TKT-P3b): the daemon's own artifact_paths default is
+    // now empty, so this repo must declare its own `target` reap path
+    // through its activated `.rk/repo.cue` policy for `--reap-artifacts` to
+    // have anything to do.
+    std::fs::create_dir_all(repo_dir.path().join(".rk")).unwrap();
+    std::fs::write(
+        repo_dir.path().join(".rk/repo.cue"),
+        r#"repo: { reap: { artifactPaths: ["target"] } }"#,
+    )
+    .unwrap();
+    git(repo_dir.path(), &["add", ".rk"]);
+    git(repo_dir.path(), &["commit", "-m", "policy: reap target/"]);
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
     let mut client = start_daemon(&layout).await;
+    let repo_name = repo_dir.path().file_name().unwrap().to_string_lossy();
+    client
+        .call(
+            "repo.add",
+            json!({"name": repo_name, "path": repo_dir.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
 
     // A live agent — its worktree must never be touched by any reap pass.
     let live = spawn(&mut client, repo_dir.path(), "hang-artifacts-1", json!({})).await;
