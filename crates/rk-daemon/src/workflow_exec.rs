@@ -206,6 +206,20 @@ enum RunOutcome {
     TimedOut,
 }
 
+/// A single `run_check_in` attempt once its outcome is fully decoded and
+/// classified — the payload `settled` carries out of the retry loop.
+struct SettledAttempt {
+    exit: i64,
+    stdout: String,
+    stdout_truncated: bool,
+    stderr: String,
+    stderr_truncated: bool,
+    timed_out: bool,
+    no_exit_code: bool,
+    signal: Option<i32>,
+    verdict: &'static str,
+}
+
 /// Decode a `spawn_check_child` outcome into the flat tuple `run_check_in`
 /// tracks. Factored out so a retried outcome (the shared cargo target-dir
 /// contention retry, and the initial attempt) decode identically.
@@ -3134,17 +3148,7 @@ impl WorkflowEngine {
         // guard is ever loosened.
         let attempts = resolved.retry_on_fail.saturating_add(1);
         let mut history: Vec<Value> = Vec::new();
-        let mut settled: Option<(
-            i64,
-            String,
-            bool,
-            String,
-            bool,
-            bool,
-            bool,
-            Option<i32>,
-            &'static str,
-        )> = None;
+        let mut settled: Option<SettledAttempt> = None;
         for attempt in 1..=attempts {
             let outcome = self
                 .spawn_check_child(command, dir, resolved, agent, env, timeout)
@@ -3245,7 +3249,7 @@ impl WorkflowEngine {
                 return Err(rk_core::Error::other(stderr));
             }
             if verdict == "pass" || attempt == attempts {
-                settled = Some((
+                settled = Some(SettledAttempt {
                     exit,
                     stdout,
                     stdout_truncated,
@@ -3255,7 +3259,7 @@ impl WorkflowEngine {
                     no_exit_code,
                     signal,
                     verdict,
-                ));
+                });
                 break;
             }
             info!(
@@ -3272,7 +3276,7 @@ impl WorkflowEngine {
         }
         // `attempts >= 1`, and `settled` is always set on the final iteration
         // (attempt == attempts), so the loop never exits without it.
-        let (
+        let SettledAttempt {
             exit,
             stdout,
             stdout_truncated,
@@ -3282,7 +3286,7 @@ impl WorkflowEngine {
             no_exit_code,
             signal,
             verdict,
-        ) = settled.expect("run step: attempt loop always settles by the final attempt");
+        } = settled.expect("run step: attempt loop always settles by the final attempt");
         info!(agent = %agent, exit, timed_out, no_exit_code, signal = ?signal, verdict, command = %command, retries = history.len(), "run step completed");
         let mut result = json!({
             "exit": exit,
