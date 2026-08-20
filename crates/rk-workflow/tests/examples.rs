@@ -3,23 +3,43 @@
 
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn workspace_root_from(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("examples/workflows").is_dir())
+        .map(Path::to_path_buf)
+}
+
+fn workspace_root() -> PathBuf {
+    let cwd = std::env::current_dir().expect("test process must have a current directory");
+    workspace_root_from(&cwd).unwrap_or_else(|| {
+        panic!(
+            "could not find the rat-kingdom workspace above runtime directory {}",
+            cwd.display()
+        )
+    })
+}
 
 fn examples_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("examples")
-        .join("workflows")
+    workspace_root().join("examples/workflows")
+}
+
+#[test]
+fn workspace_root_is_discovered_from_runtime_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let nested = root.path().join("crates/rk-workflow");
+    std::fs::create_dir_all(root.path().join("examples/workflows")).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+
+    assert_eq!(workspace_root_from(&nested).as_deref(), Some(root.path()));
 }
 
 #[test]
 fn repository_verify_check_trusts_only_its_current_worktree() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join(".rk")
-        .join("checks.cue");
+    let file = workspace_root().join(".rk/checks.cue");
     let checks = rk_workflow::load_checks(&file)
         .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
     let verify = checks
@@ -39,11 +59,7 @@ fn repository_verify_check_trusts_only_its_current_worktree() {
 
 #[test]
 fn repository_policy_preserves_agent_base_and_existing_names() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join(".rk")
-        .join("repo.cue");
+    let file = workspace_root().join(".rk/repo.cue");
     let policy = rk_workflow::load_repository_policy(&file)
         .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
 
@@ -119,11 +135,7 @@ fn research_example_loads_and_runs_engine_validation_after_artifact_production()
 
 #[test]
 fn shipped_example_triggers_load() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("examples")
-        .join("triggers.cue");
+    let file = workspace_root().join("examples/triggers.cue");
     let triggers = rk_workflow::load_triggers(&file)
         .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
     assert!(!triggers.is_empty(), "example triggers should not be empty");
@@ -149,11 +161,7 @@ fn shipped_example_triggers_load() {
 /// completion the old workflow trigger used to.
 #[test]
 fn landing_pipeline_trigger_loads_with_no_run_and_matches_rat_completions() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("examples")
-        .join("triggers-landing-pipeline.cue");
+    let file = workspace_root().join("examples/triggers-landing-pipeline.cue");
     let triggers = rk_workflow::load_triggers(&file)
         .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
     let landing = triggers
@@ -363,11 +371,7 @@ fn action_approval_smoke_target_is_a_harmless_noop() {
 
 #[test]
 fn shipped_example_schedules_load() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("examples")
-        .join("schedules.cue");
+    let file = workspace_root().join("examples/schedules.cue");
     let schedules = rk_workflow::load_schedules(&file)
         .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
     assert!(
@@ -391,11 +395,7 @@ fn shipped_example_schedules_load() {
 
 #[test]
 fn repository_activates_the_daily_nightly_schedule() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join(".rk")
-        .join("schedules.cue");
+    let file = workspace_root().join(".rk/schedules.cue");
     let schedules = rk_workflow::load_schedules(&file)
         .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
     assert_eq!(schedules.len(), 1, "one self-improvement cadence");
@@ -413,11 +413,7 @@ fn repository_activates_the_daily_nightly_schedule() {
 
 #[test]
 fn shipped_example_checks_load() {
-    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("examples")
-        .join("checks.cue");
+    let file = workspace_root().join("examples/checks.cue");
     let checks = rk_workflow::load_checks(&file)
         .unwrap_or_else(|e| panic!("{} failed to load: {e}", file.display()));
     assert!(!checks.is_empty(), "example checks should not be empty");
