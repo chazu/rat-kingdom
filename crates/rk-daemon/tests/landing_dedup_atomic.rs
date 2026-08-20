@@ -748,7 +748,10 @@ checks: [
     // lands with `--no-ff` (`rk-git/src/lib.rs`), so a 1-commit branch
     // yields the replayed commit plus the merge commit. A racing second
     // merge (the bug this test guards) would add 2 more.
-    let merge_count = git(&repo, &["rev-list", "--count", &format!("{main_before}..main")]);
+    let merge_count = git(
+        &repo,
+        &["rev-list", "--count", &format!("{main_before}..main")],
+    );
     assert_eq!(
         merge_count, "2",
         "the candidate must merge exactly once, not once per racing daemon: \
