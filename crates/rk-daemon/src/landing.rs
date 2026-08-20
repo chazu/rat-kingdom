@@ -1524,8 +1524,13 @@ impl LandingPipeline {
 
         let repo = rk_git::Repo::discover(Path::new(&entries[0].repo_path))?;
         let gates = self.gate_config(&repo);
-        let checks_file = Path::new(&entries[0].repo_path).join(".rk").join("checks.cue");
-        if self.gate_plan(&checks_file, &entries[0].target, &gates).is_err() {
+        let checks_file = Path::new(&entries[0].repo_path)
+            .join(".rk")
+            .join("checks.cue");
+        if self
+            .gate_plan(&checks_file, &entries[0].target, &gates)
+            .is_err()
+        {
             let mut outcomes = Vec::with_capacity(entries.len());
             for entry in entries {
                 outcomes.push((entry.clone(), self.process_entry(&entry).await?));
@@ -4231,7 +4236,10 @@ workflow: {
         assert_eq!(by_ordinal(2).payload["disposition"], "retry_passed");
         assert_eq!(by_ordinal(2).payload["verdict"], "pass");
         assert_eq!(by_ordinal(1).payload["check"], "verify");
-        assert_eq!(by_ordinal(1).payload["candidate_sha"], by_ordinal(2).payload["candidate_sha"]);
+        assert_eq!(
+            by_ordinal(1).payload["candidate_sha"],
+            by_ordinal(2).payload["candidate_sha"]
+        );
     }
 
     /// The symmetric failure case: a check that always dies to an
@@ -4584,10 +4592,7 @@ workflow: {
             .unwrap();
         assert_eq!(events.len(), 2, "events: {events:?}");
         assert_eq!(
-            events
-                .iter()
-                .filter(|e| e.payload["ordinal"] == 1)
-                .count(),
+            events.iter().filter(|e| e.payload["ordinal"] == 1).count(),
             1,
             "no duplicate ordinal-1 death: {events:?}"
         );
@@ -6322,7 +6327,10 @@ checks: [
         let (pipeline, git_repo, head_sha) = gate_sweep_fixture(home.path(), repo_dir.path());
         let gates = GateConfig::default();
         let mut entry = gate_sweep_entry(repo_dir.path(), "main", &head_sha);
-        assert!(pipeline.run_gates(&mut entry, &git_repo, &gates).await.unwrap());
+        assert!(pipeline
+            .run_gates(&mut entry, &git_repo, &gates)
+            .await
+            .unwrap());
 
         let gate_dir = pipeline.gate_worktree_path("myrepo", "main");
         assert!(gate_dir.is_dir());
@@ -6355,7 +6363,10 @@ checks: [
         let (pipeline, git_repo, head_sha) = gate_sweep_fixture(home.path(), repo_dir.path());
         let gates = GateConfig::default();
         let mut entry = gate_sweep_entry(repo_dir.path(), "main", &head_sha);
-        assert!(pipeline.run_gates(&mut entry, &git_repo, &gates).await.unwrap());
+        assert!(pipeline
+            .run_gates(&mut entry, &git_repo, &gates)
+            .await
+            .unwrap());
 
         let gate_dir = pipeline.gate_worktree_path("myrepo", "main");
         let marker = pipeline.gate_worktree_marker_path("myrepo", "main");
@@ -6386,7 +6397,10 @@ checks: [
 
         for target in ["a", "b", "c"] {
             let mut entry = gate_sweep_entry(repo_dir.path(), target, &head_sha);
-            assert!(pipeline.run_gates(&mut entry, &git_repo, &gates).await.unwrap());
+            assert!(pipeline
+                .run_gates(&mut entry, &git_repo, &gates)
+                .await
+                .unwrap());
             // Distinct, strictly increasing last-used timestamps even on
             // coarse filesystem/clock resolution.
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -6413,7 +6427,10 @@ checks: [
         let (pipeline, git_repo, head_sha) = gate_sweep_fixture(home.path(), repo_dir.path());
         let gates = GateConfig::default();
         let mut entry = gate_sweep_entry(repo_dir.path(), "main", &head_sha);
-        assert!(pipeline.run_gates(&mut entry, &git_repo, &gates).await.unwrap());
+        assert!(pipeline
+            .run_gates(&mut entry, &git_repo, &gates)
+            .await
+            .unwrap());
 
         // Backdate the marker so it would be evicted on age alone...
         let marker = pipeline.gate_worktree_marker_path("myrepo", "main");
