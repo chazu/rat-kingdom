@@ -2935,10 +2935,18 @@ impl LandingPipeline {
     /// carries the recorded outcome (the gate may continue iff the retry
     /// passed); `None` means the retry has not settled and must still run.
     ///
-    /// Scoped to the exact `(branch, target, task, candidate_sha, check)` this
-    /// gate run is settling: evidence from an earlier candidate of the same
-    /// branch is a different attempt with its own budget and must not be read
-    /// as this one's outcome.
+    /// Scoped to the exact `(branch, target, task, candidate_sha, check,
+    /// seq)` this gate run is settling: evidence from an earlier candidate of
+    /// the same branch is a different attempt with its own budget and must
+    /// not be read as this one's outcome. `seq` (`LandingQueueEntry::seq`) is
+    /// the durable queue-generation discriminator — `LandingQueue::requeue_tail`
+    /// can rebuild a stale-target candidate back to the exact same
+    /// `candidate_sha` it held before, and without `seq` that rebuilt
+    /// generation would silently inherit the previous generation's spent
+    /// ordinal-2 evidence and skip the bounded retry it is newly entitled to.
+    /// Evidence recorded before this field existed carries no `seq` and so
+    /// never matches here — the safe direction, since it only costs an extra
+    /// (still-bounded) retry rather than reusing stale evidence.
     fn settled_infra_retry(
         &self,
         entry: &LandingQueueEntry,
@@ -2955,7 +2963,8 @@ impl LandingPipeline {
                 && p.get("target").and_then(Value::as_str) == Some(entry.target.as_str())
                 && p.get("task").and_then(Value::as_str) == Some(entry.task.as_str())
                 && p.get("candidate_sha").and_then(Value::as_str) == Some(tested_sha)
-                && p.get("check").and_then(Value::as_str) == Some(check_name);
+                && p.get("check").and_then(Value::as_str) == Some(check_name)
+                && p.get("seq").and_then(Value::as_u64) == Some(entry.seq);
             matches.then(|| p.get("verdict").and_then(Value::as_str) == Some("pass"))
         }))
     }
@@ -3004,6 +3013,16 @@ impl LandingPipeline {
                     "target": entry.target,
                     "task": entry.task,
                     "candidate_sha": tested_sha,
+                    // The durable per-repo enqueue sequence for THIS queue
+                    // generation (`LandingQueueEntry::seq`) — constant across
+                    // `claim_next`/`set_status`/`persist`, but reassigned
+                    // fresh by `LandingQueue::requeue_tail` whenever a
+                    // candidate is rebuilt. A requeue can rebuild the exact
+                    // same `candidate_sha` (e.g. after a stale-target retry),
+                    // so branch/target/task/candidate_sha/check alone cannot
+                    // tell a fresh generation's ordinal-2 evidence apart from
+                    // a prior generation's — `seq` is what does.
+                    "seq": entry.seq,
                     "check": check_name,
                     // The RESOLVED command this attempt actually ran, not just
                     // the check's name: the evidence has to say what was
@@ -4707,6 +4726,187 @@ workflow: {
             .find(|e| e.payload["ordinal"] == 2)
             .unwrap_or_else(|| panic!("no ordinal-2 event: {events:?}"));
         assert_eq!(ordinal_2.payload["disposition"], "retry_exhausted");
+    }
+
+    /// Requeue-and-rebuild regression (landing-review-17987ae38cd4097d333c7cf22e89151e,
+    /// TKT-01M0G97GXNHA4VPRRXVMA9T6C8): `LandingQueue::requeue_tail` hands a
+    /// rebuilt candidate a fresh durable `seq` (the queue-generation
+    /// discriminator), but a rebuild can land on the EXACT SAME candidate SHA
+    /// a prior generation already spent its retry against.
+    /// `settled_infra_retry` must not let the new generation's own in-flight
+    /// retry read that prior generation's ordinal-2 evidence as if it were
+    /// its own — doing so would skip the newly-requeued generation's newly
+    /// entitled retry entirely and settle on a stale verdict instead.
+    #[tokio::test]
+    async fn requeued_generation_earns_its_own_retry_against_a_rebuilt_same_sha() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let attempt_log = home.path().join("infra-attempts.log");
+        write_checks(
+            repo_dir.path(),
+            &format!(
+                r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "echo x >> '{log}'; n=$(wc -l < '{log}'); if [ $n -eq 2 ]; then sleep 5; fi; kill -9 $$", timeout: "30s"}},
+]
+"#,
+                log = attempt_log.display()
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+
+        let base_entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            diff_class: "doc-only".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+
+        // Generation 1: enqueued, claimed, and left with durable ordinal-2
+        // evidence recording that it PASSED its retry against `head_sha` —
+        // fabricated directly (not run through the pipeline) so its verdict
+        // is deliberately the OPPOSITE of what generation 2's real check
+        // below will do, making a wrongly-reused verdict observable.
+        pipeline.enqueue(base_entry.clone()).unwrap().unwrap();
+        let gen1 = pipeline
+            .queue
+            .claim_next("code-repo", "main")
+            .unwrap()
+            .unwrap();
+        pipeline
+            .record_gate_infra_attempt(
+                &gen1,
+                &head_sha,
+                "verify",
+                "echo x; kill -9 $$",
+                2,
+                &json!({"verdict": "pass", "exit": 0}),
+            )
+            .unwrap();
+
+        // Requeue: a genuinely fresh generation (its own seq, budget, and
+        // in-flight marker all reset) that goes on to rebuild the EXACT SAME
+        // candidate SHA `head_sha` — the scenario the review flagged. Mirrors
+        // `process_next`'s real orchestration: `requeue_tail` only ADDS the
+        // new tuple, so the original claimed tuple (still durable, per
+        // `claim_next`'s doc) must be explicitly removed the same way
+        // `process_next` does once `process_entry` returns, or `claim_next`
+        // below would just re-claim generation 1 again (lower seq, still
+        // queued).
+        let seq2 = pipeline.queue.requeue_tail(&gen1).unwrap();
+        assert_ne!(
+            seq2, gen1.seq,
+            "requeue must hand out a fresh queue-generation seq"
+        );
+        pipeline.queue.remove(&gen1).unwrap();
+        let gen2 = pipeline
+            .queue
+            .claim_next("code-repo", "main")
+            .unwrap()
+            .unwrap();
+        assert_eq!(gen2.seq, seq2);
+        assert!(!gen2.gate_infra_retry_used);
+
+        // Drive generation 2's own real gate run: it dies (ordinal 1),
+        // spends its own budget, and starts its own retry — which is
+        // aborted mid-flight (the script's deliberate sleep) to leave
+        // `gate_infra_retry_check` durably set with no ordinal-2 evidence of
+        // generation 2's OWN yet, exactly the crash window
+        // `settled_infra_retry` exists to recover.
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let gates = GateConfig::default();
+        {
+            let pipeline = Arc::clone(&pipeline);
+            let git_repo = git_repo.clone();
+            let gates = gates.clone();
+            let mut gen2 = gen2.clone();
+            let handle = tokio::spawn(async move {
+                let _ = pipeline.run_gates(&mut gen2, &git_repo, &gates).await;
+            });
+            let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let pending = space
+                    .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                    .unwrap();
+                let retry_invocation_started = std::fs::read_to_string(&attempt_log)
+                    .map(|s| s.lines().count() >= 2)
+                    .unwrap_or(false);
+                if pending.len() == 1
+                    && pending[0].payload["gate_infra_retry_used"].as_bool() == Some(true)
+                    && pending[0].payload["gate_infra_retry_check"].as_str() == Some("verify")
+                    && retry_invocation_started
+                {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < poll_deadline,
+                    "generation 2 never reached a durably in-flight retry before the retry finished"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        let pending = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap();
+        assert_eq!(pending.len(), 1, "generation 2 must survive the crash");
+        assert_eq!(pending[0].payload["seq"], seq2);
+        let mut resumed: LandingQueueEntry =
+            serde_json::from_value(pending[0].payload.clone()).unwrap();
+        assert_eq!(resumed.gate_infra_retry_check.as_deref(), Some("verify"));
+
+        // "Restart": resume generation 2's in-flight retry. With the fix,
+        // its stale-evidence read must miss (different seq) and it must
+        // actually run the check one more time — observing the real death
+        // and holding, rather than silently inheriting generation 1's
+        // fabricated "pass".
+        let passed = pipeline
+            .run_gates(&mut resumed, &git_repo, &gates)
+            .await
+            .unwrap();
+        assert!(
+            !passed,
+            "generation 2 must settle from its OWN retry outcome, not generation 1's stale 'pass' evidence"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&attempt_log)
+                .unwrap()
+                .lines()
+                .count(),
+            3,
+            "generation 2 must actually execute its resumed retry rather than skip it"
+        );
+
+        let events = space
+            .scan(&Pattern::category(Category::Event).identity(GATE_INFRA_RETRY_IDENTITY))
+            .unwrap();
+        let gen2_ordinal2 = events
+            .iter()
+            .find(|e| e.payload["ordinal"] == 2 && e.payload["seq"] == seq2)
+            .unwrap_or_else(|| {
+                panic!("no ordinal-2 event stamped with generation 2's own seq: {events:?}")
+            });
+        assert_eq!(gen2_ordinal2.payload["verdict"], "infra");
+        assert_ne!(
+            gen2_ordinal2.payload["disposition"], "retry_passed",
+            "must not carry generation 1's stale verdict"
+        );
     }
 
     /// The second, narrower crash window in the same retry
