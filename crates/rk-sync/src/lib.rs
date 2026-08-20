@@ -145,7 +145,9 @@ impl NotesSync {
     }
 
     /// Append records to this actor's own notes ref (fast-forward-only by
-    /// construction — nobody else writes this ref).
+    /// construction — nobody else writes this ref). The complete batch is one
+    /// stdin-fed git operation: payload size does not consume argv space, and
+    /// callers only observe success after git commits the whole append.
     pub fn append(&self, records: &[SyncRecord]) -> rk_core::Result<()> {
         if records.is_empty() {
             return Ok(());
@@ -164,11 +166,11 @@ impl NotesSync {
                 &self.local_ref(),
                 "append",
                 "--no-separator",
-                "-m",
-                lines.trim_end(),
+                "-F",
+                "-",
                 &anchor,
             ],
-            None,
+            Some(&lines),
         )?;
         debug!(count = records.len(), r#ref = %self.local_ref(), "appended sync records");
         Ok(())
@@ -550,6 +552,45 @@ mod tests {
         assert!(all.contains(&r1) && all.contains(&r2));
         // Idempotent: re-materialize sees the same set.
         assert_eq!(sync.materialize().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn append_batch_larger_than_arg_max_materializes_every_record() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_repo(dir.path());
+        let sync = NotesSync::new(dir.path(), CastleIdentity::generate());
+
+        let output = Command::new("getconf").arg("ARG_MAX").output().unwrap();
+        assert!(output.status.success(), "getconf ARG_MAX failed");
+        let arg_max: usize = String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        let mut records = Vec::new();
+        let mut serialized_bytes = 0;
+        while serialized_bytes <= arg_max + 4096 {
+            let sequence = records.len();
+            let record = sync.record(SyncOp::Out {
+                tuple: Tuple::new(
+                    Category::Event,
+                    "repo",
+                    format!("oversized-batch-{sequence}"),
+                    "castle-a",
+                    json!({"blob": "x".repeat(64 * 1024), "sequence": sequence}),
+                ),
+            });
+            serialized_bytes += serde_json::to_vec(&record).unwrap().len() + 1;
+            records.push(record);
+        }
+        assert!(serialized_bytes > arg_max);
+
+        sync.append(&records).unwrap();
+
+        let materialized = sync.materialize().unwrap();
+        assert_eq!(materialized, records);
+        assert!(materialized.iter().all(SyncRecord::verify));
     }
 
     #[test]
