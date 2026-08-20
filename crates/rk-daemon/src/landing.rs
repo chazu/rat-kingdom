@@ -312,6 +312,35 @@ const LANDING_NON_MAIN_TARGET_IDENTITY: &str = "landing_non_main_land_target";
 /// reactor-fired.
 const REVIEW_WORKFLOW: &str = "steward-review";
 
+/// Identity of the durable primary-vs-shadow comparison record written by
+/// [`LandingPipeline::await_shadow_comparison`]. One per review request that
+/// ran with shadow review enabled, scoped to the candidate's repo and keyed
+/// (like the verdict artifact itself) on branch/head so
+/// `Pattern::for_commit` finds it. Purely observational: nothing in this
+/// pipeline ever reads it back to make a landing decision.
+const SHADOW_COMPARISON_IDENTITY: &str = "review-shadow-comparison";
+
+/// Suffix appended to a review request's stable instance id to derive the
+/// shadow reviewer's own id and, with it, the shadow's `review_attempt`. The
+/// distinct attempt is what keeps the two verdicts apart: both
+/// [`LandingPipeline::cached_verdict`] and `request_review`'s `rd` pattern
+/// match on the PRIMARY attempt, so a shadow verdict can never be routed on,
+/// re-read as a cache hit by a later pass, or race the primary.
+const SHADOW_INSTANCE_SUFFIX: &str = "-shadow";
+
+/// A launched shadow reviewer, carried from
+/// [`LandingPipeline::launch_shadow_review`] to the comparison record so the
+/// record can name the model whose opinion it holds.
+#[derive(Debug, Clone)]
+pub(crate) struct ShadowReview {
+    /// The shadow's instance id, which is also its `review_attempt` — the
+    /// key its verdict artifact is bound to and the one this comparison
+    /// polls on.
+    attempt: String,
+    model: String,
+    harness: String,
+}
+
 fn required_payload_str<'a>(
     payload: &'a Value,
     field: &str,
@@ -815,6 +844,14 @@ pub(crate) struct GateConfig {
     /// is never held to this ceiling — that case escalates immediately (see
     /// `ReviewWaitOutcome::ReviewerDied`).
     pub(crate) review_max_wait: Duration,
+    /// SHADOW REVIEW (`RepositoryPolicy.landing.shadowReviewModel`): when
+    /// non-empty, [`LandingPipeline::request_review`] also launches a second,
+    /// non-blocking reviewer on this model against the same candidate. Empty
+    /// disables shadow review. See [`LandingPipeline::launch_shadow_review`].
+    pub(crate) shadow_review_model: String,
+    /// Harness for the shadow reviewer. Ignored when `shadow_review_model` is
+    /// empty.
+    pub(crate) shadow_review_harness: String,
 }
 
 impl Default for GateConfig {
@@ -827,6 +864,14 @@ impl Default for GateConfig {
             gate_timeout: Duration::from_secs(60 * 60),
             review_timeout: Duration::from_secs(15 * 60),
             review_max_wait: Duration::from_secs(45 * 60),
+            // Deliberately OFF in this bare default, unlike every other field
+            // here: `gate_config` never reads these two from `Default` (it
+            // takes them straight off the resolved `LandingPolicy`, whose own
+            // default IS "sonnet"/"claude"), so the only consumers of the
+            // value below are unit tests constructing a `GateConfig` by hand —
+            // which must get exactly ONE reviewer unless they opt in.
+            shadow_review_model: String::new(),
+            shadow_review_harness: String::new(),
         }
     }
 }
@@ -967,6 +1012,8 @@ impl LandingPipeline {
                 .unwrap_or(defaults.review_timeout),
             review_max_wait: crate::workflow_exec::parse_duration(&policy.review_max_wait)
                 .unwrap_or(defaults.review_max_wait),
+            shadow_review_model: policy.shadow_review_model,
+            shadow_review_harness: policy.shadow_review_harness,
         }
     }
 
@@ -1703,20 +1750,7 @@ impl LandingPipeline {
             .set_status(entry, LandingEntryStatus::AwaitingReview)?;
 
         let instance_id = review_instance_id(entry);
-        let mut params = HashMap::new();
-        params.insert("taskId".to_string(), Value::String(entry.task.clone()));
-        params.insert("branch".to_string(), Value::String(entry.branch.clone()));
-        params.insert("repo".to_string(), Value::String(entry.repo_name.clone()));
-        params.insert("target".to_string(), Value::String(entry.target.clone()));
-        params.insert("headSha".to_string(), Value::String(entry.head_sha.clone()));
-        params.insert(
-            "reviewAttempt".to_string(),
-            Value::String(instance_id.clone()),
-        );
-        params.insert(
-            "reviewTimeout".to_string(),
-            Value::String(format!("{}s", gates.review_max_wait.as_secs())),
-        );
+        let params = self.review_params(entry, gates, &instance_id);
         let review = rk_core::review::ReviewContext {
             branch: entry.branch.clone(),
             head_sha: entry.head_sha.clone(),
@@ -1735,7 +1769,304 @@ impl LandingPipeline {
             params,
             review,
         )?;
+        let shadow = self.launch_shadow_review(entry, gates, &instance_id);
 
+        let outcome = self
+            .await_primary_verdict(entry, gates, &instance_id)
+            .await?;
+        // Fire-and-forget: the comparison is observational, so it must never
+        // add latency to (or fail) the landing decision that has already been
+        // reached above.
+        if let Some(shadow) = shadow {
+            self.spawn_shadow_comparison(entry, shadow, &instance_id, &outcome, gates);
+        }
+        Ok(outcome)
+    }
+
+    /// Workflow params for one review request — the PRIMARY reviewer's set.
+    /// `priority`/`labels` are the candidate ticket's, threaded through so the
+    /// review spawn participates in cost-tier routing (`tiers.rules`) exactly
+    /// like a `for_each` worker fan-out does; `reviewerModel`/`reviewerHarness`
+    /// are left empty here so the primary keeps whatever the tier table and
+    /// the workflow's own `agents.reviewer` profile resolve to (see
+    /// [`Self::launch_shadow_review`], which reuses this and overrides them).
+    fn review_params(
+        &self,
+        entry: &LandingQueueEntry,
+        gates: &GateConfig,
+        attempt: &str,
+    ) -> HashMap<String, Value> {
+        let (priority, labels) = self.review_candidate_routing(entry);
+        let mut params = HashMap::new();
+        params.insert("taskId".to_string(), Value::String(entry.task.clone()));
+        params.insert("branch".to_string(), Value::String(entry.branch.clone()));
+        params.insert("repo".to_string(), Value::String(entry.repo_name.clone()));
+        params.insert("target".to_string(), Value::String(entry.target.clone()));
+        params.insert("headSha".to_string(), Value::String(entry.head_sha.clone()));
+        params.insert("reviewAttempt".to_string(), Value::String(attempt.into()));
+        params.insert(
+            "reviewTimeout".to_string(),
+            Value::String(format!("{}s", gates.review_max_wait.as_secs())),
+        );
+        params.insert("priority".to_string(), Value::String(priority));
+        params.insert(
+            "labels".to_string(),
+            Value::Array(labels.into_iter().map(Value::String).collect()),
+        );
+        params.insert("reviewerModel".to_string(), Value::String(String::new()));
+        params.insert("reviewerHarness".to_string(), Value::String(String::new()));
+        params
+    }
+
+    /// The candidate ticket's `priority`/`labels` — the cost-tier routing
+    /// predicate for the review spawn. `entry.task` is a ticket id for every
+    /// candidate the reactor enqueues, but NOT for an operator `rk land
+    /// --task` with free text, and a ticket can always have been closed and
+    /// swept since; all of those degrade to `("", [])`, which matches no rule
+    /// carrying an explicit `priority`/`label` and so leaves resolution
+    /// exactly where it was before this wiring existed.
+    fn review_candidate_routing(&self, entry: &LandingQueueEntry) -> (String, Vec<String>) {
+        let Ok(Some(ticket)) = self.tickets.get(&entry.task) else {
+            return (String::new(), Vec::new());
+        };
+        let priority = ticket
+            .payload
+            .get("priority")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let labels = ticket
+            .payload
+            .get("labels")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        (priority, labels)
+    }
+
+    /// Launch the second, NON-BLOCKING reviewer when the repo's landing policy
+    /// configures one (`shadowReviewModel`), and return the handle the
+    /// comparison record needs. `None` when shadow review is disabled.
+    ///
+    /// The shadow is the same review workflow against the same candidate
+    /// branch/head, differing in exactly two ways: an inline
+    /// `model`/`harness` override pinning it to the configured shadow model
+    /// (an inline step override beats the tier table, unlike the primary's),
+    /// and a distinct instance id / `reviewAttempt`. That distinct attempt is
+    /// load-bearing — the primary's `rd` pattern and
+    /// [`Self::cached_verdict`] both filter on the PRIMARY attempt, so the
+    /// shadow's verdict is structurally incapable of being routed on or of
+    /// being served as a cache hit to a later pass. The primary verdict stays
+    /// the one and only authority.
+    ///
+    /// A launch failure is logged and swallowed: a broken shadow config must
+    /// never take down the real review.
+    fn launch_shadow_review(
+        &self,
+        entry: &LandingQueueEntry,
+        gates: &GateConfig,
+        primary_attempt: &str,
+    ) -> Option<ShadowReview> {
+        if gates.shadow_review_model.is_empty() {
+            return None;
+        }
+        let attempt = format!("{primary_attempt}{SHADOW_INSTANCE_SUFFIX}");
+        let mut params = self.review_params(entry, gates, &attempt);
+        params.insert(
+            "reviewerModel".to_string(),
+            Value::String(gates.shadow_review_model.clone()),
+        );
+        params.insert(
+            "reviewerHarness".to_string(),
+            Value::String(gates.shadow_review_harness.clone()),
+        );
+        let review = rk_core::review::ReviewContext {
+            branch: entry.branch.clone(),
+            head_sha: entry.head_sha.clone(),
+            target: entry.target.clone(),
+            task: entry.task.clone(),
+            attempt: attempt.clone(),
+        };
+        match self.engine.run_review_owned_with_id(
+            attempt.clone(),
+            REVIEW_WORKFLOW,
+            &entry.repo_path,
+            params,
+            review,
+        ) {
+            Ok(_) => Some(ShadowReview {
+                attempt,
+                model: gates.shadow_review_model.clone(),
+                harness: gates.shadow_review_harness.clone(),
+            }),
+            Err(e) => {
+                warn!(
+                    repo = %entry.repo_name, branch = %entry.branch,
+                    shadow_model = %gates.shadow_review_model,
+                    error = %e,
+                    "landing pipeline: shadow reviewer failed to launch; the primary \
+                     review is unaffected"
+                );
+                None
+            }
+        }
+    }
+
+    /// Detach the primary-vs-shadow comparison onto its own task so it can
+    /// outlive the landing decision (the shadow is typically still running
+    /// when the primary's verdict arrives) without holding the queue open.
+    /// Nothing awaits the handle; a lost task on daemon shutdown costs one
+    /// observational record and nothing else.
+    fn spawn_shadow_comparison(
+        &self,
+        entry: &LandingQueueEntry,
+        shadow: ShadowReview,
+        primary_attempt: &str,
+        outcome: &ReviewWaitOutcome,
+        gates: &GateConfig,
+    ) {
+        let primary_verdict = match outcome {
+            ReviewWaitOutcome::Verdict(v) => v.clone(),
+            // The primary never produced one — there is nothing to compare
+            // against, and the candidate is already headed for a human gate.
+            _ => return,
+        };
+        let space = self.space.clone();
+        let engine = Arc::clone(&self.engine);
+        let entry = entry.clone();
+        let primary_attempt = primary_attempt.to_string();
+        let wait = gates.review_max_wait;
+        tokio::spawn(async move {
+            if let Err(e) = Self::await_shadow_comparison(
+                space,
+                engine,
+                entry,
+                shadow,
+                primary_attempt,
+                primary_verdict,
+                wait,
+            )
+            .await
+            {
+                warn!(error = %e, "landing pipeline: shadow-review comparison not recorded");
+            }
+        });
+    }
+
+    /// Wait out the shadow reviewer (bounded by `wait`, off the landing path)
+    /// and write the durable [`SHADOW_COMPARISON_IDENTITY`] artifact. Returns
+    /// the tuple it wrote.
+    ///
+    /// Associated rather than a method so the detached task owns plain clones
+    /// (`Space`, `Arc<WorkflowEngine>`) instead of the pipeline itself, and so
+    /// tests can drive the wait deterministically.
+    ///
+    /// Records something in every case: agreement, disagreement, or a shadow
+    /// that died / ran out the window without a verdict. `agreement` is a
+    /// three-state string, never a bool, precisely so "the shadow never
+    /// answered" cannot be silently counted as "the two models disagreed".
+    async fn await_shadow_comparison(
+        space: Space,
+        engine: Arc<WorkflowEngine>,
+        entry: LandingQueueEntry,
+        shadow: ShadowReview,
+        primary_attempt: String,
+        primary_verdict: String,
+        wait: Duration,
+    ) -> rk_core::Result<Tuple> {
+        let mut pattern = Pattern::category(Category::Artifact)
+            .identity(REVIEW_ARTIFACT_IDENTITY)
+            .scope(&entry.repo_name);
+        pattern.payload_search = Some(format!("\"review_attempt\":\"{}\"", shadow.attempt));
+
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut shadow_verdict = None;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let slice = remaining.min(REVIEW_POLL_SLICE);
+            if let Some(tuple) = space.rd(&pattern, slice).await? {
+                shadow_verdict = tuple
+                    .payload
+                    .get("recommendation")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                break;
+            }
+            if let Some(instance) = engine.status_any(&shadow.attempt) {
+                if instance.status != InstanceStatus::Running {
+                    // Same last-race probe the primary wait does: the verdict
+                    // may have landed between the slice timing out and here.
+                    shadow_verdict = space
+                        .scan(&pattern)?
+                        .into_iter()
+                        .find_map(|t| {
+                            t.payload
+                                .get("recommendation")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        });
+                    break;
+                }
+            }
+        }
+
+        let agreement = match shadow_verdict.as_deref() {
+            None => "no-verdict",
+            Some(v) if v == primary_verdict => "agree",
+            Some(_) => "disagree",
+        };
+        let tuple = Tuple::new(
+            Category::Artifact,
+            entry.repo_name.clone(),
+            SHADOW_COMPARISON_IDENTITY,
+            "daemon",
+            json!({
+                "task": entry.task,
+                "branch": entry.branch,
+                "head_sha": entry.head_sha,
+                "target": entry.target,
+                "review_attempt": primary_attempt,
+                "shadow_attempt": shadow.attempt,
+                "primary_verdict": primary_verdict,
+                "shadow_verdict": shadow_verdict,
+                "shadow_model": shadow.model,
+                "shadow_harness": shadow.harness,
+                "agreement": agreement,
+                // Stated in the record itself so no later reader can mistake
+                // this for a second opinion the pipeline acted on.
+                "authoritative": "primary",
+            }),
+        )
+        .with_lifecycle(Lifecycle::Furniture);
+        space.out(tuple.clone())?;
+        info!(
+            repo = %entry.repo_name, branch = %entry.branch,
+            primary_verdict = %primary_verdict,
+            shadow_verdict = shadow_verdict.as_deref().unwrap_or("<none>"),
+            shadow_model = %shadow.model,
+            agreement,
+            "landing pipeline: recorded primary-vs-shadow review comparison"
+        );
+        Ok(tuple)
+    }
+
+    /// The liveness-aware wait on the PRIMARY reviewer's verdict tuple — the
+    /// loop described in [`Self::request_review`]'s doc, split out so the
+    /// shadow launch above it reads as the one-line side effect it is.
+    async fn await_primary_verdict(
+        &self,
+        entry: &LandingQueueEntry,
+        gates: &GateConfig,
+        instance_id: &str,
+    ) -> rk_core::Result<ReviewWaitOutcome> {
         let mut pattern = Pattern::category(Category::Artifact)
             .identity(REVIEW_ARTIFACT_IDENTITY)
             .scope(&entry.repo_name);
@@ -1764,7 +2095,7 @@ impl LandingPipeline {
                     .to_string();
                 return Ok(ReviewWaitOutcome::Verdict(recommendation));
             }
-            if let Some(instance) = self.engine.status_any(&instance_id) {
+            if let Some(instance) = self.engine.status_any(instance_id) {
                 if instance.status != InstanceStatus::Running {
                     // Same race as above: probe once more before declaring
                     // the reviewer dead-without-a-verdict.
