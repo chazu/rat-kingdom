@@ -738,14 +738,36 @@ pub struct DiskConfig {
     /// TKT-01M04D1QDBNCF0T0D0EHRVNJV5: with a per-worktree `target/`, disk
     /// usage multiplies by the number of concurrently live worktrees on a
     /// repo (60+ observed, 3-7 GB each) until `cargo test --workspace` fails
-    /// mid-run on ENOSPC even though nothing is actually leaked. Sharing the
-    /// cache trades that multiplication for cargo's own target-dir file lock
-    /// serializing overlapping builds — slower under heavy concurrency, but
-    /// never a hard failure the way running out of disk is. Defaults true for
-    /// a real deployment (`Daemon::new`); a bare `Supervisor` built directly
-    /// by a test defaults false ([`Self::shared_cargo_target`] is only wired
-    /// in from config), so existing tests asserting exact `agent_env` output
-    /// are unaffected.
+    /// mid-run on ENOSPC even though nothing is actually leaked.
+    ///
+    /// Defaults **false** (TKT-01M0EXYHV1GR9Z75QSS42HXBVK), reversing the
+    /// earlier default. The doc comment this replaced described the tradeoff
+    /// as "cargo's own target-dir file lock serializing overlapping builds —
+    /// slower under heavy concurrency, but never a hard failure." That is
+    /// wrong: sharing one `CARGO_TARGET_DIR` across worktrees corrupts builds
+    /// even with **zero** concurrency. Confirmed by a real two-`git worktree`
+    /// reproduction (two checkouts of this repo at different commits,
+    /// built *sequentially*, no overlap): the second build silently linked
+    /// against the first worktree's stale compiled `rk-core`, producing a
+    /// hard compile error (`E0560`, a struct field the first worktree's
+    /// checkout didn't have yet) — not a flake, 100% reproducible, and also
+    /// reproduced with a minimal two-crate fixture workspace (see
+    /// `crates/rk-core/tests/shared_cargo_target_worktree_isolation.rs`).
+    /// Cargo does not fully key a workspace-member unit's fingerprint by the
+    /// checkout's absolute path, so two worktrees of the same repo can
+    /// collide onto the same cached artifact regardless of timing. A
+    /// build-phase lock (cargo's own, or the daemon's `TestExecLock`) cannot
+    /// fix this because there is no race to serialize against — the wrong
+    /// answer is cached, not merely contended for.
+    ///
+    /// The original ENOSPC concern this flag traded against now has an
+    /// independent fix: [`WorktreeSweepConfig`] (enabled by default) reaps
+    /// each terminal worktree's own `target/` directory hourly, and
+    /// `min_free_gb` above refuses new spawns before a live batch can run a
+    /// repo out of room. An operator who still wants cross-worktree build
+    /// sharing despite the correctness risk can opt back in explicitly; nothing
+    /// downstream ([`crate::config`]'s wiring, `TestExecLock`, the
+    /// contention-retry in `run_check_in`) depends on the default.
     pub shared_cargo_target: bool,
 }
 
@@ -757,7 +779,7 @@ impl Default for DiskConfig {
         // enough room for the daemon itself to keep operating.
         Self {
             min_free_gb: 10,
-            shared_cargo_target: true,
+            shared_cargo_target: false,
         }
     }
 }
@@ -1249,6 +1271,22 @@ mod tests {
         assert_eq!(cfg, Config::default());
         assert_eq!(cfg.harness.default, "claude");
         assert_eq!(cfg.policy.automated_landing_workflows, ["steward"]);
+    }
+
+    /// TKT-01M0EXYHV1GR9Z75QSS42HXBVK: a shared `CARGO_TARGET_DIR` corrupts
+    /// builds across worktrees with no concurrency required (see the doc
+    /// comment on `DiskConfig::shared_cargo_target` and
+    /// `crates/rk-core/tests/shared_cargo_target_worktree_isolation.rs` for
+    /// the reproduction). Pin the default off so a future edit cannot flip it
+    /// back to `true` without this test naming what breaks.
+    #[test]
+    fn shared_cargo_target_defaults_off() {
+        assert!(
+            !DiskConfig::default().shared_cargo_target,
+            "a shared CARGO_TARGET_DIR corrupts cross-worktree builds even \
+             with zero concurrency (TKT-01M0EXYHV1GR9Z75QSS42HXBVK) — this \
+             must stay opt-in"
+        );
     }
 
     /// TKT-01M0E8PN9C41BWECGNW0990R3J's "repository or castle policy declares
