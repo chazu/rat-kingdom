@@ -2007,15 +2007,12 @@ impl LandingPipeline {
                 if instance.status != InstanceStatus::Running {
                     // Same last-race probe the primary wait does: the verdict
                     // may have landed between the slice timing out and here.
-                    shadow_verdict = space
-                        .scan(&pattern)?
-                        .into_iter()
-                        .find_map(|t| {
-                            t.payload
-                                .get("recommendation")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        });
+                    shadow_verdict = space.scan(&pattern)?.into_iter().find_map(|t| {
+                        t.payload
+                            .get("recommendation")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
                     break;
                 }
             }
@@ -5299,8 +5296,7 @@ workflow: {
         let outcome = {
             let pipeline = Arc::clone(&pipeline);
             let entry = entry.clone();
-            let handle =
-                tokio::spawn(async move { pipeline.request_review(&entry, &gates).await });
+            let handle = tokio::spawn(async move { pipeline.request_review(&entry, &gates).await });
             wait_for_spawn_count(&space, 1).await;
             space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
             handle.await.unwrap().unwrap()
@@ -5352,8 +5348,7 @@ workflow: {
         let outcome = {
             let pipeline = Arc::clone(&pipeline);
             let entry = entry.clone();
-            let handle =
-                tokio::spawn(async move { pipeline.request_review(&entry, &gates).await });
+            let handle = tokio::spawn(async move { pipeline.request_review(&entry, &gates).await });
             // Exactly two spawns: the primary and the one shadow — never more.
             assert_eq!(wait_for_spawn_count(&space, 2).await, 2);
             space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
@@ -5362,7 +5357,10 @@ workflow: {
         let ReviewWaitOutcome::Verdict(v) = outcome else {
             panic!("expected Verdict, got {outcome:?}");
         };
-        assert_eq!(v, "APPROVE", "the primary verdict is what request_review returns");
+        assert_eq!(
+            v, "APPROVE",
+            "the primary verdict is what request_review returns"
+        );
 
         // Neither more spawns happened waiting for the shadow to settle.
         assert_eq!(
@@ -5473,8 +5471,7 @@ workflow: {
         let outcome = {
             let pipeline = Arc::clone(&pipeline);
             let entry = entry.clone();
-            let handle =
-                tokio::spawn(async move { pipeline.request_review(&entry, &gates).await });
+            let handle = tokio::spawn(async move { pipeline.request_review(&entry, &gates).await });
             assert_eq!(wait_for_spawn_count(&space, 2).await, 2);
             space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
             handle.await.unwrap().unwrap()
@@ -5538,8 +5535,7 @@ workflow: {
         let outcome = tokio::time::timeout(Duration::from_secs(15), async {
             let pipeline = Arc::clone(&pipeline);
             let entry = entry.clone();
-            let handle =
-                tokio::spawn(async move { pipeline.request_review(&entry, &gates).await });
+            let handle = tokio::spawn(async move { pipeline.request_review(&entry, &gates).await });
             assert_eq!(wait_for_spawn_count(&space, 2).await, 2);
             space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
             handle.await.unwrap().unwrap()
@@ -5673,8 +5669,7 @@ workflow: {
         let outcome = {
             let pipeline = Arc::clone(&pipeline);
             let entry = entry.clone();
-            let handle =
-                tokio::spawn(async move { pipeline.request_review(&entry, &gates).await });
+            let handle = tokio::spawn(async move { pipeline.request_review(&entry, &gates).await });
             wait_for_spawn_count(&space, 1).await;
             space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
             handle.await.unwrap().unwrap()
