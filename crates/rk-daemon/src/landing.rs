@@ -1563,10 +1563,11 @@ impl LandingPipeline {
     }
 
     /// Non-blocking probe of Phase 2's commit-keyed verdict cache — ANY
-    /// prior run's recommendation for this exact `(repo, branch, head_sha)`,
-    /// regardless of who wrote it (§1.3). A hit is honored identically to a
-    /// fresh verdict — never re-reviewed to shop for a better opinion.
+    /// prior run's recommendation for this exact review context, regardless
+    /// of who wrote it (§1.3). A hit is honored identically to a fresh verdict
+    /// — never re-reviewed to shop for a better opinion.
     fn cached_verdict(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<String>> {
+        let expected_review_attempt = review_instance_id(entry);
         let pattern = Pattern::for_commit(
             Category::Artifact,
             REVIEW_ARTIFACT_IDENTITY,
@@ -1578,6 +1579,8 @@ impl LandingPipeline {
             let payload = &t.payload;
             if payload.get("task").and_then(Value::as_str) == Some(entry.task.as_str())
                 && payload.get("target").and_then(Value::as_str) == Some(entry.target.as_str())
+                && payload.get("review_attempt").and_then(Value::as_str)
+                    == Some(expected_review_attempt.as_str())
             {
                 payload
                     .get("recommendation")
@@ -3448,6 +3451,35 @@ workflow: {
         );
     }
 
+    #[test]
+    fn verdict_cache_rejects_wrong_or_missing_review_attempt() {
+        for review_attempt in [Some("landing-review-wrong-context"), None] {
+            let home = tempfile::tempdir().unwrap();
+            let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+            let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+            let space = Space::open_in_memory().unwrap();
+            let mut verdict = verdict_tuple(&head_sha, "APPROVE");
+            match review_attempt {
+                Some(attempt) => verdict.payload["review_attempt"] = json!(attempt),
+                None => {
+                    verdict
+                        .payload
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("review_attempt");
+                }
+            }
+            space.out(verdict).unwrap();
+            let pipeline = test_pipeline(home.path(), space);
+
+            assert_eq!(
+                pipeline.cached_verdict(&entry).unwrap(),
+                None,
+                "a verdict without the exact review attempt is not reusable: {review_attempt:?}"
+            );
+        }
+    }
+
     /// The APPROVE routing arm (`LandingPipeline::route_verdict`) is a
     /// second, independent prepared-landing route from the doc-only
     /// fast path — this proves the non-main visibility event fires there
@@ -3466,24 +3498,24 @@ workflow: {
         let head_sha = rev_parse(repo_dir.path(), "feature");
         git(repo_dir.path(), &["checkout", "base"]);
 
+        let entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "base".into(),
+            head_sha,
+            diff_class: "large".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
         let space = Space::open_in_memory().unwrap();
-        let mut verdict = verdict_tuple(&head_sha, "APPROVE");
+        let mut verdict = verdict_tuple(&entry.head_sha, "APPROVE");
         verdict.payload["target"] = json!("base");
+        verdict.payload["review_attempt"] = json!(review_instance_id(&entry));
         space.out(verdict).unwrap();
 
         let pipeline = test_pipeline(home.path(), space.clone());
-        pipeline
-            .enqueue(LandingQueueEntry {
-                repo_name: "code-repo".into(),
-                repo_path: repo_dir.path().display().to_string(),
-                branch: "feature".into(),
-                target: "base".into(),
-                head_sha,
-                diff_class: "large".into(),
-                task: "add src".into(),
-                ..Default::default()
-            })
-            .unwrap();
+        pipeline.enqueue(entry).unwrap();
 
         let outcomes = pipeline.drain_key("code-repo", "base").await.unwrap();
         assert_eq!(outcomes.len(), 1);
