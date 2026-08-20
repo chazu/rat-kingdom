@@ -2219,6 +2219,7 @@ impl Daemon {
             "budget.rollup" => reply(Response::ok(id, self.supervisor.fleet_rollup())),
             "inbox.list" => reply(self.handle_inbox(req).await),
             "inbox.ack" => reply(self.handle_inbox_ack(req)),
+            "reconcile.report" => reply(self.handle_reconcile(req).await),
             "agent.status" => reply(self.handle_named(req, |sup, name| {
                 sup.status(&name)
                     .map(|r| json!({"agent": r}))
@@ -2837,6 +2838,129 @@ impl Daemon {
         Ok(json!({"items": items, "truncated": response_truncated}))
     }
 
+    /// Assemble the cross-ledger convergence report (`crate::reconcile`) for
+    /// one repository: scan the durable views scoped to it, ask git the
+    /// questions `reconcile::build` needs pre-answered, then hand everything
+    /// to that pure function. Read-only throughout — every git call below is
+    /// one of `rk_git::Repo`'s ancestry reads, never a mutation.
+    async fn reconcile_value(&self, requested_repo: String) -> rk_core::Result<Value> {
+        let repo = self
+            .resolve_inbox_repo(Some(requested_repo))?
+            .ok_or_else(|| rk_core::Error::other("repo is required"))?;
+
+        let agents: Vec<crate::agents::AgentRecord> = self
+            .supervisor
+            .list_all()
+            .into_iter()
+            .filter(|a| a.repo_name == repo)
+            .collect();
+
+        let tickets = self.tickets.list(Some(repo.clone()), None, None)?;
+
+        let lands_pattern = Pattern::category(Category::Event)
+            .identity("branch_landed")
+            .scope(repo.clone());
+        let raw_lands = self
+            .space
+            .scan_newest_limited(&lands_pattern, MAX_SCAN_TUPLES)?;
+        let lands: Vec<Tuple> = crate::inbox::dropped_lands(&raw_lands)
+            .into_iter()
+            .cloned()
+            .collect();
+
+        // The same hand-off carve-outs `Server::ticket_reopen_sweep_at` uses:
+        // a ticket already recorded as landed, or still in flight through the
+        // landing queue, is not abandoned even if its owning agent has gone
+        // non-live. Unscoped scans, matching the sweep — ticket ids are
+        // globally unique ULIDs, so intersecting against this repo's own
+        // tickets below cannot pick up another repo's landed/queued ids.
+        let landed_tickets: HashSet<String> = self
+            .space
+            .scan(&Pattern::category(Category::Event).identity(crate::landing::LANDING_PROCESSED_IDENTITY))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.payload.get("outcome").and_then(Value::as_str) == Some("landed"))
+            .filter_map(|t| {
+                t.payload
+                    .get("task")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|task| !task.is_empty())
+            .collect();
+        let queued_tickets = crate::landing::tasks_in_landing_queue(&self.space);
+
+        // Both branch-shaped self-clearing checks reuse the exact machinery
+        // `rk inbox` uses: the dropped-land half of `cleared_branches`, and a
+        // dedicated ancestry check per ticket's own delivery record.
+        let cleared_branches = self.cleared_branches(&[&lands]).await?;
+
+        let delivered_pairs: HashSet<(String, String)> = tickets
+            .iter()
+            .filter_map(crate::tickets::delivery_of)
+            .filter(|d| !d.merge_commit.is_empty())
+            .map(|d| (d.merge_commit, d.target))
+            .collect();
+        let is_ancestor = self
+            .merge_commit_ancestry(&repo, delivered_pairs.into_iter().collect())
+            .await?;
+
+        let git = crate::reconcile::GitFacts {
+            is_ancestor,
+            cleared_branches,
+        };
+
+        let report = crate::reconcile::build(
+            &repo,
+            &tickets,
+            &agents,
+            &lands,
+            &landed_tickets,
+            &queued_tickets,
+            &git,
+        );
+        Ok(crate::reconcile::to_json(&report))
+    }
+
+    /// `(merge_commit, target) -> is merge_commit an ancestor of target?` for
+    /// every pair in `pairs`, resolved against the repo registered as `repo`.
+    /// An unregistered or unopenable repo returns an empty map — "cannot
+    /// check", which `reconcile::build` reads as no evidence rather than a
+    /// contradiction — instead of erroring the whole report over one bad
+    /// registration.
+    async fn merge_commit_ancestry(
+        &self,
+        repo: &str,
+        pairs: Vec<(String, String)>,
+    ) -> rk_core::Result<HashMap<(String, String), bool>> {
+        if pairs.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let path = {
+            let reg = self
+                .repos
+                .lock()
+                .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
+            reg.get(repo).map(|r| r.path.clone())
+        };
+        let Some(path) = path else {
+            return Ok(HashMap::new());
+        };
+        tokio::task::spawn_blocking(move || {
+            let mut result = HashMap::new();
+            let Ok(git_repo) = rk_git::Repo::discover(&path) else {
+                return result;
+            };
+            for (commit, target) in pairs {
+                let verdict = git_repo.is_ancestor(&commit, &target);
+                result.insert((commit, target), verdict);
+            }
+            result
+        })
+        .await
+        .map_err(|e| rk_core::Error::other(format!("git ancestry check panicked: {e}")))
+    }
+
     async fn handle_inbox(&self, req: Request) -> Response {
         let params: InboxParams = match parse_params(&req.params) {
             Ok(params) => params,
@@ -2920,6 +3044,21 @@ impl Daemon {
                 json!({"acked": id, "already": false, "written": true, "by": by}),
             ),
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
+    /// `reconcile.report` — the cross-ledger convergence report for one
+    /// repository (`crate::reconcile`). Read-only: no tuple is written and no
+    /// state changes, so repeated calls over unchanged state return identical
+    /// output.
+    async fn handle_reconcile(&self, req: Request) -> Response {
+        let params: ReconcileParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        match self.reconcile_value(params.repo).await {
+            Ok(value) => Response::ok(req.id, value),
+            Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
         }
     }
 
@@ -6930,6 +7069,11 @@ struct NameParams {
 struct InboxParams {
     #[serde(default)]
     repo: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReconcileParams {
+    repo: String,
 }
 
 #[derive(Deserialize)]

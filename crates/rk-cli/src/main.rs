@@ -7,6 +7,7 @@ mod factory_skill;
 mod ingest_cmds;
 mod observe;
 mod product_to_code_cmds;
+mod reconcile_cmds;
 mod repo_cmds;
 mod space_cmds;
 mod ticket_cmds;
@@ -96,6 +97,12 @@ enum Command {
         #[command(subcommand)]
         command: Option<InboxCommand>,
     },
+    /// Cross-ledger convergence report for one repository: read-only
+    /// comparison of the ticket, agent, landing, and git views, surfacing
+    /// contradictions between them (delivered-but-open tickets, terminal
+    /// assignees still owning active work, conflict-held landing work,
+    /// tracker claims git disagrees with).
+    Reconcile(reconcile_cmds::ReportArgs),
     /// Live fleet dashboard: agents, workflows, budget, inbox (q to quit).
     Top {
         /// Refresh interval in seconds.
@@ -1014,6 +1021,7 @@ async fn main() -> Result<()> {
             None => agent_cmds::inbox(&layout, cli.json).await?,
             Some(InboxCommand::Ack { id }) => agent_cmds::inbox_ack(&layout, id, cli.json).await?,
         },
+        Command::Reconcile(args) => reconcile_cmds::report(&layout, args, cli.json).await?,
         Command::Top { interval, all } => top::top(&layout, interval, all).await?,
         Command::Digest { since, llm } => observe::digest(&layout, &since, llm, cli.json).await?,
         Command::Status(args) => agent_cmds::status(&layout, args, cli.json).await?,
