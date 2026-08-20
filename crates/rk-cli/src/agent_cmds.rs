@@ -37,6 +37,11 @@ pub struct SpawnArgs {
     /// Model override.
     #[arg(long)]
     pub model: Option<String>,
+    /// Agent profile (`[agents.<name>]`) to dispatch on. Naming one opts this
+    /// spawn out of the fleet's `[[tiers.rules]]` cost routing, which otherwise
+    /// picks the profile from the ticket's labels/priority.
+    #[arg(long)]
+    pub profile: Option<String>,
     /// Harness permission mode (autonomous: bypassPermissions or danger-full-access).
     #[arg(long)]
     pub permission_mode: Option<String>,
@@ -275,6 +280,7 @@ pub async fn spawn(layout: &Layout, args: SpawnArgs, as_json: bool) -> Result<()
                 "parent": args.parent,
                 "base": args.base,
                 "model": args.model,
+                "profile": args.profile,
                 "permission_mode": args.permission_mode,
                 "attach": args.attach,
             }),
@@ -304,8 +310,26 @@ pub async fn spawn(layout: &Layout, args: SpawnArgs, as_json: bool) -> Result<()
             agent["harness"].as_str().unwrap_or("?"),
             agent["branch"].as_str().unwrap_or("?"),
         );
+        // Say which profile this landed on and why. Cost routing is otherwise
+        // invisible at dispatch — an operator would have to read back the
+        // agent record's model to notice a ticket went premium.
+        println!("  profile {}", describe_routing(&result, agent));
     }
     Ok(())
+}
+
+/// One line describing the profile a spawn resolved to and where it came from:
+/// a cost-tier rule, an explicit `--profile`, or the global defaults.
+fn describe_routing(result: &Value, agent: &Value) -> String {
+    let model = agent["model"].as_str().unwrap_or("harness default");
+    match (
+        result["routing"]["profile"].as_str(),
+        result["routing"]["source"].as_str(),
+    ) {
+        (Some(name), Some("tier")) => format!("{name} (cost tier, from ticket labels/priority) · model {model}"),
+        (Some(name), _) => format!("{name} (--profile, tier routing bypassed) · model {model}"),
+        _ => format!("agents.default (no tier rule matched) · model {model}"),
+    }
 }
 
 pub async fn list(layout: &Layout, args: ListArgs, as_json: bool) -> Result<()> {
