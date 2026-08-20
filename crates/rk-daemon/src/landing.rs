@@ -69,6 +69,9 @@
 //! that live wiring.
 #![allow(dead_code)]
 
+use crate::landing_rework::{
+    self, ReworkContext, ReworkPolicy, ReworkRoute, Withheld, REWORK_DISPATCH_IDENTITY,
+};
 use crate::supervisor::Supervisor;
 use crate::tickets::{NewTicket, Tickets};
 use crate::workflow_exec::{InstanceStatus, OnTimeout, ResolvedRun, WorkflowEngine};
@@ -1753,9 +1756,7 @@ impl LandingPipeline {
                 self.record_delivery(entry, &result).await;
                 Ok(LandingOutcome::Landed(result))
             }
-            "REWORK" => Ok(LandingOutcome::ReworkFiled(
-                self.file_rework_ticket(entry).await?,
-            )),
+            "REWORK" => self.route_rework(entry, git_repo).await,
             "STOP" => {
                 let text = format!(
                     "steward: reviewer returned STOP for {} on {} — needs a human merge \
@@ -1851,6 +1852,279 @@ impl LandingPipeline {
         }
     }
 
+    /// This entry's repo-owned unattended-rework bounds, resolved from the
+    /// same activated `.rk/repo.cue` `landing` block [`Self::gate_config`]
+    /// reads — the REWORK arm's counterpart to `GateConfig`.
+    fn rework_policy(&self, repo: &rk_git::Repo) -> ReworkPolicy {
+        ReworkPolicy::from_landing(&self.supervisor.repository_policy(repo).landing)
+    }
+
+    /// Every durable rework-dispatch marker for `branch` in this repo,
+    /// regardless of which head it was written against.
+    ///
+    /// CHAIN-scoped on purpose, not head-scoped: each landed rework moves the
+    /// reviewed branch to a NEW head, so a `(branch, head_sha)` count would
+    /// reset to zero on every pass and `max_attempts` would never bind. The
+    /// per-head probe ([`Self::rework_dispatch_marker`]) is a different
+    /// question — "did we already route THIS exact commit" — and is what makes
+    /// redelivery and restart idempotent.
+    fn rework_dispatch_markers(&self, repo_name: &str, branch: &str) -> rk_core::Result<Vec<Tuple>> {
+        let pattern = Pattern::category(Category::Event)
+            .identity(REWORK_DISPATCH_IDENTITY)
+            .scope(repo_name);
+        Ok(self
+            .space
+            .scan(&pattern)?
+            .into_iter()
+            .filter(|t| t.payload.get("branch").and_then(Value::as_str) == Some(branch))
+            .collect())
+    }
+
+    /// The marker for one EXACT reviewed commit, if this verdict was already
+    /// routed. Its presence is what a redelivered completion, a restart, or a
+    /// repeated queue scan trips on, so none of them can mint a second rework
+    /// ticket or a second rework agent.
+    fn rework_dispatch_marker(
+        &self,
+        entry: &LandingQueueEntry,
+    ) -> rk_core::Result<Option<Tuple>> {
+        let pattern = Pattern::for_commit(
+            Category::Event,
+            REWORK_DISPATCH_IDENTITY,
+            &entry.branch,
+            &entry.head_sha,
+        )
+        .scope(&entry.repo_name);
+        Ok(self.space.scan(&pattern)?.into_iter().next())
+    }
+
+    /// Cumulative USD across this reviewed branch's whole review/rework chain:
+    /// the agent that produced the branch (`branch == reviewed branch`) plus
+    /// every rework agent dispatched to land back onto it (`target_branch ==
+    /// reviewed branch`). Read from `list_all` rather than `list` so a
+    /// dismissed or archived attempt still counts — a cap that forgets what
+    /// prior attempts cost is not a cap.
+    fn rework_chain_spend(&self, repo_name: &str, branch: &str) -> f64 {
+        self.supervisor
+            .list_all()
+            .iter()
+            .filter(|a| {
+                a.repo_name == repo_name
+                    && (a.branch.as_deref() == Some(branch) || a.target_branch == branch)
+            })
+            .map(|a| a.cost_usd)
+            .sum()
+    }
+
+    /// Route one REWORK verdict: file the follow-up ticket (idempotently),
+    /// classify the verdict on the authority ladder, check the repository's
+    /// caps, and then either dispatch exactly one rework agent from the
+    /// reviewed branch at its exact head or hold the branch behind one
+    /// evidence-rich human gate.
+    ///
+    /// The ticket is filed on BOTH paths and before the routing decision: a
+    /// withheld verdict must still leave a durable work item behind, which is
+    /// exactly the pre-feature behaviour this arm preserves.
+    async fn route_rework(
+        &self,
+        entry: &LandingQueueEntry,
+        git_repo: &rk_git::Repo,
+    ) -> rk_core::Result<LandingOutcome> {
+        // Idempotency gate, checked before any side effect: an already-routed
+        // commit replays its recorded ticket instead of routing again.
+        if let Some(marker) = self.rework_dispatch_marker(entry)? {
+            let recorded = marker
+                .payload
+                .get("rework_ticket")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            info!(
+                repo = %entry.repo_name, branch = %entry.branch, head_sha = %entry.head_sha,
+                ticket = %recorded,
+                "landing pipeline: REWORK already routed for this exact head; not re-dispatching"
+            );
+            if let Some(ticket) = self.tickets.get(&recorded)? {
+                return Ok(LandingOutcome::ReworkFiled(ticket));
+            }
+        }
+
+        let review = self.review_artifact(entry)?;
+        let stat = {
+            let repo = git_repo.clone();
+            let target = entry.target.clone();
+            let branch = entry.branch.clone();
+            blocking(move || repo.diff_stat(&target, &branch)).await?
+        };
+        let ticket = self.file_rework_ticket(entry).await?;
+        let ctx = ReworkContext {
+            repo: entry.repo_name.clone(),
+            branch: entry.branch.clone(),
+            head_sha: entry.head_sha.clone(),
+            target: entry.target.clone(),
+            task: entry.task.clone(),
+            rework_ticket: ticket.identity.clone(),
+            notes: landing_rework::notes(review.as_ref()),
+            diff_files: stat.files.len() as u64,
+            diff_lines: stat.lines,
+        };
+
+        let policy = self.rework_policy(git_repo);
+        let attempts_used = self
+            .rework_dispatch_markers(&entry.repo_name, &entry.branch)?
+            .len() as u32;
+        let spent_usd = self.rework_chain_spend(&entry.repo_name, &entry.branch);
+
+        let route = landing_rework::route(&policy, review.as_ref(), attempts_used, spent_usd);
+        let attempt = match route {
+            ReworkRoute::Withhold(withheld) => {
+                self.escalate(entry, ctx.escalation(&withheld))?;
+                self.space.out(
+                    Tuple::new(
+                        Category::Event,
+                        entry.repo_name.clone(),
+                        REWORK_DISPATCH_IDENTITY,
+                        "daemon",
+                        ctx.marker_payload(attempts_used, None, withheld.code),
+                    )
+                    .with_lifecycle(Lifecycle::Furniture),
+                )?;
+                return Ok(LandingOutcome::ReworkFiled(ticket));
+            }
+            ReworkRoute::Dispatch { attempt } => attempt,
+        };
+
+        // EXACT-BASE GUARD. `SpawnParams::base` cuts the worktree from the
+        // branch TIP, so dispatching while the tip has moved past the head we
+        // reviewed would hand the agent work nobody reviewed. That is a
+        // human's call, not a silent retarget, so it withholds rather than
+        // dispatching against the newer tip.
+        let tip = {
+            let repo = git_repo.clone();
+            let branch = entry.branch.clone();
+            blocking(move || repo.rev_parse(&branch)).await?
+        };
+        if tip != entry.head_sha {
+            let withheld = Withheld {
+                code: "reviewed-head-moved",
+                detail: format!(
+                    "the reviewed head {} is no longer {}'s tip (now {tip}), so a rework cut from \
+                     the branch would start from work this verdict never reviewed",
+                    entry.head_sha, entry.branch
+                ),
+                decision: "re-review the branch at its current tip, or reset it back to the \
+                           reviewed head and let the rework dispatch"
+                    .into(),
+            };
+            self.escalate(entry, ctx.escalation(&withheld))?;
+            self.space.out(
+                Tuple::new(
+                    Category::Event,
+                    entry.repo_name.clone(),
+                    REWORK_DISPATCH_IDENTITY,
+                    "daemon",
+                    ctx.marker_payload(attempts_used, None, withheld.code),
+                )
+                .with_lifecycle(Lifecycle::Furniture),
+            )?;
+            return Ok(LandingOutcome::ReworkFiled(ticket));
+        }
+
+        // MARKER BEFORE SPAWN, deliberately. A crash in the window between
+        // these two writes must leave the chain over-marked (one recorded
+        // attempt, no agent — recoverable by hand) rather than under-marked
+        // (an agent nothing knows about, which a restart would duplicate).
+        self.space.out(
+            Tuple::new(
+                Category::Event,
+                entry.repo_name.clone(),
+                REWORK_DISPATCH_IDENTITY,
+                "daemon",
+                ctx.marker_payload(attempt, None, "dispatching"),
+            )
+            .with_lifecycle(Lifecycle::Furniture),
+        )?;
+
+        let params = crate::supervisor::SpawnParams {
+            repo: entry.repo_path.clone(),
+            task: ctx.rework_ticket.clone(),
+            prompt: Some(ctx.prompt()),
+            role: "rat".to_string(),
+            // The whole point of the arm: the rework's base — and so its merge
+            // target on dismissal — is the REVIEWED branch, never `target`.
+            base: Some(entry.branch.clone()),
+            ..Default::default()
+        };
+        match self.supervisor.spawn_async(params, 0).await {
+            Ok(record) => {
+                info!(
+                    repo = %entry.repo_name, branch = %entry.branch, head_sha = %entry.head_sha,
+                    agent = %record.name, ticket = %ctx.rework_ticket, attempt,
+                    "landing pipeline: dispatched bounded rework agent from the reviewed branch"
+                );
+                self.space.out(
+                    Tuple::new(
+                        Category::Event,
+                        entry.repo_name.clone(),
+                        REWORK_DISPATCH_IDENTITY,
+                        "daemon",
+                        ctx.marker_payload(attempt, Some(&record.name), "dispatched"),
+                    )
+                    .with_lifecycle(Lifecycle::Furniture),
+                )?;
+                if let Err(e) = self
+                    .tickets
+                    .update(
+                        &ctx.rework_ticket,
+                        crate::tickets::TicketChanges {
+                            assignee: Some(record.name.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    warn!(
+                        ticket = %ctx.rework_ticket, agent = %record.name, error = %e,
+                        "landing pipeline: failed to record rework assignee"
+                    );
+                }
+            }
+            Err(e) => {
+                // A refused spawn (budget, WIP cap, paused dispatch) is not a
+                // landing failure — the branch is held either way. It becomes
+                // the same human gate every other withheld verdict gets, so
+                // the refusal is visible rather than only in the daemon log.
+                let withheld = Withheld {
+                    code: "dispatch-refused",
+                    detail: format!("the rework spawn was refused by the supervisor: {e}"),
+                    decision: "clear whatever refused the dispatch (budget cap, WIP ceiling, \
+                               paused dispatch), then dispatch the rework ticket"
+                        .into(),
+                };
+                self.escalate(entry, ctx.escalation(&withheld))?;
+                warn!(
+                    repo = %entry.repo_name, branch = %entry.branch, error = %e,
+                    "landing pipeline: bounded rework dispatch refused"
+                );
+            }
+        }
+        Ok(LandingOutcome::ReworkFiled(ticket))
+    }
+
+    /// The full review artifact for this exact `(repo, branch, head_sha)` —
+    /// the classifier's input, as opposed to [`Self::cached_verdict`]'s
+    /// recommendation-only projection of the same tuple.
+    fn review_artifact(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<Value>> {
+        let pattern = Pattern::for_commit(
+            Category::Artifact,
+            REVIEW_ARTIFACT_IDENTITY,
+            &entry.branch,
+            &entry.head_sha,
+        )
+        .scope(&entry.repo_name);
+        Ok(self.space.scan(&pattern)?.into_iter().next().map(|t| t.payload))
+    }
+
     /// File the REWORK follow-up directly through `Tickets::create` (§1.5) —
     /// the same shape `steward-file-rework-ticket` produces today, minus the
     /// shell hop. The branch is left as-is: no agent worktree exists for the
@@ -1870,7 +2144,13 @@ impl LandingPipeline {
                 labels: Vec::new(),
                 depends_on: Vec::new(),
                 created_by: Some("daemon".to_string()),
-                coalesce_key: None,
+                // Idempotent on the reviewed work key: a redelivered
+                // completion or a restart-driven reprocess resolves to the
+                // SAME follow-up ticket instead of minting a second one.
+                coalesce_key: Some(format!(
+                    "landing-rework:{}:{}:{}",
+                    entry.repo_name, entry.branch, entry.head_sha
+                )),
             })
             .await
     }

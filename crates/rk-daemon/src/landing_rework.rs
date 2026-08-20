@@ -524,7 +524,7 @@ mod tests {
         assert_eq!(withheld.code, "budget-exhausted");
 
         let unlimited = ReworkPolicy {
-            max_usd: 0.0,
+            max_usd: 0,
             ..ReworkPolicy::default()
         };
         assert_eq!(
