@@ -2261,7 +2261,10 @@ impl Supervisor {
         let budget = self.budget_for(record);
         format!(
             "budget stop: spent ${:.2} / ${:.2} cap; {} / {} token cap",
-            record.cost_usd, budget.max_usd, record.usage.total(), budget.max_tokens
+            record.cost_usd,
+            budget.max_usd,
+            record.usage.total(),
+            budget.max_tokens
         )
     }
 

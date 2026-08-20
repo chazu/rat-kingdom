@@ -2628,10 +2628,8 @@ checks: [
         assert_eq!(policy.landing.shadow_review_harness, "codex");
 
         // Empty disables shadow review; the loader must not reject it.
-        let disabled = load_repository_policy_str(
-            r#"repo: {landing: {shadowReviewModel: ""}}"#,
-        )
-        .unwrap();
+        let disabled =
+            load_repository_policy_str(r#"repo: {landing: {shadowReviewModel: ""}}"#).unwrap();
         assert_eq!(disabled.landing.shadow_review_model, "");
     }
 
