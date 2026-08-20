@@ -588,6 +588,7 @@ fn every_shipped_verdict_read_is_bound_to_its_reviewer() {
             json!("How does the tuplespace work?"),
         ),
         ("branch".to_string(), json!("rat/example-task/tkt-1")),
+        ("reviewAttempt".to_string(), json!("landing-review-example")),
     ]);
     let mut total = 0;
     for def in rk_workflow::definitions(&examples_dir()) {
