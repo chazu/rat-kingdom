@@ -353,6 +353,66 @@ fn tracker_contradicts_git(tickets: &[Tuple], git: &GitFacts) -> Vec<Violation> 
         .collect()
 }
 
+/// The record for one *generation* of a name: the row whose
+/// [`AgentRecord::spawn_id`] is the one the caller captured, not merely the
+/// row that happens to hold the name now. Preferring a live row over a
+/// settled one covers the archive/persist crash window, where the same
+/// generation can briefly appear twice.
+fn generation_of<'a>(
+    agents: &'a [AgentRecord],
+    name: &str,
+    spawn: rk_core::id::SpawnId,
+) -> Option<&'a AgentRecord> {
+    agents
+        .iter()
+        .filter(|a| a.name == name && a.spawn_id() == spawn)
+        .reduce(|best, a| {
+            if !best.state.is_live() && a.state.is_live() {
+                a
+            } else {
+                best
+            }
+        })
+}
+
+/// The agent generation a settled instance was actually supervising, or
+/// `None` where the join cannot be made safely.
+///
+/// Names are reusable across generations — the registry frees a name once its
+/// holder is archived (TKT-146) — so a name-only join lets a *newer namesake*
+/// stand in for the generation the run really held. That is the exact shape
+/// of a false [`kind::WORKFLOW_SETTLED_AGENT_STILL_LIVE`], and this check's
+/// authority is [`Authority::Mechanical`], so a false positive is a script
+/// tearing down an innocent live rat. The join therefore keys on
+/// `WorkflowContext::active_agent_spawn`/[`AgentRecord::spawn_id`], the same
+/// durable generation identity `dismiss` guards itself with
+/// (`Supervisor::dismiss_checked`). A recorded spawn id with no matching row
+/// means that generation is no longer in the agent view at all — nothing to
+/// report, never a fall back to the name.
+///
+/// Legacy instances snapshotted before `active_agent_spawn` existed carry no
+/// generation identity, so they fall back to the name join this check has
+/// always used, fenced by the instant the run settled: an agent record
+/// created at or after that instant cannot be the one the run was
+/// supervising, so a newer namesake is still never mistaken for a leak. An
+/// instance with no settlement timestamp has no fence to apply and stays
+/// silent rather than risk a mechanical dismissal on a name alone.
+fn supervised_generation<'a>(
+    i: &Instance,
+    agents: &'a [AgentRecord],
+    by_name: &HashMap<&str, &'a AgentRecord>,
+) -> Option<&'a AgentRecord> {
+    let active = i.context.active_agent.as_deref()?;
+    match i.context.active_agent_spawn {
+        Some(spawn) => generation_of(agents, active, spawn),
+        None => {
+            let settled_at = i.completed_at?;
+            let candidate = by_name.get(active).copied()?;
+            (candidate.created_at < settled_at).then_some(candidate)
+        }
+    }
+}
+
 /// A workflow instance's own ledger records the run as settled
 /// (`Completed`/`Failed`), but the agent view shows its `active_agent` is
 /// still live. Normal settlement dismisses the active agent as part of
@@ -360,6 +420,9 @@ fn tracker_contradicts_git(tickets: &[Tuple], git: &GitFacts) -> Vec<Violation> 
 /// declared the run over while a worker under it is still running unwatched
 /// — a supervision leak, not an in-progress hand-off. Archived instances are
 /// excluded: they are historical record, not something to act on again.
+///
+/// The instance-to-agent join is by generation, not by name — see
+/// [`supervised_generation`] for why a name alone cannot carry it.
 fn workflow_settled_agent_still_live(
     instances: &[Instance],
     agents: &[AgentRecord],
@@ -370,8 +433,7 @@ fn workflow_settled_agent_still_live(
         .filter(|i| i.archived_at.is_none())
         .filter(|i| matches!(i.status, InstanceStatus::Completed | InstanceStatus::Failed))
         .filter_map(|i| {
-            let active = i.context.active_agent.as_deref()?;
-            let agent = by_name.get(active)?;
+            let agent = supervised_generation(i, agents, &by_name)?;
             if !agent.state.is_live() {
                 return None;
             }
@@ -389,6 +451,9 @@ fn workflow_settled_agent_still_live(
                     format!("workflow_instance.status:{:?}", i.status),
                     format!("agent:{}", agent.name),
                     format!("agent.state:{:?}", agent.state),
+                    // The generation the join was made on, so a reader can
+                    // confirm this is the run's own agent and not a namesake.
+                    format!("agent.spawn:{}", agent.spawn_id()),
                 ],
                 authority: Authority::Mechanical,
             })
@@ -570,6 +635,29 @@ mod tests {
             trigger: None,
             stale_timeout_secs: None,
         }
+    }
+
+    /// An instance carrying `agent`'s generation identity — the shape every
+    /// instance written since `active_agent_spawn` landed has, and the shape
+    /// the generation-safe join is built for. A terminal instance also gets
+    /// the settlement timestamp the engine stamps on it.
+    fn instance_for(id: &str, repo: &str, status: InstanceStatus, agent: &AgentRecord) -> Instance {
+        let mut i = instance(id, repo, status, Some(&agent.name));
+        i.context.active_agent_spawn = Some(agent.spawn_id());
+        if matches!(status, InstanceStatus::Completed | InstanceStatus::Failed) {
+            i.completed_at = Some(Utc::now());
+        }
+        i
+    }
+
+    /// A record with an explicitly minted generation. Two `agent()` calls in
+    /// the same millisecond synthesise the *same* id from `created_at`, so
+    /// any test about two generations of one name has to mint them.
+    fn generation(name: &str, state: AgentState, created_at: chrono::DateTime<Utc>) -> AgentRecord {
+        let mut a = agent(name, None, state);
+        a.spawn = Some(rk_core::id::SpawnId::new());
+        a.created_at = created_at;
+        a
     }
 
     fn branch_landed(
@@ -892,8 +980,8 @@ mod tests {
 
     #[test]
     fn a_settled_instance_with_a_still_live_active_agent_is_flagged() {
-        let i = instance("wf-1", "myrepo", InstanceStatus::Completed, Some("Whisker"));
         let a = agent("Whisker", None, AgentState::Running);
+        let i = instance_for("wf-1", "myrepo", InstanceStatus::Completed, &a);
         let report = build(
             "myrepo",
             &[],
@@ -915,8 +1003,8 @@ mod tests {
 
     #[test]
     fn a_failed_instance_with_a_still_live_active_agent_is_flagged() {
-        let i = instance("wf-1", "myrepo", InstanceStatus::Failed, Some("Whisker"));
         let a = agent("Whisker", None, AgentState::Running);
+        let i = instance_for("wf-1", "myrepo", InstanceStatus::Failed, &a);
         let report = build(
             "myrepo",
             &[],
@@ -936,8 +1024,8 @@ mod tests {
 
     #[test]
     fn a_running_instance_with_a_live_active_agent_is_not_flagged() {
-        let i = instance("wf-1", "myrepo", InstanceStatus::Running, Some("Whisker"));
         let a = agent("Whisker", None, AgentState::Running);
+        let i = instance_for("wf-1", "myrepo", InstanceStatus::Running, &a);
         let report = build(
             "myrepo",
             &[],
@@ -953,8 +1041,8 @@ mod tests {
 
     #[test]
     fn a_settled_instance_whose_agent_already_settled_too_is_not_flagged() {
-        let i = instance("wf-1", "myrepo", InstanceStatus::Completed, Some("Whisker"));
         let a = agent("Whisker", None, AgentState::Dismissed);
+        let i = instance_for("wf-1", "myrepo", InstanceStatus::Completed, &a);
         let report = build(
             "myrepo",
             &[],
@@ -987,9 +1075,154 @@ mod tests {
     #[test]
     fn an_archived_settled_instance_with_a_live_agent_is_not_flagged() {
         // Historical record — nothing to act on again.
-        let mut i = instance("wf-1", "myrepo", InstanceStatus::Completed, Some("Whisker"));
-        i.archived_at = Some(Utc::now());
         let a = agent("Whisker", None, AgentState::Running);
+        let mut i = instance_for("wf-1", "myrepo", InstanceStatus::Completed, &a);
+        i.archived_at = Some(Utc::now());
+        let report = build(
+            "myrepo",
+            &[],
+            &[a],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[i],
+            &GitFacts::default(),
+        );
+        assert!(report.violations.is_empty());
+    }
+
+    #[test]
+    fn an_old_settled_instance_does_not_flag_a_newer_live_namesake() {
+        // The name "Whisker" outlived its first holder: the generation wf-old
+        // supervised was dismissed, the registry freed the name, and a later
+        // spawn took it. A name-only join reports the stranger — and this
+        // violation's authority is Mechanical, so that report is a script
+        // dismissing a live rat out from under whatever is actually
+        // supervising it.
+        let started = Utc::now();
+        let supervised = generation("Whisker", AgentState::Dismissed, started);
+        let i = instance_for("wf-old", "myrepo", InstanceStatus::Completed, &supervised);
+
+        let namesake = generation(
+            "Whisker",
+            AgentState::Running,
+            started + chrono::Duration::seconds(60),
+        );
+        assert_ne!(supervised.spawn_id(), namesake.spawn_id());
+
+        let report = build(
+            "myrepo",
+            &[],
+            &[supervised.clone(), namesake.clone()],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            std::slice::from_ref(&i),
+            &GitFacts::default(),
+        );
+        assert!(
+            report.violations.is_empty(),
+            "a newer namesake is not the generation wf-old held: {:?}",
+            report.violations,
+        );
+
+        // ...and the check is not merely silent: the same instance whose own
+        // generation is still live is still a leak, namesake or not.
+        let mut leaked = supervised;
+        leaked.state = AgentState::Running;
+        let report = build(
+            "myrepo",
+            &[],
+            &[leaked, namesake],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[i],
+            &GitFacts::default(),
+        );
+        assert_eq!(report.violations.len(), 1);
+        assert_eq!(
+            report.violations[0].kind,
+            kind::WORKFLOW_SETTLED_AGENT_STILL_LIVE
+        );
+        assert_eq!(report.violations[0].subject, "wf-old");
+        assert_eq!(report.violations[0].authority, Authority::Mechanical);
+    }
+
+    #[test]
+    fn a_settled_instance_whose_recorded_generation_is_absent_is_not_flagged() {
+        // The generation wf-1 held is not in the agent view at all (archived
+        // away). There is nothing to report, and the live namesake is not a
+        // substitute for it.
+        let gone = generation("Whisker", AgentState::Dismissed, Utc::now());
+        let i = instance_for("wf-1", "myrepo", InstanceStatus::Completed, &gone);
+        let namesake = generation("Whisker", AgentState::Running, Utc::now());
+        let report = build(
+            "myrepo",
+            &[],
+            &[namesake],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[i],
+            &GitFacts::default(),
+        );
+        assert!(report.violations.is_empty());
+    }
+
+    #[test]
+    fn a_legacy_instance_without_a_spawn_id_still_flags_its_own_live_agent() {
+        // Pre-migration snapshot: no generation identity recorded, so the
+        // name join stands — fenced by the settlement instant, which this
+        // agent predates.
+        let a = agent("Whisker", None, AgentState::Running);
+        let mut i = instance("wf-1", "myrepo", InstanceStatus::Completed, Some("Whisker"));
+        assert!(i.context.active_agent_spawn.is_none());
+        i.completed_at = Some(a.created_at + chrono::Duration::seconds(60));
+        let report = build(
+            "myrepo",
+            &[],
+            &[a],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[i],
+            &GitFacts::default(),
+        );
+        assert_eq!(report.violations.len(), 1);
+        assert_eq!(
+            report.violations[0].kind,
+            kind::WORKFLOW_SETTLED_AGENT_STILL_LIVE
+        );
+    }
+
+    #[test]
+    fn a_legacy_instance_does_not_flag_a_namesake_spawned_after_it_settled() {
+        // Same legacy shape, but the only record holding the name was created
+        // after the run was already over, so it cannot be what the run held.
+        let a = agent("Whisker", None, AgentState::Running);
+        let mut i = instance("wf-1", "myrepo", InstanceStatus::Completed, Some("Whisker"));
+        i.completed_at = Some(a.created_at - chrono::Duration::seconds(60));
+        let report = build(
+            "myrepo",
+            &[],
+            &[a],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[i],
+            &GitFacts::default(),
+        );
+        assert!(report.violations.is_empty());
+    }
+
+    #[test]
+    fn a_legacy_instance_with_no_settlement_timestamp_is_not_flagged() {
+        // No generation identity and no fence to apply: silence beats a
+        // mechanical dismissal decided on a reusable name alone.
+        let a = agent("Whisker", None, AgentState::Running);
+        let i = instance("wf-1", "myrepo", InstanceStatus::Completed, Some("Whisker"));
+        assert!(i.completed_at.is_none());
         let report = build(
             "myrepo",
             &[],
