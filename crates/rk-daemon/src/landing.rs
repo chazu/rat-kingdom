@@ -4155,6 +4155,545 @@ workflow: {
         assert_eq!(main_before, main_after, "branch must not have landed");
     }
 
+    /// Bounded fail-safe recovery for landing gate infrastructure death
+    /// (TKT-01M0FXGQMA10JYCV9QCGEAK4TT): a check whose child is killed by a
+    /// signal on its first invocation, but passes on the automatic retry,
+    /// must land — and the retry must be visible as exactly two durable
+    /// per-attempt evidence events.
+    #[tokio::test]
+    async fn infra_death_then_pass_retries_once_and_lands() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let attempt_log = home.path().join("infra-attempts.log");
+        write_checks(
+            repo_dir.path(),
+            &format!(
+                r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "echo x >> '{log}'; n=$(wc -l < '{log}'); if [ $n -eq 1 ]; then kill -9 $$; else exit 0; fi", timeout: "30s"}},
+]
+"#,
+                log = attempt_log.display()
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "code-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha,
+                diff_class: "doc-only".into(),
+                task: "add src".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(&outcomes[0], LandingOutcome::Landed(r) if r["merged"] == true),
+            "outcome: {:?}",
+            outcomes[0]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&attempt_log)
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "the check must run exactly twice — the death and the one retry"
+        );
+
+        let events = space
+            .scan(&Pattern::category(Category::Event).identity(GATE_INFRA_RETRY_IDENTITY))
+            .unwrap();
+        assert_eq!(events.len(), 2, "events: {events:?}");
+        let by_ordinal = |n: u64| {
+            events
+                .iter()
+                .find(|e| e.payload["ordinal"].as_u64() == Some(n))
+                .unwrap_or_else(|| panic!("no event with ordinal {n}: {events:?}"))
+        };
+        assert_eq!(by_ordinal(1).payload["disposition"], "retrying");
+        assert_eq!(by_ordinal(1).payload["verdict"], "infra");
+        assert_eq!(by_ordinal(2).payload["disposition"], "retry_passed");
+        assert_eq!(by_ordinal(2).payload["verdict"], "pass");
+        assert_eq!(by_ordinal(1).payload["check"], "verify");
+        assert_eq!(by_ordinal(1).payload["candidate_sha"], by_ordinal(2).payload["candidate_sha"]);
+    }
+
+    /// The symmetric failure case: a check that always dies to an
+    /// infrastructure fault gets exactly one retry, then holds — never a
+    /// second retry — with both attempts durably recorded.
+    #[tokio::test]
+    async fn infra_death_exhausted_after_one_retry_holds_with_precise_evidence() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let attempt_log = home.path().join("infra-attempts.log");
+        write_checks(
+            repo_dir.path(),
+            &format!(
+                r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "echo x >> '{log}'; kill -9 $$", timeout: "30s"}},
+]
+"#,
+                log = attempt_log.display()
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        let main_before = rev_parse(repo_dir.path(), "main");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "code-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha,
+                diff_class: "doc-only".into(),
+                task: "add src".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], LandingOutcome::GateHeld));
+        assert_eq!(
+            std::fs::read_to_string(&attempt_log)
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "exactly one retry — never a second"
+        );
+
+        let events = space
+            .scan(&Pattern::category(Category::Event).identity(GATE_INFRA_RETRY_IDENTITY))
+            .unwrap();
+        assert_eq!(events.len(), 2, "events: {events:?}");
+        let by_ordinal = |n: u64| {
+            events
+                .iter()
+                .find(|e| e.payload["ordinal"].as_u64() == Some(n))
+                .unwrap_or_else(|| panic!("no event with ordinal {n}: {events:?}"))
+        };
+        assert_eq!(by_ordinal(1).payload["disposition"], "retrying");
+        assert_eq!(by_ordinal(2).payload["disposition"], "retry_exhausted");
+        assert_eq!(by_ordinal(2).payload["verdict"], "infra");
+
+        let needs = space
+            .scan(
+                &Pattern::category(Category::Need)
+                    .scope("code-repo")
+                    .identity(STEWARD_NEED_IDENTITY),
+            )
+            .unwrap();
+        assert_eq!(needs.len(), 1);
+        assert!(
+            needs[0].payload["text"]
+                .as_str()
+                .unwrap()
+                .contains("infrastructure-death retry was exhausted"),
+            "text: {}",
+            needs[0].payload["text"]
+        );
+
+        let main_after = rev_parse(repo_dir.path(), "main");
+        assert_eq!(main_before, main_after, "branch must not have landed");
+    }
+
+    /// An ordinary red check (a real, non-signal exit code) must never be
+    /// retried — it holds immediately on the first attempt, with zero
+    /// infra-retry evidence events.
+    #[tokio::test]
+    async fn ordinary_check_failure_is_held_without_infra_retry() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let attempt_log = home.path().join("attempts.log");
+        write_checks(
+            repo_dir.path(),
+            &format!(
+                r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "echo x >> '{log}'; exit 3", timeout: "30s"}},
+]
+"#,
+                log = attempt_log.display()
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "code-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha,
+                diff_class: "doc-only".into(),
+                task: "add src".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert!(matches!(outcomes[0], LandingOutcome::GateHeld));
+        assert_eq!(
+            std::fs::read_to_string(&attempt_log)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "an ordinary failure must never be retried"
+        );
+        let events = space
+            .scan(&Pattern::category(Category::Event).identity(GATE_INFRA_RETRY_IDENTITY))
+            .unwrap();
+        assert!(events.is_empty(), "events: {events:?}");
+    }
+
+    /// A genuine timeout (`onTimeout: fail`, the default) must never be
+    /// retried either — it is a policy-declared bound, not an infrastructure
+    /// fault, and the acceptance contract explicitly preserves it unretried.
+    #[tokio::test]
+    async fn timeout_holds_without_infra_retry() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        // `GateConfig::gate_timeout` (the durable bound `run_gates_at`
+        // actually enforces for the "verify" check — a named check's own
+        // `timeout:` field in checks.cue is metadata only, not what's wired
+        // in as the gate's wall-clock bound) is set short directly below
+        // rather than through checks.cue, which has no effect on it.
+        write_checks(
+            repo_dir.path(),
+            r#"checks: [
+    {name: "steward-protected-paths", command: "true", timeout: "30s"},
+    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "verify", command: "sleep 5", timeout: "30s"},
+]
+"#,
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let gates = GateConfig {
+            gate_timeout: Duration::from_millis(300),
+            ..GateConfig::default()
+        };
+        let mut entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha,
+            diff_class: "doc-only".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+
+        let passed = pipeline
+            .run_gates(&mut entry, &git_repo, &gates)
+            .await
+            .unwrap();
+        assert!(!passed, "a genuine timeout must hold the branch");
+        assert!(
+            !entry.gate_infra_retry_used,
+            "a timeout must never spend the infra-retry budget"
+        );
+        let events = space
+            .scan(&Pattern::category(Category::Event).identity(GATE_INFRA_RETRY_IDENTITY))
+            .unwrap();
+        assert!(events.is_empty(), "events: {events:?}");
+        let failures = space
+            .scan(
+                &Pattern::category(Category::Artifact)
+                    .scope("code-repo")
+                    .identity("gate-failure"),
+            )
+            .unwrap();
+        assert_eq!(failures.len(), 1, "failures: {failures:?}");
+        assert_eq!(failures[0].payload["verdict"], "timeout");
+    }
+
+    /// Restart-safety for the retry itself, not just the surrounding gate
+    /// run (TKT-01M0FXGQMA10JYCV9QCGEAK4TT review point 3): a crash landing
+    /// AFTER the retry budget is durably spent but BEFORE the retry attempt
+    /// finishes must resume as exactly the ordinal-2 completion of that same
+    /// retry on restart — recording its final disposition — never a second
+    /// ordinal-1 death and never a second retry grant.
+    #[tokio::test]
+    async fn restart_resumes_in_flight_infra_retry_without_granting_a_second_one() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let attempt_log = home.path().join("infra-attempts.log");
+        // Invocation 1 (before restart): dies immediately. Invocation 2
+        // (before restart, the retry): logs, then sleeps — giving the test a
+        // window to abort mid-retry, simulating the crash — before dying.
+        // Invocation 3 (after restart): dies immediately again, so a THIRD
+        // invocation ever happening at all would prove a second retry was
+        // wrongly granted.
+        write_checks(
+            repo_dir.path(),
+            &format!(
+                r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "echo x >> '{log}'; n=$(wc -l < '{log}'); if [ $n -eq 2 ]; then sleep 5; fi; kill -9 $$", timeout: "30s"}},
+]
+"#,
+                log = attempt_log.display()
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha,
+            diff_class: "doc-only".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+
+        // "Before restart": a real on-disk Space, claimed and mid-retry when
+        // the hosting task is aborted (the crash).
+        {
+            let space = Space::open(&layout.db_path()).unwrap();
+            let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+            pipeline.enqueue(entry.clone()).unwrap().unwrap();
+            let handle = tokio::spawn({
+                let pipeline = Arc::clone(&pipeline);
+                async move { pipeline.run_cycle().await }
+            });
+            // Poll until the durable entry shows the retry budget spent AND
+            // the exact check marked in-flight — the retry itself is
+            // genuinely running (sleeping) at that point, not merely queued.
+            let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let pending = space
+                    .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                    .unwrap();
+                if pending.len() == 1
+                    && pending[0].payload["gate_infra_retry_used"].as_bool() == Some(true)
+                    && pending[0].payload["gate_infra_retry_check"].as_str() == Some("verify")
+                {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < poll_deadline,
+                    "candidate never reached a durably in-flight retry before the retry finished"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            handle.abort();
+            let _ = handle.await;
+
+            let pending = space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                .unwrap();
+            assert_eq!(pending.len(), 1, "candidate must survive the crash");
+            assert_eq!(pending[0].payload["gate_infra_retry_used"], true);
+            assert_eq!(pending[0].payload["gate_infra_retry_check"], "verify");
+
+            // Only the ordinal-1 "retrying" event exists so far — the
+            // aborted retry's own continuation (which would record
+            // ordinal 2) never ran.
+            let events = space
+                .scan(&Pattern::category(Category::Event).identity(GATE_INFRA_RETRY_IDENTITY))
+                .unwrap();
+            assert_eq!(events.len(), 1, "events: {events:?}");
+            assert_eq!(events[0].payload["ordinal"], 1);
+        }
+
+        // "After restart": fresh Space handle over the SAME on-disk store.
+        let space = Space::open(&layout.db_path()).unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        let outcomes = pipeline.run_cycle().await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(&outcomes[0], LandingOutcome::GateHeld),
+            "outcome: {:?}",
+            outcomes[0]
+        );
+
+        // Exactly one more script invocation happened (n=3 total) — the
+        // resumed check re-ran once and died again — never a fresh
+        // ordinal-1 death plus its own new retry (which would need n=4).
+        assert_eq!(
+            std::fs::read_to_string(&attempt_log)
+                .unwrap()
+                .lines()
+                .count(),
+            3,
+            "restart must resume the exact retry, not restart the whole cycle"
+        );
+
+        // Exactly one more event (ordinal 2, exhausted) — the budget was
+        // never re-spent, and no second "retrying" (ordinal 1) event exists.
+        let events = space
+            .scan(&Pattern::category(Category::Event).identity(GATE_INFRA_RETRY_IDENTITY))
+            .unwrap();
+        assert_eq!(events.len(), 2, "events: {events:?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.payload["ordinal"] == 1)
+                .count(),
+            1,
+            "no duplicate ordinal-1 death: {events:?}"
+        );
+        let ordinal_2 = events
+            .iter()
+            .find(|e| e.payload["ordinal"] == 2)
+            .unwrap_or_else(|| panic!("no ordinal-2 event: {events:?}"));
+        assert_eq!(ordinal_2.payload["disposition"], "retry_exhausted");
+    }
+
+    /// Batch/bisect audit (TKT-01M0FXGQMA10JYCV9QCGEAK4TT review point 4): a
+    /// batch whose shared gate run dies to an infrastructure fault, retries,
+    /// and is STILL red bisects into per-branch sub-attempts. The already-
+    /// spent retry budget for the ORIGINAL (now-discarded) batch candidate
+    /// must not silently duplicate a retry for a sub-candidate cloned from
+    /// it, and cloning `entries[0]` into `first` inside `process_batch` must
+    /// never diverge from the durable tuple the retry path persists against.
+    #[tokio::test]
+    async fn batch_bisect_does_not_duplicate_a_spent_infra_retry() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let attempt_log = home.path().join("batch-infra-attempts.log");
+        // Every invocation of the shared batch gate dies to an
+        // infrastructure fault — deterministic red, so the batch always
+        // bisects (all-or-nothing: no `docs/bad.md` needed here).
+        write_checks(
+            repo_dir.path(),
+            &format!(
+                r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "echo x >> '{log}'; kill -9 $$", timeout: "30s"}},
+]
+"#,
+                log = attempt_log.display()
+            ),
+        );
+
+        let mut queued = Vec::new();
+        for (branch, file) in [("branch-a", "a.md"), ("branch-b", "b.md")] {
+            git(repo_dir.path(), &["checkout", "-b", branch]);
+            std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+            std::fs::write(repo_dir.path().join("docs").join(file), "x\n").unwrap();
+            git(repo_dir.path(), &["add", "."]);
+            git(repo_dir.path(), &["commit", "-m", branch]);
+            queued.push((branch.to_string(), rev_parse(repo_dir.path(), branch)));
+            git(repo_dir.path(), &["checkout", "main"]);
+        }
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        for (branch, head_sha) in queued {
+            pipeline
+                .enqueue(LandingQueueEntry {
+                    repo_name: "bisect-repo".into(),
+                    repo_path: repo_dir.path().display().to_string(),
+                    branch,
+                    target: "main".into(),
+                    head_sha,
+                    diff_class: "doc-only".into(),
+                    task: String::new(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let outcomes = pipeline.drain_key("bisect-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o, LandingOutcome::GateHeld)),
+            "outcomes: {outcomes:?}"
+        );
+
+        // The shared batch attempt (driven by `entries[0]`/branch-a, whose
+        // durable tuple `process_batch` mutates and persists directly — the
+        // clone-divergence bug this test guards against) spends its one
+        // retry: 2 invocations. Bisecting to single entries then re-runs
+        // each via plain `process_entry`, reading each entry's OWN durable
+        // budget: branch-a's is already spent (per `bisect_batch`'s doc — a
+        // same-pass continuation, not reset) so it holds on ONE more
+        // invocation with no further retry; branch-b's was never touched by
+        // the shared run (only `entries[0]` drove it) and is still fresh, so
+        // it independently earns its own one retry against its own new
+        // single-branch candidate SHA — 2 more invocations. Total: 2 + 1 + 2
+        // = 5. The property under test is branch-a's 1, not 2: its already-
+        // spent budget must never be duplicated into a second retry.
+        assert_eq!(
+            std::fs::read_to_string(&attempt_log)
+                .unwrap()
+                .lines()
+                .count(),
+            5,
+            "the already-spent batch-driving entry's retry must not duplicate"
+        );
+        let events = space
+            .scan(&Pattern::category(Category::Event).identity(GATE_INFRA_RETRY_IDENTITY))
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            4,
+            "2 from the shared batch retry + 2 from branch-b's own fresh-budget retry: {events:?}"
+        );
+    }
+
     /// Shared setup for the review-integration tests below: a repo with a
     /// "large" (review-needing) candidate branch, checks that always pass,
     /// and back on `main` when it returns. Returns `(repo_dir, head_sha,
