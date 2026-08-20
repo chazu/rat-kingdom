@@ -110,8 +110,20 @@ async fn reviewer_stop_verdict_aborts_the_run() {
         .unwrap();
     let id = started["instance"]["id"].as_str().unwrap().to_string();
 
+    // One review round still carries its own 60s workTimeout/reviewTimeout
+    // plus a fixed 2m `read` timeout on the verdict
+    // (examples/workflows/reviewer-drives-rework.cue) — internal ceilings the
+    // workflow is allowed to take. A 30s outer poll window is tighter than
+    // even one of those steps, so under cargo-test-workspace-wide CPU/disk
+    // contention (TKT-01M0D2APS09AXKB4AHAYHCPSPX: the same class of
+    // contention pushes other daemon integration tests past fixed wait
+    // budgets) this loop can give up on a workflow that is still healthy and
+    // simply slow, not stuck. 120s stays well under the ~4m theoretical sum
+    // of every internal ceiling maxing out — which would itself flip the
+    // instance to `failed` and be caught below immediately — while giving
+    // real contention-induced slowdown room to clear.
     let mut error: Option<String> = None;
-    for _ in 0..300 {
+    for _ in 0..1200 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let status = client
             .call("workflow.status", json!({"name": id}))
