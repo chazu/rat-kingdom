@@ -124,7 +124,10 @@ async fn a_dropped_land_surfaces_as_a_conflict_held_violation_and_self_clears() 
     // Now hand-merge the branch exactly as an operator resolving the
     // conflict would, and the row must self-clear — nothing has to write a
     // "resolved" marker, matching `rk inbox`'s own unlanded-branch check.
-    git(repo_path, &["merge", "--no-ff", "-m", "resolve", "rat/whisker/work"]);
+    git(
+        repo_path,
+        &["merge", "--no-ff", "-m", "resolve", "rat/whisker/work"],
+    );
 
     let cleared = client
         .call("reconcile.report", json!({"repo": repo_name}))

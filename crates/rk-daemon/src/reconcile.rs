@@ -238,7 +238,10 @@ fn terminal_assignee_active_work(
                 detail: format!(
                     "{} is still '{}' but its owner {} settled to {:?} with no hand-off recorded",
                     t.identity,
-                    t.payload.get("status").and_then(Value::as_str).unwrap_or("?"),
+                    t.payload
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?"),
                     agent.name,
                     agent.state,
                 ),
@@ -476,7 +479,13 @@ mod tests {
         }
     }
 
-    fn branch_landed(scope: &str, branch: &str, target: &str, merged: bool, pr_opened: bool) -> Tuple {
+    fn branch_landed(
+        scope: &str,
+        branch: &str,
+        target: &str,
+        merged: bool,
+        pr_opened: bool,
+    ) -> Tuple {
         Tuple::new(
             Category::Event,
             scope,
@@ -495,7 +504,12 @@ mod tests {
 
     #[test]
     fn delivered_but_open_flags_a_delivery_record_with_a_non_terminal_status() {
-        let t = ticket("TKT-1", "myrepo", "in_progress", delivery_json("abc123", "main"));
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            delivery_json("abc123", "main"),
+        );
         let report = build(
             "myrepo",
             &[t],
@@ -745,7 +759,12 @@ mod tests {
 
     #[test]
     fn repeated_reads_of_unchanged_state_are_identical() {
-        let t = ticket("TKT-1", "myrepo", "in_progress", delivery_json("abc123", "main"));
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            delivery_json("abc123", "main"),
+        );
         let a = agent("Whisker", Some("TKT-1"), AgentState::Dismissed);
         let land = branch_landed("myrepo", "rat/y/tkt-2", "main", false, false);
         let build_it = || {

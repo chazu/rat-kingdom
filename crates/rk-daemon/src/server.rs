@@ -2876,7 +2876,10 @@ impl Daemon {
         // tickets below cannot pick up another repo's landed/queued ids.
         let landed_tickets: HashSet<String> = self
             .space
-            .scan(&Pattern::category(Category::Event).identity(crate::landing::LANDING_PROCESSED_IDENTITY))
+            .scan(
+                &Pattern::category(Category::Event)
+                    .identity(crate::landing::LANDING_PROCESSED_IDENTITY),
+            )
             .unwrap_or_default()
             .into_iter()
             .filter(|t| t.payload.get("outcome").and_then(Value::as_str) == Some("landed"))
