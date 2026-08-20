@@ -2347,6 +2347,8 @@ impl LandingPipeline {
             role: "rat".to_string(),
             // A correction always lands back on the reviewed branch.
             base: Some(entry.branch.clone()),
+            // Ordinary correction spawn, not a machine-routed reviewer.
+            review: None,
             coordination: None,
             harness: None,
             parent: None,
