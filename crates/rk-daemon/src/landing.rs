@@ -437,6 +437,12 @@ pub(crate) struct LandingQueueEntry {
     /// and recording its outcome as the ordinal-2 attempt, rather than
     /// silently skipping straight to a hold with no ordinal-2 evidence at
     /// all (the gap TKT-01M0FXGQMA10JYCV9QCGEAK4TT's review caught).
+    ///
+    /// This marker is a hint that a retry MAY still be owed, never proof of
+    /// it: the clear is a separate write from the ordinal-2 evidence, so a
+    /// crash between them leaves it `Some` over an already-settled retry. The
+    /// durable evidence is the authority — see
+    /// [`LandingPipeline::settled_infra_retry`].
     #[serde(default)]
     pub(crate) gate_infra_retry_check: Option<String>,
 }
@@ -2744,6 +2750,26 @@ impl LandingPipeline {
             // through the exact same path the inline retry below uses,
             // without ever granting a second retry.
             if entry.gate_infra_retry_check.as_deref() == Some(check.name.as_str()) {
+                // The crash can equally have landed in the OTHER window
+                // `finish_infra_retry` opens: after the ordinal-2 evidence was
+                // written but before the marker was cleared and persisted.
+                // There the retry is genuinely spent and its outcome is
+                // already durable, so re-running the check would both execute
+                // an already-settled attempt and append a duplicate ordinal-2
+                // event. Settlement is therefore idempotent — the durable
+                // evidence, not the marker alone, decides whether anything is
+                // left to run.
+                if let Some(passed) = self.settled_infra_retry(entry, tested_sha, &check.name)? {
+                    warn!(
+                        check = %check.name, branch = %entry.branch, passed,
+                        "landing pipeline: infra retry was already settled before the crash, resuming from its durable evidence"
+                    );
+                    self.clear_infra_retry_marker(entry)?;
+                    if !passed {
+                        return Ok(false);
+                    }
+                    continue;
+                }
                 let retry_outcome = self
                     .engine
                     .run_check_in(
@@ -2759,7 +2785,13 @@ impl LandingPipeline {
                     )
                     .await;
                 if !self
-                    .finish_infra_retry(entry, tested_sha, &check.name, retry_outcome)
+                    .finish_infra_retry(
+                        entry,
+                        tested_sha,
+                        &check.name,
+                        &resolved.command,
+                        retry_outcome,
+                    )
                     .await?
                 {
                     return Ok(false);
@@ -2809,7 +2841,14 @@ impl LandingPipeline {
                     entry.gate_infra_retry_check = Some(check.name.clone());
                     self.queue
                         .persist(entry, LandingEntryStatus::RunningGates)?;
-                    self.record_gate_infra_attempt(entry, tested_sha, &check.name, 1, &result)?;
+                    self.record_gate_infra_attempt(
+                        entry,
+                        tested_sha,
+                        &check.name,
+                        &resolved.command,
+                        1,
+                        &result,
+                    )?;
                     let retry_outcome = self
                         .engine
                         .run_check_in(
@@ -2825,7 +2864,13 @@ impl LandingPipeline {
                         )
                         .await;
                     if !self
-                        .finish_infra_retry(entry, tested_sha, &check.name, retry_outcome)
+                        .finish_infra_retry(
+                            entry,
+                            tested_sha,
+                            &check.name,
+                            &resolved.command,
+                            retry_outcome,
+                        )
                         .await?
                     {
                         return Ok(false);
@@ -2861,6 +2906,7 @@ impl LandingPipeline {
         entry: &mut LandingQueueEntry,
         tested_sha: &str,
         check_name: &str,
+        command: &str,
         retry_outcome: rk_core::Result<Value>,
     ) -> rk_core::Result<bool> {
         let (result, passed) = match retry_outcome {
@@ -2873,11 +2919,54 @@ impl LandingPipeline {
                 (json!({"verdict": "error", "exit": -1}), false)
             }
         };
-        self.record_gate_infra_attempt(entry, tested_sha, check_name, 2, &result)?;
-        entry.gate_infra_retry_check = None;
-        self.queue
-            .persist(entry, LandingEntryStatus::RunningGates)?;
+        // Evidence FIRST, marker cleared second: the durable evidence is what
+        // `settled_infra_retry` reads to recognise an already-settled retry, so
+        // a crash between these two writes resumes as "nothing left to run"
+        // rather than replaying a spent attempt. The reverse order would lose
+        // the outcome entirely if the crash landed between them.
+        self.record_gate_infra_attempt(entry, tested_sha, check_name, command, 2, &result)?;
+        self.clear_infra_retry_marker(entry)?;
         Ok(passed)
+    }
+
+    /// Whether the retry marked in-flight for `check_name` has ALREADY settled
+    /// — i.e. its ordinal-2 evidence for this exact candidate is durably
+    /// recorded, so only the marker clear was lost to the crash. `Some(passed)`
+    /// carries the recorded outcome (the gate may continue iff the retry
+    /// passed); `None` means the retry has not settled and must still run.
+    ///
+    /// Scoped to the exact `(branch, target, task, candidate_sha, check)` this
+    /// gate run is settling: evidence from an earlier candidate of the same
+    /// branch is a different attempt with its own budget and must not be read
+    /// as this one's outcome.
+    fn settled_infra_retry(
+        &self,
+        entry: &LandingQueueEntry,
+        tested_sha: &str,
+        check_name: &str,
+    ) -> rk_core::Result<Option<bool>> {
+        let pattern = Pattern::category(Category::Event)
+            .identity(GATE_INFRA_RETRY_IDENTITY)
+            .scope(&entry.repo_name);
+        Ok(self.space.scan(&pattern)?.into_iter().find_map(|t| {
+            let p = &t.payload;
+            let matches = p.get("ordinal").and_then(Value::as_u64) == Some(2)
+                && p.get("branch").and_then(Value::as_str) == Some(entry.branch.as_str())
+                && p.get("target").and_then(Value::as_str) == Some(entry.target.as_str())
+                && p.get("task").and_then(Value::as_str) == Some(entry.task.as_str())
+                && p.get("candidate_sha").and_then(Value::as_str) == Some(tested_sha)
+                && p.get("check").and_then(Value::as_str) == Some(check_name);
+            matches.then(|| p.get("verdict").and_then(Value::as_str) == Some("pass"))
+        }))
+    }
+
+    /// Drop the in-flight retry marker and persist it, leaving
+    /// `gate_infra_retry_used` spent. Both settlement paths — a retry this
+    /// process ran, and one it found already settled — end here, so the
+    /// durable state after either is identical.
+    fn clear_infra_retry_marker(&self, entry: &mut LandingQueueEntry) -> rk_core::Result<()> {
+        entry.gate_infra_retry_check = None;
+        self.queue.persist(entry, LandingEntryStatus::RunningGates)
     }
 
     /// Durable per-attempt evidence for a gate-infrastructure-death retry
@@ -2894,6 +2983,7 @@ impl LandingPipeline {
         entry: &LandingQueueEntry,
         tested_sha: &str,
         check_name: &str,
+        command: &str,
         ordinal: u32,
         result: &Value,
     ) -> rk_core::Result<()> {
@@ -2915,6 +3005,11 @@ impl LandingPipeline {
                     "task": entry.task,
                     "candidate_sha": tested_sha,
                     "check": check_name,
+                    // The RESOLVED command this attempt actually ran, not just
+                    // the check's name: the evidence has to say what was
+                    // executed, since a name alone cannot be replayed by hand
+                    // or checked against the checks.cue of the day.
+                    "command": command,
                     "ordinal": ordinal,
                     "exit": result.get("exit").cloned().unwrap_or(Value::Null),
                     "signal": result.get("signal").cloned().unwrap_or(Value::Null),
@@ -4612,6 +4707,172 @@ workflow: {
             .find(|e| e.payload["ordinal"] == 2)
             .unwrap_or_else(|| panic!("no ordinal-2 event: {events:?}"));
         assert_eq!(ordinal_2.payload["disposition"], "retry_exhausted");
+    }
+
+    /// The second, narrower crash window in the same retry
+    /// (TKT-01M0GC2A0BPSRK96A4EPZB2HGQ): `finish_infra_retry` records the
+    /// ordinal-2 evidence and only THEN clears the in-flight marker, so a
+    /// crash between those two writes leaves a durably-settled retry still
+    /// marked in-flight. Resuming that state must NOT re-run the check (the
+    /// one retry is spent) and must NOT append a second ordinal-2 event — it
+    /// must settle from the recorded evidence alone, in both directions.
+    ///
+    /// Driven through `run_gates` at a known `tested_sha` so the pre-crash
+    /// state is exact; the evidence itself is written by the real
+    /// `record_gate_infra_attempt`, not hand-rolled, so the test cannot pass
+    /// against a payload shape the production path no longer writes.
+    #[tokio::test]
+    async fn settled_infra_retry_resumes_from_evidence_without_rerunning_or_duplicating() {
+        for (recorded_verdict, expect_pass) in [("pass", true), ("infra", false)] {
+            let home = tempfile::tempdir().unwrap();
+            let repo_dir = tempfile::tempdir().unwrap();
+            init_repo(repo_dir.path());
+            let attempt_log = home.path().join("infra-attempts.log");
+            write_checks(
+                repo_dir.path(),
+                &format!(
+                    r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "echo x >> '{log}'; exit 0", timeout: "30s"}},
+]
+"#,
+                    log = attempt_log.display()
+                ),
+            );
+            git(repo_dir.path(), &["checkout", "-b", "feature"]);
+            std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+            git(repo_dir.path(), &["add", "."]);
+            git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+            let head_sha = rev_parse(repo_dir.path(), "feature");
+            git(repo_dir.path(), &["checkout", "main"]);
+
+            let space = Space::open_in_memory().unwrap();
+            let pipeline = test_pipeline(home.path(), space.clone());
+            let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+            let gates = GateConfig::default();
+
+            // The exact durable state a crash in that window leaves behind:
+            // budget spent, marker still set, ordinal-2 evidence already
+            // written for this candidate.
+            let mut entry = LandingQueueEntry {
+                repo_name: "code-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha: head_sha.clone(),
+                diff_class: "doc-only".into(),
+                task: "add src".into(),
+                gate_infra_retry_used: true,
+                gate_infra_retry_check: Some("verify".into()),
+                ..Default::default()
+            };
+            pipeline
+                .record_gate_infra_attempt(
+                    &entry,
+                    &head_sha,
+                    "verify",
+                    "echo x; exit 0",
+                    2,
+                    &json!({"verdict": recorded_verdict, "exit": 0}),
+                )
+                .unwrap();
+
+            let passed = pipeline
+                .run_gates(&mut entry, &git_repo, &gates)
+                .await
+                .unwrap();
+            assert_eq!(
+                passed, expect_pass,
+                "a settled {recorded_verdict} retry must decide the gate from its recorded verdict"
+            );
+
+            assert!(
+                !attempt_log.exists(),
+                "an already-settled retry must not re-run the check ({recorded_verdict})"
+            );
+            let events = space
+                .scan(&Pattern::category(Category::Event).identity(GATE_INFRA_RETRY_IDENTITY))
+                .unwrap();
+            assert_eq!(
+                events.len(),
+                1,
+                "no duplicate ordinal-2 evidence ({recorded_verdict}): {events:?}"
+            );
+            assert!(
+                entry.gate_infra_retry_check.is_none(),
+                "the marker must be cleared once the settled outcome is consumed"
+            );
+            assert!(
+                entry.gate_infra_retry_used,
+                "the budget stays spent — resuming must never hand back a retry"
+            );
+        }
+    }
+
+    /// Evidence for an infra-retry attempt must name the exact command that
+    /// ran, not only the check's name — the parent acceptance requires check
+    /// name AND command, and a name alone cannot be replayed by hand.
+    #[tokio::test]
+    async fn infra_retry_evidence_carries_the_exact_check_command() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let attempt_log = home.path().join("infra-attempts.log");
+        let verify_command = format!("echo x >> '{log}'; kill -9 $$", log = attempt_log.display());
+        write_checks(
+            repo_dir.path(),
+            &format!(
+                r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "{cmd}", timeout: "30s"}},
+]
+"#,
+                cmd = verify_command
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let mut entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha,
+            diff_class: "doc-only".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+        let passed = pipeline
+            .run_gates(&mut entry, &git_repo, &GateConfig::default())
+            .await
+            .unwrap();
+        assert!(!passed, "a check that always dies must hold the branch");
+
+        let events = space
+            .scan(&Pattern::category(Category::Event).identity(GATE_INFRA_RETRY_IDENTITY))
+            .unwrap();
+        assert_eq!(events.len(), 2, "events: {events:?}");
+        for event in &events {
+            assert_eq!(
+                event.payload["check"], "verify",
+                "check name missing: {event:?}"
+            );
+            assert_eq!(
+                event.payload["command"], verify_command,
+                "exact command missing from ordinal-{} evidence: {event:?}",
+                event.payload["ordinal"]
+            );
+        }
     }
 
     /// Batch/bisect audit (TKT-01M0FXGQMA10JYCV9QCGEAK4TT review point 4): a
