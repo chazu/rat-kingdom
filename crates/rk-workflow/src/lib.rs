@@ -112,6 +112,25 @@ pub struct LandingPolicy {
     /// abandoned at `reviewTimeout`, only at this ceiling.
     #[serde(default = "default_review_max_wait", rename = "reviewMaxWait")]
     pub review_max_wait: String,
+    /// Whether a reviewer REWORK verdict classified as delegated-LLM work may
+    /// dispatch a rework agent unattended, from the reviewed branch at its
+    /// exact head. `false` restores the pre-feature behavior: file the
+    /// follow-up ticket, hold the branch, and wait for a human to dispatch it.
+    /// See `crates/rk-daemon/src/landing_rework.rs` for the classifier — a
+    /// verdict it cannot positively read as a bounded correction is held
+    /// regardless of this switch.
+    #[serde(default = "default_true", rename = "reworkAutoDispatch")]
+    pub rework_auto_dispatch: bool,
+    /// Hard ceiling on how many rework agents one reviewed branch may have
+    /// dispatched across its whole review→rework→re-review chain. `0` disables
+    /// unattended rework as surely as `reworkAutoDispatch: false` does.
+    #[serde(default = "default_max_rework_attempts", rename = "maxReworkAttempts")]
+    pub max_rework_attempts: u32,
+    /// Hard ceiling on the cumulative USD spent by the original agent plus
+    /// every rework agent in one chain, checked before each dispatch. `0`
+    /// means unlimited, matching the fleet budget convention.
+    #[serde(default = "default_rework_max_usd", rename = "reworkMaxUsd")]
+    pub rework_max_usd: u32,
 }
 
 impl Default for LandingPolicy {
@@ -123,8 +142,26 @@ impl Default for LandingPolicy {
             gate_timeout: default_gate_timeout(),
             review_timeout: default_review_timeout(),
             review_max_wait: default_review_max_wait(),
+            rework_auto_dispatch: true,
+            max_rework_attempts: default_max_rework_attempts(),
+            rework_max_usd: default_rework_max_usd(),
         }
     }
+}
+
+/// One automatic correction per reviewed branch. Deliberately not two: a
+/// second REWORK on the same branch after a rework already landed into it is
+/// the signal that the work is not converging, which is a judgment call, not
+/// more of the same dispatch.
+fn default_max_rework_attempts() -> u32 {
+    1
+}
+
+/// A rework chain that has burned this much has stopped being cheap
+/// automation. Sized well above a normal implement+review pair so an ordinary
+/// bounded correction never trips it, and well below a runaway.
+fn default_rework_max_usd() -> u32 {
+    25
 }
 
 /// Versioned repository behavior activated into the daemon's repo registry.
