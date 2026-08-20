@@ -15,6 +15,7 @@ pub mod factory_events;
 pub mod inbox;
 pub mod ingest_auth;
 mod landing;
+mod landing_rework;
 pub mod machine;
 pub mod onboarding;
 pub mod onboarding_activation;

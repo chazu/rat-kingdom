@@ -51,4 +51,14 @@ repo: #RepositoryPolicy
 	// reviewTimeout is not abandoned until this ceiling. Only a reviewer that
 	// goes terminal without a verdict escalates before it.
 	reviewMaxWait: string | *"45m"
+	// UNATTENDED REWORK (crates/rk-daemon/src/landing_rework.rs): whether a
+	// reviewer REWORK classified as delegated-LLM work may dispatch a rework
+	// agent from the reviewed branch at its exact head, with no human polling.
+	// A verdict the classifier cannot positively read as a bounded correction
+	// is held for a human regardless of this switch.
+	reworkAutoDispatch: bool | *true
+	// Hard ceiling on rework agents per reviewed branch. 0 disables dispatch.
+	maxReworkAttempts: int | *1
+	// Hard ceiling on cumulative USD across one review/rework chain. 0 = unlimited.
+	reworkMaxUsd: int | *25
 }
