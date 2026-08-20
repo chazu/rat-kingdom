@@ -3956,6 +3956,19 @@ workflow: {
             .unwrap()
     }
 
+    /// Like `tuples`, but scoped to `code-repo` — for identities (dispatch
+    /// markers, steward needs) that must not be conflated with another
+    /// repo's tuples of the same category+identity.
+    fn scoped_tuples(space: &Space, category: Category, identity: &str) -> Vec<Tuple> {
+        space
+            .scan(
+                &Pattern::category(category)
+                    .scope("code-repo")
+                    .identity(identity),
+            )
+            .unwrap()
+    }
+
     fn rework_context(head: &str, task: &str, rework_ticket: &str) -> ReworkContext {
         ReworkContext {
             repo: "code-repo".into(),
@@ -4116,7 +4129,7 @@ workflow: {
 
         let spawns = tuples(&space, Category::Event, "agent_spawned");
         assert_eq!(spawns.len(), 1, "bounded REWORK must dispatch one agent");
-        let markers = tuples(&space, Category::Event, REWORK_DISPATCH_IDENTITY);
+        let markers = scoped_tuples(&space, Category::Event, REWORK_DISPATCH_IDENTITY);
         assert_eq!(markers.len(), 1, "one logical dispatch gets one marker");
         assert_eq!(markers[0].payload["state"], "dispatching");
         assert_eq!(markers[0].payload["branch"], "feature");
@@ -4138,12 +4151,12 @@ workflow: {
             "replayed routing must not spawn a second correction"
         );
         assert_eq!(
-            tuples(&space, Category::Event, REWORK_DISPATCH_IDENTITY).len(),
+            scoped_tuples(&space, Category::Event, REWORK_DISPATCH_IDENTITY).len(),
             1,
             "replayed routing must not append another marker"
         );
         assert!(
-            tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).is_empty(),
+            scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).is_empty(),
             "a journaled correction agent must not be mistaken for an interrupted dispatch"
         );
     }
@@ -4334,7 +4347,7 @@ workflow: {
         assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
         no_spawns(&space);
 
-        let needs = tuples(&space, Category::Need, STEWARD_NEED_IDENTITY);
+        let needs = scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY);
         assert_eq!(needs.len(), 1);
         let text = needs[0].payload["text"].as_str().unwrap();
         for required in [
@@ -4350,7 +4363,7 @@ workflow: {
         let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
         pipeline.route_rework(&entry, &repo).await.unwrap();
         assert_eq!(
-            tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).len(),
+            scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).len(),
             1,
             "replay must converge on the existing human gate"
         );
