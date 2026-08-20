@@ -47,12 +47,17 @@ use serde_json::{json, Value};
 /// (`Pattern::for_commit`).
 pub(crate) const REWORK_DISPATCH_IDENTITY: &str = "landing_rework_dispatch";
 
-/// Identity of the durable marker recording that a corrected parent branch was
-/// re-enqueued to its original target after a rework landed into it. Keyed by
-/// `(parent branch, parent's NEW head sha)`, so a restart or replay between
-/// the intermediate landing and the parent resubmission converges on exactly
-/// one parent landing entry.
-pub(crate) const REWORK_RESUBMIT_IDENTITY: &str = "landing_rework_resubmit";
+/// Stable dedupe key for the rework ticket itself — the reviewed work key, so
+/// `Tickets::create`'s coalesce path returns the SAME ticket for a redelivered
+/// completion instead of minting a second one.
+///
+/// A free function rather than a [`ReworkContext`] method because the pipeline
+/// files the ticket BEFORE it can build a context (the context needs the
+/// ticket's own identity), so the key has to be derivable from the work key
+/// alone.
+pub(crate) fn ticket_coalesce_key(repo: &str, branch: &str, head_sha: &str) -> String {
+    format!("landing-rework:{repo}:{branch}:{head_sha}")
+}
 
 /// Per-repository bounds on unattended rework, resolved from
 /// `rk_workflow::LandingPolicy` (`.rk/repo.cue`, digest-activated like every
@@ -181,8 +186,7 @@ pub(crate) fn classify_authority(review: Option<&Value>) -> (Authority, Option<W
                              recognize ({raw:?}) — treated as human rather than ignored, so a \
                              typo cannot read as consent to dispatch"
                         ),
-                        decision: "correct the reviewer's verdict, then dispatch or abandon"
-                            .into(),
+                        decision: "correct the reviewer's verdict, then dispatch or abandon".into(),
                     }),
                 );
             }
@@ -402,13 +406,6 @@ impl ReworkContext {
             "diff_lines": self.diff_lines,
         })
     }
-
-    /// Stable dedupe key for the rework ticket itself — the reviewed work
-    /// key, so `Tickets::create_idempotent` returns the SAME ticket for a
-    /// redelivered completion instead of minting a second one.
-    pub(crate) fn ticket_coalesce_key(&self) -> String {
-        format!("landing-rework:{}:{}:{}", self.repo, self.branch, self.head_sha)
-    }
 }
 
 #[cfg(test)]
@@ -483,7 +480,10 @@ mod tests {
 
     #[test]
     fn an_open_product_decision_escalates_even_with_notes() {
-        for flag in [json!({"decision_required": true}), json!({"bounded": false})] {
+        for flag in [
+            json!({"decision_required": true}),
+            json!({"bounded": false}),
+        ] {
             let (authority, withheld) = classify_authority(Some(&review(flag.clone())));
             assert_eq!(authority, Authority::Human, "flag: {flag}");
             assert_eq!(withheld.unwrap().code, "ambiguous-decision");
@@ -551,7 +551,10 @@ mod tests {
     #[test]
     fn the_prompt_pins_the_reviewed_branch_and_exact_head() {
         let prompt = ctx().prompt();
-        assert!(prompt.contains("YOUR BASE IS `feature` AT abc123"), "{prompt}");
+        assert!(
+            prompt.contains("YOUR BASE IS `feature` AT abc123"),
+            "{prompt}"
+        );
         assert!(prompt.contains("not main"), "{prompt}");
         assert!(prompt.contains("TKT-1"), "{prompt}");
         assert!(prompt.contains("TKT-2"), "{prompt}");
@@ -567,8 +570,14 @@ mod tests {
         };
         let text = ctx().escalation(&withheld);
         assert!(text.contains("EVIDENCE:"), "{text}");
-        assert!(text.contains("DECISION NEEDED: read the branch yourself"), "{text}");
-        assert!(text.contains("BLAST RADIUS: 3 file(s) / 42 line(s)"), "{text}");
+        assert!(
+            text.contains("DECISION NEEDED: read the branch yourself"),
+            "{text}"
+        );
+        assert!(
+            text.contains("BLAST RADIUS: 3 file(s) / 42 line(s)"),
+            "{text}"
+        );
         assert!(
             text.contains("rk spawn --repo code-repo --ticket TKT-2 --base feature"),
             "{text}"
@@ -578,7 +587,7 @@ mod tests {
     #[test]
     fn the_ticket_coalesce_key_is_the_reviewed_work_key() {
         assert_eq!(
-            ctx().ticket_coalesce_key(),
+            ticket_coalesce_key("code-repo", "feature", "abc123"),
             "landing-rework:code-repo:feature:abc123"
         );
     }

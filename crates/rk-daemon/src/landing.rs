@@ -1868,7 +1868,11 @@ impl LandingPipeline {
     /// per-head probe ([`Self::rework_dispatch_marker`]) is a different
     /// question — "did we already route THIS exact commit" — and is what makes
     /// redelivery and restart idempotent.
-    fn rework_dispatch_markers(&self, repo_name: &str, branch: &str) -> rk_core::Result<Vec<Tuple>> {
+    fn rework_dispatch_markers(
+        &self,
+        repo_name: &str,
+        branch: &str,
+    ) -> rk_core::Result<Vec<Tuple>> {
         let pattern = Pattern::category(Category::Event)
             .identity(REWORK_DISPATCH_IDENTITY)
             .scope(repo_name);
@@ -1884,10 +1888,7 @@ impl LandingPipeline {
     /// routed. Its presence is what a redelivered completion, a restart, or a
     /// repeated queue scan trips on, so none of them can mint a second rework
     /// ticket or a second rework agent.
-    fn rework_dispatch_marker(
-        &self,
-        entry: &LandingQueueEntry,
-    ) -> rk_core::Result<Option<Tuple>> {
+    fn rework_dispatch_marker(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<Tuple>> {
         let pattern = Pattern::for_commit(
             Category::Event,
             REWORK_DISPATCH_IDENTITY,
@@ -2053,7 +2054,17 @@ impl LandingPipeline {
             // The whole point of the arm: the rework's base — and so its merge
             // target on dismissal — is the REVIEWED branch, never `target`.
             base: Some(entry.branch.clone()),
-            ..Default::default()
+            coordination: None,
+            harness: None,
+            parent: None,
+            model: None,
+            permission_mode: None,
+            profile: None,
+            resolved_profile: None,
+            attach: false,
+            workflow_instance: None,
+            coordinator: None,
+            instance_max_usd: None,
         };
         match self.supervisor.spawn_async(params, 0).await {
             Ok(record) => {
@@ -2122,7 +2133,12 @@ impl LandingPipeline {
             &entry.head_sha,
         )
         .scope(&entry.repo_name);
-        Ok(self.space.scan(&pattern)?.into_iter().next().map(|t| t.payload))
+        Ok(self
+            .space
+            .scan(&pattern)?
+            .into_iter()
+            .next()
+            .map(|t| t.payload))
     }
 
     /// File the REWORK follow-up directly through `Tickets::create` (§1.5) —
@@ -2147,9 +2163,10 @@ impl LandingPipeline {
                 // Idempotent on the reviewed work key: a redelivered
                 // completion or a restart-driven reprocess resolves to the
                 // SAME follow-up ticket instead of minting a second one.
-                coalesce_key: Some(format!(
-                    "landing-rework:{}:{}:{}",
-                    entry.repo_name, entry.branch, entry.head_sha
+                coalesce_key: Some(landing_rework::ticket_coalesce_key(
+                    &entry.repo_name,
+                    &entry.branch,
+                    &entry.head_sha,
                 )),
             })
             .await
