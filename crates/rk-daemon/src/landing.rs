@@ -3109,6 +3109,7 @@ impl LandingPipeline {
     /// the original attempt's in-memory result — `false` for every event
     /// recorded from a result this process actually observed (both ordinals
     /// on the normal path).
+    #[allow(clippy::too_many_arguments)]
     fn record_gate_infra_attempt(
         &self,
         entry: &LandingQueueEntry,
