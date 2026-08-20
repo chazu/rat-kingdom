@@ -4523,16 +4523,27 @@ workflow: {
                 async move { pipeline.run_cycle().await }
             });
             // Poll until the durable entry shows the retry budget spent AND
-            // the exact check marked in-flight — the retry itself is
-            // genuinely running (sleeping) at that point, not merely queued.
+            // the exact check marked in-flight AND the retry's own script
+            // invocation has actually started (its line landed in
+            // `attempt_log`) — the durable marker alone is written BEFORE
+            // the retry's child process is even spawned (deliberately, so a
+            // crash before that spawn still resumes correctly), so waiting
+            // on it alone races ahead of the retry starting and can abort
+            // the task before invocation 2 ever runs, collapsing this test
+            // to a 2-invocation resume instead of the intended 3-invocation,
+            // mid-sleep crash.
             let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             loop {
                 let pending = space
                     .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
                     .unwrap();
+                let retry_invocation_started = std::fs::read_to_string(&attempt_log)
+                    .map(|s| s.lines().count() >= 2)
+                    .unwrap_or(false);
                 if pending.len() == 1
                     && pending[0].payload["gate_infra_retry_used"].as_bool() == Some(true)
                     && pending[0].payload["gate_infra_retry_check"].as_str() == Some("verify")
+                    && retry_invocation_started
                 {
                     break;
                 }
