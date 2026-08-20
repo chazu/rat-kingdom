@@ -1938,6 +1938,7 @@ impl LandingPipeline {
         };
         let space = self.space.clone();
         let engine = Arc::clone(&self.engine);
+        let supervisor = Arc::clone(&self.supervisor);
         let entry = entry.clone();
         let primary_attempt = primary_attempt.to_string();
         let wait = gates.review_max_wait;
@@ -1945,6 +1946,7 @@ impl LandingPipeline {
             if let Err(e) = Self::await_shadow_comparison(
                 space,
                 engine,
+                supervisor,
                 entry,
                 shadow,
                 primary_attempt,
@@ -1973,6 +1975,7 @@ impl LandingPipeline {
     async fn await_shadow_comparison(
         space: Space,
         engine: Arc<WorkflowEngine>,
+        supervisor: Arc<Supervisor>,
         entry: LandingQueueEntry,
         shadow: ShadowReview,
         primary_attempt: String,
@@ -2023,6 +2026,20 @@ impl LandingPipeline {
             Some(v) if v == primary_verdict => "agree",
             Some(_) => "disagree",
         };
+        // Each reviewer's own generation, found by its `review.attempt` —
+        // the same join key `AgentRecord::review` persists at spawn time —
+        // so the comparison carries the ACTUAL identity/model/spend of each
+        // reviewer rather than merely the shadow's configured request. Not
+        // found (already reaped, or an archived generation) degrades to
+        // `null` rather than failing the whole comparison record.
+        let records = supervisor.list_all();
+        let find = |attempt: &str| {
+            records
+                .iter()
+                .find(|r| r.review.as_ref().is_some_and(|rv| rv.attempt == attempt))
+        };
+        let primary_record = find(&primary_attempt);
+        let shadow_record = find(&shadow.attempt);
         let tuple = Tuple::new(
             Category::Artifact,
             entry.repo_name.clone(),
@@ -2035,14 +2052,20 @@ impl LandingPipeline {
                 "target": entry.target,
                 "review_attempt": primary_attempt,
                 "shadow_attempt": shadow.attempt,
+                "primary_identity": primary_record.map(|r| r.name.clone()),
                 "primary_verdict": primary_verdict,
+                "primary_model": primary_record.and_then(|r| r.model.clone()),
+                "primary_spend_usd": primary_record.map(|r| r.cost_usd),
+                "shadow_identity": shadow_record.map(|r| r.name.clone()),
                 "shadow_verdict": shadow_verdict,
                 "shadow_model": shadow.model,
                 "shadow_harness": shadow.harness,
+                "shadow_spend_usd": shadow_record.map(|r| r.cost_usd),
                 "agreement": agreement,
                 // Stated in the record itself so no later reader can mistake
                 // this for a second opinion the pipeline acted on.
                 "authoritative": "primary",
+                "recorded_at": chrono::Utc::now().to_rfc3339(),
             }),
         )
         .with_lifecycle(Lifecycle::Furniture);

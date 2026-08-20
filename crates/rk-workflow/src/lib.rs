@@ -138,9 +138,9 @@ pub struct LandingPolicy {
     /// (`review-shadow-comparison` artifact) but never gates landing and
     /// never changes which model is authoritative — the primary reviewer
     /// (this workflow's own `agents.reviewer`) stays the one and only
-    /// verdict `LandingPipeline` routes on. Empty disables shadow review
-    /// entirely (default: `"sonnet"`, additive and non-gating, so this is
-    /// safe to leave on).
+    /// verdict `LandingPipeline` routes on. Empty (the default) disables
+    /// shadow review entirely: the acceptance bar is default unchanged until
+    /// an explicit follow-up ticket flips it, so a repo must opt in.
     #[serde(default = "default_shadow_review_model", rename = "shadowReviewModel")]
     pub shadow_review_model: String,
     /// Harness for the shadow reviewer. Ignored when `shadow_review_model`
@@ -341,11 +341,11 @@ fn default_review_max_wait() -> String {
 }
 
 fn default_shadow_review_model() -> String {
-    "sonnet".into()
+    String::new()
 }
 
 fn default_shadow_review_harness() -> String {
-    "claude".into()
+    String::new()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2607,8 +2607,8 @@ checks: [
         assert_eq!(policy.landing.gate_timeout, "60m");
         assert_eq!(policy.landing.review_timeout, "15m");
         assert_eq!(policy.landing.review_max_wait, "45m");
-        assert_eq!(policy.landing.shadow_review_model, "sonnet");
-        assert_eq!(policy.landing.shadow_review_harness, "claude");
+        assert_eq!(policy.landing.shadow_review_model, "");
+        assert_eq!(policy.landing.shadow_review_harness, "");
     }
 
     #[test]

@@ -68,10 +68,12 @@ repo: #RepositoryPolicy
 	// primary reviewer's (a `review-shadow-comparison` artifact) but never
 	// gates landing and never replaces the primary reviewer — this workflow's
 	// own `agents.reviewer` stays the one and only verdict LandingPipeline
-	// routes on. Empty disables shadow review.
-	shadowReviewModel: string | *"sonnet"
+	// routes on. Empty (the default) disables shadow review entirely — the
+	// acceptance bar is default-unchanged until an explicit follow-up ticket
+	// flips it; a repo opts in explicitly.
+	shadowReviewModel: string | *""
 	// Harness for the shadow reviewer. Ignored when shadowReviewModel is empty.
-	shadowReviewHarness: string | *"claude"
+	shadowReviewHarness: string | *""
 }
 
 // Regenerable build-artifact paths (relative to a worktree root) the daemon's
