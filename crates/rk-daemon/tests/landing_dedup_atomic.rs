@@ -513,18 +513,13 @@ checks: [
 /// marker (not just the in-process mutex, which resets on restart) is what
 /// closes the race.
 ///
-/// Deliberately does NOT kill mid-gate: `Daemon::new`'s reactor and
-/// landing-pipeline consumer loops are independent `tokio::spawn` tasks, not
-/// children of the `Daemon::run()` future, so `handle_a.abort()` cancels
-/// only the latter — a gate run already in flight under daemon A would keep
-/// running as an orphaned task on the SAME test-process runtime even after
-/// the "kill", free to race daemon B's own resume (two independent
-/// `LandingPipeline` instances, each with its own in-process locks and
-/// neither aware of the other). Only a real process crash — not a
-/// same-process task abort — actually prevents that, so it is a
-/// test-harness artifact rather than the dedup gap this file exists to
-/// prove; `live_landing_restart.rs` already separately covers a mid-gate
-/// kill resuming correctly. Settling before the kill sidesteps it.
+/// Deliberately does NOT kill mid-gate — see
+/// `restart_mid_gate_kill_does_not_race_a_second_landing_processed_marker`
+/// below, which now owns that case since `Daemon::run()`'s background loops
+/// were moved into a `JoinSet` local to the future (TKT-01M0G2VXS8PQYZN2X3ZWXDFC5B),
+/// making `handle.abort()` tear down the whole task tree instead of leaving
+/// orphans. Settling before the kill here keeps this test's only variable
+/// the durable marker, not the restart timing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_preserves_the_landing_dedup_invariant() {
     let home = tempfile::tempdir().unwrap();
@@ -626,6 +621,138 @@ async fn restart_preserves_the_landing_dedup_invariant() {
     assert_eq!(
         main_after, main_after_retry,
         "a post-restart retry must not merge a second time"
+    );
+
+    handle_b.abort();
+    let _ = handle_b.await;
+}
+
+/// TKT-01M0G2VXS8PQYZN2X3ZWXDFC5B: the actual mid-gate kill
+/// `restart_preserves_the_landing_dedup_invariant` above deliberately avoids.
+/// Daemon A's `verify` check is mid-`sleep` (durably `running_gates`) when
+/// `handle_a.abort()` fires — before this fix, `Daemon::run()`'s reactor and
+/// landing-pipeline consumer loops were independent `tokio::spawn` tasks, not
+/// children of the aborted future, so that in-flight gate run kept executing
+/// as an orphan on this same test-process runtime. Daemon B's own fresh
+/// `LandingPipeline` then resumed and re-ran the SAME gate concurrently — two
+/// independent instances, each with its own in-process locks, racing to
+/// write the terminal `landing_processed` marker for one work key. That
+/// produced two markers 100% of 5 runs in the field investigation. Now that
+/// every background loop is spawned into a `JoinSet` local to `run()`,
+/// aborting `handle_a` drops that `JoinSet` and aborts every task still in
+/// it, so daemon A's orphaned gate run is torn down before it can finish —
+/// only daemon B's resume ever completes the candidate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_mid_gate_kill_does_not_race_a_second_landing_processed_marker() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo = repo_dir.path().join("dedup-restart-midgate");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let barrier_dir = tempfile::tempdir().unwrap();
+    let run_count = barrier_dir.path().join("run-count.log");
+    let checks = format!(
+        r#"
+checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "echo run >> \"{log}\"; sleep 0.8 && true", timeout: "30s"}},
+]
+"#,
+        log = run_count.display(),
+    );
+    write_checks(&repo, &checks);
+
+    let repo_name = repo_name_of(&repo);
+    let head_sha = make_branch(&repo, "rat/dedup-restart-midgate/tkt-1", "work.txt", "v1\n");
+    let main_before = git(&repo, &["rev-parse", "main"]);
+
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    std::fs::create_dir_all(layout.triggers_dir()).unwrap();
+    std::fs::write(layout.triggers_dir().join("landing.cue"), LANDING_TRIGGER).unwrap();
+
+    let mut config = rk_core::config::Config::default();
+    config.harness.default = "fake".into();
+
+    // Daemon A: a genuinely on-disk `Space` (`Daemon::new`, not
+    // `new_in_memory`) — a second `Daemon::new` below must inherit this
+    // one's durable state, not start from an empty store.
+    let daemon_a = Daemon::new(layout.clone(), &config).unwrap();
+    let handle_a = tokio::spawn(daemon_a.run());
+    let mut client = connect(&layout).await;
+
+    client
+        .call(
+            "repo.add",
+            json!({"name": &repo_name, "path": repo.to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+
+    emit_harness_result(
+        &mut client,
+        &repo_name,
+        Completion {
+            agent: "Deyna-9",
+            branch: "rat/dedup-restart-midgate/tkt-1",
+            target: "main",
+            head_sha: &head_sha,
+            task: "dedup-restart-midgate-task",
+            diff_class: "trivial",
+        },
+    )
+    .await;
+
+    assert!(
+        wait_until_status(&mut client, &repo_name, "running_gates", 150).await,
+        "candidate never reached running_gates before the kill"
+    );
+
+    // The kill: abort the daemon's task outright, genuinely mid-gate — the
+    // landing consumer loop's shutdown signal is only checked BETWEEN
+    // cycles, so a graceful `stop` would let an already-started `run_cycle`
+    // finish first and defeat the point of this test.
+    handle_a.abort();
+    let _ = handle_a.await;
+    std::fs::remove_file(layout.pid_file()).ok();
+    std::fs::remove_file(layout.socket_path()).ok();
+
+    // Daemon B: a fresh `Daemon::new` over the SAME on-disk home, with the
+    // SAME installed trigger rediscovered off disk.
+    let daemon_b = Daemon::new(layout.clone(), &config).unwrap();
+    let handle_b = tokio::spawn(daemon_b.run());
+    let mut client = connect(&layout).await;
+
+    assert!(
+        wait_until_queue_empty(&mut client, &repo_name, 300).await,
+        "the candidate never drained after the mid-gate restart"
+    );
+
+    let markers = processed_markers(&mut client, &repo_name).await;
+    assert_eq!(
+        markers.len(),
+        1,
+        "an orphaned daemon-A gate run must not race daemon B's resume into a \
+         second processed marker: {markers:?}"
+    );
+    assert_eq!(markers[0]["payload"]["outcome"], "landed", "{markers:?}");
+
+    let main_after = git(&repo, &["rev-parse", "main"]);
+    assert_ne!(
+        main_before, main_after,
+        "the branch must have landed onto main after the restart"
+    );
+    // A single landing always advances main by exactly 2 commits — `rk`
+    // lands with `--no-ff` (`rk-git/src/lib.rs`), so a 1-commit branch
+    // yields the replayed commit plus the merge commit. A racing second
+    // merge (the bug this test guards) would add 2 more.
+    let merge_count = git(&repo, &["rev-list", "--count", &format!("{main_before}..main")]);
+    assert_eq!(
+        merge_count, "2",
+        "the candidate must merge exactly once, not once per racing daemon: \
+         {merge_count} commits landed onto main"
     );
 
     handle_b.abort();
