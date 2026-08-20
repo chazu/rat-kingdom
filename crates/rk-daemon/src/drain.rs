@@ -393,7 +393,7 @@ impl Drain {
     /// resolve that profile over the global agents. A bare drain has no
     /// workflow-scoped agents, so only global profiles apply. An unknown tier
     /// name errors, exactly like an unknown profile in a spawn step.
-    fn resolve_tier(&self, ticket: &Tuple) -> rk_core::Result<ResolvedAgent> {
+    pub(crate) fn resolve_tier(&self, ticket: &Tuple) -> rk_core::Result<ResolvedAgent> {
         let (labels, priority) = tier_key(&ticket.payload);
         let tier = self.tier_routing.route(&labels, Some(priority));
         if let Some(tier) = tier {

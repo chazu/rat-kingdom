@@ -326,7 +326,9 @@ fn describe_routing(result: &Value, agent: &Value) -> String {
         result["routing"]["profile"].as_str(),
         result["routing"]["source"].as_str(),
     ) {
-        (Some(name), Some("tier")) => format!("{name} (cost tier, from ticket labels/priority) · model {model}"),
+        (Some(name), Some("tier")) => {
+            format!("{name} (cost tier, from ticket labels/priority) · model {model}")
+        }
         (Some(name), _) => format!("{name} (--profile, tier routing bypassed) · model {model}"),
         _ => format!("agents.default (no tier rule matched) · model {model}"),
     }

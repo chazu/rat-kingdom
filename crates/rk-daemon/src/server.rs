@@ -7895,6 +7895,152 @@ mod default_agent_profile_tests {
         assert_eq!(record.model.as_deref(), Some("profile-model"));
         assert_eq!(record.permission_mode.as_deref(), Some("workspace-write"));
     }
+
+    fn profile_cfg(model: &str) -> AgentProfileConfig {
+        AgentProfileConfig {
+            harness: Some("fake".into()),
+            model: Some(model.into()),
+            permission_mode: None,
+        }
+    }
+
+    fn spawn_params(task: &str, profile: Option<&str>) -> crate::supervisor::SpawnParams {
+        crate::supervisor::SpawnParams {
+            repo: ".".into(),
+            task: task.into(),
+            prompt: None,
+            role: "rat".into(),
+            coordination: None,
+            harness: None,
+            parent: None,
+            base: None,
+            model: None,
+            permission_mode: None,
+            attach: false,
+            workflow_instance: None,
+            coordinator: None,
+            instance_max_usd: None,
+            profile: profile.map(String::from),
+            resolved_profile: None,
+        }
+    }
+
+    /// The acceptance for TKT-01M0CW1918D10C48C2J3TMRSFQ: a ticket must reach
+    /// the same profile whichever dispatcher picks it up. Before this, tier
+    /// routing ran only on the drain path, so `rk spawn --ticket` quietly
+    /// resolved `[agents.default]` and the fleet's cost policy went unenforced
+    /// for every hand-dispatched ticket.
+    #[tokio::test]
+    async fn operator_spawn_and_drain_resolve_the_same_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = rk_core::config::Config::default();
+        config.harness.default = "fake".into();
+        config
+            .agents
+            .insert("default".into(), profile_cfg("opus-default"));
+        config
+            .agents
+            .insert("sonnet-worker".into(), profile_cfg("sonnet"));
+        config.agents.insert("premium".into(), profile_cfg("opus"));
+        // Catch-all last, exactly as an operator would write it: everything is
+        // a medium unless it is labelled `hard`.
+        config.tiers.rules = vec![
+            rk_core::config::TierRuleConfig {
+                priority: None,
+                label: Some("hard".into()),
+                tier: "premium".into(),
+            },
+            rk_core::config::TierRuleConfig {
+                priority: None,
+                label: None,
+                tier: "sonnet-worker".into(),
+            },
+        ];
+        let daemon = Daemon::new(Layout::at(dir.path().join("rk-home")), &config).unwrap();
+
+        let medium = daemon
+            .tickets
+            .create(
+                serde_json::from_value(json!({"title": "medium work", "scope": "demo"})).unwrap(),
+            )
+            .await
+            .unwrap();
+        let hard = daemon
+            .tickets
+            .create(
+                serde_json::from_value(
+                    json!({"title": "hard work", "scope": "demo", "labels": ["hard"]}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // The drain's view of the same two tickets, resolved through its own
+        // (pre-existing) path — this is the reference the operator path must
+        // agree with, not a re-derivation of the expected answer.
+        let drain = crate::drain::Drain::new(
+            Arc::clone(&daemon.supervisor),
+            Arc::clone(&daemon.tickets),
+            Layout::at(dir.path().join("rk-home")),
+            rk_core::config::DrainConfig::default(),
+            daemon.tier_routing.clone(),
+            daemon.global_agents.clone(),
+            daemon.default_harness.clone(),
+        );
+
+        for ticket in [&medium, &hard] {
+            let by_drain = drain.resolve_tier(ticket).unwrap();
+            let (by_operator, name, source) = daemon
+                .route_spawn_profile(&spawn_params(&ticket.identity, None))
+                .unwrap()
+                .expect("a catch-all rule must route every ticket");
+            assert_eq!(source, "tier");
+            assert_eq!(
+                by_operator.model, by_drain.model,
+                "{} routed to {name} by hand but to {:?} by the drain",
+                ticket.identity, by_drain.model
+            );
+            assert_eq!(
+                by_operator.harness.as_deref(),
+                Some(by_drain.harness.as_str())
+            );
+        }
+        // ...and the two tickets are genuinely on different tiers, so the
+        // agreement above is not both paths collapsing to one default.
+        let medium_model = daemon
+            .route_spawn_profile(&spawn_params(&medium.identity, None))
+            .unwrap()
+            .unwrap()
+            .0
+            .model;
+        assert_eq!(medium_model.as_deref(), Some("sonnet"));
+        assert_eq!(
+            daemon
+                .route_spawn_profile(&spawn_params(&hard.identity, None))
+                .unwrap()
+                .unwrap()
+                .0
+                .model
+                .as_deref(),
+            Some("opus")
+        );
+
+        // `--profile` is the documented opt-out: it replaces the tier rather
+        // than layering under it, so a catch-all cannot override an operator
+        // who named a profile at dispatch time.
+        let (overridden, name, source) = daemon
+            .route_spawn_profile(&spawn_params(&medium.identity, Some("premium")))
+            .unwrap()
+            .unwrap();
+        assert_eq!((name.as_str(), source), ("premium", "profile"));
+        assert_eq!(overridden.model.as_deref(), Some("opus"));
+
+        // A typo must be refused, not silently dispatched on the default.
+        assert!(daemon
+            .route_spawn_profile(&spawn_params(&medium.identity, Some("nope")))
+            .is_err());
+    }
 }
 
 #[cfg(test)]
