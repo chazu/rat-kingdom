@@ -63,10 +63,19 @@ async fn foreman_delegates_merges_and_lands_worker() {
     scratch_repo(repo_dir.path());
 
     let rk = std::env::var("CARGO_BIN_EXE_rk").unwrap_or_else(|_| {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
+        // rk-daemon doesn't own the `rk` binary, so cargo never sets
+        // CARGO_BIN_EXE_rk for this test binary. Fall back to the real
+        // target dir: CARGO_TARGET_DIR when set (mise redirects it out of
+        // the workspace), else cargo's workspace-root-relative default.
+        let target_dir = std::env::var("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("..")
+                    .join("target")
+            });
+        target_dir
             .join("debug")
             .join("rk")
             .to_string_lossy()
