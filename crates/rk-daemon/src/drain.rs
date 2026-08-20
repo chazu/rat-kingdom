@@ -251,6 +251,7 @@ impl Drain {
                 harness: Some(resolved.harness),
                 parent: None,
                 base: None,
+                review: None,
                 model: resolved.model,
                 permission_mode: resolved.permission_mode,
                 attach: false,

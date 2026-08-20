@@ -138,6 +138,15 @@ workflow: #Workflow
 	}
 	// Base/merge-target branch override.
 	branch?: string
+	// Exact review correlation, supplied by the review request rather than
+	// reconstructed from the spawned reviewer's generated branch name.
+	review?: {
+		branch:  string
+		headSha: string
+		target:  string
+		task:    string
+		attempt: string
+	}
 }
 
 #Coordination: {

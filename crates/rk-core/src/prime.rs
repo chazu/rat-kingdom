@@ -17,6 +17,10 @@ pub struct PrimeContext {
     /// Resolved merge/base branch used when spawning this worker. The renderer
     /// substitutes it into instructions that mention `<base>`.
     pub base: Option<String>,
+    /// Exact candidate identity for a machine-routed reviewer. This is
+    /// runtime-owned metadata and must not be inferred from the reviewer's own
+    /// generated branch name.
+    pub review: Option<crate::review::ReviewContext>,
     pub parent: Option<String>,
     /// Recent facts pre-scanned by the caller from the tuplespace for this
     /// rat's repo scope + system. The renderer caps injected facts at
@@ -685,6 +689,17 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
             out.push_str(FRAGMENT_COMPLETION);
         }
         "reviewer" => {
+            if let Some(review) = &ctx.review {
+                let _ = writeln!(
+                    out,
+                    "## Exact review binding\n\nThe runtime has bound this verdict to:\n- task: `{}`\n- reviewed branch: `{}`\n- reviewed head: `{}`\n- landing target: `{}`\n- review attempt: `{}`\n\nDo not derive any of these values from your agent name or your own generated branch. Emit only `recommendation` and `notes`; `rk out artifact <repo> review` supplies this binding from the runtime and rejects conflicting metadata.\n",
+                    review.task,
+                    review.branch,
+                    review.head_sha,
+                    review.target,
+                    review.attempt,
+                );
+            }
             out.push_str(
                 "Review the changes on your branch against the task requirements. \
                  FIRST establish there are changes: run `git log <base>..HEAD`, where \
@@ -753,6 +768,7 @@ mod tests {
             task: Some(".rk-1".into()),
             branch: Some("rat/whisker/rk-1".into()),
             base: None,
+            review: None,
             parent: None,
             facts: Vec::new(),
             conventions: Vec::new(),
@@ -1108,6 +1124,33 @@ mod tests {
             .and_then(|arm| arm.split("## Coordination: the tuplespace").next())
             .expect("reviewer arm");
         assert!(!reviewer_arm.contains("do not assume"));
+    }
+
+    #[test]
+    fn reviewer_prompt_names_the_runtime_owned_review_binding() {
+        let mut context = ctx();
+        context.review = Some(crate::review::ReviewContext {
+            branch: "rat/fidget-10/tkt-1".into(),
+            head_sha: "0640835".into(),
+            target: "release".into(),
+            task: "TKT-1".into(),
+            attempt: "landing-review-1".into(),
+        });
+
+        let text = render("reviewer", &context);
+        for exact in [
+            "task: `TKT-1`",
+            "reviewed branch: `rat/fidget-10/tkt-1`",
+            "reviewed head: `0640835`",
+            "landing target: `release`",
+            "review attempt: `landing-review-1`",
+            "Do not derive any of these values from your agent name",
+        ] {
+            assert!(
+                text.contains(exact),
+                "missing exact review context: {exact}"
+            );
+        }
     }
 
     #[test]

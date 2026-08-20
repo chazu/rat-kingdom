@@ -433,6 +433,11 @@ pub struct SpawnStep {
     pub task: TaskDef,
     #[serde(default)]
     pub branch: Option<String>,
+    /// Runtime-owned identity of the exact work a reviewer is judging. When
+    /// present, the daemon preserves it into the reviewer environment and
+    /// validates every emitted review artifact against it.
+    #[serde(default)]
+    pub review: Option<rk_core::review::ReviewContext>,
 }
 
 /// Dispatch metadata identifying an agent as a reporting boundary. The
@@ -2195,6 +2200,7 @@ workflow: {
                 description: None,
             },
             branch: None,
+            review: None,
         })];
         let gate = |d: &str| {
             Step::Gate(GateStep {

@@ -5385,6 +5385,7 @@ impl Daemon {
                     harness: Some(session.harness.clone()),
                     parent: None,
                     base: Some(session.base_branch.clone()),
+                    review: None,
                     model: session.model.clone(),
                     permission_mode: None,
                     attach,
@@ -6955,6 +6956,17 @@ impl Daemon {
         };
         let caller = req.caller.clone();
         let is_agent = caller != "operator" && !caller.is_empty();
+        if is_agent && params.category == Category::Artifact && params.identity == "review" {
+            if let Some(review) = self
+                .supervisor
+                .status(&caller)
+                .and_then(|record| record.review)
+            {
+                if let Err(error) = validate_review_artifact(&params.payload, &review) {
+                    return Response::err(req.id, codes::BAD_PARAMS, error);
+                }
+            }
+        }
         let attention = if is_agent
             && matches!(params.category, Category::Obstacle | Category::Need)
             && self.supervisor.is_reporting_boundary(&caller)
@@ -7777,6 +7789,31 @@ struct OutParams {
     lifecycle: Option<Lifecycle>,
     #[serde(default)]
     ttl_secs: Option<u64>,
+}
+
+fn validate_review_artifact(
+    payload: &Value,
+    review: &rk_core::review::ReviewContext,
+) -> Result<(), String> {
+    for (field, expected) in [
+        ("branch", review.branch.as_str()),
+        ("head_sha", review.head_sha.as_str()),
+        ("target", review.target.as_str()),
+        ("task", review.task.as_str()),
+        ("review_attempt", review.attempt.as_str()),
+    ] {
+        let Some(actual) = payload.get(field) else {
+            return Err(format!(
+                "review artifact binding mismatch for {field}: expected '{expected}', got <missing>"
+            ));
+        };
+        if actual.as_str() != Some(expected) {
+            return Err(format!(
+                "review artifact binding mismatch for {field}: expected '{expected}', got {actual}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `space.withdraw` params: the ballot to close. Everything else the record
@@ -8871,6 +8908,7 @@ mod default_agent_profile_tests {
                     harness: None,
                     parent: None,
                     base: None,
+                    review: None,
                     model: None,
                     permission_mode: None,
                     attach: false,
@@ -8912,6 +8950,7 @@ mod default_agent_profile_tests {
             permission_mode: None,
             attach: false,
             workflow_instance: None,
+            review: None,
             coordinator: None,
             instance_max_usd: None,
             profile: profile.map(String::from),
@@ -9173,6 +9212,7 @@ mod authorize_reasoned_tests {
             target_branch: "main".into(),
             parent: None,
             workflow_instance: None,
+            review: None,
             coordinator: None,
             session_id: Some("test-session".into()),
             attach_target: None,
@@ -9378,6 +9418,70 @@ mod authorize_reasoned_tests {
 }
 
 #[cfg(test)]
+mod review_artifact_binding_tests {
+    use super::*;
+    use rk_core::review::ReviewContext;
+
+    fn review() -> ReviewContext {
+        ReviewContext {
+            branch: "rat/fidget-10/tkt-1".into(),
+            head_sha: "0640835".into(),
+            target: "release".into(),
+            task: "TKT-1".into(),
+            attempt: "landing-review-1".into(),
+        }
+    }
+
+    #[test]
+    fn authenticated_reviewer_rejects_an_incorrectly_bound_artifact_exactly() {
+        let (_dir, daemon) =
+            super::authorize_reasoned_tests::test_daemon_with_named_role("Brie-10", "reviewer");
+        daemon
+            .supervisor
+            .lock_registry()
+            .update("Brie-10", |record| record.review = Some(review()))
+            .unwrap();
+
+        let response = daemon.handle_out(Request {
+            id: "wrong-review".into(),
+            method: "space.out".into(),
+            auth: String::new(),
+            caller: "Brie-10".into(),
+            client_version: None,
+            params: json!({
+                "category": "artifact",
+                "scope": "repo",
+                "identity": "review",
+                "payload": {
+                    "recommendation": "APPROVE",
+                    "branch": "rat/fidget-10/steward-review-tkt-1",
+                    "head_sha": "0640835",
+                    "target": "release",
+                    "task": "TKT-1",
+                    "review_attempt": "landing-review-1"
+                }
+            }),
+        });
+
+        let error = response.error.expect("wrong binding must be rejected");
+        assert_eq!(error.code, codes::BAD_PARAMS);
+        assert_eq!(
+            error.message,
+            "review artifact binding mismatch for branch: expected \
+             'rat/fidget-10/tkt-1', got \"rat/fidget-10/steward-review-tkt-1\""
+        );
+        assert!(
+            daemon
+                .space
+                .scan(&Pattern::category(Category::Artifact).identity("review"))
+                .unwrap()
+                .is_empty(),
+            "a rejected artifact must not enter the tuplespace"
+        );
+    }
+}
+
+#[cfg(test)]
 mod groomer_ticket_update_tests {
     //! `handle_ticket_update`'s own shape check and audit event, exercised
     //! directly (bypassing the wire) the way `authorize_reasoned_tests` above
@@ -9571,6 +9675,7 @@ mod ticket_reopen_sweep_tests {
             target_branch: "main".into(),
             parent: None,
             workflow_instance: None,
+            review: None,
             coordinator: None,
             session_id: Some("test-session".into()),
             attach_target: None,

@@ -747,6 +747,7 @@ mod tests {
             target_branch: "main".into(),
             parent: parent.map(str::to_string),
             workflow_instance: Some("wf-1".into()),
+            review: None,
             coordinator: Some("session-1".into()),
             session_id: None,
             attach_target: None,

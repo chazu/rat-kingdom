@@ -76,12 +76,40 @@ fn all_shipped_examples_load() {
             json!("How does the tuplespace work?"),
         ),
         ("branch".to_string(), json!("rat/example-task/tkt-1")),
+        ("reviewAttempt".to_string(), json!("landing-review-example")),
     ]);
     for def in defs {
         let workflow = rk_workflow::load(&def, &inputs)
             .unwrap_or_else(|e| panic!("{} failed to load: {e}", def.display()));
         assert!(!workflow.steps.is_empty(), "{}", def.display());
     }
+}
+
+#[test]
+fn steward_review_carries_the_exact_review_binding_on_its_spawn() {
+    let inputs = HashMap::from([
+        ("taskId".to_string(), json!("TKT-1")),
+        ("branch".to_string(), json!("rat/worker/tkt-1")),
+        ("target".to_string(), json!("release")),
+        ("headSha".to_string(), json!("abc123")),
+        ("reviewAttempt".to_string(), json!("landing-review-1")),
+    ]);
+    let workflow = rk_workflow::load(&examples_dir().join("steward-review.cue"), &inputs)
+        .expect("steward-review loads");
+    let spawn = workflow
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            rk_workflow::Step::Spawn(spawn) => Some(spawn),
+            _ => None,
+        })
+        .expect("reviewer spawn");
+    let review = spawn.review.as_ref().expect("typed review binding");
+    assert_eq!(review.branch, "rat/worker/tkt-1");
+    assert_eq!(review.head_sha, "abc123");
+    assert_eq!(review.target, "release");
+    assert_eq!(review.task, "TKT-1");
+    assert_eq!(review.attempt, "landing-review-1");
 }
 
 #[test]

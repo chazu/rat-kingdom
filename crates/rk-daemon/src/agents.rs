@@ -4,6 +4,7 @@
 //! this structure, never payload fields (the predecessor's foreman-routing lesson).
 
 use chrono::{DateTime, Utc};
+use rk_core::review::ReviewContext;
 use rk_harness::TokenUsage;
 use rk_workflow::Coordination;
 use serde::{Deserialize, Serialize};
@@ -140,6 +141,11 @@ pub struct AgentRecord {
     /// enforce a workflow's `budget:` cap at dispatch time.
     #[serde(default)]
     pub workflow_instance: Option<String>,
+    /// Exact candidate identity for a reviewer spawned by a review workflow.
+    /// Persisted with the generation so respawn and artifact authorization
+    /// retain the original binding.
+    #[serde(default)]
+    pub review: Option<ReviewContext>,
     /// Coordinator session owning the workflow that dispatched this agent.
     #[serde(default)]
     pub coordinator: Option<String>,
@@ -764,6 +770,7 @@ mod tests {
             target_branch: "main".into(),
             parent: None,
             workflow_instance: None,
+            review: None,
             coordinator: None,
             session_id: None,
             attach_target: None,

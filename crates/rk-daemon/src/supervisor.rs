@@ -298,6 +298,7 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
         target_branch: journal.target_branch,
         parent: journal.params.parent.clone(),
         workflow_instance: journal.params.workflow_instance.clone(),
+        review: journal.params.review.clone(),
         coordinator: journal.params.coordinator.clone(),
         session_id: None,
         attach_target: None,
@@ -448,6 +449,10 @@ pub struct SpawnParams {
     /// Base/merge-target branch; defaults to the repo's current branch.
     #[serde(default)]
     pub base: Option<String>,
+    /// Exact work identity when this spawn is a reviewer for a machine-routed
+    /// verdict. Ordinary reviewers and non-review roles leave this unset.
+    #[serde(default)]
+    pub review: Option<rk_core::review::ReviewContext>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -1265,6 +1270,7 @@ impl Supervisor {
             task: Some(params.task.clone()),
             branch: Some(branch.clone()),
             base: Some(instruction_base.clone()),
+            review: params.review.clone(),
             parent: params.parent.clone(),
             facts: self.scan_facts(&repo_name),
             conventions: self.scan_conventions(&repo_name),
@@ -1288,6 +1294,7 @@ impl Supervisor {
             &instruction_base,
             &worktree,
             params.workflow_instance.as_deref(),
+            params.review.as_ref(),
         );
         if let Some(parent) = &params.parent {
             env.insert("RK_PARENT".into(), parent.clone());
@@ -1623,6 +1630,7 @@ impl Supervisor {
             &instruction_base,
             &worktree,
             record.workflow_instance.as_deref(),
+            record.review.as_ref(),
         );
 
         let prime_ctx = PrimeContext {
@@ -1631,6 +1639,7 @@ impl Supervisor {
             task: record.task.clone(),
             branch: record.branch.clone(),
             base: Some(instruction_base),
+            review: record.review.clone(),
             parent: record.parent.clone(),
             facts: self.scan_facts(&record.repo_name),
             conventions: self.scan_conventions(&record.repo_name),
@@ -5463,6 +5472,7 @@ impl Supervisor {
         base: &str,
         worktree: &std::path::Path,
         workflow_instance: Option<&str>,
+        review: Option<&rk_core::review::ReviewContext>,
     ) -> HashMap<String, String> {
         let mut env = HashMap::new();
         env.insert("RK_HOME".into(), self.layout.home().display().to_string());
@@ -5499,6 +5509,11 @@ impl Supervisor {
         }
         if let Some(instance) = workflow_instance {
             env.insert("RK_WORKFLOW_INSTANCE".into(), instance.to_string());
+        }
+        if let Some(review) = review {
+            for (name, value) in review.env_pairs() {
+                env.insert(name.into(), value.into());
+            }
         }
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
@@ -5851,6 +5866,13 @@ mod respawn_tests {
     fn agent_env_exports_resolved_base() {
         let home = tempfile::tempdir().unwrap();
         let sup = supervisor(home.path());
+        let review = rk_core::review::ReviewContext {
+            branch: "rat/worker/task".into(),
+            head_sha: "abc123".into(),
+            target: "integration".into(),
+            task: "TKT-123".into(),
+            attempt: "landing-review-123".into(),
+        };
         let env = sup.agent_env(
             "Nibble",
             "reviewer",
@@ -5860,9 +5882,13 @@ mod respawn_tests {
             "integration",
             Path::new("/tmp/review-worktree"),
             None,
+            Some(&review),
         );
 
         assert_eq!(env.get("RK_BASE").map(String::as_str), Some("integration"));
+        for (name, expected) in review.env_pairs() {
+            assert_eq!(env.get(name).map(String::as_str), Some(expected), "{name}");
+        }
     }
 
     #[test]
@@ -5877,6 +5903,7 @@ mod respawn_tests {
             Some("rat/nibble/task"),
             "main",
             Path::new("/tmp/nibble-worktree"),
+            None,
             None,
         );
 
@@ -5896,6 +5923,7 @@ mod respawn_tests {
             Some("rat/nibble/task"),
             "main",
             Path::new("/tmp/nibble-worktree"),
+            None,
             None,
         );
 
@@ -5928,6 +5956,7 @@ mod respawn_tests {
             harness: Some("fake".into()),
             parent: None,
             base: Some("integration".into()),
+            review: None,
             model: None,
             permission_mode: None,
             attach: false,
@@ -5978,6 +6007,7 @@ mod respawn_tests {
             harness: None,
             parent: None,
             base: None,
+            review: None,
             model: None,
             permission_mode: None,
             attach: false,
@@ -6266,6 +6296,7 @@ mod respawn_tests {
             target_branch: "main".into(),
             parent: None,
             workflow_instance: None,
+            review: None,
             coordinator: None,
             session_id: None,
             attach_target: None,
@@ -6801,6 +6832,7 @@ mod respawn_tests {
             harness: Some("fake".into()),
             parent: None,
             base: None,
+            review: None,
             model: None,
             permission_mode: None,
             attach: false,
