@@ -381,3 +381,207 @@ async fn duplicate_submission_with_explicit_task_is_idempotent() {
 
     handle.abort();
 }
+
+/// A recovery branch with neither an agent record nor an explicit `--task`
+/// must be refused outright, not silently enqueued with `task: ""` — that
+/// used to mean no ticket/spec for the reviewer, no delivery record, and
+/// nothing ever closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unbound_recovery_branch_without_task_fails_closed() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo = repo_dir.path().join("landtaskrepo-unbound");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let branch = recovery_branch(&repo, "rat/recovery-retry/tkt-unbound", "recovered.txt");
+
+    let refused = client
+        .call(
+            "repo.land",
+            json!({
+                "repo": repo.to_string_lossy(),
+                "branch": branch,
+                "target": "main",
+            }),
+        )
+        .await;
+    let err = refused.expect_err(
+        "a branch with no agent record and no --task must fail closed rather than land with an \
+         empty task identity",
+    );
+    assert!(
+        err.to_string().to_lowercase().contains("no task identity"),
+        "{err}"
+    );
+
+    handle.abort();
+}
+
+/// Resubmitting the exact same branch/head under a DIFFERENT same-repo
+/// ticket must fail closed, not report `already_processed` — that would
+/// silently look like a no-op while leaving the newly-named ticket untouched
+/// and misleading the operator into thinking it landed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resubmission_with_a_different_task_fails_closed() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo = repo_dir.path().join("landtaskrepo-mismatch-retry");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let first_ticket = client
+        .call(
+            "ticket.new",
+            json!({"title": "first submission", "scope": "landtaskrepo-mismatch-retry"}),
+        )
+        .await
+        .unwrap();
+    let first_id = first_ticket["ticket"]["identity"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let second_ticket = client
+        .call(
+            "ticket.new",
+            json!({"title": "wrongly retried under this one", "scope": "landtaskrepo-mismatch-retry"}),
+        )
+        .await
+        .unwrap();
+    let second_id = second_ticket["ticket"]["identity"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // `keep_branch: true` so the branch/head survive the first land — the
+    // dedup key is `(repo, branch, head_sha)`, unchanged across the retry.
+    let branch = recovery_branch(&repo, "rat/recovery-retry/tkt-remismatch", "recovered.txt");
+    let first = client
+        .call(
+            "repo.land",
+            json!({
+                "repo": repo.to_string_lossy(),
+                "branch": branch,
+                "target": "main",
+                "task": first_id,
+                "keep_branch": true,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["merged"], true, "{first}");
+
+    let refused = client
+        .call(
+            "repo.land",
+            json!({
+                "repo": repo.to_string_lossy(),
+                "branch": branch,
+                "target": "main",
+                "task": second_id,
+                "keep_branch": true,
+            }),
+        )
+        .await;
+    let err = refused.expect_err(
+        "retrying the same branch/head under a different task must fail closed, not report \
+         already_processed",
+    );
+    assert!(
+        err.to_string().contains(&first_id) && err.to_string().contains(&second_id),
+        "{err}"
+    );
+
+    let first_after = client
+        .call("ticket.get", json!({"id": first_id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_after["ticket"]["payload"]["status"], "closed",
+        "the real landing's ticket must remain closed: {first_after}"
+    );
+    let second_after = client
+        .call("ticket.get", json!({"id": second_id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        second_after["ticket"]["payload"]["status"], "open",
+        "a refused resubmission must not touch the wrongly-named ticket: {second_after}"
+    );
+
+    handle.abort();
+}
+
+/// `--force` bypasses the landing pipeline entirely — it never runs
+/// `Supervisor::resolve_land_task`, never writes a `landing_processed`
+/// marker, and never records a delivery. Silently accepting `--task`
+/// alongside it would look like the ticket was bound when nothing recorded
+/// that; the combination must be refused, not ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn force_landing_rejects_explicit_task() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo = repo_dir.path().join("landtaskrepo-force");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let ticket = client
+        .call(
+            "ticket.new",
+            json!({"title": "force landing attempt", "scope": "landtaskrepo-force"}),
+        )
+        .await
+        .unwrap();
+    let ticket_id = ticket["ticket"]["identity"].as_str().unwrap().to_string();
+
+    let branch = recovery_branch(&repo, "rat/recovery-retry/tkt-force", "recovered.txt");
+
+    let refused = client
+        .call(
+            "repo.land",
+            json!({
+                "repo": repo.to_string_lossy(),
+                "branch": branch,
+                "target": "main",
+                "force": true,
+                "reason": "emergency landing",
+                "task": ticket_id,
+            }),
+        )
+        .await;
+    let err = refused.expect_err(
+        "--force combined with --task must be refused, not silently land without binding the \
+         ticket",
+    );
+    assert!(
+        err.to_string().to_lowercase().contains("force")
+            && err.to_string().to_lowercase().contains("task"),
+        "{err}"
+    );
+
+    let untouched = client
+        .call("ticket.get", json!({"id": ticket_id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        untouched["ticket"]["payload"]["status"], "open",
+        "a refused force+task combination must not touch the ticket: {untouched}"
+    );
+
+    handle.abort();
+}

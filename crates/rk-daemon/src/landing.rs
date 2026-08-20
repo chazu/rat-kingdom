@@ -921,15 +921,35 @@ impl LandingPipeline {
     /// Enqueue a fresh completion as a landing candidate, guarded by the
     /// `work_key = (repo, branch, head_sha)` dedup (module doc, design doc
     /// §2.6): `Ok(None)` means this exact candidate was already fully
-    /// processed (a `landing_processed` marker exists) and nothing was
-    /// written — a redelivered completion tuple is dropped here rather than
-    /// repeating gate/review work. `Ok(Some(seq))` is the fresh queue
-    /// position, as before.
+    /// processed under the SAME task identity (a `landing_processed` marker
+    /// exists and its recorded task agrees with `entry.task`, or either side
+    /// is blank) — nothing is written, and a redelivered completion tuple is
+    /// dropped here rather than repeating gate/review work. `Ok(Some(seq))`
+    /// is the fresh queue position, as before.
+    ///
+    /// A marker recording a DIFFERENT non-empty task is not a redelivery —
+    /// it is the same branch/head being resubmitted under the wrong ticket
+    /// (an operator typo, or a stale `--task` reused after the real one
+    /// already landed and closed). That fails closed with an error instead
+    /// of silently reporting `already_processed`, which would otherwise read
+    /// as "nothing to do" while leaving the newly-named ticket untouched.
     pub(crate) fn enqueue(&self, entry: LandingQueueEntry) -> rk_core::Result<Option<u64>> {
-        if self.already_processed(&entry)? {
-            return Ok(None);
+        let Some(marker) = self.processed_marker(&entry)? else {
+            return Ok(Some(self.queue.enqueue(entry)?));
+        };
+        let recorded_task = marker
+            .payload
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !entry.task.is_empty() && !recorded_task.is_empty() && entry.task != recorded_task {
+            return Err(rk_core::Error::other(format!(
+                "{}@{} in {} was already landed under task {recorded_task} — refusing to \
+                 resubmit the same branch/head under a different task {}",
+                entry.branch, entry.head_sha, entry.repo_name, entry.task
+            )));
         }
-        Ok(Some(self.queue.enqueue(entry)?))
+        Ok(None)
     }
 
     /// Reclaim parked merge objects not referenced by any durable queue row.
@@ -990,6 +1010,14 @@ impl LandingPipeline {
     /// automatic completions, then synchronously drive that key until this
     /// work key reaches a terminal result. Priority changes ordering only;
     /// it never skips preparation, named gates, review, or CAS.
+    ///
+    /// `task` must resolve to a non-empty identity — `Supervisor::land`
+    /// passes `Supervisor::resolve_land_task`'s result, which already infers
+    /// it from an agent record for an ordinary agent-bound branch. A branch
+    /// with neither an agent record nor an explicit `--task` (a hand-built
+    /// or recovery branch nobody bound) fails closed here rather than
+    /// enqueueing with `task: ""` — that used to mean no ticket/spec for the
+    /// reviewer, no delivery record, and nothing ever closed.
     pub(crate) async fn submit_manual(
         &self,
         repo_root: &Path,
@@ -998,6 +1026,14 @@ impl LandingPipeline {
         keep_branch: bool,
         task: Option<String>,
     ) -> rk_core::Result<Value> {
+        let Some(task) = task.filter(|t| !t.trim().is_empty()) else {
+            return Err(rk_core::Error::other(format!(
+                "cannot land {branch} onto {target}: no task identity — this branch carries no \
+                 agent record and no --task was given; pass --task <ticket> to bind a hand-built \
+                 or recovery submission, or land it from a ticket-dispatched agent so its task is \
+                 inferred automatically"
+            )));
+        };
         let repo = rk_git::Repo::discover(repo_root)?;
         let repo_name = repo.name();
         let head_sha = repo.rev_parse(branch)?;
@@ -1009,7 +1045,7 @@ impl LandingPipeline {
             target: target.to_string(),
             head_sha: head_sha.clone(),
             diff_class: crate::supervisor::classify_diff(&stat.files, stat.lines).to_string(),
-            task: task.unwrap_or_default(),
+            task,
             operator_fast_lane: true,
             keep_branch,
             ..Default::default()
@@ -1077,13 +1113,12 @@ impl LandingPipeline {
         }
     }
 
-    /// Has `entry`'s exact `(repo, branch, head_sha)` already reached a
-    /// terminal [`LandingOutcome`]? See [`Self::mark_processed`], the write
-    /// side of this marker.
-    /// The recorded terminal outcome string for `entry`'s work key, when a
-    /// `landing_processed` marker exists — the read side used both by the
-    /// enqueue dedup and by `process_entry`'s crash-window reconciliation.
-    fn processed_outcome(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<String>> {
+    /// The durable `landing_processed` marker tuple for `entry`'s exact
+    /// `(repo, branch, head_sha)` work key, if one exists — the base read
+    /// both [`Self::enqueue`]'s dedup/mismatch probe and
+    /// [`Self::processed_outcome`] build on. See [`Self::mark_processed`],
+    /// the write side.
+    fn processed_marker(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<Tuple>> {
         let pattern = Pattern::for_commit(
             Category::Event,
             LANDING_PROCESSED_IDENTITY,
@@ -1091,7 +1126,15 @@ impl LandingPipeline {
             &entry.head_sha,
         )
         .scope(&entry.repo_name);
-        Ok(self.space.scan(&pattern)?.into_iter().find_map(|t| {
+        Ok(self.space.scan(&pattern)?.into_iter().next())
+    }
+
+    /// The recorded terminal outcome string for `entry`'s work key, when a
+    /// `landing_processed` marker exists — the read side used both by
+    /// `process_entry`'s crash-window reconciliation and `submit_manual`'s
+    /// post-drain lookup.
+    fn processed_outcome(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<String>> {
+        Ok(self.processed_marker(entry)?.and_then(|t| {
             t.payload
                 .get("outcome")
                 .and_then(Value::as_str)
@@ -1099,16 +1142,12 @@ impl LandingPipeline {
         }))
     }
 
-    fn already_processed(&self, entry: &LandingQueueEntry) -> rk_core::Result<bool> {
-        Ok(self.processed_outcome(entry)?.is_some())
-    }
-
     /// Durably record that `entry`'s work key reached a terminal outcome —
-    /// the write side of [`Self::already_processed`]'s dedup probe. Called
-    /// from every terminal return in [`Self::process_entry`], independent of
-    /// whether `entry` arrived through the queue or a direct call (a caller
-    /// bypassing the queue for testing still gets the same double-land
-    /// protection on its next `enqueue`).
+    /// the write side of [`Self::processed_marker`]'s dedup/mismatch probe.
+    /// Called from every terminal return in [`Self::process_entry`],
+    /// independent of whether `entry` arrived through the queue or a direct
+    /// call (a caller bypassing the queue for testing still gets the same
+    /// double-land protection on its next `enqueue`).
     fn mark_processed(
         &self,
         entry: &LandingQueueEntry,
@@ -1123,7 +1162,7 @@ impl LandingPipeline {
             LandingOutcome::Requeued { .. } => return Ok(()),
             // A reconciled entry's marker already exists from the run that
             // performed the side effects; writing a second would corrupt the
-            // one-marker-per-work-key invariant `already_processed` reads.
+            // one-marker-per-work-key invariant `processed_marker` reads.
             LandingOutcome::Reconciled(_) => return Ok(()),
         };
         let tuple = Tuple::new(
