@@ -9,6 +9,10 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
 use rk_core::identity::CastleDisplay;
 use rk_core::paths::Layout;
+use rk_core::review::{
+    ReviewContext, REVIEW_ATTEMPT_ENV, REVIEW_BRANCH_ENV, REVIEW_HEAD_ENV, REVIEW_TARGET_ENV,
+    REVIEW_TASK_ENV,
+};
 use rk_daemon::Client;
 use serde_json::{json, Value};
 
@@ -347,6 +351,11 @@ pub async fn out(layout: &Layout, args: OutArgs, as_json: bool) -> Result<()> {
         }
         payload["resolves"] = json!(resolves);
     }
+    if args.category == "artifact" && args.identity == "review" {
+        if let Some(review) = review_context_from_env()? {
+            bind_review_payload(&mut payload, &review)?;
+        }
+    }
     stamp_author(&mut payload, std::env::var("RK_AGENT").ok());
     let mut params = json!({
         "category": args.category,
@@ -366,6 +375,53 @@ pub async fn out(layout: &Layout, args: OutArgs, as_json: bool) -> Result<()> {
         println!("{result}");
     } else {
         println!("written {}", result["id"].as_str().unwrap_or("?"));
+    }
+    Ok(())
+}
+
+fn review_context_from_env() -> Result<Option<ReviewContext>> {
+    let values = [
+        (REVIEW_BRANCH_ENV, std::env::var(REVIEW_BRANCH_ENV).ok()),
+        (REVIEW_HEAD_ENV, std::env::var(REVIEW_HEAD_ENV).ok()),
+        (REVIEW_TARGET_ENV, std::env::var(REVIEW_TARGET_ENV).ok()),
+        (REVIEW_TASK_ENV, std::env::var(REVIEW_TASK_ENV).ok()),
+        (REVIEW_ATTEMPT_ENV, std::env::var(REVIEW_ATTEMPT_ENV).ok()),
+    ];
+    if values.iter().all(|(_, value)| value.is_none()) {
+        return Ok(None);
+    }
+    if let Some((name, _)) = values.iter().find(|(_, value)| value.is_none()) {
+        bail!("incomplete review runtime binding: missing {name}");
+    }
+    Ok(Some(ReviewContext {
+        branch: values[0].1.clone().unwrap(),
+        head_sha: values[1].1.clone().unwrap(),
+        target: values[2].1.clone().unwrap(),
+        task: values[3].1.clone().unwrap(),
+        attempt: values[4].1.clone().unwrap(),
+    }))
+}
+
+fn bind_review_payload(payload: &mut Value, review: &ReviewContext) -> Result<()> {
+    let Some(object) = payload.as_object_mut() else {
+        bail!("review artifact payload must be a JSON object");
+    };
+    for (field, expected) in [
+        ("branch", review.branch.as_str()),
+        ("head_sha", review.head_sha.as_str()),
+        ("target", review.target.as_str()),
+        ("task", review.task.as_str()),
+        ("review_attempt", review.attempt.as_str()),
+    ] {
+        if let Some(actual) = object.get(field) {
+            if actual.as_str() != Some(expected) {
+                bail!(
+                    "review artifact binding mismatch for {field}: expected '{expected}', got {}",
+                    actual
+                );
+            }
+        }
+        object.insert(field.into(), Value::String(expected.into()));
     }
     Ok(())
 }
@@ -929,5 +985,47 @@ mod tests {
         let mut scalar = json!(null);
         stamp_author(&mut scalar, Some("Filch-2".into()));
         assert_eq!(scalar, json!(null));
+    }
+
+    #[test]
+    fn review_artifact_is_bound_from_runtime_context() {
+        let review = ReviewContext {
+            branch: "rat/worker/tkt-1".into(),
+            head_sha: "abc123".into(),
+            target: "integration".into(),
+            task: "TKT-1".into(),
+            attempt: "landing-review-1".into(),
+        };
+        let mut payload = json!({"recommendation": "APPROVE", "notes": "clean"});
+
+        bind_review_payload(&mut payload, &review).unwrap();
+
+        assert_eq!(payload["branch"], review.branch);
+        assert_eq!(payload["head_sha"], review.head_sha);
+        assert_eq!(payload["target"], review.target);
+        assert_eq!(payload["task"], review.task);
+        assert_eq!(payload["review_attempt"], review.attempt);
+    }
+
+    #[test]
+    fn review_artifact_rejects_a_synthesized_reviewer_branch_exactly() {
+        let review = ReviewContext {
+            branch: "rat/fidget-10/tkt-1".into(),
+            head_sha: "0640835".into(),
+            target: "release".into(),
+            task: "TKT-1".into(),
+            attempt: "landing-review-1".into(),
+        };
+        let mut payload = json!({
+            "recommendation": "APPROVE",
+            "branch": "rat/fidget-10/steward-review-tkt-1",
+        });
+
+        let error = bind_review_payload(&mut payload, &review).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "review artifact binding mismatch for branch: expected \
+             'rat/fidget-10/tkt-1', got \"rat/fidget-10/steward-review-tkt-1\""
+        );
     }
 }

@@ -919,6 +919,7 @@ mod tests {
             target_branch: "main".into(),
             parent: None,
             workflow_instance: None,
+            review: None,
             coordinator: None,
             session_id: None,
             attach_target: None,

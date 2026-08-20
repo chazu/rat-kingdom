@@ -865,6 +865,20 @@ const PRIME_ROLES: [&str; 9] = [
     "groomer",
 ];
 
+fn review_context_from_env() -> Option<rk_core::review::ReviewContext> {
+    use rk_core::review::{
+        ReviewContext, REVIEW_ATTEMPT_ENV, REVIEW_BRANCH_ENV, REVIEW_HEAD_ENV, REVIEW_TARGET_ENV,
+        REVIEW_TASK_ENV,
+    };
+    Some(ReviewContext {
+        branch: std::env::var(REVIEW_BRANCH_ENV).ok()?,
+        head_sha: std::env::var(REVIEW_HEAD_ENV).ok()?,
+        target: std::env::var(REVIEW_TARGET_ENV).ok()?,
+        task: std::env::var(REVIEW_TASK_ENV).ok()?,
+        attempt: std::env::var(REVIEW_ATTEMPT_ENV).ok()?,
+    })
+}
+
 fn print_prime(role: String, json_output: bool) -> Result<()> {
     if !PRIME_ROLES.contains(&role.as_str()) {
         anyhow::bail!(
@@ -878,6 +892,7 @@ fn print_prime(role: String, json_output: bool) -> Result<()> {
         task: std::env::var("RK_TASK").ok(),
         branch: std::env::var("RK_BRANCH").ok(),
         base: std::env::var("RK_BASE").ok(),
+        review: review_context_from_env(),
         parent: std::env::var("RK_PARENT").ok(),
         facts: Vec::new(),
         // `rk prime` inspects the template shape; live conventions are scanned

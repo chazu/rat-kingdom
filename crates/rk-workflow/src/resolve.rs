@@ -133,6 +133,7 @@ mod tests {
                 description: None,
             },
             branch: None,
+            review: None,
         }
     }
 

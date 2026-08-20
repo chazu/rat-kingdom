@@ -64,6 +64,9 @@ workflow: {
 		// and its verdict artifact so LandingPipeline's commit-keyed cache
 		// probe (Phase 2) can key on it.
 		headSha: {type: "string", required: false, default: ""}
+		// Stable identity of this exact review request. LandingPipeline derives
+		// it from the complete review context and the runtime binds verdicts to it.
+		reviewAttempt: {type: "string", required: true}
 		// Same invariant as the old mega-workflow's `reviewTimeout`
 		// (`examples/workflows/steward.cue`): must stay comfortably ABOVE the
 		// daemon's `supervisor.stuck_after_secs`, or the wait here hard-fails
@@ -86,6 +89,13 @@ workflow: {
 			role:   "reviewer"
 			agent:  "reviewer"
 			branch: _input.branch
+			review: {
+				branch:  _input.branch
+				headSha: _input.headSha
+				target:  _input.target
+				task:    _input.taskId
+				attempt: _input.reviewAttempt
+			}
 			task: {
 				title: "steward-review-" + _input.taskId
 				description: """
@@ -99,7 +109,7 @@ workflow: {
 					remain), or STOP (fundamentally wrong / needs a human call). Record
 					the verdict before finishing so the daemon-native landing pipeline
 					can route on it:
-					rk out artifact \(_input.repo) review --payload '{"task": "\(_input.taskId)", "recommendation": "APPROVE|REWORK|STOP", "notes": "...", "head_sha": "\(_input.headSha)", "branch": "\(_input.branch)"}'
+					rk out artifact \(_input.repo) review --payload '{"recommendation": "APPROVE|REWORK|STOP", "notes": "..."}'
 					"""
 			}
 		},

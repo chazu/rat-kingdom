@@ -440,6 +440,11 @@ impl InstanceStatus {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowContext {
+    /// Runtime-owned identity of an exact review request. Persisted with the
+    /// workflow instance so a daemon restart or a stale installed workflow
+    /// definition cannot strip the binding before the reviewer spawn.
+    #[serde(default)]
+    pub review: Option<rk_core::review::ReviewContext>,
     pub active_agent: Option<String>,
     /// The generation of `active_agent` captured at the moment `spawn` minted
     /// it. This is the sequential counterpart to `FannedAgent::spawn`: a
@@ -1008,6 +1013,30 @@ impl WorkflowEngine {
             coordinator,
             None,
             None,
+            None,
+        )
+    }
+
+    /// Launch a review workflow with daemon-owned correlation metadata. The
+    /// binding is persisted independently of the CUE definition so an older
+    /// installed copy cannot turn a correctly emitted verdict into no-verdict.
+    pub(crate) fn run_review_owned_with_id(
+        self: &Arc<Self>,
+        instance_id: String,
+        name: &str,
+        repo: &str,
+        params: HashMap<String, Value>,
+        review: rk_core::review::ReviewContext,
+    ) -> rk_core::Result<Instance> {
+        self.run_owned_with_id_and_schedule(
+            instance_id,
+            name,
+            repo,
+            params,
+            None,
+            None,
+            None,
+            Some(review),
         )
     }
 
@@ -1031,6 +1060,7 @@ impl WorkflowEngine {
             None,
             None,
             Some(trigger.to_string()),
+            None,
         )
     }
 
@@ -1049,6 +1079,7 @@ impl WorkflowEngine {
             None,
             Some(schedule.to_string()),
             None,
+            None,
         )
     }
 
@@ -1062,6 +1093,7 @@ impl WorkflowEngine {
         coordinator: Option<String>,
         schedule: Option<String>,
         trigger: Option<String>,
+        review: Option<rk_core::review::ReviewContext>,
     ) -> rk_core::Result<Instance> {
         let file = self.find_definition(name, repo)?;
         let definition_digest = definition_digest(&file)?;
@@ -1080,7 +1112,10 @@ impl WorkflowEngine {
             revision: 0,
             current_step: 0,
             total_steps: workflow.steps.len(),
-            context: WorkflowContext::default(),
+            context: WorkflowContext {
+                review,
+                ..WorkflowContext::default()
+            },
             error: None,
             awaiting: None,
             instance_max_usd: workflow.budget.map(|b| b.max_usd),
@@ -1683,6 +1718,16 @@ impl WorkflowEngine {
                         .description
                         .as_ref()
                         .map(|d| interpolate(d, &ctx));
+                    let review = match (&ctx.review, &spawn.review) {
+                        (Some(runtime), Some(declared)) if runtime != declared => {
+                            return Err(rk_core::Error::other(format!(
+                                "review spawn binding disagrees with runtime context: runtime \
+                                 {runtime:?}, workflow {declared:?}"
+                            )));
+                        }
+                        (Some(runtime), _) => Some(runtime.clone()),
+                        (None, declared) => declared.clone(),
+                    };
                     let params = SpawnParams {
                         repo: repo.to_string(),
                         task: title,
@@ -1692,6 +1737,7 @@ impl WorkflowEngine {
                         harness: Some(resolved.harness),
                         parent: None,
                         base: spawn.branch.clone().or(ctx.active_branch.clone()),
+                        review,
                         model: resolved.model,
                         permission_mode: resolved.permission_mode,
                         attach: false,
@@ -2463,6 +2509,7 @@ impl WorkflowEngine {
                 // Each rat gets its own branch off the base; fan-out never
                 // chains onto ctx.active_branch (that would serialize them).
                 base: fe.branch.clone(),
+                review: None,
                 model: resolved.model,
                 permission_mode: resolved.permission_mode,
                 attach: false,
@@ -5876,6 +5923,7 @@ test a::flaky ... FAILED
             target_branch: "main".into(),
             parent: None,
             workflow_instance: None,
+            review: None,
             coordinator: None,
             session_id: None,
             attach_target: None,

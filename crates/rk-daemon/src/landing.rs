@@ -718,7 +718,7 @@ fn sanitize_path_component(raw: &str) -> String {
 /// A durable workflow instance id, stable across repeat calls for the SAME
 /// work key — the request-review counterpart to
 /// `reactor::stable_workflow_instance_id`. Deriving it from `(repo, branch,
-/// head_sha)` rather than a fresh random id per call is what makes
+/// head_sha, target, task)` rather than a fresh random id per call is what makes
 /// [`LandingPipeline::request_review`] safe to invoke twice for the same
 /// candidate (a restart-driven reprocess): `run_owned_with_id` resolves the
 /// second call to the first call's already-running (or already-finished)
@@ -726,7 +726,11 @@ fn sanitize_path_component(raw: &str) -> String {
 fn review_instance_id(entry: &LandingQueueEntry) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(
-        format!("{}@{}@{}", entry.repo_name, entry.branch, entry.head_sha).as_bytes(),
+        format!(
+            "{}@{}@{}@{}@{}",
+            entry.repo_name, entry.branch, entry.head_sha, entry.target, entry.task
+        )
+        .as_bytes(),
     );
     format!("landing-review-{}", hex::encode(&digest[..16]))
 }
@@ -1559,10 +1563,11 @@ impl LandingPipeline {
     }
 
     /// Non-blocking probe of Phase 2's commit-keyed verdict cache — ANY
-    /// prior run's recommendation for this exact `(repo, branch, head_sha)`,
-    /// regardless of who wrote it (§1.3). A hit is honored identically to a
-    /// fresh verdict — never re-reviewed to shop for a better opinion.
+    /// prior run's recommendation for this exact review context, regardless
+    /// of who wrote it (§1.3). A hit is honored identically to a fresh verdict
+    /// — never re-reviewed to shop for a better opinion.
     fn cached_verdict(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<String>> {
+        let expected_review_attempt = review_instance_id(entry);
         let pattern = Pattern::for_commit(
             Category::Artifact,
             REVIEW_ARTIFACT_IDENTITY,
@@ -1571,10 +1576,19 @@ impl LandingPipeline {
         )
         .scope(&entry.repo_name);
         Ok(self.space.scan(&pattern)?.into_iter().find_map(|t| {
-            t.payload
-                .get("recommendation")
-                .and_then(Value::as_str)
-                .map(str::to_string)
+            let payload = &t.payload;
+            if payload.get("task").and_then(Value::as_str) == Some(entry.task.as_str())
+                && payload.get("target").and_then(Value::as_str) == Some(entry.target.as_str())
+                && payload.get("review_attempt").and_then(Value::as_str)
+                    == Some(expected_review_attempt.as_str())
+            {
+                payload
+                    .get("recommendation")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            } else {
+                None
+            }
         }))
     }
 
@@ -1622,6 +1636,7 @@ impl LandingPipeline {
         self.queue
             .set_status(entry, LandingEntryStatus::AwaitingReview)?;
 
+        let instance_id = review_instance_id(entry);
         let mut params = HashMap::new();
         params.insert("taskId".to_string(), Value::String(entry.task.clone()));
         params.insert("branch".to_string(), Value::String(entry.branch.clone()));
@@ -1629,29 +1644,36 @@ impl LandingPipeline {
         params.insert("target".to_string(), Value::String(entry.target.clone()));
         params.insert("headSha".to_string(), Value::String(entry.head_sha.clone()));
         params.insert(
+            "reviewAttempt".to_string(),
+            Value::String(instance_id.clone()),
+        );
+        params.insert(
             "reviewTimeout".to_string(),
             Value::String(format!("{}s", gates.review_max_wait.as_secs())),
         );
+        let review = rk_core::review::ReviewContext {
+            branch: entry.branch.clone(),
+            head_sha: entry.head_sha.clone(),
+            target: entry.target.clone(),
+            task: entry.task.clone(),
+            attempt: instance_id.clone(),
+        };
         // The engine's `repo` argument is a filesystem path (it feeds
         // `Repo::discover` and repo-local definition resolution), unlike the
         // `repo` WORKFLOW PARAM above, which is the repo's scope name used
         // to address its verdict artifact.
-        let instance_id = review_instance_id(entry);
-        self.engine.run_owned_with_id(
+        self.engine.run_review_owned_with_id(
             instance_id.clone(),
             REVIEW_WORKFLOW,
             &entry.repo_path,
             params,
-            None,
+            review,
         )?;
 
-        let pattern = Pattern::for_commit(
-            Category::Artifact,
-            REVIEW_ARTIFACT_IDENTITY,
-            &entry.branch,
-            &entry.head_sha,
-        )
-        .scope(&entry.repo_name);
+        let mut pattern = Pattern::category(Category::Artifact)
+            .identity(REVIEW_ARTIFACT_IDENTITY)
+            .scope(&entry.repo_name);
+        pattern.payload_search = Some(format!("\"review_attempt\":\"{}\"", instance_id));
 
         let started = tokio::time::Instant::now();
         let deadline = started + gates.review_max_wait;
@@ -2463,6 +2485,10 @@ checks: [
     /// `request_review` can spawn a real (cheap, scripted) reviewer process
     /// without touching the shipped `examples/workflows/steward-review.cue`,
     /// which pins a real harness/model.
+    ///
+    /// Deliberately omits the new declarative `review` block: the daemon-owned
+    /// instance context must still bind the spawn when the globally installed
+    /// workflow copy predates this feature.
     ///
     /// A `timer` gate holds the instance `Running` for a couple of seconds
     /// after spawn, before the `wait`/`evaluate` steps that would otherwise
@@ -3334,6 +3360,7 @@ workflow: {
     }
 
     fn verdict_tuple(head_sha: &str, recommendation: &str) -> Tuple {
+        let entry = review_candidate_entry(Path::new("."), head_sha);
         Tuple::new(
             Category::Artifact,
             "code-repo",
@@ -3345,6 +3372,8 @@ workflow: {
                 "notes": "notes",
                 "head_sha": head_sha,
                 "branch": "feature",
+                "target": "main",
+                "review_attempt": review_instance_id(&entry),
             }),
         )
     }
@@ -3391,6 +3420,66 @@ workflow: {
         no_spawns(&space);
     }
 
+    #[test]
+    fn verdict_cache_rejects_a_different_review_context() {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+        let space = Space::open_in_memory().unwrap();
+        space
+            .out(Tuple::new(
+                Category::Artifact,
+                "code-repo",
+                REVIEW_ARTIFACT_IDENTITY,
+                "some-reviewer",
+                json!({
+                    "task": "a different task",
+                    "target": "release",
+                    "recommendation": "APPROVE",
+                    "head_sha": head_sha,
+                    "branch": "feature",
+                    "review_attempt": "landing-review-wrong-context",
+                }),
+            ))
+            .unwrap();
+        let pipeline = test_pipeline(home.path(), space);
+
+        assert_eq!(
+            pipeline.cached_verdict(&entry).unwrap(),
+            None,
+            "a verdict for the same branch tip but a different target/task is not reusable"
+        );
+    }
+
+    #[test]
+    fn verdict_cache_rejects_wrong_or_missing_review_attempt() {
+        for review_attempt in [Some("landing-review-wrong-context"), None] {
+            let home = tempfile::tempdir().unwrap();
+            let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+            let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+            let space = Space::open_in_memory().unwrap();
+            let mut verdict = verdict_tuple(&head_sha, "APPROVE");
+            match review_attempt {
+                Some(attempt) => verdict.payload["review_attempt"] = json!(attempt),
+                None => {
+                    verdict
+                        .payload
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("review_attempt");
+                }
+            }
+            space.out(verdict).unwrap();
+            let pipeline = test_pipeline(home.path(), space);
+
+            assert_eq!(
+                pipeline.cached_verdict(&entry).unwrap(),
+                None,
+                "a verdict without the exact review attempt is not reusable: {review_attempt:?}"
+            );
+        }
+    }
+
     /// The APPROVE routing arm (`LandingPipeline::route_verdict`) is a
     /// second, independent prepared-landing route from the doc-only
     /// fast path — this proves the non-main visibility event fires there
@@ -3409,22 +3498,24 @@ workflow: {
         let head_sha = rev_parse(repo_dir.path(), "feature");
         git(repo_dir.path(), &["checkout", "base"]);
 
+        let entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "base".into(),
+            head_sha,
+            diff_class: "large".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
         let space = Space::open_in_memory().unwrap();
-        space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
+        let mut verdict = verdict_tuple(&entry.head_sha, "APPROVE");
+        verdict.payload["target"] = json!("base");
+        verdict.payload["review_attempt"] = json!(review_instance_id(&entry));
+        space.out(verdict).unwrap();
 
         let pipeline = test_pipeline(home.path(), space.clone());
-        pipeline
-            .enqueue(LandingQueueEntry {
-                repo_name: "code-repo".into(),
-                repo_path: repo_dir.path().display().to_string(),
-                branch: "feature".into(),
-                target: "base".into(),
-                head_sha,
-                diff_class: "large".into(),
-                task: "add src".into(),
-                ..Default::default()
-            })
-            .unwrap();
+        pipeline.enqueue(entry).unwrap();
 
         let outcomes = pipeline.drain_key("code-repo", "base").await.unwrap();
         assert_eq!(outcomes.len(), 1);
@@ -4288,6 +4379,74 @@ checks: [
                 .unwrap()
                 .is_empty(),
             "a live reviewer that produced a verdict before the ceiling must not escalate"
+        );
+    }
+
+    #[tokio::test]
+    async fn chained_non_main_reviewer_preserves_exact_binding_and_approve_resolves() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_review_workflow(&layout);
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+        git(repo_dir.path(), &["branch", "release"]);
+        let mut entry = review_candidate_entry(repo_dir.path(), &head_sha);
+        entry.target = "release".into();
+        entry.task = "TKT-non-main".into();
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        let gates = GateConfig {
+            review_timeout: Duration::from_millis(200),
+            review_max_wait: Duration::from_secs(5),
+            ..GateConfig::default()
+        };
+        let wait = tokio::spawn({
+            let pipeline = Arc::clone(&pipeline);
+            let entry = entry.clone();
+            let gates = gates.clone();
+            async move { pipeline.request_review(&entry, &gates).await }
+        });
+
+        wait_for_spawn_count(&space, 1).await;
+        let reviewer = pipeline
+            .supervisor
+            .list()
+            .into_iter()
+            .find(|record| record.role == "reviewer")
+            .expect("spawned reviewer record");
+        assert_eq!(reviewer.target_branch, entry.branch, "reviewer is chained");
+        let review = reviewer.review.expect("typed review binding");
+        assert_eq!(review.branch, entry.branch);
+        assert_eq!(review.head_sha, entry.head_sha);
+        assert_eq!(review.target, "release");
+        assert_eq!(review.task, "TKT-non-main");
+        assert_eq!(review.attempt, review_instance_id(&entry));
+
+        space
+            .out(Tuple::new(
+                Category::Artifact,
+                &entry.repo_name,
+                REVIEW_ARTIFACT_IDENTITY,
+                reviewer.name,
+                json!({
+                    "recommendation": "APPROVE",
+                    "branch": review.branch,
+                    "head_sha": review.head_sha,
+                    "target": review.target,
+                    "task": review.task,
+                    "review_attempt": review.attempt,
+                }),
+            ))
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("bound APPROVE must not become no-verdict")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(outcome, ReviewWaitOutcome::Verdict(ref verdict) if verdict == "APPROVE"),
+            "expected bound APPROVE, got {outcome:?}"
         );
     }
 
