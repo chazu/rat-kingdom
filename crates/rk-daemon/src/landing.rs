@@ -5275,8 +5275,8 @@ workflow: {
     /// original death, and must resume as exactly one more execution of the
     /// check — never a duplicate.
     #[tokio::test]
-    async fn restart_reconstructs_missing_ordinal1_evidence_across_the_marker_persist_crash_window(
-    ) {
+    async fn restart_reconstructs_missing_ordinal1_evidence_across_the_marker_persist_crash_window()
+    {
         let home = tempfile::tempdir().unwrap();
         let repo_dir = tempfile::tempdir().unwrap();
         init_repo(repo_dir.path());
