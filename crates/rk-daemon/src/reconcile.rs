@@ -68,6 +68,51 @@ pub enum Authority {
     Human,
 }
 
+impl Authority {
+    /// Conservatism rank: lower is more autonomous. `crate::authority`'s
+    /// policy overrides may only move a violation kind's rank UP (toward
+    /// [`Authority::Human`]), never down — the one mechanism this ladder
+    /// uses to guarantee a castle policy edit can narrow authority but never
+    /// widen it past what the code itself allows.
+    pub fn rank(self) -> u8 {
+        match self {
+            Authority::Mechanical => 0,
+            Authority::Orchestrator => 1,
+            Authority::Human => 2,
+        }
+    }
+
+    /// Parse the `snake_case` wire spelling this type serializes as
+    /// (`"mechanical" | "orchestrator" | "human"`), the same vocabulary a
+    /// castle policy file names an override with.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "mechanical" => Some(Authority::Mechanical),
+            "orchestrator" => Some(Authority::Orchestrator),
+            "human" => Some(Authority::Human),
+            _ => None,
+        }
+    }
+}
+
+/// The authority [`build`] assigns a violation `kind` in the absence of any
+/// policy override — the single source of truth `crate::authority`'s
+/// narrow-only validation checks a configured override against. Kept as a
+/// standalone lookup (rather than requiring a live report) so policy can be
+/// validated at daemon startup, before any violation has ever been observed.
+/// `tests::builtin_authority_matches_every_kind_build_assigns` guards this
+/// against drifting from what the per-kind constructors above actually set.
+pub fn builtin_authority(kind: &str) -> Option<Authority> {
+    match kind {
+        kind::DELIVERED_BUT_OPEN => Some(Authority::Mechanical),
+        kind::TERMINAL_ASSIGNEE_ACTIVE_WORK => Some(Authority::Orchestrator),
+        kind::CONFLICT_HELD_LANDING => Some(Authority::Orchestrator),
+        kind::TRACKER_CONTRADICTS_GIT => Some(Authority::Human),
+        kind::WORKFLOW_SETTLED_AGENT_STILL_LIVE => Some(Authority::Mechanical),
+        _ => None,
+    }
+}
+
 /// One detected contradiction between two or more of a repository's durable
 /// views (or a durable view and git). Pure data — this module makes no state
 /// changes and this type carries none.
@@ -1234,6 +1279,49 @@ mod tests {
             &GitFacts::default(),
         );
         assert!(report.violations.is_empty());
+    }
+
+    #[test]
+    fn builtin_authority_matches_every_kind_build_assigns() {
+        // Every violation this module can produce must have a `builtin_authority`
+        // entry equal to what its own constructor hardcodes, or a policy
+        // override's narrow-only check would validate against a stale ceiling.
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "in_progress",
+            delivery_json("abc123", "main"),
+        );
+        let agent_rec = agent("Whisker", Some("TKT-1"), AgentState::Dismissed);
+        let land = branch_landed("myrepo", "rat/x/tkt-1", "main", false, false);
+        let mut is_ancestor = HashMap::new();
+        is_ancestor.insert(("def456".to_string(), "main".to_string()), false);
+        let human_ticket = ticket("TKT-2", "myrepo", "closed", delivery_json("def456", "main"));
+        let git = GitFacts {
+            is_ancestor,
+            ..Default::default()
+        };
+        let stale = agent("Gouda", None, AgentState::Running);
+        let instance = instance_for("wf-1", "myrepo", InstanceStatus::Completed, &stale);
+        let report = build(
+            "myrepo",
+            &[t, human_ticket],
+            &[agent_rec, stale],
+            &[land],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[instance],
+            &git,
+        );
+        assert_eq!(report.violations.len(), 5, "{report:?}");
+        for v in &report.violations {
+            assert_eq!(
+                builtin_authority(&v.kind),
+                Some(v.authority),
+                "builtin_authority drifted from build()'s own assignment for {}",
+                v.kind
+            );
+        }
     }
 
     #[test]
