@@ -138,13 +138,14 @@ fn draw_header(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     let line = Line::from(vec![
         Span::styled("rk top ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!(
-            "castle {} · up {} · {} tuples · {} agents ({} live) · fleet {} · ",
+            "castle {} · up {} · {} tuples · {} agents ({} live) · fleet {} · {} · ",
             snap.status["castle"].as_str().unwrap_or("?"),
             human_secs(snap.status["uptime_secs"].as_u64().unwrap_or(0)),
             snap.status["tuples"].as_u64().unwrap_or(0),
             snap.agents.len(),
             live,
             spend,
+            landing_queue_summary(snap),
         )),
         Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" quit · "),
@@ -152,6 +153,25 @@ fn draw_header(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         Span::raw(" refresh"),
     ]);
     frame.render_widget(Paragraph::new(line), area);
+}
+
+/// `landing 3 queued (oldest 2h14m)` / `landing clear` — depth and
+/// oldest-entry age across every `(repo, target)` queue key, so a slow queue
+/// reads as patience and a wedged one reads as a problem (probe O18) without
+/// having to read tuples by hand.
+fn landing_queue_summary(snap: &Snapshot) -> String {
+    let queues = snap.status["landing_queue"].as_array();
+    let Some(queues) = queues.filter(|q| !q.is_empty()) else {
+        return "landing clear".into();
+    };
+    let depth: u64 = queues.iter().filter_map(|q| q["depth"].as_u64()).sum();
+    let oldest = queues
+        .iter()
+        .filter_map(|q| q["oldest_age_secs"].as_i64())
+        .max()
+        .unwrap_or(0)
+        .max(0) as u64;
+    format!("landing {depth} queued (oldest {})", human_secs(oldest))
 }
 
 fn draw_agents(frame: &mut Frame, area: Rect, snap: &Snapshot) {
@@ -311,7 +331,7 @@ fn instance_style(status: &str) -> Style {
     }
 }
 
-fn human_secs(secs: u64) -> String {
+pub(crate) fn human_secs(secs: u64) -> String {
     if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {

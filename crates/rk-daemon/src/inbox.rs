@@ -26,6 +26,7 @@
 //! that can never be emptied trains the operator to skip the whole queue.
 
 use crate::agents::{AgentRecord, AgentState};
+use crate::landing::LandingQueueSummary;
 use crate::workflow_exec::{settled_at, Instance, InstanceStatus};
 use chrono::{DateTime, Utc};
 use rk_core::tuple::{Category, Tuple, SYSTEM_SCOPE};
@@ -49,6 +50,12 @@ mod urgency {
     /// forge. Co-ranked with a parked gate — both are pushed work blocked on a
     /// human decision — and above passive obstacles.
     pub const AWAITING_REVIEW: u8 = 3;
+    /// The oldest entry in a `(repo, target)` landing queue has waited past
+    /// the configured staleness threshold. Co-ranked with a parked gate and
+    /// an open PR — all three are finished work blocked from landing, and a
+    /// wedged queue is otherwise indistinguishable from one patiently
+    /// draining a deep backlog (probe O18).
+    pub const LANDING_QUEUE_STALLED: u8 = 3;
     pub const OBSTACLE: u8 = 2;
     pub const NEED: u8 = 1;
     /// An open proposal awaiting endorsements. Co-ranked with `need` — both are
@@ -522,6 +529,58 @@ fn open_suggestions(ballots: &Ballots<'_>) -> Vec<InboxItem> {
     rows
 }
 
+/// One row per `(repo, target)` landing-queue key whose OLDEST pending entry
+/// has waited at least `stale_after_secs` since it first enqueued (probe
+/// O18). Computed live over the current queue summary on every read — no ack,
+/// no stored escalation, same shape as `unlanded-branch`/`awaiting-review`:
+/// the row exists exactly as long as the condition holds and disappears the
+/// moment the oldest entry drains or a fresher entry becomes the oldest.
+/// `stale_after_secs == 0` disables the row entirely (depth/age still show on
+/// `status`/`rk top`, which read the summary directly).
+pub(crate) fn stalled_landing_queue_rows(
+    summary: &[LandingQueueSummary],
+    stale_after_secs: u64,
+) -> Vec<InboxItem> {
+    if stale_after_secs == 0 {
+        return Vec::new();
+    }
+    let mut rows: Vec<&LandingQueueSummary> = summary
+        .iter()
+        .filter(|q| q.oldest_age_secs >= 0 && q.oldest_age_secs as u64 >= stale_after_secs)
+        .collect();
+    // Longest-waiting first — the entry closest to explaining a stall belongs
+    // at the top of this rank.
+    rows.sort_by_key(|q| std::cmp::Reverse(q.oldest_age_secs));
+    rows.into_iter()
+        .map(|q| InboxItem {
+            urgency: urgency::LANDING_QUEUE_STALLED,
+            kind: "landing-queue-stalled".into(),
+            subject: format!("{} → {}", q.repo, q.target),
+            scope: q.repo.clone(),
+            detail: format!(
+                "{} queued, oldest ({}) waiting {}",
+                q.depth,
+                q.oldest_branch,
+                waiting_for(q.oldest_age_secs),
+            ),
+            action: "rk status --json  (see landing_queue)".into(),
+        })
+        .collect()
+}
+
+/// Render an age in seconds as `3h12m waiting` / `45m waiting` / `12s
+/// waiting`. Negative input (a clock skew, never expected in practice) reads
+/// as `0s waiting` rather than a nonsensical negative duration.
+fn waiting_for(age_secs: i64) -> String {
+    let secs = age_secs.max(0);
+    let mins = secs / 60;
+    match (mins / 60, mins % 60) {
+        (0, 0) => format!("{}s waiting", secs),
+        (0, m) => format!("{m}m waiting"),
+        (h, m) => format!("{h}h{m:02}m waiting"),
+    }
+}
+
 /// Render how long a ballot has left as a ` (6h12m left)` clause, or empty when
 /// it carries no voting window at all. Sub-minute remainders round to `<1m`
 /// rather than `0m`, which would read as decayed.
@@ -985,6 +1044,57 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let critical_row = rows.iter().find(|r| r.subject == "Whisker").unwrap();
         assert_eq!(critical_row.urgency, urgency::FAILED);
+    }
+
+    fn queue_summary(
+        repo: &str,
+        target: &str,
+        depth: usize,
+        oldest_age_secs: i64,
+    ) -> LandingQueueSummary {
+        LandingQueueSummary {
+            repo: repo.into(),
+            target: target.into(),
+            depth,
+            oldest_age_secs,
+            oldest_branch: "rat/some-branch".into(),
+            oldest_task: "TKT-9".into(),
+        }
+    }
+
+    #[test]
+    fn stalled_landing_queue_rows_only_fire_past_the_threshold() {
+        let three_hours = 3 * 3600;
+        // Actively progressing: well under threshold — no row (probe O18's
+        // acceptance bar: patience must not read as a stall).
+        let fresh = vec![queue_summary("alpha", "main", 4, 60)];
+        assert!(stalled_landing_queue_rows(&fresh, three_hours as u64).is_empty());
+
+        // Genuinely wedged: oldest entry past the threshold — exactly one
+        // row, carrying depth and the oldest branch/age in its detail.
+        let stalled = vec![queue_summary("alpha", "main", 4, three_hours + 60)];
+        let rows = stalled_landing_queue_rows(&stalled, three_hours as u64);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "landing-queue-stalled");
+        assert_eq!(rows[0].urgency, urgency::LANDING_QUEUE_STALLED);
+        assert_eq!(rows[0].scope, "alpha");
+        assert!(rows[0].detail.contains('4'));
+        assert!(rows[0].detail.contains("rat/some-branch"));
+
+        // Disabled threshold: never raises a row regardless of age.
+        assert!(stalled_landing_queue_rows(&stalled, 0).is_empty());
+    }
+
+    #[test]
+    fn stalled_landing_queue_rows_rank_oldest_first_across_keys() {
+        let queues = vec![
+            queue_summary("alpha", "main", 1, 4 * 3600),
+            queue_summary("beta", "main", 1, 10 * 3600),
+        ];
+        let rows = stalled_landing_queue_rows(&queues, 3600);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].scope, "beta");
+        assert_eq!(rows[1].scope, "alpha");
     }
 
     #[test]
