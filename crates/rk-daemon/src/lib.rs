@@ -26,6 +26,7 @@ pub mod proto;
 pub mod reactor;
 pub mod read_only_roles;
 pub mod reconcile;
+pub mod reconcile_repair;
 pub mod recovery;
 pub mod repos;
 pub mod scheduler;

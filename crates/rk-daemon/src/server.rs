@@ -1529,6 +1529,7 @@ impl Daemon {
                 | "ticket.update"
                 | "ticket.dep"
                 | "ticket.reopen"
+                | "reconcile.repair"
         ) {
             return (true, "");
         }
@@ -2255,6 +2256,7 @@ impl Daemon {
             "inbox.list" => reply(self.handle_inbox(req).await),
             "inbox.ack" => reply(self.handle_inbox_ack(req)),
             "reconcile.report" => reply(self.handle_reconcile(req).await),
+            "reconcile.repair" => reply(self.handle_reconcile_repair(req).await),
             "lease.acquire" => reply(self.handle_lease_acquire(req).await),
             "lease.renew" => reply(self.handle_lease_renew(req).await),
             "attention.next" => reply(self.handle_attention_next(req).await),
@@ -3013,6 +3015,172 @@ impl Daemon {
         ))
     }
 
+    /// Assemble a repair plan for the two mechanically-repairable
+    /// convergence violations (`crate::reconcile_repair`) and either preview
+    /// it (`apply = false`) or execute it (`apply = true`). Reuses the same
+    /// ticket/agent/carve-out scans `reconcile_value` performs, plus one
+    /// extra round of durable-evidence git checks a read-only report never
+    /// needs to answer: whether a delivered commit touches a protected path,
+    /// and whether its landed branch has since diverged from what was
+    /// recorded — both gathered fresh on every call, never cached, so a
+    /// repair can never act on stale evidence.
+    async fn reconcile_repair_value(
+        &self,
+        requested_repo: String,
+        apply: bool,
+    ) -> rk_core::Result<Value> {
+        let repo = self
+            .resolve_inbox_repo(Some(requested_repo))?
+            .ok_or_else(|| rk_core::Error::other("repo is required"))?;
+
+        let agents: Vec<crate::agents::AgentRecord> = self
+            .supervisor
+            .list_all()
+            .into_iter()
+            .filter(|a| a.repo_name == repo)
+            .collect();
+
+        let tickets = self.tickets.list(Some(repo.clone()), None, None)?;
+
+        // The same hand-off carve-outs `reconcile_value`/`Server::ticket_reopen_sweep_at`
+        // use — see `reconcile_value` for the full rationale.
+        let landed_tickets: HashSet<String> = self
+            .space
+            .scan(
+                &Pattern::category(Category::Event)
+                    .identity(crate::landing::LANDING_PROCESSED_IDENTITY),
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.payload.get("outcome").and_then(Value::as_str) == Some("landed"))
+            .filter_map(|t| {
+                t.payload
+                    .get("task")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|task| !task.is_empty())
+            .collect();
+        let queued_tickets = crate::landing::tasks_in_landing_queue(&self.space);
+
+        let delivered_pairs: HashSet<(String, String)> = tickets
+            .iter()
+            .filter_map(crate::tickets::delivery_of)
+            .filter(|d| !d.merge_commit.is_empty())
+            .map(|d| (d.merge_commit, d.target))
+            .collect();
+        let is_ancestor = self
+            .merge_commit_ancestry(&repo, delivered_pairs.into_iter().collect())
+            .await?;
+        let (protected_touch, diverged) = self.repair_git_facts(&repo, &tickets).await?;
+
+        let facts = crate::reconcile_repair::RepairFacts {
+            git: crate::reconcile::GitFacts {
+                is_ancestor,
+                cleared_branches: HashSet::new(),
+            },
+            protected_touch,
+            diverged,
+        };
+
+        let plan = crate::reconcile_repair::plan(
+            &repo,
+            &tickets,
+            &agents,
+            &landed_tickets,
+            &queued_tickets,
+            &facts,
+        );
+        let report = if apply {
+            // Re-fetch agents right here, immediately before the write: the
+            // slice `plan` was built from can be seconds old by the time we
+            // get here (two intervening git/ancestry awaits above), and
+            // `apply`'s stale-ownership re-check is only as fresh as what we
+            // hand it — never reuse the `agents` snapshot planning used.
+            let fresh_agents: Vec<crate::agents::AgentRecord> = self
+                .supervisor
+                .list_all()
+                .into_iter()
+                .filter(|a| a.repo_name == repo)
+                .collect();
+            crate::reconcile_repair::apply(
+                plan,
+                &crate::reconcile_repair::ApplyContext {
+                    tickets: &self.tickets,
+                    space: &self.space,
+                    castle: &self.castle,
+                    agents: &fresh_agents,
+                },
+            )
+            .await?
+        } else {
+            crate::reconcile_repair::dry_run(plan)
+        };
+        Ok(crate::reconcile_repair::to_json(&report))
+    }
+
+    /// The two durable-evidence git checks `reconcile_repair_value` needs
+    /// beyond ancestry: `merge_commit -> does its diff touch a protected
+    /// path?` and `(scope, branch) -> has the branch diverged from what
+    /// landed?`. An unregistered/unopenable repo, or a ticket with no
+    /// delivery record at all, returns empty maps — "cannot check", read by
+    /// `reconcile_repair::plan` as missing evidence, never as a clean bill.
+    async fn repair_git_facts(
+        &self,
+        repo: &str,
+        tickets: &[Tuple],
+    ) -> rk_core::Result<(HashMap<String, bool>, HashMap<(String, String), bool>)> {
+        let records: Vec<crate::tickets::DeliveryRecord> = tickets
+            .iter()
+            .filter_map(crate::tickets::delivery_of)
+            .filter(|d| !d.merge_commit.is_empty())
+            .collect();
+        if records.is_empty() {
+            return Ok((HashMap::new(), HashMap::new()));
+        }
+        let path = {
+            let reg = self
+                .repos
+                .lock()
+                .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?;
+            reg.get(repo).map(|r| r.path.clone())
+        };
+        let Some(path) = path else {
+            return Ok((HashMap::new(), HashMap::new()));
+        };
+        let scope = repo.to_string();
+        let supervisor = Arc::clone(&self.supervisor);
+        tokio::task::spawn_blocking(move || {
+            let mut protected_touch = HashMap::new();
+            let mut diverged = HashMap::new();
+            let Ok(git_repo) = rk_git::Repo::discover(&path) else {
+                return (protected_touch, diverged);
+            };
+            let protected_paths = supervisor
+                .repository_policy(&git_repo)
+                .landing
+                .protected_paths;
+            for record in records {
+                if let Some(touch) =
+                    touches_protected_path(&git_repo, &record.merge_commit, &protected_paths)
+                {
+                    protected_touch
+                        .entry(record.merge_commit.clone())
+                        .or_insert(touch);
+                }
+                if git_repo.branch_exists(&record.branch) {
+                    if let Ok(tip) = git_repo.rev_parse(&record.branch) {
+                        let still_ancestor = git_repo.is_ancestor(&tip, &record.merge_commit);
+                        diverged.insert((scope.clone(), record.branch.clone()), !still_ancestor);
+                    }
+                }
+            }
+            (protected_touch, diverged)
+        })
+        .await
+        .map_err(|e| rk_core::Error::other(format!("repair git facts panicked: {e}")))
+    }
+
     /// `(merge_commit, target) -> is merge_commit an ancestor of target?` for
     /// every pair in `pairs`, resolved against the repo registered as `repo`.
     /// An unregistered or unopenable repo returns an empty map — "cannot
@@ -3654,6 +3822,22 @@ impl Daemon {
             .filter(|t| t.payload.get("violation_id").and_then(Value::as_str) == Some(violation_id))
             .find(|t| t.payload.get("terminal").and_then(Value::as_bool) == Some(true))
             .map(|t| t.payload))
+    }
+
+    /// `reconcile.repair` — dry-run or apply mechanical repair for the two
+    /// convergence violations durable evidence alone proves and fixes
+    /// (`crate::reconcile_repair`). Operator-only: unlike `reconcile.report`
+    /// this can write tuples (a ticket status/assignee flip, and a durable
+    /// journal/announcement event) when called with `apply: true`.
+    async fn handle_reconcile_repair(&self, req: Request) -> Response {
+        let params: ReconcileRepairParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        match self.reconcile_repair_value(params.repo, params.apply).await {
+            Ok(value) => Response::ok(req.id, value),
+            Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
+        }
     }
 
     /// (scope, branch) pairs among the given branch-shaped events whose branch
@@ -7765,6 +7949,15 @@ struct ReconcileParams {
 }
 
 #[derive(Deserialize)]
+struct ReconcileRepairParams {
+    repo: String,
+    /// `false` (the default) previews the plan with zero mutation; `true`
+    /// executes every `Planned` item through the CAS repair writers.
+    #[serde(default)]
+    apply: bool,
+}
+
+#[derive(Deserialize)]
 struct InboxAckParams {
     id: String,
 }
@@ -8104,6 +8297,39 @@ struct TicketReopenParams {
 
 fn parse_params<T: serde::de::DeserializeOwned>(params: &Value) -> Result<T, String> {
     serde_json::from_value(params.clone()).map_err(|e| e.to_string())
+}
+
+/// Does `commit`'s own diff (against its first parent) touch a path matched
+/// by `protected_paths` (an ERE)? The same question `.rk/checks.cue`'s
+/// `steward-protected-paths` check answers by hand for a landing candidate's
+/// diff-scope range; this asks it about one already-landed commit instead,
+/// via the exact same `grep -qE` semantics. `None` means the question could
+/// not be answered (no parent commit, git or grep unavailable) — the caller
+/// treats that as missing evidence, never as "does not touch".
+fn touches_protected_path(
+    repo: &rk_git::Repo,
+    commit: &str,
+    protected_paths: &str,
+) -> Option<bool> {
+    let parent = format!("{commit}^");
+    let stat = repo.diff_stat(&parent, commit).ok()?;
+    grep_matches(&stat.files, protected_paths)
+}
+
+fn grep_matches(files: &[String], pattern: &str) -> Option<bool> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("grep")
+        .args(["-qE", pattern])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = writeln!(stdin, "{}", files.join("\n"));
+    }
+    child.wait().ok().map(|status| status.success())
 }
 
 async fn write_json_line<W, T>(write: &mut W, value: &T) -> std::io::Result<()>

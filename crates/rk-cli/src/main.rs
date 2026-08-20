@@ -9,6 +9,7 @@ mod ingest_cmds;
 mod observe;
 mod product_to_code_cmds;
 mod reconcile_cmds;
+mod reconcile_repair_cmds;
 mod repo_cmds;
 mod space_cmds;
 mod ticket_cmds;
@@ -104,6 +105,11 @@ enum Command {
     /// assignees still owning active work, conflict-held landing work,
     /// tracker claims git disagrees with).
     Reconcile(reconcile_cmds::ReportArgs),
+    /// Dry-run (default) or apply mechanical repair for the two convergence
+    /// violations durable evidence alone proves and fixes: delivered-but-open
+    /// tickets and stale ownership (a terminal assignee still on record for
+    /// open work). Every other violation stays report-only. Operator-only.
+    ReconcileRepair(reconcile_repair_cmds::RepairArgs),
     /// Durable orchestrator lease over one repository's attention queue
     /// (TKT-01M0E8PN9C41BWECGNW0990R3J): acquire/renew, surviving disconnect,
     /// replacement, or a daemon restart.
@@ -1050,6 +1056,9 @@ async fn main() -> Result<()> {
             Some(InboxCommand::Ack { id }) => agent_cmds::inbox_ack(&layout, id, cli.json).await?,
         },
         Command::Reconcile(args) => reconcile_cmds::report(&layout, args, cli.json).await?,
+        Command::ReconcileRepair(args) => {
+            reconcile_repair_cmds::repair(&layout, args, cli.json).await?
+        }
         Command::Lease { command } => match command {
             attention_cmds::LeaseCommand::Acquire(args) => {
                 attention_cmds::lease_acquire(&layout, args, cli.json).await?
