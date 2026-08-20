@@ -47,12 +47,23 @@ use serde_json::{json, Value};
 /// (`Pattern::for_commit`).
 pub(crate) const REWORK_DISPATCH_IDENTITY: &str = "landing_rework_dispatch";
 
-/// Identity of the durable marker recording that a corrected parent branch was
-/// re-enqueued to its original target after a rework landed into it. Keyed by
-/// `(parent branch, parent's NEW head sha)`, so a restart or replay between
-/// the intermediate landing and the parent resubmission converges on exactly
-/// one parent landing entry.
-pub(crate) const REWORK_RESUBMIT_IDENTITY: &str = "landing_rework_resubmit";
+/// Stable dedupe key for the rework ticket itself. Target and original task
+/// are part of the key: the same branch/head submitted to a different target
+/// or under a different ticket is a different review chain, not a replay.
+///
+/// A free function rather than a [`ReworkContext`] method because the pipeline
+/// files the ticket BEFORE it can build a context (the context needs the
+/// ticket's own identity), so the key has to be derivable from the work key
+/// alone.
+pub(crate) fn ticket_coalesce_key(
+    repo: &str,
+    branch: &str,
+    head_sha: &str,
+    target: &str,
+    task: &str,
+) -> String {
+    format!("landing-rework:{repo}:{branch}:{head_sha}:{target}:{task}")
+}
 
 /// Per-repository bounds on unattended rework, resolved from
 /// `rk_workflow::LandingPolicy` (`.rk/repo.cue`, digest-activated like every
@@ -181,8 +192,7 @@ pub(crate) fn classify_authority(review: Option<&Value>) -> (Authority, Option<W
                              recognize ({raw:?}) — treated as human rather than ignored, so a \
                              typo cannot read as consent to dispatch"
                         ),
-                        decision: "correct the reviewer's verdict, then dispatch or abandon"
-                            .into(),
+                        decision: "correct the reviewer's verdict, then dispatch or abandon".into(),
                     }),
                 );
             }
@@ -316,6 +326,18 @@ pub(crate) struct ReworkContext {
 }
 
 impl ReworkContext {
+    /// Full logical dispatch identity. The follow-up ticket is included even
+    /// though it is itself coalesced from the preceding fields: persisting all
+    /// six dimensions makes replay evidence self-contained and prevents a
+    /// malformed/stale ticket association from being treated as the same
+    /// dispatch.
+    pub(crate) fn dispatch_key(&self) -> String {
+        format!(
+            "{}\0{}\0{}\0{}\0{}\0{}",
+            self.repo, self.branch, self.head_sha, self.target, self.task, self.rework_ticket
+        )
+    }
+
     /// The rework agent's task prompt. States the identities on both ends
     /// (original and rework ticket), pins the exact base commit, quotes the
     /// reviewer verbatim, and — critically — tells the agent it is landing
@@ -389,6 +411,7 @@ impl ReworkContext {
     /// lookup rather than a full scan.
     pub(crate) fn marker_payload(&self, attempt: u32, agent: Option<&str>, state: &str) -> Value {
         json!({
+            "dispatch_key": self.dispatch_key(),
             "branch": self.branch,
             "head_sha": self.head_sha,
             "repo": self.repo,
@@ -401,13 +424,6 @@ impl ReworkContext {
             "diff_files": self.diff_files,
             "diff_lines": self.diff_lines,
         })
-    }
-
-    /// Stable dedupe key for the rework ticket itself — the reviewed work
-    /// key, so `Tickets::create_idempotent` returns the SAME ticket for a
-    /// redelivered completion instead of minting a second one.
-    pub(crate) fn ticket_coalesce_key(&self) -> String {
-        format!("landing-rework:{}:{}:{}", self.repo, self.branch, self.head_sha)
     }
 }
 
@@ -483,7 +499,10 @@ mod tests {
 
     #[test]
     fn an_open_product_decision_escalates_even_with_notes() {
-        for flag in [json!({"decision_required": true}), json!({"bounded": false})] {
+        for flag in [
+            json!({"decision_required": true}),
+            json!({"bounded": false}),
+        ] {
             let (authority, withheld) = classify_authority(Some(&review(flag.clone())));
             assert_eq!(authority, Authority::Human, "flag: {flag}");
             assert_eq!(withheld.unwrap().code, "ambiguous-decision");
@@ -524,7 +543,7 @@ mod tests {
         assert_eq!(withheld.code, "budget-exhausted");
 
         let unlimited = ReworkPolicy {
-            max_usd: 0.0,
+            max_usd: 0,
             ..ReworkPolicy::default()
         };
         assert_eq!(
@@ -551,7 +570,10 @@ mod tests {
     #[test]
     fn the_prompt_pins_the_reviewed_branch_and_exact_head() {
         let prompt = ctx().prompt();
-        assert!(prompt.contains("YOUR BASE IS `feature` AT abc123"), "{prompt}");
+        assert!(
+            prompt.contains("YOUR BASE IS `feature` AT abc123"),
+            "{prompt}"
+        );
         assert!(prompt.contains("not main"), "{prompt}");
         assert!(prompt.contains("TKT-1"), "{prompt}");
         assert!(prompt.contains("TKT-2"), "{prompt}");
@@ -567,8 +589,14 @@ mod tests {
         };
         let text = ctx().escalation(&withheld);
         assert!(text.contains("EVIDENCE:"), "{text}");
-        assert!(text.contains("DECISION NEEDED: read the branch yourself"), "{text}");
-        assert!(text.contains("BLAST RADIUS: 3 file(s) / 42 line(s)"), "{text}");
+        assert!(
+            text.contains("DECISION NEEDED: read the branch yourself"),
+            "{text}"
+        );
+        assert!(
+            text.contains("BLAST RADIUS: 3 file(s) / 42 line(s)"),
+            "{text}"
+        );
         assert!(
             text.contains("rk spawn --repo code-repo --ticket TKT-2 --base feature"),
             "{text}"
@@ -576,10 +604,18 @@ mod tests {
     }
 
     #[test]
-    fn the_ticket_coalesce_key_is_the_reviewed_work_key() {
+    fn the_ticket_coalesce_key_names_the_whole_review_chain() {
         assert_eq!(
-            ctx().ticket_coalesce_key(),
-            "landing-rework:code-repo:feature:abc123"
+            ticket_coalesce_key("code-repo", "feature", "abc123", "main", "TKT-1"),
+            "landing-rework:code-repo:feature:abc123:main:TKT-1"
         );
+    }
+
+    #[test]
+    fn dispatch_key_includes_original_and_rework_ticket() {
+        let key = ctx().dispatch_key();
+        for component in ["code-repo", "feature", "abc123", "main", "TKT-1", "TKT-2"] {
+            assert!(key.split('\0').any(|part| part == component), "{key:?}");
+        }
     }
 }

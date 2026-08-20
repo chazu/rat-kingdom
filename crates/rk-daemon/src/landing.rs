@@ -69,6 +69,9 @@
 //! that live wiring.
 #![allow(dead_code)]
 
+use crate::landing_rework::{
+    self, ReworkContext, ReworkPolicy, ReworkRoute, Withheld, REWORK_DISPATCH_IDENTITY,
+};
 use crate::supervisor::Supervisor;
 use crate::tickets::{NewTicket, Tickets};
 use crate::workflow_exec::{InstanceStatus, OnTimeout, ResolvedRun, WorkflowEngine};
@@ -90,6 +93,11 @@ use tracing::{info, warn};
 /// [`tasks_in_landing_queue`] can be called from `Server`/`Supervisor` —
 /// mirrors [`LANDING_PROCESSED_IDENTITY`]'s visibility below.
 pub(crate) const LANDING_QUEUE_IDENTITY: &str = "landing_queue_entry";
+
+/// Evidence that a landed correction queued its reviewed parent for a fresh
+/// pass against the parent's original target. The queue tuple is the durable
+/// source of truth; this event makes the automatic hand-off inspectable.
+const REWORK_RESUBMISSION_IDENTITY: &str = "landing_rework_resubmission";
 
 /// Identity of the durable `work_key = (repo, branch, head_sha)` dedup
 /// marker (`Furniture`, scoped to the repo), written by
@@ -304,6 +312,18 @@ const LANDING_NON_MAIN_TARGET_IDENTITY: &str = "landing_non_main_land_target";
 /// reactor-fired.
 const REVIEW_WORKFLOW: &str = "steward-review";
 
+fn required_payload_str<'a>(
+    payload: &'a Value,
+    field: &str,
+    source: &str,
+) -> rk_core::Result<&'a str> {
+    payload
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| rk_core::Error::other(format!("{source} missing {field}")))
+}
+
 /// Poll slice for the liveness-aware review wait (module doc): how often
 /// [`LandingPipeline::request_review`] gives up on the current `rd` and
 /// checks the review instance's liveness before resuming the wait. Short
@@ -394,6 +414,14 @@ pub(crate) enum LandingEntryStatus {
     Queued,
     RunningGates,
     AwaitingReview,
+    Landing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueueDisposition {
+    Queued(u64),
+    Pending,
+    Processed,
 }
 
 /// A durable, per-`(repo,target)` FIFO of landing candidates — modeled
@@ -458,6 +486,20 @@ impl LandingQueue {
         }
         self.write(&entry)?;
         Ok(seq)
+    }
+
+    fn contains_work_key(&self, entry: &LandingQueueEntry) -> rk_core::Result<bool> {
+        Ok(self
+            .scan_current(&entry.repo_name, None)?
+            .into_iter()
+            .any(|tuple| {
+                let payload = &tuple.payload;
+                payload.get("branch").and_then(Value::as_str) == Some(entry.branch.as_str())
+                    && payload.get("target").and_then(Value::as_str) == Some(entry.target.as_str())
+                    && payload.get("head_sha").and_then(Value::as_str)
+                        == Some(entry.head_sha.as_str())
+                    && payload.get("task").and_then(Value::as_str) == Some(entry.task.as_str())
+            }))
     }
 
     /// Write (or overwrite, via delete-then-out — tuples have no in-place
@@ -584,7 +626,9 @@ impl LandingQueue {
         };
         let mut entry: LandingQueueEntry = serde_json::from_value(tuple.payload.clone())
             .map_err(|e| rk_core::Error::other(format!("landing queue entry: {e}")))?;
-        entry.status = LandingEntryStatus::RunningGates;
+        if entry.status != LandingEntryStatus::Landing {
+            entry.status = LandingEntryStatus::RunningGates;
+        }
         entry.rev = entry.rev.wrapping_add(1);
         // Write-then-delete (T4 crash-safety, module doc): the successor
         // tuple lands durably BEFORE the predecessor is removed, so a crash
@@ -619,7 +663,9 @@ impl LandingQueue {
         for tuple in pending.into_iter().take(max) {
             let mut entry: LandingQueueEntry = serde_json::from_value(tuple.payload.clone())
                 .map_err(|error| rk_core::Error::other(format!("landing queue entry: {error}")))?;
-            entry.status = LandingEntryStatus::RunningGates;
+            if entry.status != LandingEntryStatus::Landing {
+                entry.status = LandingEntryStatus::RunningGates;
+            }
             entry.rev = entry.rev.wrapping_add(1);
             self.write(&entry)?;
             self.space.delete(tuple.id)?;
@@ -849,6 +895,7 @@ pub(crate) struct LandingPipeline {
     /// T3 adds (`Space::scan`/`rd`/`out`, §1.3/§1.5) — none of which go
     /// through the queue.
     space: Space,
+    enqueue_lock: Mutex<()>,
     key_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -886,6 +933,7 @@ impl LandingPipeline {
             layout,
             queue,
             space,
+            enqueue_lock: Mutex::new(()),
             key_locks: Mutex::new(HashMap::new()),
         }
     }
@@ -933,9 +981,13 @@ impl LandingPipeline {
     /// already landed and closed). That fails closed with an error instead
     /// of silently reporting `already_processed`, which would otherwise read
     /// as "nothing to do" while leaving the newly-named ticket untouched.
-    pub(crate) fn enqueue(&self, entry: LandingQueueEntry) -> rk_core::Result<Option<u64>> {
+    fn enqueue_disposition(&self, entry: LandingQueueEntry) -> rk_core::Result<EnqueueDisposition> {
+        let _guard = self.enqueue_lock.lock().unwrap_or_else(|p| p.into_inner());
         let Some(marker) = self.processed_marker(&entry)? else {
-            return Ok(Some(self.queue.enqueue(entry)?));
+            if self.queue.contains_work_key(&entry)? {
+                return Ok(EnqueueDisposition::Pending);
+            }
+            return Ok(EnqueueDisposition::Queued(self.queue.enqueue(entry)?));
         };
         let recorded_task = marker
             .payload
@@ -949,7 +1001,14 @@ impl LandingPipeline {
                 entry.branch, entry.head_sha, entry.repo_name, entry.task
             )));
         }
-        Ok(None)
+        Ok(EnqueueDisposition::Processed)
+    }
+
+    pub(crate) fn enqueue(&self, entry: LandingQueueEntry) -> rk_core::Result<Option<u64>> {
+        Ok(match self.enqueue_disposition(entry)? {
+            EnqueueDisposition::Queued(seq) => Some(seq),
+            EnqueueDisposition::Pending | EnqueueDisposition::Processed => None,
+        })
     }
 
     /// Reclaim parked merge objects not referenced by any durable queue row.
@@ -1050,14 +1109,17 @@ impl LandingPipeline {
             keep_branch,
             ..Default::default()
         };
-        let Some(_seq) = self.enqueue(entry.clone())? else {
-            return Ok(json!({
-                "branch": branch,
-                "target": target,
-                "already_processed": true,
-                "detail": "this exact branch/head landing was already processed",
-            }));
-        };
+        match self.enqueue_disposition(entry.clone())? {
+            EnqueueDisposition::Queued(_) | EnqueueDisposition::Pending => {}
+            EnqueueDisposition::Processed => {
+                return Ok(json!({
+                    "branch": branch,
+                    "target": target,
+                    "already_processed": true,
+                    "detail": "this exact branch/head landing was already processed",
+                }));
+            }
+        }
 
         let lock = self.key_lock(&repo_name, target);
         let _guard = lock.lock().await;
@@ -1224,6 +1286,9 @@ impl LandingPipeline {
             let repo_path = repo_path.clone();
             blocking(move || rk_git::Repo::discover(&repo_path)).await?
         };
+        if let Some(outcome) = self.recover_completed_land(&entry, &git_repo).await? {
+            return Ok(outcome);
+        }
         let gates = self.gate_config(&git_repo);
         let checks_file = repo_path.join(".rk").join("checks.cue");
         if let Err(error) = self.gate_plan(&checks_file, &entry.target, &gates) {
@@ -1312,6 +1377,7 @@ impl LandingPipeline {
         }
         if matches!(entry.diff_class.as_str(), "doc-only" | "trivial") {
             self.note_non_main_land_target(&entry);
+            self.queue.set_status(&entry, LandingEntryStatus::Landing)?;
             let result = self
                 .supervisor
                 .land_prepared(
@@ -1716,27 +1782,31 @@ impl LandingPipeline {
         let verdict = match outcome {
             ReviewWaitOutcome::Verdict(v) => v,
             ReviewWaitOutcome::ReviewerDied(context) => {
-                let text = format!(
-                    "steward: reviewer for {} on {} ended without producing a verdict — branch \
-                     held unmerged. {context}",
-                    entry.task, entry.branch
-                );
-                return Ok(LandingOutcome::Escalated(self.escalate(entry, text)?));
+                return Ok(LandingOutcome::Escalated(self.review_human_gate(
+                    entry,
+                    git_repo,
+                    "reviewer-died",
+                    format!("the reviewer ended without producing a verdict: {context}"),
+                    "inspect the failed review and either record a fresh verdict or make the land decision",
+                )?));
             }
             ReviewWaitOutcome::CeilingReached => {
-                let text = format!(
-                    "steward: reviewer still running at the {}s wait ceiling for {} on {} — \
-                     branch held unmerged",
-                    gates.review_max_wait.as_secs(),
-                    entry.task,
-                    entry.branch
-                );
-                return Ok(LandingOutcome::Escalated(self.escalate(entry, text)?));
+                return Ok(LandingOutcome::Escalated(self.review_human_gate(
+                    entry,
+                    git_repo,
+                    "review-wait-exhausted",
+                    format!(
+                        "the reviewer was still running at the {}s hard wait ceiling",
+                        gates.review_max_wait.as_secs()
+                    ),
+                    "inspect or stop the reviewer, then record a verdict or make the land decision",
+                )?));
             }
         };
         match verdict.as_str() {
             "APPROVE" => {
                 self.note_non_main_land_target(entry);
+                self.queue.set_status(entry, LandingEntryStatus::Landing)?;
                 let result = self
                     .supervisor
                     .land_prepared(
@@ -1753,26 +1823,61 @@ impl LandingPipeline {
                 self.record_delivery(entry, &result).await;
                 Ok(LandingOutcome::Landed(result))
             }
-            "REWORK" => Ok(LandingOutcome::ReworkFiled(
-                self.file_rework_ticket(entry).await?,
-            )),
-            "STOP" => {
-                let text = format!(
-                    "steward: reviewer returned STOP for {} on {} — needs a human merge \
-                     decision; branch held unmerged",
-                    entry.task, entry.branch
-                );
-                Ok(LandingOutcome::Escalated(self.escalate(entry, text)?))
-            }
-            other => {
-                let text = format!(
-                    "steward: unrecognized review verdict '{other}' for {} on {} — branch held \
-                     unmerged, needs a human",
-                    entry.task, entry.branch
-                );
-                Ok(LandingOutcome::Escalated(self.escalate(entry, text)?))
-            }
+            "REWORK" => self.route_rework(entry, git_repo).await,
+            "STOP" => Ok(LandingOutcome::Escalated(self.review_human_gate(
+                entry,
+                git_repo,
+                "reviewer-stop",
+                "the reviewer returned STOP".into(),
+                "decide whether to abandon the branch or explicitly override the STOP",
+            )?)),
+            other => Ok(LandingOutcome::Escalated(self.review_human_gate(
+                entry,
+                git_repo,
+                "unknown-verdict",
+                format!("the reviewer returned unrecognized verdict {other:?}"),
+                "correct the review artifact to APPROVE, REWORK, or STOP, then resubmit",
+            )?)),
         }
+    }
+
+    fn review_human_gate(
+        &self,
+        entry: &LandingQueueEntry,
+        git_repo: &rk_git::Repo,
+        code: &str,
+        detail: String,
+        decision: &str,
+    ) -> rk_core::Result<Tuple> {
+        let stat = git_repo.diff_stat(&entry.target, &entry.branch)?;
+        let notes = self
+            .review_artifact(entry)?
+            .as_ref()
+            .map(|artifact| landing_rework::notes(Some(artifact)))
+            .filter(|notes| !notes.is_empty())
+            .unwrap_or_else(|| "(none recorded)".to_string());
+        self.escalate(
+            entry,
+            format!(
+                "steward: review of {} for {} requires a human ({code}) — branch held unmerged.\n\
+                 EVIDENCE: exact reviewed head {}; {detail}. Reviewer notes: {notes}\n\
+                 DECISION NEEDED: {decision}\n\
+                 BLAST RADIUS: {} file(s) / {} line(s) on {}, held back from {}. Nothing merged.\n\
+                 RESOLVE WITH: rk land {} --repo {} --target {} --task {} --force --reason \
+                 'human resolved {code}'",
+                entry.branch,
+                entry.task,
+                entry.head_sha,
+                stat.files.len(),
+                stat.lines,
+                entry.branch,
+                entry.target,
+                entry.branch,
+                entry.repo_path,
+                entry.target,
+                entry.task,
+            ),
+        )
     }
 
     #[cfg(test)]
@@ -1849,6 +1954,533 @@ impl LandingPipeline {
                 "landed but failed to record delivery on the ticket"
             ),
         }
+        if let Err(error) = self.resubmit_reworked_parent(entry) {
+            // The intermediate merge is already durable. Never turn a
+            // resubmission bookkeeping fault into a claim that the merge
+            // failed; surface it as an operator-visible need instead.
+            let _ = self.escalate(
+                entry,
+                format!(
+                    "steward: rework {} landed onto {}, but automatic parent resubmission failed: \
+                     {error}. Re-submit with `rk land {} --repo {} --target <original-target> \
+                     --task <original-ticket>`",
+                    entry.task, entry.target, entry.target, entry.repo_path
+                ),
+            );
+            warn!(
+                task = %entry.task,
+                target = %entry.target,
+                error = %error,
+                "rework landed but parent resubmission failed"
+            );
+        }
+    }
+
+    /// Finish the durable ticket transition after a crash that happened after
+    /// an APPROVE-authorized target advance but before `record_delivery`.
+    async fn recover_completed_land(
+        &self,
+        entry: &LandingQueueEntry,
+        repo: &rk_git::Repo,
+    ) -> rk_core::Result<Option<LandingOutcome>> {
+        if entry.status != LandingEntryStatus::Landing {
+            return Ok(None);
+        }
+        if self.supervisor.repository_policy(repo).delivery.mode != rk_workflow::DeliveryMode::Merge
+        {
+            return Ok(None);
+        }
+        let (Some(commit), Some(base)) = (&entry.candidate_sha, &entry.candidate_base) else {
+            return Ok(None);
+        };
+        if repo.rev_parse(&entry.target)? != *commit {
+            return Ok(None);
+        }
+        let result = json!({
+            "branch": entry.branch, "target": entry.target, "delivered": true,
+            "merged": true, "merge_commit": commit, "content_free": commit == base,
+            "recovered": true,
+        });
+        self.record_delivery(entry, &result).await;
+        let outcome = LandingOutcome::Landed(result);
+        self.mark_processed(entry, &outcome)?;
+        Ok(Some(outcome))
+    }
+
+    /// If `entry` is a dispatched rework ticket landing onto its reviewed
+    /// parent branch, queue that parent at its NEW head against the original
+    /// target and original ticket. `enqueue_disposition` deduplicates both a
+    /// still-pending row and an already-processed row, so replay after a
+    /// restart converges without a second review/land.
+    fn resubmit_reworked_parent(&self, entry: &LandingQueueEntry) -> rk_core::Result<()> {
+        let marker = self
+            .space
+            .scan(
+                &Pattern::category(Category::Event)
+                    .identity(REWORK_DISPATCH_IDENTITY)
+                    .scope(&entry.repo_name),
+            )?
+            .into_iter()
+            .find(|marker| {
+                marker.payload.get("rework_ticket").and_then(Value::as_str)
+                    == Some(entry.task.as_str())
+                    && marker.payload.get("branch").and_then(Value::as_str)
+                        == Some(entry.target.as_str())
+                    && matches!(
+                        marker.payload.get("state").and_then(Value::as_str),
+                        Some("dispatching" | "dispatched")
+                    )
+            });
+        let Some(marker) = marker else {
+            return Ok(());
+        };
+        let payload = &marker.payload;
+        let original_branch = required_payload_str(payload, "branch", "rework dispatch marker")?;
+        let original_target = required_payload_str(payload, "target", "rework dispatch marker")?;
+        let original_task = required_payload_str(payload, "task", "rework dispatch marker")?;
+        let repo = rk_git::Repo::discover(Path::new(&entry.repo_path))?;
+        let head_sha = repo.rev_parse(original_branch)?;
+        let stat = repo.diff_stat(original_target, original_branch)?;
+        let parent = LandingQueueEntry {
+            repo_name: entry.repo_name.clone(),
+            repo_path: entry.repo_path.clone(),
+            branch: original_branch.to_string(),
+            target: original_target.to_string(),
+            head_sha: head_sha.clone(),
+            diff_class: crate::supervisor::classify_diff(&stat.files, stat.lines).to_string(),
+            task: original_task.to_string(),
+            ..Default::default()
+        };
+        let disposition = self.enqueue_disposition(parent)?;
+        if let EnqueueDisposition::Queued(seq) = disposition {
+            self.space.out(
+                Tuple::new(
+                    Category::Event,
+                    entry.repo_name.clone(),
+                    REWORK_RESUBMISSION_IDENTITY,
+                    "daemon",
+                    json!({
+                        "dispatch_key": payload.get("dispatch_key"),
+                        "rework_ticket": entry.task,
+                        "rework_branch": entry.branch,
+                        "branch": original_branch,
+                        "target": original_target,
+                        "task": original_task,
+                        "head_sha": head_sha,
+                        "seq": seq,
+                        "state": "queued",
+                    }),
+                )
+                .with_lifecycle(Lifecycle::Furniture),
+            )?;
+            info!(
+                rework_ticket = %entry.task,
+                branch = original_branch,
+                target = original_target,
+                head_sha,
+                seq,
+                "landed rework queued its corrected parent for fresh review"
+            );
+        }
+        Ok(())
+    }
+
+    /// This entry's repo-owned unattended-rework bounds, resolved from the
+    /// same activated `.rk/repo.cue` `landing` block [`Self::gate_config`]
+    /// reads — the REWORK arm's counterpart to `GateConfig`.
+    fn rework_policy(&self, repo: &rk_git::Repo) -> ReworkPolicy {
+        ReworkPolicy::from_landing(&self.supervisor.repository_policy(repo).landing)
+    }
+
+    /// Every durable rework-dispatch marker for `branch` in this repo,
+    /// regardless of which head it was written against.
+    ///
+    /// CHAIN-scoped on purpose, not head-scoped: each landed rework moves the
+    /// reviewed branch to a NEW head, so a `(branch, head_sha)` count would
+    /// reset to zero on every pass and `max_attempts` would never bind. The
+    /// per-head probe ([`Self::rework_dispatch_marker`]) is a different
+    /// question — "did we already route THIS exact commit" — and is what makes
+    /// redelivery and restart idempotent.
+    fn rework_dispatch_markers(&self, ctx: &ReworkContext) -> rk_core::Result<Vec<Tuple>> {
+        let pattern = Pattern::category(Category::Event)
+            .identity(REWORK_DISPATCH_IDENTITY)
+            .scope(&ctx.repo);
+        Ok(self
+            .space
+            .scan(&pattern)?
+            .into_iter()
+            .filter(|t| {
+                t.payload.get("branch").and_then(Value::as_str) == Some(ctx.branch.as_str())
+                    && t.payload.get("target").and_then(Value::as_str) == Some(ctx.target.as_str())
+                    && t.payload.get("task").and_then(Value::as_str) == Some(ctx.task.as_str())
+            })
+            .collect())
+    }
+
+    fn rework_attempts_used(&self, ctx: &ReworkContext) -> rk_core::Result<u32> {
+        let distinct: BTreeSet<String> = self
+            .rework_dispatch_markers(ctx)?
+            .into_iter()
+            .filter(|marker| {
+                matches!(
+                    marker.payload.get("state").and_then(Value::as_str),
+                    Some("dispatching" | "dispatched")
+                )
+            })
+            .map(|marker| {
+                marker
+                    .payload
+                    .get("dispatch_key")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}\0{}",
+                            marker
+                                .payload
+                                .get("head_sha")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                            marker
+                                .payload
+                                .get("rework_ticket")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                        )
+                    })
+            })
+            .collect();
+        Ok(distinct.len() as u32)
+    }
+
+    /// The marker for one EXACT reviewed commit, if this verdict was already
+    /// routed. Its presence is what a redelivered completion, a restart, or a
+    /// repeated queue scan trips on, so none of them can mint a second rework
+    /// ticket or a second rework agent.
+    fn rework_dispatch_marker(&self, ctx: &ReworkContext) -> rk_core::Result<Option<Tuple>> {
+        let key = ctx.dispatch_key();
+        Ok(self
+            .rework_dispatch_markers(ctx)?
+            .into_iter()
+            .find(|marker| {
+                marker.payload.get("dispatch_key").and_then(Value::as_str) == Some(key.as_str())
+                    || (marker.payload.get("head_sha").and_then(Value::as_str)
+                        == Some(ctx.head_sha.as_str())
+                        && marker.payload.get("rework_ticket").and_then(Value::as_str)
+                            == Some(ctx.rework_ticket.as_str()))
+            }))
+    }
+
+    fn rework_dispatch_has_state(&self, ctx: &ReworkContext, state: &str) -> rk_core::Result<bool> {
+        let key = ctx.dispatch_key();
+        Ok(self
+            .rework_dispatch_markers(ctx)?
+            .into_iter()
+            .any(|marker| {
+                (marker.payload.get("dispatch_key").and_then(Value::as_str) == Some(key.as_str())
+                    || (marker.payload.get("head_sha").and_then(Value::as_str)
+                        == Some(ctx.head_sha.as_str())
+                        && marker.payload.get("rework_ticket").and_then(Value::as_str)
+                            == Some(ctx.rework_ticket.as_str())))
+                    && marker.payload.get("state").and_then(Value::as_str) == Some(state)
+            }))
+    }
+
+    /// Whether the supervisor durably journaled the agent for this exact
+    /// rework dispatch. Spawn writes its `Spawning` registry row before it
+    /// creates the worktree or launches the harness, and `list_all` retains
+    /// terminal and archived rows, so this remains a reliable proof after a
+    /// daemon restart or a later agent failure.
+    fn rework_agent_was_journaled(&self, ctx: &ReworkContext) -> bool {
+        self.supervisor.list_all().into_iter().any(|record| {
+            record.role == "rat"
+                && record.task.as_deref() == Some(ctx.rework_ticket.as_str())
+                && record.target_branch == ctx.branch
+                && record.fork_point.as_deref() == Some(ctx.head_sha.as_str())
+        })
+    }
+
+    /// Cumulative USD across this reviewed branch's whole review/rework chain:
+    /// the agent that produced the branch (`branch == reviewed branch`) plus
+    /// every rework agent dispatched to land back onto it (`target_branch ==
+    /// reviewed branch`). Read from `list_all` rather than `list` so a
+    /// dismissed or archived attempt still counts — a cap that forgets what
+    /// prior attempts cost is not a cap.
+    fn rework_chain_spend(&self, ctx: &ReworkContext) -> rk_core::Result<f64> {
+        let rework_tickets: BTreeSet<String> = self
+            .rework_dispatch_markers(ctx)?
+            .into_iter()
+            .filter_map(|marker| {
+                marker
+                    .payload
+                    .get("rework_ticket")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        let spent = self
+            .supervisor
+            .list_all()
+            .iter()
+            .filter(|a| {
+                a.repo_name == ctx.repo
+                    && a.role == "rat"
+                    && a.task
+                        .as_deref()
+                        .is_some_and(|task| task == ctx.task || rework_tickets.contains(task))
+            })
+            .map(|a| a.cost_usd)
+            .sum();
+        Ok(spent)
+    }
+
+    /// Route one REWORK verdict: file the follow-up ticket (idempotently),
+    /// classify the verdict on the authority ladder, check the repository's
+    /// caps, and then either dispatch exactly one rework agent from the
+    /// reviewed branch at its exact head or hold the branch behind one
+    /// evidence-rich human gate.
+    ///
+    /// The ticket is filed on BOTH paths and before the routing decision: a
+    /// withheld verdict must still leave a durable work item behind, which is
+    /// exactly the pre-feature behaviour this arm preserves.
+    async fn route_rework(
+        &self,
+        entry: &LandingQueueEntry,
+        git_repo: &rk_git::Repo,
+    ) -> rk_core::Result<LandingOutcome> {
+        let review = self.review_artifact(entry)?;
+        let stat = {
+            let repo = git_repo.clone();
+            let target = entry.target.clone();
+            let branch = entry.branch.clone();
+            blocking(move || repo.diff_stat(&target, &branch)).await?
+        };
+        let ticket = self.file_rework_ticket(entry).await?;
+        let ctx = ReworkContext {
+            repo: entry.repo_name.clone(),
+            branch: entry.branch.clone(),
+            head_sha: entry.head_sha.clone(),
+            target: entry.target.clone(),
+            task: entry.task.clone(),
+            rework_ticket: ticket.identity.clone(),
+            notes: landing_rework::notes(review.as_ref()),
+            diff_files: stat.files.len() as u64,
+            diff_lines: stat.lines,
+        };
+
+        // Ticket creation is coalesced on the original review chain. Once its
+        // identity is known, the full six-dimensional dispatch key can be
+        // checked before any non-idempotent side effect.
+        if let Some(marker) = self.rework_dispatch_marker(&ctx)? {
+            // A marker is deliberately persisted before spawn. If the daemon
+            // stopped in that narrow window, replay must not silently treat
+            // the correction as dispatched. Conversely, a journaled agent is
+            // durable proof that spawn crossed its own commit point, even if
+            // the daemon stopped before this call returned.
+            if marker.payload.get("state").and_then(Value::as_str) == Some("dispatching")
+                && !self.rework_agent_was_journaled(&ctx)
+                && !self.rework_dispatch_has_state(&ctx, "dispatch-interrupted")?
+            {
+                let attempt = marker
+                    .payload
+                    .get("attempt")
+                    .and_then(Value::as_u64)
+                    .and_then(|attempt| u32::try_from(attempt).ok())
+                    .unwrap_or_default();
+                let withheld = Withheld {
+                    code: "dispatch-interrupted",
+                    detail: format!(
+                        "durable dispatch attempt {attempt} exists, but the supervisor registry \
+                         contains no rat for rework ticket {} based on {} at {}; the daemon may \
+                         have stopped between recording the marker and journaling the spawn",
+                        ctx.rework_ticket, ctx.branch, ctx.head_sha
+                    ),
+                    decision: "confirm that no correction agent exists, then dispatch the \
+                               recorded rework ticket exactly once or abandon it"
+                        .into(),
+                };
+                self.escalate(entry, ctx.escalation(&withheld))?;
+                self.space.out(
+                    Tuple::new(
+                        Category::Event,
+                        entry.repo_name.clone(),
+                        REWORK_DISPATCH_IDENTITY,
+                        "daemon",
+                        ctx.marker_payload(attempt, None, withheld.code),
+                    )
+                    .with_lifecycle(Lifecycle::Furniture),
+                )?;
+                warn!(
+                    repo = %entry.repo_name, branch = %entry.branch,
+                    head_sha = %entry.head_sha, ticket = %ctx.rework_ticket, attempt,
+                    "landing pipeline: interrupted rework dispatch requires human recovery"
+                );
+            }
+            info!(
+                repo = %entry.repo_name, branch = %entry.branch, head_sha = %entry.head_sha,
+                ticket = %ctx.rework_ticket,
+                "landing pipeline: REWORK already routed for this exact chain; not re-dispatching"
+            );
+            return Ok(LandingOutcome::ReworkFiled(ticket));
+        }
+
+        let policy = self.rework_policy(git_repo);
+        let attempts_used = self.rework_attempts_used(&ctx)?;
+        let spent_usd = self.rework_chain_spend(&ctx)?;
+
+        let route = landing_rework::route(&policy, review.as_ref(), attempts_used, spent_usd);
+        let attempt = match route {
+            ReworkRoute::Withhold(withheld) => {
+                self.escalate(entry, ctx.escalation(&withheld))?;
+                self.space.out(
+                    Tuple::new(
+                        Category::Event,
+                        entry.repo_name.clone(),
+                        REWORK_DISPATCH_IDENTITY,
+                        "daemon",
+                        ctx.marker_payload(attempts_used, None, withheld.code),
+                    )
+                    .with_lifecycle(Lifecycle::Furniture),
+                )?;
+                return Ok(LandingOutcome::ReworkFiled(ticket));
+            }
+            ReworkRoute::Dispatch { attempt } => attempt,
+        };
+
+        // EXACT-BASE GUARD. `SpawnParams::base` cuts the worktree from the
+        // branch TIP, so dispatching while the tip has moved past the head we
+        // reviewed would hand the agent work nobody reviewed. That is a
+        // human's call, not a silent retarget, so it withholds rather than
+        // dispatching against the newer tip.
+        let tip = {
+            let repo = git_repo.clone();
+            let branch = entry.branch.clone();
+            blocking(move || repo.rev_parse(&branch)).await?
+        };
+        if tip != entry.head_sha {
+            let withheld = Withheld {
+                code: "reviewed-head-moved",
+                detail: format!(
+                    "the reviewed head {} is no longer {}'s tip (now {tip}), so a rework cut from \
+                     the branch would start from work this verdict never reviewed",
+                    entry.head_sha, entry.branch
+                ),
+                decision: "re-review the branch at its current tip, or reset it back to the \
+                           reviewed head and let the rework dispatch"
+                    .into(),
+            };
+            self.escalate(entry, ctx.escalation(&withheld))?;
+            self.space.out(
+                Tuple::new(
+                    Category::Event,
+                    entry.repo_name.clone(),
+                    REWORK_DISPATCH_IDENTITY,
+                    "daemon",
+                    ctx.marker_payload(attempts_used, None, withheld.code),
+                )
+                .with_lifecycle(Lifecycle::Furniture),
+            )?;
+            return Ok(LandingOutcome::ReworkFiled(ticket));
+        }
+
+        // MARKER BEFORE SPAWN, deliberately. A crash in the window between
+        // these two writes leaves the chain over-marked rather than risking a
+        // duplicate agent; replay distinguishes a journaled spawn from an
+        // interrupted one and raises the latter as a durable human gate.
+        self.space.out(
+            Tuple::new(
+                Category::Event,
+                entry.repo_name.clone(),
+                REWORK_DISPATCH_IDENTITY,
+                "daemon",
+                ctx.marker_payload(attempt, None, "dispatching"),
+            )
+            .with_lifecycle(Lifecycle::Furniture),
+        )?;
+
+        let params = crate::supervisor::SpawnParams {
+            repo: entry.repo_path.clone(),
+            task: ctx.rework_ticket.clone(),
+            prompt: Some(ctx.prompt()),
+            role: "rat".to_string(),
+            // The whole point of the arm: the rework's base — and so its merge
+            // target on dismissal — is the REVIEWED branch, never `target`.
+            base: Some(entry.branch.clone()),
+            coordination: None,
+            harness: None,
+            parent: None,
+            model: None,
+            permission_mode: None,
+            profile: None,
+            resolved_profile: None,
+            attach: false,
+            workflow_instance: None,
+            coordinator: None,
+            instance_max_usd: None,
+        };
+        match self.supervisor.spawn_async(params, 0).await {
+            Ok(record) => {
+                info!(
+                    repo = %entry.repo_name, branch = %entry.branch, head_sha = %entry.head_sha,
+                    agent = %record.name, ticket = %ctx.rework_ticket, attempt,
+                    "landing pipeline: dispatched bounded rework agent from the reviewed branch"
+                );
+                if let Err(e) = self
+                    .tickets
+                    .update(
+                        &ctx.rework_ticket,
+                        crate::tickets::TicketChanges {
+                            assignee: Some(record.name.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    warn!(
+                        ticket = %ctx.rework_ticket, agent = %record.name, error = %e,
+                        "landing pipeline: failed to record rework assignee"
+                    );
+                }
+            }
+            Err(e) => {
+                // A refused spawn (budget, WIP cap, paused dispatch) is not a
+                // landing failure — the branch is held either way. It becomes
+                // the same human gate every other withheld verdict gets, so
+                // the refusal is visible rather than only in the daemon log.
+                let withheld = Withheld {
+                    code: "dispatch-refused",
+                    detail: format!("the rework spawn was refused by the supervisor: {e}"),
+                    decision: "clear whatever refused the dispatch (budget cap, WIP ceiling, \
+                               paused dispatch), then dispatch the rework ticket"
+                        .into(),
+                };
+                self.escalate(entry, ctx.escalation(&withheld))?;
+                warn!(
+                    repo = %entry.repo_name, branch = %entry.branch, error = %e,
+                    "landing pipeline: bounded rework dispatch refused"
+                );
+            }
+        }
+        Ok(LandingOutcome::ReworkFiled(ticket))
+    }
+
+    /// The full review artifact for this exact `(repo, branch, head_sha)` —
+    /// the classifier's input, as opposed to [`Self::cached_verdict`]'s
+    /// recommendation-only projection of the same tuple.
+    fn review_artifact(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<Value>> {
+        let pattern = Pattern::for_commit(
+            Category::Artifact,
+            REVIEW_ARTIFACT_IDENTITY,
+            &entry.branch,
+            &entry.head_sha,
+        )
+        .scope(&entry.repo_name);
+        Ok(self
+            .space
+            .scan(&pattern)?
+            .into_iter()
+            .next()
+            .map(|t| t.payload))
     }
 
     /// File the REWORK follow-up directly through `Tickets::create` (§1.5) —
@@ -1870,7 +2502,16 @@ impl LandingPipeline {
                 labels: Vec::new(),
                 depends_on: Vec::new(),
                 created_by: Some("daemon".to_string()),
-                coalesce_key: None,
+                // Idempotent on the reviewed work key: a redelivered
+                // completion or a restart-driven reprocess resolves to the
+                // SAME follow-up ticket instead of minting a second one.
+                coalesce_key: Some(landing_rework::ticket_coalesce_key(
+                    &entry.repo_name,
+                    &entry.branch,
+                    &entry.head_sha,
+                    &entry.target,
+                    &entry.task,
+                )),
             })
             .await
     }
@@ -2987,12 +3628,10 @@ workflow: {
             .is_empty());
     }
 
-    /// P1b end-to-end: a successful land writes the merge commit onto the
-    /// ticket and closes it, with no operator action. Before this, nothing
-    /// closed a ticket post-land and delivery was inferred from a branch ref
-    /// the land had just deleted (probe O14/O16).
+    /// A crash after the exact target advance but before ticket recording
+    /// resumes from the durable `landing` phase and closes the ticket.
     #[tokio::test]
-    async fn landing_records_the_merge_commit_on_the_ticket_and_closes_it() {
+    async fn advanced_landing_reconciles_the_ticket_and_terminal_marker() {
         let home = tempfile::tempdir().unwrap();
         let repo_dir = tempfile::tempdir().unwrap();
         init_repo(repo_dir.path());
@@ -3040,6 +3679,30 @@ workflow: {
                 ..Default::default()
             })
             .unwrap();
+
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let candidate = match repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+        let mut claimed = pipeline
+            .queue
+            .claim_next("docs-repo", "main")
+            .unwrap()
+            .unwrap();
+        claimed.candidate_sha = Some(candidate.commit.clone());
+        claimed.candidate_base = Some(candidate.base.clone());
+        claimed.candidate_ref = Some(candidate.candidate_ref.clone());
+        pipeline
+            .queue
+            .persist(&mut claimed, LandingEntryStatus::Landing)
+            .unwrap();
+        assert!(repo
+            .advance_target_to("main", &candidate.commit, &candidate.base)
+            .unwrap()
+            .advanced());
+        repo.discard_candidate(&candidate.candidate_ref).unwrap();
+        repo.delete_branch("feature").unwrap();
 
         let outcomes = pipeline.drain_key("docs-repo", "main").await.unwrap();
         let LandingOutcome::Landed(result) = &outcomes[0] else {
@@ -3447,7 +4110,7 @@ workflow: {
     }
 
     #[tokio::test]
-    async fn cached_rework_routes_to_ticket_without_spawning() {
+    async fn cached_rework_dispatches_exactly_once_and_replay_converges() {
         let home = tempfile::tempdir().unwrap();
         let (repo_dir, head_sha, main_before) = review_candidate_repo();
 
@@ -3470,7 +4133,432 @@ workflow: {
         let main_after = rev_parse(repo_dir.path(), "main");
         assert_eq!(main_before, main_after, "branch must not have landed");
 
+        let spawns = space
+            .scan(&Pattern::category(Category::Event).identity("agent_spawned"))
+            .unwrap();
+        assert_eq!(spawns.len(), 1, "bounded REWORK must dispatch one agent");
+        let markers = space
+            .scan(
+                &Pattern::category(Category::Event)
+                    .scope("code-repo")
+                    .identity(REWORK_DISPATCH_IDENTITY),
+            )
+            .unwrap();
+        assert_eq!(markers.len(), 1, "one logical dispatch gets one marker");
+        assert_eq!(markers[0].payload["state"], "dispatching");
+        assert_eq!(markers[0].payload["branch"], "feature");
+        assert_eq!(markers[0].payload["target"], "main");
+        assert_eq!(markers[0].payload["task"], "add src");
+        assert_eq!(markers[0].payload["rework_ticket"], ticket.identity);
+
+        // Bypass the processed-work-key shortcut to exercise the dispatch
+        // marker itself, as a restart replay of the routed verdict would.
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let replay = pipeline
+            .route_rework(&review_candidate_entry(repo_dir.path(), &head_sha), &repo)
+            .await
+            .unwrap();
+        assert!(matches!(replay, LandingOutcome::ReworkFiled(_)));
+        assert_eq!(
+            space
+                .scan(&Pattern::category(Category::Event).identity("agent_spawned"))
+                .unwrap()
+                .len(),
+            1,
+            "replayed routing must not spawn a second correction"
+        );
+        assert_eq!(
+            space
+                .scan(&Pattern::category(Category::Event).identity(REWORK_DISPATCH_IDENTITY))
+                .unwrap()
+                .len(),
+            1,
+            "replayed routing must not append another marker"
+        );
+        assert!(
+            space
+                .scan(
+                    &Pattern::category(Category::Need)
+                        .scope("code-repo")
+                        .identity(STEWARD_NEED_IDENTITY),
+                )
+                .unwrap()
+                .is_empty(),
+            "a journaled correction agent must not be mistaken for an interrupted dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatching_marker_without_spawn_survives_restart_as_one_human_gate() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        {
+            let space = Space::open(&layout.db_path()).unwrap();
+            space.out(verdict_tuple(&head_sha, "REWORK")).unwrap();
+            let pipeline = test_pipeline(home.path(), space.clone());
+            let ticket = pipeline.file_rework_ticket(&entry).await.unwrap();
+            let ctx = ReworkContext {
+                repo: entry.repo_name.clone(),
+                branch: entry.branch.clone(),
+                head_sha: entry.head_sha.clone(),
+                target: entry.target.clone(),
+                task: entry.task.clone(),
+                rework_ticket: ticket.identity,
+                notes: "notes".into(),
+                diff_files: 1,
+                diff_lines: 1,
+            };
+            space
+                .out(
+                    Tuple::new(
+                        Category::Event,
+                        entry.repo_name.clone(),
+                        REWORK_DISPATCH_IDENTITY,
+                        "daemon",
+                        ctx.marker_payload(1, None, "dispatching"),
+                    )
+                    .with_lifecycle(Lifecycle::Furniture),
+                )
+                .unwrap();
+        }
+
+        // A fresh Space and pipeline stand in for a daemon restart after the
+        // marker commit point but before Supervisor::spawn journaled an agent.
+        let space = Space::open(&layout.db_path()).unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        for _ in 0..2 {
+            let replay = pipeline.route_rework(&entry, &repo).await.unwrap();
+            assert!(matches!(replay, LandingOutcome::ReworkFiled(_)));
+        }
+
+        assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
+        assert!(
+            space
+                .scan(&Pattern::category(Category::Event).identity("agent_spawned"))
+                .unwrap()
+                .is_empty(),
+            "an ambiguous restart must never duplicate the correction agent"
+        );
+        let needs = space
+            .scan(
+                &Pattern::category(Category::Need)
+                    .scope("code-repo")
+                    .identity(STEWARD_NEED_IDENTITY),
+            )
+            .unwrap();
+        assert_eq!(needs.len(), 1, "replay must converge on one visible gate");
+        let text = needs[0].payload["text"].as_str().unwrap();
+        for required in [
+            "dispatch-interrupted",
+            "EVIDENCE: reviewer verdict REWORK",
+            "DECISION NEEDED:",
+            "BLAST RADIUS:",
+            "RESOLVE WITH: rk spawn",
+        ] {
+            assert!(text.contains(required), "missing {required:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn dispatch_status_replays_count_as_one_attempt() {
+        let home = tempfile::tempdir().unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let ctx = ReworkContext {
+            repo: "code-repo".into(),
+            branch: "feature".into(),
+            head_sha: "abc123".into(),
+            target: "main".into(),
+            task: "TKT-original".into(),
+            rework_ticket: "TKT-rework".into(),
+            notes: "fix it".into(),
+            diff_files: 1,
+            diff_lines: 2,
+        };
+        for state in ["dispatching", "dispatched"] {
+            space
+                .out(
+                    Tuple::new(
+                        Category::Event,
+                        "code-repo",
+                        REWORK_DISPATCH_IDENTITY,
+                        "daemon",
+                        ctx.marker_payload(1, None, state),
+                    )
+                    .with_lifecycle(Lifecycle::Furniture),
+                )
+                .unwrap();
+        }
+        assert_eq!(pipeline.rework_attempts_used(&ctx).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn landed_rework_resubmits_parent_once_then_ordinary_approve_lands_it() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn fixed() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "src.rs"]);
+        git(repo_dir.path(), &["commit", "-m", "feat: original work"]);
+        let reviewed_head = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "-b", "rat/rework"]);
+        std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+        std::fs::write(repo_dir.path().join("docs/fix.md"), "bounded correction\n").unwrap();
+        git(repo_dir.path(), &["add", "docs/fix.md"]);
+        git(
+            repo_dir.path(),
+            &["commit", "-m", "fix: reviewer correction"],
+        );
+        let rework_head = rev_parse(repo_dir.path(), "rat/rework");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let original = pipeline
+            .tickets
+            .create(NewTicket {
+                title: "original".into(),
+                body: None,
+                scope: Some("code-repo".into()),
+                parent: None,
+                priority: "normal".into(),
+                labels: vec![],
+                depends_on: vec![],
+                created_by: Some("daemon".into()),
+                coalesce_key: None,
+            })
+            .await
+            .unwrap();
+        let rework = pipeline
+            .tickets
+            .create(NewTicket {
+                title: "rework".into(),
+                body: None,
+                scope: Some("code-repo".into()),
+                parent: None,
+                priority: "normal".into(),
+                labels: vec![],
+                depends_on: vec![],
+                created_by: Some("daemon".into()),
+                coalesce_key: None,
+            })
+            .await
+            .unwrap();
+        let ctx = ReworkContext {
+            repo: "code-repo".into(),
+            branch: "feature".into(),
+            head_sha: reviewed_head,
+            target: "main".into(),
+            task: original.identity.clone(),
+            rework_ticket: rework.identity.clone(),
+            notes: "add the missing correction".into(),
+            diff_files: 1,
+            diff_lines: 1,
+        };
+        space
+            .out(
+                Tuple::new(
+                    Category::Event,
+                    "code-repo",
+                    REWORK_DISPATCH_IDENTITY,
+                    "daemon",
+                    ctx.marker_payload(1, Some("Rat-Rework"), "dispatching"),
+                )
+                .with_lifecycle(Lifecycle::Furniture),
+            )
+            .unwrap();
+
+        let intermediate = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "rat/rework".into(),
+            target: "feature".into(),
+            head_sha: rework_head,
+            diff_class: "doc-only".into(),
+            task: rework.identity.clone(),
+            ..Default::default()
+        };
+        pipeline.enqueue(intermediate.clone()).unwrap();
+        let landed = pipeline.drain_key("code-repo", "feature").await.unwrap();
+        assert!(matches!(landed.as_slice(), [LandingOutcome::Landed(_)]));
+
+        let parent_head = rev_parse(repo_dir.path(), "feature");
+        let pending = pipeline
+            .queue
+            .scan_current("code-repo", Some("main"))
+            .unwrap();
+        assert_eq!(pending.len(), 1, "corrected parent must be queued once");
+        assert_eq!(pending[0].payload["branch"], "feature");
+        assert_eq!(pending[0].payload["target"], "main");
+        assert_eq!(pending[0].payload["task"], original.identity);
+        assert_eq!(pending[0].payload["head_sha"], parent_head);
+
+        pipeline.resubmit_reworked_parent(&intermediate).unwrap();
+        assert_eq!(
+            pipeline
+                .queue
+                .scan_current("code-repo", Some("main"))
+                .unwrap()
+                .len(),
+            1,
+            "replayed intermediate delivery must not duplicate the parent"
+        );
+        assert_eq!(
+            space
+                .scan(&Pattern::category(Category::Event).identity(REWORK_RESUBMISSION_IDENTITY))
+                .unwrap()
+                .len(),
+            1,
+            "one logical parent hand-off gets one evidence event"
+        );
+
+        space
+            .out(Tuple::new(
+                Category::Artifact,
+                "code-repo",
+                REVIEW_ARTIFACT_IDENTITY,
+                "fresh-reviewer",
+                json!({
+                    "task": original.identity,
+                    "recommendation": "APPROVE",
+                    "notes": "corrected branch is clean",
+                    "head_sha": parent_head,
+                    "branch": "feature",
+                }),
+            ))
+            .unwrap();
+        let final_outcome = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert!(matches!(
+            final_outcome.as_slice(),
+            [LandingOutcome::Landed(_)]
+        ));
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir.path())
+            .args(["ls-tree", "--name-only", "-r", "main"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let listing = String::from_utf8_lossy(&output.stdout);
+        assert!(listing.contains("src.rs"), "{listing}");
+        assert!(listing.contains("docs/fix.md"), "{listing}");
+        let original_after = pipeline.tickets.get(&original.identity).unwrap().unwrap();
+        let rework_after = pipeline.tickets.get(&rework.identity).unwrap().unwrap();
+        assert_eq!(original_after.payload["status"], "closed");
+        assert_eq!(rework_after.payload["status"], "closed");
+    }
+
+    #[tokio::test]
+    async fn exhausted_rework_chain_holds_once_with_actionable_evidence() {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+        let space = Space::open_in_memory().unwrap();
+        space.out(verdict_tuple(&head_sha, "REWORK")).unwrap();
+        let prior = ReworkContext {
+            repo: "code-repo".into(),
+            branch: "feature".into(),
+            head_sha: "prior-reviewed-head".into(),
+            target: "main".into(),
+            task: "add src".into(),
+            rework_ticket: "TKT-prior-rework".into(),
+            notes: "first correction".into(),
+            diff_files: 1,
+            diff_lines: 1,
+        };
+        space
+            .out(
+                Tuple::new(
+                    Category::Event,
+                    "code-repo",
+                    REWORK_DISPATCH_IDENTITY,
+                    "daemon",
+                    prior.marker_payload(1, Some("Prior-Rat"), "dispatching"),
+                )
+                .with_lifecycle(Lifecycle::Furniture),
+            )
+            .unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+        pipeline.enqueue(entry.clone()).unwrap();
+        let outcome = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert!(matches!(
+            outcome.as_slice(),
+            [LandingOutcome::ReworkFiled(_)]
+        ));
+        assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
         no_spawns(&space);
+
+        let needs = space
+            .scan(
+                &Pattern::category(Category::Need)
+                    .scope("code-repo")
+                    .identity(STEWARD_NEED_IDENTITY),
+            )
+            .unwrap();
+        assert_eq!(needs.len(), 1);
+        let text = needs[0].payload["text"].as_str().unwrap();
+        for required in [
+            "attempts-exhausted",
+            "EVIDENCE: reviewer verdict REWORK",
+            "DECISION NEEDED:",
+            "BLAST RADIUS:",
+            "RESOLVE WITH: rk spawn",
+        ] {
+            assert!(text.contains(required), "missing {required:?}: {text}");
+        }
+
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        pipeline.route_rework(&entry, &repo).await.unwrap();
+        assert_eq!(
+            space
+                .scan(
+                    &Pattern::category(Category::Need)
+                        .scope("code-repo")
+                        .identity(STEWARD_NEED_IDENTITY),
+                )
+                .unwrap()
+                .len(),
+            1,
+            "replay must converge on the existing human gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_declared_human_holds_without_dispatch() {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+        let space = Space::open_in_memory().unwrap();
+        let mut verdict = verdict_tuple(&head_sha, "REWORK");
+        verdict.payload["authority"] = json!("human");
+        verdict.payload["notes"] = json!("operator must choose the compatibility policy");
+        space.out(verdict).unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(review_candidate_entry(repo_dir.path(), &head_sha))
+            .unwrap();
+        let outcome = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert!(matches!(
+            outcome.as_slice(),
+            [LandingOutcome::ReworkFiled(_)]
+        ));
+        assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
+        no_spawns(&space);
+        let needs = space
+            .scan(&Pattern::category(Category::Need).scope("code-repo"))
+            .unwrap();
+        assert_eq!(needs.len(), 1);
+        let text = needs[0].payload["text"].as_str().unwrap();
+        assert!(text.contains("reviewer-declared-human"), "{text}");
+        assert!(text.contains("operator must choose"), "{text}");
+        assert!(text.contains("RESOLVE WITH:"), "{text}");
     }
 
     /// `LandingPipeline::escalate` writes its `need` tuple directly
@@ -3545,11 +4633,18 @@ workflow: {
         assert_eq!(historical_rows[0].subject, produced_rows[0].subject);
         assert_eq!(historical_rows[0].scope, produced_rows[0].scope);
         assert_eq!(historical_rows[0].action, produced_rows[0].action);
-        // Byte-identical, not just "mentions STOP": the historical text was
-        // hand-built to match `escalate`'s exact wording for this task/branch,
-        // so the row `rk inbox` renders must be the two sides' `detail`
-        // agreeing character-for-character, not merely overlapping.
-        assert_eq!(historical_rows[0].detail, produced_rows[0].detail);
+        let detail = &produced_rows[0].detail;
+        for required in [
+            "reviewer-stop",
+            "EVIDENCE: exact reviewed head",
+            "Reviewer notes: notes",
+            "DECISION NEEDED:",
+            "BLAST RADIUS: 1 file(s) / 1 line(s)",
+            "RESOLVE WITH: rk land feature",
+            "--target main --task add src --force",
+        ] {
+            assert!(detail.contains(required), "missing {required:?}: {detail}");
+        }
     }
 
     /// The REWORK counterpart to `escalation_row_matches_the_workflow_driven_
