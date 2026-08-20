@@ -3777,6 +3777,60 @@ impl Supervisor {
             .and_then(|r| r.task.clone())
     }
 
+    /// Resolve the task identity a `land` submission delivers against.
+    ///
+    /// `task_for_branch` only ever finds a task if some agent record was
+    /// spawned onto exactly this branch — a recovery branch built by hand
+    /// (e.g. resubmitting escalated work after a reviewer died) carries no
+    /// such record, so that lookup silently returns `None` and the landing
+    /// pipeline enqueues with `task: ""`: no ticket/spec for the reviewer,
+    /// no delivery record, no close. An explicit `--task` closes that gap,
+    /// but only after validation — this must never let branch text or an
+    /// operator typo bind a delivery to the wrong ticket:
+    ///   - the ticket must exist;
+    ///   - its scope must match the repo being landed into;
+    ///   - if an agent record ALSO resolves a task for this branch, it must
+    ///     agree with the explicit one (fail closed on disagreement rather
+    ///     than silently letting the explicit value override real evidence).
+    ///
+    /// With no explicit task, behavior is unchanged: fall back to whatever
+    /// `task_for_branch` finds (possibly `None`, for untracked work).
+    fn resolve_land_task(
+        &self,
+        repo_name: &str,
+        repo_root: &std::path::Path,
+        branch: &str,
+        explicit: Option<String>,
+    ) -> rk_core::Result<Option<String>> {
+        let Some(task) = explicit else {
+            return Ok(self.task_for_branch(repo_root, branch));
+        };
+        let task = task.trim().to_string();
+        if task.is_empty() {
+            return Err(rk_core::Error::other("--task must not be empty"));
+        }
+        let ticket = self
+            .tickets
+            .get(&task)?
+            .ok_or_else(|| rk_core::Error::other(format!("no such ticket: {task}")))?;
+        if ticket.scope != repo_name {
+            return Err(rk_core::Error::other(format!(
+                "task {task} is scoped to '{}', not '{repo_name}' — refusing to bind this \
+                 landing to a ticket from another repo",
+                ticket.scope
+            )));
+        }
+        if let Some(found) = self.task_for_branch(repo_root, branch) {
+            if found != task {
+                return Err(rk_core::Error::other(format!(
+                    "task {task} disagrees with {found}, which an agent record already binds to \
+                     branch {branch} — refusing to override real evidence with --task"
+                )));
+            }
+        }
+        Ok(Some(task))
+    }
+
     fn record_merge_for_branch(
         &self,
         repo_root: &std::path::Path,
@@ -4551,6 +4605,7 @@ impl Supervisor {
         branch: &str,
         target: &str,
         keep_branch: bool,
+        task: Option<String>,
     ) -> rk_core::Result<serde_json::Value> {
         let repo_path = repo_root.to_path_buf();
         let repo = blocking_io("land repo discovery", move || Repo::discover(&repo_path)).await?;
@@ -4563,7 +4618,7 @@ impl Supervisor {
             DeliveryMode::Merge | DeliveryMode::MergePush
         ) {
             if let Some(pipeline) = self.landing_pipeline() {
-                let task = self.task_for_branch(repo.root(), branch);
+                let task = self.resolve_land_task(&repo_name, repo.root(), branch, task)?;
                 let result = pipeline
                     .submit_manual(repo.root(), branch, target, keep_branch, task)
                     .await?;

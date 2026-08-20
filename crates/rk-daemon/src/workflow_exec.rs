@@ -1783,7 +1783,7 @@ impl WorkflowEngine {
                             )
                         })?;
                         self.supervisor
-                            .land(&repo_root, &branch, &target, false)
+                            .land(&repo_root, &branch, &target, false, None)
                             .await?
                     };
                     self.update(id, |i| {
@@ -2148,6 +2148,7 @@ impl WorkflowEngine {
                             &branch,
                             &target,
                             land.keep_branch,
+                            None,
                         )
                         .await?;
                     self.update(id, |i| {
@@ -2847,7 +2848,7 @@ impl WorkflowEngine {
                     Ok(dismissed) if no_merge => Ok(dismissed),
                     Ok(_) => match landing {
                         Some((repo_root, branch, target)) => {
-                            supervisor.land(&repo_root, &branch, &target, false).await
+                            supervisor.land(&repo_root, &branch, &target, false, None).await
                         }
                         None => Err(rk_core::Error::other(
                             "dismiss_all could not resolve a branch to submit",

@@ -2569,6 +2569,7 @@ impl Daemon {
                             &params.branch,
                             &params.target,
                             params.keep_branch,
+                            params.task,
                         )
                         .await
                 };
@@ -7046,6 +7047,12 @@ struct RepoLandParams {
     #[serde(default)]
     force: bool,
     reason: Option<String>,
+    /// Explicit, operator-validated task identity for this submission.
+    /// Overrides (and is cross-checked against) whatever
+    /// `Supervisor::task_for_branch` would infer from an agent record — see
+    /// `Supervisor::resolve_land_task`.
+    #[serde(default)]
+    task: Option<String>,
 }
 
 fn default_main_branch() -> String {

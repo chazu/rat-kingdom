@@ -162,6 +162,12 @@ pub struct LandArgs {
     /// Required audit reason for --force.
     #[arg(long, requires = "force")]
     pub reason: Option<String>,
+    /// Explicit ticket this submission delivers (e.g. a recovery branch that
+    /// carries no agent record of its own). Validated against the ticket
+    /// store; must agree with any task an agent record already binds to this
+    /// branch.
+    #[arg(long)]
+    pub task: Option<String>,
 }
 
 #[derive(Args)]
@@ -794,6 +800,7 @@ pub async fn land(layout: &Layout, args: LandArgs, as_json: bool) -> Result<()> 
                 "keep_branch": args.keep_branch,
                 "force": args.force,
                 "reason": args.reason,
+                "task": args.task,
             }),
         )
         .await?;
