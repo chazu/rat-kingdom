@@ -129,6 +129,124 @@ pub(crate) fn tasks_in_landing_queue(space: &Space) -> std::collections::HashSet
         .collect()
 }
 
+/// One durable queue entry as read for depth/age telemetry (`rk status`/`rk
+/// top`, `rk inbox`'s `landing-queue-stalled` row — probe O18). A plain
+/// read-side projection of [`LandingQueueEntry`], not the entry itself, so a
+/// dashboard consumer never depends on the queue's internal transition
+/// fields (`rev`, `candidate_*`).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct LandingQueueSnapshotEntry {
+    pub(crate) repo: String,
+    pub(crate) target: String,
+    pub(crate) branch: String,
+    pub(crate) task: String,
+    pub(crate) status: LandingEntryStatus,
+    /// Seconds since [`LandingQueueEntry::enqueued_at`]. `0` for a legacy
+    /// entry written before that field existed — under-reporting age rather
+    /// than fabricating one.
+    pub(crate) age_secs: i64,
+}
+
+/// Every candidate currently sitting in the landing queue, across every
+/// repo/target, self-healed the same way [`LandingQueue::scan_current`]
+/// heals a single key: a crash between `claim_next`/`set_status`'s
+/// write-then-delete can leave two durable tuples sharing one `(scope,
+/// seq)`, and only the one with the higher `rev` (ties broken by tuple id)
+/// is live. This is a read-only projection — unlike `scan_current` it never
+/// deletes the stale duplicate itself, since a `status`/`inbox` read has no
+/// business mutating the queue; the next real queue operation on that key
+/// heals it.
+pub(crate) fn landing_queue_snapshot(space: &Space) -> Vec<LandingQueueSnapshotEntry> {
+    let all = space
+        .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+        .unwrap_or_default();
+    let mut by_key: HashMap<(String, u64), Tuple> = HashMap::new();
+    for tuple in all {
+        let seq = tuple.payload.get("seq").and_then(Value::as_u64).unwrap_or(0);
+        let rev = tuple.payload.get("rev").and_then(Value::as_u64).unwrap_or(0);
+        let key = (tuple.scope.clone(), seq);
+        let replace = match by_key.get(&key) {
+            None => true,
+            Some(existing) => {
+                let existing_rev = existing
+                    .payload
+                    .get("rev")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                (rev, tuple.id) > (existing_rev, existing.id)
+            }
+        };
+        if replace {
+            by_key.insert(key, tuple);
+        }
+    }
+    let now = Utc::now();
+    by_key
+        .into_values()
+        .filter_map(|tuple| {
+            let entry: LandingQueueEntry = serde_json::from_value(tuple.payload).ok()?;
+            let age_secs = entry
+                .enqueued_at
+                .map(|enqueued_at| (now - enqueued_at).num_seconds().max(0))
+                .unwrap_or(0);
+            Some(LandingQueueSnapshotEntry {
+                repo: entry.repo_name,
+                target: entry.target,
+                branch: entry.branch,
+                task: entry.task,
+                status: entry.status,
+                age_secs,
+            })
+        })
+        .collect()
+}
+
+/// Depth and oldest-entry age per `(repo, target)` landing-queue key — the
+/// summary `status`/`rk top` render directly and `rk inbox`'s
+/// `landing-queue-stalled` row is derived from (probe O18: "a slow queue is
+/// indistinguishable from a dead one" without this).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct LandingQueueSummary {
+    pub(crate) repo: String,
+    pub(crate) target: String,
+    pub(crate) depth: usize,
+    pub(crate) oldest_age_secs: i64,
+    pub(crate) oldest_branch: String,
+    pub(crate) oldest_task: String,
+}
+
+pub(crate) fn landing_queue_summary(space: &Space) -> Vec<LandingQueueSummary> {
+    let mut by_key: HashMap<(String, String), Vec<LandingQueueSnapshotEntry>> = HashMap::new();
+    for entry in landing_queue_snapshot(space) {
+        by_key
+            .entry((entry.repo.clone(), entry.target.clone()))
+            .or_default()
+            .push(entry);
+    }
+    let mut summary: Vec<LandingQueueSummary> = by_key
+        .into_iter()
+        .map(|((repo, target), entries)| {
+            // Oldest = largest age_secs; ties keep the first found, which is
+            // fine — the summary reports the age, not a stable identity.
+            let oldest = entries
+                .iter()
+                .max_by_key(|entry| entry.age_secs)
+                .expect("entries is non-empty: only ever built by pushing at least one");
+            LandingQueueSummary {
+                repo,
+                target,
+                depth: entries.len(),
+                oldest_age_secs: oldest.age_secs,
+                oldest_branch: oldest.branch.clone(),
+                oldest_task: oldest.task.clone(),
+            }
+        })
+        .collect();
+    // Deterministic order for `status`/`rk top` and unit-test assertions.
+    summary.sort_by(|a, b| (&a.repo, &a.target).cmp(&(&b.repo, &b.target)));
+    summary
+}
+
 /// The two gates that guard every landing attempt regardless of tier —
 /// `examples/workflows/steward.cue`'s `_gates` block, POLICY (#19) and
 /// DIFF-SCOPE (#20). Named-check registry entries, not raw commands: a repo
@@ -246,6 +364,18 @@ pub(crate) struct LandingQueueEntry {
     /// losing) the entry.
     #[serde(default)]
     pub(crate) rev: u64,
+    /// When this candidate first entered the queue — set once by
+    /// [`LandingQueue::enqueue`] and left untouched by every status
+    /// transition (`claim_next`/`set_status`/`persist` all rewrite the
+    /// tuple but preserve this field via `entry.clone()`). Deliberately
+    /// PRESERVED across [`LandingQueue::requeue_tail`] too, even though that
+    /// resets `seq`/`rev`/`status`/candidate fields to look like a fresh
+    /// entry: a candidate stuck in a stale-target requeue loop must keep
+    /// aging from when it first arrived, not reset to zero on every retry —
+    /// that reset is exactly what would hide a genuine wedge (probe O18).
+    /// `None` only for a durable tuple written before this field existed.
+    #[serde(default)]
+    pub(crate) enqueued_at: Option<DateTime<Utc>>,
 }
 
 /// See [`LandingQueueEntry::status`].
@@ -311,6 +441,13 @@ impl LandingQueue {
         entry.seq = seq;
         entry.status = LandingEntryStatus::Queued;
         entry.rev = 0;
+        // Only a genuinely fresh candidate gets a fresh timestamp — a
+        // `requeue_tail` call passes a clone carrying its original
+        // `enqueued_at` forward (see the field's doc comment) so re-queued
+        // work keeps aging rather than resetting.
+        if entry.enqueued_at.is_none() {
+            entry.enqueued_at = Some(Utc::now());
+        }
         self.write(&entry)?;
         Ok(seq)
     }
@@ -2511,6 +2648,68 @@ workflow: {
 
         // Every key drained to empty; nothing left queued anywhere.
         assert!(queue.pending_keys().unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_and_summary_report_depth_and_oldest_age_surviving_requeue() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let space = Space::open_in_memory().unwrap();
+        let queue = LandingQueue::new(space.clone(), &layout);
+
+        // A candidate that's been sitting for 5h, plus a fresh one right
+        // behind it in the same (repo, target) key.
+        let old_enqueued_at = Utc::now() - chrono::Duration::hours(5);
+        let base = LandingQueueEntry {
+            repo_name: "alpha".into(),
+            repo_path: "/repos/alpha".into(),
+            branch: "b1".into(),
+            target: "main".into(),
+            head_sha: "sha-old".into(),
+            diff_class: "trivial".into(),
+            task: "TKT-1".into(),
+            enqueued_at: Some(old_enqueued_at),
+            ..Default::default()
+        };
+        queue.enqueue(base.clone()).unwrap();
+        queue
+            .enqueue(LandingQueueEntry {
+                branch: "b2".into(),
+                head_sha: "sha-fresh".into(),
+                task: "TKT-2".into(),
+                enqueued_at: None,
+                ..base.clone()
+            })
+            .unwrap();
+
+        let summary = landing_queue_summary(&space);
+        assert_eq!(summary.len(), 1, "one (repo, target) key");
+        let q = &summary[0];
+        assert_eq!(q.repo, "alpha");
+        assert_eq!(q.target, "main");
+        assert_eq!(q.depth, 2);
+        // The 5h-old entry is the oldest even though it enqueued first and a
+        // fresher one shares the key.
+        assert!(q.oldest_age_secs >= 5 * 3600 - 5);
+        assert_eq!(q.oldest_branch, "b1");
+
+        // FIFO claims b1 first regardless of the age we set by hand.
+        let claimed = queue.claim_next("alpha", "main").unwrap().unwrap();
+        assert_eq!(claimed.branch, "b1");
+        assert_eq!(claimed.enqueued_at, Some(old_enqueued_at));
+
+        // A stale-target requeue resets seq/rev/status but must NOT reset
+        // enqueued_at — otherwise a candidate stuck in a requeue loop would
+        // look freshly-arrived on every cycle, hiding exactly the wedge
+        // probe O18 wants surfaced.
+        queue.requeue_tail(&claimed).unwrap();
+        let after = landing_queue_snapshot(&space);
+        let requeued = after.iter().find(|e| e.branch == "b1").unwrap();
+        assert!(
+            requeued.age_secs >= 5 * 3600 - 5,
+            "requeue must not reset age, got {}",
+            requeued.age_secs
+        );
     }
 
     #[test]

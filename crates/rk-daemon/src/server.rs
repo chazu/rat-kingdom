@@ -142,6 +142,9 @@ pub struct Daemon {
     /// (`<home>/gate-worktrees/<repo>/<target>`) — see
     /// `crate::landing::LandingPipeline::gate_worktree_sweep_once`.
     gate_worktree_sweep_config: rk_core::config::GateWorktreeSweepConfig,
+    /// Staleness threshold for the `landing-queue-stalled` `rk inbox` row
+    /// (probe O18). See `crate::inbox::stalled_landing_queue_rows`.
+    landing_queue_config: rk_core::config::LandingQueueConfig,
     /// B2 re-notify sweep: how often an unacked `recovery-action` escalation
     /// re-pushes. See `crate::recovery::renotify_sweep`.
     recovery_sweep_config: rk_core::config::RecoverySweepConfig,
@@ -280,6 +283,7 @@ impl Daemon {
         daemon.review_sweep_config = config.review_sweep.clone();
         daemon.worktree_sweep_config = config.worktree_sweep.clone();
         daemon.gate_worktree_sweep_config = config.gate_worktree_sweep.clone();
+        daemon.landing_queue_config = config.landing_queue.clone();
         daemon.recovery_sweep_config = config.recovery_sweep.clone();
         daemon.instance_timeout_sweep_config = config.instance_timeout_sweep.clone();
         daemon.ticket_reopen_sweep_config = config.ticket_reopen_sweep.clone();
@@ -528,6 +532,11 @@ impl Daemon {
                 enabled: false,
                 ..rk_core::config::GateWorktreeSweepConfig::default()
             },
+            // No periodic loop to gate — this is a pure read-time threshold
+            // (`crate::inbox::stalled_landing_queue_rows`), so unlike the
+            // sweep configs above a bare/test constructor can take the real
+            // default safely.
+            landing_queue_config: rk_core::config::LandingQueueConfig::default(),
             // Same reasoning as `worktree_sweep_config` above: the default is
             // `enabled: true`, but a bare/test constructor must not grow a new
             // periodic background loop that existing e2e tests never asked
@@ -2815,6 +2824,19 @@ impl Daemon {
         items.extend(crate::inbox::recovery_action_rows(
             &recovery_actions,
             &recovery_acks,
+        ));
+        // Landing-queue staleness (probe O18): computed live over the current
+        // queue, same as the branch-shaped rows above — no ack, self-clears
+        // the moment the oldest entry drains. Scoped to `repo` like every
+        // other source above, so `rk inbox --repo X` never shows another
+        // repo's queue.
+        let landing_queue_summary: Vec<_> = crate::landing::landing_queue_summary(&self.space)
+            .into_iter()
+            .filter(|q| repo.as_deref().is_none_or(|repo| q.repo == repo))
+            .collect();
+        items.extend(crate::inbox::stalled_landing_queue_rows(
+            &landing_queue_summary,
+            self.landing_queue_config.stale_after_secs,
         ));
         items.sort_by_key(|b| std::cmp::Reverse(b.urgency));
         let mut response_truncated = source_truncated || items.len() > MAX_INBOX_ITEMS;
@@ -6513,6 +6535,10 @@ impl Daemon {
             "uptime_secs": self.started.elapsed().as_secs(),
             "socket": self.layout.socket_path(),
             "tuples": self.space.count().unwrap_or(0),
+            // Landing-queue depth and oldest-entry age per (repo, target) —
+            // without this a slowly-draining queue and a wedged one are
+            // indistinguishable from the outside (probe O18).
+            "landing_queue": crate::landing::landing_queue_summary(&self.space),
         })
     }
 }

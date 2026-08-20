@@ -26,6 +26,7 @@ pub struct Config {
     pub review_sweep: ReviewSweepConfig,
     pub worktree_sweep: WorktreeSweepConfig,
     pub gate_worktree_sweep: GateWorktreeSweepConfig,
+    pub landing_queue: LandingQueueConfig,
     pub recovery_sweep: RecoverySweepConfig,
     pub instance_timeout_sweep: InstanceTimeoutSweepConfig,
     pub ticket_reopen_sweep: TicketReopenSweepConfig,
@@ -685,6 +686,34 @@ impl Default for GateWorktreeSweepConfig {
             interval_secs: 3600,
             max_age_days: 14,
             max_per_repo: 5,
+        }
+    }
+}
+
+/// Landing-queue staleness threshold (probe O18): depth and per-entry age are
+/// always visible on `status`/`rk top`; this only governs when the oldest
+/// pending entry additionally raises a `landing-queue-stalled` `rk inbox`
+/// row. Without it a slowly-draining queue and a wedged one look identical
+/// from the outside, which cost an operator an unnecessary hand-land during
+/// probe O18 — the pipeline was working a deep serial backlog the whole time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LandingQueueConfig {
+    /// Age (from first enqueue, surviving any stale-target requeue) past
+    /// which the oldest pending entry for a `(repo, target)` key raises a
+    /// row. `0` disables the row entirely — depth/age still show on
+    /// `status`/`rk top`.
+    pub stale_after_secs: u64,
+}
+
+impl Default for LandingQueueConfig {
+    fn default() -> Self {
+        Self {
+            // Matches probe O18's own "oldest waiting 3h" framing: long
+            // enough that a healthy queue draining a normal backlog never
+            // trips it, short enough that a genuine wedge is caught well
+            // inside a working day.
+            stale_after_secs: 3 * 3600,
         }
     }
 }

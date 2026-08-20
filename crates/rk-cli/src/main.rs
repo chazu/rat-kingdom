@@ -929,6 +929,20 @@ async fn main() -> Result<()> {
                             status["tuples"],
                             status["uptime_secs"],
                         );
+                        // Landing-queue depth and oldest-entry age per
+                        // (repo, target) — a slow queue and a wedged one
+                        // are otherwise indistinguishable (probe O18).
+                        for q in status["landing_queue"].as_array().into_iter().flatten() {
+                            let oldest = q["oldest_age_secs"].as_i64().unwrap_or(0).max(0) as u64;
+                            println!(
+                                "  landing {} → {}: {} queued, oldest ({}) waiting {}",
+                                q["repo"].as_str().unwrap_or("?"),
+                                q["target"].as_str().unwrap_or("?"),
+                                q["depth"],
+                                q["oldest_branch"].as_str().unwrap_or("?"),
+                                top::human_secs(oldest),
+                            );
+                        }
                     }
                 }
                 Err(_) => {
