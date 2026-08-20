@@ -9,7 +9,7 @@
 //! unit-testable without a daemon, with the actual tuple scans and git
 //! subprocess calls done by the caller (`server.rs::reconcile_value`).
 //!
-//! Four contradiction families, chosen because each is a gap between two
+//! Five contradiction families, chosen because each is a gap between two
 //! views that nothing else in the fleet reconciles automatically:
 //!
 //! - [`kind::DELIVERED_BUT_OPEN`] — a ticket's own delivery record disagrees
@@ -24,6 +24,12 @@
 //! - [`kind::TRACKER_CONTRADICTS_GIT`] — the ticket view claims a specific
 //!   merge commit landed on a specific target, and git's own ancestry check
 //!   disagrees.
+//! - [`kind::WORKFLOW_SETTLED_AGENT_STILL_LIVE`] — the durable
+//!   workflow-instance ledger (`WorkflowEngine::list_all`) records a run as
+//!   settled (`Completed`/`Failed`), but the agent view shows that run's own
+//!   `active_agent` still live — the engine's own settlement should have
+//!   dismissed it, so a live agent past that point is a supervision leak
+//!   nothing else in the fleet surfaces.
 //!
 //! Every violation names a stable identity (`kind:subject`, unchanged across
 //! repeated reads of unchanged state), the evidence it was read from, and a
@@ -31,6 +37,7 @@
 //! loop.
 
 use crate::agents::AgentRecord;
+use crate::workflow_exec::{Instance, InstanceStatus};
 use rk_core::tuple::Tuple;
 use serde::Serialize;
 use serde_json::Value;
@@ -41,6 +48,7 @@ pub mod kind {
     pub const TERMINAL_ASSIGNEE_ACTIVE_WORK: &str = "terminal-assignee-active-work";
     pub const CONFLICT_HELD_LANDING: &str = "conflict-held-landing";
     pub const TRACKER_CONTRADICTS_GIT: &str = "tracker-contradicts-git-history";
+    pub const WORKFLOW_SETTLED_AGENT_STILL_LIVE: &str = "workflow-settled-agent-still-live";
 }
 
 /// Who can safely act on a violation without a human in the loop.
@@ -345,6 +353,49 @@ fn tracker_contradicts_git(tickets: &[Tuple], git: &GitFacts) -> Vec<Violation> 
         .collect()
 }
 
+/// A workflow instance's own ledger records the run as settled
+/// (`Completed`/`Failed`), but the agent view shows its `active_agent` is
+/// still live. Normal settlement dismisses the active agent as part of
+/// finishing the run, so a live agent past that point means the engine
+/// declared the run over while a worker under it is still running unwatched
+/// — a supervision leak, not an in-progress hand-off. Archived instances are
+/// excluded: they are historical record, not something to act on again.
+fn workflow_settled_agent_still_live(
+    instances: &[Instance],
+    agents: &[AgentRecord],
+) -> Vec<Violation> {
+    let by_name = latest_by(agents, |a| Some(a.name.as_str()));
+    instances
+        .iter()
+        .filter(|i| i.archived_at.is_none())
+        .filter(|i| matches!(i.status, InstanceStatus::Completed | InstanceStatus::Failed))
+        .filter_map(|i| {
+            let active = i.context.active_agent.as_deref()?;
+            let agent = by_name.get(active)?;
+            if !agent.state.is_live() {
+                return None;
+            }
+            Some(Violation {
+                id: format!("{}:{}", kind::WORKFLOW_SETTLED_AGENT_STILL_LIVE, i.id),
+                kind: kind::WORKFLOW_SETTLED_AGENT_STILL_LIVE.into(),
+                scope: i.repo.clone(),
+                subject: i.id.clone(),
+                detail: format!(
+                    "workflow instance {} ({}) settled to {:?} but its active agent {} is still {:?}",
+                    i.id, i.workflow, i.status, agent.name, agent.state,
+                ),
+                evidence: vec![
+                    format!("workflow_instance:{}", i.id),
+                    format!("workflow_instance.status:{:?}", i.status),
+                    format!("agent:{}", agent.name),
+                    format!("agent.state:{:?}", agent.state),
+                ],
+                authority: Authority::Mechanical,
+            })
+        })
+        .collect()
+}
+
 /// Aggregate every contradiction into one report. Pure over its inputs so it
 /// can be unit-tested without a running daemon — the actual tuple scans and
 /// git subprocess calls happen once, in the caller, before this runs.
@@ -354,6 +405,10 @@ fn tracker_contradicts_git(tickets: &[Tuple], git: &GitFacts) -> Vec<Violation> 
 /// has already recorded as landed, and ticket ids still in flight through the
 /// landing queue, respectively. Both mean "this ticket's rat is gone because
 /// it handed off", not abandonment.
+///
+/// `instances` is the durable workflow-instance ledger
+/// (`WorkflowEngine::list_all`), the explicit workflow view this report
+/// reconciles against the agent view.
 #[allow(clippy::too_many_arguments)]
 pub fn build(
     scope: &str,
@@ -362,6 +417,7 @@ pub fn build(
     lands: &[Tuple],
     landed_tickets: &HashSet<String>,
     queued_tickets: &HashSet<String>,
+    instances: &[Instance],
     git: &GitFacts,
 ) -> ConvergenceReport {
     let mut violations = Vec::new();
@@ -374,6 +430,7 @@ pub fn build(
     ));
     violations.extend(conflict_held_landing(lands, git));
     violations.extend(tracker_contradicts_git(tickets, git));
+    violations.extend(workflow_settled_agent_still_live(instances, agents));
     // Stable order: sorted by id, so two reads of unchanged state produce
     // byte-identical output regardless of scan order.
     violations.sort_by(|a, b| a.id.cmp(&b.id));
@@ -479,6 +536,37 @@ mod tests {
         }
     }
 
+    fn instance(id: &str, repo: &str, status: InstanceStatus, active_agent: Option<&str>) -> Instance {
+        Instance {
+            id: id.into(),
+            workflow: "some-workflow".into(),
+            repo: repo.into(),
+            coordinator: None,
+            schedule: None,
+            status,
+            revision: 0,
+            current_step: 1,
+            total_steps: 1,
+            context: crate::workflow_exec::WorkflowContext {
+                active_agent: active_agent.map(str::to_string),
+                ..Default::default()
+            },
+            error: None,
+            awaiting: None,
+            instance_max_usd: None,
+            definition: "some-workflow".into(),
+            definition_digest: String::new(),
+            automated_landing_authorized: false,
+            params: Default::default(),
+            depth: 0,
+            started_at: Utc::now(),
+            completed_at: None,
+            archived_at: None,
+            trigger: None,
+            stale_timeout_secs: None,
+        }
+    }
+
     fn branch_landed(
         scope: &str,
         branch: &str,
@@ -517,6 +605,7 @@ mod tests {
             &[],
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &GitFacts::default(),
         );
         assert_eq!(report.violations.len(), 1);
@@ -534,6 +623,7 @@ mod tests {
             &[],
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &GitFacts::default(),
         );
         assert!(report.violations.is_empty());
@@ -551,6 +641,7 @@ mod tests {
             &[],
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &GitFacts::default(),
         );
         assert!(report.violations.is_empty());
@@ -572,6 +663,7 @@ mod tests {
             &[],
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &GitFacts::default(),
         );
         assert_eq!(report.violations.len(), 1);
@@ -598,6 +690,7 @@ mod tests {
             &[],
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &GitFacts::default(),
         );
         assert!(report.violations.is_empty());
@@ -621,6 +714,7 @@ mod tests {
             &[],
             &landed,
             &HashSet::new(),
+            &[],
             &GitFacts::default(),
         );
         assert!(report.violations.is_empty(), "hand-off, not abandonment");
@@ -637,6 +731,7 @@ mod tests {
             &[],
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &GitFacts::default(),
         );
         assert_eq!(report.violations.len(), 1);
@@ -652,6 +747,7 @@ mod tests {
             &[land],
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &GitFacts::default(),
         );
         assert_eq!(report.violations.len(), 1);
@@ -675,6 +771,7 @@ mod tests {
             &[land],
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &git,
         );
         assert!(report.violations.is_empty());
@@ -690,6 +787,7 @@ mod tests {
             &[land],
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &GitFacts::default(),
         );
         assert!(report.violations.is_empty());
@@ -711,6 +809,7 @@ mod tests {
             &[],
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &git,
         );
         assert_eq!(report.violations.len(), 1);
@@ -731,6 +830,7 @@ mod tests {
             &[],
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &GitFacts::default(),
         );
         assert!(report.violations.is_empty());
@@ -752,6 +852,7 @@ mod tests {
             &[],
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &git,
         );
         assert!(report.violations.is_empty());
@@ -775,12 +876,141 @@ mod tests {
                 std::slice::from_ref(&land),
                 &HashSet::new(),
                 &HashSet::new(),
+                &[],
                 &GitFacts::default(),
             )
         };
         let first = serde_json::to_string(&to_json(&build_it())).unwrap();
         let second = serde_json::to_string(&to_json(&build_it())).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_settled_instance_with_a_still_live_active_agent_is_flagged() {
+        let i = instance(
+            "wf-1",
+            "myrepo",
+            InstanceStatus::Completed,
+            Some("Whisker"),
+        );
+        let a = agent("Whisker", None, AgentState::Running);
+        let report = build(
+            "myrepo",
+            &[],
+            &[a],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[i],
+            &GitFacts::default(),
+        );
+        assert_eq!(report.violations.len(), 1);
+        assert_eq!(
+            report.violations[0].kind,
+            kind::WORKFLOW_SETTLED_AGENT_STILL_LIVE
+        );
+        assert_eq!(report.violations[0].subject, "wf-1");
+        assert_eq!(report.violations[0].authority, Authority::Mechanical);
+    }
+
+    #[test]
+    fn a_failed_instance_with_a_still_live_active_agent_is_flagged() {
+        let i = instance("wf-1", "myrepo", InstanceStatus::Failed, Some("Whisker"));
+        let a = agent("Whisker", None, AgentState::Running);
+        let report = build(
+            "myrepo",
+            &[],
+            &[a],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[i],
+            &GitFacts::default(),
+        );
+        assert_eq!(report.violations.len(), 1);
+        assert_eq!(
+            report.violations[0].kind,
+            kind::WORKFLOW_SETTLED_AGENT_STILL_LIVE
+        );
+    }
+
+    #[test]
+    fn a_running_instance_with_a_live_active_agent_is_not_flagged() {
+        let i = instance("wf-1", "myrepo", InstanceStatus::Running, Some("Whisker"));
+        let a = agent("Whisker", None, AgentState::Running);
+        let report = build(
+            "myrepo",
+            &[],
+            &[a],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[i],
+            &GitFacts::default(),
+        );
+        assert!(report.violations.is_empty());
+    }
+
+    #[test]
+    fn a_settled_instance_whose_agent_already_settled_too_is_not_flagged() {
+        let i = instance(
+            "wf-1",
+            "myrepo",
+            InstanceStatus::Completed,
+            Some("Whisker"),
+        );
+        let a = agent("Whisker", None, AgentState::Dismissed);
+        let report = build(
+            "myrepo",
+            &[],
+            &[a],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[i],
+            &GitFacts::default(),
+        );
+        assert!(report.violations.is_empty());
+    }
+
+    #[test]
+    fn a_settled_instance_with_no_active_agent_is_not_flagged() {
+        let i = instance("wf-1", "myrepo", InstanceStatus::Completed, None);
+        let report = build(
+            "myrepo",
+            &[],
+            &[],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[i],
+            &GitFacts::default(),
+        );
+        assert!(report.violations.is_empty());
+    }
+
+    #[test]
+    fn an_archived_settled_instance_with_a_live_agent_is_not_flagged() {
+        // Historical record — nothing to act on again.
+        let mut i = instance(
+            "wf-1",
+            "myrepo",
+            InstanceStatus::Completed,
+            Some("Whisker"),
+        );
+        i.archived_at = Some(Utc::now());
+        let a = agent("Whisker", None, AgentState::Running);
+        let report = build(
+            "myrepo",
+            &[],
+            &[a],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[i],
+            &GitFacts::default(),
+        );
+        assert!(report.violations.is_empty());
     }
 
     #[test]
@@ -792,6 +1022,7 @@ mod tests {
             &[],
             &HashSet::new(),
             &HashSet::new(),
+            &[],
             &GitFacts::default(),
         );
         assert!(report.violations.is_empty());

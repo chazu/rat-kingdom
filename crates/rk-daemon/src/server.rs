@@ -2913,6 +2913,13 @@ impl Daemon {
             cleared_branches,
         };
 
+        let instances: Vec<crate::workflow_exec::Instance> = self
+            .engine()
+            .list_all()
+            .into_iter()
+            .filter(|i| i.repo == repo)
+            .collect();
+
         let report = crate::reconcile::build(
             &repo,
             &tickets,
@@ -2920,6 +2927,7 @@ impl Daemon {
             &lands,
             &landed_tickets,
             &queued_tickets,
+            &instances,
             &git,
         );
         Ok(crate::reconcile::to_json(&report))
