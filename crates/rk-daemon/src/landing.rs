@@ -3545,6 +3545,138 @@ workflow: {
         .unwrap();
     }
 
+    /// [`write_review_workflow`] predates the P4a live-path wiring and never
+    /// declares `priority`/`labels`/`reviewerModel`/`reviewerHarness` on its
+    /// spawn step, so it cannot exercise either cost-tier routing or shadow
+    /// review. This mirrors `examples/workflows/steward-review.cue`'s actual
+    /// wiring of those four params onto the spawn step: `priority`/`labels`
+    /// are the tier-routing predicate; `reviewerModel`/`reviewerHarness` are
+    /// empty for the primary reviewer (leaving the tier table / `reviewer`
+    /// profile to decide) and set only for the shadow, whose inline
+    /// model/harness beats the tier table — the same precedence the real
+    /// workflow relies on to pin the shadow to its configured model.
+    fn write_routed_review_workflow(layout: &Layout) {
+        let dir = layout.workflows_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("steward-review.cue"),
+            r#"
+package workflow
+
+workflow: {
+	name: "steward-review"
+	params: {
+		taskId:          {type: "string", required: false, default: "unknown"}
+		branch:          {type: "string", required: true}
+		repo:            {type: "string", required: false, default: "rat-kingdom"}
+		target:          {type: "string", required: false, default: "main"}
+		headSha:         {type: "string", required: false, default: ""}
+		reviewTimeout:   {type: "string", required: false, default: "15m"}
+		priority:        {type: "string", required: false, default: ""}
+		labels:          {type: "list",   required: false, default: []}
+		reviewerModel:   {type: "string", required: false, default: ""}
+		reviewerHarness: {type: "string", required: false, default: ""}
+	}
+	agents: {
+		default:  {harness: "fake", model: "sonnet"}
+		reviewer: {harness: "fake", model: "reviewer-model"}
+	}
+	steps: [
+		{
+			type:   "spawn"
+			role:   "reviewer"
+			agent:  "reviewer"
+			branch: _input.branch
+			labels: _input.labels
+			if _input.priority != "" {
+				priority: _input.priority
+			}
+			if _input.reviewerModel != "" {
+				model: _input.reviewerModel
+			}
+			if _input.reviewerHarness != "" {
+				harness: _input.reviewerHarness
+			}
+			task: {title: "review", description: "review it"}
+		},
+		{type: "gate", gateType: "timer", duration: "2s"},
+		{type: "wait", timeout: _input.reviewTimeout},
+		{type: "evaluate", expect: {is_error: false}},
+	]
+}
+"#,
+        )
+        .unwrap();
+    }
+
+    /// [`write_routed_review_workflow`] with one difference: a spawn carrying
+    /// a non-empty `reviewerModel` — which only the SHADOW spawn ever sets
+    /// (see [`LandingPipeline::launch_shadow_review`]) — hits `stop` instead
+    /// of the normal wait/evaluate tail. A deterministic stand-in for "the
+    /// shadow reviewer died" that leaves the PRIMARY arm (empty
+    /// `reviewerModel`) completely unaffected, so a test using this fixture
+    /// proves shadow death in isolation rather than killing both reviewers.
+    fn write_review_workflow_with_shadow_death(layout: &Layout) {
+        let dir = layout.workflows_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("steward-review.cue"),
+            r#"
+package workflow
+
+import "list"
+
+workflow: {
+	name: "steward-review"
+	params: {
+		taskId:          {type: "string", required: false, default: "unknown"}
+		branch:          {type: "string", required: true}
+		repo:            {type: "string", required: false, default: "rat-kingdom"}
+		target:          {type: "string", required: false, default: "main"}
+		headSha:         {type: "string", required: false, default: ""}
+		reviewTimeout:   {type: "string", required: false, default: "15m"}
+		priority:        {type: "string", required: false, default: ""}
+		labels:          {type: "list",   required: false, default: []}
+		reviewerModel:   {type: "string", required: false, default: ""}
+		reviewerHarness: {type: "string", required: false, default: ""}
+	}
+	agents: {
+		default:  {harness: "fake", model: "sonnet"}
+		reviewer: {harness: "fake", model: "reviewer-model"}
+	}
+	_isShadow: _input.reviewerModel != ""
+	_spawn: {
+		type:   "spawn"
+		role:   "reviewer"
+		agent:  "reviewer"
+		branch: _input.branch
+		labels: _input.labels
+		if _input.priority != "" {
+			priority: _input.priority
+		}
+		if _input.reviewerModel != "" {
+			model: _input.reviewerModel
+		}
+		if _input.reviewerHarness != "" {
+			harness: _input.reviewerHarness
+		}
+		task: {title: "review", description: "review it"}
+	}
+	steps: list.Concat([
+		[_spawn],
+		if _isShadow {[{type: "stop", reason: "simulated shadow reviewer crash"}]},
+		if !_isShadow {[
+			{type: "gate", gateType: "timer", duration: "2s"},
+			{type: "wait", timeout: _input.reviewTimeout},
+			{type: "evaluate", expect: {is_error: false}},
+		]},
+	])
+}
+"#,
+        )
+        .unwrap();
+    }
+
     /// Poll until at least `want` `agent_spawned` events are visible, or
     /// panic after a generous budget — the direct measurement that a
     /// reviewer spawn actually happened (or didn't), matching this crate's
@@ -5112,6 +5244,523 @@ workflow: {
             1,
             "the restarted pipeline must not spawn a second reviewer once the verdict is cached"
         );
+    }
+
+    /// P4a gap (1): reviewer tier routing never reached the live path — every
+    /// review spawn resolved through the workflow's fixed `reviewer` profile
+    /// regardless of the candidate ticket's own priority/labels. Proves the
+    /// fix on the REAL landing path: a ticket carrying a priority a tier rule
+    /// matches routes the reviewer spawn through that tier's profile, not the
+    /// workflow's baseline `reviewer` profile.
+    #[tokio::test]
+    async fn real_review_path_routes_the_reviewer_through_ticket_priority_and_labels() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_routed_review_workflow(&layout);
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        let space = Space::open_in_memory().unwrap();
+        // The candidate ticket the routing predicate reads — `entry.task` is
+        // the lookup key `review_candidate_routing` uses.
+        space
+            .out(Tuple::new(
+                Category::Task,
+                "code-repo",
+                entry.task.clone(),
+                "castle",
+                json!({"priority": "urgent", "labels": ["security"]}),
+            ))
+            .unwrap();
+
+        let tiers = TierRouting {
+            rules: vec![rk_workflow::TierRule {
+                priority: Some("urgent".into()),
+                label: None,
+                tier: "premium".into(),
+            }],
+        };
+        let global_agents = HashMap::from([(
+            "premium".to_string(),
+            rk_workflow::AgentProfile {
+                harness: Some("fake".into()),
+                model: Some("premium-model".into()),
+                permission_mode: None,
+            },
+        )]);
+        let pipeline = Arc::new(test_pipeline_routed(
+            home.path(),
+            space.clone(),
+            global_agents,
+            tiers,
+        ));
+        let gates = GateConfig::default();
+
+        let outcome = {
+            let pipeline = Arc::clone(&pipeline);
+            let entry = entry.clone();
+            let handle =
+                tokio::spawn(async move { pipeline.request_review(&entry, &gates).await });
+            wait_for_spawn_count(&space, 1).await;
+            space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
+            handle.await.unwrap().unwrap()
+        };
+        let ReviewWaitOutcome::Verdict(v) = outcome else {
+            panic!("expected Verdict, got {outcome:?}");
+        };
+        assert_eq!(v, "APPROVE");
+
+        let reviewer = pipeline
+            .supervisor
+            .list_all()
+            .into_iter()
+            .find(|r| r.role == "reviewer")
+            .expect("reviewer must have spawned");
+        assert_eq!(
+            reviewer.model.as_deref(),
+            Some("premium-model"),
+            "the candidate ticket's priority must route the reviewer spawn through \
+             the tier table instead of the workflow's fixed reviewer profile"
+        );
+    }
+
+    /// P4a gap (2): shadow review was schema-only. When the repo's policy
+    /// configures `shadowReviewModel`, `request_review` must launch EXACTLY
+    /// one secondary reviewer, bound to the same task/branch/head/target as
+    /// the primary but under a distinct review attempt, and the two verdicts
+    /// (recorded on the primary vs. carried in `ShadowReview`) must stay
+    /// structurally distinct.
+    #[tokio::test]
+    async fn shadow_review_launches_exactly_one_secondary_reviewer_with_exact_binding() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_routed_review_workflow(&layout);
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        let gates = GateConfig {
+            shadow_review_model: "shadow-model".into(),
+            shadow_review_harness: "fake".into(),
+            ..GateConfig::default()
+        };
+
+        let primary_attempt = review_instance_id(&entry);
+        let shadow_attempt = format!("{primary_attempt}{SHADOW_INSTANCE_SUFFIX}");
+
+        let outcome = {
+            let pipeline = Arc::clone(&pipeline);
+            let entry = entry.clone();
+            let handle =
+                tokio::spawn(async move { pipeline.request_review(&entry, &gates).await });
+            // Exactly two spawns: the primary and the one shadow — never more.
+            assert_eq!(wait_for_spawn_count(&space, 2).await, 2);
+            space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
+            handle.await.unwrap().unwrap()
+        };
+        let ReviewWaitOutcome::Verdict(v) = outcome else {
+            panic!("expected Verdict, got {outcome:?}");
+        };
+        assert_eq!(v, "APPROVE", "the primary verdict is what request_review returns");
+
+        // Neither more spawns happened waiting for the shadow to settle.
+        assert_eq!(
+            space
+                .scan(&Pattern::category(Category::Event).identity("agent_spawned"))
+                .unwrap()
+                .len(),
+            2,
+            "exactly one primary and one shadow reviewer, never more"
+        );
+
+        let records = pipeline.supervisor.list_all();
+        let primary = records
+            .iter()
+            .find(|r| r.review.as_ref().map(|rv| rv.attempt.as_str()) == Some(&primary_attempt))
+            .expect("primary reviewer record must exist");
+        let shadow = records
+            .iter()
+            .find(|r| r.review.as_ref().map(|rv| rv.attempt.as_str()) == Some(&shadow_attempt))
+            .expect("shadow reviewer record must exist");
+
+        // Exact binding: same task/branch/head/target, distinct attempt.
+        let pr = primary.review.as_ref().unwrap();
+        let sr = shadow.review.as_ref().unwrap();
+        assert_eq!(pr.branch, sr.branch);
+        assert_eq!(pr.head_sha, sr.head_sha);
+        assert_eq!(pr.target, sr.target);
+        assert_eq!(pr.task, sr.task);
+        assert_ne!(pr.attempt, sr.attempt);
+        assert_eq!(sr.attempt, shadow_attempt);
+
+        // Distinct models: the shadow's inline override beats the tier
+        // table / named profile, the primary keeps the workflow's own.
+        assert_eq!(primary.model.as_deref(), Some("reviewer-model"));
+        assert_eq!(shadow.model.as_deref(), Some("shadow-model"));
+
+        // The comparison record is written off the landing path (fire and
+        // forget) — supply the shadow's own verdict so the detached task
+        // doesn't have to run out its full wait budget, then poll for it.
+        space
+            .out(Tuple::new(
+                Category::Artifact,
+                "code-repo",
+                REVIEW_ARTIFACT_IDENTITY,
+                "some-other-reviewer",
+                json!({
+                    "task": entry.task,
+                    "recommendation": "APPROVE",
+                    "notes": "shadow notes",
+                    "head_sha": head_sha,
+                    "branch": "feature",
+                    "target": "main",
+                    "review_attempt": shadow_attempt,
+                }),
+            ))
+            .unwrap();
+
+        let comparison = wait_for_comparison(&space, "code-repo").await;
+        assert_eq!(comparison.payload["task"], "add src");
+        assert_eq!(comparison.payload["branch"], "feature");
+        assert_eq!(comparison.payload["head_sha"], head_sha);
+        assert_eq!(comparison.payload["target"], "main");
+        assert_eq!(comparison.payload["review_attempt"], primary_attempt);
+        assert_eq!(comparison.payload["shadow_attempt"], shadow_attempt);
+        assert_eq!(comparison.payload["primary_identity"], json!(primary.name));
+        assert_eq!(comparison.payload["shadow_identity"], json!(shadow.name));
+        assert_eq!(comparison.payload["primary_model"], "reviewer-model");
+        assert_eq!(comparison.payload["shadow_model"], "shadow-model");
+        assert_eq!(comparison.payload["primary_verdict"], "APPROVE");
+        assert_eq!(comparison.payload["shadow_verdict"], "APPROVE");
+        assert_eq!(comparison.payload["agreement"], "agree");
+        assert_eq!(
+            comparison.payload["authoritative"], "primary",
+            "the shadow verdict must never be recorded as authoritative"
+        );
+        assert!(comparison.payload["primary_spend_usd"].is_number());
+        assert!(comparison.payload["shadow_spend_usd"].is_number());
+        assert!(
+            comparison.payload["recorded_at"]
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .is_some(),
+            "recorded_at must be a real timestamp: {comparison:?}"
+        );
+    }
+
+    /// The shadow's verdict must never gate landing: a primary APPROVE lands
+    /// the candidate even when the shadow disagrees, and the disagreement is
+    /// recorded (not silently dropped or mistaken for agreement).
+    #[tokio::test]
+    async fn shadow_disagreement_is_recorded_and_never_blocks_the_primary_verdict() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_routed_review_workflow(&layout);
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        let gates = GateConfig {
+            shadow_review_model: "shadow-model".into(),
+            shadow_review_harness: "fake".into(),
+            ..GateConfig::default()
+        };
+        let primary_attempt = review_instance_id(&entry);
+        let shadow_attempt = format!("{primary_attempt}{SHADOW_INSTANCE_SUFFIX}");
+
+        let outcome = {
+            let pipeline = Arc::clone(&pipeline);
+            let entry = entry.clone();
+            let handle =
+                tokio::spawn(async move { pipeline.request_review(&entry, &gates).await });
+            assert_eq!(wait_for_spawn_count(&space, 2).await, 2);
+            space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
+            handle.await.unwrap().unwrap()
+        };
+        let ReviewWaitOutcome::Verdict(v) = outcome else {
+            panic!("expected Verdict, got {outcome:?}");
+        };
+        assert_eq!(
+            v, "APPROVE",
+            "the primary's verdict is authoritative regardless of what the shadow says"
+        );
+
+        space
+            .out(Tuple::new(
+                Category::Artifact,
+                "code-repo",
+                REVIEW_ARTIFACT_IDENTITY,
+                "some-other-reviewer",
+                json!({
+                    "task": entry.task,
+                    "recommendation": "REWORK",
+                    "notes": "shadow disagrees",
+                    "head_sha": head_sha,
+                    "branch": "feature",
+                    "target": "main",
+                    "review_attempt": shadow_attempt,
+                }),
+            ))
+            .unwrap();
+
+        let comparison = wait_for_comparison(&space, "code-repo").await;
+        assert_eq!(comparison.payload["primary_verdict"], "APPROVE");
+        assert_eq!(comparison.payload["shadow_verdict"], "REWORK");
+        assert_eq!(comparison.payload["agreement"], "disagree");
+        assert_eq!(comparison.payload["authoritative"], "primary");
+    }
+
+    /// A shadow reviewer that dies without ever producing a verdict (crash,
+    /// budget death) must not affect the primary at all: landing still
+    /// proceeds off the primary's verdict, and the comparison records the
+    /// three-state "no-verdict" rather than being silently skipped or
+    /// mistaken for disagreement.
+    #[tokio::test]
+    async fn shadow_reviewer_death_is_recorded_without_affecting_the_primary() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_review_workflow_with_shadow_death(&layout);
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        let gates = GateConfig {
+            shadow_review_model: "shadow-model".into(),
+            shadow_review_harness: "fake".into(),
+            review_max_wait: Duration::from_secs(30),
+            ..GateConfig::default()
+        };
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(15), async {
+            let pipeline = Arc::clone(&pipeline);
+            let entry = entry.clone();
+            let handle =
+                tokio::spawn(async move { pipeline.request_review(&entry, &gates).await });
+            assert_eq!(wait_for_spawn_count(&space, 2).await, 2);
+            space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
+            handle.await.unwrap().unwrap()
+        })
+        .await
+        .expect("a dead shadow must not stall the primary's own escalation path");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the primary's verdict must resolve without waiting on the dead shadow"
+        );
+        let ReviewWaitOutcome::Verdict(v) = outcome else {
+            panic!("expected Verdict, got {outcome:?}");
+        };
+        assert_eq!(v, "APPROVE");
+
+        let comparison = wait_for_comparison(&space, "code-repo").await;
+        assert_eq!(comparison.payload["primary_verdict"], "APPROVE");
+        assert!(
+            comparison.payload["shadow_verdict"].is_null(),
+            "a dead shadow must record no verdict, not a fabricated one: {comparison:?}"
+        );
+        assert_eq!(
+            comparison.payload["agreement"], "no-verdict",
+            "a shadow that never answered must be distinct from disagreement"
+        );
+    }
+
+    /// A restarted daemon reprocessing the same candidate (the late-verdict
+    /// replay path `park_and_resume_survives_space_level_restart_with_late_verdict`
+    /// already proves for the primary alone) must not duplicate the SHADOW
+    /// reviewer either, nor write a second comparison record.
+    #[tokio::test]
+    async fn restart_replay_does_not_duplicate_the_shadow_reviewer_or_its_comparison() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_routed_review_workflow(&layout);
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+        let gates = GateConfig {
+            shadow_review_model: "shadow-model".into(),
+            shadow_review_harness: "fake".into(),
+            ..GateConfig::default()
+        };
+        let primary_attempt = review_instance_id(&entry);
+        let shadow_attempt = format!("{primary_attempt}{SHADOW_INSTANCE_SUFFIX}");
+
+        // "Before restart": park on both verdict tuples, then simulate a
+        // crash before either arrives.
+        {
+            let space = Space::open(&layout.db_path()).unwrap();
+            let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+            let handle = tokio::spawn({
+                let pipeline = Arc::clone(&pipeline);
+                let entry = entry.clone();
+                let gates = gates.clone();
+                async move { pipeline.request_review(&entry, &gates).await }
+            });
+            assert_eq!(wait_for_spawn_count(&space, 2).await, 2);
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        // "After restart": both verdicts land late, against a fresh Space
+        // handle over the same durable store and a brand-new pipeline/engine
+        // — nothing carried over in memory from the aborted attempt.
+        let space = Space::open(&layout.db_path()).unwrap();
+        space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
+        space
+            .out(Tuple::new(
+                Category::Artifact,
+                "code-repo",
+                REVIEW_ARTIFACT_IDENTITY,
+                "some-other-reviewer",
+                json!({
+                    "task": entry.task,
+                    "recommendation": "APPROVE",
+                    "notes": "late shadow verdict",
+                    "head_sha": head_sha,
+                    "branch": "feature",
+                    "target": "main",
+                    "review_attempt": shadow_attempt,
+                }),
+            ))
+            .unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let outcome = pipeline.request_review(&entry, &gates).await.unwrap();
+        let ReviewWaitOutcome::Verdict(v) = outcome else {
+            panic!("expected Verdict, got {outcome:?}");
+        };
+        assert_eq!(v, "APPROVE");
+
+        assert_eq!(
+            space
+                .scan(&Pattern::category(Category::Event).identity("agent_spawned"))
+                .unwrap()
+                .len(),
+            2,
+            "the restarted pipeline must not spawn a second primary or a second shadow"
+        );
+
+        let comparisons = wait_for_comparison_count(&space, "code-repo", 1).await;
+        assert_eq!(
+            comparisons, 1,
+            "restart/replay must not duplicate the shadow comparison record"
+        );
+    }
+
+    /// Repository policy defaults to authoritative-only review: no
+    /// `shadowReviewModel` configured means `request_review` spawns exactly
+    /// one reviewer and no comparison record is ever written. The acceptance
+    /// bar this whole feature shipped under (`docs/2026-08-19-rk-phase-2-epic-rev3.md`
+    /// P4a: "default unchanged until an explicit follow-up ticket flips it").
+    #[tokio::test]
+    async fn shadow_review_disabled_by_default_spawns_only_the_primary() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_review_workflow(&layout);
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        // The policy-derived default, exactly as `LandingPipeline::gate_config`
+        // resolves it for a repo with no activated landing policy.
+        let gates = GateConfig::default();
+        assert_eq!(
+            gates.shadow_review_model, "",
+            "shadow review must default to disabled"
+        );
+
+        let outcome = {
+            let pipeline = Arc::clone(&pipeline);
+            let entry = entry.clone();
+            let handle =
+                tokio::spawn(async move { pipeline.request_review(&entry, &gates).await });
+            wait_for_spawn_count(&space, 1).await;
+            space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
+            handle.await.unwrap().unwrap()
+        };
+        let ReviewWaitOutcome::Verdict(v) = outcome else {
+            panic!("expected Verdict, got {outcome:?}");
+        };
+        assert_eq!(v, "APPROVE");
+
+        // Give any (incorrectly) launched shadow comparison task a moment to
+        // land before asserting its absence.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            space
+                .scan(&Pattern::category(Category::Event).identity("agent_spawned"))
+                .unwrap()
+                .len(),
+            1,
+            "the default policy must never launch a shadow reviewer"
+        );
+        assert!(
+            space
+                .scan(
+                    &Pattern::category(Category::Artifact)
+                        .scope("code-repo")
+                        .identity(SHADOW_COMPARISON_IDENTITY)
+                )
+                .unwrap()
+                .is_empty(),
+            "no comparison record when shadow review is disabled"
+        );
+    }
+
+    /// Poll until at least one `review-shadow-comparison` artifact is
+    /// visible for `repo` — the detached comparison task
+    /// ([`LandingPipeline::spawn_shadow_comparison`]) writes off the landing
+    /// path, so tests must poll for it rather than assume it lands
+    /// synchronously with the primary's verdict.
+    async fn wait_for_comparison(space: &Space, repo: &str) -> Tuple {
+        for _ in 0..400 {
+            let found = space
+                .scan(
+                    &Pattern::category(Category::Artifact)
+                        .scope(repo)
+                        .identity(SHADOW_COMPARISON_IDENTITY),
+                )
+                .unwrap();
+            if let Some(t) = found.into_iter().next() {
+                return t;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for a review-shadow-comparison artifact");
+    }
+
+    /// Like [`wait_for_comparison`], but waits for an exact COUNT to settle
+    /// (rather than returning on the first sighting) — the restart/replay
+    /// duplicate-suppression test needs to see that the count never exceeds
+    /// `want`, not merely that it eventually reaches it.
+    async fn wait_for_comparison_count(space: &Space, repo: &str, want: usize) -> usize {
+        let mut last = 0;
+        for _ in 0..400 {
+            last = space
+                .scan(
+                    &Pattern::category(Category::Artifact)
+                        .scope(repo)
+                        .identity(SHADOW_COMPARISON_IDENTITY),
+                )
+                .unwrap()
+                .len();
+            if last >= want {
+                // Settle a little longer to catch a spurious duplicate
+                // written just after the count first reached `want`.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                return space
+                    .scan(
+                        &Pattern::category(Category::Artifact)
+                            .scope(repo)
+                            .identity(SHADOW_COMPARISON_IDENTITY),
+                    )
+                    .unwrap()
+                    .len();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        last
     }
 
     /// T4's queue-level restart-safety (design doc §2.6, module doc): a
