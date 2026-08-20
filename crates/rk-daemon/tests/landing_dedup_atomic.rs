@@ -207,10 +207,7 @@ async fn wait_until_status(
 ) -> bool {
     for _ in 0..iters {
         let entries = queue_entries(client, repo_name).await;
-        if entries
-            .iter()
-            .any(|e| e["payload"]["status"] == status)
-        {
+        if entries.iter().any(|e| e["payload"]["status"] == status) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -242,7 +239,10 @@ async fn sequential_duplicate_reactor_completions_converge_to_one_live_entry() {
     let mut client = connect(&layout).await;
 
     client
-        .call("repo.add", json!({"name": &repo_name, "path": repo.to_string_lossy()}))
+        .call(
+            "repo.add",
+            json!({"name": &repo_name, "path": repo.to_string_lossy()}),
+        )
         .await
         .unwrap();
 
@@ -267,11 +267,7 @@ async fn sequential_duplicate_reactor_completions_converge_to_one_live_entry() {
         "the first completion never drained the queue"
     );
     let markers_after_first = processed_markers(&mut client, &repo_name).await;
-    assert_eq!(
-        markers_after_first.len(),
-        1,
-        "{markers_after_first:?}"
-    );
+    assert_eq!(markers_after_first.len(), 1, "{markers_after_first:?}");
     let main_after_first = git(&repo, &["rev-parse", "main"]);
 
     // The resumed background verifier's redundant `rk done`: a second,
@@ -436,7 +432,10 @@ checks: [
     let mut client = connect(&layout).await;
 
     client
-        .call("repo.add", json!({"name": &repo_name, "path": repo.to_string_lossy()}))
+        .call(
+            "repo.add",
+            json!({"name": &repo_name, "path": repo.to_string_lossy()}),
+        )
         .await
         .unwrap();
 
@@ -540,7 +539,10 @@ async fn restart_preserves_the_landing_dedup_invariant() {
     let mut client = connect(&layout).await;
 
     client
-        .call("repo.add", json!({"name": &repo_name, "path": repo.to_string_lossy()}))
+        .call(
+            "repo.add",
+            json!({"name": &repo_name, "path": repo.to_string_lossy()}),
+        )
         .await
         .unwrap();
 
@@ -640,7 +642,10 @@ async fn a_different_head_under_the_same_task_is_independently_admissible() {
     let mut client = connect(&layout).await;
 
     client
-        .call("repo.add", json!({"name": &repo_name, "path": repo.to_string_lossy()}))
+        .call(
+            "repo.add",
+            json!({"name": &repo_name, "path": repo.to_string_lossy()}),
+        )
         .await
         .unwrap();
 
