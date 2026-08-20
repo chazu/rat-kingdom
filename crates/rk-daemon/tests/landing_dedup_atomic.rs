@@ -723,3 +723,222 @@ async fn a_different_head_under_the_same_task_is_independently_admissible() {
 
     handle.abort();
 }
+
+/// A different head under a DIFFERENT task must also remain independently
+/// admissible — distinct-head admission does not depend on the two
+/// completions sharing a task identity. Operator-clarified acceptance
+/// (2026-08-20): "independent admission means a different head, including a
+/// different task on that head." Two distinct branches/heads, each under its
+/// own task, both land, producing two processed markers each recording its
+/// own task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_different_head_under_a_different_task_is_independently_admissible() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo = repo_dir.path().join("dedup-distinct-head-task");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    write_checks(&repo, FAST_CHECKS);
+    std::fs::write(repo.join(".rk").join("triggers.cue"), LANDING_TRIGGER).unwrap();
+
+    let repo_name = repo_name_of(&repo);
+    let head_a = make_branch(&repo, "rat/dedup-distinct-head-task/tkt-a", "a.txt", "a\n");
+    let head_b = make_branch(&repo, "rat/dedup-distinct-head-task/tkt-b", "b.txt", "b\n");
+    assert_ne!(head_a, head_b);
+
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "dedup-castle".into()).unwrap();
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    client
+        .call(
+            "repo.add",
+            json!({"name": &repo_name, "path": repo.to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+
+    // Both branch AND task differ between the two completions.
+    emit_harness_result(
+        &mut client,
+        &repo_name,
+        Completion {
+            agent: "Rat-A",
+            branch: "rat/dedup-distinct-head-task/tkt-a",
+            target: "main",
+            head_sha: &head_a,
+            task: "task-a",
+            diff_class: "trivial",
+        },
+    )
+    .await;
+    emit_harness_result(
+        &mut client,
+        &repo_name,
+        Completion {
+            agent: "Rat-B",
+            branch: "rat/dedup-distinct-head-task/tkt-b",
+            target: "main",
+            head_sha: &head_b,
+            task: "task-b",
+            diff_class: "trivial",
+        },
+    )
+    .await;
+
+    assert!(
+        wait_until_marker_count(&mut client, &repo_name, 2, 300).await,
+        "both distinct-head/distinct-task candidates never reached processed markers"
+    );
+    assert!(
+        wait_until_queue_empty(&mut client, &repo_name, 50).await,
+        "both distinct-head/distinct-task candidates never drained the queue"
+    );
+
+    let markers = processed_markers(&mut client, &repo_name).await;
+    assert_eq!(
+        markers.len(),
+        2,
+        "a different head under a different task must be admitted independently, not deduped: {markers:?}"
+    );
+
+    let outcomes: Vec<Value> = markers
+        .iter()
+        .map(|m| m["payload"]["outcome"].clone())
+        .collect();
+    assert!(
+        outcomes.iter().all(|o| o == "landed"),
+        "both distinct-head/distinct-task candidates must have landed: {outcomes:?}"
+    );
+
+    let mut tasks: Vec<String> = markers
+        .iter()
+        .map(|m| {
+            m["payload"]["task"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    tasks.sort();
+    assert_eq!(
+        tasks,
+        vec!["task-a".to_string(), "task-b".to_string()],
+        "each marker must record its own task, not collapse to one: {markers:?}"
+    );
+
+    assert!(repo.join("a.txt").exists() && repo.join("b.txt").exists());
+
+    handle.abort();
+}
+
+/// The identical repo/branch/head/target rebound to a DIFFERENT non-empty
+/// task must fail closed rather than double-process the code or close the
+/// wrong ticket — operator-clarified acceptance (2026-08-20) preserves this
+/// existing rule. Driven through the same reactor/`harness_result` path as
+/// the rest of this suite (not `repo.land` directly, which
+/// `land_task_identity.rs::resubmission_with_a_different_task_fails_closed`
+/// already covers) so the actual incident shape — a redelivered completion
+/// that happens to carry a different task string — is exercised end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_head_resubmitted_under_a_different_task_fails_closed() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo = repo_dir.path().join("dedup-task-mismatch");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    write_checks(&repo, FAST_CHECKS);
+    std::fs::write(repo.join(".rk").join("triggers.cue"), LANDING_TRIGGER).unwrap();
+
+    let repo_name = repo_name_of(&repo);
+    let head_sha = make_branch(&repo, "rat/dedup-task-mismatch/tkt-1", "work.txt", "v1\n");
+
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "dedup-castle".into()).unwrap();
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    client
+        .call(
+            "repo.add",
+            json!({"name": &repo_name, "path": repo.to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+
+    emit_harness_result(
+        &mut client,
+        &repo_name,
+        Completion {
+            agent: "Deyna-9",
+            branch: "rat/dedup-task-mismatch/tkt-1",
+            target: "main",
+            head_sha: &head_sha,
+            task: "real-task",
+            diff_class: "trivial",
+        },
+    )
+    .await;
+
+    assert!(
+        wait_until_marker_count(&mut client, &repo_name, 1, 200).await,
+        "the first completion never reached a processed marker"
+    );
+    assert!(
+        wait_until_queue_empty(&mut client, &repo_name, 50).await,
+        "the first completion never drained the queue"
+    );
+    let markers_after_first = processed_markers(&mut client, &repo_name).await;
+    assert_eq!(markers_after_first.len(), 1, "{markers_after_first:?}");
+    assert_eq!(
+        markers_after_first[0]["payload"]["task"], "real-task",
+        "{markers_after_first:?}"
+    );
+    let main_after_first = git(&repo, &["rev-parse", "main"]);
+
+    // Same branch/head/target resubmitted under a DIFFERENT, wrong task —
+    // the shape an operator typo or a stale `--task` reused after the real
+    // one already landed would produce.
+    emit_harness_result(
+        &mut client,
+        &repo_name,
+        Completion {
+            agent: "Deyna-9",
+            branch: "rat/dedup-task-mismatch/tkt-1",
+            target: "main",
+            head_sha: &head_sha,
+            task: "wrong-task",
+            diff_class: "trivial",
+        },
+    )
+    .await;
+
+    // Give the feed-woken reactor a beat to evaluate (and fail closed on)
+    // the mismatched-task resubmission.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    assert!(
+        queue_entries(&mut client, &repo_name).await.is_empty(),
+        "a different-task resubmission must never leave a live queue entry behind"
+    );
+    let markers_after_second = processed_markers(&mut client, &repo_name).await;
+    assert_eq!(
+        markers_after_second.len(),
+        1,
+        "a different-task resubmission must fail closed, not create a second processed marker: \
+         {markers_after_second:?}"
+    );
+    assert_eq!(
+        markers_after_second[0]["payload"]["task"], "real-task",
+        "the surviving marker must still record the original task, not the mismatched retry: \
+         {markers_after_second:?}"
+    );
+    let main_after_second = git(&repo, &["rev-parse", "main"]);
+    assert_eq!(
+        main_after_first, main_after_second,
+        "a different-task resubmission must not merge (double-process) a second time"
+    );
+
+    handle.abort();
+}
