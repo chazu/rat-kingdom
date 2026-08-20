@@ -170,6 +170,12 @@ fn effective_agent_config(
         });
     }
 
+    // A dispatch-time routed profile (cost tier and/or an explicitly named
+    // profile, already layered over the global default by the server) stands in
+    // for `[agents.default]` here. Deliberately *below* the read-only-role
+    // return above: cost routing must never be able to hand an assessment role
+    // a different harness, and so a different authority boundary.
+    let default_agent = params.resolved_profile.as_ref().unwrap_or(default_agent);
     let harness = params
         .harness
         .clone()
@@ -446,6 +452,23 @@ pub struct SpawnParams {
     pub model: Option<String>,
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// Explicit agent-profile name (`[agents.<name>]`, or a workflow `agents:`
+    /// entry) for this dispatch. Naming one is a deliberate override: on the
+    /// operator path it *replaces* cost-tier routing rather than layering
+    /// under it, so `--profile` is how you opt a hand-dispatched ticket out of
+    /// the fleet's cost rules. See `Daemon::route_spawn_profile`.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// The profile the daemon resolved for this dispatch — a cost tier and/or
+    /// named profile already layered over global `[agents.default]`. It stands
+    /// in for the supervisor's global default profile for this spawn only, so
+    /// explicit `harness`/`model`/`permission_mode` above still win field-wise.
+    ///
+    /// Server-side output of `Daemon::route_spawn_profile`, never accepted from
+    /// a client (hence `serde(skip)`): a caller must not be able to hand itself
+    /// a profile the routing table would not have given it.
+    #[serde(skip)]
+    pub resolved_profile: Option<AgentProfile>,
     /// Run in a herdr pane (interactive, human-attachable) instead of
     /// headless. Completion comes from the rat's own `rk done` tuple.
     #[serde(default)]
@@ -5856,6 +5879,8 @@ mod respawn_tests {
             workflow_instance: None,
             coordinator: None,
             instance_max_usd: None,
+            profile: None,
+            resolved_profile: None,
         };
         let record = spawning_record(SpawnJournal {
             params: &params,
@@ -5904,6 +5929,8 @@ mod respawn_tests {
             workflow_instance: None,
             coordinator: None,
             instance_max_usd: None,
+            profile: None,
+            resolved_profile: None,
         };
 
         let worker = effective_agent_config("claude", &profile, &params).unwrap();
@@ -6725,6 +6752,8 @@ mod respawn_tests {
             workflow_instance: None,
             coordinator: None,
             instance_max_usd: None,
+            profile: None,
+            resolved_profile: None,
         }
     }
 

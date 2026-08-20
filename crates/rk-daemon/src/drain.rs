@@ -259,6 +259,8 @@ impl Drain {
                 workflow_instance: None,
                 coordinator: None,
                 instance_max_usd: None,
+                profile: None,
+                resolved_profile: None,
             };
             // `max_wip` is passed through so the supervisor atomically admits
             // this spawn against the SAME fleet-wide ceiling a workflow
@@ -391,9 +393,8 @@ impl Drain {
     /// resolve that profile over the global agents. A bare drain has no
     /// workflow-scoped agents, so only global profiles apply. An unknown tier
     /// name errors, exactly like an unknown profile in a spawn step.
-    fn resolve_tier(&self, ticket: &Tuple) -> rk_core::Result<ResolvedAgent> {
-        let labels = string_array(&ticket.payload, "labels");
-        let priority = field(&ticket.payload, "priority");
+    pub(crate) fn resolve_tier(&self, ticket: &Tuple) -> rk_core::Result<ResolvedAgent> {
+        let (labels, priority) = tier_key(&ticket.payload);
         let tier = self.tier_routing.route(&labels, Some(priority));
         if let Some(tier) = tier {
             info!(ticket = %ticket.identity, tier, "drain routed ticket to cost tier");
@@ -436,6 +437,14 @@ fn ticket_prompt(ticket: &Tuple) -> String {
 
 fn field<'a>(payload: &'a Value, key: &str) -> &'a str {
     payload.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// The routing key a cost-tier rule matches on: a ticket's labels and its
+/// priority. Shared with the operator `agent.spawn` path (`server.rs`) so one
+/// ticket routes to one tier whichever dispatcher picked it up — a hand spawn
+/// and a drain claim must not disagree about which model a ticket deserves.
+pub(crate) fn tier_key(payload: &Value) -> (Vec<String>, &str) {
+    (string_array(payload, "labels"), field(payload, "priority"))
 }
 
 /// The string array under `key` in a ticket payload (e.g. `labels`), empty when

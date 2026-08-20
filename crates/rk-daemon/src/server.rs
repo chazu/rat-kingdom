@@ -4496,6 +4496,8 @@ impl Daemon {
                     workflow_instance: None,
                     coordinator: None,
                     instance_max_usd: None,
+                    profile: None,
+                    resolved_profile: None,
                 },
                 0,
             )
@@ -4802,6 +4804,79 @@ impl Daemon {
         }
     }
 
+    /// Route an `agent.spawn` through the SAME cost-tier → profile-layering
+    /// path the drain and the workflow fan-out use, so a ticket dispatched by
+    /// hand lands on the profile the fleet's `[[tiers.rules]]` chose for it
+    /// rather than silently on `[agents.default]`. Before this, tier routing
+    /// was consulted only on the drain/fan-out paths, so every operator spawn
+    /// quietly bypassed the fleet's ratified cost policy.
+    ///
+    /// Precedence, most specific first — the same order as
+    /// [`rk_workflow::resolve`], with one deliberate difference:
+    ///
+    /// 1. explicit `harness`/`model`/`permission_mode` on the request
+    /// 2. an explicit `profile` — an operator naming a profile *replaces*
+    ///    routing rather than layering under it. (In a workflow the tier beats
+    ///    the step's static `agent:`, because the point of tiers is to override
+    ///    a definition's baked-in defaults; a flag typed at dispatch time is a
+    ///    live decision and must be the way to opt out.)
+    /// 3. the tier a routing rule picked from the ticket's labels/priority
+    /// 4. global `[agents.default]`, unchanged
+    ///
+    /// Returns the profile to layer under the request's own fields plus a
+    /// human-readable `(name, source)` for the reply, or `None` when nothing
+    /// routed — in which case resolution is byte-for-byte what it was before.
+    fn route_spawn_profile(
+        &self,
+        params: &crate::supervisor::SpawnParams,
+    ) -> rk_core::Result<Option<(rk_workflow::AgentProfile, String, &'static str)>> {
+        let (name, source) = match params.profile.as_deref() {
+            Some(explicit) => (explicit.to_string(), "profile"),
+            None => {
+                // The spawn's task IS the ticket id on every ticket-backed
+                // dispatch (drain and `rk spawn --ticket` alike), so the same
+                // labels/priority the drain routes on are recoverable here. A
+                // free-form task has neither, and matches only a catch-all rule
+                // — which is exactly what a catch-all means.
+                let ticket = self.tickets.get(&params.task).ok().flatten();
+                let (labels, priority) = match ticket.as_ref() {
+                    Some(t) => crate::drain::tier_key(&t.payload),
+                    None => (Vec::new(), ""),
+                };
+                match self.tier_routing.route(&labels, Some(priority)) {
+                    Some(tier) => (tier.to_string(), "tier"),
+                    None => return Ok(None),
+                }
+            }
+        };
+        // Reuse the workflow resolver so an unknown name errors here exactly as
+        // it does in a spawn step or a drain cycle, instead of silently falling
+        // back to the default profile and masking the typo.
+        let (agent, tier) = match source {
+            "profile" => (Some(name.as_str()), None),
+            _ => (None, Some(name.as_str())),
+        };
+        let resolved = rk_workflow::resolve::resolve_fields(
+            agent,
+            tier,
+            None,
+            None,
+            None,
+            &HashMap::new(),
+            &self.global_agents,
+            &self.default_harness,
+        )?;
+        Ok(Some((
+            rk_workflow::AgentProfile {
+                harness: Some(resolved.harness),
+                model: resolved.model,
+                permission_mode: resolved.permission_mode,
+            },
+            name,
+            source,
+        )))
+    }
+
     async fn handle_spawn(&self, req: Request) -> Response {
         let params: crate::supervisor::SpawnParams = match parse_params(&req.params) {
             Ok(p) => p,
@@ -4815,6 +4890,17 @@ impl Daemon {
                 Err(e) => return Response::err(req.id, codes::FORBIDDEN, e.to_string()),
             }
         };
+        // Cost-tier routing, applied before the spawn so an unknown tier/profile
+        // is refused rather than dispatched onto the wrong model.
+        let routing = match self.route_spawn_profile(&params) {
+            Ok(routed) => routed,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        };
+        let routing = routing.map(|(profile, name, source)| {
+            info!(task = %params.task, profile = %name, source, "spawn routed to agent profile");
+            params.resolved_profile = Some(profile);
+            json!({"profile": name, "source": source})
+        });
         // Workflow-spawned foremen inherit the instance cap for children they
         // dispatch. The workflow engine remains the source of that definition;
         // the child spawn must not silently become an uncapped side door.
@@ -4826,8 +4912,12 @@ impl Daemon {
         // Manual/foreman-driven spawns are not subject to the fleet-WIP
         // ceiling (0 = no cap enforced by this call) — only the drain
         // autoscaler and workflow `spawn` steps admit against it.
+        // `routing` is echoed back so the resolved profile and *why* it was
+        // chosen are visible at dispatch instead of being inferred later from
+        // the agent record's model. `null` = nothing routed: global defaults.
+        let routing = routing.unwrap_or(Value::Null);
         match self.supervisor.spawn_async(params, 0).await {
-            Ok(record) => Response::ok(req.id, json!({"agent": record})),
+            Ok(record) => Response::ok(req.id, json!({"agent": record, "routing": routing})),
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
     }
@@ -7793,6 +7883,8 @@ mod default_agent_profile_tests {
                     workflow_instance: None,
                     coordinator: None,
                     instance_max_usd: None,
+                    profile: None,
+                    resolved_profile: None,
                 },
                 0,
             )
@@ -7802,6 +7894,152 @@ mod default_agent_profile_tests {
         assert_eq!(record.harness, "fake");
         assert_eq!(record.model.as_deref(), Some("profile-model"));
         assert_eq!(record.permission_mode.as_deref(), Some("workspace-write"));
+    }
+
+    fn profile_cfg(model: &str) -> AgentProfileConfig {
+        AgentProfileConfig {
+            harness: Some("fake".into()),
+            model: Some(model.into()),
+            permission_mode: None,
+        }
+    }
+
+    fn spawn_params(task: &str, profile: Option<&str>) -> crate::supervisor::SpawnParams {
+        crate::supervisor::SpawnParams {
+            repo: ".".into(),
+            task: task.into(),
+            prompt: None,
+            role: "rat".into(),
+            coordination: None,
+            harness: None,
+            parent: None,
+            base: None,
+            model: None,
+            permission_mode: None,
+            attach: false,
+            workflow_instance: None,
+            coordinator: None,
+            instance_max_usd: None,
+            profile: profile.map(String::from),
+            resolved_profile: None,
+        }
+    }
+
+    /// The acceptance for TKT-01M0CW1918D10C48C2J3TMRSFQ: a ticket must reach
+    /// the same profile whichever dispatcher picks it up. Before this, tier
+    /// routing ran only on the drain path, so `rk spawn --ticket` quietly
+    /// resolved `[agents.default]` and the fleet's cost policy went unenforced
+    /// for every hand-dispatched ticket.
+    #[tokio::test]
+    async fn operator_spawn_and_drain_resolve_the_same_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = rk_core::config::Config::default();
+        config.harness.default = "fake".into();
+        config
+            .agents
+            .insert("default".into(), profile_cfg("opus-default"));
+        config
+            .agents
+            .insert("sonnet-worker".into(), profile_cfg("sonnet"));
+        config.agents.insert("premium".into(), profile_cfg("opus"));
+        // Catch-all last, exactly as an operator would write it: everything is
+        // a medium unless it is labelled `hard`.
+        config.tiers.rules = vec![
+            rk_core::config::TierRuleConfig {
+                priority: None,
+                label: Some("hard".into()),
+                tier: "premium".into(),
+            },
+            rk_core::config::TierRuleConfig {
+                priority: None,
+                label: None,
+                tier: "sonnet-worker".into(),
+            },
+        ];
+        let daemon = Daemon::new(Layout::at(dir.path().join("rk-home")), &config).unwrap();
+
+        let medium = daemon
+            .tickets
+            .create(
+                serde_json::from_value(json!({"title": "medium work", "scope": "demo"})).unwrap(),
+            )
+            .await
+            .unwrap();
+        let hard = daemon
+            .tickets
+            .create(
+                serde_json::from_value(
+                    json!({"title": "hard work", "scope": "demo", "labels": ["hard"]}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // The drain's view of the same two tickets, resolved through its own
+        // (pre-existing) path — this is the reference the operator path must
+        // agree with, not a re-derivation of the expected answer.
+        let drain = crate::drain::Drain::new(
+            Arc::clone(&daemon.supervisor),
+            Arc::clone(&daemon.tickets),
+            Layout::at(dir.path().join("rk-home")),
+            rk_core::config::DrainConfig::default(),
+            daemon.tier_routing.clone(),
+            daemon.global_agents.clone(),
+            daemon.default_harness.clone(),
+        );
+
+        for ticket in [&medium, &hard] {
+            let by_drain = drain.resolve_tier(ticket).unwrap();
+            let (by_operator, name, source) = daemon
+                .route_spawn_profile(&spawn_params(&ticket.identity, None))
+                .unwrap()
+                .expect("a catch-all rule must route every ticket");
+            assert_eq!(source, "tier");
+            assert_eq!(
+                by_operator.model, by_drain.model,
+                "{} routed to {name} by hand but to {:?} by the drain",
+                ticket.identity, by_drain.model
+            );
+            assert_eq!(
+                by_operator.harness.as_deref(),
+                Some(by_drain.harness.as_str())
+            );
+        }
+        // ...and the two tickets are genuinely on different tiers, so the
+        // agreement above is not both paths collapsing to one default.
+        let medium_model = daemon
+            .route_spawn_profile(&spawn_params(&medium.identity, None))
+            .unwrap()
+            .unwrap()
+            .0
+            .model;
+        assert_eq!(medium_model.as_deref(), Some("sonnet"));
+        assert_eq!(
+            daemon
+                .route_spawn_profile(&spawn_params(&hard.identity, None))
+                .unwrap()
+                .unwrap()
+                .0
+                .model
+                .as_deref(),
+            Some("opus")
+        );
+
+        // `--profile` is the documented opt-out: it replaces the tier rather
+        // than layering under it, so a catch-all cannot override an operator
+        // who named a profile at dispatch time.
+        let (overridden, name, source) = daemon
+            .route_spawn_profile(&spawn_params(&medium.identity, Some("premium")))
+            .unwrap()
+            .unwrap();
+        assert_eq!((name.as_str(), source), ("premium", "profile"));
+        assert_eq!(overridden.model.as_deref(), Some("opus"));
+
+        // A typo must be refused, not silently dispatched on the default.
+        assert!(daemon
+            .route_spawn_profile(&spawn_params(&medium.identity, Some("nope")))
+            .is_err());
     }
 }
 

@@ -1698,6 +1698,8 @@ impl WorkflowEngine {
                         workflow_instance: Some(id.to_string()),
                         coordinator: self.coordinator(id),
                         instance_max_usd: self.instance_budget(id),
+                        profile: None,
+                        resolved_profile: None,
                     };
                     let record = loop {
                         match self.spawn_agent(params.clone(), self.fleet_wip_cap).await {
@@ -2466,6 +2468,8 @@ impl WorkflowEngine {
                 workflow_instance: Some(id.to_string()),
                 coordinator: self.coordinator(id),
                 instance_max_usd: instance_cap,
+                profile: None,
+                resolved_profile: None,
                 coordination: None,
             };
             // Route through the same fleet-WIP admission/retry path as
