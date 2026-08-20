@@ -229,6 +229,16 @@ async fn bounded_rework_lands_intermediately_then_resubmits_parent_exactly_once(
     }
     assert!(ref_contains(&repo, "main", "src.rs"));
     assert!(ref_contains(&repo, "main", "docs/rework.md"));
+    for _ in 0..400 {
+        if scan(&mut client, "rework-e2e-repo", "ticket_closed")
+            .await
+            .iter()
+            .any(|tuple| tuple["payload"]["ticket"] == original_ticket)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     assert_eq!(
         scan(&mut client, "rework-e2e-repo", "landing_rework_dispatch")
             .await

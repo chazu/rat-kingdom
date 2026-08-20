@@ -414,6 +414,7 @@ pub(crate) enum LandingEntryStatus {
     Queued,
     RunningGates,
     AwaitingReview,
+    Landing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -625,7 +626,9 @@ impl LandingQueue {
         };
         let mut entry: LandingQueueEntry = serde_json::from_value(tuple.payload.clone())
             .map_err(|e| rk_core::Error::other(format!("landing queue entry: {e}")))?;
-        entry.status = LandingEntryStatus::RunningGates;
+        if entry.status != LandingEntryStatus::Landing {
+            entry.status = LandingEntryStatus::RunningGates;
+        }
         entry.rev = entry.rev.wrapping_add(1);
         // Write-then-delete (T4 crash-safety, module doc): the successor
         // tuple lands durably BEFORE the predecessor is removed, so a crash
@@ -660,7 +663,9 @@ impl LandingQueue {
         for tuple in pending.into_iter().take(max) {
             let mut entry: LandingQueueEntry = serde_json::from_value(tuple.payload.clone())
                 .map_err(|error| rk_core::Error::other(format!("landing queue entry: {error}")))?;
-            entry.status = LandingEntryStatus::RunningGates;
+            if entry.status != LandingEntryStatus::Landing {
+                entry.status = LandingEntryStatus::RunningGates;
+            }
             entry.rev = entry.rev.wrapping_add(1);
             self.write(&entry)?;
             self.space.delete(tuple.id)?;
@@ -1281,6 +1286,9 @@ impl LandingPipeline {
             let repo_path = repo_path.clone();
             blocking(move || rk_git::Repo::discover(&repo_path)).await?
         };
+        if let Some(outcome) = self.recover_completed_land(&entry, &git_repo).await? {
+            return Ok(outcome);
+        }
         let gates = self.gate_config(&git_repo);
         let checks_file = repo_path.join(".rk").join("checks.cue");
         if let Err(error) = self.gate_plan(&checks_file, &entry.target, &gates) {
@@ -1369,6 +1377,7 @@ impl LandingPipeline {
         }
         if matches!(entry.diff_class.as_str(), "doc-only" | "trivial") {
             self.note_non_main_land_target(&entry);
+            self.queue.set_status(&entry, LandingEntryStatus::Landing)?;
             let result = self
                 .supervisor
                 .land_prepared(
@@ -1797,6 +1806,7 @@ impl LandingPipeline {
         match verdict.as_str() {
             "APPROVE" => {
                 self.note_non_main_land_target(entry);
+                self.queue.set_status(entry, LandingEntryStatus::Landing)?;
                 let result = self
                     .supervisor
                     .land_prepared(
@@ -1964,6 +1974,37 @@ impl LandingPipeline {
                 "rework landed but parent resubmission failed"
             );
         }
+    }
+
+    /// Finish the durable ticket transition after a crash that happened after
+    /// an APPROVE-authorized target advance but before `record_delivery`.
+    async fn recover_completed_land(
+        &self,
+        entry: &LandingQueueEntry,
+        repo: &rk_git::Repo,
+    ) -> rk_core::Result<Option<LandingOutcome>> {
+        if entry.status != LandingEntryStatus::Landing {
+            return Ok(None);
+        }
+        if self.supervisor.repository_policy(repo).delivery.mode != rk_workflow::DeliveryMode::Merge
+        {
+            return Ok(None);
+        }
+        let (Some(commit), Some(base)) = (&entry.candidate_sha, &entry.candidate_base) else {
+            return Ok(None);
+        };
+        if repo.rev_parse(&entry.target)? != *commit {
+            return Ok(None);
+        }
+        let result = json!({
+            "branch": entry.branch, "target": entry.target, "delivered": true,
+            "merged": true, "merge_commit": commit, "content_free": commit == base,
+            "recovered": true,
+        });
+        self.record_delivery(entry, &result).await;
+        let outcome = LandingOutcome::Landed(result);
+        self.mark_processed(entry, &outcome)?;
+        Ok(Some(outcome))
     }
 
     /// If `entry` is a dispatched rework ticket landing onto its reviewed
@@ -3514,12 +3555,10 @@ workflow: {
             .is_empty());
     }
 
-    /// P1b end-to-end: a successful land writes the merge commit onto the
-    /// ticket and closes it, with no operator action. Before this, nothing
-    /// closed a ticket post-land and delivery was inferred from a branch ref
-    /// the land had just deleted (probe O14/O16).
+    /// A crash after the exact target advance but before ticket recording
+    /// resumes from the durable `landing` phase and closes the ticket.
     #[tokio::test]
-    async fn landing_records_the_merge_commit_on_the_ticket_and_closes_it() {
+    async fn advanced_landing_reconciles_the_ticket_and_terminal_marker() {
         let home = tempfile::tempdir().unwrap();
         let repo_dir = tempfile::tempdir().unwrap();
         init_repo(repo_dir.path());
@@ -3567,6 +3606,30 @@ workflow: {
                 ..Default::default()
             })
             .unwrap();
+
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let candidate = match repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+        let mut claimed = pipeline
+            .queue
+            .claim_next("docs-repo", "main")
+            .unwrap()
+            .unwrap();
+        claimed.candidate_sha = Some(candidate.commit.clone());
+        claimed.candidate_base = Some(candidate.base.clone());
+        claimed.candidate_ref = Some(candidate.candidate_ref.clone());
+        pipeline
+            .queue
+            .persist(&mut claimed, LandingEntryStatus::Landing)
+            .unwrap();
+        assert!(repo
+            .advance_target_to("main", &candidate.commit, &candidate.base)
+            .unwrap()
+            .advanced());
+        repo.discard_candidate(&candidate.candidate_ref).unwrap();
+        repo.delete_branch("feature").unwrap();
 
         let outcomes = pipeline.drain_key("docs-repo", "main").await.unwrap();
         let LandingOutcome::Landed(result) = &outcomes[0] else {
