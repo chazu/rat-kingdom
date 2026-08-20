@@ -173,7 +173,7 @@ fn short(sha: &str) -> &str {
 /// edit bypassing that path, or a status regression after delivery — either
 /// way it is safe to fix mechanically: the delivery record is the durable
 /// proof, so the status field is what is wrong.
-fn delivered_but_open(tickets: &[Tuple]) -> Vec<Violation> {
+pub(crate) fn delivered_but_open(tickets: &[Tuple]) -> Vec<Violation> {
     tickets
         .iter()
         .filter_map(|t| {
@@ -248,15 +248,31 @@ fn latest_by(
 /// Unlike the sweep, this raises immediately with no staleness timer: a
 /// report is not a mutation, so there is no risk of reopening a ticket out
 /// from under a rat that is mid-handoff — the sweep still owns that decision.
-fn terminal_assignee_active_work(
+/// Resolve the agent that owns a ticket's active work — assignee field,
+/// falling back to a live `task` match only when assignee is absent. Shared
+/// by [`terminal_assignee_active_work`] (first read) and
+/// `reconcile_repair::execute` (the fresh re-check immediately before a
+/// stale-ownership CAS write), so both always resolve ownership the exact
+/// same way.
+pub(crate) fn resolve_owner<'a>(
+    ticket_id: &str,
+    assignee: Option<&str>,
+    agents: &'a [AgentRecord],
+) -> Option<&'a AgentRecord> {
+    let by_name = latest_by(agents, |a| Some(a.name.as_str()));
+    let by_task = latest_by(agents, |a| a.task.as_deref());
+    match assignee {
+        Some(name) => by_name.get(name).copied(),
+        None => by_task.get(ticket_id).copied(),
+    }
+}
+
+pub(crate) fn terminal_assignee_active_work(
     tickets: &[Tuple],
     agents: &[AgentRecord],
     landed_tickets: &HashSet<String>,
     queued_tickets: &HashSet<String>,
 ) -> Vec<Violation> {
-    let by_name = latest_by(agents, |a| Some(a.name.as_str()));
-    let by_task = latest_by(agents, |a| a.task.as_deref());
-
     tickets
         .iter()
         .filter(|t| {
@@ -268,10 +284,7 @@ fn terminal_assignee_active_work(
         .filter(|t| !landed_tickets.contains(&t.identity) && !queued_tickets.contains(&t.identity))
         .filter_map(|t| {
             let assignee = t.payload.get("assignee").and_then(Value::as_str);
-            let agent = match assignee {
-                Some(name) => by_name.get(name).copied(),
-                None => by_task.get(t.identity.as_str()).copied(),
-            }?;
+            let agent = resolve_owner(&t.identity, assignee, agents)?;
             if !agent.state.is_archivable() {
                 return None;
             }

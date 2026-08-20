@@ -59,6 +59,18 @@ pub struct DeliveryRecord {
     pub landed_at: String,
 }
 
+/// Result of a compare-and-swap repair write (`repair_close_delivered`,
+/// `repair_clear_stale_ownership`): either the precondition matched the
+/// ticket's live payload and the mutation landed, the ticket had already
+/// drifted away from the caller's evidence (fails closed, zero mutation), or
+/// the ticket no longer exists at all.
+#[derive(Debug)]
+pub enum CasOutcome {
+    Applied(Tuple),
+    Drifted { detail: String },
+    Gone,
+}
+
 /// Read a ticket tuple's delivery record, if it carries one.
 pub fn delivery_of(ticket: &Tuple) -> Option<DeliveryRecord> {
     serde_json::from_value(ticket.payload.get(DELIVERY_FIELD)?.clone()).ok()
@@ -681,6 +693,120 @@ impl Tickets {
         Ok(updated)
     }
 
+    /// Mechanically close a ticket whose own delivery record already proves
+    /// it shipped (`crate::reconcile::kind::DELIVERED_BUT_OPEN`), but only if
+    /// the ticket's live payload still carries exactly the merge commit the
+    /// caller verified before deciding to repair it — a compare-and-swap so a
+    /// concurrent status change (a human closing it by hand, a second repair
+    /// racing this one, a revert) is never clobbered. Takes the ticket
+    /// destructively, checks the precondition in memory under the same lock
+    /// every other mutation serializes through, and always writes the ticket
+    /// back — mutated on a match, byte-identical on a miss — so a losing
+    /// repair never destroys the ticket it took (same shape as [`claim`]).
+    ///
+    /// Deliberately bypasses [`valid_transition`]: like [`record_delivery`],
+    /// a durable delivery record is ground truth, not a workflow request, so
+    /// the close must be recordable from any prior non-terminal status.
+    ///
+    /// [`claim`]: Self::claim
+    /// [`record_delivery`]: Self::record_delivery
+    pub async fn repair_close_delivered(
+        &self,
+        id: &str,
+        expected_merge_commit: &str,
+    ) -> rk_core::Result<CasOutcome> {
+        let _guard = self.lock.lock().await;
+        let Some(existing) = self.take_ticket(id).await? else {
+            return Ok(CasOutcome::Gone);
+        };
+        let status = existing
+            .payload
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("open")
+            .to_string();
+        let current_commit = delivery_of(&existing).map(|d| d.merge_commit);
+        let matches = !matches!(status.as_str(), "done" | "closed")
+            && current_commit.as_deref() == Some(expected_merge_commit);
+        let mut payload = existing.payload.clone();
+        if matches {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("status".into(), json!("closed"));
+                obj.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
+            }
+        }
+        let updated = with_payload(existing, payload);
+        self.space.out(updated.clone())?;
+        if matches {
+            Ok(CasOutcome::Applied(updated))
+        } else {
+            Ok(CasOutcome::Drifted {
+                detail: format!(
+                    "expected status not in (done, closed) and delivery.merge_commit == {expected_merge_commit}, found status={status} delivery.merge_commit={current_commit:?}"
+                ),
+            })
+        }
+    }
+
+    /// Mechanically clear a stale ownership record
+    /// (`crate::reconcile::kind::TERMINAL_ASSIGNEE_ACTIVE_WORK`): the ticket
+    /// still names an owner whose agent record has settled terminal with no
+    /// hand-off recorded, so the ownership pointer itself is proven wrong by
+    /// durable evidence, independent of whatever redispatch decision comes
+    /// next (that decision stays [`crate::reconcile::Authority::Orchestrator`]
+    /// — this only un-sticks the record). Resets the ticket to `open` and
+    /// clears `assignee` so it becomes claimable again.
+    ///
+    /// Compare-and-swap on `(status, assignee)` exactly as read by the
+    /// caller, with the same take-check-always-write-back shape as
+    /// [`repair_close_delivered`] — a live owner reclaiming the ticket, or a
+    /// concurrent status change, drifts the precondition and the write is a
+    /// no-op.
+    ///
+    /// [`repair_close_delivered`]: Self::repair_close_delivered
+    pub async fn repair_clear_stale_ownership(
+        &self,
+        id: &str,
+        expected_status: &str,
+        expected_assignee: Option<&str>,
+    ) -> rk_core::Result<CasOutcome> {
+        let _guard = self.lock.lock().await;
+        let Some(existing) = self.take_ticket(id).await? else {
+            return Ok(CasOutcome::Gone);
+        };
+        let status = existing
+            .payload
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("open")
+            .to_string();
+        let assignee = existing
+            .payload
+            .get("assignee")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let matches = status == expected_status && assignee.as_deref() == expected_assignee;
+        let mut payload = existing.payload.clone();
+        if matches {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("status".into(), json!("open"));
+                obj.insert("assignee".into(), Value::Null);
+                obj.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
+            }
+        }
+        let updated = with_payload(existing, payload);
+        self.space.out(updated.clone())?;
+        if matches {
+            Ok(CasOutcome::Applied(updated))
+        } else {
+            Ok(CasOutcome::Drifted {
+                detail: format!(
+                    "expected status={expected_status} assignee={expected_assignee:?}, found status={status} assignee={assignee:?}"
+                ),
+            })
+        }
+    }
+
     /// Announce a just-closed ticket as an `Event` tuple the reactor can react
     /// to. Scoped to the ticket's repo so a trigger's repo defaults to that repo
     /// (and its fan-out drains that repo's newly-ready backlog).
@@ -1289,5 +1415,126 @@ mod tests {
         let mut nt = new("x", "r", None);
         nt.depends_on = vec!["TKT-999".into()];
         assert!(t.create(nt).await.is_err());
+    }
+
+    /// The delivered-but-open shape (a delivery record present, status still
+    /// non-terminal) only arises from a direct payload write or a status
+    /// regression after delivery — never from the ordinary `Tickets` API,
+    /// which always closes atomically with the record ([`Tickets::record_delivery`]).
+    /// Built the same way `reconcile.rs`'s own tests build it: a raw tuple
+    /// written straight to the space, bypassing `Tickets` entirely.
+    fn seed_delivered_but_open(space: &Space, id: &str, merge_commit: &str) {
+        let payload = json!({
+            "title": "t",
+            "status": "in_progress",
+            "assignee": Value::Null,
+            "delivery": {
+                "merge_commit": merge_commit,
+                "branch": "rat/x/tkt-1",
+                "target": "main",
+                "landed_at": "2026-08-19T00:00:00Z",
+            },
+        });
+        space
+            .out(
+                Tuple::new(Category::Task, "repo", id, "castle", payload)
+                    .with_lifecycle(Lifecycle::Session),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn repair_close_delivered_applies_on_a_matching_precondition() {
+        let (t, space) = tickets_with_space();
+        seed_delivered_but_open(&space, "TKT-1", "abc123");
+
+        let outcome = t.repair_close_delivered("TKT-1", "abc123").await.unwrap();
+        assert!(matches!(outcome, CasOutcome::Applied(_)));
+        assert_eq!(t.get("TKT-1").unwrap().unwrap().payload["status"], "closed");
+    }
+
+    #[tokio::test]
+    async fn repair_close_delivered_drifts_closed_on_a_mismatched_commit() {
+        let (t, space) = tickets_with_space();
+        seed_delivered_but_open(&space, "TKT-1", "abc123");
+
+        let outcome = t
+            .repair_close_delivered("TKT-1", "does-not-match")
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CasOutcome::Drifted { .. }));
+        // Zero mutation: still exactly the ticket the caller took, unchanged.
+        assert_eq!(
+            t.get("TKT-1").unwrap().unwrap().payload["status"],
+            "in_progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_close_delivered_drifts_on_an_already_terminal_ticket() {
+        let t = tickets();
+        let id = t.create(new("work", "repo", None)).await.unwrap().identity;
+        t.record_delivery(&id, &record("abc123")).await.unwrap(); // already closes it
+        let outcome = t.repair_close_delivered(&id, "abc123").await.unwrap();
+        assert!(matches!(outcome, CasOutcome::Drifted { .. }));
+    }
+
+    #[tokio::test]
+    async fn repair_close_delivered_reports_gone_on_a_missing_ticket() {
+        let t = tickets();
+        let outcome = t.repair_close_delivered("TKT-999", "abc123").await.unwrap();
+        assert!(matches!(outcome, CasOutcome::Gone));
+    }
+
+    #[tokio::test]
+    async fn repair_clear_stale_ownership_applies_on_a_matching_precondition() {
+        let t = tickets();
+        let a = t.create(new("x", "r", None)).await.unwrap();
+        t.update(
+            &a.identity,
+            TicketChanges {
+                status: Some("in_progress".into()),
+                assignee: Some("Whisker".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let outcome = t
+            .repair_clear_stale_ownership(&a.identity, "in_progress", Some("Whisker"))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CasOutcome::Applied(_)));
+        let stored = t.get(&a.identity).unwrap().unwrap();
+        assert_eq!(stored.payload["status"], "open");
+        assert_eq!(stored.payload["assignee"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn repair_clear_stale_ownership_drifts_closed_when_the_owner_already_moved_on() {
+        let t = tickets();
+        let a = t.create(new("x", "r", None)).await.unwrap();
+        t.update(
+            &a.identity,
+            TicketChanges {
+                status: Some("in_progress".into()),
+                assignee: Some("Whisker".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // The live owner advanced it between the caller's read and this call.
+        set_status(&t, &a.identity, "blocked").await;
+
+        let outcome = t
+            .repair_clear_stale_ownership(&a.identity, "in_progress", Some("Whisker"))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CasOutcome::Drifted { .. }));
+        let stored = t.get(&a.identity).unwrap().unwrap();
+        assert_eq!(stored.payload["status"], "blocked", "no mutation on drift");
+        assert_eq!(stored.payload["assignee"], "Whisker");
     }
 }
