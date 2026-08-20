@@ -131,6 +131,25 @@ pub struct LandingPolicy {
     /// means unlimited, matching the fleet budget convention.
     #[serde(default = "default_rework_max_usd", rename = "reworkMaxUsd")]
     pub rework_max_usd: u32,
+    /// Shadow-review model (phase-2 P4a): when non-empty, every review
+    /// request ALSO spawns a second, non-blocking reviewer on this model,
+    /// chained onto the same candidate branch/commit. Its verdict is
+    /// recorded alongside the primary reviewer's for comparison
+    /// (`review-shadow-comparison` artifact) but never gates landing and
+    /// never changes which model is authoritative — the primary reviewer
+    /// (this workflow's own `agents.reviewer`) stays the one and only
+    /// verdict `LandingPipeline` routes on. Empty disables shadow review
+    /// entirely (default: `"sonnet"`, additive and non-gating, so this is
+    /// safe to leave on).
+    #[serde(default = "default_shadow_review_model", rename = "shadowReviewModel")]
+    pub shadow_review_model: String,
+    /// Harness for the shadow reviewer. Ignored when `shadow_review_model`
+    /// is empty.
+    #[serde(
+        default = "default_shadow_review_harness",
+        rename = "shadowReviewHarness"
+    )]
+    pub shadow_review_harness: String,
 }
 
 impl Default for LandingPolicy {
@@ -145,6 +164,8 @@ impl Default for LandingPolicy {
             rework_auto_dispatch: true,
             max_rework_attempts: default_max_rework_attempts(),
             rework_max_usd: default_rework_max_usd(),
+            shadow_review_model: default_shadow_review_model(),
+            shadow_review_harness: default_shadow_review_harness(),
         }
     }
 }
@@ -317,6 +338,14 @@ fn default_review_timeout() -> String {
 
 fn default_review_max_wait() -> String {
     "45m".into()
+}
+
+fn default_shadow_review_model() -> String {
+    "sonnet".into()
+}
+
+fn default_shadow_review_harness() -> String {
+    "claude".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2578,6 +2607,32 @@ checks: [
         assert_eq!(policy.landing.gate_timeout, "60m");
         assert_eq!(policy.landing.review_timeout, "15m");
         assert_eq!(policy.landing.review_max_wait, "45m");
+        assert_eq!(policy.landing.shadow_review_model, "sonnet");
+        assert_eq!(policy.landing.shadow_review_harness, "claude");
+    }
+
+    #[test]
+    fn repository_policy_loads_versioned_shadow_review_policy() {
+        let policy = load_repository_policy_str(
+            r#"
+            repo: {
+                landing: {
+                    shadowReviewModel:   "opus"
+                    shadowReviewHarness: "codex"
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(policy.landing.shadow_review_model, "opus");
+        assert_eq!(policy.landing.shadow_review_harness, "codex");
+
+        // Empty disables shadow review; the loader must not reject it.
+        let disabled = load_repository_policy_str(
+            r#"repo: {landing: {shadowReviewModel: ""}}"#,
+        )
+        .unwrap();
+        assert_eq!(disabled.landing.shadow_review_model, "");
     }
 
     #[test]

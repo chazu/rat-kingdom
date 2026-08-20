@@ -62,6 +62,16 @@ repo: #RepositoryPolicy
 	maxReworkAttempts: int | *1
 	// Hard ceiling on cumulative USD across one review/rework chain. 0 = unlimited.
 	reworkMaxUsd: int | *25
+	// SHADOW REVIEW (phase-2 P4a): when non-empty, every review request ALSO
+	// spawns a second, non-blocking reviewer on this model, chained onto the
+	// same candidate. Its verdict is recorded for comparison against the
+	// primary reviewer's (a `review-shadow-comparison` artifact) but never
+	// gates landing and never replaces the primary reviewer — this workflow's
+	// own `agents.reviewer` stays the one and only verdict LandingPipeline
+	// routes on. Empty disables shadow review.
+	shadowReviewModel: string | *"sonnet"
+	// Harness for the shadow reviewer. Ignored when shadowReviewModel is empty.
+	shadowReviewHarness: string | *"claude"
 }
 
 // Regenerable build-artifact paths (relative to a worktree root) the daemon's
