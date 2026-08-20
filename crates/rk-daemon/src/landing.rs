@@ -341,6 +341,20 @@ pub(crate) struct ShadowReview {
     harness: String,
 }
 
+/// The per-request data for [`LandingPipeline::await_shadow_comparison`],
+/// bundled so the detached task's call site is a single struct literal
+/// rather than the flat argument list that used to trip
+/// `clippy::too_many_arguments` (the comparison also needs `Space`,
+/// `Arc<WorkflowEngine>`, and `Arc<Supervisor>`, which stay separate params
+/// since they're handles, not request data).
+struct ShadowComparisonRequest {
+    entry: LandingQueueEntry,
+    shadow: ShadowReview,
+    primary_attempt: String,
+    primary_verdict: String,
+    wait: Duration,
+}
+
 fn required_payload_str<'a>(
     payload: &'a Value,
     field: &str,
@@ -1943,17 +1957,14 @@ impl LandingPipeline {
         let primary_attempt = primary_attempt.to_string();
         let wait = gates.review_max_wait;
         tokio::spawn(async move {
-            if let Err(e) = Self::await_shadow_comparison(
-                space,
-                engine,
-                supervisor,
+            let request = ShadowComparisonRequest {
                 entry,
                 shadow,
                 primary_attempt,
                 primary_verdict,
                 wait,
-            )
-            .await
+            };
+            if let Err(e) = Self::await_shadow_comparison(space, engine, supervisor, request).await
             {
                 warn!(error = %e, "landing pipeline: shadow-review comparison not recorded");
             }
@@ -1976,12 +1987,15 @@ impl LandingPipeline {
         space: Space,
         engine: Arc<WorkflowEngine>,
         supervisor: Arc<Supervisor>,
-        entry: LandingQueueEntry,
-        shadow: ShadowReview,
-        primary_attempt: String,
-        primary_verdict: String,
-        wait: Duration,
+        request: ShadowComparisonRequest,
     ) -> rk_core::Result<Tuple> {
+        let ShadowComparisonRequest {
+            entry,
+            shadow,
+            primary_attempt,
+            primary_verdict,
+            wait,
+        } = request;
         let mut pattern = Pattern::category(Category::Artifact)
             .identity(REVIEW_ARTIFACT_IDENTITY)
             .scope(&entry.repo_name);
