@@ -842,30 +842,34 @@ pub struct Reap {
     pub git: bool,
     /// The generation's transcript file under `agent-logs/`. One-way.
     pub logs: bool,
-    /// Regenerable build-artifact paths (relative to a worktree root) to
-    /// delete from EVERY archived record's worktree, terminal state
-    /// regardless of merge outcome — unlike `git` above, there is no
-    /// merged-or-gone gate, because an unmerged branch's build output is
-    /// exactly as regenerable as a merged one's. Empty disables artifact
-    /// reaping (the default, so a bare `Reap` stays a total no-op).
+    /// Master switch for build-artifact reclaim. Whether anything actually
+    /// gets deleted for a given record is then decided per-repo: its own
+    /// activated `.rk/repo.cue` `reap.artifactPaths` if it declares one, else
+    /// the operator-set [`artifact_paths_by_repo`](Self::artifact_paths_by_repo)/
+    /// [`artifact_paths`](Self::artifact_paths) fallback below — see
+    /// [`Supervisor::reap_artifacts`]. A repo that has configured neither
+    /// stays a no-op even with this on, so leaving it on by default is safe.
+    pub artifacts: bool,
+    /// Fleet-wide fallback build-artifact paths (relative to a worktree
+    /// root), used only for a repo whose activated policy declares no
+    /// `reap.artifactPaths` of its own. STACK NEUTRALITY: empty by default —
+    /// see [`Supervisor::reap_artifacts`].
     pub artifact_paths: Vec<String>,
-    /// Per-repo override of `artifact_paths`, keyed by repo name — a repo
-    /// with an entry here uses THAT list instead (not merged with it).
+    /// Per-repo override of `artifact_paths`, keyed by repo name — same
+    /// fallback role, consulted before the fleet-wide default.
     pub artifact_paths_by_repo: HashMap<String, Vec<String>>,
 }
 
 impl Reap {
-    /// The paths to reap for one record's repo: its per-repo override if one
-    /// is configured, else the fleet-wide default.
+    /// The fallback paths to reap for one record's repo — its per-repo
+    /// override if one is configured, else the fleet-wide default. Only
+    /// consulted when the repo's own activated policy names nothing; see
+    /// [`Supervisor::reap_artifacts`].
     fn artifact_paths_for(&self, repo: &str) -> &[String] {
         self.artifact_paths_by_repo
             .get(repo)
             .map(Vec::as_slice)
             .unwrap_or(&self.artifact_paths)
-    }
-
-    fn reaps_artifacts(&self) -> bool {
-        !self.artifact_paths.is_empty() || !self.artifact_paths_by_repo.is_empty()
     }
 }
 
@@ -5249,7 +5253,7 @@ impl Supervisor {
         } else {
             Vec::new()
         };
-        let reaped_artifacts: Vec<serde_json::Value> = if reap.reaps_artifacts() {
+        let reaped_artifacts: Vec<serde_json::Value> = if reap.artifacts {
             archived
                 .iter()
                 .map(|r| self.reap_artifacts(r, reap.artifact_paths_for(&r.repo_name)))
@@ -5362,7 +5366,7 @@ impl Supervisor {
     ///
     /// [`archive_agents`]: Self::archive_agents
     pub fn reap_terminal_artifacts(&self, reap: &Reap) -> Vec<serde_json::Value> {
-        if !reap.reaps_artifacts() {
+        if !reap.artifacts {
             return Vec::new();
         }
         self.lock_registry()
@@ -5376,7 +5380,7 @@ impl Supervisor {
     /// `target` — from its worktree, regardless of merge state. Unlike
     /// [`reap_git`](Self::reap_git) there is no merged-or-gone gate: an
     /// unmerged branch's build output is exactly as regenerable as a merged
-    /// one's, and only the paths in `paths` are ever removed, so the source
+    /// one's, and only the resolved paths are ever removed, so the source
     /// tree, git history, and any uncommitted edits elsewhere in the worktree
     /// stay completely untouched. Reachable via [`archive_agents`] (archived
     /// records) and [`reap_terminal_artifacts`](Self::reap_terminal_artifacts)
@@ -5384,16 +5388,28 @@ impl Supervisor {
     /// be terminal (Completed/Failed/Dismissed); a live agent's worktree is
     /// never a candidate.
     ///
-    /// Each entry in `paths` is a literal worktree-relative path (not a shell
+    /// STACK NEUTRALITY: which paths get removed is resolved per-repo, not
+    /// hardcoded here — the record's own repo, if registered, uses its
+    /// activated `.rk/repo.cue` `reap.artifactPaths`
+    /// ([`rk_workflow::ReapPolicy`]) whenever it declares one; only a repo
+    /// that declares NOTHING falls back to `fallback_paths` (the caller's
+    /// operator-set [`Reap::artifact_paths`]/`artifact_paths_by_repo`, empty
+    /// by default). The daemon itself never assumes what any language's
+    /// build directory is called.
+    ///
+    /// Each resolved entry is a literal worktree-relative path (not a shell
     /// glob); entries that are empty, absolute, contain a `..` segment, or
     /// resolve to the worktree root itself (`.`, `./`, or equivalent — every
     /// segment empty or `.`) are skipped defensively rather than resolved,
     /// since nothing about this reap should ever be able to reach outside —
-    /// or BE — the worktree.
+    /// or BE — the worktree. `.rk/repo.cue` policy loading already rejects
+    /// these at activation time; the check is repeated here as the last line
+    /// of defense against the operator-set fallback, which is not
+    /// schema-validated the same way.
     ///
     /// Best-effort in the same shape as `reap_git`/`reap_log`: a failure is a
     /// `reaped: false` row with a reason, never a failed archive.
-    fn reap_artifacts(&self, record: &AgentRecord, paths: &[String]) -> serde_json::Value {
+    fn reap_artifacts(&self, record: &AgentRecord, fallback_paths: &[String]) -> serde_json::Value {
         let row = |reaped: bool, reason: String| json!({"agent": record.name, "reaped": reaped, "reason": reason});
         let Some(worktree) = &record.worktree else {
             return row(false, "no worktree recorded".into());
@@ -5401,6 +5417,15 @@ impl Supervisor {
         if !worktree.exists() {
             return row(false, "worktree already gone".into());
         }
+        let policy_paths = Repo::discover(&record.repo_root)
+            .ok()
+            .map(|repo| self.repository_policy(&repo).reap.artifact_paths)
+            .unwrap_or_default();
+        let paths: &[String] = if !policy_paths.is_empty() {
+            &policy_paths
+        } else {
+            fallback_paths
+        };
         let mut removed = Vec::new();
         for rel in paths {
             let resolves_to_root = rel.split('/').all(|seg| seg.is_empty() || seg == ".");

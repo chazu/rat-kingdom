@@ -474,6 +474,12 @@ async fn periodic_sweep_reaps_terminal_artifacts_regardless_of_merge_state() {
         interval_secs: 1,
         after_days: 0,
         finalize_cleanup_enabled: false,
+        // Operator-set fallback: this repo is unregistered (no activated
+        // `.rk/repo.cue`), so `reap_artifacts` falls back to this list. The
+        // shipped default is empty — see
+        // `periodic_sweep_reaps_artifacts_immediately_under_default_after_days`
+        // for the repo-policy-driven path this exists alongside.
+        artifact_paths: vec!["target".to_string()],
         ..rk_core::config::WorktreeSweepConfig::default()
     });
     let _handle = tokio::spawn(daemon.run());
@@ -557,15 +563,26 @@ async fn periodic_sweep_reaps_terminal_artifacts_regardless_of_merge_state() {
 /// "reaped once the (already-elapsed) cutoff passed" — it would pass even if
 /// artifact reap were still wired through the age-gated `archive_agents`
 /// path. This one runs the SHIPPED DEFAULT `WorktreeSweepConfig` (whose
-/// `after_days` is 3) and proves a `target/` dir is gone well within one
-/// sweep interval regardless — the exact default-config gap the reviewer
-/// flagged: a newly terminal agent's build artifacts must not stand for
-/// `after_days` before the first sweep even looks at them.
+/// `after_days` is 3, and whose `artifact_paths` is now EMPTY — TKT-P3b
+/// stack neutrality: the daemon has no built-in notion of what any
+/// language's build directory is called) and proves a `target/` dir is still
+/// gone well within one sweep interval, driven entirely by the repo's own
+/// activated `.rk/repo.cue` `reap.artifactPaths` — the exact default-config
+/// gap the reviewer flagged: a newly terminal agent's build artifacts must
+/// not stand for `after_days` before the first sweep even looks at them.
 #[tokio::test]
 async fn periodic_sweep_reaps_artifacts_immediately_under_default_after_days() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
+    std::fs::create_dir_all(repo_dir.path().join(".rk")).unwrap();
+    std::fs::write(
+        repo_dir.path().join(".rk/repo.cue"),
+        r#"repo: { reap: { artifactPaths: ["target"] } }"#,
+    )
+    .unwrap();
+    git(repo_dir.path(), &["add", ".rk"]);
+    git(repo_dir.path(), &["commit", "-m", "policy: reap target/"]);
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
     let layout = Layout::at(home.path());
@@ -574,12 +591,28 @@ async fn periodic_sweep_reaps_artifacts_immediately_under_default_after_days() {
         enabled: true,
         interval_secs: 1,
         finalize_cleanup_enabled: false,
-        // Deliberately NOT overridden: this is the shipped default (3 days),
-        // which must not gate the artifact reap below.
+        // Deliberately NOT overridden: this is the shipped default (3 days,
+        // empty artifact_paths) — the reap below must come entirely from the
+        // repo's own registered policy, not this daemon-wide fallback.
         ..rk_core::config::WorktreeSweepConfig::default()
     });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+
+    let repo_name = repo_dir.path().file_name().unwrap().to_string_lossy();
+    let added = client
+        .call(
+            "repo.add",
+            json!({"name": repo_name, "path": repo_dir.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        added["repo"]["activated_policy"]["digest"]
+            .as_str()
+            .is_some_and(|d| d.len() == 64),
+        "registration must activate the repo's reap.artifactPaths policy: {added}"
+    );
 
     let name = spawn(
         &mut client,
@@ -613,6 +646,58 @@ async fn periodic_sweep_reaps_artifacts_immediately_under_default_after_days() {
     assert!(
         worktree.exists(),
         "artifact reap must never remove the worktree itself"
+    );
+}
+
+/// STACK NEUTRALITY (binding, TKT-P3b): the shipped `WorktreeSweepConfig`
+/// default is empty and a repo that never activates a `reap.artifactPaths`
+/// policy of its own gets no artifact reaping at all — the daemon must never
+/// guess a build directory name on a repo's behalf. Pins the "reap nothing"
+/// half of the default that `periodic_sweep_reaps_artifacts_immediately_under_default_after_days`
+/// pins the opposite (policy-declared) half of.
+#[tokio::test]
+async fn periodic_sweep_reaps_nothing_for_a_repo_with_no_declared_artifact_paths() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
+    let layout = Layout::at(home.path());
+    let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
+        enabled: true,
+        interval_secs: 1,
+        after_days: 0,
+        finalize_cleanup_enabled: false,
+        // Shipped default: no fallback paths, and this repo is never
+        // registered so it has no activated policy either.
+        ..rk_core::config::WorktreeSweepConfig::default()
+    });
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let name = spawn(
+        &mut client,
+        repo_dir.path(),
+        "sweep-artifacts-no-policy-1",
+        json!({}),
+    )
+    .await;
+    wait_for_state(&mut client, &name, "completed").await;
+
+    let agents = list(&mut client, json!({})).await;
+    let rec = agents.iter().find(|a| a["name"] == name).unwrap();
+    let worktree = PathBuf::from(rec["worktree"].as_str().unwrap());
+
+    std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
+    std::fs::write(worktree.join("target/debug/build-marker"), b"binary").unwrap();
+
+    // Several sweep ticks to give a wrongly-firing reap a chance to act.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    assert!(
+        worktree.join("target").exists(),
+        "with no declared reap.artifactPaths anywhere, the shipped-default sweep must reap nothing"
     );
 }
 

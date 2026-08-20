@@ -4065,6 +4065,11 @@ impl Daemon {
         let artifact_reap = crate::supervisor::Reap {
             git: false,
             logs: false,
+            // Always on: whether anything is actually removed for a given
+            // repo is decided per-record inside `reap_artifacts` from that
+            // repo's own activated policy, falling back to the operator-set
+            // lists below (empty by default — STACK NEUTRALITY).
+            artifacts: true,
             artifact_paths: self.worktree_sweep_config.artifact_paths.clone(),
             artifact_paths_by_repo: self.worktree_sweep_config.artifact_paths_by_repo.clone(),
         };
@@ -4075,6 +4080,7 @@ impl Daemon {
         let reap = crate::supervisor::Reap {
             git: true,
             logs: false,
+            artifacts: true,
             artifact_paths: self.worktree_sweep_config.artifact_paths.clone(),
             artifact_paths_by_repo: self.worktree_sweep_config.artifact_paths_by_repo.clone(),
         };
@@ -6809,6 +6815,7 @@ impl Daemon {
         let reap = crate::supervisor::Reap {
             git: params.reap_git,
             logs: params.reap_logs,
+            artifacts: params.reap_artifacts,
             artifact_paths: if params.reap_artifacts {
                 self.worktree_sweep_config.artifact_paths.clone()
             } else {

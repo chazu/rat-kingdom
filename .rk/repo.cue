@@ -16,4 +16,12 @@ repo: {
 		remoteBranch: "{{branch}}"
 		deleteSource: true
 	}
+
+	// Regenerable build-artifact paths the daemon's worktree sweep reclaims
+	// from every terminal agent's worktree, any merge state (TKT-P3b). The
+	// daemon itself defaults to reaping nothing — this cargo workspace is the
+	// one declaring that its own `target/` is safe to delete.
+	reap: {
+		artifactPaths: ["target"]
+	}
 }
