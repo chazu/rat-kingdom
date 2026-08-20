@@ -190,6 +190,14 @@ pub struct Daemon {
     /// this lock prevents concurrent operator retries racing those checkpoints.
     ticket_graph_apply_lock: tokio::sync::Mutex<()>,
     action_approvals: crate::action_approval::ActionApprovalStore,
+    /// TKT-01M0E8PN9C41BWECGNW0990R3J: the durable orchestrator lease store
+    /// (one lease per repo scope) an `attention.decide` orchestrator-authority
+    /// call must hold before it may act.
+    orchestrator_lease: crate::orchestrator_lease::LeaseStore,
+    /// The authority-ladder policy (`[policy]` in `config.toml`), built once
+    /// at startup — see `crate::authority::AuthorityPolicy` for why nothing
+    /// mutates this at runtime.
+    authority_policy: crate::authority::AuthorityPolicy,
     tickets: Arc<crate::tickets::Tickets>,
     coordinator_sessions: std::sync::Mutex<crate::coordinator::CoordinatorSessions>,
     /// Serializes read/append cycles for one agent's effective fact vote.
@@ -311,6 +319,7 @@ impl Daemon {
         daemon.automated_landing_workflows = config.policy.automated_landing_workflows.clone();
         daemon.default_merge_mode = config.policy.default_merge_mode;
         daemon.allowed_target_branches = config.policy.allowed_target_branches.clone();
+        daemon.authority_policy = crate::authority::AuthorityPolicy::from_config(&config.policy)?;
         if config.sync.enabled {
             let syncer = crate::sync::Syncer::new(
                 &daemon.layout,
@@ -382,6 +391,18 @@ impl Daemon {
     #[doc(hidden)]
     pub fn set_require_named_checks(&mut self, v: bool) {
         self.require_named_checks = v;
+    }
+
+    /// Test-only equivalent of `Daemon::new`'s
+    /// `AuthorityPolicy::from_config(&config.policy)` — an in-memory/bare
+    /// test daemon has no `config.toml` to load, so a test that needs a
+    /// non-default authority-ladder policy (e.g. an orchestrator action
+    /// allowlist entry) sets it directly. Panics on an invalid policy
+    /// (a widening override), the same as a real daemon would fail to start.
+    #[doc(hidden)]
+    pub fn set_authority_policy_for_tests(&mut self, cfg: &rk_core::config::PolicyConfig) {
+        self.authority_policy = crate::authority::AuthorityPolicy::from_config(cfg)
+            .expect("test authority policy config must be valid");
     }
 
     #[doc(hidden)]
@@ -492,6 +513,9 @@ impl Daemon {
         let action_approvals = crate::action_approval::ActionApprovalStore::load(
             layout.home().join("factory-actions.json"),
         )?;
+        let orchestrator_lease = crate::orchestrator_lease::LeaseStore::load(
+            layout.home().join("orchestrator-lease.json"),
+        )?;
         Ok(Self {
             layout,
             space,
@@ -581,6 +605,8 @@ impl Daemon {
             onboarding_apply_lock: tokio::sync::Mutex::new(()),
             ticket_graph_apply_lock: tokio::sync::Mutex::new(()),
             action_approvals,
+            orchestrator_lease,
+            authority_policy: crate::authority::AuthorityPolicy::default(),
             tickets,
             coordinator_sessions,
             fact_vote_lock: std::sync::Mutex::new(()),
@@ -2229,6 +2255,10 @@ impl Daemon {
             "inbox.list" => reply(self.handle_inbox(req).await),
             "inbox.ack" => reply(self.handle_inbox_ack(req)),
             "reconcile.report" => reply(self.handle_reconcile(req).await),
+            "lease.acquire" => reply(self.handle_lease_acquire(req).await),
+            "lease.renew" => reply(self.handle_lease_renew(req).await),
+            "attention.next" => reply(self.handle_attention_next(req).await),
+            "attention.decide" => reply(self.handle_attention_decide(req).await),
             "agent.status" => reply(self.handle_named(req, |sup, name| {
                 sup.status(&name)
                     .map(|r| json!({"agent": r}))
@@ -2882,6 +2912,19 @@ impl Daemon {
     /// to that pure function. Read-only throughout — every git call below is
     /// one of `rk_git::Repo`'s ancestry reads, never a mutation.
     async fn reconcile_value(&self, requested_repo: String) -> rk_core::Result<Value> {
+        let report = self.reconcile_report(requested_repo).await?;
+        Ok(crate::reconcile::to_json(&report))
+    }
+
+    /// The typed report `reconcile_value` renders to JSON — factored out so
+    /// `crate::attention` (TKT-01M0E8PN9C41BWECGNW0990R3J) can consume the
+    /// same live `Violation`s the operator-facing `reconcile.report` shows,
+    /// rather than re-deriving a second, disconnected view of "what needs
+    /// attention".
+    async fn reconcile_report(
+        &self,
+        requested_repo: String,
+    ) -> rk_core::Result<crate::reconcile::ConvergenceReport> {
         let repo = self
             .resolve_inbox_repo(Some(requested_repo))?
             .ok_or_else(|| rk_core::Error::other("repo is required"))?;
@@ -2958,7 +3001,7 @@ impl Daemon {
             .filter(|i| i.repo == repo)
             .collect();
 
-        let report = crate::reconcile::build(
+        Ok(crate::reconcile::build(
             &repo,
             &tickets,
             &agents,
@@ -2967,8 +3010,7 @@ impl Daemon {
             &queued_tickets,
             &instances,
             &git,
-        );
-        Ok(crate::reconcile::to_json(&report))
+        ))
     }
 
     /// `(merge_commit, target) -> is merge_commit an ancestor of target?` for
@@ -3109,6 +3151,509 @@ impl Daemon {
             Ok(value) => Response::ok(req.id, value),
             Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
         }
+    }
+
+    /// `lease.acquire` — TKT-01M0E8PN9C41BWECGNW0990R3J: a primed external
+    /// orchestrator session's entry point. The SAME `holder` calling again
+    /// (after a disconnect or a daemon restart) resumes its generation and
+    /// cursor untouched; a DIFFERENT holder may only take over once the
+    /// existing lease has expired.
+    async fn handle_lease_acquire(&self, req: Request) -> Response {
+        let params: LeaseAcquireParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let repo = match self.resolve_inbox_repo(Some(params.repo)) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Response::err(req.id, codes::BAD_PARAMS, "repo is required"),
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        };
+        let ttl = params
+            .ttl_secs
+            .unwrap_or(self.authority_policy.lease_ttl_secs);
+        match self
+            .orchestrator_lease
+            .acquire(&repo, &params.holder, ttl, (self.request_clock)())
+        {
+            Ok(lease) => Response::ok(req.id, json!(lease)),
+            Err(e) => Response::err(req.id, codes::FORBIDDEN, e.to_string()),
+        }
+    }
+
+    /// `lease.renew` — extend a held lease's TTL without disturbing its
+    /// generation or cursor. Fenced identically to `attention.decide`: a
+    /// stale generation (this holder has since been replaced) is refused.
+    async fn handle_lease_renew(&self, req: Request) -> Response {
+        let params: LeaseRenewParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let repo = match self.resolve_inbox_repo(Some(params.repo)) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Response::err(req.id, codes::BAD_PARAMS, "repo is required"),
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        };
+        let ttl = params
+            .ttl_secs
+            .unwrap_or(self.authority_policy.lease_ttl_secs);
+        match self.orchestrator_lease.renew(
+            &repo,
+            &params.holder,
+            params.generation,
+            ttl,
+            (self.request_clock)(),
+        ) {
+            Ok(lease) => Response::ok(req.id, json!(lease)),
+            Err(e) => Response::err(req.id, codes::FORBIDDEN, e.to_string()),
+        }
+    }
+
+    /// `attention.next` — the next resumable attention item for one
+    /// repository: the freshest `reconcile.report` for it, consumed against
+    /// the repo's current lease cursor (or from the very start if no lease
+    /// has ever been acquired). Read-only, like `reconcile.report` itself.
+    async fn handle_attention_next(&self, req: Request) -> Response {
+        let params: AttentionNextParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let report = match self.reconcile_report(params.repo).await {
+            Ok(r) => r,
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        let cursor = match self.orchestrator_lease.current(&report.scope) {
+            Ok(lease) => lease.and_then(|l| l.cursor),
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        let item =
+            crate::attention::next_attention(&report, &self.authority_policy, cursor.as_deref());
+        Response::ok(req.id, json!({"repo": report.scope, "item": item}))
+    }
+
+    /// `attention.decide` — TKT-01M0E8PN9C41BWECGNW0990R3J: resolve one
+    /// attention item, dispatched by its effective authority.
+    ///
+    /// * `Human` — refused outright. Nothing is written, nothing is executed
+    ///   — "pauses with no side effect" holds exactly because this arm never
+    ///   reaches the journal write below.
+    /// * `Mechanical` — the durable record already proves the fix
+    ///   (`crate::attention::mechanical_action_for`); no lease, no LLM, no
+    ///   rate cap.
+    /// * `Orchestrator` — requires a live, fenced lease over this repo and a
+    ///   kind the castle's `orchestrator_action_allowlist` names explicitly,
+    ///   and is rate-capped fleet-wide through the SAME `RecoveryAnnouncer`
+    ///   every other automated recovery source in this daemon uses, so a
+    ///   rate-held decision is announced (visible in `rk inbox`) exactly
+    ///   like a held mechanical recovery action, not silently dropped.
+    ///
+    /// Every path checks the durable decision journal FIRST: a violation id
+    /// that already has a recorded decision returns it verbatim as a replay
+    /// — the repair function is never called a second time, which is what
+    /// makes replaying a fixture unable to repeat a mutation.
+    async fn handle_attention_decide(&self, req: Request) -> Response {
+        let params: AttentionDecideParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        match self.attention_decide(params).await {
+            Ok(value) => Response::ok(req.id, value),
+            Err(AttentionDecideError::Refused(msg)) => Response::err(req.id, codes::FORBIDDEN, msg),
+            Err(AttentionDecideError::BadParams(msg)) => {
+                Response::err(req.id, codes::BAD_PARAMS, msg)
+            }
+            Err(AttentionDecideError::Internal(msg)) => Response::err(req.id, codes::INTERNAL, msg),
+        }
+    }
+
+    async fn attention_decide(
+        &self,
+        params: AttentionDecideParams,
+    ) -> Result<Value, AttentionDecideError> {
+        let repo = self
+            .resolve_inbox_repo(Some(params.repo))
+            .map_err(|e| AttentionDecideError::Internal(e.to_string()))?
+            .ok_or_else(|| AttentionDecideError::BadParams("repo is required".to_string()))?;
+
+        // Consult the durable decision journal BEFORE rebuilding the report:
+        // a mechanical/orchestrator repair can be self-clearing (the
+        // violation it fixed no longer appears in a FRESH
+        // `reconcile.report`), so checking "is this violation still live"
+        // first would make a resumed/replayed `attention.decide` for an
+        // already-terminal item look like "not found" instead of returning
+        // the terminal decision it already recorded.
+        if let Some(existing) = self
+            .find_decision(&repo, &params.item)
+            .map_err(|e| AttentionDecideError::Internal(e.to_string()))?
+        {
+            // Mirror the ORIGINAL decision's own shape rather than assuming
+            // "found a record" means "resolved": a human gate that already
+            // fired records `resolved: false, gated: true` (zero mutation,
+            // still paused) and a replay must say the same thing again, not
+            // claim the item was resolved just because a durable record for
+            // it exists.
+            let resolved = existing
+                .get("resolved")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let gated = existing
+                .get("gated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            return Ok(
+                json!({"resolved": resolved, "replay": true, "gated": gated, "decision": existing}),
+            );
+        }
+
+        let report = self
+            .reconcile_report(repo.clone())
+            .await
+            .map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
+        let Some(violation) = report.violations.iter().find(|v| v.id == params.item) else {
+            return Ok(json!({
+                "resolved": false,
+                "replay": false,
+                "reason": "attention item not found: already resolved, or state has changed since it was surfaced",
+            }));
+        };
+        let authority = self.authority_policy.effective_authority(violation);
+
+        match authority {
+            crate::reconcile::Authority::Human => {
+                // Refused with ZERO mutation: no tuple is written on this arm
+                // at all, so "pauses with no side effect" holds exactly and
+                // a replayed call for the same violation id simply re-evaluates
+                // (nothing was ever journaled to replay) and is refused again.
+                let message = match crate::attention::human_gate_for(violation) {
+                    Some(gate) => format!(
+                        "{} is human-gated ({}): no automated action is permitted — {}. \
+                         Blast radius: {}. Resolving action: {}",
+                        violation.id,
+                        violation.detail,
+                        gate.requested_decision,
+                        gate.blast_radius,
+                        gate.resolving_action
+                    ),
+                    None => format!(
+                        "{} is human-gated ({}): no automated action is permitted, and no \
+                         human-gate template is registered for kind {}",
+                        violation.id, violation.detail, violation.kind
+                    ),
+                };
+                Err(AttentionDecideError::Refused(message))
+            }
+            crate::reconcile::Authority::Mechanical => {
+                let Some(action) = crate::attention::mechanical_action_for(violation) else {
+                    return Err(AttentionDecideError::BadParams(format!(
+                        "no mechanical repair is registered for kind {}",
+                        violation.kind
+                    )));
+                };
+                // Durable INTENT written BEFORE the mutation: a crash between
+                // `execute_mechanical` actually applying and the terminal
+                // record below used to leave zero trace at all, so a resumed
+                // caller had no way to tell "already attempted" from "never
+                // tried" other than blindly calling the repair again. This
+                // record makes that window observable. It cannot itself make
+                // the repair exactly-once — that guarantee comes from
+                // `execute_mechanical` calling `Tickets::set_status`, a CAS
+                // that is safe to invoke twice — but it is what lets a
+                // resumed decide converge on exactly one TERMINAL record
+                // instead of silently retrying with no audit trail.
+                self.record_decision(
+                    &repo,
+                    violation,
+                    authority,
+                    crate::attention::DECIDED_BY_MECHANICAL,
+                    action,
+                    None,
+                    None,
+                    "attempting",
+                    false,
+                    false,
+                )
+                .map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
+                let outcome = self.execute_mechanical(violation).await;
+                let succeeded = outcome.is_ok();
+                let outcome_str = match &outcome {
+                    Ok(detail) => detail.clone(),
+                    Err(e) => format!("error: {e}"),
+                };
+                let decision = self
+                    .record_decision(
+                        &repo,
+                        violation,
+                        authority,
+                        crate::attention::DECIDED_BY_MECHANICAL,
+                        action,
+                        None,
+                        None,
+                        &outcome_str,
+                        succeeded,
+                        succeeded,
+                    )
+                    .map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
+                outcome.map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
+                Ok(json!({"resolved": true, "replay": false, "decision": decision}))
+            }
+            crate::reconcile::Authority::Orchestrator => {
+                let holder = params.holder.ok_or_else(|| {
+                    AttentionDecideError::BadParams("orchestrator decision requires holder".into())
+                })?;
+                let generation = params.generation.ok_or_else(|| {
+                    AttentionDecideError::BadParams(
+                        "orchestrator decision requires generation".into(),
+                    )
+                })?;
+                if !self.authority_policy.orchestrator_may_act(&violation.kind) {
+                    return Err(AttentionDecideError::Refused(format!(
+                        "kind {} is not in the castle's orchestrator_action_allowlist",
+                        violation.kind
+                    )));
+                }
+                let Some(action) = crate::attention::orchestrator_action_for(violation) else {
+                    return Err(AttentionDecideError::BadParams(format!(
+                        "no orchestrator repair is registered for kind {}",
+                        violation.kind
+                    )));
+                };
+                let now = (self.request_clock)();
+                self.orchestrator_lease
+                    .renew(
+                        &repo,
+                        &holder,
+                        generation,
+                        self.authority_policy.lease_ttl_secs,
+                        now,
+                    )
+                    .map_err(|e| AttentionDecideError::Refused(e.to_string()))?;
+
+                let sinks = crate::reactor::sink_factory().registry(
+                    self.notify_config
+                        .resolved(self.reactor_config.notify_escalations),
+                );
+                let notice = rk_core::notify::EscalationNotice::new(
+                    format!("{}@{}", violation.id, holder),
+                    "orchestrator-action",
+                    rk_core::notify::Severity::Warn,
+                    repo.clone(),
+                    violation.subject.clone(),
+                    format!(
+                        "orchestrator {holder} resolving {}: {}",
+                        violation.id, violation.detail
+                    ),
+                );
+                let announced = self
+                    .recovery_announcer
+                    .announce(
+                        &self.space,
+                        &sinks,
+                        crate::recovery::RecoveryAction {
+                            kind: "orchestrator-action".into(),
+                            instance: holder.clone(),
+                            notice,
+                        },
+                        self.authority_policy.rate_cap,
+                    )
+                    .map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
+
+                // Held (rate-capped) and a genuine execution failure are
+                // both NON-terminal: neither actually mutated anything, so
+                // neither may be recorded in a way that blocks a later
+                // `attention.decide` call for this same violation from
+                // trying again. Only `succeeded` may set `terminal: true` —
+                // that is what actually makes "replaying a fixture cannot
+                // repeat a mutation" true (nothing to repeat, because a
+                // held/failed attempt is not journaled as done) while ALSO
+                // not silently losing an orchestrator action that errored
+                // (previously this recorded success and advanced the cursor
+                // past it regardless of whether `execute_orchestrator`
+                // actually returned `Ok`).
+                let held = announced.held();
+                let exec_result = if held {
+                    None
+                } else {
+                    // Durable INTENT before the mutation — the same
+                    // crash-safety reasoning as the mechanical arm above: a
+                    // resumed caller sees this even if the daemon dies
+                    // between `execute_orchestrator` applying and the
+                    // terminal record below.
+                    self.record_decision(
+                        &repo,
+                        violation,
+                        authority,
+                        &holder,
+                        action,
+                        params.budget_usd,
+                        params.budget_tokens,
+                        "attempting",
+                        false,
+                        false,
+                    )
+                    .map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
+                    Some(self.execute_orchestrator(violation).await)
+                };
+                let outcome_str = match &exec_result {
+                    None => "held: fleet-wide orchestrator rate cap exceeded".to_string(),
+                    Some(Ok(detail)) => detail.clone(),
+                    Some(Err(e)) => format!("error: {e}"),
+                };
+                let succeeded = matches!(exec_result, Some(Ok(_)));
+                let failed = matches!(exec_result, Some(Err(_)));
+                let decision = self
+                    .record_decision(
+                        &repo,
+                        violation,
+                        authority,
+                        &holder,
+                        action,
+                        params.budget_usd,
+                        params.budget_tokens,
+                        &outcome_str,
+                        succeeded,
+                        succeeded,
+                    )
+                    .map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
+                if succeeded {
+                    self.orchestrator_lease
+                        .advance_cursor(&repo, &holder, generation, &violation.id, now)
+                        .map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
+                }
+                if failed {
+                    return Err(AttentionDecideError::Internal(outcome_str));
+                }
+                Ok(json!({
+                    "resolved": succeeded,
+                    "replay": false,
+                    "held": held,
+                    "decision": decision,
+                }))
+            }
+        }
+    }
+
+    /// The one registered mechanical repair this tracer bullet wires up:
+    /// `delivered-but-open`'s own doc comment names the fix — the delivery
+    /// record is the durable proof, so the ticket's status is what is wrong.
+    async fn execute_mechanical(&self, v: &crate::reconcile::Violation) -> rk_core::Result<String> {
+        match v.kind.as_str() {
+            crate::reconcile::kind::DELIVERED_BUT_OPEN => {
+                self.tickets.set_status(&v.subject, "closed").await?;
+                Ok(format!("{} set to closed", v.subject))
+            }
+            other => Err(rk_core::Error::other(format!(
+                "no mechanical repair implemented for kind {other}"
+            ))),
+        }
+    }
+
+    /// The one registered orchestrator repair this tracer bullet wires up:
+    /// hand the ticket back to the backlog via the SAME atomic CAS the B9
+    /// orphaned-ticket sweep uses, so a live rat can redispatch it.
+    async fn execute_orchestrator(
+        &self,
+        v: &crate::reconcile::Violation,
+    ) -> rk_core::Result<String> {
+        match v.kind.as_str() {
+            crate::reconcile::kind::TERMINAL_ASSIGNEE_ACTIVE_WORK => {
+                let reopened = self.tickets.reopen_if_in_progress(&v.subject).await?;
+                Ok(format!("{} reopened: {reopened}", v.subject))
+            }
+            other => Err(rk_core::Error::other(format!(
+                "no orchestrator repair implemented for kind {other}"
+            ))),
+        }
+    }
+
+    /// Durably record one attention decision (evidence, selected action,
+    /// budget use, outcome) — this IS the acknowledgement the acceptance
+    /// criteria describe. Called TWICE per real attempt: once as a
+    /// non-`terminal` "attempting" intent before the mutation runs (so a
+    /// crash between the mutation applying and this function's own SECOND,
+    /// terminal call still leaves a durable trace instead of none at all),
+    /// and once after, with the real outcome.
+    ///
+    /// `resolved`/`terminal` are governed by the SAME boolean by every
+    /// current caller (a decision is only ever terminal when it actually
+    /// resolved something), but they are kept as two separate fields because
+    /// they answer different questions: `resolved` is what a caller's
+    /// response should say happened; `terminal` is only consulted by
+    /// `find_decision`, which is what makes replaying the same violation id
+    /// return this record instead of acting again. A rate-held or genuinely
+    /// failed attempt is NEITHER: `resolved: false` (nothing happened) and
+    /// `terminal: false` (so a LATER `attention.decide` call — after the
+    /// rate window passes, or simply retried — is free to try again rather
+    /// than being permanently told "already decided" for an item nothing
+    /// ever actually resolved).
+    #[allow(clippy::too_many_arguments)]
+    fn record_decision(
+        &self,
+        repo: &str,
+        violation: &crate::reconcile::Violation,
+        authority: crate::reconcile::Authority,
+        decided_by: &str,
+        action: &str,
+        budget_usd: Option<f64>,
+        budget_tokens: Option<u64>,
+        outcome: &str,
+        resolved: bool,
+        terminal: bool,
+    ) -> rk_core::Result<Value> {
+        let payload = json!({
+            "violation_id": violation.id,
+            "kind": violation.kind,
+            "scope": violation.scope,
+            "subject": violation.subject,
+            "authority": authority,
+            "evidence": violation.evidence,
+            "decided_by": decided_by,
+            "action": action,
+            "budget_usd": budget_usd,
+            "budget_tokens": budget_tokens,
+            "outcome": outcome,
+            "resolved": resolved,
+            "gated": false,
+            "terminal": terminal,
+            "decided_at": (self.request_clock)(),
+        });
+        let tuple = Tuple::new(
+            Category::Event,
+            repo,
+            crate::attention::DECISION_IDENTITY,
+            decided_by,
+            payload.clone(),
+        )
+        // Permanent ledger entry, matching every other decision/escalation
+        // record in this daemon (`recovery::RECOVERY_ACTION_IDENTITY`,
+        // `action_approval`'s grants): the journal must not evaporate out
+        // from under a caller replaying an old fixture.
+        .with_lifecycle(Lifecycle::Furniture);
+        self.space.out(tuple)?;
+        Ok(payload)
+    }
+
+    /// The durably recorded TERMINAL decision for `violation_id`, if any —
+    /// the idempotent-replay check every `attention.decide` arm consults
+    /// before doing anything else. Deliberately skips a non-`terminal`
+    /// record (an "attempting" intent, or a held/failed attempt): those
+    /// exist for audit/crash-recovery visibility only and must never
+    /// themselves count as "already decided", or a rate-capped or genuinely
+    /// failed attempt would silently and permanently block every future
+    /// retry of an item nothing ever actually resolved.
+    /// `payload_search` narrows the scan; the exact field comparison after
+    /// it guards against a substring match on a DIFFERENT violation id that
+    /// happens to contain this one.
+    fn find_decision(&self, repo: &str, violation_id: &str) -> rk_core::Result<Option<Value>> {
+        let mut pattern = Pattern::category(Category::Event)
+            .identity(crate::attention::DECISION_IDENTITY)
+            .scope(repo.to_string());
+        pattern.payload_search = Some(format!("\"violation_id\":\"{violation_id}\""));
+        Ok(self
+            .space
+            .scan(&pattern)?
+            .into_iter()
+            .filter(|t| t.payload.get("violation_id").and_then(Value::as_str) == Some(violation_id))
+            .find(|t| t.payload.get("terminal").and_then(Value::as_bool) == Some(true))
+            .map(|t| t.payload))
     }
 
     /// (scope, branch) pairs among the given branch-shaped events whose branch
@@ -7222,6 +7767,52 @@ struct ReconcileParams {
 #[derive(Deserialize)]
 struct InboxAckParams {
     id: String,
+}
+
+#[derive(Deserialize)]
+struct LeaseAcquireParams {
+    repo: String,
+    /// Stable identity of the orchestrator session acquiring the lease. The
+    /// same string presented again is how a reconnect or a daemon restart
+    /// resumes this session's generation and cursor.
+    holder: String,
+    ttl_secs: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct LeaseRenewParams {
+    repo: String,
+    holder: String,
+    generation: u64,
+    ttl_secs: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct AttentionNextParams {
+    repo: String,
+}
+
+#[derive(Deserialize)]
+struct AttentionDecideParams {
+    repo: String,
+    /// The attention item's `Violation::id`, as returned by `attention.next`.
+    item: String,
+    /// Required only when the item's effective authority is `Orchestrator`.
+    holder: Option<String>,
+    generation: Option<u64>,
+    budget_usd: Option<f64>,
+    budget_tokens: Option<u64>,
+}
+
+/// `attention.decide`'s three failure shapes, mapped to distinct wire error
+/// codes by `handle_attention_decide`: a policy/authority refusal (403-shaped,
+/// e.g. human-gated or lease fencing) is a materially different failure than
+/// a malformed request or an internal error, and a caller (especially an
+/// automated orchestrator loop) needs to tell them apart.
+enum AttentionDecideError {
+    Refused(String),
+    BadParams(String),
+    Internal(String),
 }
 
 /// `agent.list` view selector. Defaults keep the reply to the live registry so

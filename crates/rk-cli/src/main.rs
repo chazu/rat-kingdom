@@ -1,6 +1,7 @@
 //! `rk` — the rat-kingdom CLI.
 
 mod agent_cmds;
+mod attention_cmds;
 mod factory_cmds;
 mod factory_dashboard;
 mod factory_skill;
@@ -103,6 +104,19 @@ enum Command {
     /// assignees still owning active work, conflict-held landing work,
     /// tracker claims git disagrees with).
     Reconcile(reconcile_cmds::ReportArgs),
+    /// Durable orchestrator lease over one repository's attention queue
+    /// (TKT-01M0E8PN9C41BWECGNW0990R3J): acquire/renew, surviving disconnect,
+    /// replacement, or a daemon restart.
+    Lease {
+        #[command(subcommand)]
+        command: attention_cmds::LeaseCommand,
+    },
+    /// Consume and resolve `rk reconcile`'s violations as a resumable,
+    /// authority-classified attention queue.
+    Attention {
+        #[command(subcommand)]
+        command: attention_cmds::AttentionCommand,
+    },
     /// Live fleet dashboard: agents, workflows, budget, inbox (q to quit).
     Top {
         /// Refresh interval in seconds.
@@ -1036,6 +1050,22 @@ async fn main() -> Result<()> {
             Some(InboxCommand::Ack { id }) => agent_cmds::inbox_ack(&layout, id, cli.json).await?,
         },
         Command::Reconcile(args) => reconcile_cmds::report(&layout, args, cli.json).await?,
+        Command::Lease { command } => match command {
+            attention_cmds::LeaseCommand::Acquire(args) => {
+                attention_cmds::lease_acquire(&layout, args, cli.json).await?
+            }
+            attention_cmds::LeaseCommand::Renew(args) => {
+                attention_cmds::lease_renew(&layout, args, cli.json).await?
+            }
+        },
+        Command::Attention { command } => match command {
+            attention_cmds::AttentionCommand::Next(args) => {
+                attention_cmds::attention_next(&layout, args, cli.json).await?
+            }
+            attention_cmds::AttentionCommand::Decide(args) => {
+                attention_cmds::attention_decide(&layout, args, cli.json).await?
+            }
+        },
         Command::Top { interval, all } => top::top(&layout, interval, all).await?,
         Command::Digest { since, llm } => observe::digest(&layout, &since, llm, cli.json).await?,
         Command::Status(args) => agent_cmds::status(&layout, args, cli.json).await?,

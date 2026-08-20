@@ -610,6 +610,27 @@ default_merge_mode = "direct"    # fleet-wide fallback for repos registered
                                  # branch, "pr" pushes it and opens a pull/merge
                                  # request for review (see docs/pr-merge-mode.md).
                                  # Versioned repository policy takes precedence.
+
+# The unattended authority ladder (`rk reconcile`/`rk attention`/`rk lease`):
+# who may resolve a detected cross-ledger contradiction without a human in
+# the loop. Conservative by construction — every kind defaults to its
+# built-in Mechanical/Orchestrator/Human authority (see `rk reconcile report`
+# for the current matrix), and BOTH knobs below only ever narrow that: an
+# override can move a kind toward "human", never away from it, and the
+# allowlist starts empty, so an orchestrator session stays unable to resolve
+# ANY kind until a human names it here explicitly and restarts the daemon —
+# there is no RPC that writes this file.
+# [policy.authority_overrides]
+# delivered-but-open = "human"          # extra caution: even the mechanical
+                                       # repair now needs a human
+# orchestrator_action_allowlist = ["terminal-assignee-active-work"]
+                                 # explicit human approval, one kind at a time
+# orchestrator_rate_cap = 5       # max orchestrator-authority decisions per
+                                 # window, fleet-wide (0 = unlimited)
+# orchestrator_rate_window_secs = 3600
+# orchestrator_lease_ttl_secs = 300 # how long an orchestrator lease holder
+                                    # has before a different holder may take
+                                    # over (only once it has expired)
 ```
 
 Configuration is loaded when the daemon starts. After editing

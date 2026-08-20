@@ -4,6 +4,8 @@
 pub mod action_approval;
 pub mod agent_log;
 pub mod agents;
+pub mod attention;
+pub mod authority;
 pub mod client;
 pub mod coordinator;
 pub mod cron;
@@ -19,6 +21,7 @@ pub mod onboarding_activation;
 pub mod onboarding_apply;
 pub mod onboarding_proposals;
 pub mod onboarding_sessions;
+pub mod orchestrator_lease;
 pub mod proto;
 pub mod reactor;
 pub mod read_only_roles;

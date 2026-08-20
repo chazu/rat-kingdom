@@ -1093,6 +1093,34 @@ pub struct PolicyConfig {
     /// state. Configure the project base branch here when it is not `main` or
     /// `master`; an empty list denies all workflow landing targets.
     pub allowed_target_branches: Vec<String>,
+    /// The authority-ladder matrix (`crate::action`'s unattended-orchestration
+    /// counterpart to the mechanical/orchestrator/human split
+    /// `rk-daemon::reconcile::Authority` assigns each cross-ledger
+    /// convergence violation kind). A kind absent here keeps its conservative
+    /// built-in default. Values are validated at daemon startup
+    /// (`rk-daemon::authority::AuthorityPolicy::from_config`) against
+    /// `rk-daemon::reconcile::builtin_authority`, which rk-core does not
+    /// depend on — so this stays untyped strings here
+    /// (`"mechanical" | "orchestrator" | "human"`) and an override may only
+    /// NARROW a kind's authority toward `"human"`, never widen it. Combined
+    /// with there being no RPC method that writes `config.toml`, this is what
+    /// makes an orchestrator session unable to widen its own authority: the
+    /// only way to grant more is a human editing this file and restarting
+    /// the daemon.
+    pub authority_overrides: BTreeMap<String, String>,
+    /// Violation `kind`s an `Orchestrator`-authority attention item may be
+    /// resolved for without a human in the loop. Conservative default: empty
+    /// — every orchestrator-classified item stays unresolved until a human
+    /// explicitly names its kind here.
+    pub orchestrator_action_allowlist: Vec<String>,
+    /// Max orchestrator-authority decisions a lease may act on per rolling
+    /// window, fleet-wide. `0` means unlimited (mirrors `RecoveryAction`'s
+    /// own `RateCap` convention).
+    pub orchestrator_rate_cap: u32,
+    pub orchestrator_rate_window_secs: u64,
+    /// Durable orchestrator lease TTL (seconds): how long a lease holder has
+    /// before a different holder may preempt it.
+    pub orchestrator_lease_ttl_secs: i64,
 }
 
 impl Default for PolicyConfig {
@@ -1103,6 +1131,11 @@ impl Default for PolicyConfig {
             automated_landing_workflows: vec!["steward".into()],
             default_merge_mode: MergeMode::default(),
             allowed_target_branches: vec!["main".into(), "master".into()],
+            authority_overrides: BTreeMap::new(),
+            orchestrator_action_allowlist: Vec::new(),
+            orchestrator_rate_cap: 5,
+            orchestrator_rate_window_secs: 3600,
+            orchestrator_lease_ttl_secs: 300,
         }
     }
 }
@@ -1216,6 +1249,50 @@ mod tests {
         assert_eq!(cfg, Config::default());
         assert_eq!(cfg.harness.default, "claude");
         assert_eq!(cfg.policy.automated_landing_workflows, ["steward"]);
+    }
+
+    /// TKT-01M0E8PN9C41BWECGNW0990R3J's "repository or castle policy declares
+    /// the initial authority matrix" acceptance item: a castle's own
+    /// `config.toml` — not merely `PolicyConfig::default()` in Rust — is what
+    /// a real daemon loads its authority ladder from. This parses an actual
+    /// declared `[policy]` section (conservative: only ONE kind explicitly
+    /// promoted to `orchestrator`, with a narrowing override recorded
+    /// alongside it) through the real `Config::load` layering path, proving
+    /// the file — not code — is the source of truth for what gets activated.
+    #[test]
+    fn a_declared_policy_file_narrows_and_allowlists_exactly_what_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[policy]
+# Conservative, explicit human approval: only this ONE violation kind may be
+# resolved by an orchestrator session without a human in the loop.
+orchestrator_action_allowlist = ["terminal-assignee-active-work"]
+# A human has decided this castle wants EXTRA caution on mechanical repairs:
+# narrow delivered-but-open from its Mechanical default toward Human.
+[policy.authority_overrides]
+delivered-but-open = "human"
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(
+            cfg.policy.orchestrator_action_allowlist,
+            vec!["terminal-assignee-active-work".to_string()]
+        );
+        assert_eq!(
+            cfg.policy.authority_overrides.get("delivered-but-open"),
+            Some(&"human".to_string())
+        );
+        // Everything the file did not mention keeps its conservative
+        // built-in: no other kind is allowlisted, and the rate cap / lease
+        // TTL stay at their shipped defaults.
+        assert_eq!(cfg.policy.orchestrator_action_allowlist.len(), 1);
+        assert_eq!(cfg.policy.orchestrator_rate_cap, 5);
+        assert_eq!(cfg.policy.orchestrator_lease_ttl_secs, 300);
     }
 
     #[test]
