@@ -492,6 +492,17 @@ pub struct SpawnStep {
     /// validates every emitted review artifact against it.
     #[serde(default)]
     pub review: Option<rk_core::review::ReviewContext>,
+    /// Predicate inputs for cost-tier routing (`[[tiers.rules]]`), same
+    /// semantics as [`ForEachStep`]'s per-ticket `priority`/`labels` but
+    /// literal on the step (a single `spawn` has no fanned-out ticket to read
+    /// them from) — a workflow author binds them from `_input`/`ctx`, e.g. a
+    /// review spawn setting `priority: _input.priority`. Unset predicates
+    /// (`None`/empty) simply never match a rule with that predicate, so an
+    /// ordinary spawn omitting these is unaffected. See [`TierRouting::route`].
+    #[serde(default)]
+    pub priority: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// Dispatch metadata identifying an agent as a reporting boundary. The
@@ -2271,6 +2282,8 @@ workflow: {
             },
             branch: None,
             review: None,
+            priority: None,
+            labels: Vec::new(),
         })];
         let gate = |d: &str| {
             Step::Gate(GateStep {

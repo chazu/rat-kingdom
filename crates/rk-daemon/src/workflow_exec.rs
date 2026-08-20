@@ -1710,8 +1710,14 @@ impl WorkflowEngine {
                     // retries if a concurrent admitter (a drain refill, or another
                     // workflow spawn step) wins the race for the slot this saw free.
                     self.await_fleet_capacity(id).await;
-                    let resolved =
-                        resolve(spawn, agents, &self.global_agents, &self.default_harness)?;
+                    let routing = tiers.chained(&self.tier_routing);
+                    let resolved = resolve(
+                        spawn,
+                        &routing,
+                        agents,
+                        &self.global_agents,
+                        &self.default_harness,
+                    )?;
                     let title = interpolate(&spawn.task.title, &ctx);
                     let prompt = spawn
                         .task
