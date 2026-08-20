@@ -3342,13 +3342,31 @@ checks: [
         space: Space,
         tickets: Arc<Tickets>,
     ) -> Arc<WorkflowEngine> {
-        Arc::new(WorkflowEngine::new(
+        test_engine_routed(
             layout,
             supervisor,
             space,
             tickets,
             HashMap::new(),
             TierRouting::default(),
+        )
+    }
+
+    fn test_engine_routed(
+        layout: Layout,
+        supervisor: Arc<Supervisor>,
+        space: Space,
+        tickets: Arc<Tickets>,
+        global_agents: HashMap<String, rk_workflow::AgentProfile>,
+        tiers: TierRouting,
+    ) -> Arc<WorkflowEngine> {
+        Arc::new(WorkflowEngine::new(
+            layout,
+            supervisor,
+            space,
+            tickets,
+            global_agents,
+            tiers,
             "fake".into(),
             false,
             true,
@@ -3361,6 +3379,20 @@ checks: [
     }
 
     fn test_pipeline(home: &Path, space: Space) -> LandingPipeline {
+        test_pipeline_routed(home, space, HashMap::new(), TierRouting::default())
+    }
+
+    /// [`test_pipeline`] with the daemon's GLOBAL agent profiles and cost-tier
+    /// routing table populated — the two inputs `WorkflowEngine` consults when
+    /// resolving a spawn, and therefore the only way to exercise reviewer tier
+    /// routing on the real landing path rather than through a synthetic
+    /// workflow that declares its own `tiers` block.
+    fn test_pipeline_routed(
+        home: &Path,
+        space: Space,
+        global_agents: HashMap<String, rk_workflow::AgentProfile>,
+        tiers: TierRouting,
+    ) -> LandingPipeline {
         let layout = Layout::at(home);
         let tickets = Arc::new(Tickets::new(space.clone(), "castle".into()));
         let supervisor = Arc::new(
@@ -3375,11 +3407,13 @@ checks: [
             )
             .unwrap(),
         );
-        let engine = test_engine(
+        let engine = test_engine_routed(
             layout.clone(),
             supervisor.clone(),
             space.clone(),
             tickets.clone(),
+            global_agents,
+            tiers,
         );
         LandingPipeline::new(space, supervisor, engine, tickets, layout)
     }
