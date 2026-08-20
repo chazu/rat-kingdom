@@ -2171,6 +2171,35 @@ impl LandingPipeline {
             }))
     }
 
+    fn rework_dispatch_has_state(&self, ctx: &ReworkContext, state: &str) -> rk_core::Result<bool> {
+        let key = ctx.dispatch_key();
+        Ok(self
+            .rework_dispatch_markers(ctx)?
+            .into_iter()
+            .any(|marker| {
+                (marker.payload.get("dispatch_key").and_then(Value::as_str) == Some(key.as_str())
+                    || (marker.payload.get("head_sha").and_then(Value::as_str)
+                        == Some(ctx.head_sha.as_str())
+                        && marker.payload.get("rework_ticket").and_then(Value::as_str)
+                            == Some(ctx.rework_ticket.as_str())))
+                    && marker.payload.get("state").and_then(Value::as_str) == Some(state)
+            }))
+    }
+
+    /// Whether the supervisor durably journaled the agent for this exact
+    /// rework dispatch. Spawn writes its `Spawning` registry row before it
+    /// creates the worktree or launches the harness, and `list_all` retains
+    /// terminal and archived rows, so this remains a reliable proof after a
+    /// daemon restart or a later agent failure.
+    fn rework_agent_was_journaled(&self, ctx: &ReworkContext) -> bool {
+        self.supervisor.list_all().into_iter().any(|record| {
+            record.role == "rat"
+                && record.task.as_deref() == Some(ctx.rework_ticket.as_str())
+                && record.target_branch == ctx.branch
+                && record.fork_point.as_deref() == Some(ctx.head_sha.as_str())
+        })
+    }
+
     /// Cumulative USD across this reviewed branch's whole review/rework chain:
     /// the agent that produced the branch (`branch == reviewed branch`) plus
     /// every rework agent dispatched to land back onto it (`target_branch ==
@@ -2242,7 +2271,51 @@ impl LandingPipeline {
         // Ticket creation is coalesced on the original review chain. Once its
         // identity is known, the full six-dimensional dispatch key can be
         // checked before any non-idempotent side effect.
-        if self.rework_dispatch_marker(&ctx)?.is_some() {
+        if let Some(marker) = self.rework_dispatch_marker(&ctx)? {
+            // A marker is deliberately persisted before spawn. If the daemon
+            // stopped in that narrow window, replay must not silently treat
+            // the correction as dispatched. Conversely, a journaled agent is
+            // durable proof that spawn crossed its own commit point, even if
+            // the daemon stopped before this call returned.
+            if marker.payload.get("state").and_then(Value::as_str) == Some("dispatching")
+                && !self.rework_agent_was_journaled(&ctx)
+                && !self.rework_dispatch_has_state(&ctx, "dispatch-interrupted")?
+            {
+                let attempt = marker
+                    .payload
+                    .get("attempt")
+                    .and_then(Value::as_u64)
+                    .and_then(|attempt| u32::try_from(attempt).ok())
+                    .unwrap_or_default();
+                let withheld = Withheld {
+                    code: "dispatch-interrupted",
+                    detail: format!(
+                        "durable dispatch attempt {attempt} exists, but the supervisor registry \
+                         contains no rat for rework ticket {} based on {} at {}; the daemon may \
+                         have stopped between recording the marker and journaling the spawn",
+                        ctx.rework_ticket, ctx.branch, ctx.head_sha
+                    ),
+                    decision: "confirm that no correction agent exists, then dispatch the \
+                               recorded rework ticket exactly once or abandon it"
+                        .into(),
+                };
+                self.escalate(entry, ctx.escalation(&withheld))?;
+                self.space.out(
+                    Tuple::new(
+                        Category::Event,
+                        entry.repo_name.clone(),
+                        REWORK_DISPATCH_IDENTITY,
+                        "daemon",
+                        ctx.marker_payload(attempt, None, withheld.code),
+                    )
+                    .with_lifecycle(Lifecycle::Furniture),
+                )?;
+                warn!(
+                    repo = %entry.repo_name, branch = %entry.branch,
+                    head_sha = %entry.head_sha, ticket = %ctx.rework_ticket, attempt,
+                    "landing pipeline: interrupted rework dispatch requires human recovery"
+                );
+            }
             info!(
                 repo = %entry.repo_name, branch = %entry.branch, head_sha = %entry.head_sha,
                 ticket = %ctx.rework_ticket,
@@ -2311,9 +2384,9 @@ impl LandingPipeline {
         }
 
         // MARKER BEFORE SPAWN, deliberately. A crash in the window between
-        // these two writes must leave the chain over-marked (one recorded
-        // attempt, no agent — recoverable by hand) rather than under-marked
-        // (an agent nothing knows about, which a restart would duplicate).
+        // these two writes leaves the chain over-marked rather than risking a
+        // duplicate agent; replay distinguishes a journaled spawn from an
+        // interrupted one and raises the latter as a durable human gate.
         self.space.out(
             Tuple::new(
                 Category::Event,
@@ -4102,6 +4175,93 @@ workflow: {
             1,
             "replayed routing must not append another marker"
         );
+        assert!(
+            space
+                .scan(
+                    &Pattern::category(Category::Need)
+                        .scope("code-repo")
+                        .identity(STEWARD_NEED_IDENTITY),
+                )
+                .unwrap()
+                .is_empty(),
+            "a journaled correction agent must not be mistaken for an interrupted dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatching_marker_without_spawn_survives_restart_as_one_human_gate() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        {
+            let space = Space::open(&layout.db_path()).unwrap();
+            space.out(verdict_tuple(&head_sha, "REWORK")).unwrap();
+            let pipeline = test_pipeline(home.path(), space.clone());
+            let ticket = pipeline.file_rework_ticket(&entry).await.unwrap();
+            let ctx = ReworkContext {
+                repo: entry.repo_name.clone(),
+                branch: entry.branch.clone(),
+                head_sha: entry.head_sha.clone(),
+                target: entry.target.clone(),
+                task: entry.task.clone(),
+                rework_ticket: ticket.identity,
+                notes: "notes".into(),
+                diff_files: 1,
+                diff_lines: 1,
+            };
+            space
+                .out(
+                    Tuple::new(
+                        Category::Event,
+                        entry.repo_name.clone(),
+                        REWORK_DISPATCH_IDENTITY,
+                        "daemon",
+                        ctx.marker_payload(1, None, "dispatching"),
+                    )
+                    .with_lifecycle(Lifecycle::Furniture),
+                )
+                .unwrap();
+        }
+
+        // A fresh Space and pipeline stand in for a daemon restart after the
+        // marker commit point but before Supervisor::spawn journaled an agent.
+        let space = Space::open(&layout.db_path()).unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        for _ in 0..2 {
+            let replay = pipeline.route_rework(&entry, &repo).await.unwrap();
+            assert!(matches!(replay, LandingOutcome::ReworkFiled(_)));
+        }
+
+        assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
+        assert!(
+            space
+                .scan(&Pattern::category(Category::Event).identity("agent_spawned"))
+                .unwrap()
+                .is_empty(),
+            "an ambiguous restart must never duplicate the correction agent"
+        );
+        let needs = space
+            .scan(
+                &Pattern::category(Category::Need)
+                    .scope("code-repo")
+                    .identity(STEWARD_NEED_IDENTITY),
+            )
+            .unwrap();
+        assert_eq!(needs.len(), 1, "replay must converge on one visible gate");
+        let text = needs[0].payload["text"].as_str().unwrap();
+        for required in [
+            "dispatch-interrupted",
+            "EVIDENCE: reviewer verdict REWORK",
+            "DECISION NEEDED:",
+            "BLAST RADIUS:",
+            "RESOLVE WITH: rk spawn",
+        ] {
+            assert!(text.contains(required), "missing {required:?}: {text}");
+        }
     }
 
     #[test]
