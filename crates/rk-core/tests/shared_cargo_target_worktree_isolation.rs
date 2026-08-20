@@ -131,9 +131,17 @@ fn per_checkout_target_dirs_do_not_corrupt_each_other() {
     let target_b = checkout_b.join("target");
 
     let out_a = cargo_build(&checkout_a, &target_a);
-    assert!(out_a.status.success(), "{}", String::from_utf8_lossy(&out_a.stderr));
+    assert!(
+        out_a.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out_a.stderr)
+    );
     let out_b = cargo_build(&checkout_b, &target_b);
-    assert!(out_b.status.success(), "{}", String::from_utf8_lossy(&out_b.stderr));
+    assert!(
+        out_b.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out_b.stderr)
+    );
 
     assert_eq!(bin_output(&target_a), "0");
     assert_eq!(
