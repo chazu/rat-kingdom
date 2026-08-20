@@ -130,6 +130,22 @@ async fn wait_for_parent_resubmission(client: &mut Client, scope: &str) -> Strin
     panic!("corrected parent was never resubmitted");
 }
 
+/// Mirrors the daemon's private `landing::review_instance_id`: the exact
+/// commit-keyed verdict cache binding a review artifact must carry to be
+/// honored instead of triggering a fresh reviewer spawn.
+fn review_instance_id(
+    repo_name: &str,
+    branch: &str,
+    head_sha: &str,
+    target: &str,
+    task: &str,
+) -> String {
+    use sha2::Digest;
+    let digest =
+        sha2::Sha256::digest(format!("{repo_name}@{branch}@{head_sha}@{target}@{task}").as_bytes());
+    format!("landing-review-{}", hex::encode(&digest[..16]))
+}
+
 fn ref_contains(repo: &Path, rev: &str, path: &str) -> bool {
     Command::new("git")
         .arg("-C")
@@ -182,7 +198,10 @@ async fn bounded_rework_lands_intermediately_then_resubmits_parent_exactly_once(
                 "category": "artifact", "scope": "rework-e2e-repo", "identity": "review",
                 "payload": {"task": original_ticket, "recommendation": "REWORK",
                     "notes": "add the bounded correction only", "bounded": true,
-                    "branch": "feature", "head_sha": reviewed_head}
+                    "branch": "feature", "head_sha": reviewed_head, "target": "main",
+                    "review_attempt": review_instance_id(
+                        "rework-e2e-repo", "feature", &reviewed_head, "main", &original_ticket,
+                    )}
             }),
         )
         .await
@@ -214,7 +233,10 @@ async fn bounded_rework_lands_intermediately_then_resubmits_parent_exactly_once(
                 "category": "artifact", "scope": "rework-e2e-repo", "identity": "review",
                 "payload": {"task": original_ticket, "recommendation": "APPROVE",
                     "notes": "fresh corrected head is clean", "branch": "feature",
-                    "head_sha": corrected_head}
+                    "head_sha": corrected_head, "target": "main",
+                    "review_attempt": review_instance_id(
+                        "rework-e2e-repo", "feature", &corrected_head, "main", &original_ticket,
+                    )}
             }),
         )
         .await
