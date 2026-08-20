@@ -3467,7 +3467,9 @@ workflow: {
         git(repo_dir.path(), &["checkout", "base"]);
 
         let space = Space::open_in_memory().unwrap();
-        space.out(verdict_tuple(&head_sha, "APPROVE")).unwrap();
+        let mut verdict = verdict_tuple(&head_sha, "APPROVE");
+        verdict.payload["target"] = json!("base");
+        space.out(verdict).unwrap();
 
         let pipeline = test_pipeline(home.path(), space.clone());
         pipeline
