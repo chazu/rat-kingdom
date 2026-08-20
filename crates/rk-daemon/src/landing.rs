@@ -99,6 +99,11 @@ pub(crate) const LANDING_QUEUE_IDENTITY: &str = "landing_queue_entry";
 /// source of truth; this event makes the automatic hand-off inspectable.
 const REWORK_RESUBMISSION_IDENTITY: &str = "landing_rework_resubmission";
 
+/// Identity of the durable per-attempt evidence event for a gate
+/// infrastructure-death retry (bounded fail-safe recovery). See
+/// [`LandingPipeline::record_gate_infra_attempt`].
+const GATE_INFRA_RETRY_IDENTITY: &str = "landing_gate_infra_retry";
+
 /// Identity of the durable `work_key = (repo, branch, head_sha)` dedup
 /// marker (`Furniture`, scoped to the repo), written by
 /// [`LandingPipeline::process_entry`] on every terminal outcome. Probed by
@@ -404,6 +409,36 @@ pub(crate) struct LandingQueueEntry {
     /// `None` only for a durable tuple written before this field existed.
     #[serde(default)]
     pub(crate) enqueued_at: Option<DateTime<Utc>>,
+    /// Whether this exact prepared candidate has already spent its one
+    /// automatic gate-infrastructure-death retry (bounded fail-safe recovery
+    /// — see [`LandingPipeline::run_gates_at`]). Persisted durably and set
+    /// BEFORE the retry attempt itself runs, so a daemon crash between
+    /// spending the budget and the retry completing can never be replayed
+    /// into a second retry: a restart's `claim_next` re-discovers this entry
+    /// with the flag already `true` and treats any further infra death as an
+    /// ordinary hold. Reset only by [`LandingQueue::requeue_tail`], which
+    /// also clears the candidate identity — a rebuilt candidate against a
+    /// new base is a genuinely fresh attempt and earns its own budget.
+    /// Deliberately NOT reset by `LandingPipeline::bisect_batch` (see that
+    /// function's doc) — a bisect is a same-pass continuation of the run
+    /// that just spent this budget, not a new future attempt.
+    #[serde(default)]
+    pub(crate) gate_infra_retry_used: bool,
+    /// The name of the check currently mid-retry, while `run_gates_at`
+    /// awaits its outcome — `None` the rest of the time, including once that
+    /// outcome is settled (ordinal-2 evidence recorded) either way. Persisted
+    /// in the SAME write as `gate_infra_retry_used` flipping to `true`, so
+    /// the two durable fields never disagree about whether a retry is
+    /// in-flight. This is what makes the retry resumable rather than merely
+    /// non-duplicable: a crash between spending the budget and the retry
+    /// completing leaves this `Some(check_name)` durably, and a restart's
+    /// next `run_gates_at` call — reaching that same check again — reads it
+    /// as "resume the in-flight retry", running the check exactly once more
+    /// and recording its outcome as the ordinal-2 attempt, rather than
+    /// silently skipping straight to a hold with no ordinal-2 evidence at
+    /// all (the gap TKT-01M0FXGQMA10JYCV9QCGEAK4TT's review caught).
+    #[serde(default)]
+    pub(crate) gate_infra_retry_check: Option<String>,
 }
 
 /// See [`LandingQueueEntry::status`].
@@ -722,6 +757,8 @@ impl LandingQueue {
         retry.candidate_base = None;
         retry.candidate_ref = None;
         retry.batch_branches.clear();
+        retry.gate_infra_retry_used = false;
+        retry.gate_infra_retry_check = None;
         self.enqueue(retry)
     }
 
@@ -1361,20 +1398,28 @@ impl LandingPipeline {
             }
         };
         if !self
-            .run_gates_at(&entry, &git_repo, &gates, &candidate.commit)
+            .run_gates_at(&mut entry, &git_repo, &gates, &candidate.commit)
             .await?
         {
             git_repo.discard_candidate(&candidate.candidate_ref)?;
             // The durable gate-failure artifact carries the evidence; the
             // need row is what makes the hold VISIBLE in `rk inbox` — parity
-            // with the CUE steward's escalation contract.
-            self.escalate(
-                &entry,
+            // with the CUE steward's escalation contract. A hold that
+            // followed an exhausted infra-death retry says so explicitly —
+            // "one precise human gate" distinct from an ordinary red check,
+            // since the automatic recovery path already ran and lost.
+            let text = if entry.gate_infra_retry_used {
+                format!(
+                    "steward: run gate FAILED for {} on {} after an automatic infrastructure-death retry was exhausted — branch held unmerged; read the durable gate-failure and landing_gate_infra_retry artifacts for the evidence",
+                    entry.task, entry.branch
+                )
+            } else {
                 format!(
                     "steward: run gate FAILED for {} on {} — branch held unmerged; read the                      durable gate-failure artifact for the failing tests",
                     entry.task, entry.branch
-                ),
-            )?;
+                )
+            };
+            self.escalate(&entry, text)?;
             let outcome = LandingOutcome::GateHeld;
             self.mark_processed(&entry, &outcome)?;
             return Ok(outcome);
@@ -1477,11 +1522,10 @@ impl LandingPipeline {
             return Ok(outcomes);
         }
 
-        let first = entries[0].clone();
-        let repo = rk_git::Repo::discover(Path::new(&first.repo_path))?;
+        let repo = rk_git::Repo::discover(Path::new(&entries[0].repo_path))?;
         let gates = self.gate_config(&repo);
-        let checks_file = Path::new(&first.repo_path).join(".rk").join("checks.cue");
-        if self.gate_plan(&checks_file, &first.target, &gates).is_err() {
+        let checks_file = Path::new(&entries[0].repo_path).join(".rk").join("checks.cue");
+        if self.gate_plan(&checks_file, &entries[0].target, &gates).is_err() {
             let mut outcomes = Vec::with_capacity(entries.len());
             for entry in entries {
                 outcomes.push((entry.clone(), self.process_entry(&entry).await?));
@@ -1513,7 +1557,7 @@ impl LandingPipeline {
         } else {
             let batch_repo = repo.clone();
             let branches = branch_names.clone();
-            let target = first.target.clone();
+            let target = entries[0].target.clone();
             match blocking(move || batch_repo.prepare_merge_batch(&branches, &target)).await? {
                 rk_git::PrepareOutcome::Prepared(candidate) => candidate,
                 rk_git::PrepareOutcome::Conflict { .. } => {
@@ -1530,13 +1574,28 @@ impl LandingPipeline {
                 .persist(entry, LandingEntryStatus::RunningGates)?;
         }
 
+        // The gate run mutates and durably persists `entries[0]`'s own
+        // infra-retry-budget fields (and, on the infra-retry path, re-persists
+        // its candidate identity too — see `run_gates_at`). It must run
+        // against `entries[0]` ITSELF, not a clone taken before the candidate
+        // loop above: a clone would still carry `candidate_sha: None` at this
+        // point, and persisting that stale snapshot from inside the retry
+        // path would clobber the candidate identity the loop just wrote,
+        // corrupting restart recovery for the whole batch
+        // (TKT-01M0FXGQMA10JYCV9QCGEAK4TT audit finding). Cloning only AFTER
+        // this call — into `first` below — is also what keeps the retry
+        // budget itself from silently diverging between `entries[0]`'s
+        // in-memory copy and its durable tuple, which would otherwise let a
+        // later `bisect_batch`/`mark_processed` pass over `entries` grant a
+        // second retry the durable store had already spent.
         if !self
-            .run_gates_at(&first, &repo, &gates, &candidate.commit)
+            .run_gates_at(&mut entries[0], &repo, &gates, &candidate.commit)
             .await?
         {
             return self.bisect_batch(entries, Some(&candidate)).await;
         }
 
+        let first = entries[0].clone();
         self.note_non_main_land_target(&first);
         let mut result = self
             .supervisor
@@ -1595,6 +1654,19 @@ impl LandingPipeline {
             let repo = rk_git::Repo::discover(Path::new(&entries[0].repo_path))?;
             repo.discard_candidate(&candidate.candidate_ref)?;
         }
+        // Deliberately does NOT reset `gate_infra_retry_used`/
+        // `gate_infra_retry_check` here, unlike `LandingQueue::requeue_tail`.
+        // A bisect is a same-pass continuation of the batch gate run that
+        // just failed, not a genuinely new future landing attempt — an entry
+        // whose budget the batch run already spent stays spent through the
+        // split, so re-splitting a stubborn batch can never manufacture more
+        // than the one retry the parent run was entitled to. Each entry's
+        // OWN field values (not a stale clone's) are what get persisted here
+        // — `entries[0]`'s retry fields are exactly what `run_gates_at` just
+        // durably wrote in `process_batch`, and every other entry's is
+        // whatever it already carried (untouched budget, since only
+        // `entries[0]` drove the shared gate run) — so no clone can diverge
+        // from its own durable tuple here (audit: TKT-01M0FXGQMA10JYCV9QCGEAK4TT).
         for entry in &mut entries {
             entry.candidate_sha = None;
             entry.candidate_base = None;
@@ -2613,7 +2685,7 @@ impl LandingPipeline {
     /// Returns `Ok(true)` only if every gate reported `verdict: "pass"`.
     async fn run_gates_at(
         &self,
-        entry: &LandingQueueEntry,
+        entry: &mut LandingQueueEntry,
         git_repo: &rk_git::Repo,
         gates: &GateConfig,
         tested_sha: &str,
@@ -2658,6 +2730,38 @@ impl LandingPipeline {
                 retry_on_fail: 0,
                 shared_cargo_target: check.shared_cargo_target,
             };
+
+            // Resuming after a crash landed between spending the retry
+            // budget and the retry attempt completing (`gate_infra_retry_check`'s
+            // doc): this exact check is durably marked mid-retry from a PRIOR
+            // process. Whatever THIS attempt does completes that retry — it
+            // is ordinal 2, never a fresh ordinal-1 death — so it is settled
+            // through the exact same path the inline retry below uses,
+            // without ever granting a second retry.
+            if entry.gate_infra_retry_check.as_deref() == Some(check.name.as_str()) {
+                let retry_outcome = self
+                    .engine
+                    .run_check_in(
+                        &id,
+                        &entry.repo_name,
+                        "daemon",
+                        &gate_dir,
+                        &resolved.command,
+                        &resolved,
+                        &env,
+                        timeout,
+                        None,
+                    )
+                    .await;
+                if !self
+                    .finish_infra_retry(entry, tested_sha, &check.name, retry_outcome)
+                    .await?
+                {
+                    return Ok(false);
+                }
+                continue;
+            }
+
             let outcome = self
                 .engine
                 .run_check_in(
@@ -2674,6 +2778,54 @@ impl LandingPipeline {
                 .await;
             match outcome {
                 Ok(result) if result.get("verdict").and_then(Value::as_str) == Some("pass") => {}
+                // An infra death (the child never reported its own exit code
+                // — killed by a signal, or any other runner-loss shape) is
+                // not a verdict on the branch, so it earns exactly one
+                // automatic retry of this SAME check against this SAME
+                // prepared candidate, bounded by the durable per-entry
+                // budget. Everything else (a real "fail", a "timeout") falls
+                // straight through to `Ok(_) => return Ok(false)` below —
+                // never retried, held immediately.
+                Ok(result)
+                    if result.get("verdict").and_then(Value::as_str) == Some("infra")
+                        && !entry.gate_infra_retry_used =>
+                {
+                    warn!(
+                        check = %check.name, branch = %entry.branch,
+                        "landing pipeline: gate check died to an infrastructure fault, retrying once"
+                    );
+                    // Spend the budget AND durably mark THIS check in-flight
+                    // BEFORE anything else — including the ordinal-1 evidence
+                    // write below — so a crash at any point from here onward
+                    // resumes (via the `gate_infra_retry_check` branch above)
+                    // as exactly one more attempt of this same check, never a
+                    // duplicate ordinal-1 death or a second retry grant.
+                    entry.gate_infra_retry_used = true;
+                    entry.gate_infra_retry_check = Some(check.name.clone());
+                    self.queue
+                        .persist(entry, LandingEntryStatus::RunningGates)?;
+                    self.record_gate_infra_attempt(entry, tested_sha, &check.name, 1, &result)?;
+                    let retry_outcome = self
+                        .engine
+                        .run_check_in(
+                            &id,
+                            &entry.repo_name,
+                            "daemon",
+                            &gate_dir,
+                            &resolved.command,
+                            &resolved,
+                            &env,
+                            timeout,
+                            None,
+                        )
+                        .await;
+                    if !self
+                        .finish_infra_retry(entry, tested_sha, &check.name, retry_outcome)
+                        .await?
+                    {
+                        return Ok(false);
+                    }
+                }
                 Ok(_) => return Ok(false),
                 Err(e) => {
                     // Only reachable when `on_timeout: Fail` turns a blown
@@ -2690,15 +2842,94 @@ impl LandingPipeline {
         Ok(true)
     }
 
+    /// Settle a gate-infrastructure-death retry's outcome — the ordinal-2
+    /// attempt, whether reached inline (the retry `run_gates_at` just
+    /// launched itself) or by resuming one a prior process crashed mid-flight
+    /// (`gate_infra_retry_check`'s doc). Records the durable per-attempt
+    /// evidence (fail-closed: an evidence-write failure propagates as `Err`
+    /// rather than letting the caller silently continue or land on
+    /// unrecorded evidence — TKT-01M0FXGQMA10JYCV9QCGEAK4TT), clears the
+    /// in-flight marker, and reports whether the gate run may continue
+    /// (`Ok(true)`, the retry passed) or must hold (`Ok(false)`).
+    async fn finish_infra_retry(
+        &self,
+        entry: &mut LandingQueueEntry,
+        tested_sha: &str,
+        check_name: &str,
+        retry_outcome: rk_core::Result<Value>,
+    ) -> rk_core::Result<bool> {
+        let (result, passed) = match retry_outcome {
+            Ok(result) => {
+                let passed = result.get("verdict").and_then(Value::as_str) == Some("pass");
+                (result, passed)
+            }
+            Err(e) => {
+                warn!(error = %e, check = %check_name, branch = %entry.branch, "landing pipeline: gate retry errored, holding branch");
+                (json!({"verdict": "error", "exit": -1}), false)
+            }
+        };
+        self.record_gate_infra_attempt(entry, tested_sha, check_name, 2, &result)?;
+        entry.gate_infra_retry_check = None;
+        self.queue
+            .persist(entry, LandingEntryStatus::RunningGates)?;
+        Ok(passed)
+    }
+
+    /// Durable per-attempt evidence for a gate-infrastructure-death retry
+    /// (bounded fail-safe recovery — see [`Self::run_gates_at`]): one event
+    /// per attempt, so the full history (the original death, and the retry
+    /// this pipeline allows) is inspectable even across a daemon restart
+    /// between the two. `ordinal` is 1 for the original attempt that died, 2
+    /// for the retry (fresh or resumed). This evidence is an acceptance
+    /// invariant, not a diagnostic nicety — a write failure propagates as
+    /// `Err` (fail-closed) instead of letting the gate run silently continue
+    /// or land without a durable record of what the retry actually did.
+    fn record_gate_infra_attempt(
+        &self,
+        entry: &LandingQueueEntry,
+        tested_sha: &str,
+        check_name: &str,
+        ordinal: u32,
+        result: &Value,
+    ) -> rk_core::Result<()> {
+        let verdict = result.get("verdict").and_then(Value::as_str).unwrap_or("");
+        let disposition = match (ordinal, verdict) {
+            (1, _) => "retrying",
+            (_, "pass") => "retry_passed",
+            _ => "retry_exhausted",
+        };
+        self.space.out(
+            Tuple::new(
+                Category::Event,
+                entry.repo_name.clone(),
+                GATE_INFRA_RETRY_IDENTITY,
+                "daemon",
+                json!({
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "task": entry.task,
+                    "candidate_sha": tested_sha,
+                    "check": check_name,
+                    "ordinal": ordinal,
+                    "exit": result.get("exit").cloned().unwrap_or(Value::Null),
+                    "signal": result.get("signal").cloned().unwrap_or(Value::Null),
+                    "verdict": verdict,
+                    "disposition": disposition,
+                }),
+            )
+            .with_lifecycle(Lifecycle::Furniture),
+        )
+    }
+
     #[cfg(test)]
     async fn run_gates(
         &self,
-        entry: &LandingQueueEntry,
+        entry: &mut LandingQueueEntry,
         git_repo: &rk_git::Repo,
         gates: &GateConfig,
     ) -> rk_core::Result<bool> {
-        self.run_gates_at(entry, git_repo, gates, &entry.head_sha)
-            .await
+        let head_sha = entry.head_sha.clone();
+        self.run_gates_at(entry, git_repo, gates, &head_sha).await
     }
 
     /// Resolve the three named checks (POLICY, DIFF-SCOPE, the run gate) into
@@ -5551,8 +5782,8 @@ checks: [
         let repo_dir = tempfile::tempdir().unwrap();
         let (pipeline, git_repo, head_sha) = gate_sweep_fixture(home.path(), repo_dir.path());
         let gates = GateConfig::default();
-        let entry = gate_sweep_entry(repo_dir.path(), "main", &head_sha);
-        assert!(pipeline.run_gates(&entry, &git_repo, &gates).await.unwrap());
+        let mut entry = gate_sweep_entry(repo_dir.path(), "main", &head_sha);
+        assert!(pipeline.run_gates(&mut entry, &git_repo, &gates).await.unwrap());
 
         let gate_dir = pipeline.gate_worktree_path("myrepo", "main");
         assert!(gate_dir.is_dir());
@@ -5584,8 +5815,8 @@ checks: [
         let repo_dir = tempfile::tempdir().unwrap();
         let (pipeline, git_repo, head_sha) = gate_sweep_fixture(home.path(), repo_dir.path());
         let gates = GateConfig::default();
-        let entry = gate_sweep_entry(repo_dir.path(), "main", &head_sha);
-        assert!(pipeline.run_gates(&entry, &git_repo, &gates).await.unwrap());
+        let mut entry = gate_sweep_entry(repo_dir.path(), "main", &head_sha);
+        assert!(pipeline.run_gates(&mut entry, &git_repo, &gates).await.unwrap());
 
         let gate_dir = pipeline.gate_worktree_path("myrepo", "main");
         let marker = pipeline.gate_worktree_marker_path("myrepo", "main");
@@ -5615,8 +5846,8 @@ checks: [
         let gates = GateConfig::default();
 
         for target in ["a", "b", "c"] {
-            let entry = gate_sweep_entry(repo_dir.path(), target, &head_sha);
-            assert!(pipeline.run_gates(&entry, &git_repo, &gates).await.unwrap());
+            let mut entry = gate_sweep_entry(repo_dir.path(), target, &head_sha);
+            assert!(pipeline.run_gates(&mut entry, &git_repo, &gates).await.unwrap());
             // Distinct, strictly increasing last-used timestamps even on
             // coarse filesystem/clock resolution.
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -5642,8 +5873,8 @@ checks: [
         let repo_dir = tempfile::tempdir().unwrap();
         let (pipeline, git_repo, head_sha) = gate_sweep_fixture(home.path(), repo_dir.path());
         let gates = GateConfig::default();
-        let entry = gate_sweep_entry(repo_dir.path(), "main", &head_sha);
-        assert!(pipeline.run_gates(&entry, &git_repo, &gates).await.unwrap());
+        let mut entry = gate_sweep_entry(repo_dir.path(), "main", &head_sha);
+        assert!(pipeline.run_gates(&mut entry, &git_repo, &gates).await.unwrap());
 
         // Backdate the marker so it would be evicted on age alone...
         let marker = pipeline.gate_worktree_marker_path("myrepo", "main");
