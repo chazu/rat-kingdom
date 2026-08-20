@@ -100,22 +100,25 @@ triggers: [
 ]
 "#;
 
+/// Fields for a hand-crafted `harness_result` completion — bundled into one
+/// struct rather than passed as separate args to [`emit_harness_result`]
+/// (clippy's `too_many_arguments`).
+struct Completion<'a> {
+    agent: &'a str,
+    branch: &'a str,
+    target: &'a str,
+    head_sha: &'a str,
+    task: &'a str,
+    diff_class: &'a str,
+}
+
 /// Hand-crafts a `harness_result` completion event exactly as
 /// `Supervisor::route_completion` would, and writes it straight to the
 /// space over `space.out` as the operator — this is what lets a test drive
 /// the reactor's `action: "land"` path (the ticket's actual incident path)
 /// without needing to reproduce the full respawn/pause machinery that
 /// produced the duplicate `task_done` in the field.
-async fn emit_harness_result(
-    client: &mut Client,
-    repo_name: &str,
-    agent: &str,
-    branch: &str,
-    target: &str,
-    head_sha: &str,
-    task: &str,
-    diff_class: &str,
-) {
+async fn emit_harness_result(client: &mut Client, repo_name: &str, c: Completion<'_>) {
     client
         .call(
             "space.out",
@@ -124,18 +127,18 @@ async fn emit_harness_result(
                 "scope": repo_name,
                 "identity": "harness_result",
                 "payload": {
-                    "agent": agent,
-                    "spawn": format!("spawn-{agent}"),
+                    "agent": c.agent,
+                    "spawn": format!("spawn-{}", c.agent),
                     "role": "rat",
-                    "task": task,
-                    "branch": branch,
-                    "target": target,
+                    "task": c.task,
+                    "branch": c.branch,
+                    "target": c.target,
                     "parent": Value::Null,
                     "is_error": false,
-                    "head_sha": head_sha,
+                    "head_sha": c.head_sha,
                     "diff_files": 1,
                     "diff_lines": 1,
-                    "diff_class": diff_class,
+                    "diff_class": c.diff_class,
                     "declared_done": true,
                     "result": "done",
                     "cost_usd": 0.0,
@@ -249,12 +252,14 @@ async fn sequential_duplicate_reactor_completions_converge_to_one_live_entry() {
     emit_harness_result(
         &mut client,
         &repo_name,
-        "Deyna-9",
-        "rat/dedup-seq/tkt-1",
-        "main",
-        &head_sha,
-        "dedup-seq-task",
-        "trivial",
+        Completion {
+            agent: "Deyna-9",
+            branch: "rat/dedup-seq/tkt-1",
+            target: "main",
+            head_sha: &head_sha,
+            task: "dedup-seq-task",
+            diff_class: "trivial",
+        },
     )
     .await;
 
@@ -275,12 +280,14 @@ async fn sequential_duplicate_reactor_completions_converge_to_one_live_entry() {
     emit_harness_result(
         &mut client,
         &repo_name,
-        "Deyna-9",
-        "rat/dedup-seq/tkt-1",
-        "main",
-        &head_sha,
-        "dedup-seq-task",
-        "trivial",
+        Completion {
+            agent: "Deyna-9",
+            branch: "rat/dedup-seq/tkt-1",
+            target: "main",
+            head_sha: &head_sha,
+            task: "dedup-seq-task",
+            diff_class: "trivial",
+        },
     )
     .await;
 
@@ -442,12 +449,14 @@ checks: [
     emit_harness_result(
         &mut client,
         &repo_name,
-        "Deyna-9",
-        "rat/dedup-midgate/tkt-1",
-        "main",
-        &head_sha,
-        "dedup-midgate-task",
-        "trivial",
+        Completion {
+            agent: "Deyna-9",
+            branch: "rat/dedup-midgate/tkt-1",
+            target: "main",
+            head_sha: &head_sha,
+            task: "dedup-midgate-task",
+            diff_class: "trivial",
+        },
     )
     .await;
 
@@ -462,12 +471,14 @@ checks: [
     emit_harness_result(
         &mut client,
         &repo_name,
-        "Deyna-9",
-        "rat/dedup-midgate/tkt-1",
-        "main",
-        &head_sha,
-        "dedup-midgate-task",
-        "trivial",
+        Completion {
+            agent: "Deyna-9",
+            branch: "rat/dedup-midgate/tkt-1",
+            target: "main",
+            head_sha: &head_sha,
+            task: "dedup-midgate-task",
+            diff_class: "trivial",
+        },
     )
     .await;
 
@@ -549,12 +560,14 @@ async fn restart_preserves_the_landing_dedup_invariant() {
     emit_harness_result(
         &mut client,
         &repo_name,
-        "Deyna-9",
-        "rat/dedup-restart/tkt-1",
-        "main",
-        &head_sha,
-        "dedup-restart-task",
-        "trivial",
+        Completion {
+            agent: "Deyna-9",
+            branch: "rat/dedup-restart/tkt-1",
+            target: "main",
+            head_sha: &head_sha,
+            task: "dedup-restart-task",
+            diff_class: "trivial",
+        },
     )
     .await;
 
@@ -586,12 +599,14 @@ async fn restart_preserves_the_landing_dedup_invariant() {
     emit_harness_result(
         &mut client,
         &repo_name,
-        "Deyna-9",
-        "rat/dedup-restart/tkt-1",
-        "main",
-        &head_sha,
-        "dedup-restart-task",
-        "trivial",
+        Completion {
+            agent: "Deyna-9",
+            branch: "rat/dedup-restart/tkt-1",
+            target: "main",
+            head_sha: &head_sha,
+            task: "dedup-restart-task",
+            diff_class: "trivial",
+        },
     )
     .await;
 
@@ -653,23 +668,27 @@ async fn a_different_head_under_the_same_task_is_independently_admissible() {
     emit_harness_result(
         &mut client,
         &repo_name,
-        "Rat-A",
-        "rat/dedup-distinct-head/tkt-1a",
-        "main",
-        &head_a,
-        "shared-task",
-        "trivial",
+        Completion {
+            agent: "Rat-A",
+            branch: "rat/dedup-distinct-head/tkt-1a",
+            target: "main",
+            head_sha: &head_a,
+            task: "shared-task",
+            diff_class: "trivial",
+        },
     )
     .await;
     emit_harness_result(
         &mut client,
         &repo_name,
-        "Rat-B",
-        "rat/dedup-distinct-head/tkt-1b",
-        "main",
-        &head_b,
-        "shared-task",
-        "trivial",
+        Completion {
+            agent: "Rat-B",
+            branch: "rat/dedup-distinct-head/tkt-1b",
+            target: "main",
+            head_sha: &head_b,
+            task: "shared-task",
+            diff_class: "trivial",
+        },
     )
     .await;
 
