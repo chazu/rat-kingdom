@@ -164,10 +164,7 @@ fn landing_queue_summary(snap: &Snapshot) -> String {
     let Some(queues) = queues.filter(|q| !q.is_empty()) else {
         return "landing clear".into();
     };
-    let depth: u64 = queues
-        .iter()
-        .filter_map(|q| q["depth"].as_u64())
-        .sum();
+    let depth: u64 = queues.iter().filter_map(|q| q["depth"].as_u64()).sum();
     let oldest = queues
         .iter()
         .filter_map(|q| q["oldest_age_secs"].as_i64())

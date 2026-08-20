@@ -1046,7 +1046,12 @@ mod tests {
         assert_eq!(critical_row.urgency, urgency::FAILED);
     }
 
-    fn queue_summary(repo: &str, target: &str, depth: usize, oldest_age_secs: i64) -> LandingQueueSummary {
+    fn queue_summary(
+        repo: &str,
+        target: &str,
+        depth: usize,
+        oldest_age_secs: i64,
+    ) -> LandingQueueSummary {
         LandingQueueSummary {
             repo: repo.into(),
             target: target.into(),

@@ -162,8 +162,16 @@ pub(crate) fn landing_queue_snapshot(space: &Space) -> Vec<LandingQueueSnapshotE
         .unwrap_or_default();
     let mut by_key: HashMap<(String, u64), Tuple> = HashMap::new();
     for tuple in all {
-        let seq = tuple.payload.get("seq").and_then(Value::as_u64).unwrap_or(0);
-        let rev = tuple.payload.get("rev").and_then(Value::as_u64).unwrap_or(0);
+        let seq = tuple
+            .payload
+            .get("seq")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let rev = tuple
+            .payload
+            .get("rev")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         let key = (tuple.scope.clone(), seq);
         let replace = match by_key.get(&key) {
             None => true,
