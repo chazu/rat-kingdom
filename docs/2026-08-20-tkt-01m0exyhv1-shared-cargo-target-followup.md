@@ -101,3 +101,24 @@ ticket surfaced: with sharing off by default, there is no shared target dir
 for a self-driven `mise run verify` to contend over in the first place. Left
 open in case an operator re-enables `shared_cargo_target` and wants that
 gap covered for that mode.
+
+## Isolated verification and landing recovery
+
+The final repository verification was rerun with the deployed daemon's
+shared-target environment explicitly overridden:
+
+```sh
+CARGO_TARGET_DIR="$PWD/target" MISE_TRUSTED_CONFIG_PATHS="$PWD" \
+  env -u RK_AGENT -u RK_TASK -u RK_REPO -u RK_ROLE -u RK_HOME \
+      -u RK_BRANCH -u RK_WORKTREE mise run verify
+```
+
+It completed formatting, the workspace build and test suite, and clippy in
+the Skitter-10 worktree-local target directory. The first daemon landing
+attempt did not report a repository failure: artifact
+`01M0FX57KQNFM24DE1Y8Y8DAE8` recorded `exit = -1`, no timeout, no failing
+test, and output ending during normal compilation while several independent
+full builds were active. That infrastructure-death classification and its
+bounded automatic retry are tracked separately by
+`TKT-01M0FXGQMA10JYCV9QCGEAK4TT`; this commit gives the otherwise unchanged,
+verified fix a fresh head for another normal gated submission.
