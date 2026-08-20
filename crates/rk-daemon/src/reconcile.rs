@@ -536,7 +536,12 @@ mod tests {
         }
     }
 
-    fn instance(id: &str, repo: &str, status: InstanceStatus, active_agent: Option<&str>) -> Instance {
+    fn instance(
+        id: &str,
+        repo: &str,
+        status: InstanceStatus,
+        active_agent: Option<&str>,
+    ) -> Instance {
         Instance {
             id: id.into(),
             workflow: "some-workflow".into(),
@@ -887,12 +892,7 @@ mod tests {
 
     #[test]
     fn a_settled_instance_with_a_still_live_active_agent_is_flagged() {
-        let i = instance(
-            "wf-1",
-            "myrepo",
-            InstanceStatus::Completed,
-            Some("Whisker"),
-        );
+        let i = instance("wf-1", "myrepo", InstanceStatus::Completed, Some("Whisker"));
         let a = agent("Whisker", None, AgentState::Running);
         let report = build(
             "myrepo",
@@ -953,12 +953,7 @@ mod tests {
 
     #[test]
     fn a_settled_instance_whose_agent_already_settled_too_is_not_flagged() {
-        let i = instance(
-            "wf-1",
-            "myrepo",
-            InstanceStatus::Completed,
-            Some("Whisker"),
-        );
+        let i = instance("wf-1", "myrepo", InstanceStatus::Completed, Some("Whisker"));
         let a = agent("Whisker", None, AgentState::Dismissed);
         let report = build(
             "myrepo",
@@ -992,12 +987,7 @@ mod tests {
     #[test]
     fn an_archived_settled_instance_with_a_live_agent_is_not_flagged() {
         // Historical record — nothing to act on again.
-        let mut i = instance(
-            "wf-1",
-            "myrepo",
-            InstanceStatus::Completed,
-            Some("Whisker"),
-        );
+        let mut i = instance("wf-1", "myrepo", InstanceStatus::Completed, Some("Whisker"));
         i.archived_at = Some(Utc::now());
         let a = agent("Whisker", None, AgentState::Running);
         let report = build(
