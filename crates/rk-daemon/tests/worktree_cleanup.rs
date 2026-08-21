@@ -21,6 +21,7 @@ use rk_daemon::{Client, Daemon};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Once;
 use std::time::Duration;
 use support::connect;
 
@@ -49,8 +50,8 @@ fn scratch_repo(dir: &Path) {
 
 /// One process-global fake harness for the whole binary (mirrors
 /// agent_archive.rs / fleet_budget.rs — `RK_FAKE_HARNESS_CMD` is a process
-/// env var, so parallel tests in this binary setting different scripts would
-/// race, TKT-88). Branches on `$RK_TASK`:
+/// env var, so install the identical script once and never rewrite it while
+/// parallel tests are spawning agents, TKT-88). Branches on `$RK_TASK`:
 ///
 /// - `dirty-*`: writes an UNCOMMITTED file, then reports success. The branch
 ///   never diverges from base (trivially "merged"), but the worktree itself
@@ -85,11 +86,19 @@ case "$RK_TASK" in
     echo '{"type":"result","subtype":"success","is_error":false,"result":"nothing to do","session_id":"fake-noop","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
     ;;
   hang-*)
+    if [[ "$RK_TASK" == hang-sweep-artifacts-* ]]; then
+      mkdir -p target/debug
+      echo binary > target/debug/build-marker
+    fi
     echo '{"type":"system","subtype":"init","session_id":"fake-hang"}'
     echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"settling in"}]}}'
     sleep 300
     ;;
   *)
+    if [[ "$RK_TASK" == sweep-artifacts-1 ]]; then
+      mkdir -p target/debug
+      echo binary > target/debug/build-marker
+    fi
     echo "gnawed by $RK_AGENT for task $RK_TASK" > gnawed.txt
     git add gnawed.txt >/dev/null 2>&1
     git -c user.email=rat@x -c user.name=Rat commit -q -m "rat work: $RK_TASK"
@@ -100,6 +109,11 @@ case "$RK_TASK" in
 esac
 "#,
     )
+}
+
+fn install_fake() {
+    static FAKE_HARNESS: Once = Once::new();
+    FAKE_HARNESS.call_once(|| std::env::set_var("RK_FAKE_HARNESS_CMD", fake()));
 }
 
 async fn spawn_record(client: &mut Client, repo: &Path, task: &str, extra: Value) -> Value {
@@ -243,7 +257,7 @@ async fn finalize_dismisses_agents_the_workflow_never_dismissed() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = init_workflow_repo();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
+    install_fake();
     let layout = Layout::at(home.path());
     let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     // Bare/test daemons default this off (TKT-01M04N6W4X47KMXDA6MH0WPH8H
@@ -307,7 +321,7 @@ async fn finalize_sweep_parks_a_dirty_worktree() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = init_workflow_repo();
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
+    install_fake();
     let layout = Layout::at(home.path());
     let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
@@ -379,7 +393,7 @@ async fn reap_git_leaves_a_dirty_worktree_standing() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
+    install_fake();
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
@@ -433,7 +447,7 @@ async fn periodic_sweep_reclaims_a_leaked_worktree() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
+    install_fake();
     let layout = Layout::at(home.path());
     let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
@@ -482,7 +496,7 @@ async fn periodic_sweep_reaps_terminal_artifacts_regardless_of_merge_state() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
+    install_fake();
     let layout = Layout::at(home.path());
     let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
@@ -529,11 +543,6 @@ async fn periodic_sweep_reaps_terminal_artifacts_regardless_of_merge_state() {
     let stranded_rec = wait_for_list_record(&mut client, &stranded).await;
     let stranded_worktree = PathBuf::from(stranded_rec["worktree"].as_str().unwrap());
     let stranded_branch = stranded_rec["branch"].as_str().unwrap().to_string();
-
-    for wt in [&live_worktree, &stranded_worktree] {
-        std::fs::create_dir_all(wt.join("target/debug")).unwrap();
-        std::fs::write(wt.join("target/debug/build-marker"), b"binary").unwrap();
-    }
 
     // Never dismissed or pruned by the test — only the periodic sweep touches it.
     let mut reaped = false;
@@ -597,7 +606,7 @@ async fn periodic_sweep_reaps_artifacts_immediately_under_default_after_days() {
     git(repo_dir.path(), &["add", ".rk"]);
     git(repo_dir.path(), &["commit", "-m", "policy: reap target/"]);
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
+    install_fake();
     let layout = Layout::at(home.path());
     let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
@@ -674,7 +683,7 @@ async fn periodic_sweep_reaps_nothing_for_a_repo_with_no_declared_artifact_paths
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
+    install_fake();
     let layout = Layout::at(home.path());
     let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
@@ -726,7 +735,7 @@ async fn periodic_sweep_rejects_artifact_path_that_resolves_to_worktree_root() {
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
 
-    std::env::set_var("RK_FAKE_HARNESS_CMD", fake());
+    install_fake();
     let layout = Layout::at(home.path());
     let mut daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     daemon.set_worktree_sweep_config(rk_core::config::WorktreeSweepConfig {
