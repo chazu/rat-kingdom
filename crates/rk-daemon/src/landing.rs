@@ -2527,9 +2527,45 @@ impl LandingPipeline {
             );
             return Ok(ReviewDeathOutcome::Escalated(settled));
         }
+        let attempts_used = self.review_death_attempts_used(&ctx)?;
+        let reviewed_tip = match git_repo.rev_parse(&entry.branch) {
+            Ok(tip) => Some(tip),
+            Err(error) => {
+                let withheld = landing_review_retry::Withheld {
+                    code: "reviewed-head-unavailable",
+                    detail: format!(
+                        "the reviewed branch {} could not be resolved while preparing a retry: \
+                         {error}",
+                        entry.branch
+                    ),
+                    decision: "restore the reviewed branch or explicitly re-submit its current \
+                               head for a fresh review, rather than retrying an unknown tree"
+                        .into(),
+                };
+                let need = self.escalate(entry, ctx.escalation(&withheld, death_context))?;
+                self.record_review_death_state(entry, &ctx, attempts_used, None, withheld.code)?;
+                return Ok(ReviewDeathOutcome::Escalated(need));
+            }
+        };
+        if reviewed_tip.as_deref() != Some(entry.head_sha.as_str()) {
+            let actual = reviewed_tip.as_deref().unwrap_or("<unavailable>");
+            let withheld = landing_review_retry::Withheld {
+                code: "reviewed-head-moved",
+                detail: format!(
+                    "the reviewed head {} is no longer {}'s tip (now {actual}), so the \
+                     replacement would inspect work the dead reviewer never reviewed",
+                    entry.head_sha, entry.branch
+                ),
+                decision: "re-review the branch at its current tip, or restore it to the exact \
+                           reviewed head before retrying"
+                    .into(),
+            };
+            let need = self.escalate(entry, ctx.escalation(&withheld, death_context))?;
+            self.record_review_death_state(entry, &ctx, attempts_used, None, withheld.code)?;
+            return Ok(ReviewDeathOutcome::Escalated(need));
+        }
         let policy =
             ReviewDeathPolicy::from_landing(&self.supervisor.repository_policy(git_repo).landing);
-        let attempts_used = self.review_death_attempts_used(&ctx)?;
         let spent_usd = self.review_death_chain_spend(entry);
         match landing_review_retry::route(&policy, attempts_used, spent_usd) {
             ReviewDeathRoute::Withhold(withheld) => {
@@ -8768,6 +8804,50 @@ checks: [
         assert_eq!(
             pipeline.cached_verdict(&entry).unwrap(),
             Some("REWORK".to_string())
+        );
+    }
+
+    /// A replacement must never silently review a newer branch tip under the
+    /// old review identity. A moved head is a new candidate and needs a fresh
+    /// review rather than an automatic retry of the dead generation.
+    #[tokio::test]
+    async fn review_death_retry_holds_when_reviewed_head_moves() {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+        git(repo_dir.path(), &["checkout", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() { 1 + 1 }\n").unwrap();
+        git(repo_dir.path(), &["add", "src.rs"]);
+        git(
+            repo_dir.path(),
+            &["commit", "-m", "feat: move reviewed head"],
+        );
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let routed = pipeline
+            .route_verdict(
+                &entry,
+                ReviewWaitOutcome::ReviewerDied("primary stopped".into()),
+                &GateConfig::default(),
+            )
+            .await
+            .unwrap();
+        let LandingOutcome::Escalated(need) = routed else {
+            panic!("expected Escalated, got {routed:?}");
+        };
+        assert!(need.payload["text"]
+            .as_str()
+            .unwrap()
+            .contains("reviewed-head-moved"));
+        assert!(tuples(&space, Category::Event, "agent_spawned").is_empty());
+        assert_eq!(
+            scoped_tuples(&space, Category::Event, REVIEW_DEATH_DISPATCH_IDENTITY)
+                .iter()
+                .filter(|marker| marker.payload["state"] == "reviewed-head-moved")
+                .count(),
+            1
         );
     }
 
