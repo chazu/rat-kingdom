@@ -594,6 +594,155 @@ async fn run_step_red_check_fails_closed_and_holds_branch() {
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
+// spawn → wait → run (a REPOSITORY-OWNED named check that fails behind a
+// successful output consumer) → dismiss (never reached). The check is
+// referenced by name, not inlined, so this exercises the same `.rk/checks.cue`
+// path a real steward gate uses.
+const RUN_MASKED_CHECK_WORKFLOW: &str = r#"
+workflow: {
+    name: "run-masked-check"
+    params: {taskId: {type: "string", required: true}}
+    agents: {default: {harness: "fake", model: "sonnet"}}
+    steps: [
+        {type: "spawn", role: "rat", task: {title: _input.taskId, description: "do " + _input.taskId}},
+        {type: "wait", timeout: "30s"},
+        {type: "run", check: "verify", expectExit: 0, timeout: "60s"},
+        {type: "dismiss"},
+    ]
+}
+"#;
+
+/// The repository-owned `verify` check fails (exit 3) with its output piped
+/// into a consumer that succeeds — `cat`, standing in for the `tee`/`tail`/
+/// renderer shape that made Basil-10 and Cluny-10 read a red suite as green —
+/// and floods well past `MAX_RUN_OUTPUT_BYTES` on the way.
+///
+/// TKT-01M0H5JNZQKZ35V87Q4H4N3EPH. Two things have to hold together, which is
+/// why they are asserted in one run:
+///
+/// 1. The gate is reported the CHECK's exit status, 3, not the consumer's 0.
+///    RK's own output consumer (`read_capped`) succeeds independently of the
+///    child and must not launder that failure into a pass, and RK's `sh -c`
+///    wrap must not defeat the `set -o pipefail` the check author wrote to
+///    unmask their own pipeline — the exact remedy the completion protocol
+///    tells agents to use.
+/// 2. Output stays BOUNDED while that happens: ~350KB of check stdout must not
+///    ride into the instance error. `check_failure_detail` keeps a 400-char
+///    tail per stream, so the whole error stays small.
+///
+/// Deliberately asserted against absolute expectations rather than a reference
+/// `sh -c` run of the same command: such an oracle agrees with RK by
+/// construction and would pass even if the failure were fully masked.
+#[tokio::test]
+async fn run_step_fails_closed_on_a_failing_check_piped_to_a_successful_consumer() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    git(repo_dir.path(), &["init", "-b", "main"]);
+    git(repo_dir.path(), &["config", "user.email", "r@x"]);
+    git(repo_dir.path(), &["config", "user.name", "R"]);
+    std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
+    git(repo_dir.path(), &["add", "."]);
+    git(repo_dir.path(), &["commit", "-m", "init"]);
+
+    // Same shape as `support::install_passing_landing_checks`, except `verify`
+    // is the masked-failure check under test: a failing stage whose status the
+    // author unmasks with `set -o pipefail`, piped to a successful `cat`, and
+    // emitting ~350KB so RK's bounded reader genuinely truncates.
+    let rk_dir = repo_dir.path().join(".rk");
+    std::fs::create_dir_all(&rk_dir).unwrap();
+    std::fs::write(
+        rk_dir.join("checks.cue"),
+        r#"checks: [
+    {name: "steward-protected-paths", command: "true", timeout: "30s"},
+    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "verify", command: "bash -c 'set -o pipefail; { seq 1 60000; exit 3; } | cat'", timeout: "60s"},
+]
+"#,
+    )
+    .unwrap();
+    git(repo_dir.path(), &["add", ".rk/checks.cue"]);
+    git(repo_dir.path(), &["commit", "-m", "test: register checks"]);
+
+    let wf_dir = repo_dir.path().join(".rk").join("workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(
+        wf_dir.join("run-masked-check.cue"),
+        RUN_MASKED_CHECK_WORKFLOW,
+    )
+    .unwrap();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
+    std::env::set_var("RK_MODEL_MARKER", "unset");
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let started = client
+        .call(
+            "workflow.run",
+            json!({
+                "name": "run-masked-check",
+                "repo": repo_dir.path().to_string_lossy(),
+                "params": {"taskId": "run-masked-check-1"},
+            }),
+        )
+        .await
+        .unwrap();
+    let id = started["instance"]["id"].as_str().unwrap().to_string();
+
+    let mut failed = false;
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = client
+            .call("workflow.status", json!({"name": id}))
+            .await
+            .unwrap();
+        match status["instance"]["status"].as_str().unwrap_or("") {
+            "failed" => {
+                let err = status["instance"]["error"].as_str().unwrap_or("");
+                assert!(
+                    err.contains("exited 3") && err.contains("expected 0"),
+                    "the check's OWN exit 3 must reach the gate, not the consumer's 0: {err}"
+                );
+                // Bounded output is retained: ~350KB of check stdout, at most a
+                // 400-char tail per stream in the error.
+                assert!(
+                    err.len() < 2_000,
+                    "gate error must stay bounded, got {} bytes",
+                    err.len()
+                );
+                failed = true;
+                break;
+            }
+            "completed" => panic!(
+                "a check that exits 3 behind a successful output consumer must not pass the gate"
+            ),
+            _ => {}
+        }
+    }
+    assert!(
+        failed,
+        "run gate did not fail closed on the check's own exit status"
+    );
+
+    // The rat's work never reached main — the gate held the branch.
+    let files = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir.path())
+        .args(["ls-tree", "--name-only", "main"])
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&files.stdout).to_string();
+    assert!(
+        !listing.contains("work-"),
+        "work behind a masked-but-failing check must not merge: {listing}"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
 // spawn → wait → run (red, cargo-test-shaped failure, inline expectExit gate)
 // → dismiss (never reached). Prints lines shaped like a real `cargo test`
 // failure summary so the gate-failure artifact's `failing_tests` extraction
