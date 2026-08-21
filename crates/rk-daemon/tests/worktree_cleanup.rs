@@ -144,6 +144,22 @@ async fn list(client: &mut Client, params: Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// Poll `agent.list` until `name` appears. `agent.status` (what
+/// `wait_for_state` reads) and `agent.list` are backed by separate reads, so
+/// a state transition confirmed via `wait_for_state` is not guaranteed to be
+/// visible to `agent.list` yet — asserting single-shot presence right after
+/// `wait_for_state` races that visibility gap (TKT-01M0CY0SRKS6MGCT2NT79BZY6N).
+async fn wait_for_list_record(client: &mut Client, name: &str) -> Value {
+    for _ in 0..200 {
+        let agents = list(client, json!({"include_archived": true})).await;
+        if let Some(rec) = agents.iter().find(|a| a["name"] == name) {
+            return rec.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no record for {name} ever appeared in agent.list");
+}
+
 /// A workflow that spawns one rat, waits, and checks the result — but,
 /// unlike `solo-task.cue`, deliberately has NO `dismiss` step. This is the
 /// exact shape of the root-cause failure mode: a workflow whose own CUE never
@@ -504,16 +520,13 @@ async fn periodic_sweep_reaps_terminal_artifacts_regardless_of_merge_state() {
     // reaps artifacts immediately, then separately archives anything past the
     // cutoff), so by the time this reads back the record it may already have
     // been archived — orthogonal to what this test is actually verifying.
-    let agents = list(&mut client, json!({"include_archived": true})).await;
-    let rec = |name: &str| {
-        agents
-            .iter()
-            .find(|a| a["name"] == name)
-            .cloned()
-            .unwrap_or_else(|| panic!("no record for {name} in {agents:?}"))
-    };
-    let live_worktree = PathBuf::from(rec(&live)["worktree"].as_str().unwrap());
-    let stranded_rec = rec(&stranded);
+    //
+    // Poll rather than a single-shot list(): `wait_for_state` above only
+    // confirms `agent.status` observed "completed", not that `agent.list`
+    // has caught up to the same record yet.
+    let live_rec = wait_for_list_record(&mut client, &live).await;
+    let live_worktree = PathBuf::from(live_rec["worktree"].as_str().unwrap());
+    let stranded_rec = wait_for_list_record(&mut client, &stranded).await;
     let stranded_worktree = PathBuf::from(stranded_rec["worktree"].as_str().unwrap());
     let stranded_branch = stranded_rec["branch"].as_str().unwrap().to_string();
 
