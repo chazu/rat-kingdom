@@ -9,6 +9,7 @@ repo: #RepositoryPolicy
 	work: #WorkPolicy | *{}
 	delivery: #DeliveryPolicy | *{}
 	landing: #LandingPolicy | *{}
+	reap: #ReapPolicy | *{}
 }
 
 #WorkPolicy: {
@@ -61,4 +62,15 @@ repo: #RepositoryPolicy
 	maxReworkAttempts: int | *1
 	// Hard ceiling on cumulative USD across one review/rework chain. 0 = unlimited.
 	reworkMaxUsd: int | *25
+}
+
+// Regenerable build-artifact paths (relative to a worktree root) the daemon's
+// worktree sweep reclaims from every terminal agent's worktree, any merge
+// state. STACK NEUTRALITY: the daemon has no built-in notion of what any
+// language's build directory is called, so this defaults to empty (reap
+// nothing) — a repo that wants this reap names its own paths, e.g.
+// ["target"] for a cargo workspace or ["node_modules", "dist"] for an npm
+// one.
+#ReapPolicy: {
+	artifactPaths: [...string] | *[]
 }

@@ -674,6 +674,23 @@ impl Daemon {
         let daemon = Arc::new(self);
         let mut shutdown_rx = daemon.shutdown_tx.subscribe();
 
+        // Every long-running background loop below (GC, sweeps, sync, reactor,
+        // landing, scheduler, drain) is spawned into this `JoinSet` rather than
+        // detached via a bare `tokio::spawn`, for two reasons. First, it makes
+        // graceful shutdown deterministic: `run()` does not return until
+        // `join_all` below has observed every loop actually exit, instead of
+        // racing its own return against loops that are still mid-`select!` on
+        // the same `shutdown_tx` signal. Second — the property a same-process
+        // test relies on — a `JoinSet` aborts every task it still holds when
+        // it is dropped, so aborting the outer `run()` future (e.g. a test
+        // doing `handle.abort()` to simulate a crash) now tears down this
+        // whole task tree instead of leaving these loops running as orphans
+        // that can race a second `Daemon` constructed over the same on-disk
+        // home (TKT-01M0G2VXS8PQYZN2X3ZWXDFC5B). A real crash needs none of
+        // this — the OS kills every task in the process at once regardless —
+        // so this has no effect on production behavior.
+        let mut background_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
         // Restore every durable workflow id before any reactor or scheduler task
         // can dispatch. Resume execution only after those consumers are listening
         // so completion events remain observable without opening a duplicate-ID
@@ -686,7 +703,7 @@ impl Daemon {
             let space = daemon.space.clone();
             let decay = daemon.evaporation_decay;
             let mut gc_shutdown = daemon.shutdown_tx.subscribe();
-            tokio::spawn(async move {
+            background_tasks.spawn(async move {
                 let mut tick = tokio::time::interval(GC_INTERVAL);
                 loop {
                     tokio::select! {
@@ -716,7 +733,7 @@ impl Daemon {
             let notify_escalations = daemon.reactor_config.notify_escalations;
             let mut sweep_shutdown = daemon.shutdown_tx.subscribe();
             let interval = Duration::from_secs(cfg.interval_secs.max(1));
-            tokio::spawn(async move {
+            background_tasks.spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 // Consume the immediate first tick so freshly-spawned rats get a
                 // full interval of grace before the first sweep looks at them.
@@ -761,7 +778,7 @@ impl Daemon {
             let daemon_ref = Arc::clone(&daemon);
             let mut rs_shutdown = daemon.shutdown_tx.subscribe();
             let interval = Duration::from_secs(daemon.review_sweep_config.interval_secs.max(1));
-            tokio::spawn(async move {
+            background_tasks.spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 // Consume the immediate first tick: give a freshly-opened PR a
                 // full interval before the first fetch, and don't fetch on boot.
@@ -797,7 +814,7 @@ impl Daemon {
             let daemon_ref = Arc::clone(&daemon);
             let mut ws_shutdown = daemon.shutdown_tx.subscribe();
             let interval = Duration::from_secs(daemon.worktree_sweep_config.interval_secs.max(1));
-            tokio::spawn(async move {
+            background_tasks.spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 // Consume the immediate first tick: give a freshly-terminal
                 // agent a full `after_days` window before the first sweep.
@@ -832,7 +849,7 @@ impl Daemon {
             let mut gws_shutdown = daemon.shutdown_tx.subscribe();
             let interval =
                 Duration::from_secs(daemon.gate_worktree_sweep_config.interval_secs.max(1));
-            tokio::spawn(async move {
+            background_tasks.spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 tick.tick().await;
                 loop {
@@ -860,7 +877,7 @@ impl Daemon {
             let daemon_ref = Arc::clone(&daemon);
             let mut rc_shutdown = daemon.shutdown_tx.subscribe();
             let interval = Duration::from_secs(daemon.recovery_sweep_config.interval_secs.max(1));
-            tokio::spawn(async move {
+            background_tasks.spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 tick.tick().await;
                 loop {
@@ -891,7 +908,7 @@ impl Daemon {
             let mut it_shutdown = daemon.shutdown_tx.subscribe();
             let interval =
                 Duration::from_secs(daemon.instance_timeout_sweep_config.interval_secs.max(1));
-            tokio::spawn(async move {
+            background_tasks.spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 tick.tick().await;
                 loop {
@@ -921,7 +938,7 @@ impl Daemon {
             let mut tr_shutdown = daemon.shutdown_tx.subscribe();
             let interval =
                 Duration::from_secs(daemon.ticket_reopen_sweep_config.interval_secs.max(1));
-            tokio::spawn(async move {
+            background_tasks.spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 tick.tick().await;
                 loop {
@@ -943,7 +960,7 @@ impl Daemon {
             let space = daemon.space.clone();
             let interval = daemon.sync_interval;
             let mut sync_shutdown = daemon.shutdown_tx.subscribe();
-            tokio::spawn(async move {
+            background_tasks.spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 loop {
                     tokio::select! {
@@ -1021,7 +1038,7 @@ impl Daemon {
             // dispatch calls `engine.run`, which `tokio::spawn`s the workflow — so
             // the blocking thread must enter the runtime context first.
             let handle = tokio::runtime::Handle::current();
-            tokio::spawn(async move {
+            background_tasks.spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 loop {
                     tokio::select! {
@@ -1066,7 +1083,7 @@ impl Daemon {
             let mut landing_feed = daemon.space.subscribe();
             let mut landing_shutdown = daemon.shutdown_tx.subscribe();
             let landing_interval = Duration::from_secs(daemon.reactor_config.interval_secs.max(1));
-            tokio::spawn(async move {
+            background_tasks.spawn(async move {
                 let mut tick = tokio::time::interval(landing_interval);
                 loop {
                     tokio::select! {
@@ -1113,7 +1130,7 @@ impl Daemon {
             // dispatch calls `engine.run`, which `tokio::spawn`s the workflow — so
             // the blocking thread must enter the runtime context first.
             let handle = tokio::runtime::Handle::current();
-            tokio::spawn(async move {
+            background_tasks.spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 loop {
                     tokio::select! {
@@ -1160,7 +1177,7 @@ impl Daemon {
             // Unlike the reactor/scheduler, a drain cycle shells out to nothing
             // (it claims tickets and spawns) so it runs directly in this async
             // task — the same context the RPC spawn path already uses.
-            tokio::spawn(async move {
+            background_tasks.spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 loop {
                     tokio::select! {
@@ -1235,6 +1252,26 @@ impl Daemon {
                     info!("signal received, shutting down");
                     break;
                 }
+            }
+        }
+
+        // Make sure every background loop has actually been told to stop —
+        // the OS-signal branch above breaks this loop directly without going
+        // through `shutdown_tx`, and each loop below selects on that channel,
+        // not the signal. `send` always notifies subscribers on this watch
+        // channel even if the value is unchanged, so this is a harmless no-op
+        // when a `stop` RPC already sent it.
+        let _ = daemon.shutdown_tx.send(true);
+        // Wait for every background loop to actually exit before returning —
+        // see the `background_tasks` comment above for why this, rather than
+        // a bare detached `tokio::spawn`, is what makes shutdown observable
+        // and makes `run()`'s task tree abort cleanly as a unit. `join_next`
+        // rather than `join_all`: a loop that panicked earlier (while running
+        // detached, same as before this change) must not take the whole
+        // shutdown down with it — warn and keep draining the set instead.
+        while let Some(result) = background_tasks.join_next().await {
+            if let Err(e) = result {
+                warn!(error = %e, "background loop task panicked");
             }
         }
 
@@ -4065,6 +4102,11 @@ impl Daemon {
         let artifact_reap = crate::supervisor::Reap {
             git: false,
             logs: false,
+            // Always on: whether anything is actually removed for a given
+            // repo is decided per-record inside `reap_artifacts` from that
+            // repo's own activated policy, falling back to the operator-set
+            // lists below (empty by default — STACK NEUTRALITY).
+            artifacts: true,
             artifact_paths: self.worktree_sweep_config.artifact_paths.clone(),
             artifact_paths_by_repo: self.worktree_sweep_config.artifact_paths_by_repo.clone(),
         };
@@ -4075,6 +4117,7 @@ impl Daemon {
         let reap = crate::supervisor::Reap {
             git: true,
             logs: false,
+            artifacts: true,
             artifact_paths: self.worktree_sweep_config.artifact_paths.clone(),
             artifact_paths_by_repo: self.worktree_sweep_config.artifact_paths_by_repo.clone(),
         };
@@ -6809,6 +6852,7 @@ impl Daemon {
         let reap = crate::supervisor::Reap {
             git: params.reap_git,
             logs: params.reap_logs,
+            artifacts: params.reap_artifacts,
             artifact_paths: if params.reap_artifacts {
                 self.worktree_sweep_config.artifact_paths.clone()
             } else {

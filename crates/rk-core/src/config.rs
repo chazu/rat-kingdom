@@ -596,18 +596,24 @@ pub struct WorktreeSweepConfig {
     /// failures, each passing standalone). Tests that specifically cover
     /// this guarantee opt back in explicitly via `set_worktree_sweep_config`.
     pub finalize_cleanup_enabled: bool,
-    /// Regenerable build-artifact paths (relative to a worktree root, e.g.
-    /// `target` for a cargo workspace) reclaimed from EVERY terminal agent's
-    /// worktree — Completed/Failed/Dismissed — regardless of merge state AND
-    /// regardless of [`after_days`](Self::after_days): every sweep tick reaps
-    /// these paths from every still-live terminal record immediately, not
-    /// only once a record ages into archiving. Unlike the git reclaim above,
-    /// an unmerged branch's build output is exactly as regenerable as a
-    /// merged one's: only these named paths are removed, never the worktree,
-    /// branch, or any source/git state. Empty disables artifact reaping
-    /// entirely. Root-caused by the 2026-08-18 O12 incident
-    /// (docs/2026-08-18-drain-probe-log.md): a probe day left 231 GB of
-    /// terminal rats' `target/` dirs standing because the sweep only
+    /// Fleet-wide fallback list of regenerable build-artifact paths (relative
+    /// to a worktree root) reclaimed from EVERY terminal agent's worktree —
+    /// Completed/Failed/Dismissed — regardless of merge state AND regardless
+    /// of [`after_days`](Self::after_days): every sweep tick reaps these
+    /// paths from every still-live terminal record immediately, not only once
+    /// a record ages into archiving. Unlike the git reclaim above, an
+    /// unmerged branch's build output is exactly as regenerable as a merged
+    /// one's: only these named paths are removed, never the worktree, branch,
+    /// or any source/git state. STACK NEUTRALITY: the daemon has no built-in
+    /// notion of what any language's build directory is called, so this
+    /// defaults to EMPTY (reap nothing) — a repo's own `.rk/repo.cue`
+    /// `reap.artifactPaths` (`rk_workflow::ReapPolicy`) is the intended source
+    /// and always takes precedence when a repo declares one; this field and
+    /// [`artifact_paths_by_repo`](Self::artifact_paths_by_repo) exist only as
+    /// an operator-set fallback for repos that have not (yet) activated a
+    /// policy naming their own paths. Root-caused by the 2026-08-18 O12
+    /// incident (docs/2026-08-18-drain-probe-log.md): a probe day left 231 GB
+    /// of terminal rats' `target/` dirs standing because the sweep only
     /// reclaimed MERGED branches' worktrees wholesale, tripping `[disk]
     /// min_free_gb` and silently stalling drain — gating the artifact reap on
     /// the same `after_days` cutoff as archiving would have reproduced that
@@ -615,8 +621,8 @@ pub struct WorktreeSweepConfig {
     pub artifact_paths: Vec<String>,
     /// Per-repo override of `artifact_paths`, keyed by repo name — a repo
     /// with an entry here uses THAT list instead of `artifact_paths` (not
-    /// merged with it), for repos whose build tool leaves a differently
-    /// named cache (`node_modules`, `.venv`, ...).
+    /// merged with it) whenever its `.rk/repo.cue` declares no
+    /// `reap.artifactPaths` of its own.
     #[serde(default)]
     pub artifact_paths_by_repo: std::collections::HashMap<String, Vec<String>>,
 }
@@ -632,7 +638,10 @@ impl Default for WorktreeSweepConfig {
             interval_secs: 3600,
             after_days: 3,
             finalize_cleanup_enabled: true,
-            artifact_paths: vec!["target".to_string()],
+            // STACK NEUTRALITY: no language/toolchain assumption belongs in a
+            // daemon-wide default — see the field doc above. Reaping only
+            // happens for a repo that opts in through its own policy.
+            artifact_paths: Vec::new(),
             artifact_paths_by_repo: std::collections::HashMap::new(),
         }
     }

@@ -35,6 +35,11 @@ workflow: {
 		description: {type: "string", required: false, default: ""}
 		workTimeout: {type: "string", required: false, default: "30m"}
 		reviewTimeout: {type: "string", required: false, default: "15m"}
+		// Ceiling for the `read` below that lifts the reviewer's verdict once
+		// the review round's wait/evaluate already confirmed the reviewer
+		// finished cleanly — covers the gap between "generation done" and "the
+		// artifact write it shelled out to has landed and been read back."
+		readTimeout: {type: "string", required: false, default: "2m"}
 		// Hard cap on review rounds (schema enforces 1..=100).
 		maxRounds: {type: "int", required: false, default: 3}
 	}
@@ -102,7 +107,7 @@ workflow: {
 					fromAgent: true
 					field:     "recommendation"
 					into:      "verdict"
-					timeout:   "2m"
+					timeout:   _input.readTimeout
 				},
 				{
 					type: "when"
