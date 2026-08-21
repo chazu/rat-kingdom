@@ -98,7 +98,13 @@ pub fn resolve_fields(
         }
     }
 
-    let mut harness: Option<String> = None;
+    // Seed the accumulator with the global default harness (module doc layer
+    // 7, the least specific of all) rather than `None`. Otherwise the first
+    // layer that names a harness always looks like a change relative to
+    // "nothing decided yet" — even when it merely spells out the harness a
+    // model-only lower layer was already implicitly running under — and a
+    // compatible model gets dropped for no provider-safety reason.
+    let mut harness: Option<String> = Some(global_default_harness.to_string());
     let mut model: Option<String> = None;
     let mut permission_mode: Option<String> = None;
     for layer in layers {
@@ -131,13 +137,18 @@ pub fn resolve_fields(
 }
 
 /// Fold one layer's fields into the accumulated resolution, least-specific
-/// layer applied first. `model` is treated as scoped to the `harness` it
-/// travels with: if this layer sets a harness that differs from the harness
-/// accumulated so far (including the first layer that sets one at all), any
-/// previously accumulated model is dropped — it belongs to the harness being
-/// replaced — and only this layer's own `model` (if any) survives. A layer
-/// that leaves `harness` unset cannot change harnesses, so it merges its
-/// `model`/`permission_mode` independently, same as before.
+/// layer applied first (the caller seeds `harness` with the global default
+/// harness before the first call, so "accumulated so far" always reflects
+/// the harness that is actually in effect, not merely "some layer already
+/// named one"). `model` is treated as scoped to the `harness` it travels
+/// with: if this layer sets a harness that differs from the harness in
+/// effect, any previously accumulated model is dropped — it belongs to the
+/// harness being replaced — and only this layer's own `model` (if any)
+/// survives. If this layer names the SAME harness already in effect
+/// (whether that came from an earlier explicit layer or is still just the
+/// seeded global default), that is not a boundary crossing, so a model
+/// accumulated under it is preserved and merges independently, same as a
+/// layer that leaves `harness` unset entirely.
 fn apply_layer(
     harness: &mut Option<String>,
     model: &mut Option<String>,
@@ -147,9 +158,11 @@ fn apply_layer(
     layer_permission_mode: Option<&str>,
 ) {
     if let Some(h) = layer_harness {
-        if harness.as_deref() != Some(h) {
-            *model = layer_model.map(String::from);
-        } else if layer_model.is_some() {
+        // Reset unconditionally on a harness change (even to None, dropping
+        // an incompatible inherited model); on the same harness, only
+        // overwrite when this layer actually names a model.
+        let changing_harness = harness.as_deref() != Some(h);
+        if changing_harness || layer_model.is_some() {
             *model = layer_model.map(String::from);
         }
         *harness = Some(h.to_string());
@@ -254,6 +267,38 @@ mod tests {
         let resolved = step(None).pipe_resolve(&wf, &global, "fake").unwrap();
         assert_eq!(resolved.harness, "codex");
         assert_eq!(resolved.model.as_deref(), Some("gpt-5-codex"));
+    }
+
+    #[test]
+    fn explicit_harness_matching_the_global_default_harness_preserves_a_model_only_layer() {
+        // Not a provider boundary: global_default_harness is "claude", the
+        // global `default` profile only names a model (no harness — it just
+        // rides the fallback), and a more-specific workflow layer spells out
+        // harness: "claude" explicitly — the SAME harness already in effect.
+        // Restating the already-effective harness must not read as a change
+        // and must not drop the model that was chosen for it.
+        let global = HashMap::from([("default".into(), profile(None, Some("opus")))]);
+        let wf = HashMap::from([("default".into(), profile(Some("claude"), None))]);
+        let resolved = step(None).pipe_resolve(&wf, &global, "claude").unwrap();
+        assert_eq!(resolved.harness, "claude");
+        assert_eq!(
+            resolved.model.as_deref(),
+            Some("opus"),
+            "restating the fallback harness explicitly must not clear a model \
+             chosen for that same harness"
+        );
+
+        // Sanity check the other side of the same seam: if the more-specific
+        // layer instead names a genuinely different harness, the model still
+        // must not leak (this is the codex/opus case from the other tests,
+        // just reached via a model-only global default instead of an
+        // explicit-harness one).
+        let wf_switch = HashMap::from([("default".into(), profile(Some("codex"), None))]);
+        let resolved_switch = step(None)
+            .pipe_resolve(&wf_switch, &global, "claude")
+            .unwrap();
+        assert_eq!(resolved_switch.harness, "codex");
+        assert_eq!(resolved_switch.model, None);
     }
 
     #[test]
