@@ -7003,12 +7003,20 @@ impl Daemon {
         } else {
             req.caller.as_str()
         };
+        let Some(session_generation) = self.supervisor.session_generation(&record.name) else {
+            return Response::err(
+                req.id,
+                codes::INTERNAL,
+                format!("{} has no live session generation", record.name),
+            );
+        };
+        let session_generation = session_generation.to_string();
         let envelope = ControlEnvelope::new(
             RecordId::new().to_string(),
             sender,
             &record.name,
-            record.created_at.to_rfc3339(),
-            record.spawn_id().to_string(),
+            session_generation.clone(),
+            session_generation.clone(),
             params.message,
         );
         if let Err(e) =
@@ -7023,7 +7031,12 @@ impl Daemon {
         {
             Ok(()) => Response::ok(
                 req.id,
-                json!({"steered": true, "message_id": envelope.message_id}),
+                json!({
+                    "steered": true,
+                    "message_id": envelope.message_id,
+                    "delivery_generation": envelope.delivery_generation,
+                    "resume_generation": envelope.resume_generation,
+                }),
             ),
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }

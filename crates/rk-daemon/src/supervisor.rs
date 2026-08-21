@@ -2181,19 +2181,6 @@ impl Supervisor {
                                 "failed to persist steer acknowledgement"
                             );
                         }
-                        self.emit_event(
-                            &record.repo_name,
-                            crate::steer::CONTROL_ACK_IDENTITY,
-                            json!({
-                                "type": crate::steer::CONTROL_MESSAGE_TYPE,
-                                "message_id": envelope.message_id,
-                                "sender": envelope.sender,
-                                "target": envelope.target,
-                                "delivery_generation": envelope.delivery_generation,
-                                "resume_generation": envelope.resume_generation,
-                                "acknowledged": true,
-                            }),
-                        );
                     }
                 }
             }
@@ -3823,6 +3810,15 @@ impl Supervisor {
                 .map_err(|e| rk_core::Error::other(e.to_string()))?;
         }
         Err(rk_core::Error::other(format!("{name} has no live session")))
+    }
+
+    /// Return the generation of the process currently behind this agent's
+    /// control handle. This is deliberately separate from `AgentRecord`'s
+    /// task generation: a respawn reuses that record while launching a new
+    /// process, and trusted control audit must name the process that received
+    /// the envelope.
+    pub fn session_generation(&self, name: &str) -> Option<rk_core::id::SpawnId> {
+        self.lock_session_tokens().get(name).copied()
     }
 
     /// Deliver a durable control envelope to a live harness. The old string
@@ -5754,6 +5750,7 @@ impl Supervisor {
                 let control = self.lock_controls().get(name).cloned();
                 if let Some(control) = control {
                     for envelope in pending {
+                        let envelope = envelope.for_resume_generation(token.to_string());
                         let control = control.clone();
                         handle.spawn(async move {
                             if let Err(error) = control.steer_envelope(&envelope).await {

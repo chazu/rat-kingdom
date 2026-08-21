@@ -527,4 +527,236 @@ while :; do sleep 1; done
         );
         assert!(!saw_delivery, "failed resume must remain unacknowledged");
     }
+
+    #[tokio::test]
+    async fn resume_rejection_after_spawn_is_not_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("codex-fake");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$2" = "resume" ]; then
+  echo '{"type":"error","message":"session rejected"}'
+  exit 2
+fi
+echo '{"type":"thread.started","thread_id":"session-rat"}'
+trap 'exit 130' INT
+while :; do sleep 1; done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = HashMap::new();
+        env.insert("RK_CODEX_BIN".into(), binary.to_string_lossy().into_owned());
+        let mut session = CodexHarness
+            .launch(&LaunchSpec {
+                prompt: "keep working".into(),
+                cwd: dir.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let started = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = session.events.recv().await {
+                if matches!(event, HarnessEvent::Started { .. }) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(started.is_ok(), "initial Codex session did not start");
+
+        let envelope = ControlEnvelope::new(
+            "message-rejected",
+            "operator",
+            "rat",
+            "delivery-1",
+            "resume-1",
+            "continue",
+        );
+        session.control.steer_envelope(&envelope).await.unwrap();
+
+        let mut saw_failure = false;
+        let mut saw_delivery = false;
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(2), session.events.recv())
+            .await
+            .unwrap()
+        {
+            match event {
+                HarnessEvent::Retry { .. } => saw_failure = true,
+                HarnessEvent::ControlDelivered { .. } => saw_delivery = true,
+                HarnessEvent::Exited { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(saw_failure, "a rejected resume must be visible");
+        assert!(
+            !saw_delivery,
+            "spawning a resume child must not acknowledge a rejected session"
+        );
+    }
+
+    /// A resumed process can complete the protocol handshake (emit
+    /// `thread.started`) and then immediately reject the session and exit,
+    /// with no further event proving control was actually applied. Started
+    /// alone must not acknowledge the envelope, or a durable ack would be
+    /// persisted for a control that never took effect, permanently
+    /// suppressing replay.
+    #[tokio::test]
+    async fn resume_started_then_immediate_exit_is_not_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("codex-fake");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$2" = "resume" ]; then
+  echo '{"type":"thread.started","thread_id":"session-rat"}'
+  exit 1
+fi
+echo '{"type":"thread.started","thread_id":"session-rat"}'
+trap 'exit 130' INT
+while :; do sleep 1; done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = HashMap::new();
+        env.insert("RK_CODEX_BIN".into(), binary.to_string_lossy().into_owned());
+        let mut session = CodexHarness
+            .launch(&LaunchSpec {
+                prompt: "keep working".into(),
+                cwd: dir.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let started = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = session.events.recv().await {
+                if matches!(event, HarnessEvent::Started { .. }) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(started.is_ok(), "initial Codex session did not start");
+
+        let envelope = ControlEnvelope::new(
+            "message-started-then-exit",
+            "operator",
+            "rat",
+            "delivery-1",
+            "resume-1",
+            "continue",
+        );
+        session.control.steer_envelope(&envelope).await.unwrap();
+
+        let mut saw_failure = false;
+        let mut saw_delivery = false;
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(2), session.events.recv())
+            .await
+            .unwrap()
+        {
+            match event {
+                HarnessEvent::Retry { .. } => saw_failure = true,
+                HarnessEvent::ControlDelivered { .. } => saw_delivery = true,
+                HarnessEvent::Exited { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_failure,
+            "a resume that starts then immediately exits must be visible as a failure"
+        );
+        assert!(
+            !saw_delivery,
+            "Started alone must not acknowledge a resume that never proves control was applied"
+        );
+    }
+
+    /// A resumed process can complete the handshake, emit a tool-call event
+    /// (Codex resume can replay command_execution/mcp_tool_call/turn.completed
+    /// activity buffered from the session's prior history), and then reject
+    /// the session and exit — all without the model ever engaging with the
+    /// newly injected control turn. Neither Started nor a lookalike
+    /// ToolUse/Usage event may acknowledge the envelope, or a durable ack
+    /// would be persisted for a control that was never actually applied.
+    #[tokio::test]
+    async fn resume_started_then_tool_only_then_rejected_is_not_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("codex-fake");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$2" = "resume" ]; then
+  echo '{"type":"thread.started","thread_id":"session-rat"}'
+  echo '{"type":"item.completed","item":{"item_type":"command_execution","command":"echo replayed"}}'
+  echo '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}'
+  echo '{"type":"error","message":"session rejected"}'
+  exit 2
+fi
+echo '{"type":"thread.started","thread_id":"session-rat"}'
+trap 'exit 130' INT
+while :; do sleep 1; done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = HashMap::new();
+        env.insert("RK_CODEX_BIN".into(), binary.to_string_lossy().into_owned());
+        let mut session = CodexHarness
+            .launch(&LaunchSpec {
+                prompt: "keep working".into(),
+                cwd: dir.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let started = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = session.events.recv().await {
+                if matches!(event, HarnessEvent::Started { .. }) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(started.is_ok(), "initial Codex session did not start");
+
+        let envelope = ControlEnvelope::new(
+            "message-tool-then-reject",
+            "operator",
+            "rat",
+            "delivery-1",
+            "resume-1",
+            "continue",
+        );
+        session.control.steer_envelope(&envelope).await.unwrap();
+
+        let mut saw_failure = false;
+        let mut saw_delivery = false;
+        let mut saw_tool = false;
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(2), session.events.recv())
+            .await
+            .unwrap()
+        {
+            match event {
+                HarnessEvent::ToolUse { .. } => saw_tool = true,
+                HarnessEvent::Retry { .. } => saw_failure = true,
+                HarnessEvent::ControlDelivered { .. } => saw_delivery = true,
+                HarnessEvent::Exited { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(saw_tool, "the replayed tool event must still surface");
+        assert!(
+            saw_failure,
+            "a resume that starts, emits tool activity, then rejects must be visible as a failure"
+        );
+        assert!(
+            !saw_delivery,
+            "a lookalike tool/usage event must not acknowledge a resume that never proved control was applied"
+        );
+    }
 }
