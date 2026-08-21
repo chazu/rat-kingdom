@@ -22,16 +22,6 @@ use std::time::Duration;
 
 const CHECKS_TARGET: &str = ".rk/checks.cue";
 const OUTPUT_SUMMARY_LIMIT: usize = 8 * 1024;
-const STRIPPED_RK_ENV: &[&str] = &[
-    "RK_AGENT",
-    "RK_TASK",
-    "RK_REPO",
-    "RK_ROLE",
-    "RK_HOME",
-    "RK_BRANCH",
-    "RK_WORKTREE",
-    "RK_AUTH_TOKEN",
-];
 
 /// Apply (or recover) the exact approved patch and return durable evidence for
 /// its one onboarding-branch commit.
@@ -211,7 +201,7 @@ pub async fn verify(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     if contract.environment_policy == CheckEnvironmentPolicy::StripRkSpawn {
-        for name in STRIPPED_RK_ENV {
+        for name in rk_workflow::STRIPPED_RK_SPAWN_ENV {
             command.env_remove(name);
         }
     }

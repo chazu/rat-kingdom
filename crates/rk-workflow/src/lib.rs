@@ -873,6 +873,33 @@ impl std::fmt::Display for CheckEnvironmentPolicy {
     }
 }
 
+/// The exact set of environment variables [`CheckEnvironmentPolicy::StripRkSpawn`]
+/// removes from a check's child process: supervised spawn identity (`RK_AGENT`
+/// and friends) AND the exact-review binding (`RK_REVIEW_*`, see
+/// `rk_core::review`). A check isolated from spawn identity must also be
+/// isolated from an outer reviewer's review binding — otherwise a nested
+/// check that itself exercises reviewer-role writes (a repo's own test suite
+/// spawning a synthetic reviewer, for example) inherits the real reviewer's
+/// `RK_REVIEW_TASK`/etc, which then mismatches its own synthetic `RK_TASK` and
+/// gets rejected by the server's exact-review binding check. Every executor of
+/// a `StripRkSpawn` check must remove exactly this list rather than hand-roll
+/// its own, or the copies drift apart.
+pub const STRIPPED_RK_SPAWN_ENV: &[&str] = &[
+    "RK_AGENT",
+    "RK_TASK",
+    "RK_REPO",
+    "RK_ROLE",
+    "RK_HOME",
+    "RK_BRANCH",
+    "RK_WORKTREE",
+    "RK_AUTH_TOKEN",
+    rk_core::review::REVIEW_BRANCH_ENV,
+    rk_core::review::REVIEW_HEAD_ENV,
+    rk_core::review::REVIEW_TARGET_ENV,
+    rk_core::review::REVIEW_TASK_ENV,
+    rk_core::review::REVIEW_ATTEMPT_ENV,
+];
+
 /// A repo-registered named check: the per-repo allowlist entry a workflow `run`
 /// step invokes by name instead of carrying a raw shell command. The registry
 /// lives in `<repo>/.rk/checks.cue` and is owned by the repo, NOT by the (possibly
@@ -898,6 +925,9 @@ pub struct Check {
     /// Environment inherited by the check process. Repositories whose test
     /// clients read ambient rat identity can explicitly strip the spawn
     /// contract rather than relying on an operator to remember shell hygiene.
+    /// `strip_rk_spawn` removes both supervised spawn identity (`RK_AGENT` and
+    /// friends) and the exact-review binding (`RK_REVIEW_*`) — see
+    /// [`STRIPPED_RK_SPAWN_ENV`].
     #[serde(default, rename = "environmentPolicy")]
     pub environment_policy: CheckEnvironmentPolicy,
     /// Repository-owned description of the runner/toolchain used by this
