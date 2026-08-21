@@ -33,6 +33,7 @@ pub mod repos;
 pub mod scheduler;
 pub mod server;
 pub mod supervisor;
+pub mod steer;
 pub mod sync;
 pub mod tickets;
 pub mod workflow_exec;

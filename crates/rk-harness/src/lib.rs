@@ -12,6 +12,64 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
+/// Versioned, daemon-authenticated control input.  This is deliberately a
+/// different value from assistant/tool/stderr output: adapters must carry it
+/// on their control input, and never reconstruct it from child output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlEnvelope {
+    pub schema: String,
+    pub message_id: String,
+    pub sender: String,
+    pub target: String,
+    pub delivery_generation: String,
+    pub resume_generation: String,
+    pub text: String,
+    #[serde(default = "default_durable_control")]
+    pub durable: bool,
+}
+
+fn default_durable_control() -> bool {
+    true
+}
+
+impl ControlEnvelope {
+    pub fn new(
+        message_id: impl Into<String>,
+        sender: impl Into<String>,
+        target: impl Into<String>,
+        delivery_generation: impl Into<String>,
+        resume_generation: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: "rk.control.v1".into(),
+            message_id: message_id.into(),
+            sender: sender.into(),
+            target: target.into(),
+            delivery_generation: delivery_generation.into(),
+            resume_generation: resume_generation.into(),
+            text: text.into(),
+            durable: true,
+        }
+    }
+
+    /// Internal supervisor nudges still use the same typed wire shape, but
+    /// are explicitly identified as daemon-originated rather than looking
+    /// like an operator's prose.
+    pub fn system(target: impl Into<String>, text: impl Into<String>) -> Self {
+        let mut envelope = Self::new(
+            rk_core::id::SpawnId::new().to_string(),
+            "rk-daemon",
+            target,
+            "system",
+            "system",
+            text,
+        );
+        envelope.durable = false;
+        envelope
+    }
+}
+
 /// Token counts for one API call or one session, by class.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
@@ -63,6 +121,10 @@ pub enum HarnessEvent {
     },
     /// The child process exited (always the final event).
     Exited { code: Option<i32> },
+    /// The adapter accepted a trusted control envelope for delivery to the
+    /// harness. This acknowledgement is separate from child prose/tool
+    /// output and is the durable audit boundary in the daemon.
+    ControlDelivered { envelope: ControlEnvelope },
 }
 
 /// What a given adapter can do; the orchestrator adapts per-capability.
@@ -104,7 +166,7 @@ pub struct HarnessSession {
 /// Handles for steering/interrupting a running session. Cheap to clone.
 #[derive(Clone)]
 pub struct SessionControl {
-    steer_tx: Option<mpsc::Sender<String>>,
+    steer_tx: Option<mpsc::Sender<ControlEnvelope>>,
     kill_tx: mpsc::Sender<KillSignal>,
 }
 
@@ -118,12 +180,20 @@ enum KillSignal {
 impl SessionControl {
     /// Send mid-session guidance. Errors if this harness cannot steer.
     pub async fn steer(&self, message: &str) -> rk_core::Result<()> {
+        self.steer_envelope(&ControlEnvelope::system("unknown", message))
+            .await
+    }
+
+    /// Send a daemon-authenticated control envelope. The envelope remains
+    /// typed through the adapter boundary; callers cannot smuggle it in via
+    /// assistant text or tool output.
+    pub async fn steer_envelope(&self, envelope: &ControlEnvelope) -> rk_core::Result<()> {
         let Some(tx) = &self.steer_tx else {
             return Err(rk_core::Error::other(
                 "this harness does not support steering",
             ));
         };
-        tx.send(message.to_string())
+        tx.send(envelope.clone())
             .await
             .map_err(|_| rk_core::Error::other("session is no longer running"))
     }
@@ -226,7 +296,7 @@ pub(crate) mod runner {
         /// Parse one stdout line into zero or more events.
         pub parse: fn(&str) -> Vec<HarnessEvent>,
         /// Map a steer message to a stdin line, if the adapter supports it.
-        pub steer_line: Option<fn(&str) -> String>,
+        pub steer_line: Option<fn(&ControlEnvelope) -> String>,
     }
 
     /// Guarantees a harness child's WHOLE process group dies, not just the
@@ -286,7 +356,7 @@ pub(crate) mod runner {
         let mut stdin = child.stdin.take();
 
         let (event_tx, events) = mpsc::channel::<HarnessEvent>(256);
-        let (steer_tx, mut steer_rx) = mpsc::channel::<String>(32);
+        let (steer_tx, mut steer_rx) = mpsc::channel::<ControlEnvelope>(32);
         let (kill_tx, mut kill_rx) = mpsc::channel::<KillSignal>(4);
 
         let parse = wiring.parse;
@@ -393,6 +463,12 @@ pub(crate) mod runner {
                             line.push(b'\n');
                             if let Err(e) = sin.write_all(&line).await {
                                 warn!(error = %e, "steer write failed");
+                            } else if event_tx
+                                .send(HarnessEvent::ControlDelivered { envelope: msg })
+                                .await
+                                .is_err()
+                            {
+                                break;
                             }
                         }
                     }
