@@ -1419,9 +1419,26 @@ fn parse_digest(digest: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dashboard_output_mode, render_dashboard, render_recommend_markdown, DashboardOutputMode,
+        dashboard_output_mode, locate_mcp_source, render_dashboard, render_recommend_markdown,
+        DashboardOutputMode,
     };
     use serde_json::json;
+    use std::fs;
+
+    #[test]
+    fn mcp_fallback_source_uses_the_running_binary_target_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let release = target.join("release/rk-mcp");
+        let debug = target.join("debug/rk-mcp");
+        fs::create_dir_all(release.parent().unwrap()).unwrap();
+        fs::create_dir_all(debug.parent().unwrap()).unwrap();
+        fs::write(&release, b"release").unwrap();
+        fs::write(&debug, b"debug").unwrap();
+
+        let destination = target.join("debug/rk");
+        assert_eq!(locate_mcp_source(&destination).unwrap(), Some(release));
+    }
 
     #[test]
     fn dashboard_uses_the_interactive_tui_on_a_terminal() {
