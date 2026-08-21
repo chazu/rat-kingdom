@@ -9030,7 +9030,14 @@ checks: [
         let entry = review_candidate_entry(repo_dir.path(), &head_sha);
 
         let space = Space::open_in_memory().unwrap();
-        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        // This test measures reviewer-death detection and escalation, not the
+        // shipped retry delay. Drive the default 30s backoff through the fake
+        // schedule so it advances deterministically without consuming wall
+        // clock time.
+        let clock = FakeSchedule::new(0.0);
+        let pipeline = Arc::new(
+            test_pipeline(home.path(), space.clone()).with_retry_schedule(clock.schedule()),
+        );
         // Generous base/ceiling: the point under test is that death is
         // detected well before EITHER, not merely before the ceiling.
         let gates = GateConfig {
@@ -9101,6 +9108,7 @@ checks: [
             2,
             "the dead primary plus exactly one replacement reviewer, no more"
         );
+        assert_eq!(clock.waits(), vec![Duration::from_secs(30)]);
         let markers = scoped_tuples(&space, Category::Event, REVIEW_DEATH_DISPATCH_IDENTITY);
         let dispatching = markers
             .iter()
