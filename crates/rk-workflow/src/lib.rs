@@ -170,10 +170,10 @@ pub struct LandingPolicy {
     /// dispatch. `0` means unlimited, matching the fleet budget convention.
     #[serde(default = "default_review_death_max_usd", rename = "reviewDeathMaxUsd")]
     pub review_death_max_usd: u32,
-    /// Delay before the FIRST review-death replacement is dispatched, e.g.
-    /// `"30s"`. `"0s"` preserves the pre-backoff immediate-dispatch behavior
-    /// exactly — see `crates/rk-daemon/src/landing_review_retry.rs`'s
-    /// `retry_delay`.
+    /// Delay before the FIRST review-death replacement is dispatched,
+    /// defaulting to `"30s"`. `"0s"` is the explicit opt-out that restores
+    /// pre-backoff immediate dispatch exactly — see
+    /// `crates/rk-daemon/src/landing_review_retry.rs`'s `retry_delay`.
     #[serde(
         default = "default_review_death_retry_delay",
         rename = "reviewDeathRetryDelay"
@@ -257,15 +257,21 @@ fn default_review_death_max_usd() -> u32 {
     10
 }
 
-/// `"0s"`: the pre-backoff behavior (dispatch the replacement immediately)
-/// stays the DEFAULT, not just an explicitly-reachable edge case — every
-/// repo without an activated `reviewDeathRetryDelay` sees no behavior
-/// change from before this policy existed. A repo that wants its
-/// replacement reviewers paced (e.g. to ride out a transient
-/// infrastructure blip) opts in explicitly, the same way `shadowReviewModel`
-/// defaults empty (disabled) rather than silently turning on for every repo.
+/// Bounded backoff is the SHIPPED behavior, not an opt-in: a reviewer that
+/// died before producing a verdict usually died for an infrastructure
+/// reason, and re-dispatching into the same blip on the same tick is the
+/// failure mode the whole policy exists to stop — so a default of `"0s"`
+/// would leave every unconfigured repo (i.e. all of them) with jitter inert
+/// and no pacing at all. `"30s"` is long enough to ride out a transient
+/// spawn/harness blip and, against `default_max_review_death_attempts`'s
+/// single attempt and `default_review_death_retry_jitter_pct`'s 20%, holds
+/// a candidate for at most ~36s before its replacement goes out — far
+/// inside the human-attention window a held branch already lives in. A repo
+/// that genuinely wants the pre-backoff immediate dispatch sets
+/// `reviewDeathRetryDelay: "0s"` explicitly, which `retry_delay`
+/// short-circuits to zero regardless of backoff/jitter/clamp.
 fn default_review_death_retry_delay() -> String {
-    "0s".to_string()
+    "30s".to_string()
 }
 
 /// Doubling: a repeat death is more likely a systemic problem than a fluke,

@@ -83,10 +83,11 @@ repo: #RepositoryPolicy
 	maxReviewDeathAttempts: int | *1
 	// Hard ceiling on cumulative USD across one review-death retry chain. 0 = unlimited.
 	reviewDeathMaxUsd: int | *10
-	// Delay before the FIRST review-death replacement is dispatched. "0s" (the
-	// default) preserves pre-backoff immediate-dispatch behavior exactly; a
-	// repo opts into pacing explicitly, e.g. "30s".
-	reviewDeathRetryDelay: string | *"0s"
+	// Delay before the FIRST review-death replacement is dispatched. Bounded
+	// backoff is on by default so an unconfigured repo does not re-dispatch
+	// into the same infrastructure blip on the same tick; "0s" is the explicit
+	// opt-out that restores pre-backoff immediate dispatch exactly.
+	reviewDeathRetryDelay: string | *"30s"
 	// Percent scaling applied to the delay per additional replacement beyond
 	// the first — 100 holds it flat, 200 doubles it each attempt.
 	reviewDeathRetryBackoffPct: int | *200
