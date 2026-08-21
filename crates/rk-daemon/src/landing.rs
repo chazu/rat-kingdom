@@ -7791,6 +7791,16 @@ workflow: {
             test_pipeline(home.path(), restarted_space.clone())
                 .with_retry_schedule(clock.schedule()),
         );
+        // A real daemon restart rehydrates every durable workflow instance
+        // into the engine's in-memory map (`Server::run`, before any dispatch
+        // loop touches the landing queue) — that is what makes
+        // `dispatch_review`'s per-`instance_id` idempotency
+        // (`WorkflowEngine::store_if_absent`) actually hold across a restart.
+        // A bare, never-rehydrated engine has no record of the retry instance
+        // the first daemon already dispatched, so it would treat the same id
+        // as new and dispatch a duplicate — mirror the real startup sequence
+        // here so this test exercises the actual restart invariant.
+        restarted.engine.rehydrate();
         let process = tokio::spawn({
             let restarted = Arc::clone(&restarted);
             let entry = entry.clone();
