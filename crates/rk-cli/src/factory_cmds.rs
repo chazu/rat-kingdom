@@ -1426,7 +1426,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn mcp_fallback_source_uses_the_running_binary_target_directory() {
+    fn mcp_fallback_source_uses_runtime_target_or_installed_sibling() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("target");
         let release = target.join("release/rk-mcp");
@@ -1436,8 +1436,25 @@ mod tests {
         fs::write(&release, b"release").unwrap();
         fs::write(&debug, b"debug").unwrap();
 
-        let destination = target.join("debug/rk");
-        assert_eq!(locate_mcp_source(&destination).unwrap(), Some(release));
+        assert_eq!(
+            locate_mcp_source(&target.join("debug/rk")).unwrap(),
+            Some(release.clone())
+        );
+        assert_eq!(
+            locate_mcp_source(&target.join("release/rk")).unwrap(),
+            Some(release)
+        );
+
+        fs::remove_file(&target.join("release/rk-mcp")).unwrap();
+        assert_eq!(
+            locate_mcp_source(&target.join("debug/rk")).unwrap(),
+            Some(debug)
+        );
+
+        let installed = temp.path().join("bin/rk-mcp");
+        fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        fs::write(&installed, b"installed").unwrap();
+        assert_eq!(locate_mcp_source(&installed).unwrap(), Some(installed));
     }
 
     #[test]
