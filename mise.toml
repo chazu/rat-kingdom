@@ -32,15 +32,22 @@ run = "cargo clippy --workspace --all-targets -- -D warnings"
 
 [tasks.test]
 description = "Run the workspace test suite"
-# `env -u RK_AGENT` is load-bearing, not hygiene. A rat's spawn env sets
-# RK_AGENT, and rk_daemon::Client::connect reads it as the RPC `caller`; the
-# daemon then refuses operator-only methods (workflow.run, agent.spawn, ...)
-# with `forbidden`. So the suite passes for a human and fails for every rat
-# running the very command its completion protocol demands. Tracked: TKT-182.
+# This `env -u` list is load-bearing, not hygiene, and must stay identical to
+# rk_core::review::STRIPPED_RK_SPAWN_ENV (see crates/rk-core/tests/
+# mise_verify_env.rs, which fails this file out of sync with that constant).
+# A rat's spawn env sets RK_AGENT, and rk_daemon::Client::connect reads it as
+# the RPC `caller`; the daemon then refuses operator-only methods
+# (workflow.run, agent.spawn, ...) with `forbidden`. So the suite passes for a
+# human and fails for every rat running the very command its completion
+# protocol demands. Tracked: TKT-182. The RK_REVIEW_* vars are the exact-review
+# binding a spawned reviewer carries; leaving them set here leaks into any
+# nested test that itself exercises reviewer-role writes (e.g.
+# reviewer_drives_rework.rs's synthetic reviewer subprocess), which then
+# mismatches its own synthetic RK_TASK and is rejected as forbidden.
 # `--no-fail-fast` reports every failing integration-test binary in one run;
 # compilation errors still stop before tests, and any test failure still makes
 # the task fail.
-run = "env -u RK_AGENT cargo test --workspace --no-fail-fast"
+run = "env -u RK_AGENT -u RK_TASK -u RK_REPO -u RK_ROLE -u RK_HOME -u RK_BRANCH -u RK_WORKTREE -u RK_AUTH_TOKEN -u RK_REVIEW_BRANCH -u RK_REVIEW_HEAD -u RK_REVIEW_TARGET -u RK_REVIEW_TASK -u RK_REVIEW_ATTEMPT cargo test --workspace --no-fail-fast"
 
 [tasks.verify]
 description = "Build, test, and lint — the checks a rat must pass before `rk done`"
@@ -49,10 +56,12 @@ description = "Build, test, and lint — the checks a rat must pass before `rk d
 # a CI pass, not just a build+test pass. Previously verify ran neither
 # `cargo fmt --check` nor clippy against test/bench targets, so CI and
 # reviewers caught fmt/clippy issues verify had already reported clean.
+# See [tasks.test] above for why the `env -u` list must stay the full
+# strip_rk_spawn set, not just RK_AGENT.
 run = """
 cargo fmt --all --check
 cargo build --workspace
-env -u RK_AGENT cargo test --workspace --no-fail-fast
+env -u RK_AGENT -u RK_TASK -u RK_REPO -u RK_ROLE -u RK_HOME -u RK_BRANCH -u RK_WORKTREE -u RK_AUTH_TOKEN -u RK_REVIEW_BRANCH -u RK_REVIEW_HEAD -u RK_REVIEW_TARGET -u RK_REVIEW_TASK -u RK_REVIEW_ATTEMPT cargo test --workspace --no-fail-fast
 cargo clippy --workspace --all-targets -- -D warnings
 """
 
