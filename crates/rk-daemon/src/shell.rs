@@ -39,7 +39,11 @@ mod tests {
         // Without pipefail, `sh -c "false | cat"` reports `cat`'s exit
         // status (0) — exactly the masking this wrapper exists to prevent.
         let (program, script) = pipefail_command("false | cat");
-        let status = Command::new(program).arg("-c").arg(&script).status().unwrap();
+        let status = Command::new(program)
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .unwrap();
         assert!(
             !status.success(),
             "pipefail_command must surface the failing pipe stage, not the consumer's success"
@@ -49,14 +53,22 @@ mod tests {
     #[test]
     fn a_clean_pipeline_still_reports_success() {
         let (program, script) = pipefail_command("true | cat");
-        let status = Command::new(program).arg("-c").arg(&script).status().unwrap();
+        let status = Command::new(program)
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .unwrap();
         assert!(status.success());
     }
 
     #[test]
     fn a_plain_command_with_no_pipe_is_unaffected() {
         let (program, script) = pipefail_command("exit 3");
-        let status = Command::new(program).arg("-c").arg(&script).status().unwrap();
+        let status = Command::new(program)
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .unwrap();
         assert_eq!(status.code(), Some(3));
     }
 }
