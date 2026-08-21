@@ -356,6 +356,12 @@ time — instead of a throwaway agent worktree. That is the structural change
 from the mega-workflow: no agent spawn is needed just to have somewhere to run
 three deterministic checks.
 
+A complete green run emits a durable `landing_gate_pass` event bound to the
+branch head, prepared candidate SHA, target, task, ordered check names, and
+wall-clock duration. This is both inspectable proof for the review phase and
+the phase timing needed to diagnose landing throughput without reconstructing
+it from process logs.
+
 4. **Review** (only if `diff_class` is not `doc-only`/`trivial`): a
    commit-keyed verdict-cache probe (`Pattern::for_commit`, scoped to
    `(repo, branch, head_sha)`) runs first, directly against the tuplespace —
@@ -366,7 +372,12 @@ three deterministic checks.
    verdict tuple itself (`space.rd`, not the workflow instance's completion
    state), which is what makes review survive a daemon restart mid-wait (see
    [Restart safety](#restart-safety)). `doc-only`/`trivial` diffs and a cache
-   hit both reach step 5 with **zero agent spawns**.
+   hit both reach step 5 with **zero agent spawns**. A fresh reviewer treats
+   the preceding daemon-owned gate as authoritative and does not rerun the
+   repository-wide verification suite; its job is semantic/spec review, with
+   focused tests available to investigate a concrete finding. The immutable
+   prepared-candidate gate remains the repository-wide test/lint proof for
+   that landing attempt.
 5. **Route** the verdict (fresh or cached), or the unconditional pass for a
    diff that skipped review entirely:
    - `APPROVE` (or no review needed) → `Supervisor::land` the branch onto its

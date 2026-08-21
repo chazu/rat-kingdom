@@ -131,6 +131,14 @@ workflow: {
 
 					Compare with: git log \(_input.target)..HEAD and git diff \(_input.target)...HEAD
 
+					The daemon-owned landing gates already passed against the prepared
+					merge of this exact head into \(_input.target), including the
+					repository's named verification check. Treat that immutable gate
+					result as the authoritative test/lint proof.
+					Do not rerun the repository-wide verification suite. Review the diff, contracts,
+					and acceptance criteria; run focused tests only when needed to
+					investigate a concrete finding.
+
 					Decide APPROVE (clean, safe to auto-merge), REWORK (fixable issues
 					remain), or STOP (fundamentally wrong / needs a human call). Record
 					the verdict before finishing so the daemon-native landing pipeline

@@ -129,6 +129,45 @@ fn steward_review_carries_the_exact_review_binding_on_its_spawn() {
 }
 
 #[test]
+fn steward_review_reuses_the_daemon_gate_proof() {
+    let inputs = HashMap::from([
+        ("taskId".to_string(), json!("TKT-1")),
+        ("branch".to_string(), json!("rat/worker/tkt-1")),
+        ("target".to_string(), json!("release")),
+        ("headSha".to_string(), json!("abc123")),
+        ("reviewAttempt".to_string(), json!("landing-review-1")),
+    ]);
+    let workflow = rk_workflow::load(&examples_dir().join("steward-review.cue"), &inputs)
+        .expect("steward-review loads");
+    let spawn = workflow
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            rk_workflow::Step::Spawn(spawn) => Some(spawn),
+            _ => None,
+        })
+        .expect("reviewer spawn");
+    let description = spawn
+        .task
+        .description
+        .as_deref()
+        .expect("reviewer task description");
+
+    assert!(
+        description.contains("daemon-owned landing gates already passed"),
+        "reviewer must receive the authoritative daemon gate proof"
+    );
+    assert!(
+        description.contains("Do not rerun the repository-wide verification suite"),
+        "reviewer must not duplicate the exact gate that just passed"
+    );
+    assert!(
+        description.contains("focused tests"),
+        "reviewer must retain authority to investigate concrete findings cheaply"
+    );
+}
+
+#[test]
 fn research_example_loads_and_runs_engine_validation_after_artifact_production() {
     use rk_workflow::Step;
 

@@ -84,7 +84,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 /// Identity of a durably-queued landing candidate (`Furniture`, scoped to the
@@ -103,6 +103,12 @@ const REWORK_RESUBMISSION_IDENTITY: &str = "landing_rework_resubmission";
 /// infrastructure-death retry (bounded fail-safe recovery). See
 /// [`LandingPipeline::record_gate_infra_attempt`].
 const GATE_INFRA_RETRY_IDENTITY: &str = "landing_gate_infra_retry";
+
+/// One durable timing/provenance record for a complete green daemon-owned
+/// landing gate run. Failed checks already emit `gate-failure`; without the
+/// successful counterpart operators cannot decompose landing latency or hand
+/// a reviewer inspectable proof that the exact prepared candidate was tested.
+const GATE_PASS_IDENTITY: &str = "landing_gate_pass";
 
 /// Identity of the durable `work_key = (repo, branch, head_sha)` dedup
 /// marker (`Furniture`, scoped to the repo), written by
@@ -3099,6 +3105,8 @@ impl LandingPipeline {
         gates: &GateConfig,
         tested_sha: &str,
     ) -> rk_core::Result<GateRunOutcome> {
+        let started = Instant::now();
+        let mut passed_checks = Vec::new();
         let repo_path = PathBuf::from(&entry.repo_path);
         let gate_dir = self.gate_worktree_path(&entry.repo_name, &entry.target);
         {
@@ -3179,6 +3187,7 @@ impl LandingPipeline {
                     if !passed {
                         return Ok(GateRunOutcome::InfraRetryExhausted);
                     }
+                    passed_checks.push(check.name.clone());
                     continue;
                 }
                 let retry_outcome = self
@@ -3207,6 +3216,7 @@ impl LandingPipeline {
                 {
                     return Ok(GateRunOutcome::InfraRetryExhausted);
                 }
+                passed_checks.push(check.name.clone());
                 continue;
             }
 
@@ -3300,7 +3310,27 @@ impl LandingPipeline {
                     return Ok(GateRunOutcome::Fail);
                 }
             }
+            passed_checks.push(check.name);
         }
+        self.space.out(
+            Tuple::new(
+                Category::Event,
+                entry.repo_name.clone(),
+                GATE_PASS_IDENTITY,
+                "daemon",
+                json!({
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "task": entry.task,
+                    "head_sha": entry.head_sha,
+                    "candidate_sha": tested_sha,
+                    "checks": passed_checks,
+                    "duration_ms": u64::try_from(started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                }),
+            )
+            .with_lifecycle(Lifecycle::Furniture),
+        )?;
         Ok(GateRunOutcome::Pass)
     }
 
@@ -5871,6 +5901,18 @@ workflow: {
             GateRunOutcome::Pass,
             "the resumed check ran once and passed"
         );
+
+        let pass_events = space
+            .scan(&Pattern::category(Category::Event).identity("landing_gate_pass"))
+            .unwrap();
+        assert_eq!(pass_events.len(), 1, "one timing record per green gate run");
+        assert_eq!(pass_events[0].payload["branch"], "feature");
+        assert_eq!(pass_events[0].payload["candidate_sha"], head_sha);
+        assert_eq!(
+            pass_events[0].payload["checks"],
+            json!(["steward-protected-paths", "steward-diff-scope", "verify"])
+        );
+        assert!(pass_events[0].payload["duration_ms"].is_u64());
 
         // Exactly one execution — the resumed attempt itself, never a
         // duplicate of the (unrecoverable) original death.
