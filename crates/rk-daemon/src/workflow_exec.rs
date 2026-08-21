@@ -3391,16 +3391,7 @@ impl WorkflowEngine {
             child_command.env("PATH", path);
         }
         if resolved.environment_policy == rk_workflow::CheckEnvironmentPolicy::StripRkSpawn {
-            for name in [
-                "RK_AGENT",
-                "RK_TASK",
-                "RK_REPO",
-                "RK_ROLE",
-                "RK_HOME",
-                "RK_BRANCH",
-                "RK_WORKTREE",
-                "RK_AUTH_TOKEN",
-            ] {
+            for name in rk_workflow::STRIPPED_RK_SPAWN_ENV {
                 child_command.env_remove(name);
             }
         } else {

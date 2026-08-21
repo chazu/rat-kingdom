@@ -873,6 +873,15 @@ impl std::fmt::Display for CheckEnvironmentPolicy {
     }
 }
 
+/// The exact set of environment variables [`CheckEnvironmentPolicy::StripRkSpawn`]
+/// removes from a check's child process: supervised spawn identity (`RK_AGENT`
+/// and friends) AND the exact-review binding (`RK_REVIEW_*`). Canonically
+/// owned by `rk_core::review` (which `rk-core::prime`'s prompt rendering also
+/// derives from, so a reviewer's own manual command and the daemon's check
+/// executor can never drift apart) and re-exported here so existing callers
+/// keep working unchanged.
+pub use rk_core::review::STRIPPED_RK_SPAWN_ENV;
+
 /// A repo-registered named check: the per-repo allowlist entry a workflow `run`
 /// step invokes by name instead of carrying a raw shell command. The registry
 /// lives in `<repo>/.rk/checks.cue` and is owned by the repo, NOT by the (possibly
@@ -898,6 +907,9 @@ pub struct Check {
     /// Environment inherited by the check process. Repositories whose test
     /// clients read ambient rat identity can explicitly strip the spawn
     /// contract rather than relying on an operator to remember shell hygiene.
+    /// `strip_rk_spawn` removes both supervised spawn identity (`RK_AGENT` and
+    /// friends) and the exact-review binding (`RK_REVIEW_*`) — see
+    /// [`STRIPPED_RK_SPAWN_ENV`].
     #[serde(default, rename = "environmentPolicy")]
     pub environment_policy: CheckEnvironmentPolicy,
     /// Repository-owned description of the runner/toolchain used by this
