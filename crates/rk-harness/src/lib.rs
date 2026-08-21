@@ -306,8 +306,10 @@ pub(crate) mod runner {
         pub resume: Option<ResumeWiring>,
     }
 
+    pub type ResumeCommand = Arc<dyn Fn(&str, &ControlEnvelope) -> Command + Send + Sync>;
+
     pub struct ResumeWiring {
-        pub command: Arc<dyn Fn(&str, &ControlEnvelope) -> Command + Send + Sync>,
+        pub command: ResumeCommand,
     }
 
     async fn drain_stdout(
