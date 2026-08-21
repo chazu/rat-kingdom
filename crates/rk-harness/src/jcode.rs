@@ -69,6 +69,7 @@ impl Harness for JcodeHarness {
             command: cmd,
             parse: parse_event_line,
             steer_line: None,
+            resume: None,
         })?;
         Ok(post_process(session))
     }
@@ -233,6 +234,15 @@ fn post_process(mut session: HarnessSession) -> HarnessSession {
                 HarnessEvent::Stderr { text } => {
                     if flush_text(&tx, &mut pending_text).await.is_err()
                         || tx.send(HarnessEvent::Stderr { text }).await.is_err()
+                    {
+                        break;
+                    }
+                }
+                HarnessEvent::ControlDelivered { envelope } => {
+                    if tx
+                        .send(HarnessEvent::ControlDelivered { envelope })
+                        .await
+                        .is_err()
                     {
                         break;
                     }

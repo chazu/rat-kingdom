@@ -3,13 +3,21 @@ use rk_core::product_to_code::contracts::{
     VerificationReport,
 };
 use std::fs;
-use std::path::Path;
 use std::process::Command;
+
+// Resolved at runtime, not baked in via `env!("CARGO_MANIFEST_DIR")`: a shared
+// CARGO_TARGET_DIR can serve this binary unrecompiled to a worktree other
+// than the one it was compiled in (TKT-01M0F0GHDPGA24X1TB24A0PZD0). Cargo
+// sets a test binary's cwd to its package's manifest directory on every run,
+// so `current_dir()` is always correct for the current process.
+fn crate_root() -> std::path::PathBuf {
+    std::env::current_dir().expect("test process must have a current directory")
+}
 
 fn fixture(name: &str) -> String {
     fs::read_to_string(format!(
         "{}/tests/fixtures/product_to_code/{name}",
-        env!("CARGO_MANIFEST_DIR")
+        crate_root().display()
     ))
     .expect("fixture exists")
 }
@@ -17,14 +25,14 @@ fn fixture(name: &str) -> String {
 fn fixture_path(name: &str) -> String {
     format!(
         "{}/tests/fixtures/product_to_code/{name}",
-        env!("CARGO_MANIFEST_DIR")
+        crate_root().display()
     )
 }
 
 fn contract_path(name: &str) -> String {
     format!(
         "{}/contracts/product_to_code/{name}",
-        env!("CARGO_MANIFEST_DIR")
+        crate_root().display()
     )
 }
 
@@ -568,7 +576,7 @@ fn test_contract_json_deserialization_rejects_unknown_fields() {
 
 #[test]
 fn test_contract_modules_do_not_reference_jcode_browser_or_gitnexus_crates() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = crate_root().join("../..");
     let mut files = vec![root.join("Cargo.toml")];
     files.extend(
         fs::read_dir(root.join("crates"))

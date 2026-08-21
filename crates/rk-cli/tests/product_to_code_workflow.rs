@@ -10,17 +10,33 @@ mod product_to_code_workflow {
         time::Duration,
     };
 
+    // Resolved at runtime, not baked in via `env!("CARGO_MANIFEST_DIR")`: a
+    // shared CARGO_TARGET_DIR can serve this binary unrecompiled to a
+    // worktree other than the one it was compiled in
+    // (TKT-01M0F0GHDPGA24X1TB24A0PZD0). Cargo sets a test binary's cwd to its
+    // package's manifest directory on every run, so `current_dir()` is
+    // always correct for the current process.
+    fn crate_root() -> std::path::PathBuf {
+        std::env::current_dir().expect("test process must have a current directory")
+    }
+
+    fn workspace_root() -> std::path::PathBuf {
+        crate_root()
+            .ancestors()
+            .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("crates").is_dir())
+            .map(Path::to_path_buf)
+            .expect("could not find the rat-kingdom workspace above the test's runtime directory")
+    }
+
     fn fixture(name: &str) -> String {
         format!(
             "{}/tests/fixtures/product_to_code/{name}",
-            env!("CARGO_MANIFEST_DIR")
+            crate_root().display()
         )
     }
 
     fn workspace_file(relative: &str) -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join(relative)
+        workspace_root().join(relative)
     }
 
     fn git(root: &Path, args: &[&str]) {
@@ -416,10 +432,7 @@ mod product_to_code_workflow {
 
     #[test]
     fn test_cli_workflow_propose_is_thin_wiring_only() {
-        let source = fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/product_to_code_cmds.rs"),
-        )
-        .unwrap();
+        let source = fs::read_to_string(crate_root().join("src/product_to_code_cmds.rs")).unwrap();
 
         // The CLI emits and submits the typed proposal via the Phase 2 daemon
         // path and owns no mutation, approval, or dispatch shortcut.

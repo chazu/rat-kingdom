@@ -3370,6 +3370,27 @@ impl WorkflowEngine {
         env: &[(String, String)],
         timeout: Duration,
     ) -> rk_core::Result<RunOutcome> {
+        // Plain `sh -c`, with `pipefail` deliberately NOT forced on: a `run`
+        // step's command — raw or a named check reference alike — is
+        // workflow-author-owned shell, and existing workflows rely on `sh`'s
+        // default (last-stage-wins) pipe semantics for assertion idioms like
+        // `... | grep -q '<expected text>'` (examples/checks.cue's
+        // steward-protected-paths does exactly this). Forcing `pipefail` over
+        // those INVERTS them: `grep -q` exits as soon as it matches, so a
+        // producer large enough to still be writing takes SIGPIPE (141), and
+        // under `pipefail` the negated pipeline reports success precisely when
+        // the protected path WAS touched. Size-dependent, silent, and fail-open
+        // — strictly worse than the masking it would fix.
+        //
+        // What RK owes instead is that its OWN layer adds no masking: the only
+        // consumer RK puts on a check is `collect_child_output`/`read_capped`
+        // below, which reads both streams to EOF and succeeds independently of
+        // the child, and the status it reports is THIS child's, verbatim.
+        // An author who wants their pipeline unmasked says so in the declared
+        // command (`bash -c 'set -o pipefail; ...'`, `${PIPESTATUS[0]}`) and
+        // RK carries that through — pinned by
+        // `collect_child_output_reports_a_failing_check_through_its_own_output_consumer`
+        // and end-to-end by `run_step_fails_closed_on_a_failing_check_piped_to_a_successful_consumer`.
         let mut child_command = tokio::process::Command::new("sh");
         child_command
             .arg("-c")
@@ -5556,6 +5577,91 @@ test a::flaky ... FAILED
                 assert!(stdout.len() <= MAX_RUN_OUTPUT_BYTES);
             }
             RunOutcome::TimedOut => panic!("output volume alone must never time out the run"),
+        }
+    }
+
+    /// TKT-01M0H5JNZQKZ35V87Q4H4N3EPH: RK reports a check command's OWN exit
+    /// status, unchanged by RK's own successful output consumer.
+    ///
+    /// RK does pipe every check: `spawn_check_child` hands the child's stdout
+    /// and stderr to `read_capped`, a consumer that succeeds (and truncates)
+    /// entirely independently of whether the check passed. That consumer is
+    /// the one masking layer RK actually owns, and this pins that it never
+    /// launders a failure into a pass — including when the check floods it
+    /// past `MAX_RUN_OUTPUT_BYTES`, where output is still bounded and the
+    /// exit code is still 3.
+    ///
+    /// Expectations here are ABSOLUTE, deliberately not compared against a
+    /// reference `sh -c` run of the same command: a reference oracle agrees
+    /// with RK on the masked case by construction (both report 0 for
+    /// `exit 3 | cat`) and so asserts nothing about masking at all.
+    #[tokio::test]
+    async fn collect_child_output_reports_a_failing_check_through_its_own_output_consumer() {
+        // (declared command, expected exit code, expected stdout truncation)
+        let cases: [(&str, Option<i32>, bool); 7] = [
+            ("exit 3", Some(3), false),
+            ("true", Some(0), false),
+            // A failing check whose output is piped to a SUCCESSFUL consumer —
+            // here RK's own `read_capped`, which reads to EOF and returns Ok
+            // no matter what the child did. 3 must reach the gate.
+            ("echo noisy; exit 3", Some(3), false),
+            // ...and the same with the volume that makes RK's consumer visibly
+            // do work: >MAX_RUN_OUTPUT_BYTES of stdout. Bounded output is
+            // retained (truncated) AND the failure still surfaces as 3.
+            ("seq 1 60000; exit 3", Some(3), true),
+            // The DECLARED command's own pipe masks its failing stage behind
+            // `cat` — POSIX sh's documented last-stage-wins. RK reports that
+            // verbatim: the repo author's shell semantics are theirs to choose,
+            // and silently forcing `pipefail` over them inverts real checks
+            // (`! producer | grep -q pat` starts passing when the pattern
+            // MATCHES, once the producer is big enough to take SIGPIPE).
+            ("exit 3 | cat", Some(0), false),
+            // ...so the unmasking has to be the author's, and RK's `sh -c`
+            // wrap must not defeat it when they ask. Both forms the completion
+            // protocol tells an agent to use reach the gate as 3, not cat's 0.
+            ("bash -c 'set -o pipefail; exit 3 | cat'", Some(3), false),
+            (
+                "bash -c 'exit 3 | cat; exit ${PIPESTATUS[0]}'",
+                Some(3),
+                false,
+            ),
+        ];
+        for (command, expected_code, expected_truncated) in cases {
+            let child = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let outcome = collect_child_output(child, Duration::from_secs(30), command)
+                .await
+                .unwrap();
+            match outcome {
+                RunOutcome::Completed {
+                    status,
+                    stdout,
+                    stdout_truncated,
+                    ..
+                } => {
+                    assert_eq!(
+                        status.code(),
+                        expected_code,
+                        "`{command}`: RK must report the check's own exit status, not one \
+                         laundered by its own output consumer"
+                    );
+                    assert_eq!(
+                        stdout_truncated, expected_truncated,
+                        "`{command}`: output bounding must be unchanged by the exit-status path"
+                    );
+                    assert!(
+                        stdout.len() <= MAX_RUN_OUTPUT_BYTES,
+                        "`{command}`: captured stdout must stay bounded"
+                    );
+                }
+                RunOutcome::TimedOut => panic!("`{command}` must not time out"),
+            }
         }
     }
 

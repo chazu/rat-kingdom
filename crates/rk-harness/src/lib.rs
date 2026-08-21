@@ -10,7 +10,76 @@ pub mod jcode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// Versioned, daemon-authenticated control input.  This is deliberately a
+/// different value from assistant/tool/stderr output: adapters must carry it
+/// on their control input, and never reconstruct it from child output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlEnvelope {
+    pub schema: String,
+    pub message_id: String,
+    pub sender: String,
+    pub target: String,
+    pub delivery_generation: String,
+    pub resume_generation: String,
+    pub text: String,
+    #[serde(default = "default_durable_control")]
+    pub durable: bool,
+}
+
+fn default_durable_control() -> bool {
+    true
+}
+
+impl ControlEnvelope {
+    pub fn new(
+        message_id: impl Into<String>,
+        sender: impl Into<String>,
+        target: impl Into<String>,
+        delivery_generation: impl Into<String>,
+        resume_generation: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: "rk.control.v1".into(),
+            message_id: message_id.into(),
+            sender: sender.into(),
+            target: target.into(),
+            delivery_generation: delivery_generation.into(),
+            resume_generation: resume_generation.into(),
+            text: text.into(),
+            durable: true,
+        }
+    }
+
+    /// Internal supervisor nudges still use the same typed wire shape, but
+    /// are explicitly identified as daemon-originated rather than looking
+    /// like an operator's prose.
+    pub fn system(target: impl Into<String>, text: impl Into<String>) -> Self {
+        let mut envelope = Self::new(
+            rk_core::id::SpawnId::new().to_string(),
+            "rk-daemon",
+            target,
+            "system",
+            "system",
+            text,
+        );
+        envelope.durable = false;
+        envelope
+    }
+
+    /// Keep the durable request identity while recording the launch that
+    /// accepted a replay. The original `delivery_generation` remains the
+    /// generation that received the RPC; a daemon restart gets a new live
+    /// session generation for `resume_generation`.
+    pub fn for_resume_generation(&self, generation: impl Into<String>) -> Self {
+        let mut envelope = self.clone();
+        envelope.resume_generation = generation.into();
+        envelope
+    }
+}
 
 /// Token counts for one API call or one session, by class.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -63,6 +132,10 @@ pub enum HarnessEvent {
     },
     /// The child process exited (always the final event).
     Exited { code: Option<i32> },
+    /// The adapter accepted a trusted control envelope for delivery to the
+    /// harness. This acknowledgement is separate from child prose/tool
+    /// output and is the durable audit boundary in the daemon.
+    ControlDelivered { envelope: ControlEnvelope },
 }
 
 /// What a given adapter can do; the orchestrator adapts per-capability.
@@ -104,7 +177,7 @@ pub struct HarnessSession {
 /// Handles for steering/interrupting a running session. Cheap to clone.
 #[derive(Clone)]
 pub struct SessionControl {
-    steer_tx: Option<mpsc::Sender<String>>,
+    steer_tx: Option<mpsc::Sender<ControlEnvelope>>,
     kill_tx: mpsc::Sender<KillSignal>,
 }
 
@@ -118,12 +191,20 @@ enum KillSignal {
 impl SessionControl {
     /// Send mid-session guidance. Errors if this harness cannot steer.
     pub async fn steer(&self, message: &str) -> rk_core::Result<()> {
+        self.steer_envelope(&ControlEnvelope::system("unknown", message))
+            .await
+    }
+
+    /// Send a daemon-authenticated control envelope. The envelope remains
+    /// typed through the adapter boundary; callers cannot smuggle it in via
+    /// assistant text or tool output.
+    pub async fn steer_envelope(&self, envelope: &ControlEnvelope) -> rk_core::Result<()> {
         let Some(tx) = &self.steer_tx else {
             return Err(rk_core::Error::other(
                 "this harness does not support steering",
             ));
         };
-        tx.send(message.to_string())
+        tx.send(envelope.clone())
             .await
             .map_err(|_| rk_core::Error::other("session is no longer running"))
     }
@@ -209,7 +290,7 @@ pub(crate) mod runner {
     use std::process::Stdio;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::process::Command;
+    use tokio::process::{ChildStdout, Command};
     use tokio::sync::mpsc::error::TrySendError;
     use tracing::{debug, warn};
 
@@ -226,7 +307,111 @@ pub(crate) mod runner {
         /// Parse one stdout line into zero or more events.
         pub parse: fn(&str) -> Vec<HarnessEvent>,
         /// Map a steer message to a stdin line, if the adapter supports it.
-        pub steer_line: Option<fn(&str) -> String>,
+        pub steer_line: Option<fn(&ControlEnvelope) -> String>,
+        /// Optional safe-turn handoff for adapters whose live process has no
+        /// control-input protocol. The runner interrupts the current
+        /// generation, waits for it to persist its session, and starts the
+        /// returned command as the next generation before acknowledging the
+        /// envelope.
+        pub resume: Option<ResumeWiring>,
+    }
+
+    pub type ResumeCommand = Arc<dyn Fn(&str, &ControlEnvelope) -> Command + Send + Sync>;
+
+    pub struct ResumeWiring {
+        pub command: ResumeCommand,
+    }
+
+    /// Started only proves a resumed process completed its protocol
+    /// handshake, not that it applied the control envelope: a rejecting or
+    /// crashing resume can emit Started and then immediately exit. Mark
+    /// `awaiting_ack_started` on Started, but only hand back (and let the
+    /// caller acknowledge) the envelope once the resumed session actually
+    /// produces assistant output. `ToolUse`/`Usage` are NOT accepted as that
+    /// proof: Codex resume can replay tool calls and cumulative usage
+    /// buffered from the session's prior history before the model ever
+    /// engages with the newly injected control turn, so a process that
+    /// starts, emits a lookalike tool/usage event, then rejects or exits
+    /// would otherwise acknowledge a control that was never applied.
+    /// `AssistantText` is the one event that can only originate from the
+    /// model actually responding to the current (resumed) turn.
+    fn confirm_awaiting_ack(
+        event: &HarnessEvent,
+        awaiting_ack: &mut Option<ControlEnvelope>,
+        awaiting_ack_started: &mut bool,
+    ) -> Option<ControlEnvelope> {
+        match event {
+            HarnessEvent::Started {
+                session_id: Some(_),
+            } => {
+                if awaiting_ack.is_some() {
+                    *awaiting_ack_started = true;
+                }
+                None
+            }
+            HarnessEvent::AssistantText { .. }
+                if *awaiting_ack_started && awaiting_ack.is_some() =>
+            {
+                *awaiting_ack_started = false;
+                awaiting_ack.take()
+            }
+            _ => None,
+        }
+    }
+
+    /// Drains any remaining buffered stdout after a child has exited (or
+    /// before switching over to a resumed child's stdout), forwarding events
+    /// and resolving `awaiting_ack` exactly as the live read loop does so a
+    /// confirmation racing the process exit is not lost.
+    #[allow(clippy::too_many_arguments)]
+    async fn drain_stdout(
+        stdout: &mut Option<tokio::io::Lines<BufReader<ChildStdout>>>,
+        parse: fn(&str) -> Vec<HarnessEvent>,
+        event_tx: &mpsc::Sender<HarnessEvent>,
+        awaiting_ack: &mut Option<ControlEnvelope>,
+        awaiting_ack_started: &mut bool,
+        delivered: &mut std::collections::HashSet<String>,
+    ) {
+        loop {
+            let line = match stdout.as_mut() {
+                Some(lines) => lines.next_line().await,
+                None => return,
+            };
+            match line {
+                Ok(Some(line)) => {
+                    for event in parse(&line) {
+                        let confirmed =
+                            confirm_awaiting_ack(&event, awaiting_ack, awaiting_ack_started);
+                        if event_tx.send(event).await.is_err() {
+                            return;
+                        }
+                        if let Some(envelope) = confirmed {
+                            delivered.insert(envelope.message_id.clone());
+                            if event_tx
+                                .send(HarnessEvent::ControlDelivered { envelope })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {
+                    *stdout = None;
+                    return;
+                }
+                Err(error) => {
+                    let _ = event_tx
+                        .send(HarnessEvent::Stderr {
+                            text: format!("Codex control stdout drain failed: {error}"),
+                        })
+                        .await;
+                    *stdout = None;
+                    return;
+                }
+            }
+        }
     }
 
     /// Guarantees a harness child's WHOLE process group dies, not just the
@@ -256,6 +441,10 @@ pub(crate) mod runner {
     }
 
     pub fn launch(mut wiring: Wiring) -> rk_core::Result<HarnessSession> {
+        if wiring.resume.is_some() {
+            return launch_with_resume(wiring);
+        }
+
         // Only pipe stdin for steerable adapters: a piped-but-idle stdin makes
         // some CLIs (codex exec) block waiting for EOF before starting.
         let stdin_mode = if wiring.steer_line.is_some() {
@@ -286,7 +475,7 @@ pub(crate) mod runner {
         let mut stdin = child.stdin.take();
 
         let (event_tx, events) = mpsc::channel::<HarnessEvent>(256);
-        let (steer_tx, mut steer_rx) = mpsc::channel::<String>(32);
+        let (steer_tx, mut steer_rx) = mpsc::channel::<ControlEnvelope>(32);
         let (kill_tx, mut kill_rx) = mpsc::channel::<KillSignal>(4);
 
         let parse = wiring.parse;
@@ -393,6 +582,12 @@ pub(crate) mod runner {
                             line.push(b'\n');
                             if let Err(e) = sin.write_all(&line).await {
                                 warn!(error = %e, "steer write failed");
+                            } else if event_tx
+                                .send(HarnessEvent::ControlDelivered { envelope: msg })
+                                .await
+                                .is_err()
+                            {
+                                break;
                             }
                         }
                     }
@@ -437,6 +632,271 @@ pub(crate) mod runner {
             events,
             control: SessionControl {
                 steer_tx: steer_line.map(|_| steer_tx),
+                kill_tx,
+            },
+            pid,
+        })
+    }
+
+    /// Run an adapter whose only trusted control boundary is a fresh resume
+    /// turn. The current process is never fed the envelope as ordinary stdin:
+    /// it is interrupted, allowed to exit at a turn boundary, and replaced by
+    /// a command built by the adapter with the exact authenticated envelope.
+    fn launch_with_resume(mut wiring: Wiring) -> rk_core::Result<HarnessSession> {
+        let resume = wiring
+            .resume
+            .take()
+            .expect("resume wiring checked before entering launch_with_resume");
+        let mut command = wiring.command;
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let mut pid = child.id();
+        let group_guard = ProcessGroupGuard(pid);
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| rk_core::Error::other("child stdout unavailable"))?;
+        let stderr = child.stderr.take();
+        let (event_tx, events) = mpsc::channel::<HarnessEvent>(256);
+        let (steer_tx, mut steer_rx) = mpsc::channel::<ControlEnvelope>(32);
+        let (kill_tx, mut kill_rx) = mpsc::channel::<KillSignal>(4);
+        let parse = wiring.parse;
+        let resume_command = resume.command;
+
+        tokio::spawn(async move {
+            let mut stdout = Some(BufReader::new(stdout).lines());
+            let mut stderr = stderr.map(|stream| BufReader::new(stream).lines());
+            let mut session_id: Option<String> = None;
+            let mut pending: Option<ControlEnvelope> = None;
+            let mut awaiting_ack: Option<ControlEnvelope> = None;
+            let mut awaiting_ack_started = false;
+            let mut interrupt_sent = false;
+            let mut delivered = std::collections::HashSet::new();
+            let mut group_guard = group_guard;
+
+            loop {
+                tokio::select! {
+                    line = async {
+                        match stdout.as_mut() {
+                            Some(lines) => lines.next_line().await,
+                            None => std::future::pending().await,
+                        }
+                    } => match line {
+                        Ok(Some(line)) => {
+                            for event in parse(&line) {
+                                if let HarnessEvent::Started { session_id: Some(id) } = &event {
+                                    session_id = Some(id.clone());
+                                }
+                                let started = matches!(&event, HarnessEvent::Started { .. });
+                                if started && pending.is_some() && !interrupt_sent {
+                                    send_group_signal(pid, SIGINT);
+                                    interrupt_sent = true;
+                                }
+                                let confirmed = confirm_awaiting_ack(
+                                    &event,
+                                    &mut awaiting_ack,
+                                    &mut awaiting_ack_started,
+                                );
+                                if event_tx.send(event).await.is_err() {
+                                    return;
+                                }
+                                if let Some(envelope) = confirmed {
+                                    delivered.insert(envelope.message_id.clone());
+                                    if event_tx
+                                        .send(HarnessEvent::ControlDelivered { envelope })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => stdout = None,
+                        Err(error) => {
+                            let _ = event_tx.send(HarnessEvent::Stderr {
+                                text: format!("Codex control stdout read failed: {error}"),
+                            }).await;
+                        }
+                    },
+                    line = async {
+                        match stderr.as_mut() {
+                            Some(lines) => lines.next_line().await,
+                            None => std::future::pending().await,
+                        }
+                    } => match line {
+                        Ok(Some(text)) => {
+                            if event_tx.send(HarnessEvent::Stderr { text }).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => stderr = None,
+                        Err(error) => {
+                            stderr = None;
+                            let _ = event_tx.send(HarnessEvent::Stderr {
+                                text: format!("Codex stderr read failed: {error}"),
+                            }).await;
+                        }
+                    },
+                    msg = steer_rx.recv() => {
+                        let Some(msg) = msg else { continue };
+                        if delivered.contains(&msg.message_id)
+                            || pending.as_ref().is_some_and(|active| active.message_id == msg.message_id)
+                            || awaiting_ack
+                                .as_ref()
+                                .is_some_and(|active| active.message_id == msg.message_id)
+                        {
+                            continue;
+                        }
+                        pending = Some(msg);
+                        if session_id.is_some() && !interrupt_sent {
+                            send_group_signal(pid, SIGINT);
+                            interrupt_sent = true;
+                        }
+                    },
+                    sig = kill_rx.recv() => match sig {
+                        Some(KillSignal::Interrupt) => {
+                            pending = None;
+                            send_group_signal(pid, SIGINT);
+                        }
+                        Some(KillSignal::Kill) => {
+                            pending = None;
+                            send_group_signal(pid, SIGTERM);
+                        }
+                        Some(KillSignal::Hard) => {
+                            pending = None;
+                            send_group_signal(pid, SIGKILL);
+                        }
+                        None => {}
+                    },
+                    status = child.wait() => {
+                        let code = match status {
+                            Ok(status) => status.code(),
+                            Err(error) => {
+                                let _ = event_tx.send(HarnessEvent::Stderr {
+                                    text: format!("Codex child wait failed: {error}"),
+                                }).await;
+                                None
+                            }
+                        };
+                        group_guard.disarm();
+
+                        let Some(envelope) = pending.take() else {
+                            let _ = tokio::time::timeout(
+                                Duration::from_millis(500),
+                                drain_stdout(
+                                    &mut stdout,
+                                    parse,
+                                    &event_tx,
+                                    &mut awaiting_ack,
+                                    &mut awaiting_ack_started,
+                                    &mut delivered,
+                                ),
+                            )
+                            .await;
+                            if let Some(envelope) = awaiting_ack.take() {
+                                let _ = event_tx.send(HarnessEvent::Stderr {
+                                    text: format!(
+                                        "Codex control {} could not resume: resumed session did not confirm control application",
+                                        envelope.message_id
+                                    ),
+                                }).await;
+                                let _ = event_tx.send(HarnessEvent::Retry {
+                                    attempt: 0,
+                                    error: "Codex resumed session exited before confirming control application".into(),
+                                }).await;
+                            }
+                            let _ = event_tx.send(HarnessEvent::Exited { code }).await;
+                            return;
+                        };
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(500),
+                            drain_stdout(
+                                &mut stdout,
+                                parse,
+                                &event_tx,
+                                &mut awaiting_ack,
+                                &mut awaiting_ack_started,
+                                &mut delivered,
+                            ),
+                        )
+                        .await;
+                        let Some(session_id) = session_id.clone() else {
+                            let _ = event_tx.send(HarnessEvent::Stderr {
+                                text: format!("Codex control {} could not resume: no session id was established", envelope.message_id),
+                            }).await;
+                            let _ = event_tx.send(HarnessEvent::Retry {
+                                attempt: 0,
+                                error: "Codex session could not resume because no session id was established".into(),
+                            }).await;
+                            let _ = event_tx.send(HarnessEvent::Exited { code }).await;
+                            return;
+                        };
+
+                        let mut resumed = (resume_command)(&session_id, &envelope);
+                        resumed
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .process_group(0)
+                            .kill_on_drop(true);
+                        let Ok(mut next_child) = resumed.spawn() else {
+                            let _ = event_tx.send(HarnessEvent::Stderr {
+                                text: format!("Codex control {} could not resume the session", envelope.message_id),
+                            }).await;
+                            let _ = event_tx.send(HarnessEvent::Retry {
+                                attempt: 0,
+                                error: "Codex session resume process could not be started".into(),
+                            }).await;
+                            let _ = event_tx.send(HarnessEvent::Exited { code }).await;
+                            return;
+                        };
+                        let next_pid = next_child.id();
+                        let next_stdout = match next_child.stdout.take() {
+                            Some(stdout) => stdout,
+                            None => {
+                                let _ = event_tx.send(HarnessEvent::Stderr {
+                                    text: format!("Codex control {} resumed without stdout", envelope.message_id),
+                                }).await;
+                                let _ = event_tx.send(HarnessEvent::Retry {
+                                    attempt: 0,
+                                    error: "Codex session resume stdout was unavailable".into(),
+                                }).await;
+                                let _ = event_tx.send(HarnessEvent::Exited { code }).await;
+                                return;
+                            }
+                        };
+                        stdout = Some(BufReader::new(next_stdout).lines());
+                        stderr = next_child.stderr.take().map(|stream| BufReader::new(stream).lines());
+                        child = next_child;
+                        group_guard = ProcessGroupGuard(next_pid);
+                        pid = next_pid;
+                        interrupt_sent = false;
+                        // Spawning the resume child only proves that the OS
+                        // accepted it, and Started only proves the protocol
+                        // handshake completed — neither proves the control
+                        // was applied. A resumed process can emit Started and
+                        // then immediately reject the session or exit, so the
+                        // durable acknowledgement is held until a further
+                        // event after Started confirms the resumed session is
+                        // actually alive; otherwise a rejecting child could
+                        // suppress replay permanently.
+                        awaiting_ack = Some(envelope);
+                        awaiting_ack_started = false;
+                    }
+                }
+            }
+        });
+
+        Ok(HarnessSession {
+            events,
+            control: SessionControl {
+                steer_tx: Some(steer_tx),
                 kill_tx,
             },
             pid,

@@ -15,6 +15,25 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+// Resolved at runtime, not baked in via `env!("CARGO_MANIFEST_DIR")`: a
+// shared CARGO_TARGET_DIR can serve this binary unrecompiled to a worktree
+// other than the one it was compiled in (TKT-01M0F0GHDPGA24X1TB24A0PZD0).
+// Cargo sets a test binary's cwd to its package's manifest directory on
+// every run, so walking up from `current_dir()` is always correct for the
+// current process.
+fn workspace_root() -> std::path::PathBuf {
+    let cwd = std::env::current_dir().expect("test process must have a current directory");
+    cwd.ancestors()
+        .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("crates").is_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            panic!(
+                "could not find the rat-kingdom workspace above runtime directory {}",
+                cwd.display()
+            )
+        })
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .arg("-C")
@@ -92,9 +111,7 @@ async fn reviewer_drives_rework_loops_then_merges() {
     let wf_dir = repo_dir.path().join(".rk").join("workflows");
     std::fs::create_dir_all(&wf_dir).unwrap();
     let wf_src = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
+        workspace_root()
             .join("examples")
             .join("workflows")
             .join("reviewer-drives-rework.cue"),

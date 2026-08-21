@@ -33,6 +33,7 @@ pub mod recovery;
 pub mod repos;
 pub mod scheduler;
 pub mod server;
+pub mod steer;
 pub mod supervisor;
 pub mod sync;
 pub mod tickets;

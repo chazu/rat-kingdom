@@ -284,6 +284,65 @@ fn nightly_self_improve_chains_groom_drain_refine() {
 }
 
 #[test]
+fn nightly_self_improve_workflow_default_cannot_resolve_to_codex_plus_opus() {
+    use rk_workflow::resolve::resolve;
+    use rk_workflow::{AgentProfile, Step, TierRouting};
+
+    // Live regression (2026-08-21): a castle whose global [agents.default] is
+    // harness="claude" model="opus" ran this shipped workflow — whose own
+    // `agents: {default: {harness: "codex"}}` overrides the harness but names
+    // no model — and every spawn resolved to codex+opus. Codex rejected it
+    // with HTTP 400 ("the opus model is not supported ..."). Prove the fix
+    // holds against the actual shipped definition, not just synthetic layers.
+    let workflow = rk_workflow::load(
+        &examples_dir().join("nightly-self-improve.cue"),
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    let global_agents = HashMap::from([(
+        "default".to_string(),
+        AgentProfile {
+            harness: Some("claude".to_string()),
+            model: Some("opus".to_string()),
+            permission_mode: None,
+        },
+    )]);
+
+    let spawns: Vec<_> = workflow
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Spawn(sp) => Some(sp),
+            _ => None,
+        })
+        .collect();
+    assert!(!spawns.is_empty(), "nightly-self-improve must spawn rats");
+
+    for spawn in spawns {
+        let resolved = resolve(
+            spawn,
+            &TierRouting::default(),
+            &workflow.agents,
+            &global_agents,
+            "claude",
+        )
+        .unwrap_or_else(|e| panic!("{} failed to resolve: {e}", spawn.task.title));
+        assert_eq!(
+            resolved.harness, "codex",
+            "{} should run on the workflow's codex default",
+            spawn.task.title
+        );
+        assert_ne!(
+            resolved.model.as_deref(),
+            Some("opus"),
+            "{} must not carry the claude-selected model onto a codex spawn",
+            spawn.task.title
+        );
+    }
+}
+
+#[test]
 fn refine_prompts_task_requires_failure_boundary_classification() {
     use rk_workflow::Step;
     // Proposal 0013: an unclassified "recurring pain" reading lets an overnight

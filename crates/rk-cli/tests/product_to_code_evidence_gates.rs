@@ -6,10 +6,20 @@ mod product_to_code_evidence_gates {
         process::{Command, Output},
     };
 
+    // Resolved at runtime, not baked in via `env!("CARGO_MANIFEST_DIR")`: a
+    // shared CARGO_TARGET_DIR can serve this binary unrecompiled to a
+    // worktree other than the one it was compiled in
+    // (TKT-01M0F0GHDPGA24X1TB24A0PZD0). Cargo sets a test binary's cwd to its
+    // package's manifest directory on every run, so `current_dir()` is
+    // always correct for the current process.
+    fn crate_root() -> std::path::PathBuf {
+        std::env::current_dir().expect("test process must have a current directory")
+    }
+
     fn fixture(name: &str) -> String {
         format!(
             "{}/tests/fixtures/product_to_code/{name}",
-            env!("CARGO_MANIFEST_DIR")
+            crate_root().display()
         )
     }
 
@@ -72,8 +82,7 @@ mod product_to_code_evidence_gates {
             &fixture("evidence_gitnexus"),
         ]));
         assert_eq!(value["valid"], true);
-        let cargo =
-            fs::read_to_string(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let cargo = fs::read_to_string(format!("{}/Cargo.toml", crate_root().display())).unwrap();
         assert!(!cargo.to_ascii_lowercase().contains("gitnexus"));
     }
 

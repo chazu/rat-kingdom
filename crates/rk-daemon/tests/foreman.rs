@@ -69,12 +69,7 @@ async fn foreman_delegates_merges_and_lands_worker() {
         // the workspace), else cargo's workspace-root-relative default.
         let target_dir = std::env::var("CARGO_TARGET_DIR")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("..")
-                    .join("..")
-                    .join("target")
-            });
+            .unwrap_or_else(|_| support::workspace_root().join("target"));
         target_dir
             .join("debug")
             .join("rk")

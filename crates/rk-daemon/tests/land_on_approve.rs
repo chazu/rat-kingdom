@@ -76,9 +76,7 @@ fn init_repo() -> tempfile::TempDir {
     let wf_dir = repo_dir.path().join(".rk").join("workflows");
     std::fs::create_dir_all(&wf_dir).unwrap();
     let wf_src = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
+        support::workspace_root()
             .join("examples")
             .join("workflows")
             .join("land-on-approve.cue"),
