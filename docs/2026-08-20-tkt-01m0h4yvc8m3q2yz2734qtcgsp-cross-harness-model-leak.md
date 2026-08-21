@@ -42,14 +42,30 @@ model the layers underneath had resolved for a different harness.
 ## Fix
 
 `crates/rk-workflow/src/resolve.rs`: layers (including the inline override)
-now fold through a shared `apply_layer` helper. Whenever a layer's `harness`
-differs from the harness accumulated so far — including the first layer
-that sets one at all — any previously accumulated `model` is dropped before
-that layer's own `model` (if any) is applied. A layer that leaves `harness`
-unset cannot change harnesses, so it still merges `model`/`permission_mode`
+now fold through a shared `apply_layer` helper. The accumulator is seeded
+with `global_default_harness` (the least-specific layer of all — module doc
+point 7) *before* any real layer runs, so "the harness in effect" always
+reflects reality, not just "some layer already named one explicitly."
+Whenever a layer's `harness` differs from the harness in effect, any
+previously accumulated `model` is dropped before that layer's own `model`
+(if any) is applied. If a layer names the *same* harness already in effect
+— whether that came from an earlier explicit layer or is still just the
+seeded fallback — that is not a boundary crossing, and a model accumulated
+under it survives. A layer that leaves `harness` unset entirely cannot
+change harnesses either way, so it still merges `model`/`permission_mode`
 independently, exactly as before. `permission_mode` is untouched by this
 change; the failure evidence and the acceptance criteria both scope the
 provider-safety invariant to `model` only.
+
+The seeded-fallback detail matters for a real, non-hypothetical shape:
+global `[agents.default]` names only a `model` (harness unset, so it rides
+`global_default_harness`), and a more-specific layer spells that same
+harness out explicitly with no model of its own — e.g. restating
+`harness: "claude"` when `claude` was already the effective harness. That
+is not a provider switch, so the model must survive; an earlier version of
+this fix (seeding the accumulator at `None` instead) got this case wrong,
+caught before merge and covered by
+`explicit_harness_matching_the_global_default_harness_preserves_a_model_only_layer`.
 
 Net effect: a harness change with no accompanying model resolves to
 `model: None`, which downstream (`workflow_exec.rs`, `drain.rs`,
@@ -80,8 +96,8 @@ that also names the harness.
 - `crates/rk-workflow/src/resolve.rs` unit tests: leak reproduced and fixed
   at the named-profile layer and the inline-override layer, in both harness
   directions (not hardcoded to one provider pair), plus sanity checks that
-  compatible cases (same harness, or harness+model named together) are
-  unaffected.
+  compatible cases (same harness, harness+model named together, or a layer
+  merely restating the already-effective/fallback harness) are unaffected.
 - `crates/rk-workflow/tests/examples.rs`:
   `nightly_self_improve_workflow_default_cannot_resolve_to_codex_plus_opus`
   resolves every spawn step in the actual shipped
