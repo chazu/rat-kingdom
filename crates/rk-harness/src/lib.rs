@@ -335,7 +335,9 @@ pub(crate) mod runner {
         awaiting_ack_started: &mut bool,
     ) -> Option<ControlEnvelope> {
         match event {
-            HarnessEvent::Started { session_id: Some(_) } => {
+            HarnessEvent::Started {
+                session_id: Some(_),
+            } => {
                 if awaiting_ack.is_some() {
                     *awaiting_ack_started = true;
                 }
