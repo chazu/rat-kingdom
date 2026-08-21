@@ -19,6 +19,7 @@ use rk_core::paths::Layout;
 use rk_core::product_to_code::contracts::{InitiativeContract, TicketGraph};
 use rk_core::sdlc::SignalSourcePrincipal;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, SYSTEM_SCOPE};
+use rk_harness::ControlEnvelope;
 use rk_space::{CoordinatorEvent, Space};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -6990,8 +6991,53 @@ impl Daemon {
         if let Err(e) = self.authorize_foreman_child(&req.caller, &params.name) {
             return Response::err(req.id, codes::FORBIDDEN, e.to_string());
         }
-        match self.supervisor.steer(&params.name, &params.message).await {
-            Ok(()) => Response::ok(req.id, json!({"steered": true})),
+        let Some(record) = self.supervisor.status(&params.name) else {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                format!("no such agent: {}", params.name),
+            );
+        };
+        let sender = if req.caller.is_empty() {
+            OPERATOR_ACTOR
+        } else {
+            req.caller.as_str()
+        };
+        let Some(session_generation) = self.supervisor.session_generation(&record.name) else {
+            return Response::err(
+                req.id,
+                codes::INTERNAL,
+                format!("{} has no live session generation", record.name),
+            );
+        };
+        let session_generation = session_generation.to_string();
+        let envelope = ControlEnvelope::new(
+            RecordId::new().to_string(),
+            sender,
+            &record.name,
+            session_generation.clone(),
+            session_generation.clone(),
+            params.message,
+        );
+        if let Err(e) =
+            crate::steer::enqueue(&self.space, &record.repo_name, &envelope, &self.castle)
+        {
+            return Response::err(req.id, codes::INTERNAL, e.to_string());
+        }
+        match self
+            .supervisor
+            .steer_envelope(&params.name, &envelope)
+            .await
+        {
+            Ok(()) => Response::ok(
+                req.id,
+                json!({
+                    "steered": true,
+                    "message_id": envelope.message_id,
+                    "delivery_generation": envelope.delivery_generation,
+                    "resume_generation": envelope.resume_generation,
+                }),
+            ),
             Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
         }
     }

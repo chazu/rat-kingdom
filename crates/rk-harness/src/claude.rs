@@ -5,7 +5,10 @@
 //! with the initial prompt delivered as the first stdin user message and role
 //! instructions via `--append-system-prompt` — no TUI, no readiness probes.
 
-use crate::{runner, Harness, HarnessCaps, HarnessEvent, HarnessSession, LaunchSpec, TokenUsage};
+use crate::{
+    runner, ControlEnvelope, Harness, HarnessCaps, HarnessEvent, HarnessSession, LaunchSpec,
+    TokenUsage,
+};
 use serde_json::{json, Value};
 use tokio::process::Command;
 
@@ -88,7 +91,8 @@ impl Harness for ClaudeHarness {
         let mut session = runner::launch(runner::Wiring {
             command: cmd,
             parse: parse_event_line,
-            steer_line: Some(user_message_line),
+            steer_line: Some(control_message_line),
+            resume: None,
         })?;
 
         // The initial prompt is just the first steer message.
@@ -103,14 +107,18 @@ impl Harness for ClaudeHarness {
     }
 }
 
-/// Wrap a plain-text message as a stream-json user message line.
-fn user_message_line(text: &str) -> String {
+/// Wrap a trusted control envelope as a stream-json user message line. The
+/// metadata is carried beside the text so repository/tool output can never
+/// manufacture an equivalent control frame.
+fn control_message_line(envelope: &ControlEnvelope) -> String {
     json!({
         "type": "user",
         "message": {
             "role": "user",
-            "content": [{"type": "text", "text": text}],
+            "content": [{"type": "text", "text": envelope.text}],
         },
+        "metadata": {"rk_control": envelope},
+        "rk_control": envelope,
     })
     .to_string()
 }
@@ -245,13 +253,24 @@ mod tests {
 
     #[test]
     fn steer_message_is_valid_stream_json() {
-        let line = user_message_line("please also run the tests");
+        let envelope = ControlEnvelope::new(
+            "msg-1",
+            "operator",
+            "Whisker",
+            "2026-08-21T12:00:00Z",
+            "spawn-1",
+            "please also run the tests",
+        );
+        let line = control_message_line(&envelope);
         let v: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["type"], "user");
         assert_eq!(
             v["message"]["content"][0]["text"],
             "please also run the tests"
         );
+        assert_eq!(v["rk_control"]["schema"], "rk.control.v1");
+        assert_eq!(v["rk_control"]["message_id"], "msg-1");
+        assert_eq!(v["metadata"]["rk_control"]["sender"], "operator");
         assert!(!line.contains('\n'), "must be a single line");
     }
 

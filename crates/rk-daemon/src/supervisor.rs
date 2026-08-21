@@ -13,7 +13,9 @@ use rk_core::paths::Layout;
 use rk_core::prime::{render, PrimeContext, VerificationCheck, MAX_INJECTED_FACTS};
 use rk_core::tuple::{Category, Pattern, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
 use rk_git::Repo;
-use rk_harness::{make_harness, HarnessEvent, LaunchSpec, SessionControl, TokenUsage};
+use rk_harness::{
+    make_harness, ControlEnvelope, HarnessEvent, LaunchSpec, SessionControl, TokenUsage,
+};
 use rk_ledger::pricing::PricingTable;
 use rk_ledger::{Budget, BudgetAction, BudgetScope, DispatchCheck, FleetBudget};
 use rk_space::Space;
@@ -2163,6 +2165,25 @@ impl Supervisor {
                     crate::agents::append_stderr_tail(&mut r.stderr_tail, &text);
                 });
             }
+            HarnessEvent::ControlDelivered { envelope } => {
+                if envelope.durable {
+                    if let Some(record) = self.lock_registry().get(name) {
+                        if let Err(error) = crate::steer::acknowledge(
+                            &self.space,
+                            &record.repo_name,
+                            &envelope,
+                            &self.castle,
+                        ) {
+                            warn!(
+                                agent = name,
+                                message_id = %envelope.message_id,
+                                %error,
+                                "failed to persist steer acknowledgement"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3787,6 +3808,40 @@ impl Supervisor {
             return tokio::task::spawn_blocking(move || rk_mux::HerdrMux::send(&target, &message))
                 .await
                 .map_err(|e| rk_core::Error::other(e.to_string()))?;
+        }
+        Err(rk_core::Error::other(format!("{name} has no live session")))
+    }
+
+    /// Return the generation of the process currently behind this agent's
+    /// control handle. This is deliberately separate from `AgentRecord`'s
+    /// task generation: a respawn reuses that record while launching a new
+    /// process, and trusted control audit must name the process that received
+    /// the envelope.
+    pub fn session_generation(&self, name: &str) -> Option<rk_core::id::SpawnId> {
+        self.lock_session_tokens().get(name).copied()
+    }
+
+    /// Deliver a durable control envelope to a live harness. The old string
+    /// method remains for daemon-internal nudges; operator/RPC steering must
+    /// use this typed path so the adapter can acknowledge the exact message.
+    pub async fn steer_envelope(
+        &self,
+        name: &str,
+        envelope: &ControlEnvelope,
+    ) -> rk_core::Result<()> {
+        let control = self.lock_controls().get(name).cloned();
+        if let Some(control) = control {
+            return control.steer_envelope(envelope).await;
+        }
+        if self
+            .lock_registry()
+            .get(name)
+            .and_then(|record| record.attach_target.clone())
+            .is_some()
+        {
+            return Err(rk_core::Error::other(
+                "attached harness has no authenticated control envelope channel",
+            ));
         }
         Err(rk_core::Error::other(format!("{name} has no live session")))
     }
@@ -5684,6 +5739,34 @@ impl Supervisor {
         let token = rk_core::id::SpawnId::new();
         self.lock_controls().insert(name.to_string(), control);
         self.lock_session_tokens().insert(name.to_string(), token);
+        // A daemon restart can leave a durable steer request without its
+        // delivery acknowledgement. Replay it exactly once per new live
+        // session; an existing ack makes `pending` omit it permanently.
+        if let (Some(record), Ok(handle)) = (
+            self.lock_registry().get(name),
+            tokio::runtime::Handle::try_current(),
+        ) {
+            if let Ok(pending) =
+                crate::steer::pending(&self.space, &record.repo_name, name, &self.castle)
+            {
+                let control = self.lock_controls().get(name).cloned();
+                if let Some(control) = control {
+                    for envelope in pending {
+                        let envelope = envelope.for_resume_generation(token.to_string());
+                        let control = control.clone();
+                        handle.spawn(async move {
+                            if let Err(error) = control.steer_envelope(&envelope).await {
+                                warn!(
+                                    message_id = %envelope.message_id,
+                                    %error,
+                                    "failed to replay pending steer"
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+        }
         token
     }
 

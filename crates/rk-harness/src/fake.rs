@@ -5,7 +5,7 @@
 //! Claude adapter — so daemon plumbing is exercised end-to-end without
 //! spending tokens.
 
-use crate::{claude, runner, Harness, HarnessCaps, HarnessSession, LaunchSpec};
+use crate::{claude, runner, ControlEnvelope, Harness, HarnessCaps, HarnessSession, LaunchSpec};
 use tokio::process::Command;
 
 pub struct FakeHarness;
@@ -57,7 +57,10 @@ impl Harness for FakeHarness {
         let mut session = runner::launch(runner::Wiring {
             command: cmd,
             parse: claude::parse_event_line,
-            steer_line: Some(|text| serde_json::json!({"type": "user", "text": text}).to_string()),
+            steer_line: Some(|envelope: &ControlEnvelope| {
+                serde_json::json!({"type": "rk_control", "control": envelope}).to_string()
+            }),
+            resume: None,
         })?;
 
         let prompt = spec.prompt.clone();
