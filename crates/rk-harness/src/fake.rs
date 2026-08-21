@@ -60,6 +60,7 @@ impl Harness for FakeHarness {
             steer_line: Some(|envelope: &ControlEnvelope| {
                 serde_json::json!({"type": "rk_control", "control": envelope}).to_string()
             }),
+            resume: None,
         })?;
 
         let prompt = spec.prompt.clone();
