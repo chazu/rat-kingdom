@@ -406,8 +406,10 @@ and executes that named check. The durable report records the application
 commit and tree plus every verification attempt's command, toolchain,
 environment policy, exit/timing result, bounded output summary, and unresolved
 risks. `strip_rk_spawn` removes `RK_AGENT`, `RK_TASK`, `RK_REPO`, `RK_ROLE`,
-`RK_HOME`, `RK_BRANCH`, `RK_WORKTREE`, and `RK_AUTH_TOKEN`; `inherit` preserves
-the daemon environment.
+`RK_HOME`, `RK_BRANCH`, `RK_WORKTREE`, and `RK_AUTH_TOKEN`, and also the five
+exact-review binding variables `RK_REVIEW_BRANCH`, `RK_REVIEW_HEAD`,
+`RK_REVIEW_TARGET`, `RK_REVIEW_TASK`, and `RK_REVIEW_ATTEMPT`; `inherit`
+preserves the daemon environment.
 
 Application retries are fail-closed and recoverable. A clean replay neither
 recommits nor reruns a verified check. After a failed check, retry reuses the
@@ -783,7 +785,12 @@ workflow: {
   registered checks — never arbitrary shell. A named check supplies its own
   command/cwd/`expectExit`/timeout; the step may override cwd/`expectExit`/timeout.
   It may also declare `environmentPolicy: "inherit" | "strip_rk_spawn"`; the
-  latter removes ambient supervised-agent identity before execution. Optional
+  latter removes ambient supervised-agent identity (`RK_AGENT`, `RK_TASK`,
+  `RK_REPO`, `RK_ROLE`, `RK_HOME`, `RK_BRANCH`, `RK_WORKTREE`,
+  `RK_AUTH_TOKEN`) before execution, and with it the five exact-review binding
+  variables (`RK_REVIEW_BRANCH`, `RK_REVIEW_HEAD`, `RK_REVIEW_TARGET`,
+  `RK_REVIEW_TASK`, `RK_REVIEW_ATTEMPT`) — so a check that itself exercises
+  reviewer-role writes is not bound to an outer reviewer's review. Optional
   `toolchain` text records the repository-owned runner/toolchain for onboarding
   evidence. A workflow may pass data to that fixed command through an `env`
   map, but only with `RK_CHECK_*` names; attempts to replace `PATH`, loader

@@ -330,6 +330,116 @@ async fn raw_command_runs_when_policy_off() {
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
+/// Regression: a `strip_rk_spawn` check must remove the exact-review binding
+/// (`RK_REVIEW_*`, see `rk_core::review`) in addition to supervised spawn
+/// identity. Before this fix, a nested check that itself exercised
+/// reviewer-role, env-driven logic (a repo's own test suite spinning up a
+/// synthetic reviewer that writes an artifact for its own synthetic task)
+/// inherited an outer reviewer's real `RK_REVIEW_TASK`/etc, which then
+/// mismatched its own synthetic identity and got rejected — exactly what
+/// happened live when steward reviewer Pumpernickel-10 ran the repository's
+/// `verify` check for Widget-10 (TKT-01M0GDHKYSKEGVZR7QY9FP1VKK).
+///
+/// This pins the environment SURFACE — exactly which names a stripped child
+/// does and does not carry — which is all a grep of the child environment can
+/// establish. The CONSEQUENCE (the same real `rk out artifact … review` write
+/// rejected from an `inherit` check and accepted from a stripped one) is pinned
+/// end to end in `crates/rk-cli/tests/strip_rk_spawn_review_binding.rs`, which
+/// lives in `rk-cli` because only that package's tests can resolve the real
+/// `rk` binary through `CARGO_BIN_EXE_rk`.
+const REVIEW_BINDING_CHECKS: &str = r#"
+checks: [
+    {name: "steward-protected-paths", command: "true", timeout: "30s"},
+    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "verify", command: "true", timeout: "30s"},
+    {name: "leaks-without-strip", command: "test \"$RK_REVIEW_TASK\" = outer-task", expectExit: 0, timeout: "30s"},
+    {
+        name: "stripped-clears-review-binding"
+        command: "env | grep -E '^(RK_AGENT|RK_TASK|RK_REPO|RK_ROLE|RK_HOME|RK_BRANCH|RK_WORKTREE|RK_AUTH_TOKEN|RK_REVIEW_BRANCH|RK_REVIEW_HEAD|RK_REVIEW_TARGET|RK_REVIEW_TASK|RK_REVIEW_ATTEMPT)=' && exit 1 || exit 0"
+        expectExit: 0
+        timeout: "30s"
+        environmentPolicy: "strip_rk_spawn"
+    },
+]
+"#;
+
+const REVIEW_BINDING_WORKFLOW: &str = r#"
+workflow: {
+    name: "review-binding-strip"
+    params: {taskId: {type: "string", required: true}}
+    agents: {default: {harness: "fake", model: "sonnet"}}
+    steps: [
+        {type: "spawn", role: "rat", task: {title: _input.taskId, description: "do " + _input.taskId}},
+        {type: "wait", timeout: "30s"},
+        {type: "run", check: "leaks-without-strip"},
+        {type: "run", check: "stripped-clears-review-binding"},
+        {type: "dismiss"},
+    ]
+}
+"#;
+
+/// The unstripped control check proves the ambient `RK_REVIEW_*` binding
+/// really was present (simulating a check invoked from within an outer
+/// reviewer's exact-review environment, as `.rk/checks.cue`'s own `verify`
+/// entry declares `environmentPolicy: "strip_rk_spawn"` for exactly this
+/// reason). The stripped check proves the isolated child never sees it —
+/// neither the supervised spawn identity nor the review binding.
+#[tokio::test]
+async fn strip_rk_spawn_removes_review_binding_but_inherit_still_sees_it() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    write_def(
+        repo_dir.path(),
+        "review-binding-strip",
+        REVIEW_BINDING_WORKFLOW,
+    );
+    write_checks(repo_dir.path(), REVIEW_BINDING_CHECKS);
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    // Simulate the daemon's own process carrying an outer reviewer's
+    // exact-review binding — as it does when a steward reviewer runs the
+    // repository's declared `verify` check from within its own worktree.
+    std::env::set_var("RK_REVIEW_BRANCH", "rat/outer-reviewer/tkt-outer");
+    std::env::set_var("RK_REVIEW_HEAD", "deadbeef");
+    std::env::set_var("RK_REVIEW_TARGET", "main");
+    std::env::set_var("RK_REVIEW_TASK", "outer-task");
+    std::env::set_var("RK_REVIEW_ATTEMPT", "landing-review-1");
+
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let started = client
+        .call(
+            "workflow.run",
+            json!({
+                "name": "review-binding-strip",
+                "repo": repo_dir.path().to_string_lossy(),
+                "params": {"taskId": "review-binding-1"},
+            }),
+        )
+        .await
+        .unwrap();
+    let id = started["instance"]["id"].as_str().unwrap().to_string();
+
+    await_status(&mut client, &id, "completed").await;
+    let listing = main_listing(repo_dir.path());
+    assert!(
+        listing.contains("work-"),
+        "both checks must pass for the branch to merge: {listing}"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+    std::env::remove_var("RK_REVIEW_BRANCH");
+    std::env::remove_var("RK_REVIEW_HEAD");
+    std::env::remove_var("RK_REVIEW_TARGET");
+    std::env::remove_var("RK_REVIEW_TASK");
+    std::env::remove_var("RK_REVIEW_ATTEMPT");
+}
+
 /// A `run` step referencing a check name that is not in the registry fails
 /// closed — a typo or a stale reference never silently runs nothing.
 #[tokio::test]

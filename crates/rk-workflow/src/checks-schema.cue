@@ -35,8 +35,10 @@ checks: [...#Check]
 
 	// Exact environment contract for the command. "inherit" preserves the
 	// daemon environment. "strip_rk_spawn" removes the supervised-agent RK_*
-	// identity variables before execution, which is required by repositories
-	// whose test clients otherwise inherit the caller rat's authorization.
+	// identity variables AND the exact-review binding (RK_REVIEW_*) before
+	// execution, which is required by repositories whose test clients
+	// otherwise inherit the caller rat's authorization or an outer
+	// reviewer's review binding.
 	environmentPolicy?: "inherit" | "strip_rk_spawn"
 
 	// Human-readable repository-owned toolchain description captured in
