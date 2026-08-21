@@ -498,8 +498,18 @@ const FRAGMENT_COMPLETION: &str = "\
    or workflow provides a repository-owned verification check, use its documented
    invocation rather than inventing a command. The check must exercise the
    relevant build, test, lint, or equivalent validation for this task and must
-   actually run. A partial check is NOT verification. If no documented
-   entrypoint exists, report that gap as an obstacle or need instead of guessing.
+   actually run. A partial check is NOT verification. Prove the check command's
+   OWN exit status, not the status of anything you routed it through: a
+   renderer, filter, `tee`/`tail`/`grep`, or backgrounded launcher reports ITS
+   OWN exit code, not the check's, so `<verify-command> 2>&1 | tail -100`
+   tells you `tail` succeeded, nothing about the check. A red check piped
+   through a green filter reads as clean and is not verification. If you pipe, tee, or
+   background the check, capture its exit status separately — `set -o
+   pipefail` (or `${PIPESTATUS[0]}` in bash) before trusting `$?`, or run the
+   check and inspect its own recorded exit code directly — and wait for that
+   real process to finish; do not report a result while it is still running.
+   If no documented entrypoint exists, report that gap as an obstacle or need
+   instead of guessing.
 4. Never `rk done` on a build you broke. If you hit a pre-existing failure that
    is unrelated to your change, do NOT fix it inline (peers on other branches
    will race you) — file a ticket and record it as an artifact
@@ -861,6 +871,41 @@ mod tests {
             assert!(text.contains(needle), "foreman prompt missing {needle:?}");
         }
         assert!(!text.contains("You have exactly one task"));
+    }
+
+    #[test]
+    fn completion_protocol_requires_unmasked_check_exit_status() {
+        // FRAGMENT_COMPLETION is shared by rat, reviewer, and foreman — every
+        // role that can run and self-report a verification check must carry
+        // this rule so a green report can't come from a filter/renderer's
+        // exit code standing in for the check's own
+        // (TKT-01M0H5JNZQKZ35V87Q4H4N3EPH: Basil-10 and Cluny-10 both trusted
+        // a `| tail` pipeline's own exit status instead of the check's).
+        for role in ["rat", "reviewer", "foreman"] {
+            let text = render(role, &ctx());
+            let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                normalized.contains("Prove the check command's OWN exit status"),
+                "{role} prompt must require proving the check's own exit status"
+            );
+            assert!(
+                normalized
+                    .contains("renderer, filter, `tee`/`tail`/`grep`, or backgrounded launcher"),
+                "{role} prompt must name filter/renderer/background masking explicitly"
+            );
+            assert!(
+                normalized.contains("`<verify-command> 2>&1 | tail -100`"),
+                "{role} prompt must give the concrete masking example"
+            );
+            assert!(
+                normalized.contains("`set -o pipefail` (or `${PIPESTATUS[0]}` in bash)"),
+                "{role} prompt must offer pipefail/PIPESTATUS as the fix"
+            );
+            assert!(
+                normalized.contains("wait for that real process to finish"),
+                "{role} prompt must forbid reporting while the real check is still running"
+            );
+        }
     }
 
     #[test]

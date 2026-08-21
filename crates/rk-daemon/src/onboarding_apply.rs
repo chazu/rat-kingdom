@@ -191,10 +191,11 @@ pub async fn verify(
     let timeout = parse_duration(&contract.timeout)?;
     let started_at = Utc::now();
 
-    let mut command = tokio::process::Command::new("sh");
+    let (shell, script) = crate::shell::pipefail_command(&contract.command);
+    let mut command = tokio::process::Command::new(shell);
     command
         .arg("-c")
-        .arg(&contract.command)
+        .arg(script)
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

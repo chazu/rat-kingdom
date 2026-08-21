@@ -3364,10 +3364,11 @@ impl WorkflowEngine {
         env: &[(String, String)],
         timeout: Duration,
     ) -> rk_core::Result<RunOutcome> {
-        let mut child_command = tokio::process::Command::new("sh");
+        let (shell, script) = crate::shell::pipefail_command(command);
+        let mut child_command = tokio::process::Command::new(shell);
         child_command
             .arg("-c")
-            .arg(command)
+            .arg(script)
             .current_dir(dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
