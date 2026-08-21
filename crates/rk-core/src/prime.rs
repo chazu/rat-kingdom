@@ -364,7 +364,22 @@ attempt to write will fail rather than be judged.
 - Finish by running `rk done \"<one-line diagnosis>\"`, then stop.
 ";
 
-const FRAGMENT_GROOMER: &str = "\
+/// The `env -u <VAR> ...` flag sequence for the full `strip_rk_spawn`
+/// environment (supervised spawn identity plus the exact-review binding).
+/// Rendered from [`rk_core::review::STRIPPED_RK_SPAWN_ENV`] so a rendered
+/// prompt can never drift from what the daemon's own check executors strip —
+/// see the doc comment on that constant for why partial isolation is unsafe.
+fn stripped_rk_spawn_env_flags() -> String {
+    crate::review::STRIPPED_RK_SPAWN_ENV
+        .iter()
+        .map(|var| format!("-u {var}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn fragment_groomer() -> String {
+    format!(
+        "\
 ## Groomer capability — close with evidence, or hand off
 
 You are a backlog groomer. Your harness is forced into a read-only mode: you
@@ -387,11 +402,11 @@ recorded evidence.
     body's say-so alone. Evidence: the target ticket id and the landing
     commit sha.
   - `stale-flake` — a ticket reporting a specific failing test that you have
-    re-run ONCE, individually, with the RK_* spawn env stripped (`env -u
-    RK_AGENT -u RK_TASK -u RK_REPO -u RK_ROLE -u RK_HOME -u RK_BRANCH -u
-    RK_WORKTREE mise exec -- cargo test ...`), and it passed. Evidence: the
-    exact command and result. A single clean run does not rule out
-    recurrence under load — say so in the evidence rather than overclaiming.
+    re-run ONCE, individually, with the full strip_rk_spawn environment
+    removed (`env {flags} mise exec -- cargo test ...`), and it passed.
+    Evidence: the exact command and result. A single clean run does not rule
+    out recurrence under load — say so in the evidence rather than
+    overclaiming.
   - `duplicate` — an exact-symptom duplicate of another open ticket. Evidence:
     the surviving ticket id and why it (not this one) is the survivor.
 - The `ticket.update` call is refused by the daemon for anything except an
@@ -402,13 +417,16 @@ recorded evidence.
 - If you are UNSURE — the evidence is ambiguous, the fix might not have
   landed, the flake might still reproduce under load — do NOT close it.
   Leave the ticket as-is and hand off what you found instead:
-  `rk out artifact $RK_REPO backlog-groom --payload '{...}'` for the findings,
+  `rk out artifact $RK_REPO backlog-groom --payload '{{...}}'` for the findings,
   or `rk ticket new` for something that needs its own follow-up. This mirrors
   how prior grooms handed findings to the operator; you replace that handoff
   only for the provable cases.
 - Finish by running `rk done \"<summary: N closed, M handed off>\"`, then
   stop.
-";
+",
+        flags = stripped_rk_spawn_env_flags(),
+    )
+}
 
 const FRAGMENT_FOREMAN: &str = "\
 ## Foreman role — coordinate, do not implement
@@ -671,7 +689,7 @@ pub fn render(role: &str, ctx: &PrimeContext) -> String {
         // refuses. Space+tickets stay, since scanning/coordination/ticket
         // reads are exactly its ordinary-rat surface.
         "groomer" => {
-            out.push_str(FRAGMENT_GROOMER);
+            out.push_str(&fragment_groomer());
             out.push('\n');
             out.push_str(FRAGMENT_SPACE);
             out.push('\n');
@@ -906,6 +924,24 @@ mod tests {
                 "groomer prompt should not teach code/git instructions it cannot act on: {absent:?}"
             );
         }
+    }
+
+    #[test]
+    fn groomer_stale_flake_instruction_derives_the_full_strip_rk_spawn_environment() {
+        let text = render("groomer", &ctx());
+        for var in crate::review::STRIPPED_RK_SPAWN_ENV {
+            let flag = format!("-u {var}");
+            assert!(
+                text.contains(&flag),
+                "groomer prompt's stale-flake instruction is missing `{flag}` — it must \
+                 derive the full strip_rk_spawn environment (spawn identity plus all five \
+                 RK_REVIEW_* bindings), not the obsolete seven-variable subset"
+            );
+        }
+        assert!(
+            !text.contains("RK_WORKTREE mise exec"),
+            "groomer prompt still contains the obsolete hard-coded seven-variable env -u list"
+        );
     }
 
     #[test]
