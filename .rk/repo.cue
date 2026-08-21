@@ -16,4 +16,8 @@ repo: {
 		remoteBranch: "{{branch}}"
 		deleteSource: true
 	}
+
+	landing: {
+		maxDiffLines: 2100
+	}
 }
