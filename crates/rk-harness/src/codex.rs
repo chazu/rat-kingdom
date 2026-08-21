@@ -527,4 +527,73 @@ while :; do sleep 1; done
         );
         assert!(!saw_delivery, "failed resume must remain unacknowledged");
     }
+
+    #[tokio::test]
+    async fn resume_rejection_after_spawn_is_not_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("codex-fake");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$2" = "resume" ]; then
+  echo '{"type":"error","message":"session rejected"}'
+  exit 2
+fi
+echo '{"type":"thread.started","thread_id":"session-rat"}'
+trap 'exit 130' INT
+while :; do sleep 1; done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = HashMap::new();
+        env.insert("RK_CODEX_BIN".into(), binary.to_string_lossy().into_owned());
+        let mut session = CodexHarness
+            .launch(&LaunchSpec {
+                prompt: "keep working".into(),
+                cwd: dir.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let started = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = session.events.recv().await {
+                if matches!(event, HarnessEvent::Started { .. }) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(started.is_ok(), "initial Codex session did not start");
+
+        let envelope = ControlEnvelope::new(
+            "message-rejected",
+            "operator",
+            "rat",
+            "delivery-1",
+            "resume-1",
+            "continue",
+        );
+        session.control.steer_envelope(&envelope).await.unwrap();
+
+        let mut saw_failure = false;
+        let mut saw_delivery = false;
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(2), session.events.recv())
+            .await
+            .unwrap()
+        {
+            match event {
+                HarnessEvent::Retry { .. } => saw_failure = true,
+                HarnessEvent::ControlDelivered { .. } => saw_delivery = true,
+                HarnessEvent::Exited { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(saw_failure, "a rejected resume must be visible");
+        assert!(
+            !saw_delivery,
+            "spawning a resume child must not acknowledge a rejected session"
+        );
+    }
 }

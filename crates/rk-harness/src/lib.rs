@@ -69,6 +69,16 @@ impl ControlEnvelope {
         envelope.durable = false;
         envelope
     }
+
+    /// Keep the durable request identity while recording the launch that
+    /// accepted a replay. The original `delivery_generation` remains the
+    /// generation that received the RPC; a daemon restart gets a new live
+    /// session generation for `resume_generation`.
+    pub fn for_resume_generation(&self, generation: impl Into<String>) -> Self {
+        let mut envelope = self.clone();
+        envelope.resume_generation = generation.into();
+        envelope
+    }
 }
 
 /// Token counts for one API call or one session, by class.
@@ -317,14 +327,16 @@ pub(crate) mod runner {
         parse: fn(&str) -> Vec<HarnessEvent>,
         event_tx: &mpsc::Sender<HarnessEvent>,
     ) -> bool {
+        let mut started = false;
         loop {
             let line = match stdout.as_mut() {
                 Some(lines) => lines.next_line().await,
-                None => return true,
+                None => return started,
             };
             match line {
                 Ok(Some(line)) => {
                     for event in parse(&line) {
+                        started |= matches!(&event, HarnessEvent::Started { .. });
                         if event_tx.send(event).await.is_err() {
                             return false;
                         }
@@ -332,7 +344,7 @@ pub(crate) mod runner {
                 }
                 Ok(None) => {
                     *stdout = None;
-                    return true;
+                    return started;
                 }
                 Err(error) => {
                     let _ = event_tx
@@ -341,7 +353,7 @@ pub(crate) mod runner {
                         })
                         .await;
                     *stdout = None;
-                    return true;
+                    return started;
                 }
             }
         }
@@ -606,6 +618,7 @@ pub(crate) mod runner {
             let mut stderr = stderr.map(|stream| BufReader::new(stream).lines());
             let mut session_id: Option<String> = None;
             let mut pending: Option<ControlEnvelope> = None;
+            let mut awaiting_ack: Option<ControlEnvelope> = None;
             let mut interrupt_sent = false;
             let mut delivered = std::collections::HashSet::new();
             let mut group_guard = group_guard;
@@ -620,15 +633,30 @@ pub(crate) mod runner {
                     } => match line {
                         Ok(Some(line)) => {
                             for event in parse(&line) {
-                                if let HarnessEvent::Started { session_id: Some(id) } = &event {
-                                    session_id = Some(id.clone());
-                                    if pending.is_some() && !interrupt_sent {
-                                        send_group_signal(pid, SIGINT);
-                                        interrupt_sent = true;
-                                    }
+                                let acknowledged =
+                                    if let HarnessEvent::Started { session_id: Some(id) } = &event {
+                                        session_id = Some(id.clone());
+                                        awaiting_ack.take()
+                                    } else {
+                                        None
+                                    };
+                                let started = matches!(&event, HarnessEvent::Started { .. });
+                                if started && pending.is_some() && !interrupt_sent {
+                                    send_group_signal(pid, SIGINT);
+                                    interrupt_sent = true;
                                 }
                                 if event_tx.send(event).await.is_err() {
                                     return;
+                                }
+                                if let Some(envelope) = acknowledged {
+                                    delivered.insert(envelope.message_id.clone());
+                                    if event_tx
+                                        .send(HarnessEvent::ControlDelivered { envelope })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -662,6 +690,9 @@ pub(crate) mod runner {
                         let Some(msg) = msg else { continue };
                         if delivered.contains(&msg.message_id)
                             || pending.as_ref().is_some_and(|active| active.message_id == msg.message_id)
+                            || awaiting_ack
+                                .as_ref()
+                                .is_some_and(|active| active.message_id == msg.message_id)
                         {
                             continue;
                         }
@@ -699,11 +730,36 @@ pub(crate) mod runner {
                         group_guard.disarm();
 
                         let Some(envelope) = pending.take() else {
-                            let _ = tokio::time::timeout(
+                            let awaiting = awaiting_ack.take();
+                            let started = tokio::time::timeout(
                                 Duration::from_millis(500),
                                 drain_stdout(&mut stdout, parse, &event_tx),
                             )
-                            .await;
+                            .await
+                            .unwrap_or(false);
+                            if let Some(envelope) = awaiting {
+                                if started {
+                                    delivered.insert(envelope.message_id.clone());
+                                    if event_tx
+                                        .send(HarnessEvent::ControlDelivered { envelope })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                } else {
+                                    let _ = event_tx.send(HarnessEvent::Stderr {
+                                        text: format!(
+                                            "Codex control {} could not resume: resumed session did not establish a session",
+                                            envelope.message_id
+                                        ),
+                                    }).await;
+                                    let _ = event_tx.send(HarnessEvent::Retry {
+                                        attempt: 0,
+                                        error: "Codex resumed session exited before establishing a session".into(),
+                                    }).await;
+                                }
+                            }
                             let _ = event_tx.send(HarnessEvent::Exited { code }).await;
                             return;
                         };
@@ -763,10 +819,12 @@ pub(crate) mod runner {
                         group_guard = ProcessGroupGuard(next_pid);
                         pid = next_pid;
                         interrupt_sent = false;
-                        delivered.insert(envelope.message_id.clone());
-                        if event_tx.send(HarnessEvent::ControlDelivered { envelope }).await.is_err() {
-                            return;
-                        }
+                        // Spawning the resume child only proves that the OS
+                        // accepted it. Hold the durable acknowledgement until
+                        // its protocol emits Started; otherwise a child that
+                        // immediately rejects the session could suppress
+                        // replay permanently.
+                        awaiting_ack = Some(envelope);
                     }
                 }
             }
