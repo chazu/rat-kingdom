@@ -20,4 +20,11 @@ repo: {
 	landing: {
 		maxDiffLines: 2100
 	}
+
+	// Regenerable build-artifact paths the daemon's worktree sweep reclaims.
+	// The daemon default remains empty/stack-neutral; this Cargo workspace
+	// declares its own `target/` as safe to delete.
+	reap: {
+		artifactPaths: ["target"]
+	}
 }

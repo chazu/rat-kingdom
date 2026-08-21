@@ -147,6 +147,12 @@ workflow: #Workflow
 		task:    string
 		attempt: string
 	}
+	// Cost-tier routing predicate for THIS spawn (same semantics as a
+	// `for_each` ticket's priority/labels, see #TierRule) — a single `spawn`
+	// has no fanned ticket to read them from, so a workflow binds them
+	// explicitly, e.g. `priority: _input.priority`.
+	priority?: string
+	labels?: [...string]
 }
 
 #Coordination: {

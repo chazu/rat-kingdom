@@ -48,6 +48,11 @@ const DIFF_TRIVIAL_MAX_LINES: u64 = 40;
 const DIFF_SMALL_MAX_FILES: usize = 10;
 const DIFF_SMALL_MAX_LINES: u64 = 400;
 
+/// `[budget] reviewer_max_usd` built-in default (`BudgetConfig::default()`
+/// mirrors this): above the observed cost of a legitimate deep review, but a
+/// hard ceiling on the $27+ uncapped outliers production surfaced.
+const DEFAULT_REVIEWER_MAX_USD: f64 = 30.0;
+
 /// The completion-payload fields a reactive steward tiers its review on: the
 /// branch tip this generation produced, its size vs. the recorded target, and
 /// a precomputed bucket. See [`Supervisor::diff_summary`].
@@ -549,6 +554,16 @@ pub struct Supervisor {
     budget: Budget,
     /// Hierarchical fleet/repo caps enforced as a pre-dispatch guard.
     fleet_budget: FleetBudget,
+    /// Per-agent USD cap for `role == "reviewer"` (`[budget] reviewer_max_usd`,
+    /// default $30), checked INSTEAD OF `budget` for that role. Stored as raw
+    /// `f64` bits in an `AtomicU64` (same reason as
+    /// [`max_load_per_cpu_bits`](Self::max_load_per_cpu_bits)): applied once
+    /// from config via [`set_reviewer_max_usd`](Supervisor::set_reviewer_max_usd)
+    /// after construction, read on the same hot path as the worker cap.
+    /// Reviewers were observed uncapped in production (one hit $27, above the
+    /// worker cap) — set above the cost of a legitimate deep review so a
+    /// thorough review is never cut off mid-verdict.
+    reviewer_max_usd_bits: AtomicU64,
     /// Agents already warned about budget (avoid repeat warnings).
     budget_warned: Mutex<std::collections::HashSet<String>>,
     /// Cost/usage rollup the budget machinery had computed for an agent at
@@ -927,6 +942,7 @@ impl Supervisor {
             pricing,
             budget,
             fleet_budget,
+            reviewer_max_usd_bits: AtomicU64::new(DEFAULT_REVIEWER_MAX_USD.to_bits()),
             budget_warned: Mutex::new(std::collections::HashSet::new()),
             budget_stop_floor: Mutex::new(HashMap::new()),
             fleet_warned: Mutex::new(std::collections::HashSet::new()),
@@ -963,6 +979,37 @@ impl Supervisor {
     pub fn set_max_load_per_cpu(&self, per_cpu: f64) {
         self.max_load_per_cpu_bits
             .store(per_cpu.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Set `[budget] reviewer_max_usd` (0 = unlimited; built-in default
+    /// [`DEFAULT_REVIEWER_MAX_USD`] applies until this is called). Applied by
+    /// `Daemon::new` from config, same pattern as
+    /// [`set_min_free_disk_gb`](Supervisor::set_min_free_disk_gb).
+    pub fn set_reviewer_max_usd(&self, usd: f64) {
+        self.reviewer_max_usd_bits
+            .store(usd.to_bits(), Ordering::Relaxed);
+    }
+
+    /// The budget checked for `record.role == "reviewer"` — same graduated
+    /// warn→stop shape as the ordinary worker `budget`, but a distinct cap
+    /// (see [`enforce_budget`](Self::enforce_budget)) and no token cap: the
+    /// $27 outlier that motivated this was a cost blowout, not a token one.
+    fn reviewer_budget(&self) -> Budget {
+        Budget {
+            max_usd: f64::from_bits(self.reviewer_max_usd_bits.load(Ordering::Relaxed)),
+            max_tokens: 0,
+            warn_at: self.budget.warn_at,
+        }
+    }
+
+    /// The budget governing `record`'s role: the reviewer cap for
+    /// `role == "reviewer"`, the ordinary worker cap for everything else.
+    fn budget_for(&self, record: &AgentRecord) -> Budget {
+        if record.role == "reviewer" {
+            self.reviewer_budget()
+        } else {
+            self.budget
+        }
     }
 
     /// The currently configured physical-capacity floors, as one value.
@@ -2151,7 +2198,8 @@ impl Supervisor {
     /// Graduated budget policy: warn once at the threshold (obstacle tuple +
     /// steer when possible), hard-stop at the cap.
     fn enforce_budget(self: &Arc<Self>, record: &AgentRecord) {
-        match self.budget.check(record.cost_usd, record.usage.total()) {
+        let budget = self.budget_for(record);
+        match budget.check(record.cost_usd, record.usage.total()) {
             BudgetAction::Ok => {}
             BudgetAction::Warn => {
                 if !self.mark_budget_warned(&record.name) {
@@ -2210,12 +2258,13 @@ impl Supervisor {
     }
 
     fn budget_stop_detail(&self, record: &AgentRecord) -> String {
+        let budget = self.budget_for(record);
         format!(
             "budget stop: spent ${:.2} / ${:.2} cap; {} / {} token cap",
             record.cost_usd,
-            self.budget.max_usd,
+            budget.max_usd,
             record.usage.total(),
-            self.budget.max_tokens
+            budget.max_tokens
         )
     }
 
@@ -6845,6 +6894,127 @@ mod respawn_tests {
         assert!(text.contains("$20.25 / $20.00 cap"));
         assert!(text.contains("100001 / 100000 token cap"));
         assert!(!is_auto_respawn_candidate(&stopped));
+    }
+
+    /// A reviewer is checked against the distinct reviewer cap, NOT the
+    /// ordinary worker `budget` — proven by a reviewer whose spend sits well
+    /// under a generous worker cap but over the (much tighter, here overridden)
+    /// reviewer cap still getting stopped, and a `rat` at the identical spend
+    /// surviving untouched.
+    #[test]
+    fn reviewer_role_is_checked_against_the_reviewer_cap_not_the_worker_cap() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let tickets = Arc::new(crate::tickets::Tickets::new(
+            Space::open_in_memory().unwrap(),
+            "castle".into(),
+        ));
+        let sup = Arc::new(
+            Supervisor::new(
+                Layout::at(home.path()),
+                "castle".into(),
+                "fake".into(),
+                Budget {
+                    max_usd: 1000.0,
+                    max_tokens: 0,
+                    warn_at: 0.8,
+                },
+                FleetBudget::default(),
+                Space::open_in_memory().unwrap(),
+                tickets,
+            )
+            .unwrap(),
+        );
+        sup.set_reviewer_max_usd(10.0);
+
+        let mut reviewer = record(repo.path(), Some("main"));
+        reviewer.role = "reviewer".into();
+        reviewer.state = AgentState::Running;
+        reviewer.cost_usd = 10.5;
+        sup.lock_registry().insert(reviewer.clone()).unwrap();
+        sup.enforce_budget(&reviewer);
+        let stopped = sup.status(&reviewer.name).unwrap();
+        assert_eq!(
+            stopped.state,
+            AgentState::Stopped,
+            "reviewer over the $10 reviewer cap must stop despite the $1000 worker cap"
+        );
+
+        let mut worker = record(repo.path(), Some("main"));
+        worker.name = format!("{}-rat", worker.name);
+        worker.role = "rat".into();
+        worker.state = AgentState::Running;
+        worker.cost_usd = 10.5;
+        sup.lock_registry().insert(worker.clone()).unwrap();
+        sup.enforce_budget(&worker);
+        let untouched = sup.status(&worker.name).unwrap();
+        assert_eq!(
+            untouched.state,
+            AgentState::Running,
+            "a rat at the same spend is judged against the $1000 worker cap, unaffected \
+             by the reviewer cap"
+        );
+    }
+
+    /// `BudgetConfig::default().reviewer_max_usd` (rk-core) and
+    /// `DEFAULT_REVIEWER_MAX_USD` (this module's built-in fallback before
+    /// `Daemon::new` applies config) must agree, or a bare `Supervisor` built
+    /// by a test/another crate silently runs a different cap than production.
+    #[test]
+    fn built_in_reviewer_cap_matches_config_default() {
+        assert_eq!(
+            DEFAULT_REVIEWER_MAX_USD,
+            rk_core::config::BudgetConfig::default().reviewer_max_usd
+        );
+    }
+
+    /// Graduated warning fires for a reviewer approaching its OWN cap even
+    /// when nowhere near the (unrelated) worker cap.
+    #[test]
+    fn reviewer_budget_warns_at_its_own_threshold() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let tickets = Arc::new(crate::tickets::Tickets::new(
+            Space::open_in_memory().unwrap(),
+            "castle".into(),
+        ));
+        let sup = Arc::new(
+            Supervisor::new(
+                Layout::at(home.path()),
+                "castle".into(),
+                "fake".into(),
+                Budget::default(),
+                FleetBudget::default(),
+                Space::open_in_memory().unwrap(),
+                tickets,
+            )
+            .unwrap(),
+        );
+        // Default $30 reviewer cap, default 0.8 warn fraction => warns at $24.
+        let mut reviewer = record(repo.path(), Some("main"));
+        reviewer.role = "reviewer".into();
+        reviewer.state = AgentState::Running;
+        reviewer.cost_usd = 25.0;
+        sup.lock_registry().insert(reviewer.clone()).unwrap();
+        sup.enforce_budget(&reviewer);
+        let after = sup.status(&reviewer.name).unwrap();
+        assert_eq!(
+            after.state,
+            AgentState::Running,
+            "a warn crossing must not stop the reviewer"
+        );
+        let obstacles = sup
+            .space
+            .scan(&Pattern::category(Category::Obstacle))
+            .unwrap();
+        assert!(
+            obstacles
+                .iter()
+                .any(|t| t.payload["type"] == json!("budget_warning")),
+            "expected a budget_warning obstacle once the reviewer crossed 80% of its cap"
+        );
     }
 
     fn spawn_params(repo: &Path, task: &str) -> SpawnParams {

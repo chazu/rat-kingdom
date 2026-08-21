@@ -14,7 +14,7 @@
 //! overrides so cost-routing beats the static profile defaults, yet an explicit
 //! `model:`/`harness:` on the step still wins.
 
-use crate::{AgentProfile, SpawnStep};
+use crate::{AgentProfile, SpawnStep, TierRouting};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,15 +24,22 @@ pub struct ResolvedAgent {
     pub permission_mode: Option<String>,
 }
 
+/// Resolve one `spawn` step, including cost-tier routing over the step's own
+/// `priority`/`labels` predicate (`tiers.route`) — the same table `for_each`
+/// fan-out consults over a fanned ticket's fields. Before this, `spawn` steps
+/// (which is how every reviewer dispatches — `for_each` is worker-only) never
+/// consulted `tiers` at all.
 pub fn resolve(
     step: &SpawnStep,
+    tiers: &TierRouting,
     workflow_agents: &HashMap<String, AgentProfile>,
     global_agents: &HashMap<String, AgentProfile>,
     global_default_harness: &str,
 ) -> rk_core::Result<ResolvedAgent> {
+    let tier = tiers.route(&step.labels, step.priority.as_deref());
     resolve_fields(
         step.agent.as_deref(),
-        None,
+        tier,
         step.harness.as_deref(),
         step.model.as_deref(),
         step.permission_mode.as_deref(),
@@ -134,6 +141,8 @@ mod tests {
             },
             branch: None,
             review: None,
+            priority: None,
+            labels: Vec::new(),
         }
     }
 
@@ -329,7 +338,38 @@ mod tests {
             global: &HashMap<String, AgentProfile>,
             default_harness: &str,
         ) -> rk_core::Result<ResolvedAgent> {
-            resolve(self, wf, global, default_harness)
+            resolve(self, &TierRouting::default(), wf, global, default_harness)
         }
+    }
+
+    #[test]
+    fn spawn_step_tier_routing_beats_named_profile_but_loses_to_inline() {
+        let global = HashMap::from([
+            ("default".into(), profile(Some("claude"), Some("opus"))),
+            ("cheap".into(), profile(Some("codex"), Some("haiku"))),
+            ("premium".into(), profile(Some("claude"), Some("opus"))),
+        ]);
+        let tiers = TierRouting {
+            rules: vec![crate::TierRule {
+                priority: Some("low".into()),
+                label: None,
+                tier: "cheap".into(),
+            }],
+        };
+        let mut low_priority = step(Some("premium"));
+        low_priority.priority = Some("low".into());
+        let resolved = resolve(&low_priority, &tiers, &HashMap::new(), &global, "fake").unwrap();
+        assert_eq!(
+            resolved.harness, "codex",
+            "the routing rule's tier beats the step's named profile"
+        );
+        assert_eq!(resolved.model.as_deref(), Some("haiku"));
+
+        // A priority the table has no rule for falls through untouched.
+        let mut other_priority = step(Some("premium"));
+        other_priority.priority = Some("high".into());
+        let resolved = resolve(&other_priority, &tiers, &HashMap::new(), &global, "fake").unwrap();
+        assert_eq!(resolved.harness, "claude", "named profile applies as-is");
+        assert_eq!(resolved.model.as_deref(), Some("opus"));
     }
 }
