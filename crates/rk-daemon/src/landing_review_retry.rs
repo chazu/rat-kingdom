@@ -103,16 +103,22 @@ impl Default for ReviewDeathBackoffPolicy {
 /// `max_delay`. Zero `base_delay` short-circuits to zero regardless of
 /// `backoff_pct`/`max_delay` — an explicit zero-delay policy stays exactly
 /// immediate, never inflated by a nonzero clamp or percent.
+///
+/// Clamps against `max_delay` in `f64` seconds BEFORE converting back to a
+/// `Duration`: a schema-valid but extreme `backoff_pct` (up to `u32::MAX`)
+/// compounded across up to 32 growth steps, or a schema-valid but extreme
+/// `base_delay`, can multiply out to a second count `Duration::mul_f64`
+/// cannot represent — that call panics rather than saturating. Computing the
+/// clamp in `f64` first and only ever constructing a `Duration` from a value
+/// already bounded by (representable) `max_delay` keeps this infallible.
 fn backoff_before_jitter(policy: &ReviewDeathBackoffPolicy, attempt: u32) -> Duration {
     if policy.base_delay.is_zero() {
         return Duration::ZERO;
     }
     let growth = attempt.saturating_sub(1).min(32);
     let factor = (f64::from(policy.backoff_pct) / 100.0).powi(growth as i32);
-    policy
-        .base_delay
-        .mul_f64(factor.max(0.0))
-        .min(policy.max_delay)
+    let scaled_secs = policy.base_delay.as_secs_f64() * factor.max(0.0);
+    clamp_secs_to_duration(scaled_secs, policy.max_delay)
 }
 
 /// The full retry delay for `attempt`: [`backoff_before_jitter`] plus
@@ -134,7 +140,21 @@ pub(crate) fn retry_delay(
     }
     let jitter_unit = jitter_unit.clamp(0.0, 1.0);
     let jitter_frac = (f64::from(policy.jitter_pct) / 100.0) * jitter_unit;
-    base.mul_f64(1.0 + jitter_frac).min(policy.max_delay)
+    let scaled_secs = base.as_secs_f64() * (1.0 + jitter_frac);
+    clamp_secs_to_duration(scaled_secs, policy.max_delay)
+}
+
+/// Bounds a raw second count (which may be non-finite or larger than
+/// `Duration` can represent, e.g. from compounding an extreme schema-valid
+/// policy value) to `[0, max_delay]` and only then converts to a `Duration`,
+/// so the conversion itself can never panic the way `Duration::mul_f64`/
+/// `from_secs_f64` do on an out-of-range result.
+fn clamp_secs_to_duration(secs: f64, max_delay: Duration) -> Duration {
+    if !secs.is_finite() || secs <= 0.0 {
+        return Duration::ZERO;
+    }
+    let bounded = secs.min(max_delay.as_secs_f64());
+    Duration::try_from_secs_f64(bounded).unwrap_or(max_delay)
 }
 
 /// Machine-readable reason and evidence for a withheld retry.
@@ -449,6 +469,36 @@ mod tests {
         // must not be able to push it past that ceiling.
         assert_eq!(retry_delay(&policy, 6, 1.0), policy.max_delay);
         assert_eq!(retry_delay(&policy, 50, 1.0), policy.max_delay);
+    }
+
+    #[test]
+    fn extreme_schema_valid_backoff_pct_and_attempt_stay_bounded_without_panicking() {
+        // backoff_pct at u32::MAX compounded over the growth cap, and an
+        // attempt ordinal far past it, used to overflow `Duration::mul_f64`
+        // before it ever reached the advertised clamp — this must not panic
+        // and must still land exactly on max_delay.
+        let policy = ReviewDeathBackoffPolicy {
+            base_delay: Duration::from_secs(u64::MAX / 4),
+            backoff_pct: u32::MAX,
+            max_delay: Duration::from_secs(600),
+            jitter_pct: 20,
+        };
+        for attempt in [1, 2, 32, 1000, u32::MAX] {
+            assert_eq!(retry_delay(&policy, attempt, 1.0), policy.max_delay);
+        }
+    }
+
+    #[test]
+    fn extreme_schema_valid_jitter_pct_stays_bounded_without_panicking() {
+        // jitter_pct at u32::MAX scales the post-jitter multiplier into the
+        // billions — `base.mul_f64` used to overflow before the re-clamp.
+        let policy = ReviewDeathBackoffPolicy {
+            base_delay: Duration::from_secs(30),
+            backoff_pct: 100,
+            max_delay: Duration::from_secs(600),
+            jitter_pct: u32::MAX,
+        };
+        assert_eq!(retry_delay(&policy, 1, 1.0), policy.max_delay);
     }
 
     #[test]
