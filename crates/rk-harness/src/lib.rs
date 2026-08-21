@@ -326,9 +326,15 @@ pub(crate) mod runner {
     /// handshake, not that it applied the control envelope: a rejecting or
     /// crashing resume can emit Started and then immediately exit. Mark
     /// `awaiting_ack_started` on Started, but only hand back (and let the
-    /// caller acknowledge) the envelope once a *further* event proves the
-    /// session is actually alive. A Retry (protocol-level error, e.g. a
-    /// rejected session) never counts as that further proof.
+    /// caller acknowledge) the envelope once the resumed session actually
+    /// produces assistant output. `ToolUse`/`Usage` are NOT accepted as that
+    /// proof: Codex resume can replay tool calls and cumulative usage
+    /// buffered from the session's prior history before the model ever
+    /// engages with the newly injected control turn, so a process that
+    /// starts, emits a lookalike tool/usage event, then rejects or exits
+    /// would otherwise acknowledge a control that was never applied.
+    /// `AssistantText` is the one event that can only originate from the
+    /// model actually responding to the current (resumed) turn.
     fn confirm_awaiting_ack(
         event: &HarnessEvent,
         awaiting_ack: &mut Option<ControlEnvelope>,
@@ -343,8 +349,9 @@ pub(crate) mod runner {
                 }
                 None
             }
-            HarnessEvent::Retry { .. } => None,
-            _ if *awaiting_ack_started && awaiting_ack.is_some() => {
+            HarnessEvent::AssistantText { .. }
+                if *awaiting_ack_started && awaiting_ack.is_some() =>
+            {
                 *awaiting_ack_started = false;
                 awaiting_ack.take()
             }
