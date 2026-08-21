@@ -905,10 +905,13 @@ fn review_retry_instance_id(entry: &LandingQueueEntry, retry_attempt: u32) -> St
 /// landed-at records, gate worktree ages) deliberately keeps using
 /// `Utc::now` directly, so injecting a frozen clock here cannot distort
 /// unrelated pipeline behavior in a test.
+type RetrySleepFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type RetrySleeper = Box<dyn Fn(Duration) -> RetrySleepFuture + Send + Sync>;
+
 pub(crate) struct RetrySchedule {
     now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     jitter_unit: Box<dyn Fn() -> f64 + Send + Sync>,
-    sleep: Box<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>,
+    sleep: RetrySleeper,
 }
 
 impl RetrySchedule {
