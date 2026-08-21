@@ -339,6 +339,14 @@ async fn raw_command_runs_when_policy_off() {
 /// mismatched its own synthetic identity and got rejected — exactly what
 /// happened live when steward reviewer Pumpernickel-10 ran the repository's
 /// `verify` check for Widget-10 (TKT-01M0GDHKYSKEGVZR7QY9FP1VKK).
+///
+/// This pins the environment SURFACE — exactly which names a stripped child
+/// does and does not carry — which is all a grep of the child environment can
+/// establish. The CONSEQUENCE (the same real `rk out artifact … review` write
+/// rejected from an `inherit` check and accepted from a stripped one) is pinned
+/// end to end in `crates/rk-cli/tests/strip_rk_spawn_review_binding.rs`, which
+/// lives in `rk-cli` because only that package's tests can resolve the real
+/// `rk` binary through `CARGO_BIN_EXE_rk`.
 const REVIEW_BINDING_CHECKS: &str = r#"
 checks: [
     {name: "steward-protected-paths", command: "true", timeout: "30s"},
