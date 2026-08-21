@@ -13,6 +13,14 @@
 //! (silent fallback would mask typos). The tier layer sits just below inline
 //! overrides so cost-routing beats the static profile defaults, yet an explicit
 //! `model:`/`harness:` on the step still wins.
+//!
+//! Provider-safe: a `model` is only ever provider-specific to the `harness` it
+//! was selected alongside. When a more-specific layer changes the harness
+//! without also naming a model, any model carried up from a less-specific
+//! layer is dropped rather than inherited — it was chosen for a different
+//! provider and is not guaranteed to mean anything to the new one. A model
+//! named at the same layer that changes the harness, or at any layer that
+//! does not change it, still applies normally.
 
 use crate::{AgentProfile, SpawnStep, TierRouting};
 use std::collections::HashMap;
@@ -94,32 +102,63 @@ pub fn resolve_fields(
     let mut model: Option<String> = None;
     let mut permission_mode: Option<String> = None;
     for layer in layers {
-        if layer.harness.is_some() {
-            harness = layer.harness.clone();
-        }
-        if layer.model.is_some() {
-            model = layer.model.clone();
-        }
-        if layer.permission_mode.is_some() {
-            permission_mode = layer.permission_mode.clone();
-        }
+        apply_layer(
+            &mut harness,
+            &mut model,
+            &mut permission_mode,
+            layer.harness.as_deref(),
+            layer.model.as_deref(),
+            layer.permission_mode.as_deref(),
+        );
     }
-    // Inline step overrides beat everything.
-    if step_harness.is_some() {
-        harness = step_harness.map(String::from);
-    }
-    if step_model.is_some() {
-        model = step_model.map(String::from);
-    }
-    if step_permission_mode.is_some() {
-        permission_mode = step_permission_mode.map(String::from);
-    }
+    // Inline step overrides beat everything — folded through the same
+    // provider-safe merge so an inline harness change without an inline model
+    // drops a model inherited from a layer, rather than leaking it.
+    apply_layer(
+        &mut harness,
+        &mut model,
+        &mut permission_mode,
+        step_harness,
+        step_model,
+        step_permission_mode,
+    );
 
     Ok(ResolvedAgent {
         harness: harness.unwrap_or_else(|| global_default_harness.to_string()),
         model,
         permission_mode,
     })
+}
+
+/// Fold one layer's fields into the accumulated resolution, least-specific
+/// layer applied first. `model` is treated as scoped to the `harness` it
+/// travels with: if this layer sets a harness that differs from the harness
+/// accumulated so far (including the first layer that sets one at all), any
+/// previously accumulated model is dropped — it belongs to the harness being
+/// replaced — and only this layer's own `model` (if any) survives. A layer
+/// that leaves `harness` unset cannot change harnesses, so it merges its
+/// `model`/`permission_mode` independently, same as before.
+fn apply_layer(
+    harness: &mut Option<String>,
+    model: &mut Option<String>,
+    permission_mode: &mut Option<String>,
+    layer_harness: Option<&str>,
+    layer_model: Option<&str>,
+    layer_permission_mode: Option<&str>,
+) {
+    if let Some(h) = layer_harness {
+        if harness.as_deref() != Some(h) {
+            *model = layer_model.map(String::from);
+        } else if layer_model.is_some() {
+            *model = layer_model.map(String::from);
+        }
+        *harness = Some(h.to_string());
+    } else if layer_model.is_some() {
+        *model = layer_model.map(String::from);
+    }
+    if layer_permission_mode.is_some() {
+        *permission_mode = layer_permission_mode.map(String::from);
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +209,86 @@ mod tests {
         let resolved = step(None).pipe_resolve(&wf, &global, "fake").unwrap();
         // harness from global default profile, model overridden by workflow.
         assert_eq!(resolved.harness, "codex");
+        assert_eq!(resolved.model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn workflow_harness_only_default_does_not_inherit_global_default_model() {
+        // The nightly-self-improve regression: global [agents.default] pins a
+        // model to the claude harness, and the workflow's own `agents.default`
+        // only overrides the harness to codex. The codex-bound spawn must NOT
+        // inherit "opus" — that model was never selected for codex, it just
+        // happened to be the model attached to the harness this replaced.
+        let global = HashMap::from([("default".into(), profile(Some("claude"), Some("opus")))]);
+        let wf = HashMap::from([("default".into(), profile(Some("codex"), None))]);
+        let resolved = step(None).pipe_resolve(&wf, &global, "fake").unwrap();
+        assert_eq!(resolved.harness, "codex");
+        assert_eq!(
+            resolved.model, None,
+            "changing harness with no model specified must not leak the prior \
+             harness's model — let codex choose its own default"
+        );
+    }
+
+    #[test]
+    fn workflow_harness_only_default_is_provider_neutral_the_other_direction() {
+        // Same shape, harnesses swapped, to prove the fix isn't hardcoded to any
+        // particular provider pair: switching claude -> codex or codex -> claude
+        // must equally drop the inherited model.
+        let global = HashMap::from([("default".into(), profile(Some("codex"), Some("gpt-5.5")))]);
+        let wf = HashMap::from([("default".into(), profile(Some("claude"), None))]);
+        let resolved = step(None).pipe_resolve(&wf, &global, "fake").unwrap();
+        assert_eq!(resolved.harness, "claude");
+        assert_eq!(resolved.model, None);
+    }
+
+    #[test]
+    fn layer_naming_both_harness_and_model_together_is_unaffected() {
+        // A layer that changes harness AND explicitly names a compatible model
+        // still resolves that model — only an *unspecified* model is dropped.
+        let global = HashMap::from([("default".into(), profile(Some("claude"), Some("opus")))]);
+        let wf = HashMap::from([(
+            "default".into(),
+            profile(Some("codex"), Some("gpt-5-codex")),
+        )]);
+        let resolved = step(None).pipe_resolve(&wf, &global, "fake").unwrap();
+        assert_eq!(resolved.harness, "codex");
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5-codex"));
+    }
+
+    #[test]
+    fn inline_harness_override_without_inline_model_drops_the_inherited_model() {
+        // Same leak, but at the inline step-override layer instead of a named
+        // profile: `harness:` alone on the step must not carry a model chosen
+        // for a different harness by the layers underneath it.
+        let global = HashMap::from([("default".into(), profile(Some("claude"), Some("opus")))]);
+        let mut s = step(None);
+        s.harness = Some("codex".into());
+        let resolved = s.pipe_resolve(&HashMap::new(), &global, "fake").unwrap();
+        assert_eq!(resolved.harness, "codex");
+        assert_eq!(resolved.model, None);
+    }
+
+    #[test]
+    fn inline_harness_and_model_together_still_win_over_layers() {
+        let global = HashMap::from([("default".into(), profile(Some("claude"), Some("opus")))]);
+        let mut s = step(None);
+        s.harness = Some("codex".into());
+        s.model = Some("gpt-5-codex".into());
+        let resolved = s.pipe_resolve(&HashMap::new(), &global, "fake").unwrap();
+        assert_eq!(resolved.harness, "codex");
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5-codex"));
+    }
+
+    #[test]
+    fn same_harness_across_layers_still_merges_model_independently() {
+        // Sanity check that the fix only fires on an actual harness *change* —
+        // when consecutive layers agree on harness, field-wise independent
+        // merging (the pre-existing, correct behavior) is untouched.
+        let global = HashMap::from([("default".into(), profile(Some("claude"), Some("opus")))]);
+        let wf = HashMap::from([("default".into(), profile(Some("claude"), Some("sonnet")))]);
+        let resolved = step(None).pipe_resolve(&wf, &global, "fake").unwrap();
+        assert_eq!(resolved.harness, "claude");
         assert_eq!(resolved.model.as_deref(), Some("sonnet"));
     }
 
