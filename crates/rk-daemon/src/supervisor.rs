@@ -5746,7 +5746,9 @@ impl Supervisor {
             self.lock_registry().get(name),
             tokio::runtime::Handle::try_current(),
         ) {
-            if let Ok(pending) = crate::steer::pending(&self.space, &record.repo_name, name) {
+            if let Ok(pending) =
+                crate::steer::pending(&self.space, &record.repo_name, name, &self.castle)
+            {
                 let control = self.lock_controls().get(name).cloned();
                 if let Some(control) = control {
                     for envelope in pending {
