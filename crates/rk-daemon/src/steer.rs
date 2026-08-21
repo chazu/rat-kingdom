@@ -14,19 +14,22 @@ use serde_json::{json, Value};
 pub const CONTROL_MESSAGE_TYPE: &str = "rk_control";
 pub const CONTROL_ACK_IDENTITY: &str = "rk_control_ack";
 
-pub fn enqueue(space: &Space, scope: &str, envelope: &ControlEnvelope, instance: &str) -> rk_core::Result<()> {
+pub fn enqueue(
+    space: &Space,
+    scope: &str,
+    envelope: &ControlEnvelope,
+    instance: &str,
+) -> rk_core::Result<()> {
     let mut payload = serde_json::to_value(envelope)
         .map_err(|e| rk_core::Error::other(format!("serialize control envelope: {e}")))?;
     payload["type"] = json!(CONTROL_MESSAGE_TYPE);
-    space.out(
-        Tuple::new(
-            Category::Message,
-            scope,
-            &envelope.target,
-            instance,
-            payload,
-        ),
-    )
+    space.out(Tuple::new(
+        Category::Message,
+        scope,
+        &envelope.target,
+        instance,
+        payload,
+    ))
 }
 
 pub fn acknowledge(
@@ -86,7 +89,14 @@ mod tests {
     use super::*;
 
     fn envelope(id: &str) -> ControlEnvelope {
-        ControlEnvelope::new(id, "operator", "Whisker", "delivery-1", "resume-1", "continue")
+        ControlEnvelope::new(
+            id,
+            "operator",
+            "Whisker",
+            "delivery-1",
+            "resume-1",
+            "continue",
+        )
     }
 
     #[test]

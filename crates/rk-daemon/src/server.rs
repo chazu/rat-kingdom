@@ -7011,12 +7011,9 @@ impl Daemon {
             record.spawn_id().to_string(),
             params.message,
         );
-        if let Err(e) = crate::steer::enqueue(
-            &self.space,
-            &record.repo_name,
-            &envelope,
-            &self.castle,
-        ) {
+        if let Err(e) =
+            crate::steer::enqueue(&self.space, &record.repo_name, &envelope, &self.castle)
+        {
             return Response::err(req.id, codes::INTERNAL, e.to_string());
         }
         match self
