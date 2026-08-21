@@ -74,6 +74,15 @@ repo: #RepositoryPolicy
 	shadowReviewModel: string | *""
 	// Harness for the shadow reviewer. Ignored when shadowReviewModel is empty.
 	shadowReviewHarness: string | *""
+	// REVIEW-DEATH RETRY (crates/rk-daemon/src/landing_review_retry.rs): whether
+	// a reviewer that goes terminal without ever producing a verdict may be
+	// retried unattended with a fresh reviewer against the same exact head,
+	// with no human polling.
+	reviewDeathAutoRetry: bool | *true
+	// Hard ceiling on replacement reviewers per dead review. 0 disables retry.
+	maxReviewDeathAttempts: int | *1
+	// Hard ceiling on cumulative USD across one review-death retry chain. 0 = unlimited.
+	reviewDeathMaxUsd: int | *10
 }
 
 // Regenerable build-artifact paths (relative to a worktree root) the daemon's

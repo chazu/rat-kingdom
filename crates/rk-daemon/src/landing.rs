@@ -69,6 +69,9 @@
 //! that live wiring.
 #![allow(dead_code)]
 
+use crate::landing_review_retry::{
+    self, ReviewDeathContext, ReviewDeathPolicy, ReviewDeathRoute, REVIEW_DEATH_DISPATCH_IDENTITY,
+};
 use crate::landing_rework::{
     self, ReworkContext, ReworkPolicy, ReworkRoute, Withheld, REWORK_DISPATCH_IDENTITY,
 };
@@ -867,6 +870,19 @@ fn review_instance_id(entry: &LandingQueueEntry) -> String {
     format!("landing-review-{}", hex::encode(&digest[..16]))
 }
 
+/// The instance id for the Nth replacement reviewer after [`review_instance_id`]'s
+/// primary died before a verdict (module doc's `ReviewWaitOutcome::ReviewerDied`
+/// path). Distinct from the primary and from every other retry, so
+/// `run_review_owned_with_id` can never resolve a retry dispatch back onto the
+/// dead primary instance (or a sibling retry) — this is what makes a late
+/// verdict from a dead generation structurally incapable of racing or
+/// overriding a live replacement: each attempt's `rd` pattern in
+/// [`LandingPipeline::await_primary_verdict`] filters on its OWN `review_attempt`,
+/// which is this id, not a shared one.
+fn review_retry_instance_id(entry: &LandingQueueEntry, retry_attempt: u32) -> String {
+    format!("{}-retry{retry_attempt}", review_instance_id(entry))
+}
+
 /// One resolved named check plus the env pairs and wall-clock bound it runs
 /// with, in the order [`LandingPipeline::gate_plan`] wants them run.
 type GatePlan = Vec<(rk_workflow::Check, Vec<(String, String)>, Duration)>;
@@ -986,6 +1002,17 @@ enum ReviewWaitOutcome {
     /// still `Running` and no verdict — a live-at-ceiling hold, distinct from
     /// a dead reviewer.
     CeilingReached,
+}
+
+/// How [`LandingPipeline::route_review_death`] resolved one `ReviewerDied`
+/// outcome — either a replacement reviewer was dispatched and awaited (its
+/// own outcome may be a fresh `Verdict`, another `ReviewerDied`, or a
+/// `CeilingReached`, all fed back through [`LandingPipeline::route_verdict_prepared`]'s
+/// loop), or the retry ladder withheld and raised the one durable escalation.
+#[derive(Debug)]
+enum ReviewDeathOutcome {
+    Retry(ReviewWaitOutcome),
+    Escalated(Tuple),
 }
 
 /// What stopped [`LandingPipeline::run_gates_at`], distinct enough for its
@@ -1803,12 +1830,51 @@ impl LandingPipeline {
         self.request_review(entry, gates).await
     }
 
+    /// The review attempt id currently authoritative for `entry`: the
+    /// highest-numbered review-death retry dispatched so far (module
+    /// [`landing_review_retry`]), or the primary [`review_instance_id`] if
+    /// none has been. Every verdict READ — this restart-safe cache probe, or
+    /// a live [`Self::await_primary_verdict`] wait — scopes to exactly this
+    /// id, never to an earlier one: once a later attempt has been
+    /// dispatched, an earlier attempt is by definition a DEAD generation, so
+    /// a verdict that arrives from it late — however it arrives — can never
+    /// be read as authoritative again. This is what keeps a late verdict
+    /// from a dead generation from racing or overriding its replacement.
+    fn active_review_attempt(&self, entry: &LandingQueueEntry) -> rk_core::Result<String> {
+        let ctx = ReviewDeathContext {
+            repo: entry.repo_name.clone(),
+            branch: entry.branch.clone(),
+            head_sha: entry.head_sha.clone(),
+            target: entry.target.clone(),
+            task: entry.task.clone(),
+        };
+        let latest_retry = self
+            .review_death_dispatch_markers(&ctx)?
+            .into_iter()
+            .filter(|marker| {
+                matches!(
+                    marker.payload.get("state").and_then(Value::as_str),
+                    Some("dispatching" | "dispatched")
+                )
+            })
+            .filter_map(|marker| marker.payload.get("attempt").and_then(Value::as_u64))
+            .max();
+        Ok(match latest_retry {
+            Some(attempt) => review_retry_instance_id(entry, attempt as u32),
+            None => review_instance_id(entry),
+        })
+    }
+
     /// Non-blocking probe of Phase 2's commit-keyed verdict cache — ANY
     /// prior run's recommendation for this exact review context, regardless
-    /// of who wrote it (§1.3). A hit is honored identically to a fresh verdict
-    /// — never re-reviewed to shop for a better opinion.
+    /// of who wrote it (§1.3), SCOPED to the currently active review attempt
+    /// (see [`Self::active_review_attempt`]) so a restart can resume an
+    /// in-flight or already-settled review-death retry without ever reading
+    /// a dead generation's verdict back as current. A hit is honored
+    /// identically to a fresh verdict — never re-reviewed to shop for a
+    /// better opinion.
     fn cached_verdict(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<String>> {
-        let expected_review_attempt = review_instance_id(entry);
+        let expected_review_attempt = self.active_review_attempt(entry)?;
         let pattern = Pattern::for_commit(
             Category::Artifact,
             REVIEW_ARTIFACT_IDENTITY,
@@ -1874,29 +1940,8 @@ impl LandingPipeline {
         entry: &LandingQueueEntry,
         gates: &GateConfig,
     ) -> rk_core::Result<ReviewWaitOutcome> {
-        self.queue
-            .set_status(entry, LandingEntryStatus::AwaitingReview)?;
-
         let instance_id = review_instance_id(entry);
-        let params = self.review_params(entry, gates, &instance_id);
-        let review = rk_core::review::ReviewContext {
-            branch: entry.branch.clone(),
-            head_sha: entry.head_sha.clone(),
-            target: entry.target.clone(),
-            task: entry.task.clone(),
-            attempt: instance_id.clone(),
-        };
-        // The engine's `repo` argument is a filesystem path (it feeds
-        // `Repo::discover` and repo-local definition resolution), unlike the
-        // `repo` WORKFLOW PARAM above, which is the repo's scope name used
-        // to address its verdict artifact.
-        self.engine.run_review_owned_with_id(
-            instance_id.clone(),
-            REVIEW_WORKFLOW,
-            &entry.repo_path,
-            params,
-            review,
-        )?;
+        self.dispatch_review(entry, gates, &instance_id)?;
         let shadow = self.launch_shadow_review(entry, gates, &instance_id);
 
         let outcome = self
@@ -1909,6 +1954,60 @@ impl LandingPipeline {
             self.spawn_shadow_comparison(entry, shadow, &instance_id, &outcome, gates);
         }
         Ok(outcome)
+    }
+
+    /// Launch one review workflow instance under `instance_id` — the primary
+    /// (see [`Self::request_review`]) or a review-death replacement (see
+    /// [`Self::request_review_retry`]). `run_review_owned_with_id` resolves a
+    /// repeat call for the SAME `instance_id` to the already-running (or
+    /// already-finished) instance instead of spawning a duplicate — the same
+    /// property [`review_instance_id`]'s doc comment relies on for restart
+    /// safety, which is why neither caller needs its own crash-window
+    /// dedup: re-entering this function for an id that already dispatched is
+    /// itself idempotent.
+    fn dispatch_review(
+        &self,
+        entry: &LandingQueueEntry,
+        gates: &GateConfig,
+        instance_id: &str,
+    ) -> rk_core::Result<()> {
+        self.queue
+            .set_status(entry, LandingEntryStatus::AwaitingReview)?;
+        let params = self.review_params(entry, gates, instance_id);
+        let review = rk_core::review::ReviewContext {
+            branch: entry.branch.clone(),
+            head_sha: entry.head_sha.clone(),
+            target: entry.target.clone(),
+            task: entry.task.clone(),
+            attempt: instance_id.to_string(),
+        };
+        // The engine's `repo` argument is a filesystem path (it feeds
+        // `Repo::discover` and repo-local definition resolution), unlike the
+        // `repo` WORKFLOW PARAM above, which is the repo's scope name used
+        // to address its verdict artifact.
+        self.engine.run_review_owned_with_id(
+            instance_id.to_string(),
+            REVIEW_WORKFLOW,
+            &entry.repo_path,
+            params,
+            review,
+        )?;
+        Ok(())
+    }
+
+    /// Dispatch and await exactly one review-death replacement reviewer under
+    /// `instance_id` (a [`review_retry_instance_id`]). No shadow reviewer: a
+    /// retry is still the PRIMARY chain, just a later attempt at it — shadow
+    /// review is an observational extra against the primary's own verdict,
+    /// not something every replacement needs its own copy of.
+    async fn request_review_retry(
+        &self,
+        entry: &LandingQueueEntry,
+        gates: &GateConfig,
+        instance_id: &str,
+    ) -> rk_core::Result<ReviewWaitOutcome> {
+        self.dispatch_review(entry, gates, instance_id)?;
+        self.await_primary_verdict(entry, gates, instance_id).await
     }
 
     /// Workflow params for one review request — the PRIMARY reviewer's set.
@@ -2280,28 +2379,33 @@ impl LandingPipeline {
         git_repo: &rk_git::Repo,
         candidate: &rk_git::PreparedMerge,
     ) -> rk_core::Result<LandingOutcome> {
-        let verdict = match outcome {
-            ReviewWaitOutcome::Verdict(v) => v,
-            ReviewWaitOutcome::ReviewerDied(context) => {
-                return Ok(LandingOutcome::Escalated(self.review_human_gate(
-                    entry,
-                    git_repo,
-                    "reviewer-died",
-                    format!("the reviewer ended without producing a verdict: {context}"),
-                    "inspect the failed review and either record a fresh verdict or make the land decision",
-                )?));
-            }
-            ReviewWaitOutcome::CeilingReached => {
-                return Ok(LandingOutcome::Escalated(self.review_human_gate(
-                    entry,
-                    git_repo,
-                    "review-wait-exhausted",
-                    format!(
-                        "the reviewer was still running at the {}s hard wait ceiling",
-                        gates.review_max_wait.as_secs()
-                    ),
-                    "inspect or stop the reviewer, then record a verdict or make the land decision",
-                )?));
+        let mut outcome = outcome;
+        let verdict = loop {
+            match outcome {
+                ReviewWaitOutcome::Verdict(v) => break v,
+                ReviewWaitOutcome::ReviewerDied(context) => {
+                    match self.route_review_death(entry, gates, git_repo, &context).await? {
+                        ReviewDeathOutcome::Retry(next) => {
+                            outcome = next;
+                            continue;
+                        }
+                        ReviewDeathOutcome::Escalated(need) => {
+                            return Ok(LandingOutcome::Escalated(need));
+                        }
+                    }
+                }
+                ReviewWaitOutcome::CeilingReached => {
+                    return Ok(LandingOutcome::Escalated(self.review_human_gate(
+                        entry,
+                        git_repo,
+                        "review-wait-exhausted",
+                        format!(
+                            "the reviewer was still running at the {}s hard wait ceiling",
+                            gates.review_max_wait.as_secs()
+                        ),
+                        "inspect or stop the reviewer, then record a verdict or make the land decision",
+                    )?));
+                }
             }
         };
         match verdict.as_str() {
@@ -2379,6 +2483,196 @@ impl LandingPipeline {
                 entry.task,
             ),
         )
+    }
+
+    /// Resolve one `ReviewWaitOutcome::ReviewerDied`: dispatch exactly one
+    /// replacement reviewer against the SAME exact branch/head/target/task
+    /// bound by `entry`, or withhold and raise the one durable human
+    /// escalation. Bounded by the repository's activated
+    /// [`ReviewDeathPolicy`] (attempt count and cumulative USD, both durable
+    /// across restarts via [`REVIEW_DEATH_DISPATCH_IDENTITY`] markers) — the
+    /// same fail-closed, evidence-rich shape as [`Self::route_rework`], just
+    /// without a verdict to classify: a death carries no reviewer notes, so
+    /// the only questions are policy ones (see `landing_review_retry` module
+    /// doc).
+    async fn route_review_death(
+        &self,
+        entry: &LandingQueueEntry,
+        gates: &GateConfig,
+        git_repo: &rk_git::Repo,
+        death_context: &str,
+    ) -> rk_core::Result<ReviewDeathOutcome> {
+        let ctx = ReviewDeathContext {
+            repo: entry.repo_name.clone(),
+            branch: entry.branch.clone(),
+            head_sha: entry.head_sha.clone(),
+            target: entry.target.clone(),
+            task: entry.task.clone(),
+        };
+        // Replay guard, independent of `process_entry`'s outer work-key dedup
+        // (module doc): a marker whose state is neither "dispatching" nor
+        // "dispatched" is a withhold code already recorded for this EXACT
+        // dispatch key — this chain already reached its final decision.
+        // Re-deciding would re-escalate a second, duplicate `need` for the
+        // same hold; converge on the existing one instead.
+        if let Some(settled) = self.review_death_settled_marker(&ctx)? {
+            info!(
+                repo = %entry.repo_name, branch = %entry.branch, head_sha = %entry.head_sha,
+                code = %settled.payload["state"],
+                "landing pipeline: review-death chain already routed for this exact candidate; \
+                 not re-escalating"
+            );
+            return Ok(ReviewDeathOutcome::Escalated(settled));
+        }
+        let policy =
+            ReviewDeathPolicy::from_landing(&self.supervisor.repository_policy(git_repo).landing);
+        let attempts_used = self.review_death_attempts_used(&ctx)?;
+        let spent_usd = self.review_death_chain_spend(entry);
+        match landing_review_retry::route(&policy, attempts_used, spent_usd) {
+            ReviewDeathRoute::Withhold(withheld) => {
+                let need = self.escalate(entry, ctx.escalation(&withheld, death_context))?;
+                self.record_review_death_state(entry, &ctx, attempts_used, None, withheld.code)?;
+                warn!(
+                    repo = %entry.repo_name, branch = %entry.branch, head_sha = %entry.head_sha,
+                    code = withheld.code, attempts_used,
+                    "landing pipeline: review-death retry withheld; escalated to a human gate"
+                );
+                Ok(ReviewDeathOutcome::Escalated(need))
+            }
+            ReviewDeathRoute::Dispatch { attempt } => {
+                let instance_id = review_retry_instance_id(entry, attempt);
+                // Marker before dispatch: a crash between this write and the
+                // spawn call below just costs one budget slot on resume
+                // (the next `route_review_death` counts this marker as
+                // "used" and moves straight to the next attempt) rather than
+                // risking a duplicate — `dispatch_review` is idempotent per
+                // `instance_id` anyway, so resuming this exact attempt after
+                // a crash is ALSO safe, just not required for correctness.
+                self.record_review_death_state(
+                    entry,
+                    &ctx,
+                    attempt,
+                    Some(&instance_id),
+                    "dispatching",
+                )?;
+                info!(
+                    repo = %entry.repo_name, branch = %entry.branch, head_sha = %entry.head_sha,
+                    attempt, instance_id = %instance_id,
+                    "landing pipeline: reviewer died before a verdict; dispatching a replacement \
+                     reviewer against the same exact head"
+                );
+                let outcome = self.request_review_retry(entry, gates, &instance_id).await?;
+                self.record_review_death_state(
+                    entry,
+                    &ctx,
+                    attempt,
+                    Some(&instance_id),
+                    "dispatched",
+                )?;
+                Ok(ReviewDeathOutcome::Retry(outcome))
+            }
+        }
+    }
+
+    /// Every review-death retry marker for this exact candidate — scoped to
+    /// the full `(repo, branch, head_sha, target, task)` dispatch key, unlike
+    /// [`Self::rework_dispatch_markers`]'s branch/target/task scoping: a
+    /// review-death chain never survives a moved head (a new head is a new
+    /// candidate, entered fresh from [`LandingPipeline::process_entry`], not
+    /// a continuation of this one), so there is no separate "exact-head
+    /// replay" case to fold in.
+    fn review_death_dispatch_markers(&self, ctx: &ReviewDeathContext) -> rk_core::Result<Vec<Tuple>> {
+        let pattern = Pattern::category(Category::Event)
+            .identity(REVIEW_DEATH_DISPATCH_IDENTITY)
+            .scope(&ctx.repo);
+        let key = ctx.dispatch_key();
+        Ok(self
+            .space
+            .scan(&pattern)?
+            .into_iter()
+            .filter(|t| t.payload.get("dispatch_key").and_then(Value::as_str) == Some(key.as_str()))
+            .collect())
+    }
+
+    fn record_review_death_state(
+        &self,
+        entry: &LandingQueueEntry,
+        ctx: &ReviewDeathContext,
+        attempt: u32,
+        instance_id: Option<&str>,
+        state: &str,
+    ) -> rk_core::Result<Tuple> {
+        let marker = Tuple::new(
+            Category::Event,
+            entry.repo_name.clone(),
+            REVIEW_DEATH_DISPATCH_IDENTITY,
+            "daemon",
+            ctx.marker_payload(attempt, instance_id.unwrap_or_default(), state),
+        )
+        .with_lifecycle(Lifecycle::Furniture);
+        self.space.out(marker.clone())?;
+        Ok(marker)
+    }
+
+    /// The withhold-code marker already recorded for this EXACT dispatch
+    /// key, if this candidate's review-death chain already reached its final
+    /// decision — a state outside `{"dispatching", "dispatched"}`, i.e. one
+    /// of [`landing_review_retry::route`]'s withhold codes. `None` while the
+    /// chain is still open (no marker yet, or its most recent attempt is
+    /// still in flight).
+    fn review_death_settled_marker(&self, ctx: &ReviewDeathContext) -> rk_core::Result<Option<Tuple>> {
+        Ok(self
+            .review_death_dispatch_markers(ctx)?
+            .into_iter()
+            .find(|marker| {
+                !matches!(
+                    marker.payload.get("state").and_then(Value::as_str),
+                    Some("dispatching" | "dispatched")
+                )
+            }))
+    }
+
+    /// Distinct retry ordinals actually dispatched (or in flight) for this
+    /// exact candidate — the attempt-cap counter [`landing_review_retry::route`]
+    /// checks. Counts `attempt` numbers, not marker tuples: `"dispatching"`
+    /// and `"dispatched"` both mark the SAME attempt at two points in its
+    /// life, so counting tuples would double-count every settled retry.
+    fn review_death_attempts_used(&self, ctx: &ReviewDeathContext) -> rk_core::Result<u32> {
+        let distinct: BTreeSet<u32> = self
+            .review_death_dispatch_markers(ctx)?
+            .into_iter()
+            .filter(|marker| {
+                matches!(
+                    marker.payload.get("state").and_then(Value::as_str),
+                    Some("dispatching" | "dispatched")
+                )
+            })
+            .filter_map(|marker| marker.payload.get("attempt").and_then(Value::as_u64))
+            .map(|attempt| attempt as u32)
+            .collect();
+        Ok(distinct.len() as u32)
+    }
+
+    /// Cumulative USD spent by the primary reviewer plus every review-death
+    /// replacement in this candidate's chain — every agent whose own
+    /// `review.attempt` is [`review_instance_id`]'s primary id or one of its
+    /// [`review_retry_instance_id`] descendants. Joined by that attempt id
+    /// (not the dispatch markers) so a terminated-and-archived reviewer's
+    /// spend still counts, the same join `Self::await_shadow_comparison`
+    /// relies on.
+    fn review_death_chain_spend(&self, entry: &LandingQueueEntry) -> f64 {
+        let primary = review_instance_id(entry);
+        let retry_prefix = format!("{primary}-retry");
+        self.supervisor
+            .list_all()
+            .iter()
+            .filter(|record| {
+                record.review.as_ref().is_some_and(|review| {
+                    review.attempt == primary || review.attempt.starts_with(&retry_prefix)
+                })
+            })
+            .map(|record| record.cost_usd)
+            .sum()
     }
 
     #[cfg(test)]
@@ -4031,6 +4325,64 @@ workflow: {
 		},
 		{type: "stop", reason: "simulated reviewer crash: harness exited without reporting"},
 	]
+}
+"#,
+        )
+        .unwrap();
+    }
+
+    /// A review-only workflow that dies on its PRIMARY attempt (a `stop`
+    /// step, same stand-in as [`write_broken_review_workflow`]) but takes the
+    /// normal wait/evaluate path — same 2s timer gate as
+    /// [`write_review_workflow`] — on every REVIEW-DEATH RETRY attempt,
+    /// distinguished purely by `_input.reviewAttempt` carrying `-retry`
+    /// (`review_retry_instance_id`'s own suffix). Lets a test drive the whole
+    /// primary-dies-then-replacement-succeeds path against one static
+    /// workflow definition, the same way `write_review_workflow_with_shadow_death`
+    /// branches on `reviewerModel` to isolate the shadow arm.
+    fn write_review_workflow_dies_on_primary_recovers_on_retry(layout: &Layout) {
+        let dir = layout.workflows_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("steward-review.cue"),
+            r#"
+package workflow
+
+import (
+	"list"
+	"strings"
+)
+
+workflow: {
+	name: "steward-review"
+	params: {
+		taskId:        {type: "string", required: false, default: "unknown"}
+		branch:        {type: "string", required: true}
+		repo:          {type: "string", required: false, default: "rat-kingdom"}
+		target:        {type: "string", required: false, default: "main"}
+		headSha:       {type: "string", required: false, default: ""}
+		reviewTimeout: {type: "string", required: false, default: "15m"}
+		reviewAttempt: {type: "string", required: false, default: ""}
+	}
+	agents: {
+		default: {harness: "fake", model: "sonnet"}
+	}
+	_isRetry: strings.Contains(_input.reviewAttempt, "-retry")
+	_spawn: {
+		type:   "spawn"
+		role:   "reviewer"
+		branch: _input.branch
+		task: {title: "review", description: "review it"}
+	}
+	steps: list.Concat([
+		[_spawn],
+		if !_isRetry {[{type: "stop", reason: "simulated reviewer crash: harness exited without reporting"}]},
+		if _isRetry {[
+			{type: "gate", gateType: "timer", duration: "2s"},
+			{type: "wait", timeout: _input.reviewTimeout},
+			{type: "evaluate", expect: {is_error: false}},
+		]},
+	])
 }
 "#,
         )
@@ -6201,6 +6553,37 @@ workflow: {
             .unwrap();
     }
 
+    fn review_death_context(head: &str, task: &str) -> ReviewDeathContext {
+        ReviewDeathContext {
+            repo: "code-repo".into(),
+            branch: "feature".into(),
+            head_sha: head.into(),
+            target: "main".into(),
+            task: task.into(),
+        }
+    }
+
+    fn put_review_death_marker(
+        space: &Space,
+        ctx: &ReviewDeathContext,
+        attempt: u32,
+        instance_id: &str,
+        state: &str,
+    ) {
+        space
+            .out(
+                Tuple::new(
+                    Category::Event,
+                    "code-repo",
+                    REVIEW_DEATH_DISPATCH_IDENTITY,
+                    "daemon",
+                    ctx.marker_payload(attempt, instance_id, state),
+                )
+                .with_lifecycle(Lifecycle::Furniture),
+            )
+            .unwrap();
+    }
+
     async fn create_test_ticket(pipeline: &LandingPipeline, title: &str) -> Tuple {
         pipeline
             .tickets
@@ -8074,10 +8457,14 @@ checks: [
 
     /// Liveness-aware review wait, case (b): a reviewer that goes terminal
     /// without ever producing a verdict must not be held to the full wait
-    /// window — it escalates fast (well before even a generous base
+    /// window — it is detected fast (well before even a generous base
     /// `reviewTimeout`), carrying the instance's own captured failure
-    /// context, and the escalation text must read as a dead reviewer, not a
-    /// live-at-ceiling hold.
+    /// context. Routing it (under the default review-death policy, one
+    /// automatic retry) dispatches exactly one replacement reviewer at the
+    /// SAME exact branch/head/target/task; the fixture's replacement also
+    /// dies, so the chain exhausts its one attempt and escalates — with the
+    /// escalation text reading as a dead reviewer (never the live-at-ceiling
+    /// case) and carrying the exhaustion code.
     #[tokio::test]
     async fn dead_reviewer_escalates_fast_with_death_context() {
         let home = tempfile::tempdir().unwrap();
@@ -8121,14 +8508,17 @@ checks: [
             "death context must not be empty"
         );
 
-        let routed = pipeline
-            .route_verdict(
+        let routed = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.route_verdict(
                 &entry,
                 ReviewWaitOutcome::ReviewerDied(context.clone()),
                 &gates,
-            )
-            .await
-            .unwrap();
+            ),
+        )
+        .await
+        .expect("the one automatic retry and its escalation must also resolve well under 10s")
+        .unwrap();
         let LandingOutcome::Escalated(need) = &routed else {
             panic!("expected Escalated, got {routed:?}");
         };
@@ -8138,12 +8528,236 @@ checks: [
             "escalation text must carry the captured failure context: {text}"
         );
         assert!(
+            text.contains("attempts-exhausted"),
+            "the one default retry attempt must be spent before escalating: {text}"
+        );
+        assert!(
             !text.contains("ceiling"),
             "a dead reviewer must not read as the live-at-ceiling case: {text}"
         );
 
+        assert_eq!(
+            tuples(&space, Category::Event, "agent_spawned").len(),
+            2,
+            "the dead primary plus exactly one replacement reviewer, no more"
+        );
+        let markers = scoped_tuples(&space, Category::Event, REVIEW_DEATH_DISPATCH_IDENTITY);
+        let dispatching = markers
+            .iter()
+            .find(|m| m.payload["state"] == "dispatching")
+            .expect("the retry dispatch must be recorded");
+        assert_eq!(dispatching.payload["branch"], entry.branch);
+        assert_eq!(dispatching.payload["head_sha"], entry.head_sha);
+        assert_eq!(dispatching.payload["target"], entry.target);
+        assert_eq!(dispatching.payload["task"], entry.task);
+        assert_eq!(
+            dispatching.payload["instance_id"],
+            review_retry_instance_id(&entry, 1),
+        );
+
         let main_after = rev_parse(repo_dir.path(), "main");
         assert_eq!(main_before, main_after, "branch must not have landed");
+    }
+
+    /// The retry ladder's happy path: a primary that dies before a verdict
+    /// is automatically replaced by exactly one reviewer at the SAME exact
+    /// head, and when THAT reviewer produces a real verdict, routing lands
+    /// on it normally — no human ever polls anything.
+    #[tokio::test]
+    async fn review_death_retry_lands_after_the_replacement_reviewer_approves() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_review_workflow_dies_on_primary_recovers_on_retry(&layout);
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        let gates = GateConfig {
+            review_timeout: Duration::from_secs(120),
+            review_max_wait: Duration::from_secs(600),
+            ..GateConfig::default()
+        };
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.request_review(&entry, &gates),
+        )
+        .await
+        .expect("the dead primary must be detected fast")
+        .unwrap();
+        let ReviewWaitOutcome::ReviewerDied(context) = outcome else {
+            panic!("expected ReviewerDied, got {outcome:?}");
+        };
+
+        let retry_instance_id = review_retry_instance_id(&entry, 1);
+        let route = tokio::spawn({
+            let pipeline = Arc::clone(&pipeline);
+            let entry = entry.clone();
+            let gates = gates.clone();
+            async move {
+                pipeline
+                    .route_verdict(&entry, ReviewWaitOutcome::ReviewerDied(context), &gates)
+                    .await
+            }
+        });
+
+        // The replacement's own 2s timer gate holds it `Running`; supply its
+        // verdict tagged to the RETRY instance id specifically.
+        wait_for_spawn_count(&space, 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        space
+            .out(Tuple::new(
+                Category::Artifact,
+                &entry.repo_name,
+                REVIEW_ARTIFACT_IDENTITY,
+                "replacement-reviewer",
+                json!({
+                    "task": entry.task,
+                    "recommendation": "APPROVE",
+                    "notes": "clean on re-review",
+                    "head_sha": entry.head_sha,
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "review_attempt": retry_instance_id,
+                }),
+            ))
+            .unwrap();
+
+        let routed = tokio::time::timeout(Duration::from_secs(10), route)
+            .await
+            .expect("the replacement's verdict must resolve the wait")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&routed, LandingOutcome::Landed(r) if r["merged"] == true),
+            "routed: {routed:?}"
+        );
+        let main_after = rev_parse(repo_dir.path(), "main");
+        assert_ne!(main_before, main_after, "branch must have landed");
+        assert!(
+            space
+                .scan(&Pattern::category(Category::Need).identity(STEWARD_NEED_IDENTITY))
+                .unwrap()
+                .is_empty(),
+            "a retry that produces a verdict before its own ceiling must not escalate"
+        );
+    }
+
+    /// Restart/replay safety: a marker already recording the one default
+    /// retry attempt as dispatched (as a crash-then-resume, or a redelivered
+    /// `ReviewerDied` completion event, would leave behind) must converge
+    /// routing on the SAME single human escalation rather than dispatching a
+    /// second replacement reviewer.
+    #[tokio::test]
+    async fn review_death_retry_seeded_marker_prevents_a_duplicate_dispatch_on_replay() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_broken_review_workflow(&layout);
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        let space = Space::open_in_memory().unwrap();
+        let ctx = review_death_context(&head_sha, &entry.task);
+        let retry_instance_id = review_retry_instance_id(&entry, 1);
+        put_review_death_marker(&space, &ctx, 1, &retry_instance_id, "dispatching");
+        put_review_death_marker(&space, &ctx, 1, &retry_instance_id, "dispatched");
+
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        let gates = GateConfig::default();
+
+        for _ in 0..2 {
+            let routed = pipeline
+                .route_verdict(
+                    &entry,
+                    ReviewWaitOutcome::ReviewerDied("simulated crash".into()),
+                    &gates,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(routed, LandingOutcome::Escalated(_)));
+        }
+
+        assert!(
+            tuples(&space, Category::Event, "agent_spawned").is_empty(),
+            "the attempt budget was already spent by the seeded marker; replay must not dispatch"
+        );
+        let needs = scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY);
+        assert_eq!(needs.len(), 1, "replay must converge on one visible gate");
+        assert!(needs[0].payload["text"]
+            .as_str()
+            .unwrap()
+            .contains("attempts-exhausted"));
+
+        let main_after = rev_parse(repo_dir.path(), "main");
+        assert_eq!(main_before, main_after, "branch must not have landed");
+    }
+
+    /// The core race the retry ladder must close: once a replacement
+    /// reviewer has been dispatched, a verdict that later arrives tagged
+    /// with the DEAD (primary) generation's attempt id must never be read as
+    /// authoritative again — [`LandingPipeline::cached_verdict`] must miss on
+    /// it, scoped as it is to [`LandingPipeline::active_review_attempt`].
+    #[test]
+    fn late_verdict_from_a_dead_generation_cannot_override_the_active_replacement() {
+        let home = tempfile::tempdir().unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let entry = review_candidate_entry(Path::new("."), "abc123");
+        let primary_id = review_instance_id(&entry);
+        let retry_id = review_retry_instance_id(&entry, 1);
+
+        // A replacement has been dispatched: the retry is now active.
+        let ctx = review_death_context("abc123", &entry.task);
+        put_review_death_marker(&space, &ctx, 1, &retry_id, "dispatching");
+        assert_eq!(pipeline.active_review_attempt(&entry).unwrap(), retry_id);
+
+        // The dead primary's verdict arrives late, tagged with its OWN attempt id.
+        space
+            .out(Tuple::new(
+                Category::Artifact,
+                "code-repo",
+                REVIEW_ARTIFACT_IDENTITY,
+                "zombie-primary-reviewer",
+                json!({
+                    "task": entry.task,
+                    "recommendation": "APPROVE",
+                    "notes": "late",
+                    "head_sha": entry.head_sha,
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "review_attempt": primary_id,
+                }),
+            ))
+            .unwrap();
+        assert_eq!(
+            pipeline.cached_verdict(&entry).unwrap(),
+            None,
+            "a verdict from a superseded attempt must never be read as current"
+        );
+
+        // The active replacement's own verdict, once it lands, IS read.
+        space
+            .out(Tuple::new(
+                Category::Artifact,
+                "code-repo",
+                REVIEW_ARTIFACT_IDENTITY,
+                "replacement-reviewer",
+                json!({
+                    "task": entry.task,
+                    "recommendation": "REWORK",
+                    "notes": "real",
+                    "head_sha": entry.head_sha,
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "review_attempt": retry_id,
+                }),
+            ))
+            .unwrap();
+        assert_eq!(
+            pipeline.cached_verdict(&entry).unwrap(),
+            Some("REWORK".to_string())
+        );
     }
 
     /// Liveness-aware review wait, case (c): a reviewer still alive when the

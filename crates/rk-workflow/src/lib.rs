@@ -150,6 +150,26 @@ pub struct LandingPolicy {
         rename = "shadowReviewHarness"
     )]
     pub shadow_review_harness: String,
+    /// Whether a reviewer workflow instance that goes terminal without ever
+    /// producing a verdict (`ReviewWaitOutcome::ReviewerDied` —
+    /// `crates/rk-daemon/src/landing.rs`) may be retried unattended with a
+    /// fresh reviewer against the SAME exact head. `false` restores the
+    /// pre-feature behavior: escalate to a human gate on the first death.
+    #[serde(default = "default_true", rename = "reviewDeathAutoRetry")]
+    pub review_death_auto_retry: bool,
+    /// Hard ceiling on how many replacement reviewers one candidate's dead
+    /// review may spawn. `0` disables unattended retry as surely as
+    /// `reviewDeathAutoRetry: false` does.
+    #[serde(
+        default = "default_max_review_death_attempts",
+        rename = "maxReviewDeathAttempts"
+    )]
+    pub max_review_death_attempts: u32,
+    /// Hard ceiling on the cumulative USD spent across every reviewer in one
+    /// candidate's review-death retry chain, checked before each retry
+    /// dispatch. `0` means unlimited, matching the fleet budget convention.
+    #[serde(default = "default_review_death_max_usd", rename = "reviewDeathMaxUsd")]
+    pub review_death_max_usd: u32,
 }
 
 impl Default for LandingPolicy {
@@ -166,6 +186,9 @@ impl Default for LandingPolicy {
             rework_max_usd: default_rework_max_usd(),
             shadow_review_model: default_shadow_review_model(),
             shadow_review_harness: default_shadow_review_harness(),
+            review_death_auto_retry: true,
+            max_review_death_attempts: default_max_review_death_attempts(),
+            review_death_max_usd: default_review_death_max_usd(),
         }
     }
 }
@@ -183,6 +206,20 @@ fn default_max_rework_attempts() -> u32 {
 /// bounded correction never trips it, and well below a runaway.
 fn default_rework_max_usd() -> u32 {
     25
+}
+
+/// One replacement reviewer per dead review. A second death on the same
+/// candidate is treated as a genuine infrastructure problem, not noise to
+/// retry through — a human gate surfaces it instead.
+fn default_max_review_death_attempts() -> u32 {
+    1
+}
+
+/// A review-death retry chain that has burned this much has stopped being
+/// cheap automation. Reviewers are far cheaper than implementers, so this is
+/// sized well below the rework ceiling.
+fn default_review_death_max_usd() -> u32 {
+    10
 }
 
 /// Per-repository regenerable build-artifact paths (relative to a worktree
