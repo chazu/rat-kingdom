@@ -2730,6 +2730,23 @@ impl LandingPipeline {
         }
     }
 
+    /// The real-time wait still owed before `not_before`, measured against
+    /// `now` — `None` for "no wait", whether because there is no schedule at
+    /// all or because it has already elapsed. Kept as a pure function of its
+    /// inputs (same "no seam for real time here" convention as
+    /// `landing_review_retry::retry_delay`, whose module doc makes the same
+    /// call for jitter) so the elapsed/not-yet-elapsed split — the exact
+    /// property [`Self::await_review_retry_after_backoff`] must get right —
+    /// is deterministically unit-testable without spawning a task, a
+    /// workflow, or touching the clock.
+    fn remaining_backoff(
+        not_before: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Option<Duration> {
+        let not_before = not_before?;
+        (not_before > now).then(|| (not_before - now).to_std().unwrap_or(Duration::ZERO))
+    }
+
     /// Wait out a review-death retry's durable backoff schedule (module doc
     /// on `landing_review_retry::ReviewDeathBackoffPolicy`), if any, then
     /// dispatch/resume the replacement reviewer. `not_before` is `None` for
@@ -2748,18 +2765,14 @@ impl LandingPipeline {
         instance_id: &str,
         not_before: Option<DateTime<Utc>>,
     ) -> rk_core::Result<ReviewWaitOutcome> {
-        if let Some(not_before) = not_before {
-            let now = Utc::now();
-            if not_before > now {
-                let wait = (not_before - now).to_std().unwrap_or(Duration::ZERO);
-                info!(
-                    repo = %entry.repo_name, branch = %entry.branch, instance_id = %instance_id,
-                    wait_secs = wait.as_secs(),
-                    "landing pipeline: waiting out the review-death retry backoff before \
-                     dispatching the replacement reviewer"
-                );
-                tokio::time::sleep(wait).await;
-            }
+        if let Some(wait) = Self::remaining_backoff(not_before, Utc::now()) {
+            info!(
+                repo = %entry.repo_name, branch = %entry.branch, instance_id = %instance_id,
+                wait_secs = wait.as_secs(),
+                "landing pipeline: waiting out the review-death retry backoff before \
+                 dispatching the replacement reviewer"
+            );
+            tokio::time::sleep(wait).await;
         }
         self.request_review_retry(entry, gates, instance_id).await
     }
@@ -9355,6 +9368,38 @@ checks: [
         );
     }
 
+    /// The exact elapsed/not-yet-elapsed split
+    /// [`LandingPipeline::await_review_retry_after_backoff`] relies on,
+    /// covered as a synchronous, deterministic unit test: no task spawn, no
+    /// workflow dispatch, no real clock in the loop, so it cannot flake
+    /// under scheduling contention the way an end-to-end timing assertion
+    /// can (see the `restart_resume_dispatches_immediately_once_not_before_has_elapsed`
+    /// doc comment below for why that mattered in practice).
+    #[test]
+    fn remaining_backoff_is_none_once_not_before_has_elapsed() {
+        let now = Utc::now();
+        assert_eq!(LandingPipeline::remaining_backoff(None, now), None);
+        assert_eq!(
+            LandingPipeline::remaining_backoff(Some(now), now),
+            None,
+            "a schedule exactly AT now has already elapsed, not still pending"
+        );
+        assert_eq!(
+            LandingPipeline::remaining_backoff(Some(now - chrono::Duration::seconds(5)), now),
+            None
+        );
+    }
+
+    #[test]
+    fn remaining_backoff_returns_the_exact_remainder_when_not_yet_elapsed() {
+        let now = Utc::now();
+        let not_before = now + chrono::Duration::milliseconds(700);
+        assert_eq!(
+            LandingPipeline::remaining_backoff(Some(not_before), now),
+            Some(Duration::from_millis(700))
+        );
+    }
+
     /// Restart before `not_before`: resuming a review-death retry whose
     /// durable schedule has NOT yet elapsed must wait out the remainder
     /// before dispatching — a restart can never reset the wait to zero.
@@ -9408,6 +9453,18 @@ checks: [
     /// backoff window) dispatches without any further added wait — the
     /// backoff is a floor on when the retry may start, not a period the
     /// candidate must additionally sit through past that point.
+    ///
+    /// The EXACT elapsed-vs-not-yet-elapsed decision this guards is covered
+    /// deterministically by `remaining_backoff_is_none_once_not_before_has_elapsed`
+    /// above, so this end-to-end test only needs a wall-clock ceiling loose
+    /// enough to absorb real scheduling contention (dispatch here runs the
+    /// genuine spawn path — CUE load, instance persistence, a real `fake`-harness
+    /// process — not a mock): under `mise run verify`'s full-workspace
+    /// parallel run this was observed at ~550-570ms against a 500ms ceiling
+    /// with zero added wait (TKT-01M0JBJGRZZNN0GK3K8RRJ4Y67), which is what
+    /// made the tight ceiling flake. 5s stays two orders of magnitude below
+    /// what a reintroduced backoff wait would look like while comfortably
+    /// clearing that contention.
     #[tokio::test]
     async fn restart_resume_dispatches_immediately_once_not_before_has_elapsed() {
         let home = tempfile::tempdir().unwrap();
@@ -9445,7 +9502,7 @@ checks: [
         });
         wait_for_spawn_count(&space, 1).await;
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < Duration::from_secs(5),
             "an already-elapsed schedule must not add any further wait: {:?}",
             started.elapsed()
         );
