@@ -32,7 +32,6 @@ pub mod recovery;
 pub mod repos;
 pub mod scheduler;
 pub mod server;
-mod shell;
 pub mod supervisor;
 pub mod sync;
 pub mod tickets;

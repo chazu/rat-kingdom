@@ -3364,11 +3364,20 @@ impl WorkflowEngine {
         env: &[(String, String)],
         timeout: Duration,
     ) -> rk_core::Result<RunOutcome> {
-        let (shell, script) = crate::shell::pipefail_command(command);
-        let mut child_command = tokio::process::Command::new(shell);
+        // Plain `sh -c`: a `run` step's command — raw or a named check
+        // reference alike — is workflow-author-owned shell, and existing
+        // workflows rely on `sh`'s default (last-stage-wins) pipe semantics
+        // for assertion idioms like `... | grep -q '<expected text>'`
+        // (examples/checks.cue's steward-protected-paths does exactly this).
+        // RK adds no outer tee/tail/filter of its own around this command —
+        // `collect_child_output` below captures THIS child's exit verbatim —
+        // so there is no RK-introduced masking layer to correct here; a
+        // declared command's own internal pipe semantics are the repo
+        // author's choice to make, not RK's to silently rewrite.
+        let mut child_command = tokio::process::Command::new("sh");
         child_command
             .arg("-c")
-            .arg(script)
+            .arg(command)
             .current_dir(dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -5551,6 +5560,52 @@ test a::flaky ... FAILED
                 assert!(stdout.len() <= MAX_RUN_OUTPUT_BYTES);
             }
             RunOutcome::TimedOut => panic!("output volume alone must never time out the run"),
+        }
+    }
+
+    /// TKT-01M0H5JNZQKZ35V87Q4H4N3EPH: RK reports a check command's OWN exit
+    /// status, not a status filtered through some RK-added presentation
+    /// layer. `collect_child_output` captures exactly what the ONE child it
+    /// spawned exited with — it adds no outer `tee`/`tail`/filter of its own
+    /// around a declared command, so its reported exit code must equal a
+    /// direct, independent `sh -c` invocation of that same command, byte for
+    /// byte in meaning. This holds even when the DECLARED command itself
+    /// contains a pipe whose own last stage already masks an earlier
+    /// failure (`exit 3 | cat`) — that masking is the repo author's own
+    /// shell choice, not something RK introduces or is responsible for
+    /// correcting; RK's only obligation is to not add a masking layer of
+    /// its own on top.
+    #[tokio::test]
+    async fn collect_child_output_preserves_the_commands_own_shell_computed_exit_code() {
+        for command in ["exit 3", "exit 3 | cat", "true", "false | cat", "exit 0"] {
+            let reference = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .status()
+                .unwrap();
+            let child = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let outcome = collect_child_output(child, Duration::from_secs(10), command)
+                .await
+                .unwrap();
+            match outcome {
+                RunOutcome::Completed { status, .. } => {
+                    assert_eq!(
+                        status.code(),
+                        reference.code(),
+                        "RK's captured exit for `{command}` diverged from a direct `sh -c` \
+                         run of the same command — RK must not add its own presentation \
+                         layer that changes the reported status"
+                    );
+                }
+                RunOutcome::TimedOut => panic!("`{command}` must not time out"),
+            }
         }
     }
 
