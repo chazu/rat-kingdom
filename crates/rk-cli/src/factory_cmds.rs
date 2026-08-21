@@ -1445,7 +1445,7 @@ mod tests {
             Some(release)
         );
 
-        fs::remove_file(&target.join("release/rk-mcp")).unwrap();
+        fs::remove_file(target.join("release/rk-mcp")).unwrap();
         assert_eq!(
             locate_mcp_source(&target.join("debug/rk")).unwrap(),
             Some(debug)
