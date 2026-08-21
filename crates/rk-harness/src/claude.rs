@@ -92,6 +92,7 @@ impl Harness for ClaudeHarness {
             command: cmd,
             parse: parse_event_line,
             steer_line: Some(control_message_line),
+            resume: None,
         })?;
 
         // The initial prompt is just the first steer message.

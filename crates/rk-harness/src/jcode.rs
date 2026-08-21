@@ -69,6 +69,7 @@ impl Harness for JcodeHarness {
             command: cmd,
             parse: parse_event_line,
             steer_line: None,
+            resume: None,
         })?;
         Ok(post_process(session))
     }

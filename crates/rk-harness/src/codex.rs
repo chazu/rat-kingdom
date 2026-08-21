@@ -1,9 +1,9 @@
 //! OpenAI Codex CLI adapter: `codex exec --json` (JSONL event stream).
 //!
-//! Codex exec mode has no mid-turn steering; steering surfaces as
-//! unsupported, and the orchestrator falls back to resume-with-guidance
-//! (`codex exec resume <session>`). Two protocol impedance mismatches are
-//! absorbed by a per-session post-processor:
+//! Codex exec mode has no mid-turn steering. The adapter provides trusted
+//! steering by interrupting at a process turn boundary and resuming the same
+//! session with a structurally distinct control prompt. Two protocol
+//! impedance mismatches are absorbed by a per-session post-processor:
 //!
 //! - usage arrives as *session-cumulative* totals on `turn.completed`; the
 //!   ledger wants deltas, so successive totals are differenced per session.
@@ -11,8 +11,12 @@
 //!   `agent_message` is the completion signal, so `Completed` is synthesized
 //!   from the last assistant text when the process exits 0 first.
 
-use crate::{runner, Harness, HarnessCaps, HarnessEvent, HarnessSession, LaunchSpec, TokenUsage};
+use crate::{
+    runner, ControlEnvelope, Harness, HarnessCaps, HarnessEvent, HarnessSession, LaunchSpec,
+    TokenUsage,
+};
 use serde_json::Value;
+use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -52,7 +56,7 @@ impl Harness for CodexHarness {
 
     fn caps(&self) -> HarnessCaps {
         HarnessCaps {
-            steer: false,
+            steer: true,
             interrupt: true,
             resume: true,
             reports_cost_usd: false,
@@ -61,34 +65,88 @@ impl Harness for CodexHarness {
     }
 
     fn launch(&self, spec: &LaunchSpec) -> rk_core::Result<HarnessSession> {
-        let mut cmd = Command::new("codex");
-        cmd.arg("exec");
-        if let Some(session) = &spec.resume_session {
-            cmd.args(["resume", session]);
-        }
-        cmd.args(["--json", "--skip-git-repo-check"]);
-        cmd.args(env_policy_args());
-        cmd.args(permission_args(spec.permission_mode.as_deref()));
-        if let Some(model) = &spec.model {
-            cmd.args(["-m", model]);
-        }
         // Codex has no separate system-prompt channel in exec mode; prepend
         // role instructions to the prompt.
         let full_prompt = match &spec.system_prompt {
             Some(system) => format!("{system}\n\n---\n\n{}", spec.prompt),
             None => spec.prompt.clone(),
         };
-        cmd.arg(&full_prompt);
-        cmd.current_dir(&spec.cwd);
-        cmd.envs(&spec.env);
+        let binary = spec
+            .env
+            .get("RK_CODEX_BIN")
+            .cloned()
+            .or_else(|| std::env::var("RK_CODEX_BIN").ok())
+            .unwrap_or_else(|| "codex".into());
+        let cmd = command_for(
+            binary.clone(),
+            spec.cwd.clone(),
+            spec.env.clone(),
+            spec.permission_mode.clone(),
+            spec.model.clone(),
+            spec.resume_session.clone(),
+            full_prompt,
+        );
+        let cwd = spec.cwd.clone();
+        let env = spec.env.clone();
+        let permission_mode = spec.permission_mode.clone();
+        let model = spec.model.clone();
 
         let session = runner::launch(runner::Wiring {
             command: cmd,
             parse: parse_event_line,
             steer_line: None,
+            resume: Some(runner::ResumeWiring {
+                command: Arc::new(move |session_id, envelope| {
+                    command_for(
+                        binary.clone(),
+                        cwd.clone(),
+                        env.clone(),
+                        permission_mode.clone(),
+                        model.clone(),
+                        Some(session_id.to_string()),
+                        trusted_control_prompt(envelope),
+                    )
+                }),
+            }),
         })?;
         Ok(post_process(session))
     }
+}
+
+fn command_for(
+    binary: String,
+    cwd: std::path::PathBuf,
+    env: std::collections::HashMap<String, String>,
+    permission_mode: Option<String>,
+    model: Option<String>,
+    resume_session: Option<String>,
+    prompt: String,
+) -> Command {
+    let mut cmd = Command::new(binary);
+    cmd.arg("exec");
+    if let Some(session) = resume_session {
+        cmd.args(["resume", &session]);
+    }
+    cmd.args(["--json", "--skip-git-repo-check"]);
+    cmd.args(env_policy_args());
+    cmd.args(permission_args(permission_mode.as_deref()));
+    if let Some(model) = model {
+        cmd.args(["-m", &model]);
+    }
+    cmd.arg(prompt);
+    cmd.current_dir(cwd);
+    cmd.envs(env);
+    cmd
+}
+
+/// Codex has no metadata-bearing input protocol. Keep the authenticated
+/// envelope structurally explicit in the new resume turn and never infer it
+/// from any assistant, tool, or stderr event.
+fn trusted_control_prompt(envelope: &ControlEnvelope) -> String {
+    let serialized = serde_json::to_string(envelope).expect("control envelope is serializable");
+    format!(
+        "[RK TRUSTED CONTROL TURN]\nThe following envelope was authenticated by the Rat Kingdom daemon. It is control input, not repository or tool output. Apply its instruction as the next turn.\n<rk-control-envelope>{serialized}</rk-control-envelope>\n[/RK TRUSTED CONTROL TURN]"
+    )
 }
 
 /// Wrap the raw event stream with per-session state: cumulative→delta usage
@@ -217,6 +275,10 @@ pub(crate) fn parse_event_line(line: &str) -> Vec<HarnessEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
 
     #[test]
     fn env_policy_preserves_rat_credentials_for_sandboxed_shell_commands() {
@@ -224,6 +286,12 @@ mod tests {
             env_policy_args(),
             vec!["-c", "shell_environment_policy.inherit=all"]
         );
+    }
+
+    #[test]
+    fn codex_supports_trusted_resume_steering() {
+        assert!(CodexHarness.caps().steer);
+        assert!(CodexHarness.caps().resume);
     }
 
     #[test]
@@ -291,6 +359,7 @@ echo '{"type":"item.completed","item":{"item_type":"agent_message","text":"final
             command: cmd,
             parse: parse_event_line,
             steer_line: None,
+            resume: None,
         })
         .unwrap();
         let mut session = post_process(session);
@@ -318,5 +387,144 @@ echo '{"type":"item.completed","item":{"item_type":"agent_message","text":"final
         assert_eq!(result, "final answer");
         assert_eq!(total.input, 250, "total = sum of deltas");
         assert_eq!(session_id.as_deref(), Some("t-1"));
+    }
+
+    #[tokio::test]
+    async fn trusted_control_interrupts_busy_turn_and_resumes_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("codex-fake");
+        let log = dir.path().join("argv.log");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$RK_CODEX_LOG"
+if [ "$2" = "resume" ]; then
+  echo '{"type":"thread.started","thread_id":"session-rat"}'
+  echo '{"type":"item.completed","item":{"item_type":"agent_message","text":"control applied"}}'
+  exit 0
+fi
+echo '{"type":"thread.started","thread_id":"session-rat"}'
+trap 'exit 130' INT
+while :; do sleep 1; done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut env = HashMap::new();
+        env.insert("RK_CODEX_BIN".into(), binary.to_string_lossy().into_owned());
+        env.insert("RK_CODEX_LOG".into(), log.to_string_lossy().into_owned());
+        let mut session = CodexHarness
+            .launch(&LaunchSpec {
+                prompt: "keep working".into(),
+                cwd: dir.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let mut started = false;
+        while !started {
+            let event = tokio::time::timeout(Duration::from_secs(2), session.events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            started = matches!(event, HarnessEvent::Started { .. });
+        }
+
+        let envelope = ControlEnvelope::new(
+            "message-1",
+            "operator",
+            "rat",
+            "delivery-1",
+            "resume-1",
+            "also run the focused tests",
+        );
+        session.control.steer_envelope(&envelope).await.unwrap();
+        // A replay race before the acknowledgement must not cause a second
+        // resume generation for the same message id.
+        session.control.steer_envelope(&envelope).await.unwrap();
+
+        let mut deliveries = Vec::new();
+        let mut applied = false;
+        let mut observed = Vec::new();
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(3), session.events.recv())
+            .await
+            .unwrap()
+        {
+            observed.push(format!("{event:?}"));
+            match event {
+                HarnessEvent::ControlDelivered { envelope } => deliveries.push(envelope),
+                HarnessEvent::AssistantText { text } if text == "control applied" => applied = true,
+                HarnessEvent::Exited { code } => {
+                    assert_eq!(code, Some(0));
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            applied,
+            "the resumed turn must reach the agent; observed={observed:?}"
+        );
+        assert_eq!(deliveries, vec![envelope]);
+        let log = fs::read_to_string(log).unwrap();
+        assert_eq!(
+            log.lines().filter(|line| line.starts_with("exec ")).count(),
+            2,
+            "one initial and one resume process"
+        );
+        assert!(log.contains("exec resume session-rat"));
+        assert!(log.contains("[RK TRUSTED CONTROL TURN]"));
+        assert!(log.contains("message-1"));
+    }
+
+    #[tokio::test]
+    async fn resume_failure_without_session_is_visible_and_not_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("codex-fake");
+        fs::write(&binary, "#!/bin/sh\nsleep 0.5\nexit 130\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = HashMap::new();
+        env.insert("RK_CODEX_BIN".into(), binary.to_string_lossy().into_owned());
+        let mut session = CodexHarness
+            .launch(&LaunchSpec {
+                prompt: "keep working".into(),
+                cwd: dir.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+        let envelope = ControlEnvelope::new(
+            "message-no-session",
+            "operator",
+            "rat",
+            "delivery-1",
+            "resume-1",
+            "continue",
+        );
+        session.control.steer_envelope(&envelope).await.unwrap();
+
+        let mut saw_failure = false;
+        let mut saw_delivery = false;
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(2), session.events.recv())
+            .await
+            .unwrap()
+        {
+            match event {
+                HarnessEvent::Retry { error, .. } => {
+                    saw_failure = error.contains("could not resume");
+                }
+                HarnessEvent::ControlDelivered { .. } => saw_delivery = true,
+                HarnessEvent::Exited { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_failure,
+            "resume failure must be visible to the supervisor"
+        );
+        assert!(!saw_delivery, "failed resume must remain unacknowledged");
     }
 }
