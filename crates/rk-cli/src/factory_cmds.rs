@@ -645,13 +645,23 @@ fn locate_mcp_source(destination: &Path) -> Result<Option<PathBuf>> {
         return Ok(Some(source));
     }
 
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for candidate in [
-        workspace.join("target/release/rk-mcp"),
-        workspace.join("target/debug/rk-mcp"),
-    ] {
-        if candidate.is_file() {
-            return Ok(Some(candidate));
+    // Resolved from the running executable's own location, not baked in via
+    // `env!("CARGO_MANIFEST_DIR")`: under a shared `CARGO_TARGET_DIR`, cargo
+    // can serve an `rk` binary compiled in one worktree to another
+    // unrecompiled, so a compile-time path can point at a reaped worktree or
+    // a wrong-commit sibling build (TKT-01M0F0GHDPGA24X1TB24A0PZD0). `binary`
+    // (the destination) already sits at `<exe_dir>/rk-mcp`, so its target
+    // directory is `<exe_dir>/..`; check both profiles there.
+    if let Some(exe_dir) = destination.parent() {
+        if let Some(target_dir) = exe_dir.parent() {
+            for candidate in [
+                target_dir.join("release/rk-mcp"),
+                target_dir.join("debug/rk-mcp"),
+            ] {
+                if candidate.is_file() {
+                    return Ok(Some(candidate));
+                }
+            }
         }
     }
     if destination.is_file() {
@@ -1409,9 +1419,43 @@ fn parse_digest(digest: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dashboard_output_mode, render_dashboard, render_recommend_markdown, DashboardOutputMode,
+        dashboard_output_mode, locate_mcp_source, render_dashboard, render_recommend_markdown,
+        DashboardOutputMode,
     };
     use serde_json::json;
+    use std::fs;
+
+    #[test]
+    fn mcp_fallback_source_uses_runtime_target_or_installed_sibling() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let release = target.join("release/rk-mcp");
+        let debug = target.join("debug/rk-mcp");
+        fs::create_dir_all(release.parent().unwrap()).unwrap();
+        fs::create_dir_all(debug.parent().unwrap()).unwrap();
+        fs::write(&release, b"release").unwrap();
+        fs::write(&debug, b"debug").unwrap();
+
+        assert_eq!(
+            locate_mcp_source(&target.join("debug/rk")).unwrap(),
+            Some(release.clone())
+        );
+        assert_eq!(
+            locate_mcp_source(&target.join("release/rk")).unwrap(),
+            Some(release)
+        );
+
+        fs::remove_file(target.join("release/rk-mcp")).unwrap();
+        assert_eq!(
+            locate_mcp_source(&target.join("debug/rk")).unwrap(),
+            Some(debug)
+        );
+
+        let installed = temp.path().join("bin/rk-mcp");
+        fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        fs::write(&installed, b"installed").unwrap();
+        assert_eq!(locate_mcp_source(&installed).unwrap(), Some(installed));
+    }
 
     #[test]
     fn dashboard_uses_the_interactive_tui_on_a_terminal() {
