@@ -322,29 +322,77 @@ pub(crate) mod runner {
         pub command: ResumeCommand,
     }
 
+    /// Started only proves a resumed process completed its protocol
+    /// handshake, not that it applied the control envelope: a rejecting or
+    /// crashing resume can emit Started and then immediately exit. Mark
+    /// `awaiting_ack_started` on Started, but only hand back (and let the
+    /// caller acknowledge) the envelope once a *further* event proves the
+    /// session is actually alive. A Retry (protocol-level error, e.g. a
+    /// rejected session) never counts as that further proof.
+    fn confirm_awaiting_ack(
+        event: &HarnessEvent,
+        awaiting_ack: &mut Option<ControlEnvelope>,
+        awaiting_ack_started: &mut bool,
+    ) -> Option<ControlEnvelope> {
+        match event {
+            HarnessEvent::Started {
+                session_id: Some(_),
+            } => {
+                if awaiting_ack.is_some() {
+                    *awaiting_ack_started = true;
+                }
+                None
+            }
+            HarnessEvent::Retry { .. } => None,
+            _ if *awaiting_ack_started && awaiting_ack.is_some() => {
+                *awaiting_ack_started = false;
+                awaiting_ack.take()
+            }
+            _ => None,
+        }
+    }
+
+    /// Drains any remaining buffered stdout after a child has exited (or
+    /// before switching over to a resumed child's stdout), forwarding events
+    /// and resolving `awaiting_ack` exactly as the live read loop does so a
+    /// confirmation racing the process exit is not lost.
+    #[allow(clippy::too_many_arguments)]
     async fn drain_stdout(
         stdout: &mut Option<tokio::io::Lines<BufReader<ChildStdout>>>,
         parse: fn(&str) -> Vec<HarnessEvent>,
         event_tx: &mpsc::Sender<HarnessEvent>,
-    ) -> bool {
-        let mut started = false;
+        awaiting_ack: &mut Option<ControlEnvelope>,
+        awaiting_ack_started: &mut bool,
+        delivered: &mut std::collections::HashSet<String>,
+    ) {
         loop {
             let line = match stdout.as_mut() {
                 Some(lines) => lines.next_line().await,
-                None => return started,
+                None => return,
             };
             match line {
                 Ok(Some(line)) => {
                     for event in parse(&line) {
-                        started |= matches!(&event, HarnessEvent::Started { .. });
+                        let confirmed =
+                            confirm_awaiting_ack(&event, awaiting_ack, awaiting_ack_started);
                         if event_tx.send(event).await.is_err() {
-                            return false;
+                            return;
+                        }
+                        if let Some(envelope) = confirmed {
+                            delivered.insert(envelope.message_id.clone());
+                            if event_tx
+                                .send(HarnessEvent::ControlDelivered { envelope })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
                     }
                 }
                 Ok(None) => {
                     *stdout = None;
-                    return started;
+                    return;
                 }
                 Err(error) => {
                     let _ = event_tx
@@ -353,7 +401,7 @@ pub(crate) mod runner {
                         })
                         .await;
                     *stdout = None;
-                    return started;
+                    return;
                 }
             }
         }
@@ -619,6 +667,7 @@ pub(crate) mod runner {
             let mut session_id: Option<String> = None;
             let mut pending: Option<ControlEnvelope> = None;
             let mut awaiting_ack: Option<ControlEnvelope> = None;
+            let mut awaiting_ack_started = false;
             let mut interrupt_sent = false;
             let mut delivered = std::collections::HashSet::new();
             let mut group_guard = group_guard;
@@ -633,22 +682,23 @@ pub(crate) mod runner {
                     } => match line {
                         Ok(Some(line)) => {
                             for event in parse(&line) {
-                                let acknowledged =
-                                    if let HarnessEvent::Started { session_id: Some(id) } = &event {
-                                        session_id = Some(id.clone());
-                                        awaiting_ack.take()
-                                    } else {
-                                        None
-                                    };
+                                if let HarnessEvent::Started { session_id: Some(id) } = &event {
+                                    session_id = Some(id.clone());
+                                }
                                 let started = matches!(&event, HarnessEvent::Started { .. });
                                 if started && pending.is_some() && !interrupt_sent {
                                     send_group_signal(pid, SIGINT);
                                     interrupt_sent = true;
                                 }
+                                let confirmed = confirm_awaiting_ack(
+                                    &event,
+                                    &mut awaiting_ack,
+                                    &mut awaiting_ack_started,
+                                );
                                 if event_tx.send(event).await.is_err() {
                                     return;
                                 }
-                                if let Some(envelope) = acknowledged {
+                                if let Some(envelope) = confirmed {
                                     delivered.insert(envelope.message_id.clone());
                                     if event_tx
                                         .send(HarnessEvent::ControlDelivered { envelope })
@@ -730,42 +780,43 @@ pub(crate) mod runner {
                         group_guard.disarm();
 
                         let Some(envelope) = pending.take() else {
-                            let awaiting = awaiting_ack.take();
-                            let started = tokio::time::timeout(
+                            let _ = tokio::time::timeout(
                                 Duration::from_millis(500),
-                                drain_stdout(&mut stdout, parse, &event_tx),
+                                drain_stdout(
+                                    &mut stdout,
+                                    parse,
+                                    &event_tx,
+                                    &mut awaiting_ack,
+                                    &mut awaiting_ack_started,
+                                    &mut delivered,
+                                ),
                             )
-                            .await
-                            .unwrap_or(false);
-                            if let Some(envelope) = awaiting {
-                                if started {
-                                    delivered.insert(envelope.message_id.clone());
-                                    if event_tx
-                                        .send(HarnessEvent::ControlDelivered { envelope })
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                } else {
-                                    let _ = event_tx.send(HarnessEvent::Stderr {
-                                        text: format!(
-                                            "Codex control {} could not resume: resumed session did not establish a session",
-                                            envelope.message_id
-                                        ),
-                                    }).await;
-                                    let _ = event_tx.send(HarnessEvent::Retry {
-                                        attempt: 0,
-                                        error: "Codex resumed session exited before establishing a session".into(),
-                                    }).await;
-                                }
+                            .await;
+                            if let Some(envelope) = awaiting_ack.take() {
+                                let _ = event_tx.send(HarnessEvent::Stderr {
+                                    text: format!(
+                                        "Codex control {} could not resume: resumed session did not confirm control application",
+                                        envelope.message_id
+                                    ),
+                                }).await;
+                                let _ = event_tx.send(HarnessEvent::Retry {
+                                    attempt: 0,
+                                    error: "Codex resumed session exited before confirming control application".into(),
+                                }).await;
                             }
                             let _ = event_tx.send(HarnessEvent::Exited { code }).await;
                             return;
                         };
                         let _ = tokio::time::timeout(
                             Duration::from_millis(500),
-                            drain_stdout(&mut stdout, parse, &event_tx),
+                            drain_stdout(
+                                &mut stdout,
+                                parse,
+                                &event_tx,
+                                &mut awaiting_ack,
+                                &mut awaiting_ack_started,
+                                &mut delivered,
+                            ),
                         )
                         .await;
                         let Some(session_id) = session_id.clone() else {
@@ -820,11 +871,16 @@ pub(crate) mod runner {
                         pid = next_pid;
                         interrupt_sent = false;
                         // Spawning the resume child only proves that the OS
-                        // accepted it. Hold the durable acknowledgement until
-                        // its protocol emits Started; otherwise a child that
-                        // immediately rejects the session could suppress
-                        // replay permanently.
+                        // accepted it, and Started only proves the protocol
+                        // handshake completed — neither proves the control
+                        // was applied. A resumed process can emit Started and
+                        // then immediately reject the session or exit, so the
+                        // durable acknowledgement is held until a further
+                        // event after Started confirms the resumed session is
+                        // actually alive; otherwise a rejecting child could
+                        // suppress replay permanently.
                         awaiting_ack = Some(envelope);
+                        awaiting_ack_started = false;
                     }
                 }
             }
