@@ -645,13 +645,23 @@ fn locate_mcp_source(destination: &Path) -> Result<Option<PathBuf>> {
         return Ok(Some(source));
     }
 
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for candidate in [
-        workspace.join("target/release/rk-mcp"),
-        workspace.join("target/debug/rk-mcp"),
-    ] {
-        if candidate.is_file() {
-            return Ok(Some(candidate));
+    // Resolved from the running executable's own location, not baked in via
+    // `env!("CARGO_MANIFEST_DIR")`: under a shared `CARGO_TARGET_DIR`, cargo
+    // can serve an `rk` binary compiled in one worktree to another
+    // unrecompiled, so a compile-time path can point at a reaped worktree or
+    // a wrong-commit sibling build (TKT-01M0F0GHDPGA24X1TB24A0PZD0). `binary`
+    // (the destination) already sits at `<exe_dir>/rk-mcp`, so its target
+    // directory is `<exe_dir>/..`; check both profiles there.
+    if let Some(exe_dir) = destination.parent() {
+        if let Some(target_dir) = exe_dir.parent() {
+            for candidate in [
+                target_dir.join("release/rk-mcp"),
+                target_dir.join("debug/rk-mcp"),
+            ] {
+                if candidate.is_file() {
+                    return Ok(Some(candidate));
+                }
+            }
         }
     }
     if destination.is_file() {
