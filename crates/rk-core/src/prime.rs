@@ -508,6 +508,11 @@ const FRAGMENT_COMPLETION: &str = "\
    pipefail` (or `${PIPESTATUS[0]}` in bash) before trusting `$?`, or run the
    check and inspect its own recorded exit code directly — and wait for that
    real process to finish; do not report a result while it is still running.
+   Then require that status to be success: the check command itself must have
+   exited 0 (or the exact success status its own documentation declares).
+   Anything else — a nonzero exit, no exit status at all, a status you could
+   not read — is a FAILED verification, not a passed one; report it and do not
+   `rk done` on it. Say which command you ran and what exit status it gave.
    If no documented entrypoint exists, report that gap as an obstacle or need
    instead of guessing.
 4. Never `rk done` on a build you broke. If you hit a pre-existing failure that
@@ -904,6 +909,25 @@ mod tests {
             assert!(
                 normalized.contains("wait for that real process to finish"),
                 "{role} prompt must forbid reporting while the real check is still running"
+            );
+            // Reading the status is only half the rule: an agent that reads it
+            // and reports done anyway has still shipped a red build. The
+            // prompt must name the value that counts as passing, and say that
+            // anything else fails.
+            assert!(
+                normalized.contains("the check command itself must have exited 0"),
+                "{role} prompt must require the check's own exit status be zero"
+            );
+            assert!(
+                normalized.contains(
+                    "is a FAILED verification, not a passed one; report it and do not `rk done` on \
+                     it"
+                ),
+                "{role} prompt must make a nonzero/unreadable check exit a failed verification"
+            );
+            assert!(
+                normalized.contains("Say which command you ran and what exit status it gave"),
+                "{role} prompt must require reporting the command and its exit status"
             );
         }
     }
