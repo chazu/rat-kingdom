@@ -1192,6 +1192,13 @@ pub struct BudgetConfig {
     pub fleet_max_usd: f64,
     /// Per-repo USD cap across every agent in one repo. Zero = unlimited.
     pub repo_max_usd: f64,
+    /// Per-agent USD cap for `role == "reviewer"` ONLY, checked in place of
+    /// (never in addition to) `max_usd` for that role. Reviewers were
+    /// observed uncapped in production (one hit $27, above the worker cap)
+    /// — this is a distinct, graduated warn→stop cap set above the cost of a
+    /// legitimate deep review so a genuinely thorough review is never cut
+    /// off mid-verdict. Zero = unlimited.
+    pub reviewer_max_usd: f64,
 }
 
 impl Default for BudgetConfig {
@@ -1202,6 +1209,7 @@ impl Default for BudgetConfig {
             warn_at: 0.8,
             fleet_max_usd: 0.0,
             repo_max_usd: 0.0,
+            reviewer_max_usd: 30.0,
         }
     }
 }

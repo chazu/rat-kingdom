@@ -169,3 +169,110 @@ async fn tickets_route_to_their_cost_tier() {
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
+
+// A single `spawn` step (how every reviewer dispatches — `for_each` fan-out
+// is worker-only) with a literal `priority` bound from a workflow param, so
+// its resolved model must come from the SAME `tiers` table `for_each` uses,
+// not the step's own named `reviewer` profile. Proves Step::Spawn now
+// consults tier routing at all — previously it never did.
+const REVIEWER_SPAWN_WORKFLOW: &str = r#"
+workflow: {
+    name: "reviewer-tier-route-test"
+    params: {
+        priority: {type: "string", required: false, default: ""}
+        repo:     {type: "string", required: false, default: ""}
+    }
+    agents: {
+        default:  {harness: "fake", model: "sonnet"}
+        reviewer: {harness: "fake", model: "gpt-5.6-luna"}
+        premium:  {harness: "fake", model: "opus"}
+    }
+    tiers: {
+        rules: [
+            {priority: "high", tier: "premium"},
+        ]
+    }
+    steps: [
+        {
+            type:     "spawn"
+            role:     "reviewer"
+            agent:    "reviewer"
+            priority: _input.priority
+            task: {title: "review", description: "review it"}
+        },
+        {type: "wait", timeout: "60s"},
+    ]
+}
+"#;
+
+#[tokio::test]
+async fn spawn_step_reviewer_routes_to_its_cost_tier() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    git(repo_dir.path(), &["init", "-b", "main"]);
+    git(repo_dir.path(), &["config", "user.email", "r@x"]);
+    git(repo_dir.path(), &["config", "user.name", "R"]);
+    std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
+    git(repo_dir.path(), &["add", "."]);
+    git(repo_dir.path(), &["commit", "-m", "init"]);
+
+    let wf_dir = repo_dir.path().join(".rk").join("workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(
+        wf_dir.join("reviewer-tier-route-test.cue"),
+        REVIEWER_SPAWN_WORKFLOW,
+    )
+    .unwrap();
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let started = client
+        .call(
+            "workflow.run",
+            json!({
+                "name": "reviewer-tier-route-test",
+                "repo": repo_dir.path().to_string_lossy(),
+                "params": {"priority": "high"},
+            }),
+        )
+        .await
+        .unwrap();
+    let id = started["instance"]["id"].as_str().unwrap().to_string();
+
+    let mut completed = false;
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = client
+            .call("workflow.status", json!({"name": id}))
+            .await
+            .unwrap();
+        match status["instance"]["status"].as_str().unwrap_or("") {
+            "completed" => {
+                completed = true;
+                break;
+            }
+            "failed" => panic!("workflow failed: {}", status["instance"]["error"]),
+            _ => {}
+        }
+    }
+    assert!(completed, "workflow did not complete");
+
+    let agents = client.call("agent.list", json!({})).await.unwrap();
+    let records = agents["agents"].as_array().unwrap();
+    let reviewer = records
+        .iter()
+        .find(|r| r["role"].as_str() == Some("reviewer"))
+        .expect("reviewer record");
+    assert_eq!(
+        reviewer["model"].as_str(),
+        Some("opus"),
+        "a high-priority review must route to the premium tier, overriding the \
+         step's named `reviewer` profile (gpt-5.6-luna)"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}

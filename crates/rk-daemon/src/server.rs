@@ -300,6 +300,9 @@ impl Daemon {
             .set_min_free_disk_gb(config.disk.min_free_gb);
         daemon
             .supervisor
+            .set_reviewer_max_usd(config.budget.reviewer_max_usd);
+        daemon
+            .supervisor
             .set_max_load_per_cpu(config.machine.max_load_per_cpu);
         daemon
             .supervisor

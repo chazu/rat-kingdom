@@ -73,6 +73,22 @@ workflow: {
 		// before the sweep's soft steer gets a chance to nudge a slow reviewer
 		// back to a clean `rk done`.
 		reviewTimeout: {type: "string", required: false, default: "15m"}
+		// COST-TIER ROUTING PREDICATE. The candidate ticket's own priority and
+		// labels, read off the ticket by LandingPipeline and bound onto the
+		// spawn below so this review participates in `[[tiers.rules]]` exactly
+		// like a `for_each` worker fan-out does. Empty/absent matches no rule
+		// carrying an explicit priority/label, which leaves the reviewer on the
+		// `reviewer` profile below — the pre-routing behaviour.
+		priority: {type: "string", required: false, default: ""}
+		labels: {type: "list", required: false, default: []}
+		// SHADOW REVIEW. Empty for the primary reviewer (so the tier table and
+		// the `reviewer` profile decide); set only for the second, non-blocking
+		// shadow reviewer LandingPipeline launches from the same definition
+		// with a distinct reviewAttempt. An inline model/harness on a spawn
+		// beats the tier table, which is what pins the shadow to the model the
+		// comparison is actually about.
+		reviewerModel: {type: "string", required: false, default: ""}
+		reviewerHarness: {type: "string", required: false, default: ""}
 	}
 
 	agents: {
@@ -89,6 +105,16 @@ workflow: {
 			role:   "reviewer"
 			agent:  "reviewer"
 			branch: _input.branch
+			labels: _input.labels
+			if _input.priority != "" {
+				priority: _input.priority
+			}
+			if _input.reviewerModel != "" {
+				model: _input.reviewerModel
+			}
+			if _input.reviewerHarness != "" {
+				harness: _input.reviewerHarness
+			}
 			review: {
 				branch:  _input.branch
 				headSha: _input.headSha
