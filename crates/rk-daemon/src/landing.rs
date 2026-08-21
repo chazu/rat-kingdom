@@ -85,7 +85,9 @@ use rk_space::Space;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -883,14 +885,57 @@ fn review_retry_instance_id(entry: &LandingQueueEntry, retry_attempt: u32) -> St
     format!("{}-retry{retry_attempt}", review_instance_id(entry))
 }
 
-/// A uniform `[0.0, 1.0]` draw for `landing_review_retry::retry_delay`'s
-/// jitter — the one place this module reaches for real randomness, so a
-/// test can bypass it by calling the pure `retry_delay` directly with a
-/// fixed unit instead (module doc: no clock/jitter seam lives on
-/// `LandingPipeline` itself, mirroring `recovery::jittered_window`'s own
-/// thin `rand::random` wrapper around its pure `scale_window`).
-fn jitter_unit() -> f64 {
-    rand::random::<f64>()
+/// The three nondeterministic inputs the review-death backoff path reads:
+/// wall-clock now (which fixes the durable `not_before` a dispatch persists),
+/// the uniform `[0.0, 1.0]` jitter draw
+/// `landing_review_retry::retry_delay` scales by, and the real-time wait
+/// itself. Gathered behind ONE injectable seam so a test can drive the real
+/// dispatch path — [`LandingPipeline::route_review_death`]'s `Dispatch` arm
+/// and [`LandingPipeline::await_review_retry_after_backoff`] — against a
+/// frozen clock and a fixed draw, and then assert the EXACT schedule
+/// persisted and the EXACT wait performed. Testing the pure
+/// `landing_review_retry::retry_delay` helper alone can only prove the
+/// arithmetic; only this seam can prove what the pipeline actually schedules
+/// under a live repository policy, which is the property a repo operator is
+/// really relying on.
+///
+/// Production wiring is the obvious one ([`Default`]): `Utc::now`,
+/// `rand::random`, `tokio::time::sleep`. Nothing outside this trio is
+/// seamed — every OTHER clock read in this module (queue enqueue stamps,
+/// landed-at records, gate worktree ages) deliberately keeps using
+/// `Utc::now` directly, so injecting a frozen clock here cannot distort
+/// unrelated pipeline behavior in a test.
+type RetrySleepFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type RetrySleeper = Box<dyn Fn(Duration) -> RetrySleepFuture + Send + Sync>;
+
+pub(crate) struct RetrySchedule {
+    now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    jitter_unit: Box<dyn Fn() -> f64 + Send + Sync>,
+    sleep: RetrySleeper,
+}
+
+impl RetrySchedule {
+    fn now(&self) -> DateTime<Utc> {
+        (self.now)()
+    }
+
+    fn jitter_unit(&self) -> f64 {
+        (self.jitter_unit)()
+    }
+
+    async fn sleep(&self, wait: Duration) {
+        (self.sleep)(wait).await
+    }
+}
+
+impl Default for RetrySchedule {
+    fn default() -> Self {
+        Self {
+            now: Box::new(Utc::now),
+            jitter_unit: Box::new(rand::random::<f64>),
+            sleep: Box::new(|wait| Box::pin(tokio::time::sleep(wait))),
+        }
+    }
 }
 
 /// One resolved named check plus the env pairs and wall-clock bound it runs
@@ -1066,6 +1111,10 @@ pub(crate) struct LandingPipeline {
     space: Space,
     enqueue_lock: Mutex<()>,
     key_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Clock/jitter/sleep seam for review-death retry backoff — see
+    /// [`RetrySchedule`]. Real in production; a test overrides it with
+    /// [`LandingPipeline::with_retry_schedule`].
+    retry_schedule: RetrySchedule,
 }
 
 /// One decision [`LandingPipeline::gate_worktree_sweep_once`] made about a
@@ -1104,7 +1153,18 @@ impl LandingPipeline {
             space,
             enqueue_lock: Mutex::new(()),
             key_locks: Mutex::new(HashMap::new()),
+            retry_schedule: RetrySchedule::default(),
         }
+    }
+
+    /// Replace the review-death backoff clock/jitter/sleep seam
+    /// ([`RetrySchedule`]). Test-only: production always wants the real
+    /// trio, and gating it behind `cfg(test)` keeps that a compile-time
+    /// guarantee rather than a convention.
+    #[cfg(test)]
+    pub(crate) fn with_retry_schedule(mut self, schedule: RetrySchedule) -> Self {
+        self.retry_schedule = schedule;
+        self
     }
 
     /// Resolve this entry's repo-owned gate/review policy from its activated
@@ -2688,9 +2748,12 @@ impl LandingPipeline {
                 let backoff_policy = landing_review_retry::ReviewDeathBackoffPolicy::from_landing(
                     &self.supervisor.repository_policy(git_repo).landing,
                 );
-                let delay =
-                    landing_review_retry::retry_delay(&backoff_policy, attempt, jitter_unit());
-                let not_before = Utc::now()
+                let delay = landing_review_retry::retry_delay(
+                    &backoff_policy,
+                    attempt,
+                    self.retry_schedule.jitter_unit(),
+                );
+                let not_before = self.retry_schedule.now()
                     + chrono::Duration::from_std(delay)
                         .unwrap_or_else(|_| chrono::Duration::zero());
                 // Marker before dispatch: a crash between this write and the
@@ -2733,12 +2796,12 @@ impl LandingPipeline {
     /// The real-time wait still owed before `not_before`, measured against
     /// `now` — `None` for "no wait", whether because there is no schedule at
     /// all or because it has already elapsed. Kept as a pure function of its
-    /// inputs (same "no seam for real time here" convention as
-    /// `landing_review_retry::retry_delay`, whose module doc makes the same
-    /// call for jitter) so the elapsed/not-yet-elapsed split — the exact
-    /// property [`Self::await_review_retry_after_backoff`] must get right —
-    /// is deterministically unit-testable without spawning a task, a
-    /// workflow, or touching the clock.
+    /// inputs — `now` is supplied by the caller from [`RetrySchedule`], the
+    /// same split `landing_review_retry::retry_delay` makes for jitter — so
+    /// the elapsed/not-yet-elapsed decision, the exact property
+    /// [`Self::await_review_retry_after_backoff`] must get right, is
+    /// deterministically unit-testable without spawning a task, a workflow,
+    /// or touching the clock.
     fn remaining_backoff(
         not_before: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
@@ -2765,14 +2828,14 @@ impl LandingPipeline {
         instance_id: &str,
         not_before: Option<DateTime<Utc>>,
     ) -> rk_core::Result<ReviewWaitOutcome> {
-        if let Some(wait) = Self::remaining_backoff(not_before, Utc::now()) {
+        if let Some(wait) = Self::remaining_backoff(not_before, self.retry_schedule.now()) {
             info!(
                 repo = %entry.repo_name, branch = %entry.branch, instance_id = %instance_id,
                 wait_secs = wait.as_secs(),
                 "landing pipeline: waiting out the review-death retry backoff before \
                  dispatching the replacement reviewer"
             );
-            tokio::time::sleep(wait).await;
+            self.retry_schedule.sleep(wait).await;
         }
         self.request_review_retry(entry, gates, instance_id).await
     }
@@ -6713,6 +6776,123 @@ workflow: {
         (repo_dir, head_sha, main_before)
     }
 
+    /// A deterministic [`RetrySchedule`]: a clock the test owns, a fixed
+    /// jitter draw, and a `sleep` that RECORDS what it was asked to wait and
+    /// advances that clock by exactly that much instead of blocking. The
+    /// recorded waits are what make "the real dispatch path waited exactly
+    /// the scheduled backoff" assertable without a wall-clock threshold, and
+    /// advancing the clock keeps a later `remaining_backoff` read honest —
+    /// after the wait, the schedule really has elapsed.
+    #[derive(Clone)]
+    struct FakeSchedule {
+        now: Arc<Mutex<DateTime<Utc>>>,
+        waits: Arc<Mutex<Vec<Duration>>>,
+        jitter_unit: f64,
+    }
+
+    impl FakeSchedule {
+        /// Frozen at `Utc::now()` with `jitter_unit` as every draw. A unit of
+        /// `1.0` is the jitter ceiling and `0.0` the floor, so a test picks
+        /// the exact end of the configured band it wants to prove.
+        fn new(jitter_unit: f64) -> Self {
+            Self {
+                now: Arc::new(Mutex::new(Utc::now())),
+                waits: Arc::new(Mutex::new(Vec::new())),
+                jitter_unit,
+            }
+        }
+
+        fn now(&self) -> DateTime<Utc> {
+            *self.now.lock().unwrap()
+        }
+
+        fn waits(&self) -> Vec<Duration> {
+            self.waits.lock().unwrap().clone()
+        }
+
+        fn schedule(&self) -> RetrySchedule {
+            let now = Arc::clone(&self.now);
+            let advancing = Arc::clone(&self.now);
+            let waits = Arc::clone(&self.waits);
+            let jitter_unit = self.jitter_unit;
+            RetrySchedule {
+                now: Box::new(move || *now.lock().unwrap()),
+                jitter_unit: Box::new(move || jitter_unit),
+                sleep: Box::new(move |wait| {
+                    waits.lock().unwrap().push(wait);
+                    let mut clock = advancing.lock().unwrap();
+                    *clock += chrono::Duration::from_std(wait)
+                        .unwrap_or_else(|_| chrono::Duration::zero());
+                    Box::pin(std::future::ready(()))
+                }),
+            }
+        }
+    }
+
+    /// Activate `landing` as `repo_path`'s repository policy, the way an
+    /// operator's `rk repo policy activate` would — the only way a test can
+    /// exercise `route_review_death` under a policy other than
+    /// `LandingPolicy::default()`, since the pipeline reads it back through
+    /// `Supervisor::repository_policy` -> `repos.json` rather than from any
+    /// injectable field. Registered against `Repo::discover`'s resolved root
+    /// (not the raw temp path), because that is the key `repository_policy`
+    /// looks up.
+    fn activate_landing_policy(home: &Path, repo_path: &Path, landing: rk_workflow::LandingPolicy) {
+        let root = rk_git::Repo::discover(repo_path)
+            .unwrap()
+            .root()
+            .to_path_buf();
+        let policy = rk_workflow::RepositoryPolicy {
+            landing,
+            ..rk_workflow::RepositoryPolicy::default()
+        };
+        let mut registry = crate::repos::RepoRegistry::load(&home.join("repos.json")).unwrap();
+        registry
+            .add(crate::repos::RepoRecord {
+                name: "code-repo".into(),
+                path: root,
+                created_at: Utc::now(),
+                merge_mode: Default::default(),
+                remote: None,
+                host: None,
+                activated_policy: Some(crate::repos::ActivatedRepositoryPolicy {
+                    digest: "test-digest".into(),
+                    policy,
+                }),
+            })
+            .unwrap();
+    }
+
+    /// The review-death backoff knobs under test, with everything else left
+    /// at its shipped default.
+    fn backoff_landing_policy(
+        delay: &str,
+        backoff_pct: u32,
+        max_delay: &str,
+        jitter_pct: u32,
+    ) -> rk_workflow::LandingPolicy {
+        rk_workflow::LandingPolicy {
+            review_death_retry_delay: delay.into(),
+            review_death_retry_backoff_pct: backoff_pct,
+            review_death_retry_max_delay: max_delay.into(),
+            review_death_retry_jitter_pct: jitter_pct,
+            ..rk_workflow::LandingPolicy::default()
+        }
+    }
+
+    /// The `not_before` persisted by the one `dispatching` marker on this
+    /// space, or `None` if that marker recorded no schedule at all.
+    fn dispatching_not_before(space: &Space) -> Option<DateTime<Utc>> {
+        let marker = scoped_tuples(space, Category::Event, REVIEW_DEATH_DISPATCH_IDENTITY)
+            .into_iter()
+            .find(|m| m.payload["state"] == "dispatching")
+            .expect("a dispatching marker must be recorded");
+        marker.payload["not_before"]
+            .as_str()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+    }
+
     fn review_candidate_entry(repo_dir: &Path, head_sha: &str) -> LandingQueueEntry {
         LandingQueueEntry {
             repo_name: "code-repo".into(),
@@ -7562,7 +7742,13 @@ workflow: {
         // leaving the replacement workflow running as it would across a
         // process restart.
         let space = Space::open(&layout.db_path()).unwrap();
-        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        // Both the original and the restarted daemon drive the shipped
+        // default backoff through the deterministic seam — this test is
+        // about resuming the marker's instance id, not about the wait.
+        let clock = FakeSchedule::new(0.0);
+        let pipeline = Arc::new(
+            test_pipeline(home.path(), space.clone()).with_retry_schedule(clock.schedule()),
+        );
         let primary = tokio::spawn({
             let pipeline = Arc::clone(&pipeline);
             let entry = entry.clone();
@@ -7598,7 +7784,13 @@ workflow: {
         // process_entry path must dispatch/await the retry instance id that
         // the marker names, rather than calling request_review for primary.
         let restarted_space = Space::open(&layout.db_path()).unwrap();
-        let restarted = Arc::new(test_pipeline(home.path(), restarted_space.clone()));
+        // Same clock: the first daemon already waited out the persisted
+        // schedule, so the restart reads it back as elapsed and adds no
+        // further wait — exactly what a real restart past `not_before` sees.
+        let restarted = Arc::new(
+            test_pipeline(home.path(), restarted_space.clone())
+                .with_retry_schedule(clock.schedule()),
+        );
         let process = tokio::spawn({
             let restarted = Arc::clone(&restarted);
             let entry = entry.clone();
@@ -8841,7 +9033,14 @@ checks: [
         let entry = review_candidate_entry(repo_dir.path(), &head_sha);
 
         let space = Space::open_in_memory().unwrap();
-        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        // This test measures reviewer-death detection and escalation, not the
+        // shipped retry delay. Drive the default 30s backoff through the fake
+        // schedule so it advances deterministically without consuming wall
+        // clock time.
+        let clock = FakeSchedule::new(0.0);
+        let pipeline = Arc::new(
+            test_pipeline(home.path(), space.clone()).with_retry_schedule(clock.schedule()),
+        );
         // Generous base/ceiling: the point under test is that death is
         // detected well before EITHER, not merely before the ceiling.
         let gates = GateConfig {
@@ -8912,6 +9111,7 @@ checks: [
             2,
             "the dead primary plus exactly one replacement reviewer, no more"
         );
+        assert_eq!(clock.waits(), vec![Duration::from_secs(30)]);
         let markers = scoped_tuples(&space, Category::Event, REVIEW_DEATH_DISPATCH_IDENTITY);
         let dispatching = markers
             .iter()
@@ -8943,7 +9143,14 @@ checks: [
         let entry = review_candidate_entry(repo_dir.path(), &head_sha);
 
         let space = Space::open_in_memory().unwrap();
-        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        // The shipped default now paces the replacement (30s + jitter), so
+        // this test — which is about the VERDICT, not the schedule — drives
+        // the wait through the deterministic seam rather than sitting
+        // through it.
+        let clock = FakeSchedule::new(0.0);
+        let pipeline = Arc::new(
+            test_pipeline(home.path(), space.clone()).with_retry_schedule(clock.schedule()),
+        );
         let gates = GateConfig {
             review_timeout: Duration::from_secs(120),
             review_max_wait: Duration::from_secs(600),
@@ -9510,12 +9717,14 @@ checks: [
         let _ = resume.await;
     }
 
-    /// The default policy (`reviewDeathRetryDelay: "0s"`) must preserve the
-    /// pre-backoff immediate-dispatch behavior exactly: the fresh Dispatch
-    /// decision records a `not_before` that is already due, and the
-    /// replacement is spawned without any added wait.
+    /// An EXPLICITLY configured `reviewDeathRetryDelay: "0s"` — the opt-out
+    /// from the shipped nonzero default — must preserve the pre-backoff
+    /// immediate-dispatch behavior exactly: the fresh Dispatch decision
+    /// records a `not_before` that is already due, and the replacement is
+    /// spawned with no wait AT ALL (asserted through the seam's recorded
+    /// waits, not a wall-clock threshold, so it cannot flake under load).
     #[tokio::test]
-    async fn zero_delay_policy_dispatches_the_replacement_without_added_wait() {
+    async fn explicit_zero_delay_policy_dispatches_the_replacement_without_added_wait() {
         let home = tempfile::tempdir().unwrap();
         let layout = Layout::at(home.path());
         write_broken_review_workflow(&layout);
@@ -9523,7 +9732,17 @@ checks: [
         let entry = review_candidate_entry(repo_dir.path(), &head_sha);
 
         let space = Space::open_in_memory().unwrap();
-        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        activate_landing_policy(
+            home.path(),
+            repo_dir.path(),
+            backoff_landing_policy("0s", 200, "10m", 50),
+        );
+        // Jitter at its ceiling: an explicit zero must stay zero even when
+        // every other knob is at its most inflating setting.
+        let clock = FakeSchedule::new(1.0);
+        let pipeline = Arc::new(
+            test_pipeline(home.path(), space.clone()).with_retry_schedule(clock.schedule()),
+        );
         let gates = GateConfig::default();
 
         let outcome = tokio::time::timeout(
@@ -9552,27 +9771,161 @@ checks: [
         // `route_verdict` (unlike `review_verdict`) also runs a real
         // `git prepare_merge` before it ever reaches the Dispatch arm, so
         // this threshold is generous rather than tight to the backoff
-        // itself — it only needs to distinguish "no added wait" from even a
-        // small explicit delay, not measure sub-second overhead.
+        // itself — the EXACT "no added wait" property is the seam assertion
+        // below; this only keeps the end-to-end path honest.
         assert!(
             started.elapsed() < Duration::from_secs(3),
-            "the default zero-delay policy must dispatch without any added wait: {:?}",
+            "an explicit zero-delay policy must dispatch without any added wait: {:?}",
             started.elapsed()
         );
-
-        let marker = scoped_tuples(&space, Category::Event, REVIEW_DEATH_DISPATCH_IDENTITY)
-            .into_iter()
-            .find(|m| m.payload["state"] == "dispatching")
-            .expect("a dispatching marker must be recorded");
-        let not_before: DateTime<Utc> = marker.payload["not_before"]
-            .as_str()
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc))
-            .expect("a zero-delay dispatch must still record its (already-due) schedule");
         assert!(
-            not_before <= Utc::now(),
-            "a zero-delay schedule must already be due: {not_before}"
+            clock.waits().is_empty(),
+            "an explicit zero-delay policy must not wait at all, waited {:?}",
+            clock.waits()
         );
+
+        let not_before = dispatching_not_before(&space)
+            .expect("a zero-delay dispatch must still record its (already-due) schedule");
+        assert_eq!(
+            not_before,
+            clock.now(),
+            "a zero-delay schedule must be due at exactly the decision instant"
+        );
+
+        route.abort();
+        let _ = route.await;
+    }
+
+    /// The SHIPPED default (no activated repository policy at all) must
+    /// actually back off: `default_review_death_retry_delay`'s 30s, scaled
+    /// by nothing at attempt 1, plus at most
+    /// `default_review_death_retry_jitter_pct`'s 20%. This is the acceptance
+    /// property the ticket asks for — bounded backoff is the default
+    /// behavior, with immediate dispatch reserved for an explicitly
+    /// configured zero — and it is asserted on the REAL dispatch path, off
+    /// the durable marker, not on the pure helper's arithmetic.
+    #[tokio::test]
+    async fn shipped_default_policy_paces_the_replacement_within_its_jitter_band() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_broken_review_workflow(&layout);
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        // Jitter at both ends of the band, on two independent runs of the
+        // real dispatch path: the floor is the un-jittered backoff and the
+        // ceiling is exactly `jitter_pct` above it. Nothing outside that
+        // band is reachable, which is what "jitter within configured bounds"
+        // means for an operator reading the policy.
+        for (jitter_unit, expected) in [
+            (0.0, Duration::from_secs(30)),
+            (1.0, Duration::from_secs(36)),
+        ] {
+            let space = Space::open_in_memory().unwrap();
+            let clock = FakeSchedule::new(jitter_unit);
+            let pipeline = Arc::new(
+                test_pipeline(home.path(), space.clone()).with_retry_schedule(clock.schedule()),
+            );
+            let gates = GateConfig::default();
+            let decided_at = clock.now();
+
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                pipeline.request_review(&entry, &gates),
+            )
+            .await
+            .expect("the dead primary must be detected fast")
+            .unwrap();
+            let ReviewWaitOutcome::ReviewerDied(context) = outcome else {
+                panic!("expected the primary reviewer to die");
+            };
+            let route = tokio::spawn({
+                let pipeline = Arc::clone(&pipeline);
+                let entry = entry.clone();
+                let gates = gates.clone();
+                async move {
+                    pipeline
+                        .route_verdict(&entry, ReviewWaitOutcome::ReviewerDied(context), &gates)
+                        .await
+                }
+            });
+            wait_for_spawn_count(&space, 2).await;
+
+            let not_before = dispatching_not_before(&space)
+                .expect("the shipped default must persist a nonzero schedule");
+            assert_eq!(
+                not_before - decided_at,
+                chrono::Duration::from_std(expected).unwrap(),
+                "jitter unit {jitter_unit} must persist exactly {expected:?} of backoff"
+            );
+            assert_eq!(
+                clock.waits(),
+                vec![expected],
+                "the dispatch must wait out exactly the schedule it persisted"
+            );
+
+            route.abort();
+            let _ = route.await;
+        }
+    }
+
+    /// A repository that configures its own bounds gets exactly those
+    /// bounds on the real dispatch path — including the `maxDelay` clamp,
+    /// which jitter may not push past. Covered here against the durable
+    /// marker and the seam's recorded wait, so the assertion is about what
+    /// the pipeline scheduled, not about `retry_delay`'s arithmetic.
+    #[tokio::test]
+    async fn configured_policy_schedule_is_clamped_to_its_max_delay() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_broken_review_workflow(&layout);
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+        // 60s base with 50% jitter would be 90s, but the repo caps at 45s.
+        activate_landing_policy(
+            home.path(),
+            repo_dir.path(),
+            backoff_landing_policy("60s", 200, "45s", 50),
+        );
+
+        let space = Space::open_in_memory().unwrap();
+        let clock = FakeSchedule::new(1.0);
+        let pipeline = Arc::new(
+            test_pipeline(home.path(), space.clone()).with_retry_schedule(clock.schedule()),
+        );
+        let gates = GateConfig::default();
+        let decided_at = clock.now();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            pipeline.request_review(&entry, &gates),
+        )
+        .await
+        .expect("the dead primary must be detected fast")
+        .unwrap();
+        let ReviewWaitOutcome::ReviewerDied(context) = outcome else {
+            panic!("expected the primary reviewer to die");
+        };
+        let route = tokio::spawn({
+            let pipeline = Arc::clone(&pipeline);
+            let entry = entry.clone();
+            let gates = gates.clone();
+            async move {
+                pipeline
+                    .route_verdict(&entry, ReviewWaitOutcome::ReviewerDied(context), &gates)
+                    .await
+            }
+        });
+        wait_for_spawn_count(&space, 2).await;
+
+        let not_before =
+            dispatching_not_before(&space).expect("a configured delay must persist a schedule");
+        assert_eq!(
+            not_before - decided_at,
+            chrono::Duration::seconds(45),
+            "the repository's maxDelay is a hard ceiling jitter cannot exceed"
+        );
+        assert_eq!(clock.waits(), vec![Duration::from_secs(45)]);
 
         route.abort();
         let _ = route.await;

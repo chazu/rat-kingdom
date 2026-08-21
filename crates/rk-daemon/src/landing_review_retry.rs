@@ -118,9 +118,9 @@ fn backoff_before_jitter(policy: &ReviewDeathBackoffPolicy, attempt: u32) -> Dur
 /// The full retry delay for `attempt`: [`backoff_before_jitter`] plus
 /// `jitter_pct` percent of jitter, drawn from the caller-supplied
 /// `jitter_unit` — a value in `[0.0, 1.0]` — so this stays pure and
-/// deterministic (module doc: no seam for real randomness lives here; the
-/// caller draws it, in production from `rand`, in a test from a fixed
-/// value). The final result is re-clamped to `max_delay`: at the ceiling,
+/// deterministic: no seam for real randomness lives here, the caller draws
+/// it from `crate::landing::RetrySchedule` (in production `rand`, in a test
+/// a fixed value). The final result is re-clamped to `max_delay`: at the ceiling,
 /// jitter has no further room to add wait, which is what "hard ceiling"
 /// means.
 pub(crate) fn retry_delay(
