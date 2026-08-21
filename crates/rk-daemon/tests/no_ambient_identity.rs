@@ -41,12 +41,22 @@ const BANNED: &[(&str, &str)] = &[
 ];
 
 fn workspace_root() -> PathBuf {
-    // crates/rk-daemon -> crates -> <root>
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .canonicalize()
-        .expect("workspace root")
+    // Resolved at runtime, not baked in via `env!("CARGO_MANIFEST_DIR")`: a
+    // shared CARGO_TARGET_DIR can serve this binary unrecompiled to a
+    // worktree other than the one it was compiled in
+    // (TKT-01M0F0GHDPGA24X1TB24A0PZD0). Cargo sets a test binary's cwd to its
+    // package's manifest directory on every run, so walking up from
+    // `current_dir()` is always correct for the current process.
+    let cwd = std::env::current_dir().expect("test process must have a current directory");
+    cwd.ancestors()
+        .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("crates").is_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            panic!(
+                "could not find the rat-kingdom workspace above runtime directory {}",
+                cwd.display()
+            )
+        })
 }
 
 /// Every `crates/*/tests/*.rs` in the workspace.
