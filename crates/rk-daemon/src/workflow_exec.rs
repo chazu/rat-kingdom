@@ -206,14 +206,46 @@ enum RunOutcome {
     TimedOut,
 }
 
+/// A single `run_check_in` attempt once its outcome is fully decoded and
+/// classified — the payload `settled` carries out of the retry loop.
+struct SettledAttempt {
+    exit: i64,
+    stdout: String,
+    stdout_truncated: bool,
+    stderr: String,
+    stderr_truncated: bool,
+    timed_out: bool,
+    no_exit_code: bool,
+    signal: Option<i32>,
+    verdict: &'static str,
+}
+
 /// Decode a `spawn_check_child` outcome into the flat tuple `run_check_in`
 /// tracks. Factored out so a retried outcome (the shared cargo target-dir
 /// contention retry, and the initial attempt) decode identically.
+///
+/// The trailing `(bool, Option<i32>)` is `(no_exit_code, signal)`.
+/// `no_exit_code` is true exactly when `status.code()` came back `None` —
+/// the process never chose its own exit status at all, whether or not this
+/// platform can also decode WHICH signal killed it. This is the classifier
+/// `run_check_in` uses to tell a genuine "the suite said no" (a real exit
+/// code, however nonzero) apart from "the process was killed out from under
+/// the check" (OOM killer, an external `kill -9`, the runner itself dying,
+/// or any other runner-loss shape reported this way) — an infrastructure
+/// death, not a verdict on the branch. `signal` is carried alongside purely
+/// as richer evidence when this platform can decode it (Unix); its absence
+/// must never suppress the `no_exit_code` classification itself, or a
+/// non-Unix runner (or a runner-loss shape with no decodable signal) would
+/// silently fall back to treating an infrastructure death as an ordinary
+/// "fail" and never get retried. A `TimedOut` outcome is never confused with
+/// this: it is `collect_child_output` itself killing the child on the
+/// wall-clock bound, reported as its own variant with no `ExitStatus` to
+/// inspect at all.
 fn decode_run_outcome(
     outcome: RunOutcome,
     command: &str,
     resolved: &ResolvedRun,
-) -> (i64, String, bool, String, bool, bool) {
+) -> (i64, String, bool, String, bool, bool, bool, Option<i32>) {
     match outcome {
         RunOutcome::Completed {
             status,
@@ -221,14 +253,26 @@ fn decode_run_outcome(
             stdout_truncated,
             stderr,
             stderr_truncated,
-        } => (
-            status.code().unwrap_or(-1) as i64,
-            String::from_utf8_lossy(&stdout).into_owned(),
-            stdout_truncated,
-            String::from_utf8_lossy(&stderr).into_owned(),
-            stderr_truncated,
-            false,
-        ),
+        } => {
+            let no_exit_code = status.code().is_none();
+            #[cfg(unix)]
+            let signal = {
+                use std::os::unix::process::ExitStatusExt;
+                status.signal()
+            };
+            #[cfg(not(unix))]
+            let signal: Option<i32> = None;
+            (
+                status.code().unwrap_or(-1) as i64,
+                String::from_utf8_lossy(&stdout).into_owned(),
+                stdout_truncated,
+                String::from_utf8_lossy(&stderr).into_owned(),
+                stderr_truncated,
+                false,
+                no_exit_code,
+                signal,
+            )
+        }
         RunOutcome::TimedOut => (
             TIMEOUT_EXIT,
             String::new(),
@@ -239,6 +283,8 @@ fn decode_run_outcome(
             ),
             false,
             true,
+            false,
+            None,
         ),
     }
 }
@@ -3078,6 +3124,7 @@ impl WorkflowEngine {
                         LOCK_TIMEOUT_EXIT,
                         "fail",
                         false,
+                        None,
                         "",
                         false,
                         &stderr,
@@ -3101,7 +3148,7 @@ impl WorkflowEngine {
         // guard is ever loosened.
         let attempts = resolved.retry_on_fail.saturating_add(1);
         let mut history: Vec<Value> = Vec::new();
-        let mut settled: Option<(i64, String, bool, String, bool, bool, &'static str)> = None;
+        let mut settled: Option<SettledAttempt> = None;
         for attempt in 1..=attempts {
             let outcome = self
                 .spawn_check_child(command, dir, resolved, agent, env, timeout)
@@ -3119,6 +3166,8 @@ impl WorkflowEngine {
                 mut stderr,
                 mut stderr_truncated,
                 mut timed_out,
+                mut no_exit_code,
+                mut signal,
             ) = decode_run_outcome(outcome, command, resolved);
             // TKT-01M0CF9PG9NHHM0ZTFKDW6BVBV: under the shared
             // `CARGO_TARGET_DIR` (`[disk] shared_cargo_target`), a concurrent
@@ -3148,13 +3197,26 @@ impl WorkflowEngine {
                     stderr,
                     stderr_truncated,
                     timed_out,
+                    no_exit_code,
+                    signal,
                 ) = decode_run_outcome(retry_outcome, command, resolved);
             }
-            // The routable three-way summary. `exit` alone cannot express it:
-            // a suite may exit 124 on its own, and "did not finish" calls for
-            // a different hand-off than "finished and said no".
+            // The routable four-way summary. `exit` alone cannot express it: a
+            // suite may exit 124 on its own, and "did not finish" calls for a
+            // different hand-off than "finished and said no". `infra` is its
+            // own case, not folded into `fail`: `no_exit_code` means the
+            // process never reported an exit code of its own — killed by a
+            // signal, or any other runner-loss shape decoded the same way —
+            // an infrastructure death (OOM killer, an external `kill -9`, the
+            // runner losing the child) that says nothing about the code under
+            // test, as opposed to a real exit code (however nonzero) the
+            // suite chose itself. Classified on `no_exit_code` rather than
+            // `signal.is_some()` so this still fires on a platform (or a
+            // runner-loss shape) that cannot decode which signal it was.
             let verdict: &'static str = if timed_out {
                 "timeout"
+            } else if no_exit_code {
+                "infra"
             } else if exit == 0 {
                 "pass"
             } else {
@@ -3177,6 +3239,7 @@ impl WorkflowEngine {
                     exit,
                     verdict,
                     timed_out,
+                    signal,
                     &stdout,
                     stdout_truncated,
                     &stderr,
@@ -3186,15 +3249,17 @@ impl WorkflowEngine {
                 return Err(rk_core::Error::other(stderr));
             }
             if verdict == "pass" || attempt == attempts {
-                settled = Some((
+                settled = Some(SettledAttempt {
                     exit,
                     stdout,
                     stdout_truncated,
                     stderr,
                     stderr_truncated,
                     timed_out,
+                    no_exit_code,
+                    signal,
                     verdict,
-                ));
+                });
                 break;
             }
             info!(
@@ -3211,9 +3276,18 @@ impl WorkflowEngine {
         }
         // `attempts >= 1`, and `settled` is always set on the final iteration
         // (attempt == attempts), so the loop never exits without it.
-        let (exit, stdout, stdout_truncated, stderr, stderr_truncated, timed_out, verdict) =
-            settled.expect("run step: attempt loop always settles by the final attempt");
-        info!(agent = %agent, exit, timed_out, verdict, command = %command, retries = history.len(), "run step completed");
+        let SettledAttempt {
+            exit,
+            stdout,
+            stdout_truncated,
+            stderr,
+            stderr_truncated,
+            timed_out,
+            no_exit_code,
+            signal,
+            verdict,
+        } = settled.expect("run step: attempt loop always settles by the final attempt");
+        info!(agent = %agent, exit, timed_out, no_exit_code, signal = ?signal, verdict, command = %command, retries = history.len(), "run step completed");
         let mut result = json!({
             "exit": exit,
             "stdout": stdout,
@@ -3221,6 +3295,8 @@ impl WorkflowEngine {
             "stderr": stderr,
             "stderr_truncated": stderr_truncated,
             "timed_out": timed_out,
+            "no_exit_code": no_exit_code,
+            "signal": signal,
             "verdict": verdict,
         });
 
@@ -3242,6 +3318,7 @@ impl WorkflowEngine {
                 exit,
                 verdict,
                 timed_out,
+                signal,
                 &stdout,
                 stdout_truncated,
                 &stderr,
@@ -3361,6 +3438,7 @@ impl WorkflowEngine {
         exit: i64,
         verdict: &str,
         timed_out: bool,
+        signal: Option<i32>,
         stdout: &str,
         stdout_truncated: bool,
         stderr: &str,
@@ -3375,6 +3453,7 @@ impl WorkflowEngine {
             "exit": exit,
             "verdict": verdict,
             "timed_out": timed_out,
+            "signal": signal,
             "stdout_tail": bounded_tail(stdout, GATE_EVIDENCE_LIMIT),
             "stdout_truncated": stdout_truncated,
             "stderr_tail": bounded_tail(stderr, GATE_EVIDENCE_LIMIT),
@@ -5472,6 +5551,51 @@ test a::flaky ... FAILED
             }
             RunOutcome::TimedOut => panic!("output volume alone must never time out the run"),
         }
+    }
+
+    #[tokio::test]
+    async fn signal_death_classifies_as_infra_on_no_exit_code_not_on_decoded_signal() {
+        // A real child killed by a signal: `status.code()` comes back `None`.
+        // `decode_run_outcome`'s classifier is `no_exit_code` — `status.code().is_none()`
+        // — deliberately independent of whether this platform can ALSO name
+        // which signal it was, so a runner-loss shape with no decodable
+        // signal (or a non-Unix target) still gets classified as an
+        // infrastructure death rather than silently falling back to an
+        // ordinary "fail" that would never earn a retry
+        // (TKT-01M0FXGQMA10JYCV9QCGEAK4TT).
+        let command = "kill -9 $$";
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let outcome = collect_child_output(child, Duration::from_secs(10), command)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&outcome, RunOutcome::Completed { status, .. } if status.code().is_none()),
+            "a self-`kill -9` must complete with no exit code: {outcome:?}"
+        );
+        let resolved = ResolvedRun {
+            command: command.into(),
+            cwd: None,
+            expect_exit: None,
+            timeout: "10s".into(),
+            on_timeout: OnTimeout::Fail,
+            environment_policy: rk_workflow::CheckEnvironmentPolicy::Inherit,
+            retry_on_fail: 0,
+            shared_cargo_target: false,
+        };
+        let (exit, _, _, _, _, timed_out, no_exit_code, _signal) =
+            decode_run_outcome(outcome, command, &resolved);
+        assert!(!timed_out);
+        assert!(
+            no_exit_code,
+            "the infra classifier must fire on the absent exit code alone, exit reported as {exit}"
+        );
     }
 
     #[tokio::test]
