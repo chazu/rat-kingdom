@@ -5,8 +5,10 @@
 
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::time::Instant;
 
 /// Resolve the workspace root at RUNTIME instead of baking
 /// `env!("CARGO_MANIFEST_DIR")` into the test binary at compile time.
@@ -63,23 +65,63 @@ pub fn install_passing_landing_checks(repo: &std::path::Path) {
     run(&["commit", "-m", "test: register landing checks"]);
 }
 
+/// Poll `attempt` at a fixed `interval` until it returns `Some` or a
+/// monotonic `deadline` (measured from first call, via `tokio::time::Instant`
+/// so it cannot be perturbed by wall-clock adjustments) elapses. Returns the
+/// elapsed time on exhaustion so callers can report it.
+///
+/// Generic over the attempt so the deadline/exhaustion behavior can be
+/// unit-tested against a fake, near-instant attempt closure instead of a real
+/// daemon socket and instead of waiting out a production-sized deadline.
+#[allow(dead_code)]
+pub async fn poll_until<T, Fut>(
+    deadline: Duration,
+    interval: Duration,
+    mut attempt: impl FnMut() -> Fut,
+) -> Result<T, Duration>
+where
+    Fut: Future<Output = Option<T>>,
+{
+    let start = Instant::now();
+    loop {
+        if let Some(value) = attempt().await {
+            return Ok(value);
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= deadline {
+            return Err(elapsed);
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
 /// Poll for a daemon at `layout` to come up and connect as operator.
 ///
 /// Was previously copy-pasted into ~40 test files with varying retry budgets
 /// (50/100/200 iterations at 20ms — a hardcoded ~1s to ~4s). Several files had
 /// already widened their local copy past the original ~1s under
-/// parallel-test-process load, so this shared version standardizes on the
+/// parallel-test-process load, so this shared version standardized on the
 /// most generous of the budgets already proven necessary rather than the
-/// tightest.
+/// tightest — but under full-workspace `cargo test` process contention, even
+/// that ~4s budget intermittently expired against a daemon that had already
+/// won its bind and would have become connectable given more time
+/// (TKT-01M0HJV6ZCREQTYSXGETEENY2F). The budget is now a monotonic 30s
+/// deadline instead of a fixed iteration count, so it cannot expire early
+/// just because individual polls ran slower under load.
 #[allow(dead_code)]
 pub async fn connect(layout: &Layout) -> Client {
-    for _ in 0..200 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if let Ok(c) = Client::connect_as_operator(layout).await {
-            return c;
+    const DEADLINE: Duration = Duration::from_secs(30);
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+    match poll_until(DEADLINE, POLL_INTERVAL, || async {
+        Client::connect_as_operator(layout).await.ok()
+    })
+    .await
+    {
+        Ok(client) => client,
+        Err(elapsed) => {
+            panic!("daemon did not come up: {elapsed:?} elapsed against a {DEADLINE:?} deadline")
         }
     }
-    panic!("daemon did not come up");
 }
 
 /// Start a daemon against `layout` and connect to it, retrying the whole
