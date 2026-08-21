@@ -83,6 +83,18 @@ repo: #RepositoryPolicy
 	maxReviewDeathAttempts: int | *1
 	// Hard ceiling on cumulative USD across one review-death retry chain. 0 = unlimited.
 	reviewDeathMaxUsd: int | *10
+	// Delay before the FIRST review-death replacement is dispatched. "0s" (the
+	// default) preserves pre-backoff immediate-dispatch behavior exactly; a
+	// repo opts into pacing explicitly, e.g. "30s".
+	reviewDeathRetryDelay: string | *"0s"
+	// Percent scaling applied to the delay per additional replacement beyond
+	// the first — 100 holds it flat, 200 doubles it each attempt.
+	reviewDeathRetryBackoffPct: int | *200
+	// Hard ceiling the computed delay (jitter included) never exceeds.
+	reviewDeathRetryMaxDelay: string | *"10m"
+	// Percent of the clamped backoff added as jitter, uniform over
+	// [0, jitterPct]. 0 disables jitter.
+	reviewDeathRetryJitterPct: int | *20
 }
 
 // Regenerable build-artifact paths (relative to a worktree root) the daemon's

@@ -10,7 +10,9 @@
 //! smaller than [`crate::landing_rework`], its direct template. Durable
 //! markers, spawning, and instance-id derivation remain in [`crate::landing`].
 
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
+use std::time::Duration;
 
 /// Durable, repo-scoped routing marker written before a replacement
 /// reviewer is dispatched.
@@ -41,6 +43,98 @@ impl Default for ReviewDeathPolicy {
     fn default() -> Self {
         Self::from_landing(&rk_workflow::LandingPolicy::default())
     }
+}
+
+/// Activated repository bounds for the delay before a review-death
+/// replacement is dispatched — a SEPARATE knob from [`ReviewDeathPolicy`]'s
+/// count/spend ceilings (module doc: policy is the whole ladder here, and
+/// this is one more rung of it, not a replacement for the others). Kept as
+/// its own type so `route`'s count/spend decision stays exactly what it was
+/// before this policy existed — this is consulted only once `route` has
+/// already decided to [`ReviewDeathRoute::Dispatch`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ReviewDeathBackoffPolicy {
+    /// Delay before the first replacement (`attempt == 1`). Zero preserves
+    /// the pre-backoff immediate-dispatch behavior exactly — see
+    /// [`retry_delay`].
+    pub(crate) base_delay: Duration,
+    /// Percent scaling applied per additional attempt beyond the first —
+    /// `100` holds the delay flat, `200` doubles it each attempt (integer,
+    /// not float, so this policy can keep deriving `Eq` like its siblings).
+    pub(crate) backoff_pct: u32,
+    /// Hard ceiling the computed delay (jitter included) never exceeds.
+    pub(crate) max_delay: Duration,
+    /// Percent of the clamped backoff added as jitter, uniform over
+    /// `[0, jitter_pct]`. `0` disables jitter.
+    pub(crate) jitter_pct: u32,
+}
+
+impl ReviewDeathBackoffPolicy {
+    pub(crate) fn from_landing(policy: &rk_workflow::LandingPolicy) -> Self {
+        let defaults = rk_workflow::LandingPolicy::default();
+        let parse = |s: &str, fallback: &str| -> Duration {
+            crate::workflow_exec::parse_duration(s)
+                .or_else(|_| crate::workflow_exec::parse_duration(fallback))
+                .unwrap_or_default()
+        };
+        Self {
+            base_delay: parse(
+                &policy.review_death_retry_delay,
+                &defaults.review_death_retry_delay,
+            ),
+            backoff_pct: policy.review_death_retry_backoff_pct,
+            max_delay: parse(
+                &policy.review_death_retry_max_delay,
+                &defaults.review_death_retry_max_delay,
+            ),
+            jitter_pct: policy.review_death_retry_jitter_pct,
+        }
+    }
+}
+
+impl Default for ReviewDeathBackoffPolicy {
+    fn default() -> Self {
+        Self::from_landing(&rk_workflow::LandingPolicy::default())
+    }
+}
+
+/// Delay before dispatching `attempt` (1-based), before jitter: `base_delay`
+/// scaled by `backoff_pct / 100` for every attempt past the first, clamped to
+/// `max_delay`. Zero `base_delay` short-circuits to zero regardless of
+/// `backoff_pct`/`max_delay` — an explicit zero-delay policy stays exactly
+/// immediate, never inflated by a nonzero clamp or percent.
+fn backoff_before_jitter(policy: &ReviewDeathBackoffPolicy, attempt: u32) -> Duration {
+    if policy.base_delay.is_zero() {
+        return Duration::ZERO;
+    }
+    let growth = attempt.saturating_sub(1).min(32);
+    let factor = (f64::from(policy.backoff_pct) / 100.0).powi(growth as i32);
+    policy
+        .base_delay
+        .mul_f64(factor.max(0.0))
+        .min(policy.max_delay)
+}
+
+/// The full retry delay for `attempt`: [`backoff_before_jitter`] plus
+/// `jitter_pct` percent of jitter, drawn from the caller-supplied
+/// `jitter_unit` — a value in `[0.0, 1.0]` — so this stays pure and
+/// deterministic (module doc: no seam for real randomness lives here; the
+/// caller draws it, in production from `rand`, in a test from a fixed
+/// value). The final result is re-clamped to `max_delay`: at the ceiling,
+/// jitter has no further room to add wait, which is what "hard ceiling"
+/// means.
+pub(crate) fn retry_delay(
+    policy: &ReviewDeathBackoffPolicy,
+    attempt: u32,
+    jitter_unit: f64,
+) -> Duration {
+    let base = backoff_before_jitter(policy, attempt);
+    if base.is_zero() || policy.jitter_pct == 0 {
+        return base;
+    }
+    let jitter_unit = jitter_unit.clamp(0.0, 1.0);
+    let jitter_frac = (f64::from(policy.jitter_pct) / 100.0) * jitter_unit;
+    base.mul_f64(1.0 + jitter_frac).min(policy.max_delay)
 }
 
 /// Machine-readable reason and evidence for a withheld retry.
@@ -161,8 +255,19 @@ impl ReviewDeathContext {
         )
     }
 
-    /// Durable marker payload; top-level branch/head fields support exact probes.
-    pub(crate) fn marker_payload(&self, attempt: u32, instance_id: &str, state: &str) -> Value {
+    /// Durable marker payload; top-level branch/head fields support exact
+    /// probes. `not_before` is the durable backoff schedule chosen when this
+    /// attempt was first decided (module doc on [`ReviewDeathBackoffPolicy`])
+    /// — `None` for a withhold marker (no dispatch to schedule) or a marker
+    /// seeded before this policy existed, either of which must read back as
+    /// "no wait", not as an error.
+    pub(crate) fn marker_payload(
+        &self,
+        attempt: u32,
+        instance_id: &str,
+        state: &str,
+        not_before: Option<DateTime<Utc>>,
+    ) -> Value {
         json!({
             "dispatch_key": self.dispatch_key(),
             "branch": self.branch,
@@ -173,6 +278,7 @@ impl ReviewDeathContext {
             "instance_id": instance_id,
             "attempt": attempt,
             "state": state,
+            "not_before": not_before.map(|dt| dt.to_rfc3339()),
         })
     }
 }
@@ -292,5 +398,105 @@ mod tests {
         for component in ["code-repo", "feature", "abc123", "main", "TKT-1"] {
             assert!(key.split('\0').any(|part| part == component), "{key:?}");
         }
+    }
+
+    fn backoff_policy() -> ReviewDeathBackoffPolicy {
+        ReviewDeathBackoffPolicy {
+            base_delay: Duration::from_secs(30),
+            backoff_pct: 200,
+            max_delay: Duration::from_secs(600),
+            jitter_pct: 20,
+        }
+    }
+
+    #[test]
+    fn the_first_retry_delay_is_the_base_delay_unjittered() {
+        assert_eq!(
+            retry_delay(&backoff_policy(), 1, 0.0),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn the_backoff_progression_is_bounded_exponential() {
+        let policy = backoff_policy();
+        // 200% per attempt: 30s, 60s, 120s, 240s, 480s, then clamped at 600s.
+        assert_eq!(retry_delay(&policy, 1, 0.0), Duration::from_secs(30));
+        assert_eq!(retry_delay(&policy, 2, 0.0), Duration::from_secs(60));
+        assert_eq!(retry_delay(&policy, 3, 0.0), Duration::from_secs(120));
+        assert_eq!(retry_delay(&policy, 4, 0.0), Duration::from_secs(240));
+        assert_eq!(retry_delay(&policy, 5, 0.0), Duration::from_secs(480));
+        assert_eq!(retry_delay(&policy, 6, 0.0), Duration::from_secs(600));
+        assert_eq!(retry_delay(&policy, 20, 0.0), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn jitter_stays_within_the_configured_percent_and_scales_with_the_unit() {
+        let policy = backoff_policy();
+        // jitter_pct 20 over a 30s base: [30s, 36s].
+        assert_eq!(retry_delay(&policy, 1, 0.0), Duration::from_secs(30));
+        assert_eq!(retry_delay(&policy, 1, 1.0), Duration::from_secs(36));
+        assert_eq!(retry_delay(&policy, 1, 0.5), Duration::from_millis(33_000));
+        // A jitter_unit outside [0, 1] is clamped rather than trusted.
+        assert_eq!(retry_delay(&policy, 1, 2.0), Duration::from_secs(36));
+        assert_eq!(retry_delay(&policy, 1, -1.0), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn max_delay_is_a_hard_clamp_even_with_jitter_at_the_ceiling() {
+        let policy = backoff_policy();
+        // Attempt 6 is already clamped to max_delay before jitter; jitter
+        // must not be able to push it past that ceiling.
+        assert_eq!(retry_delay(&policy, 6, 1.0), policy.max_delay);
+        assert_eq!(retry_delay(&policy, 50, 1.0), policy.max_delay);
+    }
+
+    #[test]
+    fn zero_base_delay_stays_immediate_regardless_of_backoff_or_jitter() {
+        let policy = ReviewDeathBackoffPolicy {
+            base_delay: Duration::ZERO,
+            backoff_pct: 200,
+            max_delay: Duration::from_secs(600),
+            jitter_pct: 50,
+        };
+        for attempt in [1, 2, 5] {
+            assert_eq!(retry_delay(&policy, attempt, 1.0), Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn zero_jitter_pct_never_adds_wait() {
+        let policy = ReviewDeathBackoffPolicy {
+            jitter_pct: 0,
+            ..backoff_policy()
+        };
+        assert_eq!(retry_delay(&policy, 1, 1.0), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn from_landing_reads_the_repository_policy_knobs() {
+        let landing = rk_workflow::LandingPolicy {
+            review_death_retry_delay: "45s".into(),
+            review_death_retry_backoff_pct: 150,
+            review_death_retry_max_delay: "5m".into(),
+            review_death_retry_jitter_pct: 10,
+            ..rk_workflow::LandingPolicy::default()
+        };
+        let policy = ReviewDeathBackoffPolicy::from_landing(&landing);
+        assert_eq!(policy.base_delay, Duration::from_secs(45));
+        assert_eq!(policy.backoff_pct, 150);
+        assert_eq!(policy.max_delay, Duration::from_secs(300));
+        assert_eq!(policy.jitter_pct, 10);
+    }
+
+    #[test]
+    fn from_landing_falls_back_to_the_default_duration_on_a_malformed_policy_string() {
+        let landing = rk_workflow::LandingPolicy {
+            review_death_retry_delay: "not-a-duration".into(),
+            ..rk_workflow::LandingPolicy::default()
+        };
+        let policy = ReviewDeathBackoffPolicy::from_landing(&landing);
+        let defaults = ReviewDeathBackoffPolicy::default();
+        assert_eq!(policy.base_delay, defaults.base_delay);
     }
 }
