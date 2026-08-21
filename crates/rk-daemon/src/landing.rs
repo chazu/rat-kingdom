@@ -1827,6 +1827,16 @@ impl LandingPipeline {
         if let Some(cached) = self.cached_verdict(entry)? {
             return Ok(ReviewWaitOutcome::Verdict(cached));
         }
+        let active_attempt = self.active_review_attempt(entry)?;
+        if active_attempt != review_instance_id(entry) {
+            // A daemon can restart after the retry marker is durable but
+            // while the replacement is still waiting for its verdict. Resume
+            // that exact instance; dispatch_review is idempotent for the
+            // stable retry id and never falls back to the dead primary.
+            return self
+                .request_review_retry(entry, gates, &active_attempt)
+                .await;
+        }
         self.request_review(entry, gates).await
     }
 
@@ -1843,6 +1853,7 @@ impl LandingPipeline {
     fn active_review_attempt(&self, entry: &LandingQueueEntry) -> rk_core::Result<String> {
         let ctx = ReviewDeathContext {
             repo: entry.repo_name.clone(),
+            repo_path: entry.repo_path.clone(),
             branch: entry.branch.clone(),
             head_sha: entry.head_sha.clone(),
             target: entry.target.clone(),
@@ -2507,6 +2518,7 @@ impl LandingPipeline {
     ) -> rk_core::Result<ReviewDeathOutcome> {
         let ctx = ReviewDeathContext {
             repo: entry.repo_name.clone(),
+            repo_path: entry.repo_path.clone(),
             branch: entry.branch.clone(),
             head_sha: entry.head_sha.clone(),
             target: entry.target.clone(),
@@ -6603,6 +6615,7 @@ workflow: {
     fn review_death_context(head: &str, task: &str) -> ReviewDeathContext {
         ReviewDeathContext {
             repo: "code-repo".into(),
+            repo_path: "/repos/code-repo".into(),
             branch: "feature".into(),
             head_sha: head.into(),
             target: "main".into(),
@@ -7325,6 +7338,114 @@ workflow: {
                 .len(),
             1,
             "the restarted pipeline must not spawn a second reviewer once the verdict is cached"
+        );
+    }
+
+    /// A daemon restart while a review-death replacement is still waiting
+    /// must resume the durable replacement attempt through `process_entry`.
+    /// Re-entering the pipeline must neither revive the dead primary nor
+    /// spend another retry slot before the active replacement can answer.
+    #[tokio::test]
+    async fn restart_resumes_in_flight_review_death_retry_through_process_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_review_workflow_dies_on_primary_recovers_on_retry(&layout);
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+        let gates = GateConfig {
+            review_timeout: Duration::from_secs(120),
+            review_max_wait: Duration::from_secs(600),
+            ..GateConfig::default()
+        };
+
+        // The first daemon observes the primary death and dispatches the
+        // replacement. Abort its wait after the dispatch marker is durable,
+        // leaving the replacement workflow running as it would across a
+        // process restart.
+        let space = Space::open(&layout.db_path()).unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        let primary = tokio::spawn({
+            let pipeline = Arc::clone(&pipeline);
+            let entry = entry.clone();
+            let gates = gates.clone();
+            async move { pipeline.request_review(&entry, &gates).await }
+        });
+        wait_for_spawn_count(&space, 1).await;
+        let ReviewWaitOutcome::ReviewerDied(context) = primary.await.unwrap().unwrap() else {
+            panic!("expected the primary reviewer to die");
+        };
+
+        let retry = tokio::spawn({
+            let pipeline = Arc::clone(&pipeline);
+            let entry = entry.clone();
+            let gates = gates.clone();
+            async move {
+                pipeline
+                    .route_verdict(&entry, ReviewWaitOutcome::ReviewerDied(context), &gates)
+                    .await
+            }
+        });
+        wait_for_spawn_count(&space, 2).await;
+        assert!(
+            scoped_tuples(&space, Category::Event, REVIEW_DEATH_DISPATCH_IDENTITY)
+                .iter()
+                .any(|marker| marker.payload["state"] == "dispatching"),
+            "the restart must begin from the durable in-flight marker"
+        );
+        retry.abort();
+        let _ = retry.await;
+
+        // A fresh pipeline stands in for the restarted daemon. Its
+        // process_entry path must dispatch/await the retry instance id that
+        // the marker names, rather than calling request_review for primary.
+        let restarted_space = Space::open(&layout.db_path()).unwrap();
+        let restarted = Arc::new(test_pipeline(home.path(), restarted_space.clone()));
+        let process = tokio::spawn({
+            let restarted = Arc::clone(&restarted);
+            let entry = entry.clone();
+            async move { restarted.process_entry(&entry).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let retry_instance_id = review_retry_instance_id(&entry, 1);
+        restarted_space
+            .out(Tuple::new(
+                Category::Artifact,
+                &entry.repo_name,
+                REVIEW_ARTIFACT_IDENTITY,
+                "replacement-reviewer",
+                json!({
+                    "task": entry.task,
+                    "recommendation": "APPROVE",
+                    "notes": "clean after restart",
+                    "head_sha": entry.head_sha,
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "review_attempt": retry_instance_id,
+                }),
+            ))
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), process)
+            .await
+            .expect("the restarted pipeline must finish from the replacement verdict")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&outcome, LandingOutcome::Landed(result) if result["merged"] == true),
+            "expected the replacement verdict to land, got {outcome:?}"
+        );
+        assert_ne!(
+            main_before,
+            rev_parse(repo_dir.path(), "main"),
+            "the restarted pipeline must land the reviewed branch"
+        );
+        assert_eq!(
+            restarted_space
+                .scan(&Pattern::category(Category::Event).identity("agent_spawned"))
+                .unwrap()
+                .len(),
+            2,
+            "restart recovery must not spawn a fresh primary or duplicate retry"
         );
     }
 
@@ -8581,6 +8702,10 @@ checks: [
         assert!(
             !text.contains("ceiling"),
             "a dead reviewer must not read as the live-at-ceiling case: {text}"
+        );
+        assert!(
+            text.contains(&format!("--repo {}", entry.repo_path)),
+            "human recovery must use the registered checkout path: {text}"
         );
 
         assert_eq!(

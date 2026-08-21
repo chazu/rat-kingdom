@@ -121,6 +121,8 @@ pub(crate) fn route(
 #[derive(Debug, Clone)]
 pub(crate) struct ReviewDeathContext {
     pub(crate) repo: String,
+    /// Filesystem checkout path accepted by `rk land --repo`.
+    pub(crate) repo_path: String,
     /// Reviewed branch: the exact same candidate every retry re-reviews.
     pub(crate) branch: String,
     /// Exact reviewed head; a retry never silently retargets to a moved branch.
@@ -146,7 +148,7 @@ impl ReviewDeathContext {
              EVIDENCE: exact reviewed head {head_sha}; the reviewer ended without producing a \
              verdict: {death_context}. {detail}\n\
              DECISION NEEDED: {decision}\n\
-             RESOLVE WITH: rk land {branch} --repo {repo} --target {target} --task {task} \
+            RESOLVE WITH: rk land {branch} --repo {repo_path} --target {target} --task {task} \
              --force --reason 'human resolved {code}'",
             branch = self.branch,
             task = self.task,
@@ -154,7 +156,7 @@ impl ReviewDeathContext {
             head_sha = self.head_sha,
             detail = withheld.detail,
             decision = withheld.decision,
-            repo = self.repo,
+            repo_path = self.repo_path,
             target = self.target,
         )
     }
@@ -182,6 +184,7 @@ mod tests {
     fn ctx() -> ReviewDeathContext {
         ReviewDeathContext {
             repo: "code-repo".into(),
+            repo_path: "/checkouts/code-repo".into(),
             branch: "feature".into(),
             head_sha: "abc123".into(),
             target: "main".into(),
@@ -276,7 +279,7 @@ mod tests {
         assert!(text.contains("DECISION NEEDED: retry by hand"), "{text}");
         assert!(
             text.contains(
-                "rk land feature --repo code-repo --target main --task TKT-1 --force --reason \
+                "rk land feature --repo /checkouts/code-repo --target main --task TKT-1 --force --reason \
                  'human resolved attempts-exhausted'"
             ),
             "{text}"
