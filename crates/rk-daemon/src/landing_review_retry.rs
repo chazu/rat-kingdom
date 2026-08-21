@@ -245,10 +245,22 @@ mod tests {
             max_attempts: 3,
             ..ReviewDeathPolicy::default()
         };
-        assert_eq!(route(&policy, 0, 0.0), ReviewDeathRoute::Dispatch { attempt: 1 });
-        assert_eq!(route(&policy, 1, 0.0), ReviewDeathRoute::Dispatch { attempt: 2 });
-        assert_eq!(route(&policy, 2, 0.0), ReviewDeathRoute::Dispatch { attempt: 3 });
-        assert!(matches!(route(&policy, 3, 0.0), ReviewDeathRoute::Withhold(_)));
+        assert_eq!(
+            route(&policy, 0, 0.0),
+            ReviewDeathRoute::Dispatch { attempt: 1 }
+        );
+        assert_eq!(
+            route(&policy, 1, 0.0),
+            ReviewDeathRoute::Dispatch { attempt: 2 }
+        );
+        assert_eq!(
+            route(&policy, 2, 0.0),
+            ReviewDeathRoute::Dispatch { attempt: 3 }
+        );
+        assert!(matches!(
+            route(&policy, 3, 0.0),
+            ReviewDeathRoute::Withhold(_)
+        ));
     }
 
     #[test]

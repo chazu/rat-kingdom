@@ -2384,7 +2384,10 @@ impl LandingPipeline {
             match outcome {
                 ReviewWaitOutcome::Verdict(v) => break v,
                 ReviewWaitOutcome::ReviewerDied(context) => {
-                    match self.route_review_death(entry, gates, git_repo, &context).await? {
+                    match self
+                        .route_review_death(entry, gates, git_repo, &context)
+                        .await?
+                    {
                         ReviewDeathOutcome::Retry(next) => {
                             outcome = next;
                             continue;
@@ -2561,7 +2564,9 @@ impl LandingPipeline {
                     "landing pipeline: reviewer died before a verdict; dispatching a replacement \
                      reviewer against the same exact head"
                 );
-                let outcome = self.request_review_retry(entry, gates, &instance_id).await?;
+                let outcome = self
+                    .request_review_retry(entry, gates, &instance_id)
+                    .await?;
                 self.record_review_death_state(
                     entry,
                     &ctx,
@@ -2581,7 +2586,10 @@ impl LandingPipeline {
     /// candidate, entered fresh from [`LandingPipeline::process_entry`], not
     /// a continuation of this one), so there is no separate "exact-head
     /// replay" case to fold in.
-    fn review_death_dispatch_markers(&self, ctx: &ReviewDeathContext) -> rk_core::Result<Vec<Tuple>> {
+    fn review_death_dispatch_markers(
+        &self,
+        ctx: &ReviewDeathContext,
+    ) -> rk_core::Result<Vec<Tuple>> {
         let pattern = Pattern::category(Category::Event)
             .identity(REVIEW_DEATH_DISPATCH_IDENTITY)
             .scope(&ctx.repo);
@@ -2620,7 +2628,10 @@ impl LandingPipeline {
     /// of [`landing_review_retry::route`]'s withhold codes. `None` while the
     /// chain is still open (no marker yet, or its most recent attempt is
     /// still in flight).
-    fn review_death_settled_marker(&self, ctx: &ReviewDeathContext) -> rk_core::Result<Option<Tuple>> {
+    fn review_death_settled_marker(
+        &self,
+        ctx: &ReviewDeathContext,
+    ) -> rk_core::Result<Option<Tuple>> {
         Ok(self
             .review_death_dispatch_markers(ctx)?
             .into_iter()
