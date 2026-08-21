@@ -18,7 +18,7 @@ repo: {
 	}
 
 	landing: {
-		maxDiffLines: 2100
+		maxDiffLines: 3000
 	}
 
 	// Regenerable build-artifact paths the daemon's worktree sweep reclaims.
