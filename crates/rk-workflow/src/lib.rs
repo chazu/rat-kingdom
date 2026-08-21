@@ -1222,6 +1222,14 @@ fn validate_repository_policy(policy: &RepositoryPolicy) -> rk_core::Result<()> 
         "repo.landing.reviewMaxWait",
         &policy.landing.review_max_wait,
     )?;
+    validate_duration_str(
+        "repo.landing.reviewDeathRetryDelay",
+        &policy.landing.review_death_retry_delay,
+    )?;
+    validate_duration_str(
+        "repo.landing.reviewDeathRetryMaxDelay",
+        &policy.landing.review_death_retry_max_delay,
+    )?;
     for rel in &policy.reap.artifact_paths {
         let path = Path::new(rel);
         let resolves_to_root = rel.split('/').all(|seg| seg.is_empty() || seg == ".");
@@ -2780,6 +2788,24 @@ checks: [
     }
 
     #[test]
+    fn repository_policy_loads_versioned_review_death_retry_delay_policy() {
+        let policy = load_repository_policy_str(
+            r#"
+            repo: {
+                landing: {
+                    reviewDeathRetryDelay:    "45s"
+                    reviewDeathRetryMaxDelay: "5m"
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(policy.landing.review_death_retry_delay, "45s");
+        assert_eq!(policy.landing.review_death_retry_max_delay, "5m");
+    }
+
+    #[test]
     fn repository_policy_rejects_unsafe_or_non_unique_worktree_templates() {
         for source in [
             r#"repo: {work: {worktree: "../outside/{{agent}}"}}"#,
@@ -2792,6 +2818,8 @@ checks: [
             r#"repo: {landing: {gateTimeout: "60mm"}}"#,
             r#"repo: {landing: {reviewTimeout: "soon"}}"#,
             r#"repo: {landing: {reviewMaxWait: "soon"}}"#,
+            r#"repo: {landing: {reviewDeathRetryDelay: "soon"}}"#,
+            r#"repo: {landing: {reviewDeathRetryMaxDelay: "60mm"}}"#,
         ] {
             assert!(load_repository_policy_str(source).is_err(), "{source}");
         }
