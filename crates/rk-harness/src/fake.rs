@@ -309,26 +309,53 @@ mod tests {
         // Dropping the runtime forcibly drops every task still running on
         // it, including the detached task that owns `child`.
         drop(runtime);
-        // Give the group-kill signal a moment to land and the OS to actually
-        // reap the process, not just mark it a zombie still visible to
-        // `kill(pid, 0)`.
-        std::thread::sleep(Duration::from_millis(300));
 
         let pid_text = std::fs::read_to_string(&pid_file).unwrap();
         let grandchild_pid: i32 = pid_text.trim().parse().unwrap();
-        assert!(
-            !process_is_alive(grandchild_pid),
-            "grandchild `sleep` survived runtime teardown"
-        );
+        // The kill signal lands on the process group synchronously (in
+        // `ProcessGroupGuard::drop`), but *reaping* the now-orphaned
+        // grandchild is the job of whatever adopts it (init/launchd) once
+        // its real parent (the `bash -c` wrapper) dies too — that can lag
+        // an arbitrary amount under full-workspace test-suite CPU
+        // contention, so a fixed sleep is inherently racy. Poll instead,
+        // bounded, and treat a zombie (signal delivered, not yet reaped) as
+        // proof the kill landed rather than waiting on OS bookkeeping that
+        // this code has no control over.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match still_running(grandchild_pid) {
+                None => break,
+                Some(stat) if std::time::Instant::now() >= deadline => panic!(
+                    "grandchild `sleep` (pid {grandchild_pid}) survived runtime \
+                     teardown: still running (ps STAT {stat:?}) after a 10s poll bound"
+                ),
+                Some(_) => std::thread::sleep(Duration::from_millis(25)),
+            }
+        }
     }
 
-    /// SAFETY: signal 0 only probes liveness/permission; it affects nothing.
-    fn process_is_alive(pid: i32) -> bool {
-        extern "C" {
-            #[link_name = "kill"]
-            fn libc_kill(pid: i32, sig: i32) -> i32;
+    /// Polls `ps` rather than raw `kill(pid, 0)`: signal-0 liveness checks
+    /// return success for a zombie exactly as they do for a running process,
+    /// which can't distinguish "still executing" from "killed but not yet
+    /// reaped by its new parent". Returns `None` once the pid is gone from
+    /// the process table *or* parked in zombie (`Z`) state — both only
+    /// happen after the kernel has already delivered and processed the
+    /// terminating signal. `Some(stat)` means it is genuinely still
+    /// running and the caller should keep polling.
+    fn still_running(pid: i32) -> Option<String> {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("failed to invoke `ps`");
+        if !output.status.success() {
+            return None; // `ps` found no such process: already reaped.
         }
-        unsafe { libc_kill(pid, 0) == 0 }
+        let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stat.is_empty() || stat.starts_with('Z') {
+            None
+        } else {
+            Some(stat)
+        }
     }
 
     /// Minimal single-quoting for embedding a path in the fake harness's bash
