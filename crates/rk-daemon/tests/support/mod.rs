@@ -5,7 +5,33 @@
 
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// Resolve the workspace root at RUNTIME instead of baking
+/// `env!("CARGO_MANIFEST_DIR")` into the test binary at compile time.
+///
+/// Test binaries live under a shared `CARGO_TARGET_DIR` (`DiskConfig::
+/// shared_cargo_target`); cargo's fingerprint does not cover the manifest
+/// directory, so a binary compiled from one worktree is reused verbatim by a
+/// byte-identical checkout in another. A path baked in via `env!` then
+/// outlives the worktree that produced it, including one already reaped
+/// (TKT-01M0F0GHDPGA24X1TB24A0PZD0). `std::env::current_dir()` is safe here
+/// because cargo sets a test binary's working directory to its package's
+/// manifest directory on every run, not at compile time.
+#[allow(dead_code)]
+pub fn workspace_root() -> PathBuf {
+    let cwd = std::env::current_dir().expect("test process must have a current directory");
+    cwd.ancestors()
+        .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("crates").is_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            panic!(
+                "could not find the rat-kingdom workspace above runtime directory {}",
+                cwd.display()
+            )
+        })
+}
 
 /// Install the stack-neutral named checks every gated landing test repo must
 /// explicitly own. The commands are intentionally trivial: individual tests
