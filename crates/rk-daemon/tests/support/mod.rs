@@ -118,9 +118,9 @@ pub async fn connect(layout: &Layout) -> Client {
     .await
     {
         Ok(client) => client,
-        Err(elapsed) => panic!(
-            "daemon did not come up: {elapsed:?} elapsed against a {DEADLINE:?} deadline"
-        ),
+        Err(elapsed) => {
+            panic!("daemon did not come up: {elapsed:?} elapsed against a {DEADLINE:?} deadline")
+        }
     }
 }
 
