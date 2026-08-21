@@ -170,6 +170,37 @@ pub struct LandingPolicy {
     /// dispatch. `0` means unlimited, matching the fleet budget convention.
     #[serde(default = "default_review_death_max_usd", rename = "reviewDeathMaxUsd")]
     pub review_death_max_usd: u32,
+    /// Delay before the FIRST review-death replacement is dispatched,
+    /// defaulting to `"30s"`. `"0s"` is the explicit opt-out that restores
+    /// pre-backoff immediate dispatch exactly — see
+    /// `crates/rk-daemon/src/landing_review_retry.rs`'s `retry_delay`.
+    #[serde(
+        default = "default_review_death_retry_delay",
+        rename = "reviewDeathRetryDelay"
+    )]
+    pub review_death_retry_delay: String,
+    /// Percent scaling applied to the delay per additional replacement beyond
+    /// the first — `100` holds it flat, `200` doubles it each attempt.
+    /// Integer (not float) so this policy can keep deriving `Eq`.
+    #[serde(
+        default = "default_review_death_retry_backoff_pct",
+        rename = "reviewDeathRetryBackoffPct"
+    )]
+    pub review_death_retry_backoff_pct: u32,
+    /// Hard ceiling the computed delay (jitter included) never exceeds, e.g.
+    /// `"10m"`.
+    #[serde(
+        default = "default_review_death_retry_max_delay",
+        rename = "reviewDeathRetryMaxDelay"
+    )]
+    pub review_death_retry_max_delay: String,
+    /// Percent of the clamped backoff added as jitter, uniform over
+    /// `[0, jitter_pct]`. `0` disables jitter.
+    #[serde(
+        default = "default_review_death_retry_jitter_pct",
+        rename = "reviewDeathRetryJitterPct"
+    )]
+    pub review_death_retry_jitter_pct: u32,
 }
 
 impl Default for LandingPolicy {
@@ -189,6 +220,10 @@ impl Default for LandingPolicy {
             review_death_auto_retry: true,
             max_review_death_attempts: default_max_review_death_attempts(),
             review_death_max_usd: default_review_death_max_usd(),
+            review_death_retry_delay: default_review_death_retry_delay(),
+            review_death_retry_backoff_pct: default_review_death_retry_backoff_pct(),
+            review_death_retry_max_delay: default_review_death_retry_max_delay(),
+            review_death_retry_jitter_pct: default_review_death_retry_jitter_pct(),
         }
     }
 }
@@ -220,6 +255,42 @@ fn default_max_review_death_attempts() -> u32 {
 /// sized well below the rework ceiling.
 fn default_review_death_max_usd() -> u32 {
     10
+}
+
+/// Bounded backoff is the SHIPPED behavior, not an opt-in: a reviewer that
+/// died before producing a verdict usually died for an infrastructure
+/// reason, and re-dispatching into the same blip on the same tick is the
+/// failure mode the whole policy exists to stop — so a default of `"0s"`
+/// would leave every unconfigured repo (i.e. all of them) with jitter inert
+/// and no pacing at all. `"30s"` is long enough to ride out a transient
+/// spawn/harness blip and, against `default_max_review_death_attempts`'s
+/// single attempt and `default_review_death_retry_jitter_pct`'s 20%, holds
+/// a candidate for at most ~36s before its replacement goes out — far
+/// inside the human-attention window a held branch already lives in. A repo
+/// that genuinely wants the pre-backoff immediate dispatch sets
+/// `reviewDeathRetryDelay: "0s"` explicitly, which `retry_delay`
+/// short-circuits to zero regardless of backoff/jitter/clamp.
+fn default_review_death_retry_delay() -> String {
+    "30s".to_string()
+}
+
+/// Doubling: a repeat death is more likely a systemic problem than a fluke,
+/// so each retry after the first waits proportionally longer.
+fn default_review_death_retry_backoff_pct() -> u32 {
+    200
+}
+
+/// Ceiling past which further backoff growth stops mattering — long enough
+/// to ride out most infrastructure incidents, short enough that a bounded
+/// retry chain (default one attempt) never parks a candidate for long.
+fn default_review_death_retry_max_delay() -> String {
+    "10m".to_string()
+}
+
+/// Modest jitter so many candidates whose reviewers died at the same
+/// incident do not all retry on the exact same clock tick.
+fn default_review_death_retry_jitter_pct() -> u32 {
+    20
 }
 
 /// Per-repository regenerable build-artifact paths (relative to a worktree
@@ -1150,6 +1221,14 @@ fn validate_repository_policy(policy: &RepositoryPolicy) -> rk_core::Result<()> 
     validate_duration_str(
         "repo.landing.reviewMaxWait",
         &policy.landing.review_max_wait,
+    )?;
+    validate_duration_str(
+        "repo.landing.reviewDeathRetryDelay",
+        &policy.landing.review_death_retry_delay,
+    )?;
+    validate_duration_str(
+        "repo.landing.reviewDeathRetryMaxDelay",
+        &policy.landing.review_death_retry_max_delay,
     )?;
     for rel in &policy.reap.artifact_paths {
         let path = Path::new(rel);
@@ -2709,6 +2788,24 @@ checks: [
     }
 
     #[test]
+    fn repository_policy_loads_versioned_review_death_retry_delay_policy() {
+        let policy = load_repository_policy_str(
+            r#"
+            repo: {
+                landing: {
+                    reviewDeathRetryDelay:    "45s"
+                    reviewDeathRetryMaxDelay: "5m"
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(policy.landing.review_death_retry_delay, "45s");
+        assert_eq!(policy.landing.review_death_retry_max_delay, "5m");
+    }
+
+    #[test]
     fn repository_policy_rejects_unsafe_or_non_unique_worktree_templates() {
         for source in [
             r#"repo: {work: {worktree: "../outside/{{agent}}"}}"#,
@@ -2721,6 +2818,8 @@ checks: [
             r#"repo: {landing: {gateTimeout: "60mm"}}"#,
             r#"repo: {landing: {reviewTimeout: "soon"}}"#,
             r#"repo: {landing: {reviewMaxWait: "soon"}}"#,
+            r#"repo: {landing: {reviewDeathRetryDelay: "soon"}}"#,
+            r#"repo: {landing: {reviewDeathRetryMaxDelay: "60mm"}}"#,
         ] {
             assert!(load_repository_policy_str(source).is_err(), "{source}");
         }
