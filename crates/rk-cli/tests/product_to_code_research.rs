@@ -3,10 +3,28 @@ mod product_to_code_research {
     use serde_json::Value;
     use std::process::Command;
 
+    // Resolved at runtime, not baked in via `env!("CARGO_MANIFEST_DIR")`: a
+    // shared CARGO_TARGET_DIR can serve this binary unrecompiled to a
+    // worktree other than the one it was compiled in
+    // (TKT-01M0F0GHDPGA24X1TB24A0PZD0). Cargo sets a test binary's cwd to its
+    // package's manifest directory on every run, so `current_dir()` is
+    // always correct for the current process.
+    fn crate_root() -> std::path::PathBuf {
+        std::env::current_dir().expect("test process must have a current directory")
+    }
+
+    fn workspace_root() -> std::path::PathBuf {
+        crate_root()
+            .ancestors()
+            .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("crates").is_dir())
+            .map(std::path::Path::to_path_buf)
+            .expect("could not find the rat-kingdom workspace above the test's runtime directory")
+    }
+
     fn fixture(name: &str) -> String {
         format!(
             "{}/tests/fixtures/product_to_code/{name}",
-            env!("CARGO_MANIFEST_DIR")
+            crate_root().display()
         )
     }
 
@@ -172,11 +190,9 @@ mod product_to_code_research {
 
     #[test]
     fn test_architecture_research_workflow_declares_structured_artifact_output() {
-        let workflow = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../examples/workflows/research.cue"
-        ))
-        .unwrap();
+        let workflow =
+            std::fs::read_to_string(workspace_root().join("examples/workflows/research.cue"))
+                .unwrap();
 
         assert!(workflow.contains("artifact"));
         assert!(workflow.contains("ArchitectureResearchArtifact"));
@@ -186,17 +202,9 @@ mod product_to_code_research {
     #[test]
     fn test_architecture_research_workflow_loads_as_shared_cue() {
         let output = Command::new("cue")
-            .args([
-                "vet",
-                concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../examples/workflows/research.cue"
-                ),
-                concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../crates/rk-workflow/src/schema.cue"
-                ),
-            ])
+            .arg("vet")
+            .arg(workspace_root().join("examples/workflows/research.cue"))
+            .arg(workspace_root().join("crates/rk-workflow/src/schema.cue"))
             .output();
         let Ok(output) = output else { return };
 

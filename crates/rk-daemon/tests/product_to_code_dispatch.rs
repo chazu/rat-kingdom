@@ -14,10 +14,13 @@ use std::{path::Path, process::Command};
 use support::connect;
 
 fn fixture_json(name: &str) -> Value {
-    let path = format!(
-        "{}/tests/fixtures/product_to_code/{name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    // Resolved at runtime, not baked in via `env!("CARGO_MANIFEST_DIR")`: a
+    // shared CARGO_TARGET_DIR can serve this binary unrecompiled to a worktree
+    // other than the one it was compiled in (TKT-01M0F0GHDPGA24X1TB24A0PZD0).
+    // Cargo sets a test binary's cwd to its package's manifest directory on
+    // every run, so `current_dir()` is always correct for the current process.
+    let crate_root = std::env::current_dir().expect("test process must have a current directory");
+    let path = crate_root.join("tests/fixtures/product_to_code").join(name);
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
@@ -378,8 +381,12 @@ async fn test_daemon_workflow_dispatch_uses_existing_phase2_proposal_validator()
 
     // Structural half: the daemon dispatch handler wraps the Phase 2 validator
     // entry points instead of duplicating digest logic.
-    let server_source =
-        std::fs::read_to_string(format!("{}/src/server.rs", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let server_source = std::fs::read_to_string(
+        std::env::current_dir()
+            .expect("test process must have a current directory")
+            .join("src/server.rs"),
+    )
+    .unwrap();
     let dispatch_region_start = server_source
         .find("fn handle_product_to_code_dispatch_execute")
         .expect("dispatch execute handler exists");
