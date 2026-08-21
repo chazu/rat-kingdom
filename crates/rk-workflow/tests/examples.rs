@@ -683,8 +683,14 @@ fn code_review_resolves_reviewer_profile() {
             _ => None,
         })
         .expect("reviewer spawn step");
-    let resolved =
-        rk_workflow::resolve::resolve(reviewer, &workflow.agents, &HashMap::new(), "fake").unwrap();
+    let resolved = rk_workflow::resolve::resolve(
+        reviewer,
+        &rk_workflow::TierRouting::default(),
+        &workflow.agents,
+        &HashMap::new(),
+        "fake",
+    )
+    .unwrap();
     assert_eq!(resolved.harness, "claude");
     assert_eq!(resolved.model.as_deref(), Some("haiku"));
 }
