@@ -382,6 +382,99 @@ async fn duplicate_submission_with_explicit_task_is_idempotent() {
     handle.abort();
 }
 
+/// TKT-01M0PH88BX7T8BHTT5224SHFKZ, exercised through the exact `rk land` ->
+/// `repo.land` path the live incident used (not the reactor-driven
+/// `harness_result` feed `landing_dedup_atomic.rs` covers): a branch/head
+/// already landed at one target must remain a distinct, freshly-processed
+/// candidate when the identical branch/head is retargeted at a different
+/// ref, under the SAME task — not read back as `already_processed` off the
+/// first target's marker. `already_processed` for a genuine retarget would
+/// mean `rk land main` silently no-ops while the branch never actually
+/// reaches `main`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resubmission_to_a_different_target_is_a_distinct_candidate() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo = repo_dir.path().join("landtaskrepo-retarget");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let ticket = client
+        .call(
+            "ticket.new",
+            json!({"title": "retarget submission", "scope": "landtaskrepo-retarget"}),
+        )
+        .await
+        .unwrap();
+    let ticket_id = ticket["ticket"]["identity"].as_str().unwrap().to_string();
+
+    // A second real ref, standing in for the predecessor step's branch a
+    // chained workflow would have targeted first (`rat/cheesethief-11/...`
+    // in the live incident).
+    git(&repo, &["checkout", "-b", "predecessor-target"]);
+    git(&repo, &["checkout", "main"]);
+
+    let branch = recovery_branch(&repo, "rat/recovery-retarget/tkt-1", "recovered.txt");
+
+    let first = client
+        .call(
+            "repo.land",
+            json!({
+                "repo": repo.to_string_lossy(),
+                "branch": branch,
+                "target": "predecessor-target",
+                "task": ticket_id,
+                "keep_branch": true,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["merged"], true, "{first}");
+    assert!(first["already_processed"].is_null(), "{first}");
+
+    let main_before_retarget = git(&repo, &["rev-parse", "main"]);
+
+    // Same exact branch/head, same task, but a DIFFERENT target — the
+    // operator's retarget-to-main resubmission from the live incident.
+    let second = client
+        .call(
+            "repo.land",
+            json!({
+                "repo": repo.to_string_lossy(),
+                "branch": branch,
+                "target": "main",
+                "task": ticket_id,
+                "keep_branch": true,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second["merged"], true,
+        "retargeting to a fresh ref must actually land, not report already_processed off the \
+         other target's marker: {second}"
+    );
+    assert!(
+        second["already_processed"].is_null(),
+        "retargeting must not be suppressed as a duplicate: {second}"
+    );
+
+    let main_after_retarget = git(&repo, &["rev-parse", "main"]);
+    assert_ne!(
+        main_before_retarget.trim(),
+        main_after_retarget.trim(),
+        "the retargeted candidate must actually advance main"
+    );
+    assert!(repo.join("recovered.txt").exists());
+
+    handle.abort();
+}
+
 /// A recovery branch with neither an agent record nor an explicit `--task`
 /// must be refused outright, not silently enqueued with `task: ""` — that
 /// used to mean no ticket/spec for the reviewer, no delivery record, and

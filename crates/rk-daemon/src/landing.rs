@@ -46,13 +46,18 @@
 //! `LandingQueue::scan_current` heals on the next read by keeping the one
 //! with the higher `rev`. See `crash_between_write_and_delete_survives_the_entry`.
 //!
-//! `work_key = (repo, branch, head_sha)` dedup against a redelivered
+//! `work_key = (repo, branch, head_sha, target)` dedup against a redelivered
 //! completion (a reactor retry after a crash, an operator manually
 //! re-triggering) is [`LandingPipeline::enqueue`]'s job: it probes a durable
 //! `landing_processed` marker — written by [`LandingPipeline::process_entry`]
 //! on every terminal outcome — before ever writing a new queue tuple, and
 //! silently drops (`Ok(None)`) a work key already fully handled rather than
-//! re-enqueueing it. The landing CAS already makes a literal double-advance
+//! re-enqueueing it. `target` is part of the key, not just `(repo, branch,
+//! head_sha)`: the identical commit legitimately lands at different targets
+//! (a nested workflow chains a step's branch onto a predecessor's, then an
+//! operator retargets the same head at `main`), and each target is a
+//! distinct, independently-audited candidate rather than a redelivery of the
+//! other. The landing CAS already makes a literal double-advance
 //! harmless; this dedup exists to also skip the
 //! gate-run/review-request work a redelivery would otherwise repeat for no
 //! reason.
@@ -1220,7 +1225,7 @@ impl LandingPipeline {
     /// as "nothing to do" while leaving the newly-named ticket untouched.
     fn enqueue_disposition(&self, entry: LandingQueueEntry) -> rk_core::Result<EnqueueDisposition> {
         let _guard = self.enqueue_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(marker) = self.processed_marker(&entry)? else {
+        let Some(marker) = self.admission_marker(&entry)? else {
             if self.queue.contains_work_key(&entry)? {
                 return Ok(EnqueueDisposition::Pending);
             }
@@ -1413,10 +1418,31 @@ impl LandingPipeline {
     }
 
     /// The durable `landing_processed` marker tuple for `entry`'s exact
-    /// `(repo, branch, head_sha)` work key, if one exists — the base read
-    /// both [`Self::enqueue`]'s dedup/mismatch probe and
-    /// [`Self::processed_outcome`] build on. See [`Self::mark_processed`],
-    /// the write side.
+    /// `(repo, branch, head_sha, target)` work key, if one exists — the
+    /// literal newest matching marker, trusted as-is regardless of whether
+    /// the target has since moved. Used by [`Self::processed_outcome`]
+    /// (process_entry's crash-window reconciliation, `submit_manual`'s
+    /// post-drain lookup): both are asking "what became of THIS exact
+    /// already-admitted attempt", not "should a NEW completion be admitted",
+    /// so staleness does not apply — see [`Self::admission_marker`] for the
+    /// probe that does. See [`Self::mark_processed`], the write side.
+    ///
+    /// `target` is filtered in Rust rather than folded into the
+    /// `Pattern::for_commit` scan (which already spends both of
+    /// [`Pattern`]'s substring predicate slots on `branch`+`head_sha`) —
+    /// same shape as [`Self::cached_verdict`]/[`Self::review_artifact`]'s
+    /// post-scan `target` check. Without it, a branch/head processed against
+    /// one target reads back as `already_processed` for a *different*
+    /// target: the same exact commit legitimately retargeted (e.g. a nested
+    /// workflow branch held for a sub-target, then an operator lands that
+    /// same head onto `main`) found no `landing_processed` event for `main`
+    /// at all, yet `rk land` reported it already handled.
+    ///
+    /// `.last()` rather than the first match: normally there is exactly one
+    /// marker per `(branch, head_sha, target)`, but [`Self::admission_marker`]
+    /// letting a stale non-`landed` verdict be reprocessed can leave an older
+    /// marker behind for the same key — the newest one is always the live
+    /// answer.
     fn processed_marker(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<Tuple>> {
         let pattern = Pattern::for_commit(
             Category::Event,
@@ -1425,13 +1451,76 @@ impl LandingPipeline {
             &entry.head_sha,
         )
         .scope(&entry.repo_name);
-        Ok(self.space.scan(&pattern)?.into_iter().next())
+        Ok(self.space.scan(&pattern)?.into_iter().rfind(|t| {
+            t.payload.get("target").and_then(Value::as_str) == Some(entry.target.as_str())
+        }))
+    }
+
+    /// [`Self::processed_marker`], but additionally filtered to markers still
+    /// CURRENT for admission purposes — the probe [`Self::enqueue_disposition`]
+    /// actually gates a fresh completion on. A `landed` marker is always
+    /// current: the merge already happened, is git-level idempotent to
+    /// repeat (module doc — "the landing CAS already makes a literal
+    /// double-advance harmless"), and this dedup exists only to skip
+    /// redundant gate/review work on a redelivery, not to guard correctness;
+    /// re-evaluating it after the target moves further would buy nothing and
+    /// risks a second delivery record.
+    ///
+    /// A non-`landed` terminal outcome (gate-held, no-gate, rework-filed,
+    /// escalated) instead recorded WHY the branch stayed unmerged against
+    /// the target's tip AT THAT MOMENT — a protected-paths or diff-scope
+    /// violation, a review REWORK, an escalation. Once the target has since
+    /// moved (unrelated commits landed, a violation may no longer apply, a
+    /// broken checks registry may have since been fixed), that verdict no
+    /// longer describes the live ref: treating it as still current would
+    /// permanently wedge the branch instead of giving it a fresh attempt
+    /// against the ref as it actually stands now — so a moved target makes
+    /// this probe report `None`, and [`Self::enqueue_disposition`] admits a
+    /// fresh attempt.
+    ///
+    /// A marker written before `target_head` existed, or one whose
+    /// comparison this probe cannot currently resolve (repo unreadable,
+    /// target ref gone), is treated as current — sticky, matching this
+    /// dedup's pre-existing behavior — rather than guessed at either way.
+    fn admission_marker(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<Tuple>> {
+        Ok(self.processed_marker(entry)?.filter(|marker| {
+            if marker.payload.get("outcome").and_then(Value::as_str) == Some("landed") {
+                return true;
+            }
+            let Some(recorded) = marker.payload.get("target_head").and_then(Value::as_str) else {
+                return true;
+            };
+            match self.current_target_head(entry) {
+                Some(current) => current == recorded,
+                None => true,
+            }
+        }))
+    }
+
+    /// Best-effort current tip of `entry.target`, resolved fresh (not
+    /// cached) so [`Self::admission_marker`] always compares against the
+    /// live ref. `None` on any resolution failure — repo unreadable, target
+    /// ref gone — rather than propagating an error into a dedup probe.
+    fn current_target_head(&self, entry: &LandingQueueEntry) -> Option<String> {
+        rk_git::Repo::discover(Path::new(&entry.repo_path))
+            .and_then(|repo| repo.rev_parse(&entry.target))
+            .ok()
     }
 
     /// The recorded terminal outcome string for `entry`'s work key, when a
-    /// `landing_processed` marker exists — the read side used both by
-    /// `process_entry`'s crash-window reconciliation and `submit_manual`'s
-    /// post-drain lookup.
+    /// `landing_processed` marker exists — the read side `submit_manual`'s
+    /// post-drain lookup uses to report what became of the caller's own
+    /// just-submitted entry once another consumer has drained it. Reads the
+    /// RAW [`Self::processed_marker`], not [`Self::admission_marker`]: at
+    /// that call site the entry in question was JUST processed under the
+    /// same key-exclusive lock this submission itself is holding, so the
+    /// newest matching marker is unambiguously the answer for THIS
+    /// submission — no staleness filter is meaningful there.
+    /// [`Self::process_entry`]'s crash-window reconciliation used to share
+    /// this helper but now goes through `admission_marker` directly instead
+    /// — a claimed entry there can also be a fresh attempt just admitted
+    /// past an old, now-superseded marker, which this raw form would
+    /// otherwise short-circuit incorrectly.
     fn processed_outcome(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<String>> {
         Ok(self.processed_marker(entry)?.and_then(|t| {
             t.payload
@@ -1447,6 +1536,13 @@ impl LandingPipeline {
     /// independent of whether `entry` arrived through the queue or a direct
     /// call (a caller bypassing the queue for testing still gets the same
     /// double-land protection on its next `enqueue`).
+    ///
+    /// Stamps the target's current tip as `target_head` so a later probe can
+    /// tell — for a non-`landed` outcome only, [`Self::marker_is_current`] —
+    /// whether this verdict still describes the live ref or was left behind
+    /// by the target moving on. Best-effort: `None` (omitted as JSON `null`)
+    /// when the tip cannot be resolved, which reads back as "still current"
+    /// rather than as a false staleness signal.
     fn mark_processed(
         &self,
         entry: &LandingQueueEntry,
@@ -1461,9 +1557,13 @@ impl LandingPipeline {
             LandingOutcome::Requeued { .. } => return Ok(()),
             // A reconciled entry's marker already exists from the run that
             // performed the side effects; writing a second would corrupt the
-            // one-marker-per-work-key invariant `processed_marker` reads.
+            // one-current-marker-per-work-key invariant `processed_marker`
+            // reads (module doc on `marker_is_current`: a stale non-`landed`
+            // predecessor may still be sitting there too, which is fine —
+            // `.last()` picks this one, not it).
             LandingOutcome::Reconciled(_) => return Ok(()),
         };
+        let target_head = self.current_target_head(entry);
         let tuple = Tuple::new(
             Category::Event,
             entry.repo_name.clone(),
@@ -1472,6 +1572,7 @@ impl LandingPipeline {
             json!({
                 "branch": entry.branch,
                 "target": entry.target,
+                "target_head": target_head,
                 "head_sha": entry.head_sha,
                 "task": entry.task,
                 "outcome": outcome_str,
@@ -1514,7 +1615,25 @@ impl LandingPipeline {
         // marker and the queue entry. The marker is the truth — never repeat
         // terminal side effects (needs, rework tickets, the land itself);
         // just report what already happened so the caller removes the entry.
-        if let Some(prior) = self.processed_outcome(entry)? {
+        //
+        // Deliberately `admission_marker`, not the raw `processed_outcome`:
+        // a claimed entry can also be a candidate `admission_marker` just
+        // ADMITTED because the target moved since a stale non-`landed`
+        // marker was recorded — the raw marker still exists (only
+        // superseded, never deleted) and would otherwise short-circuit this
+        // fresh attempt straight back to `Reconciled`, silently skipping the
+        // very gate re-run the move was supposed to trigger. A genuine
+        // same-process crash-window marker is always current by construction
+        // (mark_processed→crash→restart is too narrow a window for the
+        // target to move in between), so this stays exactly as strict for
+        // the case it exists to guard.
+        if let Some(marker) = self.admission_marker(entry)? {
+            let prior = marker
+                .payload
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             return Ok(LandingOutcome::Reconciled(prior));
         }
         let mut entry = entry.clone();
@@ -8768,6 +8887,202 @@ checks: [
             )
             .unwrap();
         assert_eq!(announced.len(), 1, "stale retry must be visibly announced");
+    }
+
+    /// TKT-01M0PH88BX7T8BHTT5224SHFKZ's second acceptance leg: a `target`
+    /// name match ALONE is not enough to keep a non-`landed` verdict
+    /// current. A branch held `gate-held` against `main`'s tip at S1 must not
+    /// stay wedged forever once `main` legitimately advances to S2 — the
+    /// diff a redelivered completion carries could gate differently against
+    /// the ref as it stands now, and permanently trusting the S1-era verdict
+    /// would silently drop a since-fixed branch on the floor. Confirms both
+    /// halves of `LandingPipeline::admission_marker`: freshly admitted after
+    /// the move, and still deduped again once the target is stable.
+    #[tokio::test]
+    async fn moved_target_reprocesses_a_gate_held_verdict_instead_of_staying_wedged() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), VERIFY_FAILS_CHECKS);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("work.txt"), "v1\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "work"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let base_entry = LandingQueueEntry {
+            repo_name: "moved-target-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            diff_class: "doc-only".into(),
+            task: "moved-target-task".into(),
+            ..Default::default()
+        };
+
+        pipeline.enqueue(base_entry.clone()).unwrap().unwrap();
+        let first = pipeline
+            .drain_key("moved-target-repo", "main")
+            .await
+            .unwrap();
+        assert!(
+            matches!(first.as_slice(), [LandingOutcome::GateHeld]),
+            "{first:?}"
+        );
+        let main_at_first_hold = rev_parse(repo_dir.path(), "main");
+
+        // A same-key resubmission while `main` has not moved is still an
+        // ordinary redelivery: suppressed, no second gate run.
+        assert_eq!(
+            pipeline.enqueue(base_entry.clone()).unwrap(),
+            None,
+            "an unmoved target must still dedup the redelivery"
+        );
+
+        // `main` legitimately advances — unrelated work landing, nothing to
+        // do with this held branch.
+        std::fs::write(repo_dir.path().join("unrelated.txt"), "other work\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(
+            repo_dir.path(),
+            &["commit", "-m", "unrelated work advances main"],
+        );
+        let main_after_move = rev_parse(repo_dir.path(), "main");
+        assert_ne!(main_at_first_hold, main_after_move);
+
+        // The identical branch/head/target/task resubmitted post-move must
+        // be admitted afresh, not read back as already_processed off the
+        // stale S1-era gate-held marker.
+        let reenqueued = pipeline.enqueue(base_entry.clone()).unwrap();
+        assert!(
+            reenqueued.is_some(),
+            "a gate-held verdict recorded against the target's old tip must not permanently \
+             wedge the branch once the target has moved"
+        );
+        let second = pipeline
+            .drain_key("moved-target-repo", "main")
+            .await
+            .unwrap();
+        assert!(
+            matches!(second.as_slice(), [LandingOutcome::GateHeld]),
+            "{second:?}"
+        );
+
+        let markers = space
+            .scan(
+                &Pattern::category(Category::Event)
+                    .scope("moved-target-repo")
+                    .identity(LANDING_PROCESSED_IDENTITY),
+            )
+            .unwrap();
+        assert_eq!(
+            markers.len(),
+            2,
+            "the post-move reprocessing must leave its own marker behind, not overwrite or skip \
+             recording it: {markers:?}"
+        );
+        let target_heads: Vec<Option<&str>> = markers
+            .iter()
+            .map(|t| t.payload.get("target_head").and_then(Value::as_str))
+            .collect();
+        assert!(
+            target_heads.contains(&Some(main_at_first_hold.as_str())),
+            "{target_heads:?}"
+        );
+        assert!(
+            target_heads.contains(&Some(main_after_move.as_str())),
+            "{target_heads:?}"
+        );
+
+        // And now that the target is stable again (at S2), a further
+        // redelivery goes back to being an ordinary dedup — not an infinite
+        // reprocessing loop.
+        assert_eq!(
+            pipeline.enqueue(base_entry).unwrap(),
+            None,
+            "a stable post-move target must dedup again, not reprocess every redelivery forever"
+        );
+    }
+
+    /// The `landed` half of the same acceptance leg: once a candidate has
+    /// actually landed, the target moving FURTHER afterward must never
+    /// reopen it — a `landed` marker is sticky regardless of `target_head`,
+    /// unlike a `gate-held`/`rework-filed`/`escalated` one. Re-litigating an
+    /// already-delivered merge on every later redelivery would risk a
+    /// duplicate merge commit for zero benefit (module doc: the CAS already
+    /// makes a repeat land harmless, but there is still no reason to redo
+    /// the work).
+    #[tokio::test]
+    async fn moved_target_does_not_reopen_an_already_landed_verdict() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("work.txt"), "v1\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "work"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let base_entry = LandingQueueEntry {
+            repo_name: "moved-target-landed-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha,
+            diff_class: "doc-only".into(),
+            task: "moved-target-landed-task".into(),
+            ..Default::default()
+        };
+
+        pipeline.enqueue(base_entry.clone()).unwrap().unwrap();
+        let first = pipeline
+            .drain_key("moved-target-landed-repo", "main")
+            .await
+            .unwrap();
+        assert!(
+            matches!(first.as_slice(), [LandingOutcome::Landed(_)]),
+            "{first:?}"
+        );
+        let main_after_land = rev_parse(repo_dir.path(), "main");
+
+        // `main` advances further with unrelated work, same as any busy
+        // branch would between the real land and a later redelivered
+        // completion.
+        std::fs::write(repo_dir.path().join("unrelated.txt"), "other work\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(
+            repo_dir.path(),
+            &["commit", "-m", "unrelated work advances main again"],
+        );
+        let main_after_further_move = rev_parse(repo_dir.path(), "main");
+        assert_ne!(main_after_land, main_after_further_move);
+
+        assert_eq!(
+            pipeline.enqueue(base_entry).unwrap(),
+            None,
+            "a landed verdict must stay suppressed even after the target moves further, not \
+             reopen and risk a duplicate merge"
+        );
+        assert!(
+            space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                .unwrap()
+                .is_empty(),
+            "the suppressed redelivery must never leave a live queue entry behind"
+        );
+        assert_eq!(
+            rev_parse(repo_dir.path(), "main"),
+            main_after_further_move,
+            "no duplicate merge: main must not move again from the suppressed redelivery"
+        );
     }
 
     #[tokio::test]
