@@ -25,6 +25,7 @@ pub mod onboarding_apply;
 pub mod onboarding_proposals;
 pub mod onboarding_sessions;
 pub mod orchestrator_lease;
+pub mod phase_latency;
 pub mod proto;
 pub mod reactor;
 pub mod read_only_roles;

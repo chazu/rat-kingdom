@@ -987,6 +987,12 @@ impl Daemon {
         // `repeat_renotify_secs`, up to `max_renotifies` times — after which
         // it stands as a passive `rk inbox` row with no further pushes. `rk
         // inbox ack <id>` is the only thing that stops it early.
+        //
+        // The repository-policy phase latency sweep (TKT-01M0P974MQK5XE1MR9KQCWT654,
+        // `Daemon::phase_latency_sweep_once`) shares this exact tick rather than
+        // getting its own config/timer: both are periodic housekeeping this
+        // daemon already runs by default, and a repo with no `phaseLatency`
+        // targets configured short-circuits immediately.
         if daemon.recovery_sweep_config.enabled {
             let daemon_ref = Arc::clone(&daemon);
             let mut rc_shutdown = daemon.shutdown_tx.subscribe();
@@ -998,9 +1004,17 @@ impl Daemon {
                     tokio::select! {
                         _ = tick.tick() => {
                             let d = Arc::clone(&daemon_ref);
-                            match tokio::task::spawn_blocking(move || d.recovery_renotify_sweep_once()).await {
-                                Ok(0) => {}
-                                Ok(n) => debug!(pushed = n, "recovery re-notify sweep pushed escalations"),
+                            match tokio::task::spawn_blocking(move || {
+                                let recovery = d.recovery_renotify_sweep_once();
+                                let phase_latency = d.phase_latency_sweep_once();
+                                (recovery, phase_latency)
+                            }).await {
+                                Ok((0, 0)) => {}
+                                Ok((recovery, phase_latency)) => debug!(
+                                    pushed = recovery,
+                                    phase_latency_breaches = phase_latency,
+                                    "recovery re-notify sweep pushed escalations"
+                                ),
                                 Err(e) => warn!(error = %e, "recovery re-notify sweep task panicked"),
                             }
                         }
@@ -4826,6 +4840,107 @@ impl Daemon {
                 0
             }
         }
+    }
+
+    /// Repository-policy phase latency sweep body
+    /// (TKT-01M0P974MQK5XE1MR9KQCWT654): for every registered repo with at
+    /// least one `phaseLatency` target configured, classify its settled
+    /// `task_span` events and its current landing-queue occupancy against
+    /// that repo's targets, and durably announce any newly crossed breach
+    /// through the SAME B2 `RecoveryAnnouncer`/sink set every other
+    /// automated escalation in this daemon uses — see `crate::phase_latency`
+    /// for why this is detection-only (never kills, mutates, or bypasses a
+    /// gate) and how its own idempotency guard makes a repeated sweep tick
+    /// or a restart a no-op for an already-announced breach identity. Runs
+    /// on the SAME cadence as the B2 re-notify sweep rather than its own
+    /// config/timer: both are periodic housekeeping this daemon already
+    /// runs by default, and a repo with no targets configured (the
+    /// stack-neutral default) short-circuits before touching the space at
+    /// all, so this adds negligible cost to an unconfigured repo's tick.
+    fn phase_latency_sweep_once(&self) -> usize {
+        let repos = match self.repos.lock() {
+            Ok(guard) => guard.list(),
+            Err(_) => return 0,
+        };
+        if repos.is_empty() {
+            return 0;
+        }
+        let sinks = crate::reactor::sink_factory().registry(
+            self.notify_config
+                .resolved(self.reactor_config.notify_escalations),
+        );
+        let queue = crate::landing::landing_queue_snapshot(&self.space);
+        let mut announced = 0;
+        for repo in repos {
+            let policy = repo.effective_policy().phase_latency;
+            if policy.targets.is_empty() {
+                continue;
+            }
+            let terminal_spans: Vec<Value> = self
+                .space
+                .scan(
+                    &Pattern::category(Category::Event)
+                        .identity(crate::span::SPAN_IDENTITY)
+                        .scope(&repo.name),
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| t.payload)
+                .collect();
+            let live_probes: Vec<crate::phase_latency::LivePhaseProbe> = queue
+                .iter()
+                .filter(|entry| entry.repo == repo.name)
+                .map(|entry| {
+                    let phase = match entry.status {
+                        crate::landing::LandingEntryStatus::Queued
+                        | crate::landing::LandingEntryStatus::RunningGates => {
+                            crate::span::Phase::VerificationQueued
+                        }
+                        crate::landing::LandingEntryStatus::AwaitingReview => {
+                            crate::span::Phase::SemanticReview
+                        }
+                        crate::landing::LandingEntryStatus::Landing => {
+                            crate::span::Phase::Merge
+                        }
+                    };
+                    let mut capacity = std::collections::BTreeMap::new();
+                    capacity.insert(
+                        "queue_depth".to_string(),
+                        queue
+                            .iter()
+                            .filter(|e| e.repo == entry.repo && e.target == entry.target)
+                            .count()
+                            .to_string(),
+                    );
+                    crate::phase_latency::LivePhaseProbe {
+                        task: entry.task.clone(),
+                        phase,
+                        attempt: 1,
+                        elapsed_ms: entry.age_secs.max(0) as u64 * 1000,
+                        repo: Some(entry.repo.clone()),
+                        target: Some(entry.target.clone()),
+                        candidate: Some(entry.branch.clone()),
+                        capacity,
+                    }
+                })
+                .collect();
+            if terminal_spans.is_empty() && live_probes.is_empty() {
+                continue;
+            }
+            match crate::phase_latency::sweep_once(
+                &self.space,
+                &sinks,
+                &self.recovery_announcer,
+                "phase-latency-monitor",
+                &terminal_spans,
+                &live_probes,
+                &|_| policy.clone(),
+            ) {
+                Ok(breaches) => announced += breaches.len(),
+                Err(e) => warn!(error = %e, repo = %repo.name, "phase latency sweep failed"),
+            }
+        }
+        announced
     }
 
     /// B8 stale-`Running`-instance hard timeout sweep body: delegates to
