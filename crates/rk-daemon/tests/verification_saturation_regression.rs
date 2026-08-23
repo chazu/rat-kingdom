@@ -227,3 +227,243 @@ async fn wip4_admission_saturation_stays_bounded_starves_nothing_and_keeps_exact
          not just 8 checks running one at a time: observed peak was only {peak}"
     );
 }
+
+/// `rk-daemon` doesn't build the `rk` binary itself (no build-time
+/// dependency on `rk-cli`), so `cargo test -p rk-daemon` alone never
+/// populates it — same rationale/fallback as
+/// `managed_verification_cancel_e2e.rs::rk_bin`.
+fn rk_bin() -> String {
+    let path = std::env::var("CARGO_BIN_EXE_rk").unwrap_or_else(|_| {
+        let target_dir = std::env::var("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| support::workspace_root().join("target"));
+        target_dir
+            .join("debug")
+            .join("rk")
+            .to_string_lossy()
+            .into_owned()
+    });
+    assert!(
+        Path::new(&path).exists(),
+        "rk binary not found at {path} — build it first (`cargo build -p rk-cli --bin rk`) or \
+         run `cargo test --workspace`, which builds every workspace member including rk-cli."
+    );
+    path
+}
+
+fn install_long_verify_check(dir: &Path) {
+    let rk_dir = dir.join(".rk");
+    std::fs::create_dir_all(&rk_dir).unwrap();
+    std::fs::write(
+        rk_dir.join("checks.cue"),
+        r#"checks: [
+    {name: "verify", command: "echo $$ > verify.pid; sleep 20", timeout: "30s", environmentPolicy: "strip_rk_spawn"},
+]
+"#,
+    )
+    .unwrap();
+    git(dir, &["add", ".rk/checks.cue"]);
+    git(dir, &["commit", "-m", "test: install long verify check"]);
+}
+
+/// One fake harness script, behaviour selected by `$RK_FAKE_PROMPT` (the
+/// task text) — same technique `supervisor_sweep.rs`'s `COMBINED_FAKE`
+/// uses. Neither branch ever declares `rk_done`; both are meant to be acted
+/// on by the supervisor's liveness sweep, not to complete normally.
+///
+/// - `*alive-verifier*`: backgrounds a REAL `rk verify` call (through the
+///   real `rk` binary) against a check that writes its own pid then sleeps
+///   20s, waits for that pid file to exist, then goes silent itself — no
+///   more harness output, but a genuinely live verifier descendant process
+///   tree hangs off it.
+/// - anything else: goes silent immediately with no descendants at all —
+///   the plain STUCK case `supervisor_sweep.rs` already covers, included
+///   here as the negative control proving the sweep still reclaims a truly
+///   dead/silent generation while its live-verifier sibling survives.
+fn liveness_fake(rk: &str) -> String {
+    format!(
+        r#"
+echo '{{"type":"system","subtype":"init","session_id":"liveness-fake"}}'
+read -r _prompt
+case "$RK_FAKE_PROMPT" in
+  *alive-verifier*)
+    '{rk}' verify --repo "$RK_REPO" > verify-rpc-output.txt 2>&1 &
+    for i in $(seq 1 200); do
+      [ -f verify.pid ] && break
+      sleep 0.05
+    done
+    sleep 30
+    ;;
+  *)
+    sleep 120
+    ;;
+esac
+"#
+    )
+}
+
+fn process_alive(pid: i32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+async fn wait_for_pid(path: &Path) -> i32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(pid) = text.trim().parse() {
+                return pid;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the check's real child never wrote its own pid to {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// "live verifiers are not reaped" / "dead or transport-unhealthy
+/// generations are reclaimed" (TKT-01M0HNF2HR9Y0PY44RHY4Q245P's liveness
+/// evidence, exercised here as part of the saturation regression): one
+/// agent goes silent but has a real, live `rk verify` descendant process
+/// tree — it must survive the supervisor's sweep untouched. A second agent
+/// goes silent with NO descendants at all — it must be reclaimed as stuck
+/// within the configured grace window. Same tight-threshold technique as
+/// `supervisor_sweep.rs`.
+#[tokio::test]
+async fn live_verifier_descendant_survives_the_sweep_while_a_silent_dead_generation_is_reclaimed() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_name = init_repo(repo_dir.path());
+    install_long_verify_check(repo_dir.path());
+
+    let rk = rk_bin();
+    std::env::set_var("RK_FAKE_HARNESS_CMD", liveness_fake(&rk));
+
+    let layout = Layout::at(home.path());
+    let space = Space::open_in_memory().unwrap();
+    let mut daemon = Daemon::with_space_for_tests(
+        layout.clone(),
+        "test-castle".into(),
+        "fake".into(),
+        Budget::default(),
+        space,
+    )
+    .unwrap();
+    daemon.set_sweep_config(rk_core::config::SupervisorConfig {
+        enabled: true,
+        interval_secs: 1,
+        stuck_after_secs: 1,
+        burn_usd_per_min: 0.0,
+        kill_grace_secs: 2,
+        ..rk_core::config::SupervisorConfig::default()
+    });
+    tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    client
+        .call(
+            "repo.add",
+            json!({"name": &repo_name, "path": repo_dir.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+
+    let alive = client
+        .call(
+            "agent.spawn",
+            json!({
+                "repo": repo_dir.path().to_string_lossy(),
+                "task": "alive-verifier-1",
+                "harness": "fake",
+            }),
+        )
+        .await
+        .unwrap();
+    let alive_name = alive["agent"]["name"].as_str().unwrap().to_string();
+    let alive_worktree = std::path::PathBuf::from(alive["agent"]["worktree"].as_str().unwrap());
+
+    let dead = client
+        .call(
+            "agent.spawn",
+            json!({
+                "repo": repo_dir.path().to_string_lossy(),
+                "task": "silent-dead-1",
+                "harness": "fake",
+            }),
+        )
+        .await
+        .unwrap();
+    let dead_name = dead["agent"]["name"].as_str().unwrap().to_string();
+
+    let alive_pid = wait_for_pid(&alive_worktree.join("verify.pid")).await;
+    assert!(
+        process_alive(alive_pid),
+        "the alive agent's own real verify child must be running before the sweep can act"
+    );
+
+    let mut dead_failed = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        let status = client
+            .call("agent.status", json!({"name": &dead_name}))
+            .await
+            .unwrap();
+        if status["agent"]["state"].as_str() == Some("failed") {
+            dead_failed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        dead_failed,
+        "the silent, descendant-less generation must eventually be reclaimed as stuck"
+    );
+
+    let alive_status = client
+        .call("agent.status", json!({"name": &alive_name}))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            alive_status["agent"]["state"].as_str(),
+            Some("spawning") | Some("running")
+        ),
+        "an agent with a live verifier descendant must NOT be reaped even while its own \
+         output is silent: {alive_status}"
+    );
+    assert!(
+        process_alive(alive_pid),
+        "the live verifier's real child process must still be alive — the sweep must never \
+         have touched it"
+    );
+
+    let obstacles = client
+        .call("space.scan", json!({"category": "obstacle"}))
+        .await
+        .unwrap();
+    let stuck_kinds: Vec<String> = obstacles["tuples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["payload"]["type"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(
+        stuck_kinds.iter().any(|k| k == "stuck"),
+        "a stuck obstacle must have fired for the reclaimed dead generation: {stuck_kinds:?}"
+    );
+
+    // Best-effort cleanup: the live verifier's real child would otherwise
+    // hold its sleep for the rest of the suite's run.
+    let _ = Command::new("kill")
+        .args(["-9", &alive_pid.to_string()])
+        .status();
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
