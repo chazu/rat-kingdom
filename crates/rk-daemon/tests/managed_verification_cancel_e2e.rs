@@ -24,6 +24,17 @@ use std::process::Command;
 use std::time::Duration;
 use support::{connect, start_daemon};
 
+// Every test below but the first configures the fake harness through a
+// process-global environment variable (`RK_FAKE_HARNESS_CMD`). `#[tokio::test]`
+// bodies in one file run concurrently by default, so without this lock a
+// sibling test's `set_var` can clobber the value between this test's own
+// `set_var` and the moment its spawned agent's harness process actually reads
+// it — under `cargo test`'s default parallelism this reproduced 100% of the
+// time, not just under incidental load (same race workflow_checks.rs's
+// `HARNESS_ENV_LOCK` guards against). Held for the whole test body, released
+// only after `remove_var`, so a queued sibling never observes a half-set value.
+static HARNESS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .arg("-C")
@@ -289,6 +300,7 @@ async fn rpc_caller_disconnect_kills_the_real_managed_child_process() {
 /// spawn/RPC/harness machinery.
 #[tokio::test]
 async fn dismissing_a_live_agent_kills_its_own_in_flight_verify_run() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let layout = Layout::at(home.path());
     let repo_dir = tempfile::tempdir().unwrap();
@@ -318,6 +330,7 @@ async fn dismissing_a_live_agent_kills_its_own_in_flight_verify_run() {
         .unwrap();
 
     wait_for_death(child_pid).await;
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
 /// Isolation half of item (4) (TKT-01M0PBNGGZTNQPXB16214V4D7M): two real
@@ -329,6 +342,7 @@ async fn dismissing_a_live_agent_kills_its_own_in_flight_verify_run() {
 /// holds under two live agents rather than one.
 #[tokio::test]
 async fn dismissing_one_agent_does_not_touch_a_different_repos_in_flight_verify_run() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let layout = Layout::at(home.path());
 
@@ -376,6 +390,7 @@ async fn dismissing_one_agent_does_not_touch_a_different_repos_in_flight_verify_
         .await
         .unwrap();
     wait_for_death(pid_b).await;
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
 /// Item (1): the real `agent.interrupt` RPC (`Supervisor::interrupt`,
@@ -391,6 +406,7 @@ async fn dismissing_one_agent_does_not_touch_a_different_repos_in_flight_verify_
 /// path — not the SIGINT's own reach — can kill it.
 #[tokio::test]
 async fn interrupting_a_live_agent_kills_its_own_in_flight_verify_run() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let layout = Layout::at(home.path());
     let repo_dir = tempfile::tempdir().unwrap();
@@ -420,6 +436,7 @@ async fn interrupting_a_live_agent_kills_its_own_in_flight_verify_run() {
         .unwrap();
 
     wait_for_death(child_pid).await;
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
 /// Item (2): `HarnessEvent::Exited` firing with no explicit `interrupt` or
@@ -434,6 +451,7 @@ async fn interrupting_a_live_agent_kills_its_own_in_flight_verify_run() {
 /// that a deliberate operator action does.
 #[tokio::test]
 async fn a_harness_that_self_exits_after_declaring_done_kills_its_own_in_flight_verify_run() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let layout = Layout::at(home.path());
     let repo_dir = tempfile::tempdir().unwrap();
@@ -460,6 +478,7 @@ async fn a_harness_that_self_exits_after_declaring_done_kills_its_own_in_flight_
     // No RPC call here at all: the harness's own script does everything —
     // declares done, prints its result, and its process exits on its own.
     wait_for_death(child_pid).await;
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
 /// Item (4)'s heavier variant: cross-repo isolation proven under FOUR
@@ -470,6 +489,7 @@ async fn a_harness_that_self_exits_after_declaring_done_kills_its_own_in_flight_
 /// 2-agent proof above.
 #[tokio::test]
 async fn dismissing_one_of_several_concurrent_agents_only_cancels_its_own_verify_run() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     const N: usize = 4;
 
     let home = tempfile::tempdir().unwrap();
@@ -528,6 +548,7 @@ async fn dismissing_one_of_several_concurrent_agents_only_cancels_its_own_verify
             );
         }
     }
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
 /// Item (3): what a daemon restart does to a `verify.run` that was
@@ -580,6 +601,7 @@ async fn dismissing_one_of_several_concurrent_agents_only_cancels_its_own_verify
 /// respawn sweep can act on, not `running`.
 #[tokio::test]
 async fn daemon_restart_never_blocks_progress_on_a_run_that_was_in_flight_when_it_died() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let layout = Layout::at(home.path());
     let repo_dir = tempfile::tempdir().unwrap();
@@ -674,4 +696,5 @@ async fn daemon_restart_never_blocks_progress_on_a_run_that_was_in_flight_when_i
 
     handle_b.abort();
     let _ = handle_b.await;
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
