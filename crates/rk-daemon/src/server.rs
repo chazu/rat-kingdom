@@ -308,6 +308,15 @@ impl Daemon {
         daemon
             .supervisor
             .set_shared_cargo_target(config.disk.shared_cargo_target);
+        daemon.supervisor.set_verification_admission_limits(
+            config.policy.verification_admission_limit,
+            config
+                .policy
+                .verification_admission_limit_by_repo
+                .clone()
+                .into_iter()
+                .collect(),
+        );
         daemon
             .supervisor
             .set_done_kill_grace_secs(config.supervisor.done_kill_grace_secs);
@@ -2425,6 +2434,7 @@ impl Daemon {
                 )
             }
             "workflow.run" => reply(self.handle_workflow_run(req).await),
+            "verify.run" => reply(self.handle_verify_run(req).await),
             "factory.propose_action" => reply(self.handle_factory_propose_action(req)),
             "factory.approve_action" => reply(self.handle_factory_approve_action(req)),
             "factory.execute_action" => reply(self.handle_factory_execute_action(req).await),
@@ -6833,6 +6843,86 @@ impl Daemon {
         }
     }
 
+    /// `verify.run` — the managed alternative to a rat self-invoking a full
+    /// verification suite directly (TKT-01M0HNESEECWWFQF8X6VH1XSJ6): resolves
+    /// `params.check` (default `"verify"`) from the caller's own repo
+    /// registry, and runs it through [`WorkflowEngine::verify_repo_check`] —
+    /// the exact same bounded per-repo admission queue, env-stripped
+    /// execution, and exact-exit provenance a landing gate or workflow `run`
+    /// step already gets from `run_check_in`.
+    ///
+    /// The operator (or an unauthenticated/empty caller) runs against the
+    /// repo's registered root checkout; any other caller must be a
+    /// currently-supervised agent whose OWN `repo_name` matches `params.repo`
+    /// — an agent cannot direct a verification run at a repo it is not
+    /// working in, and runs in ITS OWN worktree (uncommitted branch work
+    /// included), not a shared checkout.
+    async fn handle_verify_run(&self, req: Request) -> Response {
+        let params: VerifyRunParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let check_name = params.check.as_deref().unwrap_or("verify").to_string();
+        let dir = if req.caller.is_empty() || req.caller == crate::client::OPERATOR {
+            match self.repos.lock() {
+                Ok(registry) => match registry.get(&params.repo) {
+                    Some(record) => record.path.clone(),
+                    None => {
+                        return Response::err(
+                            req.id,
+                            codes::BAD_PARAMS,
+                            format!("no repo registered named '{}'", params.repo),
+                        )
+                    }
+                },
+                Err(_) => {
+                    return Response::err(req.id, codes::INTERNAL, "repo registry lock poisoned")
+                }
+            }
+        } else {
+            let Some(record) = self.supervisor.status(&req.caller) else {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    format!("no agent record for caller '{}'", req.caller),
+                );
+            };
+            if record.repo_name != params.repo {
+                return Response::err(
+                    req.id,
+                    codes::FORBIDDEN,
+                    format!(
+                        "{} may only verify.run its own repo ('{}'), not '{}'",
+                        req.caller, record.repo_name, params.repo
+                    ),
+                );
+            }
+            match record.worktree {
+                Some(worktree) => worktree,
+                None => {
+                    return Response::err(
+                        req.id,
+                        codes::INTERNAL,
+                        format!("agent '{}' has no worktree", req.caller),
+                    )
+                }
+            }
+        };
+        let caller_label = if req.caller.is_empty() {
+            crate::client::OPERATOR
+        } else {
+            req.caller.as_str()
+        };
+        match self
+            .engine()
+            .verify_repo_check(caller_label, &dir, &params.repo, &check_name)
+            .await
+        {
+            Ok(result) => Response::ok(req.id, result),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
     /// `agent.archive` — offload settled terminal records out of the default
     /// views. The daemon owns `agents.json` and rewrites it on every mutation,
     /// so this has to be an RPC: an external edit would be clobbered by the
@@ -8020,6 +8110,15 @@ struct WorkflowRunParams {
     /// Stable coordinator-session identity for owned-workflow monitoring.
     #[serde(default)]
     coordinator: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VerifyRunParams {
+    repo: String,
+    /// Named check to run (`<repo>/.rk/checks.cue`). Defaults to `"verify"`,
+    /// the conventional name for the full workspace suite.
+    #[serde(default)]
+    check: Option<String>,
 }
 
 #[derive(Deserialize)]

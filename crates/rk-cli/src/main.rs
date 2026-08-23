@@ -23,7 +23,7 @@ use clap::{Args, Parser, Subcommand};
 use rk_core::config::Config;
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[derive(Parser)]
 #[command(
@@ -217,6 +217,22 @@ enum Command {
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
+    },
+    /// Run a named repo check (`.rk/checks.cue`, default "verify") through
+    /// the daemon's `verify.run` RPC — the managed alternative to
+    /// self-invoking a full suite directly, so the run goes through the same
+    /// bounded per-repo verification admission queue a landing gate or
+    /// workflow `run` step gets (TKT-01M0HNESEECWWFQF8X6VH1XSJ6). Exits with
+    /// the check's own exit code.
+    Verify {
+        /// Repo name to verify (defaults to $RK_REPO — the repo a spawned
+        /// rat is working in). An agent caller may only verify its own repo;
+        /// the operator may verify any registered repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Named check to run. Defaults to "verify".
+        #[arg(long)]
+        check: Option<String>,
     },
     /// Install and audit deployed `#Trigger` definitions (global and
     /// repo-local), so a source-of-truth check can catch a stale trigger left
@@ -1338,6 +1354,39 @@ async fn main() -> Result<()> {
                         anyhow::bail!("workflow definitions are not synchronized");
                     }
                 }
+            }
+        }
+        Command::Verify { repo, check } => {
+            let repo = repo
+                .or_else(|| std::env::var("RK_REPO").ok())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("--repo is required (or run inside a rat with $RK_REPO set)")
+                })?;
+            let mut client = Client::connect_or_spawn(&layout).await?;
+            let mut params = serde_json::Map::new();
+            params.insert("repo".into(), json!(repo));
+            if let Some(check) = check {
+                params.insert("check".into(), json!(check));
+            }
+            let result = client.call("verify.run", Value::Object(params)).await?;
+            let exit = result["exit"].as_i64().unwrap_or(1);
+            if cli.json {
+                println!("{result}");
+            } else {
+                if let Some(stdout) = result["stdout"].as_str().filter(|s| !s.is_empty()) {
+                    println!("{stdout}");
+                }
+                if let Some(stderr) = result["stderr"].as_str().filter(|s| !s.is_empty()) {
+                    eprintln!("{stderr}");
+                }
+                println!(
+                    "verify: {} (exit {exit})",
+                    result["verdict"].as_str().unwrap_or("?"),
+                );
+            }
+            if exit != 0 {
+                std::process::exit(exit.clamp(1, 255) as i32);
             }
         }
         Command::Trigger { command } => match command {

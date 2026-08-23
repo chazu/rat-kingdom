@@ -613,6 +613,14 @@ pub struct Supervisor {
     /// Only ever contended when [`shared_cargo_target`](Self::shared_cargo_target)
     /// is also on — see [`TestExecLock`] for why.
     test_exec_lock: TestExecLock,
+    /// Bounded per-repo admission queue for daemon-managed verification runs
+    /// (`WorkflowEngine::run_check_in`, gated to `sharedCargoTarget` checks —
+    /// TKT-01M0HNESEECWWFQF8X6VH1XSJ6). Distinct from [`test_exec_lock`](Self::test_exec_lock):
+    /// that lock serializes a shared-disk hazard down to exactly 1 concurrent
+    /// runner; this queue bounds CPU/wall-clock contention and its limit is a
+    /// configurable policy value that may be raised above 1. See
+    /// [`VerificationAdmission`].
+    verification_admission: VerificationAdmission,
     /// `[disk] min_free_gb` (0 = disabled), applied by `Daemon::new` from
     /// config. Defaults to 0 here — a bare `Supervisor` constructed directly
     /// by a test or another crate stays disk-guard-free unless it opts in via
@@ -843,6 +851,98 @@ impl TestExecLock {
     }
 }
 
+/// Bounded per-repository admission queue for daemon-managed verification
+/// runs (TKT-01M0HNESEECWWFQF8X6VH1XSJ6): the ONE gate `run_check_in` sends
+/// every `sharedCargoTarget` check through, whether it was dispatched by a
+/// landing gate, a workflow `run` step, or the `verify.run` RPC an
+/// agent/reviewer's own completion check calls into instead of self-invoking
+/// a full suite. Keyed per repo, exactly like [`TestExecLock`] — the two are
+/// independent resources (this bounds CPU/wall-clock contention across
+/// concurrent full-suite runs; `TestExecLock` serializes a shared-disk build
+/// hazard down to 1), so a check that opts into `sharedCargoTarget` acquires
+/// BOTH, in the order [`WorkflowEngine::run_check_in`] declares them.
+///
+/// Backed by `tokio::sync::Semaphore`, which grants permits in acquire order
+/// (FIFO) — the fairness property the ticket asks to be provable. A repo's
+/// semaphore is created lazily, sized to its configured limit at that moment;
+/// changing the configured limit at runtime does not resize an
+/// already-created semaphore (matches this codebase's existing
+/// `TestExecLock`/`shared_cargo_target` precedent of reading config once at
+/// daemon startup, not live-reloading mid-flight).
+///
+/// RESTART RECOVERY IS AUTOMATIC: every field here is in-memory only, with no
+/// durable counterpart. A daemon restart drops this struct along with every
+/// outstanding `OwnedSemaphorePermit` it had handed out — there is no state
+/// to leak or to recover, because there is no state that survives the
+/// process. The next daemon simply starts every repo's semaphore fresh, full
+/// of permits. (Contrast a durable lease record, which WOULD need explicit
+/// restart-recovery logic to avoid permanently stranding a permit whose
+/// holder died with the old process — deliberately not built, since it would
+/// only add a way to leak what the in-memory design cannot.)
+#[derive(Default)]
+struct VerificationAdmission {
+    semaphores: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Fleet-wide default WIP limit; `0` disables admission control (no
+    /// semaphore is ever created, so an unconfigured repo pays zero overhead
+    /// beyond the lookup itself).
+    default_limit: AtomicU64,
+    /// Per-repo overrides, keyed by repo name — same convention as
+    /// `rk_core::config::PolicyConfig::verification_admission_limit_by_repo`.
+    overrides: Mutex<HashMap<String, u32>>,
+}
+
+impl VerificationAdmission {
+    fn set_limits(&self, default_limit: u32, overrides: HashMap<String, u32>) {
+        self.default_limit
+            .store(u64::from(default_limit), Ordering::Relaxed);
+        *self.overrides.lock().unwrap() = overrides;
+    }
+
+    /// The configured WIP limit for `repo` — its own override if set, else
+    /// the fleet-wide default. `0` means admission control is off for this
+    /// repo.
+    fn limit_for(&self, repo: &str) -> u32 {
+        self.overrides
+            .lock()
+            .unwrap()
+            .get(repo)
+            .copied()
+            .unwrap_or(self.default_limit.load(Ordering::Relaxed) as u32)
+    }
+
+    /// Acquire one admission permit for `repo`, waiting in FIFO order behind
+    /// any earlier waiter. Returns the held permit together with how long
+    /// this call waited for it — the queue-wait half of the ticket's durable
+    /// timing requirement (the caller times execution itself). `None` when
+    /// admission control is disabled for `repo` (limit 0): every caller must
+    /// treat that as "proceed unbounded", matching pre-existing behaviour.
+    async fn acquire(
+        &self,
+        repo: &str,
+        limit: u32,
+    ) -> Option<(tokio::sync::OwnedSemaphorePermit, std::time::Duration)> {
+        if limit == 0 {
+            return None;
+        }
+        let sem = {
+            let mut semaphores = self.semaphores.lock().unwrap();
+            Arc::clone(
+                semaphores
+                    .entry(repo.to_string())
+                    .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(limit as usize))),
+            )
+        };
+        let started = std::time::Instant::now();
+        // A semaphore is only ever closed by `close()`, which nothing here
+        // calls — this can never actually return `Err`.
+        let permit = sem
+            .acquire_owned()
+            .await
+            .expect("verification admission semaphore is never closed");
+        Some((permit, started.elapsed()))
+    }
+}
+
 /// Which of an archived record's leftovers `rk prune` should reclaim, beyond
 /// the record itself. Named fields rather than two positional `bool`s, because
 /// silently swapping them is exactly the bug worth designing out.
@@ -956,6 +1056,7 @@ impl Supervisor {
             merge_queue: MergeQueue::default(),
             landing_pipeline: Mutex::new(None),
             test_exec_lock: TestExecLock::default(),
+            verification_admission: VerificationAdmission::default(),
             min_free_disk_gb: AtomicU64::new(0),
             max_load_per_cpu_bits: AtomicU64::new(0f64.to_bits()),
             shared_cargo_target: AtomicBool::new(false),
@@ -1045,6 +1146,73 @@ impl Supervisor {
         repo: &str,
     ) -> tokio::sync::OwnedMutexGuard<()> {
         self.test_exec_lock.acquire(repo).await
+    }
+
+    /// Set `[policy] verification_admission_limit` / `_by_repo`. Applied by
+    /// `Daemon::new` from config, same pattern as
+    /// [`set_min_free_disk_gb`](Supervisor::set_min_free_disk_gb).
+    pub fn set_verification_admission_limits(
+        &self,
+        default_limit: u32,
+        overrides: HashMap<String, u32>,
+    ) {
+        self.verification_admission
+            .set_limits(default_limit, overrides);
+    }
+
+    /// The configured verification admission WIP limit for `repo` (0 =
+    /// disabled). Exposed so a caller can decide whether to bother measuring
+    /// queue-wait/execution timing at all before calling
+    /// [`acquire_verification_admission`](Self::acquire_verification_admission).
+    pub(crate) fn verification_admission_limit_for(&self, repo: &str) -> u32 {
+        self.verification_admission
+            .limit_for(&self.verification_repo_identity(repo))
+    }
+
+    /// Acquire one bounded per-repo verification admission permit for `repo`.
+    /// See [`VerificationAdmission`] for what this bounds, the FIFO fairness
+    /// guarantee, and why a daemon restart can never leak one.
+    pub(crate) async fn acquire_verification_admission(
+        &self,
+        repo: &str,
+        limit: u32,
+    ) -> Option<(tokio::sync::OwnedSemaphorePermit, std::time::Duration)> {
+        self.verification_admission
+            .acquire(&self.verification_repo_identity(repo), limit)
+            .await
+    }
+
+    /// Normalize `repo` — whatever shape reached
+    /// [`WorkflowEngine::run_check_in`](crate::workflow_exec::WorkflowEngine::run_check_in)
+    /// — to the one stable identity every [`VerificationAdmission`] bound,
+    /// and the durable event recording it, must agree on (continuation of
+    /// TKT-01M0HNESEECWWFQF8X6VH1XSJ6). Four call paths reach `run_check_in`
+    /// with two different shapes: a workflow `run` step or reactor dispatch
+    /// passes the repo's absolute, already-canonicalized checkout PATH
+    /// (`instance.repo` / the registry's own `record.path`); a landing gate
+    /// or `verify.run` passes its already-registered bare NAME
+    /// (`entry.repo_name` / `VerifyRunParams.repo`). An absolute path is
+    /// resolved here to its registered NAME via the repo registry —
+    /// deliberately NOT to its directory basename (contrast
+    /// `crate::workflow_exec::repo_name_of`): two independently registered
+    /// repos can share a directory basename, so keying on basename would
+    /// collide two distinct admission bounds into one. A path with no
+    /// registry match, or a string that was already a bare name, is returned
+    /// unchanged — a bare name is already the stable identity
+    /// landing/`verify.run` use, and an unregistered path has no name to
+    /// resolve to.
+    pub(crate) fn verification_repo_identity(&self, repo: &str) -> String {
+        let path = std::path::Path::new(repo);
+        if path.is_absolute() {
+            if let Ok(registry) =
+                crate::repos::RepoRegistry::load(&self.layout.home().join("repos.json"))
+            {
+                if let Some(record) = registry.get_by_path(path) {
+                    return record.name.clone();
+                }
+            }
+        }
+        repo.to_string()
     }
 
     /// Pause or resume new-agent admission ([`spawn`](Self::spawn)). Used by
@@ -7198,5 +7366,259 @@ mod respawn_tests {
             .await
             .expect("the failed attempt's reservation must have been released");
         assert!(record.state.is_live());
+    }
+}
+
+/// Acceptance properties for the bounded per-repo verification admission
+/// queue (TKT-01M0HNESEECWWFQF8X6VH1XSJ6) that are properties of
+/// [`VerificationAdmission`]/[`Supervisor`] alone — FIFO fairness, the
+/// configured bound, cross-repo independence, and restart recovery — as
+/// opposed to the [`crate::workflow_exec`] properties (exact exit
+/// provenance, the landing-gate/`verify.run` shared bound, proof reuse) that
+/// need a full [`crate::workflow_exec::WorkflowEngine`] to exercise.
+#[cfg(test)]
+mod verification_admission_tests {
+    use super::*;
+    use rk_ledger::{Budget, FleetBudget};
+    use std::path::Path;
+    use std::time::Duration;
+
+    fn sup(home: &Path) -> Arc<Supervisor> {
+        let layout = Layout::at(home);
+        let tickets = Arc::new(crate::tickets::Tickets::new(
+            Space::open_in_memory().unwrap(),
+            "castle".into(),
+        ));
+        Arc::new(
+            Supervisor::new(
+                layout,
+                "castle".into(),
+                "fake".into(),
+                Budget::default(),
+                FleetBudget::default(),
+                Space::open_in_memory().unwrap(),
+                tickets,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A configured limit of N never admits an (N+1)th concurrent holder:
+    /// the (N+1)th `acquire` stays unresolved until an earlier permit is
+    /// dropped.
+    #[tokio::test]
+    async fn acquire_verification_admission_bounds_concurrency_to_the_configured_limit() {
+        let home = tempfile::tempdir().unwrap();
+        let s = sup(home.path());
+        s.set_verification_admission_limits(1, HashMap::new());
+
+        let (first, _wait) = s.acquire_verification_admission("repo-a", 1).await.unwrap();
+
+        let s2 = s.clone();
+        let mut second = Box::pin(s2.acquire_verification_admission("repo-a", 1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "a second acquire must block while the configured limit's only permit is held"
+        );
+
+        drop(first);
+        let _ = tokio::time::timeout(Duration::from_millis(200), second)
+            .await
+            .expect("releasing the held permit must unblock the waiter")
+            .unwrap();
+    }
+
+    /// FIFO fairness (documented on `VerificationAdmission`, backed by
+    /// `tokio::sync::Semaphore`): permits are granted in acquire order, not
+    /// arbitrary scheduler order.
+    #[tokio::test]
+    async fn acquire_verification_admission_grants_permits_in_fifo_order() {
+        let home = tempfile::tempdir().unwrap();
+        let s = sup(home.path());
+        s.set_verification_admission_limits(1, HashMap::new());
+
+        let (first, _wait) = s
+            .acquire_verification_admission("repo-fifo", 1)
+            .await
+            .unwrap();
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+        let s_b = s.clone();
+        let order_b = order.clone();
+        let task_b = tokio::spawn(async move {
+            let (_permit, _wait) = s_b
+                .acquire_verification_admission("repo-fifo", 1)
+                .await
+                .unwrap();
+            order_b.lock().unwrap().push("B");
+        });
+        // Give B time to actually reach its `.await` and join the semaphore's
+        // wait queue before C is spawned, so acquire order is deterministic.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let s_c = s.clone();
+        let order_c = order.clone();
+        let task_c = tokio::spawn(async move {
+            let (_permit, _wait) = s_c
+                .acquire_verification_admission("repo-fifo", 1)
+                .await
+                .unwrap();
+            order_c.lock().unwrap().push("C");
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        drop(first);
+        task_b.await.unwrap();
+        task_c.await.unwrap();
+
+        assert_eq!(*order.lock().unwrap(), vec!["B", "C"]);
+    }
+
+    /// Two different repos never share a bound: repo-a's outstanding permit
+    /// must never block repo-b's acquire, even at the same configured limit.
+    #[tokio::test]
+    async fn independent_repos_do_not_serialize_against_each_other() {
+        let home = tempfile::tempdir().unwrap();
+        let s = sup(home.path());
+        s.set_verification_admission_limits(1, HashMap::new());
+
+        let (_a, _wait) = s.acquire_verification_admission("repo-a", 1).await.unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(100),
+            s.acquire_verification_admission("repo-b", 1),
+        )
+        .await
+        .expect(
+            "a different repo's admission queue must not be blocked by repo-a's outstanding permit",
+        )
+        .unwrap();
+    }
+
+    /// Restart recovery is automatic because there is nothing durable to
+    /// recover: a fresh `Supervisor` (standing in for the next daemon
+    /// process) never inherits a permit an earlier instance handed out and
+    /// never released — even one deliberately leaked here to stand in for a
+    /// holder that died mid-check.
+    #[tokio::test]
+    async fn a_fresh_supervisor_never_inherits_a_predecessors_leaked_permit() {
+        let home = tempfile::tempdir().unwrap();
+        let before_restart = sup(home.path());
+        before_restart.set_verification_admission_limits(1, HashMap::new());
+        let (leaked, _wait) = before_restart
+            .acquire_verification_admission("repo-restart", 1)
+            .await
+            .unwrap();
+        // Simulate the old process dying while still holding the permit: it
+        // is never dropped/released, just abandoned along with `before_restart`.
+        std::mem::forget(leaked);
+        drop(before_restart);
+
+        let after_restart = sup(home.path());
+        after_restart.set_verification_admission_limits(1, HashMap::new());
+        let _ = tokio::time::timeout(
+            Duration::from_millis(100),
+            after_restart.acquire_verification_admission("repo-restart", 1),
+        )
+        .await
+        .expect(
+            "a fresh Supervisor must start with a full complement of permits, unaffected by a predecessor's leaked one",
+        )
+        .unwrap();
+    }
+
+    /// Register one repo under `home/repos.json`, standing in for
+    /// `handle_repo_add`'s already-canonicalized-path effect.
+    fn register_repo(home: &Path, name: &str, path: &Path) {
+        let mut registry = crate::repos::RepoRegistry::load(&home.join("repos.json")).unwrap();
+        registry
+            .add(crate::repos::RepoRecord {
+                name: name.into(),
+                path: path.to_path_buf(),
+                created_at: Utc::now(),
+                merge_mode: Default::default(),
+                remote: None,
+                host: None,
+                activated_policy: None,
+            })
+            .unwrap();
+    }
+
+    /// The resolution [`Supervisor::verification_admission_limit_for`],
+    /// [`Supervisor::acquire_verification_admission`], and
+    /// `record_verification_admission_event` (`crate::workflow_exec`) all go
+    /// through (continuation of TKT-01M0P5NM51SKT5ABXRCDZD07J3): a registered
+    /// repo's absolute path resolves to its registered NAME, matching what a
+    /// landing gate/`verify.run` already pass directly.
+    #[tokio::test]
+    async fn verification_repo_identity_resolves_a_registered_path_to_its_name() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        register_repo(home.path(), "acme", repo_dir.path());
+        let s = sup(home.path());
+
+        assert_eq!(
+            s.verification_repo_identity(&repo_dir.path().display().to_string()),
+            "acme"
+        );
+    }
+
+    /// An absolute path with no registry match, and a string that was already
+    /// a bare name, both pass through unchanged — there is nothing to
+    /// resolve an unregistered path to, and a bare name is already the
+    /// stable identity landing/`verify.run` use.
+    #[tokio::test]
+    async fn verification_repo_identity_leaves_unregistered_paths_and_bare_names_unchanged() {
+        let home = tempfile::tempdir().unwrap();
+        let s = sup(home.path());
+
+        assert_eq!(
+            s.verification_repo_identity("some-bare-name"),
+            "some-bare-name"
+        );
+        assert_eq!(
+            s.verification_repo_identity("/no/such/registered/repo"),
+            "/no/such/registered/repo"
+        );
+    }
+
+    /// The acceptance property basename-keying would have broken: two
+    /// INDEPENDENTLY registered repos that merely happen to share a
+    /// directory basename must never collide into one admission bound.
+    #[tokio::test]
+    async fn verification_repo_identity_does_not_collide_two_repos_sharing_a_directory_basename() {
+        let home = tempfile::tempdir().unwrap();
+        let parent_a = tempfile::tempdir().unwrap();
+        let parent_b = tempfile::tempdir().unwrap();
+        let repo_a = parent_a.path().join("backend");
+        let repo_b = parent_b.path().join("backend");
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::create_dir_all(&repo_b).unwrap();
+        register_repo(home.path(), "team-a-backend", &repo_a);
+        register_repo(home.path(), "team-b-backend", &repo_b);
+        let s = sup(home.path());
+
+        assert_eq!(
+            s.verification_repo_identity(&repo_a.display().to_string()),
+            "team-a-backend"
+        );
+        assert_eq!(
+            s.verification_repo_identity(&repo_b.display().to_string()),
+            "team-b-backend"
+        );
+
+        s.set_verification_admission_limits(1, HashMap::new());
+        let (_a, _wait) = s
+            .acquire_verification_admission(&repo_a.display().to_string(), 1)
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(100),
+            s.acquire_verification_admission(&repo_b.display().to_string(), 1),
+        )
+        .await
+        .expect("two repos sharing a directory basename must not share an admission bound")
+        .unwrap();
     }
 }
