@@ -6835,4 +6835,230 @@ test a::flaky ... FAILED
         assert_eq!(after.status, InstanceStatus::Failed);
         assert!(after.error.unwrap().contains("stale-instance timeout"));
     }
+
+    // --- Verification admission queue (TKT-01M0HNESEECWWFQF8X6VH1XSJ6):
+    // properties that need a full `WorkflowEngine` (`find_check`,
+    // `run_check_in`, `verify_repo_check`) to exercise, as opposed to the
+    // FIFO/bound/independence/restart properties of `VerificationAdmission`
+    // alone, covered in `supervisor::verification_admission_tests`. ---
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A clean, committed git worktree — the precondition `clean_candidate_sha`
+    /// requires before verification-proof reuse ever engages.
+    fn init_clean_repo(dir: &Path) {
+        git(dir, &["init", "-b", "main"]);
+        git(dir, &["config", "user.email", "r@x"]);
+        git(dir, &["config", "user.name", "R"]);
+        std::fs::write(dir.join("readme"), "hello\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-m", "init"]);
+    }
+
+    /// Write a single named check to `<dir>/.rk/checks.cue`. `command` must
+    /// avoid embedded double quotes and `\(` (the CUE string-interpolation
+    /// escape) — every command built by the tests below sticks to single
+    /// quotes for paths, so this is always safe.
+    fn write_check(dir: &Path, name: &str, command: &str, shared_cargo_target: bool) {
+        std::fs::create_dir_all(dir.join(".rk")).unwrap();
+        let cue = format!(
+            "checks: [{{name: \"{name}\", command: \"{command}\", timeout: \"5s\", environmentPolicy: \"strip_rk_spawn\", sharedCargoTarget: {shared_cargo_target}}}]",
+        );
+        std::fs::write(dir.join(".rk").join("checks.cue"), cue).unwrap();
+    }
+
+    /// `verify_repo_check` — the `verify.run`-mediated path a rat's `rk
+    /// verify` ultimately calls — must surface the check's EXACT child exit
+    /// code, not a masked/rounded one: `run_check_in`'s inline `expectExit`
+    /// gate is deliberately unset for this caller (see its doc comment), so
+    /// a failing check comes back as a clean `Ok` result carrying `exit`
+    /// verbatim.
+    #[tokio::test]
+    async fn verify_repo_check_returns_the_exact_child_exit_code() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        let repo_dir = tempfile::tempdir().unwrap();
+        write_check(repo_dir.path(), "verify", "exit 37", false);
+
+        let result = engine
+            .verify_repo_check("agent", repo_dir.path(), "repo-exact-exit", "verify")
+            .await
+            .unwrap();
+
+        assert_eq!(result["exit"], json!(37));
+        assert_eq!(result["verdict"], json!("fail"));
+    }
+
+    /// The ticket's explicit shared-bound goal: a landing gate (which calls
+    /// `run_check_in` directly with `entry.repo_name`, per
+    /// `LandingPipeline::run_gates_at`) and `verify.run` (which calls
+    /// `verify_repo_check`, itself a `run_check_in` wrapper) for the SAME
+    /// bare repo name must contend for one admission permit, not two. Proven
+    /// by running both concurrently at limit 1 and showing neither ever
+    /// observes the other's in-flight marker file: whichever starts second
+    /// cannot even spawn its child process until the first's `run_check_in`
+    /// call — marker file removal included — has fully returned and released
+    /// the permit.
+    #[tokio::test]
+    async fn landing_gate_and_verify_run_share_one_admission_bound_for_the_same_repo_name() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        engine
+            .supervisor
+            .set_verification_admission_limits(1, HashMap::new());
+        let shared = tempfile::tempdir().unwrap();
+        let shared_path = shared.path().display().to_string();
+        let repo_name = "acme-shared-bound";
+
+        // The "landing gate" side: exactly `LandingPipeline::run_gates_at`'s
+        // call shape (`run_check_in` direct, no `verify_repo_check`
+        // indirection), holding the marker for 300ms.
+        let landing_resolved = ResolvedRun {
+            command: format!(
+                "touch '{shared_path}/landing-marker'; sleep 0.3; \
+                 if [ -f '{shared_path}/verify-marker' ]; then echo yes; else echo no; fi \
+                 > '{shared_path}/landing-saw'; rm -f '{shared_path}/landing-marker'"
+            ),
+            cwd: None,
+            expect_exit: None,
+            timeout: "5s".into(),
+            on_timeout: OnTimeout::Fail,
+            environment_policy: rk_workflow::CheckEnvironmentPolicy::StripRkSpawn,
+            retry_on_fail: 0,
+            shared_cargo_target: true,
+        };
+        let landing_dir = tempfile::tempdir().unwrap();
+
+        // The `verify.run` side: through `verify_repo_check`/`find_check`,
+        // starting shortly after the landing side so it would see the
+        // landing marker if the two were NOT serialized against each other.
+        let verify_dir = tempfile::tempdir().unwrap();
+        write_check(
+            verify_dir.path(),
+            "verify",
+            &format!(
+                "sleep 0.05; touch '{shared_path}/verify-marker'; \
+                 if [ -f '{shared_path}/landing-marker' ]; then echo yes; else echo no; fi \
+                 > '{shared_path}/verify-saw'; rm -f '{shared_path}/verify-marker'"
+            ),
+            true,
+        );
+
+        let landing = engine.run_check_in(
+            "inst-landing",
+            repo_name,
+            "daemon",
+            landing_dir.path(),
+            &landing_resolved.command,
+            &landing_resolved,
+            &[],
+            Duration::from_secs(5),
+            None,
+        );
+        let verify = engine.verify_repo_check("agent", verify_dir.path(), repo_name, "verify");
+        let (landing_result, verify_result) = tokio::join!(landing, verify);
+        landing_result.unwrap();
+        verify_result.unwrap();
+
+        let landing_saw =
+            std::fs::read_to_string(shared.path().join("landing-saw")).unwrap_or_default();
+        let verify_saw =
+            std::fs::read_to_string(shared.path().join("verify-saw")).unwrap_or_default();
+        assert_eq!(
+            landing_saw.trim(),
+            "no",
+            "the landing gate must never observe verify.run's marker: a shared bound means \
+             verify.run cannot even start its child process until the landing gate's whole \
+             run_check_in call (marker removal included) has returned"
+        );
+        assert_eq!(
+            verify_saw.trim(),
+            "no",
+            "verify.run must never observe the landing gate's marker for the same reason"
+        );
+    }
+
+    /// A durable verification proof is reused for an EXACT match (same repo,
+    /// same clean candidate sha, same check) instead of re-running the
+    /// check — but the moment the worktree goes dirty, the cache is never
+    /// consulted again: `clean_candidate_sha` has no stable identity to key
+    /// on, so every call after that runs fresh, however many prior clean
+    /// proofs exist.
+    #[tokio::test]
+    async fn verify_repo_check_reuses_an_exact_proof_but_never_for_a_dirty_worktree() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_clean_repo(repo_dir.path());
+        let counter = tempfile::tempdir().unwrap();
+        let counter_file = counter.path().join("count").display().to_string();
+        write_check(
+            repo_dir.path(),
+            "verify",
+            &format!(
+                "n=$(cat '{counter_file}' 2>/dev/null || echo 0); n=$((n+1)); \
+                 echo $n > '{counter_file}'; exit 0"
+            ),
+            false,
+        );
+        // `.rk/checks.cue` itself must be committed, or the worktree is
+        // "dirty" (untracked) before the test even starts.
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "add check"]);
+
+        let first = engine
+            .verify_repo_check("agent", repo_dir.path(), "repo-proof-reuse", "verify")
+            .await
+            .unwrap();
+        assert_eq!(first["exit"], json!(0));
+        assert!(
+            first.get("reused").is_none(),
+            "the first run has no prior proof to reuse: {first:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&counter_file).unwrap().trim(), "1");
+
+        // Same clean candidate sha, same check: an exact-match reuse, no
+        // second execution.
+        let second = engine
+            .verify_repo_check("agent", repo_dir.path(), "repo-proof-reuse", "verify")
+            .await
+            .unwrap();
+        assert_eq!(second["reused"], json!(true));
+        assert_eq!(second["reused_from"], json!("verification_proof"));
+        assert_eq!(
+            std::fs::read_to_string(&counter_file).unwrap().trim(),
+            "1",
+            "an exact-match proof must never re-run the check"
+        );
+
+        // Dirty the worktree: candidate_sha now resolves to None, so the
+        // cache (despite holding a valid proof for the old clean sha) is
+        // never consulted — a fresh run every time.
+        std::fs::write(repo_dir.path().join("scratch.txt"), "uncommitted\n").unwrap();
+        let third = engine
+            .verify_repo_check("agent", repo_dir.path(), "repo-proof-reuse", "verify")
+            .await
+            .unwrap();
+        assert!(
+            third.get("reused").is_none(),
+            "a dirty worktree must never reuse a proof: {third:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&counter_file).unwrap().trim(),
+            "2",
+            "a dirty worktree must run the check fresh"
+        );
+    }
 }

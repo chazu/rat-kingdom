@@ -7326,3 +7326,169 @@ mod respawn_tests {
         assert!(record.state.is_live());
     }
 }
+
+/// Acceptance properties for the bounded per-repo verification admission
+/// queue (TKT-01M0HNESEECWWFQF8X6VH1XSJ6) that are properties of
+/// [`VerificationAdmission`]/[`Supervisor`] alone — FIFO fairness, the
+/// configured bound, cross-repo independence, and restart recovery — as
+/// opposed to the [`crate::workflow_exec`] properties (exact exit
+/// provenance, the landing-gate/`verify.run` shared bound, proof reuse) that
+/// need a full [`crate::workflow_exec::WorkflowEngine`] to exercise.
+#[cfg(test)]
+mod verification_admission_tests {
+    use super::*;
+    use rk_ledger::{Budget, FleetBudget};
+    use std::path::Path;
+    use std::time::Duration;
+
+    fn sup(home: &Path) -> Arc<Supervisor> {
+        let layout = Layout::at(home);
+        let tickets = Arc::new(crate::tickets::Tickets::new(
+            Space::open_in_memory().unwrap(),
+            "castle".into(),
+        ));
+        Arc::new(
+            Supervisor::new(
+                layout,
+                "castle".into(),
+                "fake".into(),
+                Budget::default(),
+                FleetBudget::default(),
+                Space::open_in_memory().unwrap(),
+                tickets,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A configured limit of N never admits an (N+1)th concurrent holder:
+    /// the (N+1)th `acquire` stays unresolved until an earlier permit is
+    /// dropped.
+    #[tokio::test]
+    async fn acquire_verification_admission_bounds_concurrency_to_the_configured_limit() {
+        let home = tempfile::tempdir().unwrap();
+        let s = sup(home.path());
+        s.set_verification_admission_limits(1, HashMap::new());
+
+        let (first, _wait) = s
+            .acquire_verification_admission("repo-a", 1)
+            .await
+            .unwrap();
+
+        let s2 = s.clone();
+        let mut second = Box::pin(s2.acquire_verification_admission("repo-a", 1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "a second acquire must block while the configured limit's only permit is held"
+        );
+
+        drop(first);
+        let _ = tokio::time::timeout(Duration::from_millis(200), second)
+            .await
+            .expect("releasing the held permit must unblock the waiter")
+            .unwrap();
+    }
+
+    /// FIFO fairness (documented on `VerificationAdmission`, backed by
+    /// `tokio::sync::Semaphore`): permits are granted in acquire order, not
+    /// arbitrary scheduler order.
+    #[tokio::test]
+    async fn acquire_verification_admission_grants_permits_in_fifo_order() {
+        let home = tempfile::tempdir().unwrap();
+        let s = sup(home.path());
+        s.set_verification_admission_limits(1, HashMap::new());
+
+        let (first, _wait) = s
+            .acquire_verification_admission("repo-fifo", 1)
+            .await
+            .unwrap();
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+        let s_b = s.clone();
+        let order_b = order.clone();
+        let task_b = tokio::spawn(async move {
+            let (_permit, _wait) = s_b
+                .acquire_verification_admission("repo-fifo", 1)
+                .await
+                .unwrap();
+            order_b.lock().unwrap().push("B");
+        });
+        // Give B time to actually reach its `.await` and join the semaphore's
+        // wait queue before C is spawned, so acquire order is deterministic.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let s_c = s.clone();
+        let order_c = order.clone();
+        let task_c = tokio::spawn(async move {
+            let (_permit, _wait) = s_c
+                .acquire_verification_admission("repo-fifo", 1)
+                .await
+                .unwrap();
+            order_c.lock().unwrap().push("C");
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        drop(first);
+        task_b.await.unwrap();
+        task_c.await.unwrap();
+
+        assert_eq!(*order.lock().unwrap(), vec!["B", "C"]);
+    }
+
+    /// Two different repos never share a bound: repo-a's outstanding permit
+    /// must never block repo-b's acquire, even at the same configured limit.
+    #[tokio::test]
+    async fn independent_repos_do_not_serialize_against_each_other() {
+        let home = tempfile::tempdir().unwrap();
+        let s = sup(home.path());
+        s.set_verification_admission_limits(1, HashMap::new());
+
+        let (_a, _wait) = s
+            .acquire_verification_admission("repo-a", 1)
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(100),
+            s.acquire_verification_admission("repo-b", 1),
+        )
+        .await
+        .expect(
+            "a different repo's admission queue must not be blocked by repo-a's outstanding permit",
+        )
+        .unwrap();
+    }
+
+    /// Restart recovery is automatic because there is nothing durable to
+    /// recover: a fresh `Supervisor` (standing in for the next daemon
+    /// process) never inherits a permit an earlier instance handed out and
+    /// never released — even one deliberately leaked here to stand in for a
+    /// holder that died mid-check.
+    #[tokio::test]
+    async fn a_fresh_supervisor_never_inherits_a_predecessors_leaked_permit() {
+        let home = tempfile::tempdir().unwrap();
+        let before_restart = sup(home.path());
+        before_restart.set_verification_admission_limits(1, HashMap::new());
+        let (leaked, _wait) = before_restart
+            .acquire_verification_admission("repo-restart", 1)
+            .await
+            .unwrap();
+        // Simulate the old process dying while still holding the permit: it
+        // is never dropped/released, just abandoned along with `before_restart`.
+        std::mem::forget(leaked);
+        drop(before_restart);
+
+        let after_restart = sup(home.path());
+        after_restart.set_verification_admission_limits(1, HashMap::new());
+        let _ = tokio::time::timeout(
+            Duration::from_millis(100),
+            after_restart.acquire_verification_admission("repo-restart", 1),
+        )
+        .await
+        .expect(
+            "a fresh Supervisor must start with a full complement of permits, unaffected by a predecessor's leaked one",
+        )
+        .unwrap();
+    }
+}
