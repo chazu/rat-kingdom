@@ -1451,14 +1451,9 @@ impl LandingPipeline {
             &entry.head_sha,
         )
         .scope(&entry.repo_name);
-        Ok(self
-            .space
-            .scan(&pattern)?
-            .into_iter()
-            .filter(|t| {
-                t.payload.get("target").and_then(Value::as_str) == Some(entry.target.as_str())
-            })
-            .last())
+        Ok(self.space.scan(&pattern)?.into_iter().rfind(|t| {
+            t.payload.get("target").and_then(Value::as_str) == Some(entry.target.as_str())
+        }))
     }
 
     /// [`Self::processed_marker`], but additionally filtered to markers still
