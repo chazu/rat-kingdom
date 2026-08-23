@@ -130,6 +130,16 @@ const GATE_INFRA_RETRY_IDENTITY: &str = "landing_gate_infra_retry";
 /// a reviewer inspectable proof that the exact prepared candidate was tested.
 const GATE_PASS_IDENTITY: &str = "landing_gate_pass";
 
+/// Durable telemetry record (TKT-01M0QRZ7QT8CQD74GHRN81XFT5) written every
+/// time a landing gate check skips its own execution because a durable
+/// managed-verification proof already covered it — either the exact
+/// candidate under test, or the pre-merge branch tip a rat's own `rk verify`
+/// actually ran against (see [`LandingPipeline::reusable_verification_proof`]).
+/// Separate from [`GATE_PASS_IDENTITY`] (written once per whole gate run)
+/// so a peer can see proof-reuse per check without parsing that event's
+/// `checks` list against `verification_proof`/`landing_gate_pass` history.
+const VERIFICATION_PROOF_REUSE_IDENTITY: &str = "landing_verification_proof_reused";
+
 /// Durable record of the gate plan [`LandingPipeline::gate_plan`] chose for
 /// one candidate — written once per gate run, BEFORE any check executes, so
 /// it exists even when a later check fails or the target moves out from
@@ -409,6 +419,10 @@ struct CheckVerificationSpan<'a> {
     full_check_required: bool,
     queue_wait_ms: Option<u64>,
     duration_ms: Option<u64>,
+    /// Whether this check's pass came from a reused durable proof
+    /// (TKT-01M0QRZ7QT8CQD74GHRN81XFT5) rather than actually executing the
+    /// command in the gate worktree.
+    proof_reused: bool,
 }
 
 fn required_payload_str<'a>(
@@ -5150,6 +5164,7 @@ impl LandingPipeline {
                             full_check_required,
                             queue_wait_ms: None,
                             duration_ms: None,
+                            proof_reused: false,
                         },
                     );
                     queue_wait_ms.push((check.name.clone(), None));
@@ -5193,9 +5208,32 @@ impl LandingPipeline {
                         full_check_required,
                         queue_wait_ms: check_queue_wait_ms,
                         duration_ms: u64::try_from(check_started.elapsed().as_millis()).ok(),
+                        proof_reused: false,
                     },
                 );
                 queue_wait_ms.push((check.name.clone(), check_queue_wait_ms));
+                passed_checks.push(check.name.clone());
+                continue;
+            }
+
+            if let Some(reused) = self
+                .reusable_verification_proof(entry, git_repo, tested_sha, &check)
+                .await?
+            {
+                self.record_verification_proof_reuse(entry, tested_sha, &check, &reused);
+                self.record_check_verification_span(
+                    entry,
+                    CheckVerificationSpan {
+                        check_name: &check.name,
+                        attempt: check_attempt,
+                        candidate: tested_sha,
+                        full_check_required,
+                        queue_wait_ms: None,
+                        duration_ms: None,
+                        proof_reused: true,
+                    },
+                );
+                queue_wait_ms.push((check.name.clone(), None));
                 passed_checks.push(check.name.clone());
                 continue;
             }
@@ -5302,6 +5340,7 @@ impl LandingPipeline {
                     full_check_required,
                     queue_wait_ms: check_queue_wait_ms,
                     duration_ms: u64::try_from(check_started.elapsed().as_millis()).ok(),
+                    proof_reused: false,
                 },
             );
             queue_wait_ms.push((check.name.clone(), check_queue_wait_ms));
@@ -5336,6 +5375,108 @@ impl LandingPipeline {
         Ok(GateRunOutcome::Pass)
     }
 
+    /// Look for a durable, reusable managed-verification proof for one
+    /// gate-plan check under this candidate's EXACT identity — repo,
+    /// candidate/head sha, check name, command, toolchain, and environment
+    /// policy (TKT-01M0QRZ7QT8CQD74GHRN81XFT5) — so an already-proven check
+    /// is never re-run inside the gate worktree.
+    ///
+    /// Tries two shas, in order:
+    /// 1. `tested_sha` itself (the prepared merge commit) — an exact hit
+    ///    here covers a replayed/restarted gate run against the identical
+    ///    candidate, and (via `lookup_verification_proof`'s own secondary
+    ///    fallback) an earlier `landing_gate_pass` for this exact candidate.
+    /// 2. `entry.head_sha` — the pre-merge branch tip a rat's own managed
+    ///    `rk verify` actually executed against. Reusing a proof recorded
+    ///    for `head_sha` is sound only when merging changed nothing
+    ///    relative to it: `git merge --no-ff` ([`rk_git::Repo::prepare_merge`])
+    ///    always builds a fresh commit distinct from either parent, so
+    ///    `tested_sha` can never literally equal `head_sha`, but when
+    ///    `entry.candidate_base` (the target tip this merge was built on)
+    ///    is already an ancestor of `head_sha`, `head_sha` already contains
+    ///    everything `base` could have added — the merge is a fast-forward
+    ///    forced into a merge commit, and its tree is byte-for-byte
+    ///    `head_sha`'s tree. If `base` is NOT an ancestor of `head_sha`,
+    ///    `target` moved with content `head_sha` never saw, so this fails
+    ///    closed (returns `None`, the caller runs the check fresh) rather
+    ///    than risk reusing a proof for a tree the candidate does not
+    ///    actually have — the ticket's "main movement changes the prepared
+    ///    candidate" requirement.
+    ///
+    /// Never attempted for a multi-branch batch candidate
+    /// (`entry.batch_branches` naming more than one branch): `entry.head_sha`
+    /// there names only ONE of several merged branches, so even a clean
+    /// ancestor check would say nothing about the OTHER branches' content
+    /// folded into `tested_sha`.
+    ///
+    /// A cancelled managed run can never surface here: `verify_repo_check`
+    /// only ever records `VERIFICATION_PROOF_IDENTITY` after a completed
+    /// `"pass"` verdict, never for a cancelled/interrupted run
+    /// (`workflow_exec.rs`'s `VERIFICATION_CANCELLED_IDENTITY` doc), so
+    /// `lookup_verification_proof` structurally cannot return one.
+    async fn reusable_verification_proof(
+        &self,
+        entry: &LandingQueueEntry,
+        git_repo: &rk_git::Repo,
+        tested_sha: &str,
+        check: &rk_workflow::Check,
+    ) -> rk_core::Result<Option<Value>> {
+        if let Some(hit) =
+            self.engine
+                .lookup_verification_proof(&entry.repo_name, tested_sha, check)
+        {
+            return Ok(Some(hit));
+        }
+        if entry.batch_branches.len() > 1 || entry.head_sha == tested_sha {
+            return Ok(None);
+        }
+        let Some(base) = entry.candidate_base.clone() else {
+            return Ok(None);
+        };
+        let head_sha = entry.head_sha.clone();
+        let ancestor_ok = {
+            let git_repo = git_repo.clone();
+            let head = head_sha.clone();
+            blocking(move || Ok(git_repo.is_ancestor(&base, &head))).await?
+        };
+        if !ancestor_ok {
+            return Ok(None);
+        }
+        Ok(self
+            .engine
+            .lookup_verification_proof(&entry.repo_name, &head_sha, check))
+    }
+
+    /// Durable telemetry for a landing-gate check that skipped execution via
+    /// [`reusable_verification_proof`](Self::reusable_verification_proof).
+    fn record_verification_proof_reuse(
+        &self,
+        entry: &LandingQueueEntry,
+        tested_sha: &str,
+        check: &rk_workflow::Check,
+        proof: &Value,
+    ) {
+        let _ = self.space.out(
+            Tuple::new(
+                Category::Event,
+                entry.repo_name.clone(),
+                VERIFICATION_PROOF_REUSE_IDENTITY,
+                "daemon",
+                json!({
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "task": entry.task,
+                    "check": check.name,
+                    "head_sha": entry.head_sha,
+                    "tested_sha": tested_sha,
+                    "proof_key": verification_proof_key(&entry.repo_name, tested_sha, check),
+                    "reused_from": proof.get("reused_from").cloned().unwrap_or(Value::Null),
+                }),
+            )
+            .with_lifecycle(Lifecycle::Furniture),
+        );
+    }
+
     /// Record one check's `Phase::VerificationQueued` span, replacing the
     /// single aggregate span this call site used to write once per landing
     /// entry after the whole gate loop finished (TKT-01M0P974EZZTPMGVP4S0E76NXH's
@@ -5359,6 +5500,7 @@ impl LandingPipeline {
             full_check_required,
             queue_wait_ms,
             duration_ms,
+            proof_reused,
         } = occurrence;
         let _ = crate::span::record_phase_span(
             &self.space,
@@ -5380,7 +5522,8 @@ impl LandingPipeline {
                 "full-final"
             } else {
                 "focused-inner"
-            }),
+            })
+            .proof_reused(proof_reused),
         );
     }
 
@@ -13099,5 +13242,556 @@ checks: [
             1,
             "the reviewer's verify.run must not re-execute the full check"
         );
+    }
+
+    /// The ticket's primary scenario (TKT-01M0QRZ7QT8CQD74GHRN81XFT5, live
+    /// campaign evidence from Sooty-12/Ash-12/Dusty-12): a rat's own managed
+    /// `rk verify` already produced a durable passing proof for its branch's
+    /// own tip (`head_sha`) BEFORE the landing gate ever runs. The gate's
+    /// own prepared candidate (`rk_git::Repo::prepare_merge`'s `--no-ff`
+    /// merge commit) is, by construction, a different git object from
+    /// `head_sha` — so this proves the landing gate bridges the two shas via
+    /// the ancestor check, rather than merely hitting an exact-sha cache
+    /// entry it wrote itself.
+    #[tokio::test]
+    async fn landing_gate_reuses_a_managed_verify_proof_when_main_has_not_moved() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let verify_log = home.path().join("verify.log");
+        let verify_command = format!("echo x >> '{log}'; exit 0", log = verify_log.display());
+        write_checks(
+            repo_dir.path(),
+            &format!(
+                r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "{cmd}", timeout: "30s"}},
+]
+"#,
+                cmd = verify_command
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let gates = GateConfig::default();
+
+        // The agent's own managed `rk verify`, run directly against its own
+        // branch worktree at its clean tip — well before any landing gate
+        // exists for this branch.
+        let proof = pipeline
+            .engine
+            .verify_repo_check(
+                "rat-1",
+                repo_dir.path(),
+                "code-repo",
+                "verify",
+                None,
+                "verify-request-1",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(proof["verdict"], "pass");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let candidate = match git_repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+        assert_ne!(
+            candidate.commit, head_sha,
+            "a `--no-ff` merge always builds a fresh commit distinct from the branch tip"
+        );
+
+        let mut entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            candidate_sha: Some(candidate.commit.clone()),
+            candidate_base: Some(candidate.base.clone()),
+            candidate_ref: Some(candidate.candidate_ref.clone()),
+            diff_class: "feature".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+
+        let outcome = pipeline
+            .run_gates_at(&mut entry, &git_repo, &gates, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(outcome, GateRunOutcome::Pass);
+        assert_eq!(
+            std::fs::read_to_string(&verify_log)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "the landing gate must reuse the managed proof instead of re-running verify"
+        );
+
+        let reuse_events = space
+            .scan(&Pattern::category(Category::Event).identity(VERIFICATION_PROOF_REUSE_IDENTITY))
+            .unwrap();
+        assert_eq!(reuse_events.len(), 1, "reuse events: {reuse_events:?}");
+        assert_eq!(reuse_events[0].payload["check"], "verify");
+        assert_eq!(reuse_events[0].payload["head_sha"], head_sha);
+        assert_eq!(reuse_events[0].payload["tested_sha"], candidate.commit);
+        assert_eq!(
+            reuse_events[0].payload["reused_from"], "verification_proof",
+            "must credit the rat's own managed verify, not an unrelated landing_gate_pass"
+        );
+
+        // The gate still records its usual green-run evidence, crediting
+        // "verify" as passed — a reused check must look identical to a
+        // freshly-run one to every OTHER consumer of that event.
+        let pass_events = space
+            .scan(&Pattern::category(Category::Event).identity(GATE_PASS_IDENTITY))
+            .unwrap();
+        assert_eq!(pass_events.len(), 1);
+        assert_eq!(
+            pass_events[0].payload["checks"],
+            json!(["steward-protected-paths", "steward-diff-scope", "verify"])
+        );
+    }
+
+    /// Fail-closed counterpart of the previous test: `main` (the merge
+    /// target) advances with a commit the verified `head_sha` never saw
+    /// BEFORE the landing gate builds its candidate. The prepared merge's
+    /// `base` is therefore no longer an ancestor of `head_sha`, so the
+    /// ticket's "main movement changes the prepared candidate" rule must
+    /// hold — no reuse, the full check runs fresh against the real merge.
+    #[tokio::test]
+    async fn landing_gate_reruns_when_main_moved_past_the_verified_head() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let verify_log = home.path().join("verify.log");
+        let verify_command = format!("echo x >> '{log}'; exit 0", log = verify_log.display());
+        write_checks(
+            repo_dir.path(),
+            &format!(
+                r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "{cmd}", timeout: "30s"}},
+]
+"#,
+                cmd = verify_command
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let gates = GateConfig::default();
+
+        let proof = pipeline
+            .engine
+            .verify_repo_check(
+                "rat-1",
+                repo_dir.path(),
+                "code-repo",
+                "verify",
+                None,
+                "verify-request-1",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(proof["verdict"], "pass");
+
+        // `main` moves with an unrelated change AFTER the branch's own
+        // verify ran, and before landing ever builds a candidate.
+        git(repo_dir.path(), &["checkout", "main"]);
+        std::fs::write(repo_dir.path().join("other.rs"), "fn y() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(
+            repo_dir.path(),
+            &["commit", "-m", "feat: unrelated main commit"],
+        );
+
+        let candidate = match git_repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected a clean auto-merge (disjoint files), got {other:?}"),
+        };
+        assert!(
+            !git_repo.is_ancestor(&candidate.base, &head_sha),
+            "precondition: the moved target must NOT be an ancestor of the verified head"
+        );
+
+        let mut entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            candidate_sha: Some(candidate.commit.clone()),
+            candidate_base: Some(candidate.base.clone()),
+            candidate_ref: Some(candidate.candidate_ref.clone()),
+            diff_class: "feature".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+
+        let outcome = pipeline
+            .run_gates_at(&mut entry, &git_repo, &gates, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(outcome, GateRunOutcome::Pass);
+        assert_eq!(
+            std::fs::read_to_string(&verify_log)
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "main moved past what head_sha's proof covered, so verify must run again"
+        );
+        let reuse_events = space
+            .scan(&Pattern::category(Category::Event).identity(VERIFICATION_PROOF_REUSE_IDENTITY))
+            .unwrap();
+        assert!(
+            reuse_events.is_empty(),
+            "no reuse may be credited once main has moved past the verified head: {reuse_events:?}"
+        );
+    }
+
+    /// Even when `main` has not moved (the ancestor check alone would allow
+    /// reuse), a check whose command changed since the managed verify ran
+    /// must never reuse that stale proof: `verification_proof_key` folds
+    /// the exact command text into its digest, so a changed command simply
+    /// misses the cache.
+    #[tokio::test]
+    async fn landing_gate_reruns_when_the_checks_command_changed_since_verification() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let old_log = home.path().join("old-verify.log");
+        let new_log = home.path().join("new-verify.log");
+        let old_command = format!("echo x >> '{log}'; exit 0", log = old_log.display());
+        write_checks(
+            repo_dir.path(),
+            &format!(
+                r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "{cmd}", timeout: "30s"}},
+]
+"#,
+                cmd = old_command
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let gates = GateConfig::default();
+
+        let proof = pipeline
+            .engine
+            .verify_repo_check(
+                "rat-1",
+                repo_dir.path(),
+                "code-repo",
+                "verify",
+                None,
+                "verify-request-1",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(proof["verdict"], "pass");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        // The repo's checks registry changes its "verify" command before
+        // landing runs — a plain uncommitted working-tree edit, exactly
+        // like a live `.rk/checks.cue` edit landing always reads fresh.
+        let new_command = format!("echo x >> '{log}'; exit 0", log = new_log.display());
+        write_checks(
+            repo_dir.path(),
+            &format!(
+                r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "{cmd}", timeout: "30s"}},
+]
+"#,
+                cmd = new_command
+            ),
+        );
+
+        let candidate = match git_repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+
+        let mut entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            candidate_sha: Some(candidate.commit.clone()),
+            candidate_base: Some(candidate.base.clone()),
+            candidate_ref: Some(candidate.candidate_ref.clone()),
+            diff_class: "feature".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+
+        let outcome = pipeline
+            .run_gates_at(&mut entry, &git_repo, &gates, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(outcome, GateRunOutcome::Pass);
+        assert_eq!(
+            std::fs::read_to_string(&old_log).unwrap().lines().count(),
+            1,
+            "the old command must not run again"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&new_log).unwrap().lines().count(),
+            1,
+            "the new command must run fresh — its digest key never matches the old proof"
+        );
+    }
+
+    /// A managed verification that was CANCELLED (agent dismissed/interrupted,
+    /// RPC caller disconnected) before it settled never writes a
+    /// `verification_proof` — only `verification_cancelled`
+    /// (`workflow_exec.rs`'s `VERIFICATION_CANCELLED_IDENTITY` doc). This
+    /// locks in that `lookup_verification_proof` cannot mistake the
+    /// cancellation record for a reusable proof, by planting one directly
+    /// (as `record_verification_cancellation` would) with no matching
+    /// `verification_proof` ever written, and confirming the gate still
+    /// executes the check fresh.
+    #[tokio::test]
+    async fn landing_gate_never_reuses_a_cancelled_managed_verification() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let verify_log = home.path().join("verify.log");
+        let verify_command = format!("echo x >> '{log}'; exit 0", log = verify_log.display());
+        write_checks(
+            repo_dir.path(),
+            &format!(
+                r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "{cmd}", timeout: "30s"}},
+]
+"#,
+                cmd = verify_command
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let gates = GateConfig::default();
+
+        // Plant a cancellation record for this exact head_sha/check — never
+        // a `verification_proof` — the shape `record_verification_cancellation`
+        // itself writes.
+        space
+            .out(
+                Tuple::new(
+                    Category::Event,
+                    "code-repo".to_string(),
+                    "verification_cancelled",
+                    "daemon",
+                    json!({
+                        "agent": "rat-1",
+                        "generation": Value::Null,
+                        "request_key": "verify-request-1",
+                        "proof_key": Value::Null,
+                        "command": verify_command,
+                        "queue_wait_ms": Value::Null,
+                        "duration_ms": Value::Null,
+                        "reason": "dismissed",
+                    }),
+                )
+                .with_lifecycle(Lifecycle::Furniture),
+            )
+            .unwrap();
+
+        let candidate = match git_repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+
+        let mut entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            candidate_sha: Some(candidate.commit.clone()),
+            candidate_base: Some(candidate.base.clone()),
+            candidate_ref: Some(candidate.candidate_ref.clone()),
+            diff_class: "feature".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+
+        let outcome = pipeline
+            .run_gates_at(&mut entry, &git_repo, &gates, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(outcome, GateRunOutcome::Pass);
+        assert_eq!(
+            std::fs::read_to_string(&verify_log)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "a cancelled run leaves nothing reusable — the gate must execute the check itself"
+        );
+        let reuse_events = space
+            .scan(&Pattern::category(Category::Event).identity(VERIFICATION_PROOF_REUSE_IDENTITY))
+            .unwrap();
+        assert!(
+            reuse_events.is_empty(),
+            "a cancellation record must never be credited as a reused proof: {reuse_events:?}"
+        );
+    }
+
+    /// Restart/replay, and the ordinary baseline the ticket also requires:
+    /// an ordinary completion-to-landing gate run executes its full check
+    /// exactly once total, and a later replay of the SAME prepared candidate
+    /// (a landing pipeline resuming after a restart, re-processing durable
+    /// queue state) reuses that first run's own `landing_gate_pass` evidence
+    /// instead of re-running — the pre-existing fallback branch of
+    /// `lookup_verification_proof`, now actually reachable from
+    /// `run_gates_at` for the first time.
+    #[tokio::test]
+    async fn landing_gate_runs_once_ordinarily_and_reuses_its_own_pass_on_replay() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let verify_log = home.path().join("verify.log");
+        let verify_command = format!("echo x >> '{log}'; exit 0", log = verify_log.display());
+        write_checks(
+            repo_dir.path(),
+            &format!(
+                r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "{cmd}", timeout: "30s"}},
+]
+"#,
+                cmd = verify_command
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let gates = GateConfig::default();
+
+        let candidate = match git_repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+
+        let mut entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            candidate_sha: Some(candidate.commit.clone()),
+            candidate_base: Some(candidate.base.clone()),
+            candidate_ref: Some(candidate.candidate_ref.clone()),
+            diff_class: "feature".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+
+        // Ordinary case: no proof exists anywhere yet, so the full suite
+        // executes exactly once.
+        let outcome = pipeline
+            .run_gates_at(&mut entry, &git_repo, &gates, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(outcome, GateRunOutcome::Pass);
+        assert_eq!(
+            std::fs::read_to_string(&verify_log)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "an ordinary completion-to-landing run must execute the full suite exactly once"
+        );
+
+        // Replay: the daemon "restarts" and reprocesses the identical
+        // durable candidate (same tested_sha) — must reuse, never re-run.
+        let outcome = pipeline
+            .run_gates_at(&mut entry, &git_repo, &gates, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(outcome, GateRunOutcome::Pass);
+        assert_eq!(
+            std::fs::read_to_string(&verify_log)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "replaying the same prepared candidate must not re-execute the check"
+        );
+
+        // Every check in the plan (the two cheap policy checks plus
+        // "verify") was credited by the first run's own `landing_gate_pass`
+        // for this exact candidate, so replay reuses all three.
+        let reuse_events = space
+            .scan(&Pattern::category(Category::Event).identity(VERIFICATION_PROOF_REUSE_IDENTITY))
+            .unwrap();
+        assert_eq!(reuse_events.len(), 3, "reuse events: {reuse_events:?}");
+        assert!(
+            reuse_events
+                .iter()
+                .all(|t| t.payload["reused_from"] == "landing_gate_pass"),
+            "replay must credit the gate's own prior pass, not a managed verify proof: {reuse_events:?}"
+        );
+
+        // Exactly two `landing_gate_pass` records total — one per
+        // `run_gates_at` call, whether the checks it credits ran fresh or
+        // were reused — never fewer (a reused check must still count as
+        // "passed this gate run" for every other consumer of this event).
+        let pass_events = space
+            .scan(&Pattern::category(Category::Event).identity(GATE_PASS_IDENTITY))
+            .unwrap();
+        assert_eq!(pass_events.len(), 2, "pass events: {pass_events:?}");
     }
 }
