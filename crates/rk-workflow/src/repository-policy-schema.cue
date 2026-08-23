@@ -62,6 +62,17 @@ repo: #RepositoryPolicy
 	maxReworkAttempts: int | *1
 	// Hard ceiling on cumulative USD across one review/rework chain. 0 = unlimited.
 	reworkMaxUsd: int | *25
+	// UNATTENDED CONFLICT RECOVERY (crates/rk-daemon/src/landing_conflict.rs):
+	// whether a landing-time merge CONFLICT (the candidate never even built,
+	// so there is no reviewer verdict) may dispatch a bounded correction agent
+	// from the held source branch at its exact head, with no human polling. A
+	// protected-path hit, an over-budget diff, or unreadable conflict evidence
+	// is held for a human regardless of this switch.
+	conflictReworkAutoDispatch: bool | *true
+	// Hard ceiling on correction agents per conflicted branch. 0 disables dispatch.
+	maxConflictReworkAttempts: int | *1
+	// Hard ceiling on cumulative USD across one conflict/correction chain. 0 = unlimited.
+	conflictReworkMaxUsd: int | *25
 	// SHADOW REVIEW (phase-2 P4a): when non-empty, every review request ALSO
 	// spawns a second, non-blocking reviewer on this model, chained onto the
 	// same candidate. Its verdict is recorded for comparison against the

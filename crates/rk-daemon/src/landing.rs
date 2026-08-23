@@ -74,6 +74,9 @@
 //! that live wiring.
 #![allow(dead_code)]
 
+use crate::landing_conflict::{
+    self, ConflictContext, ConflictEvidence, ConflictPolicy, CONFLICT_DISPATCH_IDENTITY,
+};
 use crate::landing_review_retry::{
     self, ReviewDeathContext, ReviewDeathPolicy, ReviewDeathRoute, REVIEW_DEATH_DISPATCH_IDENTITY,
 };
@@ -110,6 +113,11 @@ pub(crate) const LANDING_QUEUE_IDENTITY: &str = "landing_queue_entry";
 /// pass against the parent's original target. The queue tuple is the durable
 /// source of truth; this event makes the automatic hand-off inspectable.
 const REWORK_RESUBMISSION_IDENTITY: &str = "landing_rework_resubmission";
+
+/// [`REWORK_RESUBMISSION_IDENTITY`]'s counterpart for a landed merge-conflict
+/// correction: evidence that it queued the conflicted branch for a fresh
+/// gate run against its original target.
+const CONFLICT_RESUBMISSION_IDENTITY: &str = "landing_conflict_rework_resubmission";
 
 /// Identity of the durable per-attempt evidence event for a gate
 /// infrastructure-death retry (bounded fail-safe recovery). See
@@ -1823,14 +1831,7 @@ impl LandingPipeline {
                     candidate
                 }
                 rk_git::PrepareOutcome::Conflict { detail } => {
-                    self.escalate(
-                        &entry,
-                        format!(
-                            "steward: merge preparation FAILED for {} on {} — branch held unmerged: {detail}",
-                            entry.task, entry.branch
-                        ),
-                    )?;
-                    let outcome = LandingOutcome::GateHeld;
+                    let outcome = self.route_conflict(&entry, &git_repo, &detail).await?;
                     self.mark_processed(&entry, &outcome)?;
                     return Ok(outcome);
                 }
@@ -3326,6 +3327,24 @@ impl LandingPipeline {
                 "rework landed but parent resubmission failed"
             );
         }
+        if let Err(error) = self.resubmit_conflict_reworked_parent(entry) {
+            // The merge is durable; surface bookkeeping failure without denying it.
+            let _ = self.escalate(
+                entry,
+                format!(
+                    "steward: conflict correction {} landed onto {}, but automatic parent \
+                     resubmission failed: {error}. Re-submit with `rk land {} --repo {} --target \
+                     <original-target> --task <original-ticket>`",
+                    entry.task, entry.target, entry.target, entry.repo_path
+                ),
+            );
+            warn!(
+                task = %entry.task,
+                target = %entry.target,
+                error = %error,
+                "conflict correction landed but parent resubmission failed"
+            );
+        }
     }
 
     /// Recover after an APPROVE-authorized target advance but before delivery.
@@ -3756,6 +3775,475 @@ impl LandingPipeline {
             }
         }
         Ok(LandingOutcome::ReworkFiled(ticket))
+    }
+
+    /// Resolve unattended-conflict-recovery bounds from the activated
+    /// repository policy.
+    fn conflict_policy(&self, repo: &rk_git::Repo) -> ConflictPolicy {
+        ConflictPolicy::from_landing(&self.supervisor.repository_policy(repo).landing)
+    }
+
+    /// Chain-scoped markers, mirroring [`Self::rework_dispatch_markers`] but
+    /// namespaced to [`CONFLICT_DISPATCH_IDENTITY`] so a conflict chain and a
+    /// review-rework chain on the same branch/target/task never share a budget.
+    fn conflict_dispatch_markers(&self, ctx: &ConflictContext) -> rk_core::Result<Vec<Tuple>> {
+        let pattern = Pattern::category(Category::Event)
+            .identity(CONFLICT_DISPATCH_IDENTITY)
+            .scope(&ctx.repo);
+        Ok(self
+            .space
+            .scan(&pattern)?
+            .into_iter()
+            .filter(|t| {
+                t.payload.get("branch").and_then(Value::as_str) == Some(ctx.branch.as_str())
+                    && t.payload.get("target").and_then(Value::as_str) == Some(ctx.target.as_str())
+                    && t.payload.get("task").and_then(Value::as_str) == Some(ctx.task.as_str())
+            })
+            .collect())
+    }
+
+    fn conflict_marker_matches(marker: &Tuple, ctx: &ConflictContext) -> bool {
+        let payload = &marker.payload;
+        let key = ctx.dispatch_key();
+        payload.get("dispatch_key").and_then(Value::as_str) == Some(key.as_str())
+            || (payload.get("head_sha").and_then(Value::as_str) == Some(ctx.head_sha.as_str())
+                && payload.get("rework_ticket").and_then(Value::as_str)
+                    == Some(ctx.rework_ticket.as_str()))
+    }
+
+    fn record_conflict_state(
+        &self,
+        entry: &LandingQueueEntry,
+        ctx: &ConflictContext,
+        attempt: u32,
+        state: &str,
+    ) -> rk_core::Result<Tuple> {
+        let marker = Tuple::new(
+            Category::Event,
+            entry.repo_name.clone(),
+            CONFLICT_DISPATCH_IDENTITY,
+            "daemon",
+            ctx.marker_payload(attempt, None, state),
+        )
+        .with_lifecycle(Lifecycle::Furniture);
+        self.space.out(marker.clone())?;
+        Ok(marker)
+    }
+
+    fn withhold_conflict(
+        &self,
+        entry: &LandingQueueEntry,
+        ctx: &ConflictContext,
+        attempt: u32,
+        withheld: &Withheld,
+    ) -> rk_core::Result<()> {
+        self.escalate(entry, ctx.escalation(withheld))?;
+        self.record_conflict_state(entry, ctx, attempt, withheld.code)?;
+        Ok(())
+    }
+
+    fn conflict_attempts_used(&self, ctx: &ConflictContext) -> rk_core::Result<u32> {
+        let distinct: BTreeSet<String> = self
+            .conflict_dispatch_markers(ctx)?
+            .into_iter()
+            .filter(|marker| {
+                matches!(
+                    marker.payload.get("state").and_then(Value::as_str),
+                    Some("dispatching" | "dispatched")
+                )
+            })
+            .map(|marker| {
+                marker
+                    .payload
+                    .get("dispatch_key")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}\0{}",
+                            marker
+                                .payload
+                                .get("head_sha")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                            marker
+                                .payload
+                                .get("rework_ticket")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                        )
+                    })
+            })
+            .collect();
+        Ok(distinct.len() as u32)
+    }
+
+    /// Exact conflicted-commit marker used for replay deduplication.
+    fn conflict_dispatch_marker(&self, ctx: &ConflictContext) -> rk_core::Result<Option<Tuple>> {
+        Ok(self
+            .conflict_dispatch_markers(ctx)?
+            .into_iter()
+            .find(|marker| Self::conflict_marker_matches(marker, ctx)))
+    }
+
+    fn conflict_dispatch_has_state(
+        &self,
+        ctx: &ConflictContext,
+        state: &str,
+    ) -> rk_core::Result<bool> {
+        Ok(self
+            .conflict_dispatch_markers(ctx)?
+            .into_iter()
+            .any(|marker| {
+                Self::conflict_marker_matches(&marker, ctx)
+                    && marker.payload.get("state").and_then(Value::as_str) == Some(state)
+            }))
+    }
+
+    /// Spawn's durable journal proves this exact dispatch crossed its commit point.
+    fn conflict_agent_was_journaled(&self, ctx: &ConflictContext) -> bool {
+        self.supervisor.list_all().into_iter().any(|record| {
+            record.role == "rat"
+                && record.task.as_deref() == Some(ctx.rework_ticket.as_str())
+                && record.target_branch == ctx.branch
+                && record.fork_point.as_deref() == Some(ctx.head_sha.as_str())
+        })
+    }
+
+    /// Cumulative chain spend, including terminal and archived agents.
+    fn conflict_chain_spend(&self, ctx: &ConflictContext) -> rk_core::Result<f64> {
+        let correction_tickets: BTreeSet<String> = self
+            .conflict_dispatch_markers(ctx)?
+            .into_iter()
+            .filter_map(|marker| {
+                marker
+                    .payload
+                    .get("rework_ticket")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        let spent = self
+            .supervisor
+            .list_all()
+            .iter()
+            .filter(|a| {
+                a.repo_name == ctx.repo
+                    && a.role == "rat"
+                    && a.task
+                        .as_deref()
+                        .is_some_and(|task| task == ctx.task || correction_tickets.contains(task))
+            })
+            .map(|a| a.cost_usd)
+            .sum();
+        Ok(spent)
+    }
+
+    /// File the ticket, then dispatch one exact-base correction agent or hold
+    /// behind an evidence-rich gate. Both paths retain the durable ticket.
+    /// Mirrors [`Self::route_rework`], the review-verdict counterpart: the
+    /// two differ only in where authority is judged from (a reviewer's notes
+    /// there, the conflict's own evidence here) and in the dedicated
+    /// dispatch-marker identity and budget each chain uses.
+    async fn route_conflict(
+        &self,
+        entry: &LandingQueueEntry,
+        git_repo: &rk_git::Repo,
+        detail: &str,
+    ) -> rk_core::Result<LandingOutcome> {
+        let stat = {
+            let repo = git_repo.clone();
+            let target = entry.target.clone();
+            let branch = entry.branch.clone();
+            blocking(move || repo.diff_stat(&target, &branch)).await?
+        };
+        let fork_point = {
+            let repo = git_repo.clone();
+            let target = entry.target.clone();
+            let branch = entry.branch.clone();
+            blocking(move || repo.merge_base(&branch, &target)).await?
+        };
+        let target_head = {
+            let repo = git_repo.clone();
+            let target = entry.target.clone();
+            blocking(move || repo.rev_parse(&target)).await?
+        };
+        let ticket = self.file_conflict_rework_ticket(entry).await?;
+        let ctx = ConflictContext {
+            repo: entry.repo_name.clone(),
+            branch: entry.branch.clone(),
+            head_sha: entry.head_sha.clone(),
+            target: entry.target.clone(),
+            target_head,
+            fork_point,
+            task: entry.task.clone(),
+            rework_ticket: ticket.identity.clone(),
+            conflict_detail: landing_conflict::bound_conflict_detail(detail),
+            diff_files: stat.files.len() as u64,
+            diff_lines: stat.lines,
+        };
+
+        // The coalesced ticket completes the dispatch key before side effects.
+        if let Some(marker) = self.conflict_dispatch_marker(&ctx)? {
+            // Marker-before-spawn needs a journal check to distinguish success
+            // from the interruption window.
+            if marker.payload.get("state").and_then(Value::as_str) == Some("dispatching")
+                && !self.conflict_agent_was_journaled(&ctx)
+                && !self.conflict_dispatch_has_state(&ctx, "dispatch-interrupted")?
+            {
+                let attempt = marker
+                    .payload
+                    .get("attempt")
+                    .and_then(Value::as_u64)
+                    .and_then(|attempt| u32::try_from(attempt).ok())
+                    .unwrap_or_default();
+                let withheld = Withheld {
+                    code: "dispatch-interrupted",
+                    detail: format!(
+                        "durable dispatch attempt {attempt} exists, but the supervisor registry \
+                         contains no rat for correction ticket {} based on {} at {}; the daemon \
+                         may have stopped between recording the marker and journaling the spawn",
+                        ctx.rework_ticket, ctx.branch, ctx.head_sha
+                    ),
+                    decision: "confirm that no correction agent exists, then dispatch the \
+                               recorded correction ticket exactly once or abandon it"
+                        .into(),
+                };
+                self.withhold_conflict(entry, &ctx, attempt, &withheld)?;
+                warn!(
+                    repo = %entry.repo_name, branch = %entry.branch,
+                    head_sha = %entry.head_sha, ticket = %ctx.rework_ticket, attempt,
+                    "landing pipeline: interrupted conflict-correction dispatch requires human recovery"
+                );
+            }
+            info!(
+                repo = %entry.repo_name, branch = %entry.branch, head_sha = %entry.head_sha,
+                ticket = %ctx.rework_ticket,
+                "landing pipeline: CONFLICT already routed for this exact chain; not re-dispatching"
+            );
+            return Ok(LandingOutcome::ReworkFiled(ticket));
+        }
+
+        let landing_policy = self.supervisor.repository_policy(git_repo).landing;
+        let protected_path_hit = ere_matches_any(&landing_policy.protected_paths, &stat.files);
+        let evidence = ConflictEvidence {
+            conflict_detail: &ctx.conflict_detail,
+            protected_path_hit,
+            diff_files: ctx.diff_files,
+            diff_lines: ctx.diff_lines,
+            max_diff_files: landing_policy.max_diff_files,
+            max_diff_lines: landing_policy.max_diff_lines,
+        };
+        let policy = self.conflict_policy(git_repo);
+        let attempts_used = self.conflict_attempts_used(&ctx)?;
+        let spent_usd = self.conflict_chain_spend(&ctx)?;
+
+        let route = landing_conflict::route(&policy, &evidence, attempts_used, spent_usd);
+        let attempt = match route {
+            ReworkRoute::Withhold(withheld) => {
+                self.withhold_conflict(entry, &ctx, attempts_used, &withheld)?;
+                return Ok(LandingOutcome::ReworkFiled(ticket));
+            }
+            ReworkRoute::Dispatch { attempt } => attempt,
+        };
+
+        // Spawn cuts from branch tip, so never dispatch after the conflicted tip moves.
+        let tip = {
+            let repo = git_repo.clone();
+            let branch = entry.branch.clone();
+            blocking(move || repo.rev_parse(&branch)).await?
+        };
+        if tip != entry.head_sha {
+            let withheld = Withheld {
+                code: "conflicted-head-moved",
+                detail: format!(
+                    "the conflicted head {} is no longer {}'s tip (now {tip}), so a correction \
+                     cut from the branch would start from work this conflict was never \
+                     evidenced against",
+                    entry.head_sha, entry.branch
+                ),
+                decision: "re-attempt the merge at the branch's current tip, or reset it back to \
+                           the conflicted head and let the correction dispatch"
+                    .into(),
+            };
+            self.withhold_conflict(entry, &ctx, attempts_used, &withheld)?;
+            return Ok(LandingOutcome::ReworkFiled(ticket));
+        }
+
+        // Marker first: replay gates an interrupted spawn instead of duplicating it.
+        self.record_conflict_state(entry, &ctx, attempt, "dispatching")?;
+
+        let params = crate::supervisor::SpawnParams {
+            repo: entry.repo_path.clone(),
+            task: ctx.rework_ticket.clone(),
+            prompt: Some(ctx.prompt()),
+            role: "rat".to_string(),
+            // A correction always lands back on the conflicted (held) branch.
+            base: Some(entry.branch.clone()),
+            review: None,
+            coordination: None,
+            harness: None,
+            parent: None,
+            model: None,
+            permission_mode: None,
+            profile: None,
+            resolved_profile: None,
+            attach: false,
+            workflow_instance: None,
+            coordinator: None,
+            instance_max_usd: None,
+        };
+        match self.supervisor.spawn_async(params, 0).await {
+            Ok(record) => {
+                info!(
+                    repo = %entry.repo_name, branch = %entry.branch, head_sha = %entry.head_sha,
+                    agent = %record.name, ticket = %ctx.rework_ticket, attempt,
+                    "landing pipeline: dispatched bounded conflict-correction agent from the held branch"
+                );
+                if let Err(e) = self
+                    .tickets
+                    .update(
+                        &ctx.rework_ticket,
+                        crate::tickets::TicketChanges {
+                            assignee: Some(record.name.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    warn!(
+                        ticket = %ctx.rework_ticket, agent = %record.name, error = %e,
+                        "landing pipeline: failed to record conflict-correction assignee"
+                    );
+                }
+            }
+            Err(e) => {
+                // Refusal holds the branch and becomes a visible human gate.
+                let withheld = Withheld {
+                    code: "dispatch-refused",
+                    detail: format!("the correction spawn was refused by the supervisor: {e}"),
+                    decision: "clear whatever refused the dispatch (budget cap, WIP ceiling, \
+                               paused dispatch), then dispatch the correction ticket"
+                        .into(),
+                };
+                self.escalate(entry, ctx.escalation(&withheld))?;
+                warn!(
+                    repo = %entry.repo_name, branch = %entry.branch, error = %e,
+                    "landing pipeline: bounded conflict-correction dispatch refused"
+                );
+            }
+        }
+        Ok(LandingOutcome::ReworkFiled(ticket))
+    }
+
+    /// File the historical steward-shaped follow-up directly and idempotently.
+    /// Distinct coalesce namespace from [`Self::file_rework_ticket`] so a
+    /// conflict and a review-rework on the same branch/head never collapse
+    /// onto the same follow-up ticket.
+    async fn file_conflict_rework_ticket(
+        &self,
+        entry: &LandingQueueEntry,
+    ) -> rk_core::Result<Tuple> {
+        self.tickets
+            .create(NewTicket {
+                title: format!("conflict: {}", entry.task),
+                body: Some(format!(
+                    "Landing pipeline could not merge {} into {} — a merge conflict, not a \
+                     review verdict. Read the durable dispatch marker: rk scan event {}",
+                    entry.branch, entry.target, entry.repo_name
+                )),
+                scope: Some(entry.repo_name.clone()),
+                parent: None,
+                priority: "normal".to_string(),
+                labels: Vec::new(),
+                depends_on: Vec::new(),
+                created_by: Some("daemon".to_string()),
+                // Redelivery resolves to the same follow-up ticket.
+                coalesce_key: Some(landing_conflict::ticket_coalesce_key(
+                    &entry.repo_name,
+                    &entry.branch,
+                    &entry.head_sha,
+                    &entry.target,
+                    &entry.task,
+                )),
+            })
+            .await
+    }
+
+    /// [`Self::resubmit_reworked_parent`]'s counterpart for a landed
+    /// conflict-correction: queue the conflicted branch at its new head once
+    /// its correction agent lands back onto it.
+    fn resubmit_conflict_reworked_parent(&self, entry: &LandingQueueEntry) -> rk_core::Result<()> {
+        let marker = self
+            .space
+            .scan(
+                &Pattern::category(Category::Event)
+                    .identity(CONFLICT_DISPATCH_IDENTITY)
+                    .scope(&entry.repo_name),
+            )?
+            .into_iter()
+            .find(|marker| {
+                marker.payload.get("rework_ticket").and_then(Value::as_str)
+                    == Some(entry.task.as_str())
+                    && marker.payload.get("branch").and_then(Value::as_str)
+                        == Some(entry.target.as_str())
+                    && matches!(
+                        marker.payload.get("state").and_then(Value::as_str),
+                        Some("dispatching" | "dispatched")
+                    )
+            });
+        let Some(marker) = marker else {
+            return Ok(());
+        };
+        let payload = &marker.payload;
+        let original_branch = required_payload_str(payload, "branch", "conflict dispatch marker")?;
+        let original_target = required_payload_str(payload, "target", "conflict dispatch marker")?;
+        let original_task = required_payload_str(payload, "task", "conflict dispatch marker")?;
+        let repo = rk_git::Repo::discover(Path::new(&entry.repo_path))?;
+        let head_sha = repo.rev_parse(original_branch)?;
+        let stat = repo.diff_stat(original_target, original_branch)?;
+        let parent = LandingQueueEntry {
+            repo_name: entry.repo_name.clone(),
+            repo_path: entry.repo_path.clone(),
+            branch: original_branch.to_string(),
+            target: original_target.to_string(),
+            head_sha: head_sha.clone(),
+            diff_class: crate::supervisor::classify_diff(&stat.files, stat.lines).to_string(),
+            task: original_task.to_string(),
+            ..Default::default()
+        };
+        let disposition = self.enqueue_disposition(parent)?;
+        if let EnqueueDisposition::Queued(seq) = disposition {
+            self.space.out(
+                Tuple::new(
+                    Category::Event,
+                    entry.repo_name.clone(),
+                    CONFLICT_RESUBMISSION_IDENTITY,
+                    "daemon",
+                    json!({
+                        "dispatch_key": payload.get("dispatch_key"),
+                        "rework_ticket": entry.task,
+                        "correction_branch": entry.branch,
+                        "branch": original_branch,
+                        "target": original_target,
+                        "task": original_task,
+                        "head_sha": head_sha,
+                        "seq": seq,
+                        "state": "queued",
+                    }),
+                )
+                .with_lifecycle(Lifecycle::Furniture),
+            )?;
+            info!(
+                rework_ticket = %entry.task,
+                branch = original_branch,
+                target = original_target,
+                head_sha,
+                seq,
+                "landed conflict correction queued its held parent for a fresh gate run"
+            );
+        }
+        Ok(())
     }
 
     /// Full exact-commit artifact used by the classifier.
@@ -7401,6 +7889,373 @@ workflow: {
                 .with_lifecycle(Lifecycle::Furniture),
             )
             .unwrap();
+    }
+
+    fn conflict_context(head: &str, task: &str, rework_ticket: &str) -> ConflictContext {
+        ConflictContext {
+            repo: "code-repo".into(),
+            branch: "feature".into(),
+            head_sha: head.into(),
+            target: "main".into(),
+            target_head: "target-head-placeholder".into(),
+            fork_point: "fork-point-placeholder".into(),
+            task: task.into(),
+            rework_ticket: rework_ticket.into(),
+            conflict_detail: "CONFLICT (content): Merge conflict in src.rs".into(),
+            diff_files: 1,
+            diff_lines: 1,
+        }
+    }
+
+    fn put_conflict_marker(space: &Space, ctx: &ConflictContext, agent: Option<&str>, state: &str) {
+        space
+            .out(
+                Tuple::new(
+                    Category::Event,
+                    "code-repo",
+                    CONFLICT_DISPATCH_IDENTITY,
+                    "daemon",
+                    ctx.marker_payload(1, agent, state),
+                )
+                .with_lifecycle(Lifecycle::Furniture),
+            )
+            .unwrap();
+    }
+
+    /// `main` and `feature` diverge on the same path from a shared fork
+    /// point, so `prepare_merge("feature", "main")` cannot build a
+    /// candidate. Returns `(repo_dir, head_sha, main_before)`.
+    fn conflicting_repo_with_file(rel_path: &str) -> (tempfile::TempDir, String, String) {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        let full = repo_dir.path().join(rel_path);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, "feature side\n").unwrap();
+        git(repo_dir.path(), &["add", rel_path]);
+        git(repo_dir.path(), &["commit", "-m", "feat: feature side"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, "main side\n").unwrap();
+        git(repo_dir.path(), &["add", rel_path]);
+        git(repo_dir.path(), &["commit", "-m", "feat: main side"]);
+        let main_before = rev_parse(repo_dir.path(), "main");
+        (repo_dir, head_sha, main_before)
+    }
+
+    fn conflicting_repo() -> (tempfile::TempDir, String, String) {
+        conflicting_repo_with_file("src.rs")
+    }
+
+    fn conflict_candidate_entry(repo_dir: &Path, head_sha: &str) -> LandingQueueEntry {
+        LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: head_sha.to_string(),
+            diff_class: "large".into(),
+            task: "add src".into(),
+            ..Default::default()
+        }
+    }
+
+    /// AC1/autonomous-rework proof: the landing conflict itself resolves into
+    /// exactly one durable, structured recovery item (repo/source/target/
+    /// fork-point/exact-heads/bounded-evidence, all on the dispatch marker),
+    /// and dispatches one bounded correction agent cut from the held branch's
+    /// own tip, without mutating either the branch or the target.
+    #[tokio::test]
+    async fn conflict_recovery_dispatches_one_bounded_correction_without_mutating_the_original_branch(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, main_before) = conflicting_repo();
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let entry = conflict_candidate_entry(repo_dir.path(), &head_sha);
+        pipeline.enqueue(entry.clone()).unwrap();
+
+        let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let LandingOutcome::ReworkFiled(ticket) = &outcomes[0] else {
+            panic!("expected ReworkFiled, got {:?}", outcomes[0]);
+        };
+        assert_eq!(ticket.payload["title"], "conflict: add src");
+        assert_eq!(ticket.scope, "code-repo");
+
+        assert_eq!(
+            rev_parse(repo_dir.path(), "main"),
+            main_before,
+            "target must not have moved"
+        );
+        assert_eq!(
+            rev_parse(repo_dir.path(), "feature"),
+            head_sha,
+            "the original conflicted branch must be untouched — the correction is a fresh agent"
+        );
+
+        let spawns = tuples(&space, Category::Event, "agent_spawned");
+        assert_eq!(
+            spawns.len(),
+            1,
+            "bounded CONFLICT recovery must dispatch one agent"
+        );
+        let markers = scoped_tuples(&space, Category::Event, CONFLICT_DISPATCH_IDENTITY);
+        assert_eq!(markers.len(), 1, "one logical dispatch gets one marker");
+        assert_eq!(markers[0].payload["state"], "dispatching");
+        assert_eq!(markers[0].payload["repo"], "code-repo");
+        assert_eq!(markers[0].payload["source"], "feature");
+        assert_eq!(markers[0].payload["target"], "main");
+        assert_eq!(markers[0].payload["head_sha"], head_sha);
+        assert_eq!(markers[0].payload["target_head"], main_before);
+        assert_eq!(markers[0].payload["task"], "add src");
+        assert_eq!(markers[0].payload["rework_ticket"], ticket.identity);
+        let fork_point = markers[0].payload["fork_point"].as_str().unwrap();
+        assert_ne!(
+            fork_point, head_sha,
+            "fork point must not be the source tip"
+        );
+        assert_ne!(
+            fork_point, main_before,
+            "fork point must not be the target tip"
+        );
+        assert!(
+            markers[0].payload["conflict_evidence"]
+                .as_str()
+                .unwrap()
+                .contains("CONFLICT"),
+            "{:?}",
+            markers[0].payload["conflict_evidence"]
+        );
+
+        // Once the correction lands back onto `feature`, the held branch must
+        // resubmit through the normal queue rather than land itself. Advance
+        // `feature`'s tip first (as a landed correction commit would) so the
+        // resubmitted work key differs from the conflicted one already
+        // marked processed above.
+        git(repo_dir.path(), &["checkout", "feature"]);
+        std::fs::write(repo_dir.path().join("resolved.txt"), "fixed\n").unwrap();
+        git(repo_dir.path(), &["add", "resolved.txt"]);
+        git(repo_dir.path(), &["commit", "-m", "fix: resolve conflict"]);
+        git(repo_dir.path(), &["checkout", "main"]);
+        let correction = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "rat/correction".into(),
+            target: "feature".into(),
+            head_sha: "irrelevant-for-this-probe".into(),
+            diff_class: "doc-only".into(),
+            task: ticket.identity.clone(),
+            ..Default::default()
+        };
+        pipeline
+            .resubmit_conflict_reworked_parent(&correction)
+            .unwrap();
+        let pending = pipeline
+            .queue
+            .scan_current("code-repo", Some("main"))
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "held branch must be requeued exactly once"
+        );
+        assert_eq!(pending[0].payload["branch"], "feature");
+        assert_eq!(pending[0].payload["target"], "main");
+        assert_eq!(pending[0].payload["task"], "add src");
+    }
+
+    /// AC5/human-gating proof: a conflict whose diff touches this
+    /// repository's `protectedPaths` is held for a human, never dispatched.
+    #[tokio::test]
+    async fn protected_path_conflict_holds_for_a_human_instead_of_dispatching() {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, main_before) =
+            conflicting_repo_with_file("migrations/0001_schema.sql");
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let entry = conflict_candidate_entry(repo_dir.path(), &head_sha);
+        pipeline.enqueue(entry.clone()).unwrap();
+
+        let outcome = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert!(matches!(
+            outcome.as_slice(),
+            [LandingOutcome::ReworkFiled(_)]
+        ));
+        assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
+        assert_eq!(rev_parse(repo_dir.path(), "feature"), head_sha);
+        no_spawns(&space);
+
+        let needs = scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY);
+        assert_eq!(needs.len(), 1);
+        let text = needs[0].payload["text"].as_str().unwrap();
+        for required in [
+            "protected-path-impact",
+            "EVIDENCE:",
+            "DECISION NEEDED:",
+            "BLAST RADIUS:",
+            "RESOLVE WITH: rk spawn",
+        ] {
+            assert!(text.contains(required), "missing {required:?}: {text}");
+        }
+    }
+
+    /// AC4/idempotent-duplicate-delivery proof: a redelivered completion for
+    /// the exact same work key (the reactor's at-least-once retry, or an
+    /// operator re-triggering the same event by hand) must reconcile against
+    /// the already-processed outcome rather than spawn or land a second time.
+    #[tokio::test]
+    async fn duplicate_conflict_delivery_does_not_spawn_or_file_twice() {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, main_before) = conflicting_repo();
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let entry = conflict_candidate_entry(repo_dir.path(), &head_sha);
+
+        let first = pipeline.process_entry(&entry).await.unwrap();
+        assert!(matches!(first, LandingOutcome::ReworkFiled(_)));
+
+        let second = pipeline.process_entry(&entry).await.unwrap();
+        assert!(
+            matches!(&second, LandingOutcome::Reconciled(prior) if prior == "rework-filed"),
+            "a redelivered conflict must reconcile against the already-processed work key, got \
+             {second:?}"
+        );
+
+        assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
+        assert_eq!(rev_parse(repo_dir.path(), "feature"), head_sha);
+        assert_eq!(
+            tuples(&space, Category::Event, "agent_spawned").len(),
+            1,
+            "duplicate delivery must not spawn a second correction agent"
+        );
+        assert_eq!(
+            scoped_tuples(&space, Category::Event, CONFLICT_DISPATCH_IDENTITY).len(),
+            1,
+            "duplicate delivery must not append another dispatch marker"
+        );
+        let conflict_tickets = space
+            .scan(&Pattern::category(Category::Task).scope("code-repo"))
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.payload["title"] == "conflict: add src")
+            .count();
+        assert_eq!(
+            conflict_tickets, 1,
+            "duplicate delivery must not file a second follow-up ticket"
+        );
+    }
+
+    /// Restart proof: a marker recorded `dispatching` but never journaled by
+    /// the supervisor (a daemon that stopped between the two) survives a
+    /// restart as one human gate, not a duplicated spawn.
+    #[tokio::test]
+    async fn conflict_dispatch_interrupted_before_spawn_survives_restart_as_one_human_gate() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        layout.ensure().unwrap();
+        let (repo_dir, head_sha, main_before) = conflicting_repo();
+        let entry = conflict_candidate_entry(repo_dir.path(), &head_sha);
+
+        {
+            let space = Space::open(&layout.db_path()).unwrap();
+            let pipeline = test_pipeline(home.path(), space.clone());
+            let ticket = pipeline.file_conflict_rework_ticket(&entry).await.unwrap();
+            let ctx = conflict_context(&entry.head_sha, &entry.task, &ticket.identity);
+            put_conflict_marker(&space, &ctx, None, "dispatching");
+        }
+
+        // A fresh Space and pipeline stand in for a daemon restart after the
+        // marker commit point but before Supervisor::spawn journaled an agent.
+        let space = Space::open(&layout.db_path()).unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        for _ in 0..2 {
+            let replay = pipeline
+                .route_conflict(
+                    &entry,
+                    &repo,
+                    "CONFLICT (content): Merge conflict in src.rs",
+                )
+                .await
+                .unwrap();
+            assert!(matches!(replay, LandingOutcome::ReworkFiled(_)));
+        }
+
+        assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
+        assert_eq!(rev_parse(repo_dir.path(), "feature"), head_sha);
+        assert!(
+            tuples(&space, Category::Event, "agent_spawned").is_empty(),
+            "an ambiguous restart must never duplicate the correction agent"
+        );
+        let needs = space
+            .scan(&Pattern::category(Category::Need).scope("code-repo"))
+            .unwrap();
+        assert_eq!(needs.len(), 1, "replay must converge on one visible gate");
+        let text = needs[0].payload["text"].as_str().unwrap();
+        for required in [
+            "dispatch-interrupted",
+            "EVIDENCE:",
+            "DECISION NEEDED:",
+            "BLAST RADIUS:",
+            "RESOLVE WITH: rk spawn",
+        ] {
+            assert!(text.contains(required), "missing {required:?}: {text}");
+        }
+    }
+
+    /// Retry-exhaustion proof: a branch that already spent this repository's
+    /// one automatic conflict-correction attempt holds on its next conflict,
+    /// with actionable evidence, and a replay converges on the same gate.
+    #[tokio::test]
+    async fn conflict_recovery_chain_exhausted_holds_once_with_actionable_evidence() {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, main_before) = conflicting_repo();
+        let space = Space::open_in_memory().unwrap();
+        let prior = conflict_context("prior-conflicted-head", "add src", "TKT-prior-correction");
+        put_conflict_marker(&space, &prior, Some("Prior-Rat"), "dispatching");
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let entry = conflict_candidate_entry(repo_dir.path(), &head_sha);
+        pipeline.enqueue(entry.clone()).unwrap();
+
+        let outcome = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert!(matches!(
+            outcome.as_slice(),
+            [LandingOutcome::ReworkFiled(_)]
+        ));
+        assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
+        assert_eq!(rev_parse(repo_dir.path(), "feature"), head_sha);
+        no_spawns(&space);
+
+        let needs = scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY);
+        assert_eq!(needs.len(), 1);
+        let text = needs[0].payload["text"].as_str().unwrap();
+        for required in [
+            "attempts-exhausted",
+            "EVIDENCE:",
+            "DECISION NEEDED:",
+            "BLAST RADIUS:",
+            "RESOLVE WITH: rk spawn",
+        ] {
+            assert!(text.contains(required), "missing {required:?}: {text}");
+        }
+
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        pipeline
+            .route_conflict(
+                &entry,
+                &repo,
+                "CONFLICT (content): Merge conflict in src.rs",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).len(),
+            1,
+            "replay must converge on the existing human gate"
+        );
     }
 
     fn review_death_context(head: &str, task: &str) -> ReviewDeathContext {

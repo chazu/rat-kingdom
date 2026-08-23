@@ -333,6 +333,18 @@ impl Repo {
         )
     }
 
+    /// The fork point of `a` and `b` — the best common ancestor `git
+    /// merge-base` finds. Bounded for the same reason [`rev_parse`](Repo::rev_parse)
+    /// is: a cheap local read that must never join the unbounded-subprocess
+    /// class of failure.
+    pub fn merge_base(&self, a: &str, b: &str) -> rk_core::Result<String> {
+        Ok(
+            git_bounded(&self.root, &["merge-base", a, b], LOCAL_READ_TIMEOUT)?
+                .trim()
+                .to_string(),
+        )
+    }
+
     /// File list and total changed-line count for the `base...head` symmetric
     /// (merge-base) diff — the same range shape the `steward-diff-scope` check
     /// computes by hand in `.rk/checks.cue`. A binary file reports `-`/`-` in
@@ -2204,6 +2216,26 @@ mod tests {
         let sha = repo.rev_parse(&branch).unwrap();
         assert_eq!(sha.len(), 40, "expected a full sha, got {sha:?}");
         assert_eq!(sha, repo.git(&["rev-parse", &branch]).unwrap().trim());
+    }
+
+    #[test]
+    fn merge_base_finds_the_common_ancestor() {
+        let (dir, repo) = scratch_repo();
+        let main_tip = repo.rev_parse("main").unwrap();
+        let branch = commit_on_branch(dir.path(), &repo, "havarti", "task-forkpoint");
+        // main advances after the branch forked, so the branch's own tip is
+        // NOT the fork point — this must resolve to where they actually
+        // diverged, not either side's current head.
+        std::fs::write(dir.path().join("README.md"), "# advanced\n").unwrap();
+        run(dir.path(), &["add", "."]);
+        run(dir.path(), &["commit", "-m", "advance main"]);
+        assert_eq!(repo.merge_base(&branch, "main").unwrap(), main_tip);
+        assert_ne!(repo.rev_parse("main").unwrap(), main_tip);
+        assert_eq!(
+            repo.merge_base(&branch, "main").unwrap(),
+            repo.merge_base("main", &branch).unwrap(),
+            "merge-base is symmetric"
+        );
     }
 
     #[test]

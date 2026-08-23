@@ -131,6 +131,33 @@ pub struct LandingPolicy {
     /// means unlimited, matching the fleet budget convention.
     #[serde(default = "default_rework_max_usd", rename = "reworkMaxUsd")]
     pub rework_max_usd: u32,
+    /// Whether a landing-time merge CONFLICT (not a reviewer verdict — the
+    /// candidate never even built) may dispatch a bounded correction agent
+    /// unattended, from the held source branch at its exact head. `false`
+    /// restores the pre-feature behavior: file the follow-up ticket, hold
+    /// the branch, and wait for a human. See
+    /// `crates/rk-daemon/src/landing_conflict.rs` for the classifier — a
+    /// protected-path hit, an over-budget diff, or unreadable conflict
+    /// evidence is held regardless of this switch.
+    #[serde(default = "default_true", rename = "conflictReworkAutoDispatch")]
+    pub conflict_rework_auto_dispatch: bool,
+    /// Hard ceiling on how many correction agents one conflicted branch may
+    /// have dispatched across its whole conflict→correction→re-land chain.
+    /// `0` disables unattended conflict recovery as surely as
+    /// `conflictReworkAutoDispatch: false` does.
+    #[serde(
+        default = "default_max_conflict_rework_attempts",
+        rename = "maxConflictReworkAttempts"
+    )]
+    pub max_conflict_rework_attempts: u32,
+    /// Hard ceiling on the cumulative USD spent across every correction agent
+    /// in one conflicted branch's chain, checked before each dispatch. `0`
+    /// means unlimited, matching the fleet budget convention.
+    #[serde(
+        default = "default_conflict_rework_max_usd",
+        rename = "conflictReworkMaxUsd"
+    )]
+    pub conflict_rework_max_usd: u32,
     /// Shadow-review model (phase-2 P4a): when non-empty, every review
     /// request ALSO spawns a second, non-blocking reviewer on this model,
     /// chained onto the same candidate branch/commit. Its verdict is
@@ -258,6 +285,9 @@ impl Default for LandingPolicy {
             rework_auto_dispatch: true,
             max_rework_attempts: default_max_rework_attempts(),
             rework_max_usd: default_rework_max_usd(),
+            conflict_rework_auto_dispatch: true,
+            max_conflict_rework_attempts: default_max_conflict_rework_attempts(),
+            conflict_rework_max_usd: default_conflict_rework_max_usd(),
             shadow_review_model: default_shadow_review_model(),
             shadow_review_harness: default_shadow_review_harness(),
             review_death_auto_retry: true,
@@ -285,6 +315,21 @@ fn default_max_rework_attempts() -> u32 {
 /// automation. Sized well above a normal implement+review pair so an ordinary
 /// bounded correction never trips it, and well below a runaway.
 fn default_rework_max_usd() -> u32 {
+    25
+}
+
+/// One automatic correction per conflicted branch. A second CONFLICT on the
+/// same branch after a correction already landed into it means the branch
+/// keeps diverging from its target faster than corrections converge it —
+/// that is a judgment call, not more of the same dispatch.
+fn default_max_conflict_rework_attempts() -> u32 {
+    1
+}
+
+/// Sized identically to [`default_rework_max_usd`]: a bounded merge-conflict
+/// correction is the same class of cheap, one-shot automation as a bounded
+/// review-rework correction.
+fn default_conflict_rework_max_usd() -> u32 {
     25
 }
 
