@@ -3565,7 +3565,9 @@ impl LandingPipeline {
             .collect();
         Ok(matching
             .iter()
-            .find(|marker| marker.payload.get("state").and_then(Value::as_str) != Some("dispatching"))
+            .find(|marker| {
+                marker.payload.get("state").and_then(Value::as_str) != Some("dispatching")
+            })
             .or_else(|| matching.first())
             .cloned())
     }
@@ -3905,7 +3907,9 @@ impl LandingPipeline {
             .collect();
         Ok(matching
             .iter()
-            .find(|marker| marker.payload.get("state").and_then(Value::as_str) != Some("dispatching"))
+            .find(|marker| {
+                marker.payload.get("state").and_then(Value::as_str) != Some("dispatching")
+            })
             .or_else(|| matching.first())
             .cloned())
     }
@@ -8291,7 +8295,11 @@ workflow: {
         );
 
         let needs = scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY);
-        assert_eq!(needs.len(), 1, "a refused dispatch must raise one human gate");
+        assert_eq!(
+            needs.len(),
+            1,
+            "a refused dispatch must raise one human gate"
+        );
         let text = needs[0].payload["text"].as_str().unwrap();
         assert!(text.contains("dispatch-refused"), "{text}");
 
@@ -8697,7 +8705,11 @@ workflow: {
         );
 
         let needs = scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY);
-        assert_eq!(needs.len(), 1, "a refused dispatch must raise one human gate");
+        assert_eq!(
+            needs.len(),
+            1,
+            "a refused dispatch must raise one human gate"
+        );
         let text = needs[0].payload["text"].as_str().unwrap();
         assert!(text.contains("dispatch-refused"), "{text}");
 
