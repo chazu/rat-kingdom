@@ -1152,6 +1152,26 @@ pub struct PolicyConfig {
     /// Durable orchestrator lease TTL (seconds): how long a lease holder has
     /// before a different holder may preempt it.
     pub orchestrator_lease_ttl_secs: i64,
+    /// Fleet-wide default max concurrent daemon-managed verification runs
+    /// (`WorkflowEngine::run_check_in`, gated to checks that set
+    /// `sharedCargoTarget` — the CPU/wall-clock-heavy ones, e.g. `verify`) for
+    /// one repository at a time: landing gates, workflow `run` steps, AND
+    /// `verify.run`-mediated agent/reviewer self-checks all share this ONE
+    /// per-repo bound (TKT-01M0HNESEECWWFQF8X6VH1XSJ6). `0` (the default)
+    /// disables admission control entirely — zero behaviour change from
+    /// before this existed — matching the `0 = unlimited/disabled` convention
+    /// already used by [`SupervisorConfig::min_free_gb`]-style caps elsewhere
+    /// in this file. An operator who has observed real contention (concurrent
+    /// full-suite runs starving each other of CPU) sets this to a small
+    /// positive number; raising it above 1 is what "repository policy limit
+    /// greater than one" in the ticket means in practice.
+    pub verification_admission_limit: u32,
+    /// Per-repo override of [`verification_admission_limit`](Self::verification_admission_limit),
+    /// keyed by repo name — same fallback role as
+    /// [`crate::config`]'s other per-repo overrides (e.g.
+    /// `rk_daemon::Reap::artifact_paths_by_repo`). A repo absent here uses the
+    /// fleet-wide default above.
+    pub verification_admission_limit_by_repo: BTreeMap<String, u32>,
 }
 
 impl Default for PolicyConfig {
@@ -1167,6 +1187,8 @@ impl Default for PolicyConfig {
             orchestrator_rate_cap: 5,
             orchestrator_rate_window_secs: 3600,
             orchestrator_lease_ttl_secs: 300,
+            verification_admission_limit: 0,
+            verification_admission_limit_by_repo: BTreeMap::new(),
         }
     }
 }

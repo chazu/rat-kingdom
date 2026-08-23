@@ -613,6 +613,14 @@ pub struct Supervisor {
     /// Only ever contended when [`shared_cargo_target`](Self::shared_cargo_target)
     /// is also on — see [`TestExecLock`] for why.
     test_exec_lock: TestExecLock,
+    /// Bounded per-repo admission queue for daemon-managed verification runs
+    /// (`WorkflowEngine::run_check_in`, gated to `sharedCargoTarget` checks —
+    /// TKT-01M0HNESEECWWFQF8X6VH1XSJ6). Distinct from [`test_exec_lock`](Self::test_exec_lock):
+    /// that lock serializes a shared-disk hazard down to exactly 1 concurrent
+    /// runner; this queue bounds CPU/wall-clock contention and its limit is a
+    /// configurable policy value that may be raised above 1. See
+    /// [`VerificationAdmission`].
+    verification_admission: VerificationAdmission,
     /// `[disk] min_free_gb` (0 = disabled), applied by `Daemon::new` from
     /// config. Defaults to 0 here — a bare `Supervisor` constructed directly
     /// by a test or another crate stays disk-guard-free unless it opts in via
@@ -843,6 +851,92 @@ impl TestExecLock {
     }
 }
 
+/// Bounded per-repository admission queue for daemon-managed verification
+/// runs (TKT-01M0HNESEECWWFQF8X6VH1XSJ6): the ONE gate `run_check_in` sends
+/// every `sharedCargoTarget` check through, whether it was dispatched by a
+/// landing gate, a workflow `run` step, or the `verify.run` RPC an
+/// agent/reviewer's own completion check calls into instead of self-invoking
+/// a full suite. Keyed per repo, exactly like [`TestExecLock`] — the two are
+/// independent resources (this bounds CPU/wall-clock contention across
+/// concurrent full-suite runs; `TestExecLock` serializes a shared-disk build
+/// hazard down to 1), so a check that opts into `sharedCargoTarget` acquires
+/// BOTH, in the order [`WorkflowEngine::run_check_in`] declares them.
+///
+/// Backed by `tokio::sync::Semaphore`, which grants permits in acquire order
+/// (FIFO) — the fairness property the ticket asks to be provable. A repo's
+/// semaphore is created lazily, sized to its configured limit at that moment;
+/// changing the configured limit at runtime does not resize an
+/// already-created semaphore (matches this codebase's existing
+/// `TestExecLock`/`shared_cargo_target` precedent of reading config once at
+/// daemon startup, not live-reloading mid-flight).
+///
+/// RESTART RECOVERY IS AUTOMATIC: every field here is in-memory only, with no
+/// durable counterpart. A daemon restart drops this struct along with every
+/// outstanding `OwnedSemaphorePermit` it had handed out — there is no state
+/// to leak or to recover, because there is no state that survives the
+/// process. The next daemon simply starts every repo's semaphore fresh, full
+/// of permits. (Contrast a durable lease record, which WOULD need explicit
+/// restart-recovery logic to avoid permanently stranding a permit whose
+/// holder died with the old process — deliberately not built, since it would
+/// only add a way to leak what the in-memory design cannot.)
+#[derive(Default)]
+struct VerificationAdmission {
+    semaphores: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Fleet-wide default WIP limit; `0` disables admission control (no
+    /// semaphore is ever created, so an unconfigured repo pays zero overhead
+    /// beyond the lookup itself).
+    default_limit: AtomicU64,
+    /// Per-repo overrides, keyed by repo name — same convention as
+    /// `rk_core::config::PolicyConfig::verification_admission_limit_by_repo`.
+    overrides: Mutex<HashMap<String, u32>>,
+}
+
+impl VerificationAdmission {
+    fn set_limits(&self, default_limit: u32, overrides: HashMap<String, u32>) {
+        self.default_limit
+            .store(u64::from(default_limit), Ordering::Relaxed);
+        *self.overrides.lock().unwrap() = overrides;
+    }
+
+    /// The configured WIP limit for `repo` — its own override if set, else
+    /// the fleet-wide default. `0` means admission control is off for this
+    /// repo.
+    fn limit_for(&self, repo: &str) -> u32 {
+        self.overrides
+            .lock()
+            .unwrap()
+            .get(repo)
+            .copied()
+            .unwrap_or(self.default_limit.load(Ordering::Relaxed) as u32)
+    }
+
+    /// Acquire one admission permit for `repo`, waiting in FIFO order behind
+    /// any earlier waiter. Returns the held permit together with how long
+    /// this call waited for it — the queue-wait half of the ticket's durable
+    /// timing requirement (the caller times execution itself). `None` when
+    /// admission control is disabled for `repo` (limit 0): every caller must
+    /// treat that as "proceed unbounded", matching pre-existing behaviour.
+    async fn acquire(&self, repo: &str, limit: u32) -> Option<(tokio::sync::OwnedSemaphorePermit, std::time::Duration)> {
+        if limit == 0 {
+            return None;
+        }
+        let sem = {
+            let mut semaphores = self.semaphores.lock().unwrap();
+            Arc::clone(semaphores.entry(repo.to_string()).or_insert_with(|| {
+                Arc::new(tokio::sync::Semaphore::new(limit as usize))
+            }))
+        };
+        let started = std::time::Instant::now();
+        // A semaphore is only ever closed by `close()`, which nothing here
+        // calls — this can never actually return `Err`.
+        let permit = sem
+            .acquire_owned()
+            .await
+            .expect("verification admission semaphore is never closed");
+        Some((permit, started.elapsed()))
+    }
+}
+
 /// Which of an archived record's leftovers `rk prune` should reclaim, beyond
 /// the record itself. Named fields rather than two positional `bool`s, because
 /// silently swapping them is exactly the bug worth designing out.
@@ -956,6 +1050,7 @@ impl Supervisor {
             merge_queue: MergeQueue::default(),
             landing_pipeline: Mutex::new(None),
             test_exec_lock: TestExecLock::default(),
+            verification_admission: VerificationAdmission::default(),
             min_free_disk_gb: AtomicU64::new(0),
             max_load_per_cpu_bits: AtomicU64::new(0f64.to_bits()),
             shared_cargo_target: AtomicBool::new(false),
@@ -1045,6 +1140,37 @@ impl Supervisor {
         repo: &str,
     ) -> tokio::sync::OwnedMutexGuard<()> {
         self.test_exec_lock.acquire(repo).await
+    }
+
+    /// Set `[policy] verification_admission_limit` / `_by_repo`. Applied by
+    /// `Daemon::new` from config, same pattern as
+    /// [`set_min_free_disk_gb`](Supervisor::set_min_free_disk_gb).
+    pub fn set_verification_admission_limits(
+        &self,
+        default_limit: u32,
+        overrides: HashMap<String, u32>,
+    ) {
+        self.verification_admission
+            .set_limits(default_limit, overrides);
+    }
+
+    /// The configured verification admission WIP limit for `repo` (0 =
+    /// disabled). Exposed so a caller can decide whether to bother measuring
+    /// queue-wait/execution timing at all before calling
+    /// [`acquire_verification_admission`](Self::acquire_verification_admission).
+    pub(crate) fn verification_admission_limit_for(&self, repo: &str) -> u32 {
+        self.verification_admission.limit_for(repo)
+    }
+
+    /// Acquire one bounded per-repo verification admission permit for `repo`.
+    /// See [`VerificationAdmission`] for what this bounds, the FIFO fairness
+    /// guarantee, and why a daemon restart can never leak one.
+    pub(crate) async fn acquire_verification_admission(
+        &self,
+        repo: &str,
+        limit: u32,
+    ) -> Option<(tokio::sync::OwnedSemaphorePermit, std::time::Duration)> {
+        self.verification_admission.acquire(repo, limit).await
     }
 
     /// Pause or resume new-agent admission ([`spawn`](Self::spawn)). Used by

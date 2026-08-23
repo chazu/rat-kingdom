@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use rk_core::id::prefixed_id;
 use rk_core::notify::{EscalationNotice, Severity, SinkRegistry};
 use rk_core::paths::Layout;
-use rk_core::tuple::{Category, Pattern, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
+use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
 use rk_space::Space;
 use rk_workflow::{
     resolve::{resolve, resolve_fields},
@@ -28,7 +28,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -153,6 +153,24 @@ const TIMEOUT_EXIT: i64 = 124;
 /// its own declared timeout. Distinct from [`TIMEOUT_EXIT`], which means the
 /// command itself started and was killed — this means it never started.
 const LOCK_TIMEOUT_EXIT: i64 = -2;
+
+/// Durable `(Event, <repo>, "verification_admission")` timing record
+/// (`Furniture`), written once per check that actually engaged the bounded
+/// per-repo admission queue (TKT-01M0HNESEECWWFQF8X6VH1XSJ6) — landing gate,
+/// workflow `run` step, or `verify.run` alike, whatever the verdict. Without
+/// this the ticket's queue-wait/execution timing requirement has no durable
+/// record: `landing_gate_pass` (commit `3d47d08`, "perf: reuse landing gate
+/// proof during review") only covers a full green LANDING gate, not every
+/// individual managed check.
+const VERIFICATION_ADMISSION_IDENTITY: &str = "verification_admission";
+
+/// Durable `(Event, <repo>, "verification_proof")` cache entry (`Furniture`)
+/// recorded by [`WorkflowEngine::verify_repo_check`] on a passing verdict for
+/// a clean-worktree candidate. Looked up again on a later exact-key match
+/// (same repo, candidate sha, check command, toolchain, environment policy —
+/// TKT-01M0HNESEECWWFQF8X6VH1XSJ6's dedup requirement) to skip a redundant
+/// re-run entirely, admission queue included.
+const VERIFICATION_PROOF_IDENTITY: &str = "verification_proof";
 
 /// Pause between a failed attempt and a `retryOnFail` retry. Fixed rather than
 /// configurable: this exists to ride out a transient condition (machine load,
@@ -3070,6 +3088,184 @@ impl WorkflowEngine {
         .await
     }
 
+    /// Run one repo-registered named check directly for `agent`, outside any
+    /// workflow instance — the `verify.run` RPC's entry point into the same
+    /// admission-controlled, env-stripped, exact-exit-provenance execution
+    /// [`run_check_in`] already gives landing gates and workflow `run` steps
+    /// (TKT-01M0HNESEECWWFQF8X6VH1XSJ6). This is the managed alternative a
+    /// rat's own completion-protocol verification step is meant to call
+    /// instead of self-invoking a full suite directly, so the same bounded
+    /// per-repo queue sees it. `dir` is both the check-registry root
+    /// (`<dir>/.rk/checks.cue`) and the check's execution cwd — the caller's
+    /// own worktree, or the repo's registered root checkout for the
+    /// operator.
+    ///
+    /// Reuses a durable proof for an EXACT match on `(repo, candidate sha,
+    /// check command, toolchain, environment policy)` instead of re-running
+    /// — including a proof an unrelated landing gate already wrote for this
+    /// exact candidate sha (`landing_gate_pass`, commit `3d47d08`), so a rat
+    /// whose branch a landing gate already tested gets an instant, free hit.
+    /// Proof reuse is gated on the worktree being clean: a dirty tree has no
+    /// stable "candidate" identity a later caller could safely match against,
+    /// so it is NEVER read from or written to the cache — always runs fresh,
+    /// through the same admission queue as everything else. Never reuses a
+    /// stale proof for a different prepared merge: the key binds the exact
+    /// candidate sha, so a rebased or amended branch head simply misses.
+    pub(crate) async fn verify_repo_check(
+        &self,
+        agent: &str,
+        dir: &Path,
+        repo_name: &str,
+        check_name: &str,
+    ) -> rk_core::Result<Value> {
+        let check = self.find_check(&dir.display().to_string(), check_name)?;
+        let resolved = ResolvedRun {
+            command: check.command.clone(),
+            cwd: check.cwd.clone(),
+            // Same reasoning as the landing pipeline's own construction
+            // (`LandingPipeline::run_gates_at`): read `verdict`/`exit` off
+            // the result instead of `run_check_in`'s inline exit-gate `Err`
+            // path, so a failing check is always a clean `Ok` result
+            // carrying its exact exit code, never a propagated error.
+            expect_exit: None,
+            timeout: check
+                .timeout
+                .clone()
+                .unwrap_or_else(|| DEFAULT_RUN_TIMEOUT.to_string()),
+            on_timeout: OnTimeout::Fail,
+            environment_policy: check.environment_policy,
+            retry_on_fail: 0,
+            shared_cargo_target: check.shared_cargo_target,
+        };
+        let exec_dir = match &resolved.cwd {
+            Some(cwd) => dir.join(cwd),
+            None => dir.to_path_buf(),
+        };
+        let timeout = parse_duration(&resolved.timeout)?;
+
+        let candidate_sha = clean_candidate_sha(dir).await;
+        if let Some(sha) = &candidate_sha {
+            if let Some(cached) = self.lookup_verification_proof(repo_name, sha, &check) {
+                return Ok(cached);
+            }
+        }
+
+        let result = self
+            .run_check_in(
+                &format!("verify-run:{agent}"),
+                repo_name,
+                agent,
+                &exec_dir,
+                &resolved.command,
+                &resolved,
+                &[],
+                timeout,
+                None,
+            )
+            .await?;
+
+        if let Some(sha) = &candidate_sha {
+            if result.get("verdict").and_then(Value::as_str) == Some("pass") {
+                self.record_verification_proof(repo_name, sha, &check, &result);
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Best-effort exact-key lookup: a durable proof this repo already wrote
+    /// for `candidate_sha` under this check's exact command/toolchain/env
+    /// policy, then — as a free secondary win — an unrelated landing gate's
+    /// `landing_gate_pass` for the same candidate sha and check name
+    /// (matched more loosely: that event carries no command text, so it is
+    /// a best-effort source, not the primary exactness guarantee the
+    /// dedicated cache above provides).
+    fn lookup_verification_proof(
+        &self,
+        repo_name: &str,
+        candidate_sha: &str,
+        check: &rk_workflow::Check,
+    ) -> Option<Value> {
+        let key = verification_proof_key(repo_name, candidate_sha, check)?;
+        if let Ok(tuples) = self.space.scan(
+            &Pattern::category(Category::Event)
+                .identity(VERIFICATION_PROOF_IDENTITY)
+                .scope(repo_name),
+        ) {
+            if let Some(t) = tuples
+                .iter()
+                .find(|t| t.payload.get("key").and_then(Value::as_str) == Some(key.as_str()))
+            {
+                let mut result = t.payload.get("result").cloned().unwrap_or_else(|| json!({}));
+                if let Value::Object(map) = &mut result {
+                    map.insert("reused".into(), json!(true));
+                    map.insert("reused_from".into(), json!("verification_proof"));
+                }
+                return Some(result);
+            }
+        }
+        if let Ok(tuples) = self.space.scan(
+            &Pattern::category(Category::Event)
+                .identity("landing_gate_pass")
+                .scope(repo_name),
+        ) {
+            if let Some(t) = tuples.iter().find(|t| {
+                t.payload.get("candidate_sha").and_then(Value::as_str) == Some(candidate_sha)
+                    && t.payload
+                        .get("checks")
+                        .and_then(Value::as_array)
+                        .map(|checks| {
+                            checks
+                                .iter()
+                                .any(|c| c.as_str() == Some(check.name.as_str()))
+                        })
+                        .unwrap_or(false)
+            }) {
+                return Some(json!({
+                    "exit": 0,
+                    "verdict": "pass",
+                    "reused": true,
+                    "reused_from": "landing_gate_pass",
+                    "candidate_sha": candidate_sha,
+                    "branch": t.payload.get("branch"),
+                }));
+            }
+        }
+        None
+    }
+
+    /// Record a durable proof of `result` (only ever called on a "pass"
+    /// verdict) for later exact-key reuse by
+    /// [`lookup_verification_proof`](Self::lookup_verification_proof).
+    fn record_verification_proof(
+        &self,
+        repo_name: &str,
+        candidate_sha: &str,
+        check: &rk_workflow::Check,
+        result: &Value,
+    ) {
+        let Some(key) = verification_proof_key(repo_name, candidate_sha, check) else {
+            return;
+        };
+        let _ = self.space.out(
+            Tuple::new(
+                Category::Event,
+                repo_name.to_string(),
+                VERIFICATION_PROOF_IDENTITY,
+                "daemon",
+                json!({
+                    "key": key,
+                    "candidate_sha": candidate_sha,
+                    "command": check.command,
+                    "toolchain": check.toolchain,
+                    "environment_policy": check.environment_policy.to_string(),
+                    "result": result,
+                }),
+            )
+            .with_lifecycle(Lifecycle::Furniture),
+        );
+    }
+
     /// Run one resolved check to completion in `dir`, with retry/timeout
     /// policy and durable gate-failure recording — everything downstream of
     /// "have a directory and a fully-resolved command". Split out of
@@ -3143,6 +3339,72 @@ impl WorkflowEngine {
         } else {
             None
         };
+
+        // Bounded per-repo verification admission queue
+        // (TKT-01M0HNESEECWWFQF8X6VH1XSJ6): the ONE gate landing gates,
+        // workflow `run` steps, and `verify.run`-mediated agent/reviewer
+        // self-checks all share for a `sharedCargoTarget` check. Distinct
+        // resource from `_test_exec_guard` above (that serializes a
+        // shared-disk hazard to exactly 1; this bounds CPU/wall-clock
+        // contention to a configurable, possibly-greater-than-1 policy
+        // limit) — both are acquired, in this order, when a check opts into
+        // `sharedCargoTarget`. `0` (the default) disables it: zero behaviour
+        // change from before this queue existed. Held for the rest of this
+        // function's scope, same fail-closed-on-its-own-timeout shape as the
+        // lock above.
+        let admission_limit = if resolved.shared_cargo_target {
+            self.supervisor.verification_admission_limit_for(repo)
+        } else {
+            0
+        };
+        // Bound to this function's scope (dropped, releasing the permit, on
+        // every return path below — including an early one — exactly like
+        // `_test_exec_guard`). `None` when admission control is disabled or
+        // this check didn't opt in; `admission_queue_wait_ms` is `None` in
+        // lockstep, so the two always agree on whether a slot was ever
+        // waited for.
+        let mut _admission_guard: Option<tokio::sync::OwnedSemaphorePermit> = None;
+        let admission_queue_wait_ms: Option<u64> = if admission_limit > 0 {
+            match tokio::time::timeout(
+                timeout,
+                self.supervisor
+                    .acquire_verification_admission(repo, admission_limit),
+            )
+            .await
+            {
+                Ok(Some((permit, wait))) => {
+                    _admission_guard = Some(permit);
+                    Some(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX))
+                }
+                Ok(None) => None,
+                Err(_) => {
+                    let stderr = format!(
+                        "run step: `{command}` did not acquire the verification admission \
+                         queue for repo `{repo}` within {timeout:?} — WIP limit {admission_limit} \
+                         reached"
+                    );
+                    self.record_gate_failure(
+                        id,
+                        repo,
+                        agent,
+                        command,
+                        LOCK_TIMEOUT_EXIT,
+                        "fail",
+                        false,
+                        None,
+                        "",
+                        false,
+                        &stderr,
+                        false,
+                        &[],
+                    );
+                    return Err(rk_core::Error::other(stderr));
+                }
+            }
+        } else {
+            None
+        };
+        let run_started = Instant::now();
 
         // Extra attempts on a non-"pass" verdict, for a check already
         // characterized as flaky for reasons outside the code under test
@@ -3252,6 +3514,15 @@ impl WorkflowEngine {
                     stderr_truncated,
                     &history,
                 );
+                self.record_verification_admission_event(
+                    repo,
+                    agent,
+                    command,
+                    admission_queue_wait_ms,
+                    run_started.elapsed(),
+                    exit,
+                    verdict,
+                );
                 return Err(rk_core::Error::other(stderr));
             }
             if verdict == "pass" || attempt == attempts {
@@ -3309,6 +3580,16 @@ impl WorkflowEngine {
         if !history.is_empty() {
             result["retries"] = json!(history);
         }
+
+        self.record_verification_admission_event(
+            repo,
+            agent,
+            command,
+            admission_queue_wait_ms,
+            run_started.elapsed(),
+            exit,
+            verdict,
+        );
 
         // A non-"pass" verdict is a gate that said no (or never finished).
         // Persist a durable, bounded record of what it said BEFORE a following
@@ -3495,6 +3776,47 @@ impl WorkflowEngine {
             "daemon",
             payload,
         ));
+    }
+
+    /// Durable queue-wait/execution timing for one check that engaged the
+    /// bounded per-repo verification admission queue (TKT-01M0HNESEECWWFQF8X6VH1XSJ6)
+    /// — a no-op when it didn't (`queue_wait_ms` is `None` exactly when
+    /// admission control was disabled or this check never opted in via
+    /// `sharedCargoTarget`, matching [`run_check_in`](Self::run_check_in)'s
+    /// own admission block). Written unconditionally otherwise, whatever the
+    /// verdict: an operator diagnosing contention needs the failed/timed-out
+    /// runs' timing as much as the passing ones'.
+    fn record_verification_admission_event(
+        &self,
+        repo: &str,
+        agent: &str,
+        command: &str,
+        queue_wait_ms: Option<u64>,
+        duration: Duration,
+        exit: i64,
+        verdict: &str,
+    ) {
+        let Some(queue_wait_ms) = queue_wait_ms else {
+            return;
+        };
+        let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        let _ = self.space.out(
+            Tuple::new(
+                Category::Event,
+                repo_name_of(repo),
+                VERIFICATION_ADMISSION_IDENTITY,
+                "daemon",
+                json!({
+                    "agent": agent,
+                    "command": command,
+                    "queue_wait_ms": queue_wait_ms,
+                    "duration_ms": duration_ms,
+                    "exit": exit,
+                    "verdict": verdict,
+                }),
+            )
+            .with_lifecycle(Lifecycle::Furniture),
+        );
     }
 
     fn require_allowed_target(
@@ -4624,6 +4946,62 @@ fn repo_name_of(repo: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".into())
+}
+
+/// Best-effort candidate identity for verification proof reuse
+/// (TKT-01M0HNESEECWWFQF8X6VH1XSJ6): `Some(sha)` only when `dir` is a git
+/// worktree with a clean working tree (no uncommitted changes) — otherwise
+/// there is no stable "candidate" a later caller could safely match a cached
+/// proof against, so proof reuse must be skipped entirely (never read from,
+/// never written to). Deliberately shells out scoped to `dir` itself rather
+/// than going through `rk_git::Repo` (whose `discover`/`rev_parse` resolve to
+/// the repo's common root, not necessarily this specific linked worktree) —
+/// `git -C <dir>` is exactly the worktree under test.
+async fn clean_candidate_sha(dir: &Path) -> Option<String> {
+    let status = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .await
+        .ok()?;
+    if !status.status.success() || !status.stdout.is_empty() {
+        return None;
+    }
+    let head = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .await
+        .ok()?;
+    if !head.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(head.stdout).ok()?;
+    let sha = sha.trim();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha.to_string())
+    }
+}
+
+/// The exact-match dedup key the ticket asks for: repository, tested
+/// candidate sha, named-check command, toolchain, and environment-policy
+/// digest, all folded into one canonical sha256 digest
+/// ([`rk_core::action::canonical_digest`]). `None` only on a (practically
+/// unreachable) serialization failure — callers treat that as "cannot cache
+/// this", never as a false hit.
+fn verification_proof_key(repo_name: &str, candidate: &str, check: &rk_workflow::Check) -> Option<String> {
+    rk_core::action::canonical_digest(&json!({
+        "repo": repo_name,
+        "candidate": candidate,
+        "command": check.command,
+        "toolchain": check.toolchain,
+        "environment_policy": check.environment_policy.to_string(),
+    }))
+    .ok()
 }
 
 /// Crate-scoped alongside [`WorkflowEngine::run_check_in`]: the T2 landing
