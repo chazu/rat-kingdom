@@ -395,6 +395,22 @@ struct ShadowComparisonRequest {
     wait: Duration,
 }
 
+/// One check's settled outcome, bundled for
+/// [`LandingPipeline::record_check_verification_span`] the same way
+/// [`ShadowComparisonRequest`] is above — so the three per-check call sites
+/// in `run_gates_at`'s check loop stay under `clippy::too_many_arguments`
+/// without an `#[allow]`. `entry` (repo/target/task identity) stays a
+/// separate parameter on that method since it is loop-invariant context,
+/// not per-occurrence data.
+struct CheckVerificationSpan<'a> {
+    check_name: &'a str,
+    attempt: u32,
+    candidate: &'a str,
+    full_check_required: bool,
+    queue_wait_ms: Option<u64>,
+    duration_ms: Option<u64>,
+}
+
 fn required_payload_str<'a>(
     payload: &'a Value,
     field: &str,
@@ -4532,6 +4548,24 @@ impl LandingPipeline {
 
         // Marker first: replay gates an interrupted spawn instead of duplicating it.
         self.record_conflict_state(&entry, &ctx, attempt, "dispatching")?;
+        // Same SemanticReview/Rework phase pair `route_rework` brackets its
+        // own LLM-authority dispatch with (landing.rs's rework routing) —
+        // this dispatch is orchestrator-authorized rather than
+        // reviewer-verdict-driven, but `Authority` has no distinct
+        // orchestrator variant (matching the choice already made for the
+        // `AttentionHold` this same chain writes while awaiting that
+        // decision, below in `hold_conflict_for_orchestrator_decision`), so
+        // `Llm` is reused here too.
+        let _ = crate::span::record_phase_span(
+            &self.space,
+            &entry.repo_name,
+            "daemon",
+            &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::SemanticReview)
+                .attempt(attempt)
+                .repo(&entry.repo_name)
+                .authority(crate::span::Authority::Llm)
+                .terminal_reason("conflict-correction-requested"),
+        );
 
         let params = crate::supervisor::SpawnParams {
             repo: ctx.repo_path.clone(),
@@ -4564,6 +4598,16 @@ impl LandingPipeline {
                 // Terminal marker: a redelivery must never read this dispatch
                 // as interrupted just because the spawn journaled cleanly.
                 self.record_conflict_state(&entry, &ctx, attempt, "dispatched")?;
+                let _ = crate::span::record_phase_span(
+                    &self.space,
+                    &entry.repo_name,
+                    "daemon",
+                    &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::Rework)
+                        .attempt(attempt)
+                        .repo(&entry.repo_name)
+                        .authority(crate::span::Authority::Llm)
+                        .terminal_reason("conflict-correction-dispatched"),
+                );
                 if let Err(e) = self
                     .tickets
                     .update(
@@ -5024,7 +5068,17 @@ impl LandingPipeline {
         );
 
         let id = format!("landing:{}", entry.branch);
-        for (check, env, timeout) in plan {
+        for (check_index, (check, env, timeout)) in plan.into_iter().enumerate() {
+            // This check's position in the plan, not a rework-round counter:
+            // stable across a crash-resume re-run of this same plan (so a
+            // repeated earlier check dedupes against the span it already
+            // wrote), but collides with a later landing round's plan over
+            // the same task the same way the single aggregate span this
+            // replaces always did (both default to the same low attempts) —
+            // no regression, just decomposed to one span per check.
+            let check_attempt = u32::try_from(check_index)
+                .unwrap_or(u32::MAX)
+                .saturating_add(1);
             let resolved = ResolvedRun {
                 command: check.command.clone(),
                 cwd: check.cwd.clone(),
@@ -5043,6 +5097,7 @@ impl LandingPipeline {
                 shared_cargo_target: check.shared_cargo_target,
             };
             let progress = Arc::new(Mutex::new(RunProgress::default()));
+            let check_started = Instant::now();
 
             // Resuming after a crash landed between spending the retry
             // budget and the retry attempt completing (`gate_infra_retry_check`'s
@@ -5086,6 +5141,17 @@ impl LandingPipeline {
                     // Never executed this attempt at all — resumed straight
                     // from durable evidence — so there is no queue wait to
                     // report for it.
+                    self.record_check_verification_span(
+                        entry,
+                        CheckVerificationSpan {
+                            check_name: &check.name,
+                            attempt: check_attempt,
+                            candidate: tested_sha,
+                            full_check_required,
+                            queue_wait_ms: None,
+                            duration_ms: None,
+                        },
+                    );
                     queue_wait_ms.push((check.name.clone(), None));
                     passed_checks.push(check.name.clone());
                     continue;
@@ -5117,7 +5183,19 @@ impl LandingPipeline {
                 {
                     return Ok(GateRunOutcome::InfraRetryExhausted);
                 }
-                queue_wait_ms.push((check.name.clone(), progress.lock().unwrap().queue_wait_ms()));
+                let check_queue_wait_ms = progress.lock().unwrap().queue_wait_ms();
+                self.record_check_verification_span(
+                    entry,
+                    CheckVerificationSpan {
+                        check_name: &check.name,
+                        attempt: check_attempt,
+                        candidate: tested_sha,
+                        full_check_required,
+                        queue_wait_ms: check_queue_wait_ms,
+                        duration_ms: u64::try_from(check_started.elapsed().as_millis()).ok(),
+                    },
+                );
+                queue_wait_ms.push((check.name.clone(), check_queue_wait_ms));
                 passed_checks.push(check.name.clone());
                 continue;
             }
@@ -5214,7 +5292,19 @@ impl LandingPipeline {
                     return Ok(GateRunOutcome::Fail);
                 }
             }
-            queue_wait_ms.push((check.name.clone(), progress.lock().unwrap().queue_wait_ms()));
+            let check_queue_wait_ms = progress.lock().unwrap().queue_wait_ms();
+            self.record_check_verification_span(
+                entry,
+                CheckVerificationSpan {
+                    check_name: &check.name,
+                    attempt: check_attempt,
+                    candidate: tested_sha,
+                    full_check_required,
+                    queue_wait_ms: check_queue_wait_ms,
+                    duration_ms: u64::try_from(check_started.elapsed().as_millis()).ok(),
+                },
+            );
+            queue_wait_ms.push((check.name.clone(), check_queue_wait_ms));
             passed_checks.push(check.name);
         }
         self.space.out(
@@ -5243,10 +5333,33 @@ impl LandingPipeline {
             )
             .with_lifecycle(Lifecycle::Furniture),
         )?;
-        let total_queue_wait_ms = queue_wait_ms
-            .iter()
-            .filter_map(|(_, wait)| *wait)
-            .sum::<u64>();
+        Ok(GateRunOutcome::Pass)
+    }
+
+    /// Record one check's `Phase::VerificationQueued` span, replacing the
+    /// single aggregate span this call site used to write once per landing
+    /// entry after the whole gate loop finished (TKT-01M0P974EZZTPMGVP4S0E76NXH's
+    /// first cut) with one span per check, so a peer reading the span
+    /// substrate sees exactly which check(s) a candidate's admission wait
+    /// and run time went to. `attempt` is the check's position in this
+    /// gate plan (`check_attempt` at each call site), not a rework-round
+    /// counter — see that call site's comment for why. `lane` carries the
+    /// check name: the one field `record_phase_span`'s `(task, phase,
+    /// attempt)` idempotency key does not itself vary by, so it is purely
+    /// descriptive here, not a dedup discriminant.
+    fn record_check_verification_span(
+        &self,
+        entry: &LandingQueueEntry,
+        occurrence: CheckVerificationSpan<'_>,
+    ) {
+        let CheckVerificationSpan {
+            check_name,
+            attempt,
+            candidate,
+            full_check_required,
+            queue_wait_ms,
+            duration_ms,
+        } = occurrence;
         let _ = crate::span::record_phase_span(
             &self.space,
             &entry.repo_name,
@@ -5254,20 +5367,21 @@ impl LandingPipeline {
             &crate::span::PhaseSpan::from_durations(
                 &entry.task,
                 crate::span::Phase::VerificationQueued,
-                Some(total_queue_wait_ms),
-                u64::try_from(started.elapsed().as_millis()).ok(),
+                queue_wait_ms,
+                duration_ms,
                 Utc::now(),
             )
+            .attempt(attempt)
             .repo(&entry.repo_name)
             .target(&entry.target)
-            .candidate(tested_sha)
+            .candidate(candidate)
+            .lane(check_name)
             .proof_kind(if full_check_required {
                 "full-final"
             } else {
                 "focused-inner"
             }),
         );
-        Ok(GateRunOutcome::Pass)
     }
 
     /// Settle a gate-infrastructure-death retry's outcome — the ordinal-2
@@ -8625,6 +8739,40 @@ workflow: {
             1,
             "a replayed decision must not spawn a second agent"
         );
+
+        // The dispatch rides the same SemanticReview/Rework span pair
+        // `route_rework` brackets its own bounded-rework dispatch with,
+        // alongside the AttentionHold already written while this chain
+        // awaited the orchestrator's decision — all three correlated on
+        // the ORIGINAL ticket ("add src"), not the correction ticket, and
+        // all under `Authority::Llm` (no distinct orchestrator variant).
+        let spans = crate::span::spans_for_task(&space, "code-repo", "add src").unwrap();
+        let review = spans
+            .iter()
+            .find(|s| s["phase"] == "semantic_review")
+            .expect("dispatch_held_conflict must record a SemanticReview span");
+        assert_eq!(review["authority"], "llm");
+        assert_eq!(review["terminal_reason"], "conflict-correction-requested");
+        let rework = spans
+            .iter()
+            .find(|s| s["phase"] == "rework")
+            .expect("dispatch_held_conflict must record a Rework span on a successful spawn");
+        assert_eq!(rework["authority"], "llm");
+        assert_eq!(rework["terminal_reason"], "conflict-correction-dispatched");
+        let hold = spans
+            .iter()
+            .find(|s| s["phase"] == "attention_hold")
+            .expect("the earlier orchestrator-decision hold must have its own span");
+        assert_eq!(hold["authority"], "llm");
+        // The replayed (already-dispatched) call must not double either span.
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|s| s["phase"] == "semantic_review")
+                .count(),
+            1
+        );
+        assert_eq!(spans.iter().filter(|s| s["phase"] == "rework").count(), 1);
 
         // Once the correction lands back onto `feature`, the held branch must
         // resubmit through the normal queue rather than land itself. Advance
@@ -12610,16 +12758,55 @@ checks: [
         assert!(!plans[0].payload["proof_key"].is_null());
 
         // The task-to-main span substrate rides alongside these same two
-        // events: a `landing_prep` span from the edge plan and a
-        // `verification` span from the settled gate run, both correlated on
-        // the ticket id and both idempotent (a second `run_gates` over the
-        // same candidate must not double them).
+        // events: a `landing_prep` span from the edge plan and one
+        // `verification` span PER CHECK from the settled gate run (not one
+        // aggregate span for the whole run), all correlated on the ticket
+        // id and idempotent (a second `run_gates` over the same candidate
+        // must not double any of them).
         let spans = crate::span::spans_for_task(&space, "direct-repo", "add src").unwrap();
         let phases: std::collections::BTreeSet<&str> =
             spans.iter().map(|s| s["phase"].as_str().unwrap()).collect();
         assert!(phases.contains("landing_prep"));
         assert!(phases.contains("verification"));
         assert_eq!(phases.len(), 2);
+
+        let verification_spans: Vec<&Value> = spans
+            .iter()
+            .filter(|s| s["phase"] == "verification")
+            .collect();
+        assert_eq!(
+            verification_spans.len(),
+            3,
+            "one span per check (steward-protected-paths, steward-diff-scope, verify), not one \
+             aggregate span for the whole gate run: {verification_spans:?}"
+        );
+        let lanes: std::collections::BTreeSet<&str> = verification_spans
+            .iter()
+            .map(|s| s["lane"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            lanes,
+            std::collections::BTreeSet::from([
+                "steward-protected-paths",
+                "steward-diff-scope",
+                "verify"
+            ])
+        );
+        let attempts: std::collections::BTreeSet<u64> = verification_spans
+            .iter()
+            .map(|s| s["attempt"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            attempts,
+            std::collections::BTreeSet::from([1, 2, 3]),
+            "each check's span is keyed by its plan position: {verification_spans:?}"
+        );
+        assert!(
+            verification_spans
+                .iter()
+                .all(|s| s["proof_kind"] == "full-final"),
+            "{verification_spans:?}"
+        );
     }
 
     #[tokio::test]
@@ -12899,6 +13086,7 @@ checks: [
                 "verify",
                 None,
                 "replay-request",
+                None,
             )
             .await
             .unwrap();

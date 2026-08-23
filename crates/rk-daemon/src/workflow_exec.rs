@@ -293,6 +293,22 @@ struct VerificationAdmissionOutcome<'a> {
     verdict: &'a str,
 }
 
+/// One `verify.run` call's `Phase::VerificationQueued` occurrence, bundled
+/// so [`record_ad_hoc_verification_span`](WorkflowEngine::record_ad_hoc_verification_span)
+/// stays under the clippy `too_many_arguments` threshold without an
+/// `#[allow]`, matching [`VerificationAdmissionOutcome`] above — see that
+/// method for what each field means.
+struct AdHocVerificationSpan<'a> {
+    task: &'a str,
+    repo_name: &'a str,
+    check_name: &'a str,
+    candidate: &'a str,
+    queue_wait_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    proof_reused: bool,
+    terminal_reason: &'a str,
+}
+
 /// Decode a `spawn_check_child` outcome into the flat tuple `run_check_in`
 /// tracks. Factored out so a retried outcome (the shared cargo target-dir
 /// contention retry, and the initial attempt) decode identically.
@@ -3439,6 +3455,7 @@ impl WorkflowEngine {
     /// same drop-based cleanup `run_check_in` already relies on for a
     /// timeout — and this records a durable cancellation outcome instead of
     /// ever writing a reusable proof for it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn verify_repo_check(
         &self,
         agent: &str,
@@ -3447,6 +3464,12 @@ impl WorkflowEngine {
         check_name: &str,
         generation: Option<rk_core::id::SpawnId>,
         request_key: &str,
+        // The ticket this call's task-to-main span correlates on
+        // (TKT-01M0QJXVF5QP858YXF82E9WRWQ) — `None` for the operator (no
+        // ticket to correlate against), `Some` for a supervised agent's own
+        // task, exactly the same string `AgentLaunched`/`FirstProgress`
+        // already carry for that generation.
+        task: Option<&str>,
     ) -> rk_core::Result<Value> {
         let check = self.find_check(&dir.display().to_string(), check_name)?;
         let resolved = ResolvedRun {
@@ -3476,6 +3499,18 @@ impl WorkflowEngine {
         let candidate_sha = clean_candidate_sha(dir).await;
         if let Some(sha) = &candidate_sha {
             if let Some(cached) = self.lookup_verification_proof(repo_name, sha, &check) {
+                if let Some(task) = task {
+                    self.record_ad_hoc_verification_span(AdHocVerificationSpan {
+                        task,
+                        repo_name,
+                        check_name,
+                        candidate: sha,
+                        queue_wait_ms: None,
+                        duration_ms: None,
+                        proof_reused: true,
+                        terminal_reason: "reused",
+                    });
+                }
                 return Ok(cached);
             }
         }
@@ -3530,6 +3565,18 @@ impl WorkflowEngine {
                     duration_ms,
                     reason,
                 );
+                if let Some(task) = task {
+                    self.record_ad_hoc_verification_span(AdHocVerificationSpan {
+                        task,
+                        repo_name,
+                        check_name,
+                        candidate: candidate_sha.as_deref().unwrap_or("dirty"),
+                        queue_wait_ms,
+                        duration_ms,
+                        proof_reused: false,
+                        terminal_reason: reason,
+                    });
+                }
                 return Err(rk_core::Error::other(format!(
                     "verification cancelled ({reason}) for repo `{repo_name}` check `{check_name}`"
                 )));
@@ -3542,7 +3589,92 @@ impl WorkflowEngine {
             }
         }
 
+        if let Some(task) = task {
+            let (queue_wait_ms, duration_ms) = {
+                let p = progress.lock().unwrap();
+                (
+                    p.queue_wait_ms,
+                    p.execution_started_at.map(|started| {
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                    }),
+                )
+            };
+            self.record_ad_hoc_verification_span(AdHocVerificationSpan {
+                task,
+                repo_name,
+                check_name,
+                candidate: candidate_sha.as_deref().unwrap_or("dirty"),
+                queue_wait_ms,
+                duration_ms,
+                proof_reused: false,
+                terminal_reason: result
+                    .get("verdict")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+            });
+        }
+
         Ok(result)
+    }
+
+    /// Record one `verify.run` call's `Phase::VerificationQueued` span — the
+    /// managed alternative's own occurrence, alongside (never instead of)
+    /// whatever a landing gate's per-check spans already recorded for the
+    /// same task (`LandingPipeline::record_check_verification_span`).
+    /// `lane` carries the check name, exactly like the landing gate's
+    /// per-check spans, so both producers read the same way in
+    /// `spans_for_task`. `attempt` is deliberately NOT this task's own
+    /// small per-check ordinal (`10_000 +` a running count of this task's
+    /// existing `verification`-phase spans): a landing gate's per-check
+    /// attempts are small, deterministic plan positions
+    /// (`LandingPipeline::run_gates_at`'s `check_attempt`, 1, 2, 3, ...),
+    /// and an ad-hoc `verify.run` for the very same task can otherwise land
+    /// on the exact same small number, silently losing one span to
+    /// `record_phase_span`'s `(task, phase, attempt)` idempotency key even
+    /// though they are for two different, unrelated occurrences. Pushing
+    /// this producer's own numbering into a disjoint high range keeps the
+    /// two producers from ever colliding without touching that shared key.
+    fn record_ad_hoc_verification_span(&self, occurrence: AdHocVerificationSpan<'_>) {
+        let AdHocVerificationSpan {
+            task,
+            repo_name,
+            check_name,
+            candidate,
+            queue_wait_ms,
+            duration_ms,
+            proof_reused,
+            terminal_reason,
+        } = occurrence;
+        const AD_HOC_ATTEMPT_BASE: u32 = 10_000;
+        let existing =
+            crate::span::spans_for_task(&self.space, repo_name, task).unwrap_or_default();
+        let ad_hoc_occurrences = u32::try_from(
+            existing
+                .iter()
+                .filter(|s| s["phase"] == "verification" && s["lane"] == check_name)
+                .count(),
+        )
+        .unwrap_or(0);
+        let attempt = AD_HOC_ATTEMPT_BASE.saturating_add(ad_hoc_occurrences);
+        let _ = crate::span::record_phase_span(
+            &self.space,
+            repo_name,
+            "daemon",
+            &crate::span::PhaseSpan::from_durations(
+                task,
+                crate::span::Phase::VerificationQueued,
+                queue_wait_ms,
+                duration_ms,
+                Utc::now(),
+            )
+            .attempt(attempt)
+            .repo(repo_name)
+            .candidate(candidate)
+            .lane(check_name)
+            .proof_kind("ad-hoc")
+            .proof_reused(proof_reused)
+            .terminal_reason(terminal_reason),
+        );
     }
 
     /// Durable record of a managed verification run cancelled before it could
@@ -7850,12 +7982,99 @@ test a::flaky ... FAILED
                 "verify",
                 None,
                 "test-request",
+                None,
             )
             .await
             .unwrap();
 
         assert_eq!(result["exit"], json!(37));
         assert_eq!(result["verdict"], json!("fail"));
+    }
+
+    /// TKT-01M0QJXVF5QP858YXF82E9WRWQ: the ad-hoc `verify.run` path (a rat's
+    /// own completion-protocol check, outside any landing gate) previously
+    /// recorded no task-to-main span at all — only a caller carrying a
+    /// ticket (`task: Some(...)`) gets one; the operator (`task: None`, no
+    /// ticket to correlate against) gets none, on purpose.
+    #[tokio::test]
+    async fn verify_repo_check_records_a_span_only_for_a_ticketed_caller() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        let repo_dir = tempfile::tempdir().unwrap();
+        write_check(repo_dir.path(), "verify", "true", false);
+
+        // The operator path: no ticket, no span.
+        engine
+            .verify_repo_check(
+                "operator",
+                repo_dir.path(),
+                "ad-hoc-repo",
+                "verify",
+                None,
+                "operator-request",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            crate::span::spans_for_task(&engine.space, "ad-hoc-repo", "TKT-ad-hoc")
+                .unwrap()
+                .is_empty()
+        );
+
+        // A ticketed rat's own `rk verify` gets a span, correlated on its
+        // ticket, carrying the check name as `lane` and `proof_kind: "ad-hoc"`
+        // — distinct from a landing gate's own per-check spans.
+        let result = engine
+            .verify_repo_check(
+                "some-rat",
+                repo_dir.path(),
+                "ad-hoc-repo",
+                "verify",
+                None,
+                "rat-request",
+                Some("TKT-ad-hoc"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["verdict"], json!("pass"));
+
+        let spans =
+            crate::span::spans_for_task(&engine.space, "ad-hoc-repo", "TKT-ad-hoc").unwrap();
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0]["phase"], "verification");
+        assert_eq!(spans[0]["lane"], "verify");
+        assert_eq!(spans[0]["proof_kind"], "ad-hoc");
+        assert_eq!(spans[0]["proof_reused"], false);
+        assert_eq!(spans[0]["terminal_reason"], "pass");
+        // Deliberately far from a landing gate's small per-check plan
+        // positions (1, 2, 3, ...) so the two producers never collide on
+        // `record_phase_span`'s `(task, phase, attempt)` idempotency key.
+        assert!(spans[0]["attempt"].as_u64().unwrap() >= 10_000);
+
+        // A second ad-hoc call for the SAME ticket and check must not
+        // collide with (silently drop) the first — a rat re-running its own
+        // `rk verify` is a genuinely new occurrence, not a replay.
+        engine
+            .verify_repo_check(
+                "some-rat",
+                repo_dir.path(),
+                "ad-hoc-repo",
+                "verify",
+                None,
+                "rat-request-2",
+                Some("TKT-ad-hoc"),
+            )
+            .await
+            .unwrap();
+        let spans =
+            crate::span::spans_for_task(&engine.space, "ad-hoc-repo", "TKT-ad-hoc").unwrap();
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        let attempts: std::collections::BTreeSet<u64> = spans
+            .iter()
+            .map(|s| s["attempt"].as_u64().unwrap())
+            .collect();
+        assert_eq!(attempts.len(), 2, "{spans:?}");
     }
 
     /// TKT-01M0PA6C5WYRWS757R1SS2F2GR: `Supervisor::interrupt`/`dismiss`/the
@@ -7893,6 +8112,7 @@ test a::flaky ... FAILED
             "verify",
             Some(generation),
             "req-1",
+            None,
         );
         tokio::pin!(first);
 
@@ -7930,6 +8150,7 @@ test a::flaky ... FAILED
             "verify",
             None,
             "req-2",
+            None,
         );
         tokio::pin!(second);
         tokio::select! {
@@ -8069,6 +8290,7 @@ test a::flaky ... FAILED
             "verify",
             Some(generation),
             "req-1",
+            None,
         );
         tokio::pin!(first);
 
@@ -8123,6 +8345,7 @@ test a::flaky ... FAILED
             "verify",
             None,
             "req-2",
+            None,
         );
         tokio::pin!(second);
         tokio::select! {
@@ -8262,6 +8485,7 @@ test a::flaky ... FAILED
             "verify",
             None,
             "test-request",
+            None,
         );
         let (landing_result, verify_result) = tokio::join!(landing, verify);
         landing_result.unwrap();
@@ -8380,6 +8604,7 @@ test a::flaky ... FAILED
             "verify",
             None,
             "test-request",
+            None,
         );
         let (path_result, name_result) = tokio::join!(path_side, name_side);
         path_result.unwrap();
@@ -8438,6 +8663,7 @@ test a::flaky ... FAILED
                 "verify",
                 None,
                 "test-request",
+                None,
             )
             .await
             .unwrap();
@@ -8458,6 +8684,7 @@ test a::flaky ... FAILED
                 "verify",
                 None,
                 "test-request",
+                None,
             )
             .await
             .unwrap();
@@ -8481,6 +8708,7 @@ test a::flaky ... FAILED
                 "verify",
                 None,
                 "test-request",
+                None,
             )
             .await
             .unwrap();
