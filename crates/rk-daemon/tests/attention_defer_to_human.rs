@@ -152,7 +152,8 @@ async fn bounded_held_conflict(
     target: &str,
     rework_ticket: &str,
 ) {
-    let chain_key = format!("{repo}\0{branch}\0{head_sha}\0{target}\0conflict-task\0{rework_ticket}");
+    let chain_key =
+        format!("{repo}\0{branch}\0{head_sha}\0{target}\0conflict-task\0{rework_ticket}");
     client
         .call(
             "space.out",
@@ -466,8 +467,8 @@ async fn defer_requires_a_live_fenced_lease_and_refuses_with_zero_side_effect() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn defer_writes_one_gated_terminal_decision_and_a_durable_inbox_gate_replay_cannot_duplicate(
-) {
+async fn defer_writes_one_gated_terminal_decision_and_a_durable_inbox_gate_replay_cannot_duplicate()
+{
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     init_repo(repo_dir.path());
@@ -491,9 +492,15 @@ async fn defer_writes_one_gated_terminal_decision_and_a_durable_inbox_gate_repla
         .unwrap();
     let generation = lease["generation"].as_u64().unwrap();
 
-    let deferred = defer(&mut client, repo, &item_id, Some("orch-1"), Some(generation))
-        .await
-        .unwrap();
+    let deferred = defer(
+        &mut client,
+        repo,
+        &item_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
     assert_eq!(deferred["resolved"], false);
     assert_eq!(deferred["replay"], false);
     assert_eq!(deferred["gated"], true);
@@ -545,9 +552,15 @@ async fn defer_writes_one_gated_terminal_decision_and_a_durable_inbox_gate_repla
     );
 
     // Replaying the SAME deferral returns the SAME record and writes nothing new.
-    let replay = defer(&mut client, repo, &item_id, Some("orch-1"), Some(generation))
-        .await
-        .unwrap();
+    let replay = defer(
+        &mut client,
+        repo,
+        &item_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
     assert_eq!(replay["resolved"], false);
     assert_eq!(replay["replay"], true);
     assert_eq!(replay["gated"], true);
@@ -639,9 +652,15 @@ async fn deferring_a_legacy_item_lets_attention_next_reach_a_later_bounded_confl
     let next = attention_next(&mut client, repo).await.unwrap();
     assert_eq!(next["id"], legacy_id);
 
-    let deferred = defer(&mut client, repo, &legacy_id, Some("orch-1"), Some(generation))
-        .await
-        .unwrap();
+    let deferred = defer(
+        &mut client,
+        repo,
+        &legacy_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
     assert_eq!(deferred["resolved"], false);
     assert_eq!(deferred["gated"], true);
 
@@ -667,7 +686,10 @@ async fn deferring_a_legacy_item_lets_attention_next_reach_a_later_bounded_confl
     .await
     .unwrap();
     assert_eq!(executed["resolved"], true);
-    assert_eq!(executed["decision"]["action"], "conflict.dispatch_correction");
+    assert_eq!(
+        executed["decision"]["action"],
+        "conflict.dispatch_correction"
+    );
     assert_eq!(agent_spawn_count(&mut client, repo).await, 1);
 
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
@@ -791,9 +813,15 @@ async fn deferred_decision_and_inbox_gate_survive_a_genuine_daemon_restart() {
     let item = attention_next(&mut client, repo).await.unwrap();
     let item_id = item["id"].as_str().unwrap().to_string();
 
-    let deferred = defer(&mut client, repo, &item_id, Some("orch-1"), Some(generation))
-        .await
-        .unwrap();
+    let deferred = defer(
+        &mut client,
+        repo,
+        &item_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
     assert_eq!(deferred["gated"], true);
 
     handle_a.abort();
@@ -822,9 +850,15 @@ async fn deferred_decision_and_inbox_gate_survive_a_genuine_daemon_restart() {
 
     // A replayed deferral across the restart still returns the same
     // terminal record and writes nothing new.
-    let replay = defer(&mut client, repo, &item_id, Some("orch-1"), Some(generation))
-        .await
-        .unwrap();
+    let replay = defer(
+        &mut client,
+        repo,
+        &item_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
     assert_eq!(replay["replay"], true);
     assert_eq!(recovery_action_count(&mut client, repo).await, 1);
     assert_eq!(terminal_decision_count(&mut client, repo).await, 1);
@@ -866,9 +900,15 @@ async fn a_stray_non_terminal_intent_never_blocks_or_duplicates_a_resumed_deferr
     fabricate_defer_intent(&mut client, repo, &item_id, "orch-1").await;
     assert_eq!(recovery_action_count(&mut client, repo).await, 0);
 
-    let resumed = defer(&mut client, repo, &item_id, Some("orch-1"), Some(generation))
-        .await
-        .unwrap();
+    let resumed = defer(
+        &mut client,
+        repo,
+        &item_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
     assert_eq!(resumed["resolved"], false);
     assert_eq!(resumed["gated"], true);
     assert_eq!(recovery_action_count(&mut client, repo).await, 1);
@@ -927,9 +967,15 @@ async fn a_gate_already_written_before_a_crash_is_reused_not_duplicated_on_resum
         .unwrap()
         .to_string();
 
-    let resumed = defer(&mut client, repo, &item_id, Some("orch-1"), Some(generation))
-        .await
-        .unwrap();
+    let resumed = defer(
+        &mut client,
+        repo,
+        &item_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
     assert_eq!(resumed["resolved"], false);
     assert_eq!(resumed["gated"], true);
     assert_eq!(
@@ -1006,16 +1052,23 @@ async fn a_cursor_advanced_before_a_crash_still_converges_to_one_terminal_decisi
     // in-memory daemon and does NOT persist the lease store to `home`; this
     // test therefore drives the fabrication through a real, file-backed
     // daemon instead of the in-memory harness the other tests use.
-    let lease_store =
-        rk_daemon::orchestrator_lease::LeaseStore::load(layout.home().join("orchestrator-lease.json"))
-            .unwrap();
+    let lease_store = rk_daemon::orchestrator_lease::LeaseStore::load(
+        layout.home().join("orchestrator-lease.json"),
+    )
+    .unwrap();
     lease_store
         .advance_cursor(repo, "orch-1", generation, &item_id, chrono::Utc::now())
         .ok();
 
-    let resumed = defer(&mut client, repo, &item_id, Some("orch-1"), Some(generation))
-        .await
-        .unwrap();
+    let resumed = defer(
+        &mut client,
+        repo,
+        &item_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
     assert_eq!(resumed["resolved"], false);
     assert_eq!(resumed["gated"], true);
     assert_eq!(

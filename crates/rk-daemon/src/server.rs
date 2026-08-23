@@ -4185,8 +4185,12 @@ impl Daemon {
             format!(
                 "orchestrator {holder} deferred {} ({}) to a human instead of executing it: \
                  {}\nDECISION NEEDED: {}\nBLAST RADIUS: {}\nRESOLVE WITH: {}",
-                violation.id, violation.detail, gate.reason, gate.requested_decision,
-                gate.blast_radius, gate.resolving_action
+                violation.id,
+                violation.detail,
+                gate.reason,
+                gate.requested_decision,
+                gate.blast_radius,
+                gate.resolving_action
             ),
         )
         // The exact-item dedup key this function's own lookup scans for —
@@ -4238,7 +4242,6 @@ impl Daemon {
                 == Some(violation_id)
         }))
     }
-
 
     /// The one registered mechanical repair this tracer bullet wires up:
     /// `delivered-but-open`'s own doc comment names the fix — the delivery
