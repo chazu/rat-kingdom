@@ -75,8 +75,18 @@ fn install_verify_check(dir: &Path) {
 /// rk-daemon doesn't own the `rk` binary, so cargo never sets
 /// `CARGO_BIN_EXE_rk` for this test binary — fall back to the real target
 /// dir, same resolution `foreman.rs` uses.
+///
+/// That fallback path is only ever populated as a side effect of building
+/// the `rk-cli` package, which `cargo test -p rk-daemon --test ...` does NOT
+/// do (rk-daemon has no build-time dependency on rk-cli). Without this
+/// check, a stale/missing binary makes the fake harness's backgrounded
+/// `'{rk}' verify ... &` fail invisibly, and these tests report the
+/// downstream symptom 10 seconds later ("the check's real child never wrote
+/// its own pid") instead of the real cause. `cargo test --workspace` (the
+/// documented verification entrypoint) always builds it first, so this only
+/// bites a scoped `-p rk-daemon` run against a fresh or partial target dir.
 fn rk_bin() -> String {
-    std::env::var("CARGO_BIN_EXE_rk").unwrap_or_else(|_| {
+    let path = std::env::var("CARGO_BIN_EXE_rk").unwrap_or_else(|_| {
         let target_dir = std::env::var("CARGO_TARGET_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| support::workspace_root().join("target"));
@@ -85,7 +95,15 @@ fn rk_bin() -> String {
             .join("rk")
             .to_string_lossy()
             .into_owned()
-    })
+    });
+    assert!(
+        Path::new(&path).exists(),
+        "rk binary not found at {path} — these tests spawn the real `rk` CLI from a fake \
+         harness script, but nothing in `cargo test -p rk-daemon` builds it. Build it first \
+         (`cargo build -p rk-cli --bin rk`) or run `cargo test --workspace`, which builds \
+         every workspace member including rk-cli."
+    );
+    path
 }
 
 /// A fake harness that issues a REAL `verify.run` call through the real `rk`
