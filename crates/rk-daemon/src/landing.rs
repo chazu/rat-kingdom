@@ -8952,7 +8952,10 @@ checks: [
         // do with this held branch.
         std::fs::write(repo_dir.path().join("unrelated.txt"), "other work\n").unwrap();
         git(repo_dir.path(), &["add", "."]);
-        git(repo_dir.path(), &["commit", "-m", "unrelated work advances main"]);
+        git(
+            repo_dir.path(),
+            &["commit", "-m", "unrelated work advances main"],
+        );
         let main_after_move = rev_parse(repo_dir.path(), "main");
         assert_ne!(main_at_first_hold, main_after_move);
 
@@ -9060,7 +9063,10 @@ checks: [
         // completion.
         std::fs::write(repo_dir.path().join("unrelated.txt"), "other work\n").unwrap();
         git(repo_dir.path(), &["add", "."]);
-        git(repo_dir.path(), &["commit", "-m", "unrelated work advances main again"]);
+        git(
+            repo_dir.path(),
+            &["commit", "-m", "unrelated work advances main again"],
+        );
         let main_after_further_move = rev_parse(repo_dir.path(), "main");
         assert_ne!(main_after_land, main_after_further_move);
 
