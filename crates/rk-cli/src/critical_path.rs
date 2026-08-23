@@ -90,23 +90,27 @@ pub fn build_critical_path(task: &str, tuples: &[Value]) -> Value {
         by_phase(phases, phase).into_iter().next_back()
     }
 
-    let start_at = latest(&phases, "ticket_ready").and_then(|p| {
-        p["queued_at"]
-            .as_str()
-            .or_else(|| p["started_at"].as_str())
-    });
+    let start_at = latest(&phases, "ticket_ready")
+        .and_then(|p| p["queued_at"].as_str().or_else(|| p["started_at"].as_str()));
     let merge = latest(&phases, "merge");
     let end_at = merge.and_then(|p| p["ended_at"].as_str());
-    let task_to_main_ms = match (start_at.and_then(parse_rfc3339), end_at.and_then(parse_rfc3339)) {
+    let task_to_main_ms = match (
+        start_at.and_then(parse_rfc3339),
+        end_at.and_then(parse_rfc3339),
+    ) {
         (Some(s), Some(e)) => Some((e - s).num_milliseconds()),
         _ => None,
     };
 
     let review_rounds = by_phase(&phases, "semantic_review").len() as u64;
     let rework_rounds = by_phase(&phases, "rework").len() as u64;
-    let rework_amplification = (review_rounds > 0).then(|| rework_rounds as f64 / review_rounds as f64);
+    let rework_amplification =
+        (review_rounds > 0).then(|| rework_rounds as f64 / review_rounds as f64);
 
-    let proof_total = phases.iter().filter(|p| p["proof_kind"].is_string()).count() as u64;
+    let proof_total = phases
+        .iter()
+        .filter(|p| p["proof_kind"].is_string())
+        .count() as u64;
     let proof_reused = phases
         .iter()
         .filter(|p| p["proof_reused"] == Value::Bool(true))
@@ -136,14 +140,8 @@ pub fn build_critical_path(task: &str, tuples: &[Value]) -> Value {
     let terminal_reason = latest(&phases, "attention_hold")
         .and_then(|p| p["terminal_reason"].as_str())
         .or_else(|| phases.last().and_then(|p| p["terminal_reason"].as_str()));
-    let target = phases
-        .iter()
-        .rev()
-        .find_map(|p| p["target"].as_str());
-    let candidate = phases
-        .iter()
-        .rev()
-        .find_map(|p| p["candidate"].as_str());
+    let target = phases.iter().rev().find_map(|p| p["target"].as_str());
+    let candidate = phases.iter().rev().find_map(|p| p["candidate"].as_str());
 
     json!({
         "task": task,
@@ -234,7 +232,11 @@ pub fn render_critical_path(cp: &Value) -> String {
         writeln!(out, "\n  (no phase spans recorded yet)").unwrap();
         return out;
     }
-    writeln!(out, "\n  phase                 attempt  queue wait  duration  authority  terminal").unwrap();
+    writeln!(
+        out,
+        "\n  phase                 attempt  queue wait  duration  authority  terminal"
+    )
+    .unwrap();
     for p in &phases {
         writeln!(
             out,
@@ -304,7 +306,11 @@ mod tests {
 
     #[test]
     fn in_flight_ticket_has_no_task_to_main_and_is_not_invented() {
-        let tuples = vec![span("ticket_ready", 1, json!({"queued_at": "2026-08-20T00:00:00Z"}))];
+        let tuples = vec![span(
+            "ticket_ready",
+            1,
+            json!({"queued_at": "2026-08-20T00:00:00Z"}),
+        )];
         let cp = build_critical_path("TKT-x", &tuples);
         assert_eq!(cp["task_to_main_ms"], Value::Null);
         assert_eq!(cp["in_flight"], true);

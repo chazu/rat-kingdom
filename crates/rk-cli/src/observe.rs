@@ -150,7 +150,8 @@ pub async fn digest(layout: &Layout, since: &str, llm: bool, as_json: bool) -> R
 /// regardless of window size. A metric with no supporting span in the window
 /// comes out `null`, never a fabricated `0`.
 pub fn build_phase_latency(events: &[Value], cutoff: DateTime<Utc>) -> Value {
-    let mut seen: std::collections::BTreeSet<(String, String, u64)> = std::collections::BTreeSet::new();
+    let mut seen: std::collections::BTreeSet<(String, String, u64)> =
+        std::collections::BTreeSet::new();
     let spans: Vec<&Value> = events
         .iter()
         .filter(|e| e["identity"].as_str() == Some(rk_daemon::span::SPAN_IDENTITY))
