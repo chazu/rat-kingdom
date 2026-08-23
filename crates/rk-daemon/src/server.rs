@@ -1514,15 +1514,12 @@ impl Daemon {
                         continue;
                     }
                     let mut probe = [0u8; 1];
-                    match read.get_ref().try_read(&mut probe) {
-                        Ok(0) => {
-                            self.supervisor.cancel_managed_verification_request(
-                                request_key,
-                                "caller_disconnect",
-                            );
-                            return dispatch_fut.await;
-                        }
-                        Ok(_) | Err(_) => {}
+                    if let Ok(0) = read.get_ref().try_read(&mut probe) {
+                        self.supervisor.cancel_managed_verification_request(
+                            request_key,
+                            "caller_disconnect",
+                        );
+                        return dispatch_fut.await;
                     }
                 }
             }
