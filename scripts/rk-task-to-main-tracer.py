@@ -153,11 +153,18 @@ def find_proof_reuse_short_circuit(cp):
 
 
 def review_rework_summary(cp):
-    """Semantic-review load proxy. NOTE (observed limit): semantic_review
-    phase spans do not carry duration_ms in the current substrate (verified
-    against production — see design note), so "duplicate semantic-review
-    time" can only be evaluated via round COUNTS, not elapsed review
-    duration. Rendered explicitly, not papered over."""
+    """Semantic-review load proxy. NOTE (observed limit, fixed for new spans):
+    commit 28c1543 ("record durable elapsed time for semantic-review and
+    rework spans") wired duration_ms into every semantic_review/rework
+    producer, confirmed live against production (see design note) — a span
+    written after that fix populates duration_ms whenever the durable
+    landing-queue phase-transition clock was available when the phase
+    started. Spans written before the fix, and any span whose landing queue
+    entry predates the clock being threaded, still render duration_ms as
+    null — this is deliberate (the substrate never fabricates a duration),
+    not a residual bug, so "duplicate semantic-review time" remains a
+    round-count proxy for those legacy spans specifically, not for the
+    substrate as a whole."""
     return {
         "review_rounds": cp.get("review_rounds"),
         "rework_rounds": cp.get("rework_rounds"),
@@ -259,6 +266,8 @@ SELF_TEST_PATHS = [
      "postchange-clean-proof-reuse.TKT-01M0QXS8WPTMJTW3ZR0QPD44XG.json"),
     ("review-rework", "TKT-01M0P974MQK5XE1MR9KQCWT654",
      "review-rework.TKT-01M0P974MQK5XE1MR9KQCWT654.json"),
+    ("timed-semantic-review", "TKT-01M0R4ZPYA7003QDRK6BET0WZN",
+     "timed-semantic-review.TKT-01M0R4ZPYA7003QDRK6BET0WZN.json"),
 ]
 
 
@@ -309,6 +318,24 @@ def self_test():
           "the day a producer starts threading semantic_review duration_ms)")
     check(rework["target_evaluation"]["duplicate_semantic_review"].startswith("NOT-APPLICABLE"),
           "review-rework: reworked ticket should not be scored against the clean-path target")
+
+    timed = by_label["timed-semantic-review"]
+    semantic_review_rows = [p for p in timed["phases"] if p["phase"] == "semantic_review"]
+    check(len(semantic_review_rows) == 1,
+          f"timed-semantic-review: expected exactly 1 semantic_review phase row, got {len(semantic_review_rows)}")
+    sr = semantic_review_rows[0] if semantic_review_rows else {}
+    check(sr.get("duration_ms") not in (None, "n/a"),
+          "timed-semantic-review: expected a real (non-null) duration_ms on the post-fix semantic_review span "
+          "— this is the live confirmation that commit 28c1543 populates duration_ms for new spans")
+    check(sr.get("authority") == "llm",
+          f"timed-semantic-review: expected authority == 'llm', got {sr.get('authority')!r}")
+    check(sr.get("terminal_reason") == "approved",
+          f"timed-semantic-review: expected terminal_reason == 'approved', got {sr.get('terminal_reason')!r}")
+    check(timed["review_rework"]["semantic_review_duration_ms_available"] is True,
+          "timed-semantic-review: expected semantic_review duration availability to now read True "
+          "(the fixed case, contrasted with review-rework's legacy False above)")
+    check(timed["review_rework"]["rework_rounds"] == 0,
+          "timed-semantic-review: expected a clean APPROVE with 0 rework rounds")
 
     if failures:
         print(f"SELF-TEST FAILED ({len(failures)} assertion(s)):", file=sys.stderr)
