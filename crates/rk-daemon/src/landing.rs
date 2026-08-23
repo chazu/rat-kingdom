@@ -2927,6 +2927,25 @@ impl LandingPipeline {
         match verdict.as_str() {
             "APPROVE" => {
                 self.note_non_main_land_target(entry);
+                // Capture the review phase's own clock BEFORE the status
+                // transition below moves the durable candidate into `Landing`
+                // (`Phase::Merge`) — that transition resets
+                // `phase_entered_at`, so reading it any later would silently
+                // lose the review's elapsed time.
+                let _ = crate::span::record_phase_span(
+                    &self.space,
+                    &entry.repo_name,
+                    "daemon",
+                    &Self::timed_review_span(
+                        &entry.task,
+                        crate::span::Phase::SemanticReview,
+                        1,
+                        &entry.repo_name,
+                        self.phase_started_at(entry),
+                        Utc::now(),
+                        "approved",
+                    ),
+                );
                 self.queue.set_status(entry, LandingEntryStatus::Landing)?;
                 let result = self
                     .supervisor
@@ -3645,6 +3664,30 @@ impl LandingPipeline {
     ) -> rk_core::Result<()> {
         self.escalate(entry, ctx.escalation(withheld))?;
         self.record_rework_state(entry, ctx, attempt, withheld.code)?;
+        let hold_at = Utc::now();
+        // Every `route_rework` call site that reaches a withhold does so
+        // BEFORE its own "rework-requested" span write (the interrupted-
+        // recovery, budget, and reviewed-head-moved routes all return early
+        // above that point) — this is the only place those routes' review
+        // phase gets closed out. The one exception (`dispatch-refused`,
+        // reached AFTER that write) targets the SAME `(task, attempt)` key,
+        // so `record_phase_span`'s dedup makes this a harmless no-op there,
+        // correctly leaving the original "rework-requested" span as the
+        // review's terminal record rather than overwriting it.
+        let _ = crate::span::record_phase_span(
+            &self.space,
+            &entry.repo_name,
+            "daemon",
+            &Self::timed_review_span(
+                &entry.task,
+                crate::span::Phase::SemanticReview,
+                attempt,
+                &entry.repo_name,
+                self.phase_started_at(entry),
+                hold_at,
+                withheld.code,
+            ),
+        );
         let _ = crate::span::record_phase_span(
             &self.space,
             &entry.repo_name,
@@ -3765,6 +3808,61 @@ impl LandingPipeline {
         Ok(spent)
     }
 
+    /// Start-of-phase clock for a `SemanticReview`/`Rework` span about to be
+    /// recorded against `entry`: the durable landing-queue transition clock
+    /// ([`LandingQueueEntry::phase_entered_at`]), read FRESH from the
+    /// queue's current durable tuple rather than `entry`'s own in-memory
+    /// copy. Every caller here holds an `entry` cloned at the top of
+    /// [`Self::process_entry`], BEFORE [`Self::dispatch_review`] durably
+    /// transitions the queue row to `AwaitingReview` — that transition
+    /// resets `phase_entered_at` to the moment review actually began, but
+    /// only in the DURABLE tuple, never in the caller's stale local copy.
+    /// Re-reading it here is what makes elapsed time phase-local instead of
+    /// inheriting whatever phase the candidate was in before review started.
+    ///
+    /// `None` when `entry` has no durable queue tuple at all — a synthetic
+    /// conflict entry ([`Self::synthetic_conflict_entry`]), which never
+    /// passed through [`LandingQueue::enqueue`] — or a legacy durable tuple
+    /// written before this field existed. Either way, the resulting span is
+    /// left without a `started_at`, so [`crate::span::PhaseSpan::duration_ms`]
+    /// comes out `None` rather than a fabricated value.
+    fn phase_started_at(&self, entry: &LandingQueueEntry) -> Option<DateTime<Utc>> {
+        self.queue
+            .find(entry)
+            .ok()
+            .flatten()
+            .and_then(|t| t.payload.get("phase_entered_at").cloned())
+            .and_then(|v| serde_json::from_value(v).ok())
+    }
+
+    /// Build a `SemanticReview`/`Rework` span carrying real elapsed time
+    /// whenever `started_at` is available, and no `duration_ms` at all when
+    /// it is not — the shared shape every producer of these two phases below
+    /// uses, so the timing logic lives in exactly one place. `authority` is
+    /// always `Llm`: every current producer of these two phases is
+    /// LLM-driven review or correction dispatch (see
+    /// [`crate::span::Authority`]'s doc on the human/LLM split).
+    fn timed_review_span(
+        task: &str,
+        phase: crate::span::Phase,
+        attempt: u32,
+        repo: &str,
+        started_at: Option<DateTime<Utc>>,
+        ended_at: DateTime<Utc>,
+        terminal_reason: &str,
+    ) -> crate::span::PhaseSpan {
+        let mut span = crate::span::PhaseSpan::new(task, phase)
+            .attempt(attempt)
+            .repo(repo)
+            .authority(crate::span::Authority::Llm)
+            .terminal_reason(terminal_reason)
+            .ended_at(ended_at);
+        if let Some(started) = started_at {
+            span = span.started_at(started);
+        }
+        span
+    }
+
     /// File the ticket, then dispatch one exact-base correction or hold behind
     /// an evidence-rich gate. Both paths retain the durable ticket.
     async fn route_rework(
@@ -3870,15 +3968,23 @@ impl LandingPipeline {
 
         // Marker first: replay gates an interrupted spawn instead of duplicating it.
         self.record_rework_state(entry, &ctx, attempt, "dispatching")?;
+        // The review phase ends exactly here — reused below as the `Rework`
+        // phase's own `started_at`, so the two spans bracket the same
+        // instant rather than leaving a gap or an overlap between them.
+        let review_ended_at = Utc::now();
         let _ = crate::span::record_phase_span(
             &self.space,
             &entry.repo_name,
             "daemon",
-            &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::SemanticReview)
-                .attempt(attempt)
-                .repo(&entry.repo_name)
-                .authority(crate::span::Authority::Llm)
-                .terminal_reason("rework-requested"),
+            &Self::timed_review_span(
+                &entry.task,
+                crate::span::Phase::SemanticReview,
+                attempt,
+                &entry.repo_name,
+                self.phase_started_at(entry),
+                review_ended_at,
+                "rework-requested",
+            ),
         );
 
         let params = crate::supervisor::SpawnParams {
@@ -3916,11 +4022,15 @@ impl LandingPipeline {
                     &self.space,
                     &entry.repo_name,
                     "daemon",
-                    &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::Rework)
-                        .attempt(attempt)
-                        .repo(&entry.repo_name)
-                        .authority(crate::span::Authority::Llm)
-                        .terminal_reason("dispatched"),
+                    &Self::timed_review_span(
+                        &entry.task,
+                        crate::span::Phase::Rework,
+                        attempt,
+                        &entry.repo_name,
+                        Some(review_ended_at),
+                        Utc::now(),
+                        "dispatched",
+                    ),
                 );
                 if let Err(e) = self
                     .tickets
@@ -4020,6 +4130,27 @@ impl LandingPipeline {
     ) -> rk_core::Result<()> {
         self.escalate(entry, ctx.escalation(withheld))?;
         self.record_conflict_state(entry, ctx, attempt, withheld.code)?;
+        // Mirrors `withhold_rework`: closes out the review/correction phase
+        // for the withhold routes that never reach `dispatch_held_conflict`'s
+        // own "conflict-correction-requested" write, and is a dedup no-op
+        // (same `(task, attempt)` key) for the one route that does. `entry`
+        // here is usually the synthetic conflict entry
+        // (`Self::synthetic_conflict_entry`), which carries no durable queue
+        // clock, so `duration_ms` is left absent rather than fabricated.
+        let _ = crate::span::record_phase_span(
+            &self.space,
+            &entry.repo_name,
+            "daemon",
+            &Self::timed_review_span(
+                &entry.task,
+                crate::span::Phase::SemanticReview,
+                attempt,
+                &entry.repo_name,
+                self.phase_started_at(entry),
+                Utc::now(),
+                withheld.code,
+            ),
+        );
         let _ = crate::span::record_phase_span(
             &self.space,
             &entry.repo_name,
@@ -4664,16 +4795,23 @@ impl LandingPipeline {
         // orchestrator variant (matching the choice already made for the
         // `AttentionHold` this same chain writes while awaiting that
         // decision, below in `hold_conflict_for_orchestrator_decision`), so
-        // `Llm` is reused here too.
+        // `Llm` is reused here too. `entry` is synthetic here, so
+        // `phase_started_at` is `None` and `duration_ms` is left absent
+        // rather than fabricated (see `Self::phase_started_at`'s doc).
+        let review_ended_at = Utc::now();
         let _ = crate::span::record_phase_span(
             &self.space,
             &entry.repo_name,
             "daemon",
-            &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::SemanticReview)
-                .attempt(attempt)
-                .repo(&entry.repo_name)
-                .authority(crate::span::Authority::Llm)
-                .terminal_reason("conflict-correction-requested"),
+            &Self::timed_review_span(
+                &entry.task,
+                crate::span::Phase::SemanticReview,
+                attempt,
+                &entry.repo_name,
+                self.phase_started_at(&entry),
+                review_ended_at,
+                "conflict-correction-requested",
+            ),
         );
 
         let params = crate::supervisor::SpawnParams {
@@ -4711,11 +4849,15 @@ impl LandingPipeline {
                     &self.space,
                     &entry.repo_name,
                     "daemon",
-                    &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::Rework)
-                        .attempt(attempt)
-                        .repo(&entry.repo_name)
-                        .authority(crate::span::Authority::Llm)
-                        .terminal_reason("conflict-correction-dispatched"),
+                    &Self::timed_review_span(
+                        &entry.task,
+                        crate::span::Phase::Rework,
+                        attempt,
+                        &entry.repo_name,
+                        Some(review_ended_at),
+                        Utc::now(),
+                        "conflict-correction-dispatched",
+                    ),
                 );
                 if let Err(e) = self
                     .tickets
@@ -6974,6 +7116,75 @@ workflow: {
         // The next transition adopts one rather than leaving it `None`.
         let claimed = queue.claim_next("alpha", "main").unwrap().unwrap();
         assert!(claimed.phase_entered_at.is_some());
+    }
+
+    /// Legacy unavailable evidence, at the span level: a durable landing-
+    /// queue tuple written before `phase_entered_at` existed has no clock to
+    /// derive a `SemanticReview`/`Rework` `started_at` from.
+    /// [`LandingPipeline::phase_started_at`] must report `None` for it (not
+    /// panic, not fall back to some other timestamp), and the resulting span
+    /// must carry no `duration_ms` at all — never a fabricated one.
+    #[test]
+    fn legacy_queue_tuple_without_a_phase_clock_yields_no_fabricated_review_duration() {
+        let home = tempfile::tempdir().unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+
+        let entry = LandingQueueEntry {
+            repo_name: "legacy-repo".into(),
+            repo_path: "/repos/legacy".into(),
+            branch: "b1".into(),
+            target: "main".into(),
+            head_sha: "sha-legacy".into(),
+            diff_class: "trivial".into(),
+            task: "TKT-legacy".into(),
+            seq: 1,
+            status: LandingEntryStatus::AwaitingReview,
+            ..Default::default()
+        };
+        // Hand-write the pre-upgrade tuple shape (module doc,
+        // `legacy_entry_without_a_phase_clock_reports_zero_then_starts_one`
+        // above): no `phase_entered_at` field at all.
+        space
+            .out(
+                Tuple::new(
+                    Category::Event,
+                    entry.repo_name.clone(),
+                    LANDING_QUEUE_IDENTITY,
+                    "daemon",
+                    json!({
+                        "repo_name": entry.repo_name,
+                        "repo_path": entry.repo_path,
+                        "branch": entry.branch,
+                        "target": entry.target,
+                        "head_sha": entry.head_sha,
+                        "diff_class": entry.diff_class,
+                        "task": entry.task,
+                        "seq": entry.seq,
+                        "rev": 0,
+                        "status": "awaiting_review",
+                    }),
+                )
+                .with_lifecycle(Lifecycle::Furniture),
+            )
+            .unwrap();
+
+        assert!(pipeline.phase_started_at(&entry).is_none());
+
+        let span = LandingPipeline::timed_review_span(
+            &entry.task,
+            crate::span::Phase::SemanticReview,
+            1,
+            &entry.repo_name,
+            pipeline.phase_started_at(&entry),
+            Utc::now(),
+            "approved",
+        );
+        assert!(span.started_at.is_none(), "{span:?}");
+        assert!(
+            span.duration_ms().is_none(),
+            "a legacy record with no start clock must never fabricate a duration: {span:?}"
+        );
     }
 
     #[test]
@@ -9257,12 +9468,29 @@ workflow: {
             .expect("dispatch_held_conflict must record a SemanticReview span");
         assert_eq!(review["authority"], "llm");
         assert_eq!(review["terminal_reason"], "conflict-correction-requested");
+        // `entry` here is the synthetic conflict entry — no durable landing-
+        // queue tuple, so no `phase_entered_at` clock exists to derive a
+        // `started_at` from. `duration_ms` must be left absent (`null`),
+        // never fabricated, exactly like the "legacy/unavailable evidence"
+        // case for a real queue entry predating the clock.
+        assert!(review["started_at"].is_null(), "{review:?}");
+        assert!(review["duration_ms"].is_null(), "{review:?}");
         let rework = spans
             .iter()
             .find(|s| s["phase"] == "rework")
             .expect("dispatch_held_conflict must record a Rework span on a successful spawn");
         assert_eq!(rework["authority"], "llm");
         assert_eq!(rework["terminal_reason"], "conflict-correction-dispatched");
+        // The Rework phase's own clock IS locally derivable (it starts
+        // exactly when the SemanticReview phase's write completed), so it
+        // must carry a real, non-negative duration even though the review
+        // phase above could not.
+        assert!(rework["started_at"].is_string(), "{rework:?}");
+        assert!(rework["ended_at"].is_string(), "{rework:?}");
+        let rework_duration = rework["duration_ms"]
+            .as_i64()
+            .expect("rework span must carry a real duration_ms");
+        assert!(rework_duration >= 0, "{rework:?}");
         let hold = spans
             .iter()
             .find(|s| s["phase"] == "attention_hold")
@@ -9700,6 +9928,31 @@ workflow: {
         assert!(listing.contains("src.rs"), "listing: {listing}");
 
         no_spawns(&space);
+
+        // Clean approval: the review phase must get its own terminal
+        // SemanticReview span too, not just the REWORK/withhold routes —
+        // this is the "duplicate semantic-review time" evaluation's ordinary
+        // path (docs/2026-08-23-tkt-01m0p974w01xt6njg10ymj0zed-live-tracer.md),
+        // and it must carry a real duration derived from the durable
+        // landing-queue phase clock set when `dispatch_review` moved this
+        // candidate into `AwaitingReview`, captured BEFORE the subsequent
+        // `Landing` transition would have reset it.
+        let review_span = crate::span::spans_for_task(&space, "code-repo", "add src")
+            .unwrap()
+            .into_iter()
+            .find(|s| s["phase"] == "semantic_review")
+            .expect("a clean APPROVE must record a SemanticReview span");
+        assert_eq!(review_span["terminal_reason"], "approved");
+        assert_eq!(review_span["authority"], "llm");
+        assert!(
+            review_span["started_at"].is_string(),
+            "{review_span:?}"
+        );
+        assert!(review_span["ended_at"].is_string(), "{review_span:?}");
+        let review_duration = review_span["duration_ms"]
+            .as_i64()
+            .expect("a clean approval must carry a real duration_ms, not null");
+        assert!(review_duration >= 0, "{review_span:?}");
     }
 
     #[test]
@@ -9866,6 +10119,41 @@ workflow: {
             assert_eq!(marker.payload["rework_ticket"], ticket.identity);
         }
 
+        // One LLM rework round: `route_rework` must record BOTH the
+        // `SemanticReview` span that closed the review with a
+        // "rework-requested" verdict AND the `Rework` span for the dispatch
+        // it triggered, each carrying a real (non-fabricated) duration —
+        // the review's from the durable landing-queue phase clock
+        // (`dispatch_review`'s `AwaitingReview` transition, set when this
+        // candidate was enqueued above), the rework's from bracketing the
+        // dispatch itself.
+        let review_span = crate::span::spans_for_task(&space, "code-repo", "add src")
+            .unwrap()
+            .into_iter()
+            .find(|s| s["phase"] == "semantic_review")
+            .expect("route_rework must record a SemanticReview span");
+        assert_eq!(review_span["terminal_reason"], "rework-requested");
+        assert!(
+            review_span["started_at"].is_string(),
+            "the durable landing-queue phase clock must supply a started_at: {review_span:?}"
+        );
+        assert!(review_span["ended_at"].is_string(), "{review_span:?}");
+        let review_duration = review_span["duration_ms"]
+            .as_i64()
+            .expect("a review round with a known start must carry a real duration_ms");
+        assert!(review_duration >= 0, "{review_span:?}");
+
+        let rework_span = crate::span::spans_for_task(&space, "code-repo", "add src")
+            .unwrap()
+            .into_iter()
+            .find(|s| s["phase"] == "rework")
+            .expect("a successful dispatch must record a Rework span");
+        assert_eq!(rework_span["terminal_reason"], "dispatched");
+        let rework_duration = rework_span["duration_ms"]
+            .as_i64()
+            .expect("rework dispatch must carry a real duration_ms");
+        assert!(rework_duration >= 0, "{rework_span:?}");
+
         // Bypass the processed-work-key shortcut to exercise the dispatch
         // marker itself, as a restart replay of the routed verdict would.
         let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
@@ -9887,6 +10175,37 @@ workflow: {
         assert!(
             scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).is_empty(),
             "a journaled correction agent must not be mistaken for an interrupted dispatch"
+        );
+
+        // Restart/replay/dedup: the idempotent replay must neither duplicate
+        // nor re-time either span — `record_phase_span`'s dedup on
+        // `(task, phase, attempt)` makes the second write a no-op, so the
+        // original timing survives untouched.
+        let spans_after_replay =
+            crate::span::spans_for_task(&space, "code-repo", "add src").unwrap();
+        assert_eq!(
+            spans_after_replay
+                .iter()
+                .filter(|s| s["phase"] == "semantic_review")
+                .count(),
+            1,
+            "replay must not duplicate the SemanticReview span"
+        );
+        assert_eq!(
+            spans_after_replay
+                .iter()
+                .filter(|s| s["phase"] == "rework")
+                .count(),
+            1,
+            "replay must not duplicate the Rework span"
+        );
+        let review_after_replay = spans_after_replay
+            .iter()
+            .find(|s| s["phase"] == "semantic_review")
+            .unwrap();
+        assert_eq!(
+            review_after_replay["duration_ms"], review_span["duration_ms"],
+            "replay must not re-time the review span"
         );
     }
 
@@ -10165,12 +10484,38 @@ workflow: {
             assert!(text.contains(required), "missing {required:?}: {text}");
         }
 
+        // Terminal hold path: this route never reaches `route_rework`'s own
+        // "rework-requested" span write (it returns from the `Withhold` arm
+        // before that point), so `withhold_rework` is the ONLY place this
+        // review round's SemanticReview span gets closed out.
+        let review_span = crate::span::spans_for_task(&space, "code-repo", "add src")
+            .unwrap()
+            .into_iter()
+            .find(|s| s["phase"] == "semantic_review")
+            .expect("a withheld rework route must still close out the review phase");
+        assert_eq!(review_span["terminal_reason"], "attempts-exhausted");
+        assert!(review_span["started_at"].is_string(), "{review_span:?}");
+        let review_duration = review_span["duration_ms"]
+            .as_i64()
+            .expect("a terminal hold must carry a real duration_ms");
+        assert!(review_duration >= 0, "{review_span:?}");
+
         let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
         pipeline.route_rework(&entry, &repo).await.unwrap();
         assert_eq!(
             scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).len(),
             1,
             "replay must converge on the existing human gate"
+        );
+        // Replay must not re-time the already-settled review span either.
+        let review_span_after_replay = crate::span::spans_for_task(&space, "code-repo", "add src")
+            .unwrap()
+            .into_iter()
+            .find(|s| s["phase"] == "semantic_review")
+            .unwrap();
+        assert_eq!(
+            review_span_after_replay["duration_ms"], review_span["duration_ms"],
+            "replay must not re-time the review span"
         );
     }
 
