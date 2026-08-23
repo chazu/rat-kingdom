@@ -800,7 +800,8 @@ impl Drop for ProcessGroupGuard {
 /// carries [`process_signature`] as recorded the moment this daemon spawned
 /// the child, so the reap sweep can tell "the exact process I spawned,
 /// simply still running" apart from "a stranger now squatting its old pid"
-/// and refuse to signal the latter.
+/// and refuse to signal the latter. That signature deliberately survives the
+/// child later exec'ing into a different command — see `process_signature`.
 struct ManagedChildMarker {
     layout: Layout,
     pid: u32,
@@ -841,19 +842,29 @@ impl Drop for ManagedChildMarker {
     }
 }
 
-/// A best-effort process identity: `pid`'s start time and command name, as
-/// `ps` reports them right now. Not a cryptographic identity — just enough
-/// to distinguish "the same process this daemon spawned" from "the OS
-/// reused this pid for something this daemon never spawned", which is all
-/// [`reap_stale_managed_children`] needs: two distinct processes are
-/// vanishingly unlikely to share both an exact start second and a command
-/// name, whereas the SAME process obviously reports the same pair every
-/// time it's asked. `None` covers both "no process is live at this pid at
-/// all" and "`ps` itself failed" — both must be treated identically by every
-/// caller (nothing to compare against, so no confident answer either way).
+/// A best-effort process identity: `pid`'s start time, as `ps` reports it
+/// right now. PID plus start time — not `comm` — is deliberate: start time
+/// is immutable for the life of a process, but `comm` is not. `sh -c
+/// '<single simple command>'` (exactly what `spawn_check_child` runs for
+/// every named check and raw `run` step) can have `sh` tail-call-exec
+/// directly into that command at any point after `spawn()` returns —
+/// same pid, same start time, but `comm` flips from `sh` to whatever the
+/// command was. A `comm`-inclusive signature would then stop matching for a
+/// process the daemon is still watching, and the reap sweep's fail-closed
+/// fence would wrongly treat a genuine orphan as a stranger squatting a
+/// recycled pid and leave it running forever. PID + start time alone is not
+/// a cryptographic identity — just enough to distinguish "the same process
+/// this daemon spawned" from "the OS reused this pid for something this
+/// daemon never spawned", which is all [`reap_stale_managed_children`]
+/// needs: two distinct processes are vanishingly unlikely to share an exact
+/// start second, whereas the SAME process obviously reports the same one
+/// every time it's asked, exec or no exec. `None` covers both "no process is
+/// live at this pid at all" and "`ps` itself failed" — both must be treated
+/// identically by every caller (nothing to compare against, so no confident
+/// answer either way).
 fn process_signature(pid: u32) -> Option<String> {
     let output = std::process::Command::new("ps")
-        .args(["-o", "lstart=,comm=", "-p", &pid.to_string()])
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -6809,18 +6820,14 @@ test a::flaky ... FAILED
             "the decoy must be alive before the test"
         );
 
-        // Hand-write a marker for that pid carrying a signature that cannot
+        // Hand-write a marker for that pid carrying a start time that cannot
         // possibly match the decoy's real one — the exact shape a stale
         // marker from a LONG-dead generation would have once its originally
         // recorded process has exited and the pid later got recycled onto
-        // this unrelated decoy.
+        // this unrelated decoy with a different start time.
         let dir = layout.managed_children_dir();
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join(decoy_pid.to_string()),
-            "Thu Jan  1 00:00:00 1970 definitely-not-sh",
-        )
-        .unwrap();
+        std::fs::write(dir.join(decoy_pid.to_string()), "Thu Jan  1 00:00:00 1970").unwrap();
 
         reap_stale_managed_children(&layout);
 
@@ -6843,6 +6850,130 @@ test a::flaky ... FAILED
             .args(["-9", &decoy_pid.to_string()])
             .status();
         let _ = decoy.wait().await;
+    }
+
+    /// Poll `ps`'s own `comm=` column for `pid` until it stops reading
+    /// `sh` — i.e. until a tail-call exec has actually landed — rather than
+    /// racing sh's own, unspecified timing for when it inlines a single
+    /// simple command. Used by the two tests below so neither one is a coin
+    /// flip on when (or whether, this run) the exec happens to occur before
+    /// the assertion.
+    async fn wait_for_comm_to_leave_sh(pid: u32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let comm = std::process::Command::new("ps")
+                .args(["-o", "comm=", "-p", &pid.to_string()])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            if matches!(&comm, Some(c) if !c.is_empty() && !c.contains("sh")) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "comm never flipped away from sh — the tail-call exec did not land"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// TKT-01M0PR64A3H2S9W7KR54Q68VN9: `process_signature`'s identity is PID
+    /// plus start time, deliberately excluding `comm`, because `comm` is not
+    /// stable across exec — `sh -c '<single simple command>'` (exactly what
+    /// `spawn_check_child` runs for every named check and raw `run` step)
+    /// can have `sh` tail-call-exec directly into that command at any point
+    /// after `spawn()` returns, same pid, same start time, but `comm` flips.
+    /// Force that exec deterministically with `exec sleep 300` (rather than
+    /// leaving it to sh's own unspecified timing) and prove the signature
+    /// captured right after spawn and the signature captured strictly after
+    /// `comm` has flipped are the same string.
+    #[tokio::test]
+    async fn process_signature_survives_a_tail_call_exec_that_changes_comm() {
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec sleep 300")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let before = process_signature(pid).expect("the process must be alive right after spawn");
+
+        wait_for_comm_to_leave_sh(pid).await;
+
+        let after = process_signature(pid).expect("the process must still be alive after the exec");
+        assert_eq!(
+            before, after,
+            "process_signature must be unchanged by an exec that only changes comm"
+        );
+
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+        let _ = child.wait().await;
+    }
+
+    /// The production regression this ticket exists for
+    /// (TKT-01M0PR64A3H2S9W7KR54Q68VN9): `spawn_check_child` calls
+    /// `ManagedChildMarker::create` immediately after `spawn()`, exactly like
+    /// this test does, so the signature it records can land BEFORE `sh`
+    /// tail-call-execs into the check command — same pid, `comm` now
+    /// different from what was recorded. A `comm`-inclusive identity would
+    /// make `reap_stale_managed_children`'s fail-closed fence refuse to
+    /// touch this process ever again across a daemon restart, defeating the
+    /// orphan-reap feature (TKT-01M0PBNGGZTNQPXB16214V4D7M) for exactly the
+    /// single-bare-command class of check most likely to hit it. Force the
+    /// exec deterministically and wait for `comm` to actually flip BEFORE
+    /// reaping, so this is never a race against sh's own tail-call timing —
+    /// it is a strict "the exec has already happened" precondition.
+    #[tokio::test]
+    async fn reap_stale_managed_children_kills_a_genuinely_orphaned_child_that_tail_call_execd_after_the_marker_was_written(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec sleep 300")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        assert!(pid_alive(pid), "the child must be alive before the test");
+
+        // Marker written right after spawn, exactly like `spawn_check_child`
+        // does — mirroring the real ordering rather than engineering around
+        // it.
+        std::mem::forget(ManagedChildMarker::create(&layout, pid));
+        assert!(
+            layout.managed_children_dir().join(pid.to_string()).exists(),
+            "the marker must exist before reaping"
+        );
+
+        // Wait for the tail-call exec to actually land before reaping, so
+        // the sweep below is guaranteed to run against a process whose
+        // `comm` has already changed from what the marker recorded.
+        wait_for_comm_to_leave_sh(pid).await;
+
+        reap_stale_managed_children(&layout);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while pid_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exec'd orphan survived reap_stale_managed_children — comm drift broke the \
+                 identity fence"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !layout.managed_children_dir().join(pid.to_string()).exists(),
+            "the marker must be removed once considered, win or lose"
+        );
+        // Reap the OS zombie: this test process is its direct parent.
+        let _ = child.wait().await;
     }
 
     #[test]
