@@ -131,6 +131,18 @@ impl Layout {
         self.home.join("worktrees")
     }
 
+    /// Durable markers for daemon-spawned check children (`run` steps,
+    /// `verify.run`-mediated managed verification): one empty file per live
+    /// child, named by its OS pid. Written the moment a child's pid is known
+    /// and removed the moment its guard drops (`ManagedChildMarker` in
+    /// `rk-daemon`'s `workflow_exec.rs`), so any file still here at the next
+    /// `Daemon::run` startup names a process an earlier daemon generation
+    /// left running with no live owner — reaped by that startup sweep before
+    /// this directory is trusted again.
+    pub fn managed_children_dir(&self) -> PathBuf {
+        self.home.join("managed-verification-children")
+    }
+
     /// Shared `CARGO_TARGET_DIR` for every worktree of `repo`. Each rat
     /// worktree is a separate git worktree (separate filesystem tree), so a
     /// bare `target/` inside it is never shared with siblings — N concurrent

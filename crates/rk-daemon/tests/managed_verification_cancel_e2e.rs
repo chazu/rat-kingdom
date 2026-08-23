@@ -17,12 +17,12 @@ mod fixture;
 mod support;
 
 use rk_core::paths::Layout;
-use rk_daemon::Client;
+use rk_daemon::{Client, Daemon};
 use serde_json::json;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
-use support::start_daemon;
+use support::{connect, start_daemon};
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -122,6 +122,33 @@ for i in $(seq 1 200); do
   sleep 0.05
 done
 sleep 30
+"#,
+        rk = rk
+    )
+}
+
+/// Same real-`verify.run`-in-flight setup as [`hold_for_verify_script`], but
+/// instead of holding the turn open, this declares `rk_done` and prints its
+/// own `"type":"result"` line right away and lets the script end — the
+/// harness process backing this generation exits on its own, with the
+/// backgrounded `rk verify` call (and the check's real child, which sleeps
+/// 30s) still genuinely in flight. Models item (2)'s
+/// `HarnessEvent::Exited`-without-`interrupt`/`dismiss` case: a rat that
+/// finishes and exits cleanly while its own completion-check run is still
+/// mid-flight. Must be wrapped in [`fixture::with_rk_done`] so `rk_done` is
+/// callable, exactly like [`hold_for_verify_script`]'s callers wrap it.
+fn self_exit_after_verify_script(rk: &str) -> String {
+    format!(
+        r#"
+echo '{{"type":"system","subtype":"init","session_id":"cancel-e2e"}}'
+read -r _prompt
+'{rk}' verify --repo "$RK_REPO" > verify-rpc-output.txt 2>&1 &
+for i in $(seq 1 200); do
+  [ -f verify.pid ] && break
+  sleep 0.05
+done
+rk_done "self-exit-cancel"
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"self-exit-cancel","session_id":"cancel-e2e","total_cost_usd":0.001,"usage":{{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}'
 "#,
         rk = rk
     )
@@ -349,4 +376,302 @@ async fn dismissing_one_agent_does_not_touch_a_different_repos_in_flight_verify_
         .await
         .unwrap();
     wait_for_death(pid_b).await;
+}
+
+/// Item (1): the real `agent.interrupt` RPC (`Supervisor::interrupt`,
+/// `supervisor.rs` ~4166-4204) driving cancellation — only `dismiss` was
+/// covered before this test. `interrupt`'s own SIGINT is delivered to the
+/// harness's whole process group (`send_group_signal`, `rk-harness/src/
+/// lib.rs`), which also reaches the harness's own `rk verify` CLI child
+/// directly (same process group, backgrounded with `&`) — so this asserts on
+/// the check's OWN independent child (`verify.pid`), which the daemon spawns
+/// itself via `.process_group(0)` and therefore lives in a completely
+/// separate process group untouched by that SIGINT. Only
+/// `cancel_managed_verification_for_agent`'s `"agent_interrupt"` cancellation
+/// path — not the SIGINT's own reach — can kill it.
+#[tokio::test]
+async fn interrupting_a_live_agent_kills_its_own_in_flight_verify_run() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    install_verify_check(repo_dir.path());
+
+    let rk = rk_bin();
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        fixture::with_rk_done(&hold_for_verify_script(&rk)),
+    );
+
+    let mut client = start_daemon(&layout).await;
+    let (agent, worktree) =
+        spawn_verify_holder(&mut client, repo_dir.path(), "interrupt-cancel").await;
+
+    let pid_path = worktree.join("verify.pid");
+    let child_pid = wait_for_pid(&pid_path).await;
+    assert!(
+        process_alive(child_pid),
+        "the agent's own verify run must have a real child alive before interrupt"
+    );
+
+    client
+        .call("agent.interrupt", json!({"name": agent}))
+        .await
+        .unwrap();
+
+    wait_for_death(child_pid).await;
+}
+
+/// Item (2): `HarnessEvent::Exited` firing with no explicit `interrupt` or
+/// `dismiss` (`supervisor.rs` ~2342-2355, `"agent_terminal_death"`) — a
+/// harness that declares `rk_done` and exits cleanly on its own while its own
+/// `verify.run` is still genuinely in flight. Uses
+/// [`self_exit_after_verify_script`], which never sleeps to hold the turn
+/// open: the moment its own real child (behind the backgrounded `rk verify`
+/// call) has started, it declares done, prints its result line, and lets the
+/// script — and with it, the harness process itself — end. Proves the daemon
+/// notices the generation is provably gone and cancels the child, not merely
+/// that a deliberate operator action does.
+#[tokio::test]
+async fn a_harness_that_self_exits_after_declaring_done_kills_its_own_in_flight_verify_run() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    install_verify_check(repo_dir.path());
+
+    let rk = rk_bin();
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        fixture::with_rk_done(&self_exit_after_verify_script(&rk)),
+    );
+
+    let mut client = start_daemon(&layout).await;
+    let (_agent, worktree) =
+        spawn_verify_holder(&mut client, repo_dir.path(), "self-exit-cancel").await;
+
+    let pid_path = worktree.join("verify.pid");
+    let child_pid = wait_for_pid(&pid_path).await;
+    assert!(
+        process_alive(child_pid),
+        "the agent's own verify run must have a real child alive before it self-exits"
+    );
+
+    // No RPC call here at all: the harness's own script does everything —
+    // declares done, prints its result, and its process exits on its own.
+    wait_for_death(child_pid).await;
+}
+
+/// Item (4)'s heavier variant: cross-repo isolation proven under FOUR
+/// concurrent live agents (not just two), each in its own repo with its own
+/// in-flight `verify.run`. Dismissing one at a time must cancel only that
+/// one's managed child — the remaining, genuinely concurrent runs are
+/// untouched — strengthening "under real concurrent load" beyond the
+/// 2-agent proof above.
+#[tokio::test]
+async fn dismissing_one_of_several_concurrent_agents_only_cancels_its_own_verify_run() {
+    const N: usize = 4;
+
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+
+    let repos: Vec<_> = (0..N)
+        .map(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            init_repo(dir.path());
+            install_verify_check(dir.path());
+            dir
+        })
+        .collect();
+
+    let rk = rk_bin();
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        fixture::with_rk_done(&hold_for_verify_script(&rk)),
+    );
+
+    let mut client = start_daemon(&layout).await;
+    let mut agents = Vec::with_capacity(N);
+    for (i, repo) in repos.iter().enumerate() {
+        let (agent, worktree) =
+            spawn_verify_holder(&mut client, repo.path(), &format!("concurrent-{i}")).await;
+        agents.push((agent, worktree));
+    }
+
+    let mut pids = Vec::with_capacity(N);
+    for (_, worktree) in &agents {
+        let pid = wait_for_pid(&worktree.join("verify.pid")).await;
+        assert!(process_alive(pid));
+        pids.push(pid);
+    }
+
+    // Dismiss agents one at a time, from the middle of the set outward, so a
+    // survivor is checked both before and after its neighbors are cancelled
+    // — not just the first and last in spawn order. `dismissed` tracks which
+    // indices have already been cancelled by an earlier iteration, so those
+    // are skipped rather than re-asserted as still alive.
+    let mut dismissed = std::collections::HashSet::new();
+    for &victim in &[2usize, 0, 3, 1] {
+        client
+            .call("agent.dismiss", json!({"name": agents[victim].0}))
+            .await
+            .unwrap();
+        wait_for_death(pids[victim]).await;
+        dismissed.insert(victim);
+        for (i, &pid) in pids.iter().enumerate() {
+            if dismissed.contains(&i) {
+                continue;
+            }
+            assert!(
+                process_alive(pid),
+                "repo {i}'s verify run must be unaffected by repo {victim}'s cancellation"
+            );
+        }
+    }
+}
+
+/// Item (3): what a daemon restart does to a `verify.run` that was
+/// genuinely in flight when the previous daemon died. Uses the same
+/// two-`Daemon`-over-one-on-disk-`Layout` pattern as `live_landing_restart
+/// .rs`'s `two_daemon_restart_mid_gate_resumes_and_lands_through_the_reactor`
+/// (`Daemon::new`, not `start_daemon`'s in-memory space, so state genuinely
+/// persists across the two instances) — not reused directly because that
+/// file's helpers are built around the landing pipeline, not a live agent's
+/// own `verify.run`.
+///
+/// `ManagedVerificationRuns`'s own doc comment (`supervisor.rs`) says a
+/// restart "drops every entry along with the managed child processes
+/// themselves". Before this test's assertions were written, that was
+/// measurably true only of the in-memory BOOKKEEPING, not of the OS-level
+/// child PROCESS: `verify_repo_check`'s real check child is reached from a
+/// per-connection task that `server.rs`'s accept loop spawns with a bare,
+/// detached `tokio::spawn` — NOT the `background_tasks` `JoinSet` that
+/// `Daemon::run`'s own doc comment explains exists specifically so aborting
+/// the outer future tears down every task it owns. Aborting daemon A's
+/// `run()` future (the same technique `live_landing_restart.rs` uses to
+/// simulate a crash) never reaches that detached task, and neither would a
+/// genuine `SIGKILL` of the whole process: the check child lives in ITS OWN
+/// process group (`.process_group(0)`, deliberately so an operator
+/// `interrupt`'s SIGINT does not reach it either), so an orphan of a killed
+/// parent is reparented by the OS, not signalled.
+///
+/// `ManagedChildMarker`/`reap_stale_managed_children`
+/// (`crates/rk-daemon/src/workflow_exec.rs`) close that gap: every check
+/// child's pid is durably marked (with a `ps`-derived identity, not just the
+/// bare pid, so a later restart can never mistake a pid the OS recycled for
+/// an unrelated process as still being the one it spawned —
+/// `reap_stale_managed_children_never_signals_a_pid_reused_by_an_unrelated_process`
+/// pins that fail-closed behavior directly) the moment it is known, and
+/// `Daemon::run` sweeps and kills every marker still on disk before its
+/// accept loop can serve a single request. This test proves that sweep end
+/// to end: daemon B genuinely kills the real child daemon A left running,
+/// not merely a mock of the mechanism.
+///
+/// This test ALSO proves "cleanly" at the level that matters operationally
+/// beyond the leaked process itself: the restart never leaves daemon B
+/// blocked by daemon A's stale state. Daemon B's own `ManagedVerificationRuns`
+/// and `VerificationAdmission` start genuinely empty (in-memory,
+/// per-process), so nothing about the dead run's bookkeeping can hold its
+/// repo's admission slot forever or deadlock a queued follower — daemon B
+/// can immediately run its OWN fresh `verify.run` against the very same
+/// repo. And the orphaned agent record is not left claiming to be live
+/// forever: daemon B's startup (`Supervisor::on_daemon_started` ->
+/// `orphan_live_agents`) marks it `orphaned`, a real terminal-ish state a
+/// respawn sweep can act on, not `running`.
+#[tokio::test]
+async fn daemon_restart_never_blocks_progress_on_a_run_that_was_in_flight_when_it_died() {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    install_verify_check(repo_dir.path());
+
+    let rk = rk_bin();
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        fixture::with_rk_done(&hold_for_verify_script(&rk)),
+    );
+
+    let config = rk_core::config::Config::default();
+
+    // Daemon A: genuinely on-disk (`Daemon::new`), so its state is actually
+    // inherited by daemon B below rather than starting from an empty store.
+    let daemon_a = Daemon::new(layout.clone(), &config).unwrap();
+    let handle_a = tokio::spawn(daemon_a.run());
+    let mut client = connect(&layout).await;
+
+    let repo_name = repo_dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    client
+        .call(
+            "repo.add",
+            json!({"name": &repo_name, "path": repo_dir.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+
+    let (agent, worktree) =
+        spawn_verify_holder(&mut client, repo_dir.path(), "restart-in-flight").await;
+    let pid_path = worktree.join("verify.pid");
+    let child_pid = wait_for_pid(&pid_path).await;
+    assert!(
+        process_alive(child_pid),
+        "the agent's own verify run must have a real child alive before the restart"
+    );
+
+    // The kill: abort the daemon's task outright, same technique
+    // `live_landing_restart.rs` uses, then clear the stale pid/socket a real
+    // crash would also leave with no live holder.
+    handle_a.abort();
+    let _ = handle_a.await;
+    std::fs::remove_file(layout.pid_file()).ok();
+    std::fs::remove_file(layout.socket_path()).ok();
+
+    // Daemon B: a fresh `Daemon::new` over the SAME on-disk home. Its own
+    // startup, before this test's client can issue a single RPC, sweeps and
+    // kills whatever daemon A left running (`reap_stale_managed_children`).
+    let daemon_b = Daemon::new(layout.clone(), &config).unwrap();
+    let handle_b = tokio::spawn(daemon_b.run());
+    let mut client = connect(&layout).await;
+
+    // The regression this item asked for: the REAL child daemon A left
+    // running is genuinely dead, not merely presumed dead.
+    wait_for_death(child_pid).await;
+
+    let status = client
+        .call("agent.status", json!({"name": &agent}))
+        .await
+        .unwrap();
+    assert_eq!(
+        status["agent"]["state"].as_str(),
+        Some("orphaned"),
+        "the dead generation's agent record must not still claim to be live: {status}"
+    );
+
+    // The forward-progress guarantee: daemon B is not blocked by ANY trace of
+    // daemon A's in-flight run — it can immediately run its own fresh
+    // `verify.run` against the very same repo.
+    let (_second_agent, worktree_2) =
+        spawn_verify_holder(&mut client, repo_dir.path(), "restart-in-flight-2").await;
+    let child_pid_2 = wait_for_pid(&worktree_2.join("verify.pid")).await;
+    assert!(
+        process_alive(child_pid_2),
+        "daemon B must be able to run its own fresh verify.run against the same repo, \
+         unblocked by any trace of the dead run daemon A left behind"
+    );
+
+    // Best-effort cleanup of daemon B's own still-running check: not part of
+    // the assertion, and would otherwise hold its `sleep 30` for the rest of
+    // the suite's run (daemon B is about to be aborted, so its OWN sweep
+    // will never run again to catch it).
+    let _ = Command::new("kill")
+        .args(["-9", &child_pid_2.to_string()])
+        .status();
+
+    handle_b.abort();
+    let _ = handle_b.await;
 }

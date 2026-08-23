@@ -675,6 +675,147 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
+/// Durable counterpart to [`ProcessGroupGuard`]: while that guard reaches a
+/// check's whole process group for as long as ITS OWNING PROCESS is alive,
+/// nothing previously reached it across a daemon restart. A check child is
+/// spawned by a connection-handling task that `server.rs`'s accept loop
+/// starts with a bare, detached `tokio::spawn` — not the `background_tasks`
+/// `JoinSet` `Daemon::run`'s own doc comment explains exists specifically so
+/// aborting the outer future tears down every task it owns. So a same-
+/// process simulated crash (`handle.abort()`, the technique
+/// `live_landing_restart.rs` and `managed_verification_cancel_e2e.rs` both
+/// use) never reaches that task, and a real `SIGKILL` reaches the task but
+/// not this child either — it lives in ITS OWN process group precisely so an
+/// operator `interrupt`'s SIGINT does not land on it, which equally means no
+/// signal the OS delivers to the dying daemon process ever reaches it. Either
+/// way the child is orphaned, not killed, unless something explicit reaps it.
+///
+/// This guard is that "something": written the moment the child's pid is
+/// known (mirroring `ProcessGroupGuard`'s own `child.id()` capture),
+/// removed on every exit from `spawn_check_child`'s scope including this
+/// future being dropped out from under it (the managed-verification
+/// cancellation race in `verify_repo_check`) — so a run that finishes,
+/// times out, errors, or gets cancelled all leave nothing durable behind.
+/// [`reap_stale_managed_children`] is the other half: called once at the
+/// START of every `Daemon::run`, before this directory is trusted again, so
+/// anything still here at that point can only be an actual orphan left by a
+/// daemon generation that is provably gone — not a false positive, since
+/// this daemon does not even accept connections yet when it sweeps.
+///
+/// The marker's content, not just its filename, is what makes reaping safe:
+/// a bare pid is not a stable identity across the (however unlikely, however
+/// long the gap between a dead generation and the next daemon start) window
+/// in which the OS can recycle it for an unrelated process. The file also
+/// carries [`process_signature`] as recorded the moment this daemon spawned
+/// the child, so the reap sweep can tell "the exact process I spawned,
+/// simply still running" apart from "a stranger now squatting its old pid"
+/// and refuse to signal the latter.
+struct ManagedChildMarker {
+    layout: Layout,
+    pid: u32,
+}
+
+impl ManagedChildMarker {
+    fn create(layout: &Layout, pid: u32) -> Self {
+        let dir = layout.managed_children_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        // Best-effort: if the child has already exited in the (negligible)
+        // window between `spawn()` and this call, there is no signature to
+        // record and therefore nothing safe to reap later — skip the write
+        // rather than persist an unverifiable marker. Written atomically
+        // (temp file + rename, same directory/filesystem) so a daemon that
+        // dies mid-write never leaves a torn, unparseable marker behind for
+        // the reap sweep to trip over.
+        if let Some(signature) = process_signature(pid) {
+            let path = dir.join(pid.to_string());
+            let tmp = dir.join(format!("{pid}.tmp-{}", std::process::id()));
+            if std::fs::write(&tmp, signature).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+        Self {
+            layout: layout.clone(),
+            pid,
+        }
+    }
+}
+
+impl Drop for ManagedChildMarker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.layout.managed_children_dir().join(self.pid.to_string()));
+    }
+}
+
+/// A best-effort process identity: `pid`'s start time and command name, as
+/// `ps` reports them right now. Not a cryptographic identity — just enough
+/// to distinguish "the same process this daemon spawned" from "the OS
+/// reused this pid for something this daemon never spawned", which is all
+/// [`reap_stale_managed_children`] needs: two distinct processes are
+/// vanishingly unlikely to share both an exact start second and a command
+/// name, whereas the SAME process obviously reports the same pair every
+/// time it's asked. `None` covers both "no process is live at this pid at
+/// all" and "`ps` itself failed" — both must be treated identically by every
+/// caller (nothing to compare against, so no confident answer either way).
+fn process_signature(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "lstart=,comm=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Kill and clear every marker [`ManagedChildMarker`] left behind by a
+/// daemon generation that is gone by the time this one starts — see that
+/// type's doc comment for why a daemon restart cannot rely on anything else
+/// (task-tree teardown, signal delivery) to reach these children. Called
+/// once from `Daemon::run`, right after `on_daemon_started` and before the
+/// accept loop can serve a single request — so before any NEW managed check
+/// can possibly exist — meaning every marker this sees genuinely predates
+/// this process.
+///
+/// Fails CLOSED on identity: a marker is only ever signalled when the pid it
+/// names is CURRENTLY live AND its [`process_signature`] still matches what
+/// was recorded at spawn time. A pid with no live process at all is simply
+/// stale (the child already exited on its own) — nothing to kill. A pid that
+/// IS live but whose signature has changed means the OS has handed that pid
+/// to a process this daemon never spawned; sending it a signal on the
+/// strength of a recycled number alone would be exactly the bug this check
+/// exists to prevent, so that case is left strictly alone. Every marker is
+/// removed once considered either way, so a later restart never re-examines
+/// the same stale entry.
+pub(crate) fn reap_stale_managed_children(layout: &Layout) {
+    let dir = layout.managed_children_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
+            let recorded = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            let recorded = recorded.trim();
+            if !recorded.is_empty() && process_signature(pid).as_deref() == Some(recorded) {
+                // SAFETY: plain kill(2) on a pid whose CURRENT identity was
+                // just confirmed, still, to match the process this daemon
+                // itself spawned as a process-group leader
+                // (`spawn_check_child` always spawns via `.process_group(0)`)
+                // — same negative-pid group signal `ProcessGroupGuard` sends
+                // to a live check's group.
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
 async fn collect_child_output(
     mut child: tokio::process::Child,
     timeout: Duration,
@@ -3880,6 +4021,14 @@ impl WorkflowEngine {
         let child = child_command.spawn().map_err(|e| {
             rk_core::Error::other(format!("run step: failed to spawn `{command}`: {e}"))
         })?;
+        // Durable counterpart to `group_guard` inside `collect_child_output`:
+        // that guard only reaches this child for as long as ITS OWN task is
+        // alive, which a daemon restart cannot guarantee (see
+        // `ManagedChildMarker`'s doc comment). Held in this local, so it is
+        // dropped — durable marker removed — on every exit from this
+        // `.await` below, including this whole future being dropped out from
+        // under it by `verify_repo_check`'s cancellation race.
+        let _managed_marker = child.id().map(|pid| ManagedChildMarker::create(&self.layout, pid));
 
         collect_child_output(child, timeout, command).await
     }
@@ -6279,6 +6428,133 @@ test a::flaky ... FAILED
         // SAFETY: signal 0 only probes liveness/permission; it affects nothing.
         let alive = unsafe { libc::kill(grandchild_pid, 0) == 0 };
         assert!(!alive, "grandchild `sleep` survived the gate timeout");
+    }
+
+    /// Polls `ps` STAT rather than raw `kill(pid, 0)`: these sleepers are
+    /// spawned as DIRECT children of the test process, so a signal-0
+    /// liveness check keeps reporting "alive" for a zombie — killed but not
+    /// yet reaped by its parent (this process, which never calls `wait` on
+    /// it) — exactly the gotcha `rk-harness/src/fake.rs`'s own `still_running`
+    /// helper documents. `None`/empty STAT or a leading `Z` both mean gone.
+    fn pid_alive(pid: u32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("failed to invoke `ps`");
+        if !output.status.success() {
+            return false;
+        }
+        let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        !(stat.is_empty() || stat.starts_with('Z'))
+    }
+
+    /// A real process, its own process-group leader (mirroring exactly how
+    /// `spawn_check_child` spawns a check), that just sleeps — standing in
+    /// for a managed check child in every test below.
+    fn spawn_sleeper() -> tokio::process::Child {
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    /// The reap half of item (3) (TKT-01M0PBNGGZTNQPXB16214V4D7M): a marker
+    /// left behind with NO owning `ManagedChildMarker` guard still alive to
+    /// remove it (`std::mem::forget`, modeling a daemon generation that died
+    /// before its own drop path could ever run) names a process that is
+    /// STILL the exact one this "daemon" spawned — same pid, same
+    /// `process_signature`. `reap_stale_managed_children` must kill it.
+    #[tokio::test]
+    async fn reap_stale_managed_children_kills_a_genuinely_orphaned_child_whose_signature_still_matches(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let mut child = spawn_sleeper();
+        let pid = child.id().unwrap();
+        assert!(pid_alive(pid), "the sleeper must be alive before the test");
+
+        // Simulate the marker surviving its own generation's death: create
+        // it, then `forget` it so its `Drop` (which would otherwise remove
+        // the file the instant this scope ends) never runs.
+        std::mem::forget(ManagedChildMarker::create(&layout, pid));
+        assert!(
+            layout.managed_children_dir().join(pid.to_string()).exists(),
+            "the marker must exist before reaping"
+        );
+
+        reap_stale_managed_children(&layout);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while pid_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the genuinely orphaned sleeper survived reap_stale_managed_children"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !layout.managed_children_dir().join(pid.to_string()).exists(),
+            "the marker must be removed once considered, win or lose"
+        );
+        // Reap the OS zombie: this test process is its direct parent.
+        let _ = child.wait().await;
+    }
+
+    /// The fail-closed half: a marker recording a WRONG signature for a
+    /// CURRENTLY LIVE pid — modeling the OS having recycled that exact pid
+    /// for a process this daemon never spawned in the gap between a dead
+    /// generation and this one starting. `reap_stale_managed_children` must
+    /// never signal it: killing on the strength of a bare, reused pid number
+    /// alone is exactly the bug this identity check exists to prevent.
+    #[tokio::test]
+    async fn reap_stale_managed_children_never_signals_a_pid_reused_by_an_unrelated_process() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        // A REAL, currently-alive, unrelated process standing in for "the OS
+        // reused this pid" — this test never spawned it as a managed check,
+        // and no `ManagedChildMarker` for it was ever created.
+        let mut decoy = spawn_sleeper();
+        let decoy_pid = decoy.id().unwrap();
+        assert!(pid_alive(decoy_pid), "the decoy must be alive before the test");
+
+        // Hand-write a marker for that pid carrying a signature that cannot
+        // possibly match the decoy's real one — the exact shape a stale
+        // marker from a LONG-dead generation would have once its originally
+        // recorded process has exited and the pid later got recycled onto
+        // this unrelated decoy.
+        let dir = layout.managed_children_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(decoy_pid.to_string()),
+            "Thu Jan  1 00:00:00 1970 definitely-not-sh",
+        )
+        .unwrap();
+
+        reap_stale_managed_children(&layout);
+
+        // Give a wrongly-issued kill every chance to land before asserting
+        // survival — this must NOT be a race the assertion wins by luck.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            pid_alive(decoy_pid),
+            "reap_stale_managed_children signalled a pid it never spawned, on a mismatched \
+             signature alone"
+        );
+        assert!(
+            !dir.join(decoy_pid.to_string()).exists(),
+            "the stale/mismatched marker must still be cleared so it is never re-examined"
+        );
+
+        // Cleanup: this decoy is never reaped by design, so kill it by hand
+        // and wait on it ourselves, same as the test above.
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &decoy_pid.to_string()])
+            .status();
+        let _ = decoy.wait().await;
     }
 
     #[test]

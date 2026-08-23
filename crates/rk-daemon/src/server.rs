@@ -687,6 +687,12 @@ impl Daemon {
         info!(socket = %sock.display(), pid = std::process::id(), castle = %self.castle_display, "daemon listening");
         // Only now that the bind is won may shared state be touched.
         self.supervisor.on_daemon_started();
+        // Before the accept loop below can serve a single request (and so
+        // before any NEW managed check child can possibly exist), reap
+        // whatever a dead daemon generation left running
+        // (`workflow_exec::reap_stale_managed_children`'s own doc comment
+        // has the full "why a restart alone can't reach these" story).
+        crate::workflow_exec::reap_stale_managed_children(&self.layout);
         match self.onboarding_sessions.lock() {
             Ok(mut sessions) => {
                 if let Err(error) = sessions.orphan_nonterminal() {

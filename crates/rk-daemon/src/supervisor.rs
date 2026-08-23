@@ -968,9 +968,16 @@ struct ManagedVerificationRun {
 
 /// Registry of in-flight [`ManagedVerificationRun`]s, keyed by an opaque
 /// monotonic id. In-memory only, exactly like [`VerificationAdmission`]: a
-/// daemon restart drops every entry along with the managed child processes
-/// themselves — there is no state to leak or recover, because the daemon
-/// process that owned them is gone.
+/// daemon restart drops every entry, and a fresh daemon's own registry
+/// starts genuinely empty, so nothing about a dead generation's bookkeeping
+/// can ever block a new one's forward progress. The OS-level check child
+/// each entry corresponds to is a SEPARATE concern this in-memory registry
+/// cannot reach across a restart on its own (it lives in its own process
+/// group, reached only via the `cancel` signal above while this process is
+/// still alive) — durably marked and reaped instead by
+/// `crate::workflow_exec::ManagedChildMarker` /
+/// `reap_stale_managed_children`, which every `Daemon::run` runs before its
+/// accept loop can serve a single request.
 #[derive(Default)]
 struct ManagedVerificationRuns {
     next_id: AtomicU64,
