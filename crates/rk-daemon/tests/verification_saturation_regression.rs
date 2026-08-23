@@ -29,7 +29,16 @@ use std::process::Command;
 use std::time::Duration;
 use support::connect;
 
-fn git(dir: &Path, args: &[&str]) {
+// `RK_FAKE_HARNESS_CMD` is a process-global env var and `#[tokio::test]`
+// bodies in one binary run concurrently by default — without this lock, a
+// sibling test's `set_var` can clobber this one's between its own `set_var`
+// and the moment its spawned agent's harness process actually reads it
+// (same race `managed_verification_cancel_e2e.rs`'s own `HARNESS_ENV_LOCK`
+// guards against). Held for the whole test body by every test below that
+// touches the var.
+static HARNESS_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -41,6 +50,7 @@ fn git(dir: &Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn init_repo(dir: &Path) -> String {
@@ -339,6 +349,7 @@ async fn wait_for_pid(path: &Path) -> i32 {
 /// `supervisor_sweep.rs`.
 #[tokio::test]
 async fn live_verifier_descendant_survives_the_sweep_while_a_silent_dead_generation_is_reclaimed() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let repo_name = init_repo(repo_dir.path());
@@ -628,4 +639,376 @@ async fn shared_cargo_target_checks_serialize_to_one_regardless_of_admission_hea
          used to produce a shared-target ENOENT must never open: peak was {peak}, log: \
          {peak_log:?}"
     );
+}
+
+// --- Mid-queue restart: order, ticket ownership, budget, and lease replay ---
+//
+// `landing_dedup_atomic.rs`'s `restart_preserves_the_landing_dedup_invariant`
+// and `restart_mid_gate_kill_does_not_race_a_second_landing_processed_marker`
+// already prove landing-identity dedup survives a restart — but only for ONE
+// queued candidate. `managed_verification_cancel_e2e.rs`'s
+// `daemon_restart_never_blocks_progress_on_a_run_that_was_in_flight_when_it_died`
+// already proves a verification-admission lease never leaks across a
+// restart. Neither proves that the durable landing QUEUE's FIFO ORDER across
+// TWO candidates survives a restart — that is the one genuinely missing
+// assertion this test adds, reusing the same real-daemon-over-socket
+// restart idiom (`live_landing_restart.rs`) rather than a new harness, and
+// folding in ticket-ownership and budget/cost_usd non-duplication as cheap
+// additional assertions on the same two real agents once they exist.
+mod fixture;
+
+const RESTART_LANDING_TRIGGER: &str = r#"
+triggers: [
+    {
+        name:   "landing-on-completion"
+        action: "land"
+        match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""}
+        maxFires: 20
+    },
+]
+"#;
+
+/// Two policy gates pass instantly; `verify` sleeps just long enough to give
+/// the "kill while candidate 1 is mid-gate, candidate 2 sits queued behind
+/// it" step below a real window — same shape as `live_landing_restart.rs`'s
+/// `CHECKS`. `sharedCargoTarget: true` routes it through the per-repo
+/// verification admission lane (WIP_LIMIT below), so the post-restart fresh
+/// `verify.run` at the end genuinely exercises lease non-leak, not a
+/// bypassed check.
+const RESTART_CHECKS: &str = r#"
+checks: [
+    {name: "steward-protected-paths", command: "true", timeout: "30s"},
+    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "verify", command: "sleep 0.6 && true", timeout: "30s", sharedCargoTarget: true},
+]
+"#;
+
+fn init_repo_restart(dir: &Path) -> String {
+    git(dir, &["init", "-b", "main"]);
+    git(dir, &["config", "user.email", "r@x"]);
+    git(dir, &["config", "user.name", "R"]);
+    std::fs::write(dir.join("README.md"), "# x\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-m", "init"]);
+    let rk_dir = dir.join(".rk");
+    std::fs::create_dir_all(&rk_dir).unwrap();
+    std::fs::write(rk_dir.join("checks.cue"), RESTART_CHECKS).unwrap();
+    git(dir, &["add", ".rk/checks.cue"]);
+    git(dir, &["commit", "-m", "add checks registry"]);
+    dir.file_name().unwrap().to_string_lossy().to_string()
+}
+
+/// A doc-only change under a distinct filename/cost per candidate — routes
+/// straight to `Supervisor::land` on a gate pass (`classify_diff`), no
+/// reviewer needed, keeping this test's only variable the restart+order, not
+/// review tiering.
+fn candidate_script(note: &str, cost: f64) -> String {
+    format!(
+        r#"
+read -r _prompt
+mkdir -p docs
+echo "note" > docs/{note}.md
+git add docs/{note}.md >/dev/null 2>&1
+git -c user.email=r@x -c user.name=R commit -q -m "docs: add {note}"
+echo '{{"type":"system","subtype":"init","session_id":"sat-restart-{note}"}}'
+rk_done "work done"   # a rat that never declares done fails (TKT-175)
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"sat-restart-{note}","total_cost_usd":{cost},"usage":{{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}'
+"#
+    )
+}
+
+fn restart_config(repo_name: &str) -> rk_core::config::Config {
+    let mut config = rk_core::config::Config::default();
+    config.harness.default = "fake".into();
+    config
+        .policy
+        .verification_admission_limit_by_repo
+        .insert(repo_name.to_string(), WIP_LIMIT);
+    config
+}
+
+async fn wait_agent_completed(client: &mut Client, name: &str) {
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = client
+            .call("agent.status", json!({"name": name}))
+            .await
+            .unwrap();
+        match status["agent"]["state"].as_str() {
+            Some("completed") => return,
+            Some("failed") => panic!("rat failed instead of completing: {status}"),
+            _ => {}
+        }
+    }
+    panic!("rat {name} never completed");
+}
+
+async fn queue_entries(client: &mut Client, repo_name: &str) -> Vec<Value> {
+    let res = client
+        .call(
+            "space.scan",
+            json!({"category": "event", "scope": repo_name, "identity": "landing_queue_entry"}),
+        )
+        .await
+        .unwrap();
+    res["tuples"].as_array().cloned().unwrap_or_default()
+}
+
+async fn processed_markers(client: &mut Client, repo_name: &str) -> Vec<Value> {
+    let res = client
+        .call(
+            "space.scan",
+            json!({"category": "event", "scope": repo_name, "identity": "landing_processed"}),
+        )
+        .await
+        .unwrap();
+    res["tuples"].as_array().cloned().unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_mid_queue_replays_fifo_order_ticket_ownership_and_budget_without_duplication() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_name = init_repo_restart(repo_dir.path());
+    let main_before = git(repo_dir.path(), &["rev-parse", "main"]);
+
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    std::fs::create_dir_all(layout.triggers_dir()).unwrap();
+    std::fs::write(
+        layout.triggers_dir().join("landing.cue"),
+        RESTART_LANDING_TRIGGER,
+    )
+    .unwrap();
+    let config = restart_config(&repo_name);
+
+    // Daemon A: genuinely on-disk (`Daemon::new`), so daemon B below
+    // actually inherits its durable state rather than starting empty.
+    let daemon_a = Daemon::new(layout.clone(), &config).unwrap();
+    let handle_a = tokio::spawn(daemon_a.run());
+    let mut client = connect(&layout).await;
+
+    client
+        .call(
+            "repo.add",
+            json!({"name": &repo_name, "path": repo_dir.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+
+    // Candidate 1: ticket-owned spawn, real completion, real reactor
+    // `action: "land"` dispatch straight onto the daemon-native
+    // `LandingQueue` — no workflow ever runs.
+    let ticket1 = client
+        .call(
+            "ticket.new",
+            json!({"title": "restart-order candidate 1", "scope": &repo_name}),
+        )
+        .await
+        .unwrap();
+    let ticket1_id = ticket1["ticket"]["identity"].as_str().unwrap().to_string();
+
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        fixture::with_rk_done(&candidate_script("note-1", 0.01)),
+    );
+    let agent1 = client
+        .call(
+            "agent.spawn",
+            json!({"repo": repo_dir.path().to_string_lossy(), "task": &ticket1_id, "harness": "fake"}),
+        )
+        .await
+        .unwrap();
+    let agent1_name = agent1["agent"]["name"].as_str().unwrap().to_string();
+    wait_agent_completed(&mut client, &agent1_name).await;
+
+    // Poll until candidate 1 is genuinely `running_gates` (the `verify`
+    // check's `sleep 0.6` is what makes that window real), so the kill
+    // below is proven to land mid-gate, not merely mid-queue.
+    let mut mid_gate = false;
+    for _ in 0..150 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let entries = queue_entries(&mut client, &repo_name).await;
+        if entries
+            .iter()
+            .any(|e| e["payload"]["status"] == "running_gates")
+        {
+            mid_gate = true;
+            break;
+        }
+    }
+    assert!(
+        mid_gate,
+        "candidate 1 never reached running_gates before candidate 2 was queued behind it"
+    );
+
+    // Candidate 2: spawned and completed WHILE candidate 1's gate run is
+    // still in flight, so its own landing completion enqueues behind
+    // candidate 1 on the same `(repo, "main")` FIFO key — `queued`, not
+    // `running_gates`, since the lock is held.
+    let ticket2 = client
+        .call(
+            "ticket.new",
+            json!({"title": "restart-order candidate 2", "scope": &repo_name}),
+        )
+        .await
+        .unwrap();
+    let ticket2_id = ticket2["ticket"]["identity"].as_str().unwrap().to_string();
+
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        fixture::with_rk_done(&candidate_script("note-2", 0.02)),
+    );
+    let agent2 = client
+        .call(
+            "agent.spawn",
+            json!({"repo": repo_dir.path().to_string_lossy(), "task": &ticket2_id, "harness": "fake"}),
+        )
+        .await
+        .unwrap();
+    let agent2_name = agent2["agent"]["name"].as_str().unwrap().to_string();
+    wait_agent_completed(&mut client, &agent2_name).await;
+
+    let mut both_queued = false;
+    for _ in 0..150 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let entries = queue_entries(&mut client, &repo_name).await;
+        if entries.len() == 2 {
+            both_queued = true;
+            break;
+        }
+    }
+    assert!(
+        both_queued,
+        "candidate 2's completion must enqueue a second live entry while candidate 1 is \
+         still mid-gate"
+    );
+
+    // The kill: abort the daemon's task outright (same technique
+    // `live_landing_restart.rs` uses), so candidate 1's in-flight gate run
+    // is genuinely cut off with candidate 2 still durably queued behind it.
+    handle_a.abort();
+    let _ = handle_a.await;
+    std::fs::remove_file(layout.pid_file()).ok();
+    std::fs::remove_file(layout.socket_path()).ok();
+
+    // Both candidates survived the kill, durably queued in FIFO order —
+    // proof the kill landed genuinely mid-queue, not after the pipeline had
+    // already drained one or both.
+    {
+        let space = rk_space::Space::open(&layout.db_path()).unwrap();
+        let pending = space
+            .scan(
+                &rk_core::tuple::Pattern::category(rk_core::tuple::Category::Event)
+                    .identity("landing_queue_entry"),
+            )
+            .unwrap();
+        assert_eq!(pending.len(), 2, "both candidates must survive the kill");
+    }
+
+    // Daemon B: a fresh `Daemon::new` over the SAME on-disk home.
+    let daemon_b = Daemon::new(layout.clone(), &config).unwrap();
+    let handle_b = tokio::spawn(daemon_b.run());
+    let mut client = connect(&layout).await;
+
+    let mut drained = false;
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if queue_entries(&mut client, &repo_name).await.is_empty() {
+            drained = true;
+            break;
+        }
+    }
+    assert!(drained, "the landing queue never drained after the restart");
+
+    // Landing identity: exactly one processed marker per candidate, no
+    // duplication from the restart re-running candidate 1's gate.
+    let markers = processed_markers(&mut client, &repo_name).await;
+    assert_eq!(
+        markers.len(),
+        2,
+        "a restart mid-queue must not duplicate either candidate's landing marker: {markers:?}"
+    );
+    assert!(
+        markers.iter().all(|m| m["payload"]["outcome"] == "landed"),
+        "{markers:?}"
+    );
+
+    // Order: candidate 1 (queued and gated first) must have landed onto
+    // main BEFORE candidate 2 — proven via commit order rather than timing,
+    // since the FIFO lock, not wall-clock luck, is what must hold.
+    let subjects = git(repo_dir.path(), &["log", "--format=%s", "main"]);
+    let subjects: Vec<&str> = subjects.lines().collect();
+    let idx1 = subjects
+        .iter()
+        .position(|s| *s == "docs: add note-1")
+        .expect("candidate 1's commit must be on main");
+    let idx2 = subjects
+        .iter()
+        .position(|s| *s == "docs: add note-2")
+        .expect("candidate 2's commit must be on main");
+    assert!(
+        idx2 < idx1,
+        "candidate 2 must land AFTER candidate 1 (git log is newest-first, so its subject \
+         must appear at a smaller index) — FIFO queue order must survive the restart: \
+         {subjects:?}"
+    );
+    let main_after = git(repo_dir.path(), &["rev-parse", "main"]);
+    assert_ne!(main_before, main_after);
+
+    // Ticket ownership: both tickets closed exactly once by the restart's
+    // resumed landing, not left open or double-processed.
+    for ticket_id in [&ticket1_id, &ticket2_id] {
+        let after = client
+            .call("ticket.get", json!({"id": ticket_id}))
+            .await
+            .unwrap();
+        assert_eq!(
+            after["ticket"]["payload"]["status"], "closed",
+            "ticket {ticket_id} must be closed exactly once across the restart: {after}"
+        );
+    }
+
+    // Budget: both agent records survived the restart durably, with their
+    // own distinct declared cost — no duplicate agent record from the
+    // restart re-observing either candidate's completion.
+    let agents = client.call("agent.list", json!({})).await.unwrap();
+    let agents = agents["agents"].as_array().unwrap();
+    let repo_agents: Vec<_> = agents
+        .iter()
+        .filter(|a| a["repo_name"].as_str() == Some(repo_name.as_str()))
+        .collect();
+    assert_eq!(
+        repo_agents.len(),
+        2,
+        "exactly one agent record per candidate must survive the restart, no duplicates: \
+         {repo_agents:#?}"
+    );
+    let total_cost: f64 = repo_agents
+        .iter()
+        .map(|a| a["cost_usd"].as_f64().unwrap_or(0.0))
+        .sum();
+    assert!(
+        (total_cost - 0.03).abs() < 1e-9,
+        "the two candidates' distinct declared costs (0.01 + 0.02) must both be present \
+         exactly once: total was {total_cost}"
+    );
+
+    // Lease non-leak: a fresh, independent `verify.run` against the same
+    // repo's verification admission lane must complete promptly on daemon
+    // B — unblocked by any trace of daemon A's aborted in-flight permit
+    // (`VerificationAdmission`'s semaphore is in-memory only; a fresh
+    // daemon's starts full).
+    let post_restart = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_verify(&layout, &repo_name, "verify"),
+    )
+    .await
+    .expect("a fresh verify.run must not be blocked by any leaked lease from daemon A");
+    assert_eq!(post_restart["exit"], json!(0), "{post_restart:#?}");
+
+    handle_b.abort();
+    let _ = handle_b.await;
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
