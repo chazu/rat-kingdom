@@ -3728,7 +3728,13 @@ impl WorkflowEngine {
     /// (matched more loosely: that event carries no command text, so it is
     /// a best-effort source, not the primary exactness guarantee the
     /// dedicated cache above provides).
-    fn lookup_verification_proof(
+    ///
+    /// `pub(crate)`: also called from `landing.rs`'s `run_gates_at`
+    /// (TKT-01M0QRZ7QT8CQD74GHRN81XFT5) so a landing gate can reuse a
+    /// passing managed `rk verify` proof instead of always re-running the
+    /// full suite in its own gate worktree — the reverse direction of the
+    /// `landing_gate_pass` fallback this method already provides.
+    pub(crate) fn lookup_verification_proof(
         &self,
         repo_name: &str,
         candidate_sha: &str,
@@ -5573,11 +5579,17 @@ async fn clean_candidate_sha(dir: &Path) -> Option<String> {
 }
 
 /// The exact-match dedup key the ticket asks for: repository, tested
-/// candidate sha, named-check command, toolchain, and environment-policy
+/// candidate sha, check name, command, toolchain, and environment-policy
 /// digest, all folded into one canonical sha256 digest
 /// ([`rk_core::action::canonical_digest`]). `None` only on a (practically
 /// unreachable) serialization failure — callers treat that as "cannot cache
 /// this", never as a false hit.
+///
+/// `check.name` is part of the digest (not just `command`/`toolchain`/
+/// `environment_policy`): two differently-named checks that happen to share
+/// identical command text are still two distinct checks as far as a caller
+/// asking "did check X pass for this candidate" is concerned, and the
+/// ticket's own identity list names "check name" explicitly.
 pub(crate) fn verification_proof_key(
     repo_name: &str,
     candidate: &str,
@@ -5586,6 +5598,7 @@ pub(crate) fn verification_proof_key(
     rk_core::action::canonical_digest(&json!({
         "repo": repo_name,
         "candidate": candidate,
+        "check": check.name,
         "command": check.command,
         "toolchain": check.toolchain,
         "environment_policy": check.environment_policy.to_string(),
