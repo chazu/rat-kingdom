@@ -371,7 +371,13 @@ fn conflict_held_landing(lands: &[Tuple], git: &GitFacts) -> Vec<Violation> {
             // which is exactly what "distinct AND reachable" requires.
             let chain_key = t.payload.get("chain_key").and_then(Value::as_str);
             let id = match chain_key {
-                Some(_) => format!("{}:{}:{}:{}", kind::CONFLICT_HELD_LANDING, t.scope, branch, t.id),
+                Some(_) => format!(
+                    "{}:{}:{}:{}",
+                    kind::CONFLICT_HELD_LANDING,
+                    t.scope,
+                    branch,
+                    t.id
+                ),
                 None => format!("{}:{}:{}", kind::CONFLICT_HELD_LANDING, t.scope, branch),
             };
             let mut evidence = vec![

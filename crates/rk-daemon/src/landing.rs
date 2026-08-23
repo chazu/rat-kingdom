@@ -4284,8 +4284,11 @@ impl LandingPipeline {
         let latest_chain = by_chain
             .into_values()
             .max_by_key(|group| group.iter().map(|m| m.id).max());
-        Ok(latest_chain
-            .and_then(|group| group.into_iter().max_by_key(|m| (Self::conflict_state_rank(m), m.id))))
+        Ok(latest_chain.and_then(|group| {
+            group
+                .into_iter()
+                .max_by_key(|m| (Self::conflict_state_rank(m), m.id))
+        }))
     }
 
     /// The in-flight attempt number for a conflict chain awaiting an
@@ -4304,7 +4307,9 @@ impl LandingPipeline {
         chain_key: Option<&str>,
     ) -> Option<u32> {
         let marker = match chain_key {
-            Some(key) => self.conflict_marker_for_chain_key(repo, branch, key).ok()??,
+            Some(key) => self
+                .conflict_marker_for_chain_key(repo, branch, key)
+                .ok()??,
             None => self.latest_conflict_marker(repo, branch).ok()??,
         };
         marker

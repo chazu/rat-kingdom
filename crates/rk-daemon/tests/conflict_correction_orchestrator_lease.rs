@@ -625,24 +625,31 @@ async fn two_sequential_conflict_chains_on_the_same_branch_each_lease_exactly_on
         "TKT-CHAIN-TWO",
     )
     .await;
-    let item2 = attention_next(&mut client, repo)
-        .await
-        .expect(
-            "a second, later conflict on the same branch must surface past the first chain's \
+    let item2 = attention_next(&mut client, repo).await.expect(
+        "a second, later conflict on the same branch must surface past the first chain's \
              cursor, not be permanently hidden behind it",
-        );
+    );
     let item2_id = item2["id"].as_str().unwrap().to_string();
     assert_ne!(
         item1_id, item2_id,
         "sequential conflicts on the same branch must never share an attention/decision identity"
     );
 
-    let decided2 = decide(&mut client, repo, &item2_id, Some("orch-1"), Some(generation))
-        .await
-        .unwrap();
+    let decided2 = decide(
+        &mut client,
+        repo,
+        &item2_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
     assert_eq!(decided2["resolved"], true);
     assert_eq!(decided2["replay"], false);
-    let outcome2 = decided2["decision"]["outcome"].as_str().unwrap().to_string();
+    let outcome2 = decided2["decision"]["outcome"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(outcome2.contains("TKT-CHAIN-TWO"), "{outcome2}");
     assert_eq!(
         agent_spawn_count(&mut client, repo).await,
@@ -651,13 +658,25 @@ async fn two_sequential_conflict_chains_on_the_same_branch_each_lease_exactly_on
     );
 
     // Replay inside EITHER chain must not double-dispatch.
-    let replay1 = decide(&mut client, repo, &item1_id, Some("orch-1"), Some(generation))
-        .await
-        .unwrap();
+    let replay1 = decide(
+        &mut client,
+        repo,
+        &item1_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
     assert_eq!(replay1["replay"], true);
-    let replay2 = decide(&mut client, repo, &item2_id, Some("orch-1"), Some(generation))
-        .await
-        .unwrap();
+    let replay2 = decide(
+        &mut client,
+        repo,
+        &item2_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
     assert_eq!(replay2["replay"], true);
     assert_eq!(
         agent_spawn_count(&mut client, repo).await,
@@ -762,17 +781,24 @@ async fn an_interrupted_dispatching_marker_fails_closed_and_stays_unresolved_on_
         .unwrap();
     let generation = lease["generation"].as_u64().unwrap();
     assert_eq!(
-        lease["cursor"], Value::Null,
+        lease["cursor"],
+        Value::Null,
         "a fresh lease starts with no cursor"
     );
 
     // First decide: hits the crash-window arm. Must fail closed, not report
     // phantom success, and must never spawn (no fake harness env is even
     // configured for this test).
-    let first = decide(&mut client, repo, &item_id, Some("orch-1"), Some(generation))
-        .await
-        .unwrap_err()
-        .to_string();
+    let first = decide(
+        &mut client,
+        repo,
+        &item_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
     assert!(
         first.contains("the supervisor registry contains no rat for it")
             && first.contains("daemon may have stopped between recording the marker"),
@@ -800,10 +826,16 @@ async fn an_interrupted_dispatching_marker_fails_closed_and_stays_unresolved_on_
     // state `"dispatch-interrupted"` — a terminal human gate — and must
     // refuse again rather than silently converging on success just because
     // it is being asked a second time.
-    let second = decide(&mut client, repo, &item_id, Some("orch-1"), Some(generation))
-        .await
-        .unwrap_err()
-        .to_string();
+    let second = decide(
+        &mut client,
+        repo,
+        &item_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
     assert!(
         second.contains("already terminally") && second.contains("dispatch-interrupted"),
         "{second}"
