@@ -622,6 +622,12 @@ fn total_tokens(usage: &Value) -> u64 {
 }
 
 pub async fn status(layout: &Layout, args: NameArg, as_json: bool) -> Result<()> {
+    // A ticket id (never a valid agent name) renders its task-to-main
+    // critical path instead of an agent record — the ticket survives long
+    // after the agent that worked it is archived/pruned.
+    if args.name.starts_with("TKT-") {
+        return crate::critical_path::show(layout, &args.name, as_json).await;
+    }
     let mut client = Client::connect_or_spawn(layout).await?;
     let result = client
         .call("agent.status", json!({"name": args.name}))

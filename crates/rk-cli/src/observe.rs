@@ -6,7 +6,8 @@ use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rk_core::paths::Layout;
 use rk_daemon::Client;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // Workflow instance timeline
@@ -113,13 +114,16 @@ pub async fn digest(layout: &Layout, since: &str, llm: bool, as_json: bool) -> R
     let digest = build_digest(
         since, cutoff, &events, &obstacles, &needs, &instances, &rollup, &inbox,
     );
+    let phase_latency = build_phase_latency(&events, cutoff);
     if as_json {
         let mut digest = digest;
         digest["capacity"] = capacity;
+        digest["phase_latency"] = phase_latency;
         println!("{digest}");
         return Ok(());
     }
-    let report = render_digest(&digest);
+    let mut report = render_digest(&digest);
+    report.push_str(&render_phase_latency(&phase_latency));
     if llm {
         match llm_summarize(&report) {
             Ok(summary) => {
@@ -132,6 +136,204 @@ pub async fn digest(layout: &Layout, since: &str, llm: bool, as_json: bool) -> R
     println!("{report}");
     print_capacity_section(&capacity);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase-latency aggregation (TKT-01M0P974FGSEFSX2KCS93QFPTF)
+// ---------------------------------------------------------------------------
+
+/// Aggregate `task_span` events (TKT-01M0P974EZZTPMGVP4S0E76NXH) within
+/// `cutoff` into p50/p95 phase latency, proof reuse rate, rework
+/// amplification, and human- vs LLM-gated time. `events` is the same raw
+/// event scan `digest` already fetched — this adds no extra RPC round trip
+/// and inherits its `MAX_SCAN_TUPLES` bound, so the query cost stays fixed
+/// regardless of window size. A metric with no supporting span in the window
+/// comes out `null`, never a fabricated `0`.
+pub fn build_phase_latency(events: &[Value], cutoff: DateTime<Utc>) -> Value {
+    let mut seen: std::collections::BTreeSet<(String, String, u64)> = std::collections::BTreeSet::new();
+    let spans: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["identity"].as_str() == Some(rk_daemon::span::SPAN_IDENTITY))
+        .filter(|e| parse_time(&e["created_at"]).is_some_and(|at| at >= cutoff))
+        // Defensive dedup on the substrate's own idempotency key: a
+        // duplicate event replay must not double-count a phase's latency
+        // twice, even though `record_phase_span` already prevents a second
+        // write for the same (task, phase, attempt) in the common case.
+        .filter(|e| {
+            let p = &e["payload"];
+            let key = (
+                p["task"].as_str().unwrap_or("").to_string(),
+                p["phase"].as_str().unwrap_or("").to_string(),
+                p["attempt"].as_u64().unwrap_or(1),
+            );
+            seen.insert(key)
+        })
+        .collect();
+
+    let mut by_phase: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    let mut proof_total = 0u64;
+    let mut proof_reused = 0u64;
+    let mut review_rounds = 0u64;
+    let mut rework_rounds = 0u64;
+    let mut human_ms_total = 0i64;
+    let mut llm_ms_total = 0i64;
+    let mut has_human = false;
+    let mut has_llm = false;
+
+    for e in &spans {
+        let p = &e["payload"];
+        let phase = p["phase"].as_str().unwrap_or("?").to_string();
+        let duration = p["duration_ms"].as_i64();
+        if let Some(d) = duration {
+            by_phase.entry(phase.clone()).or_default().push(d);
+        }
+        if p["proof_kind"].is_string() {
+            proof_total += 1;
+            if p["proof_reused"] == Value::Bool(true) {
+                proof_reused += 1;
+            }
+        }
+        match phase.as_str() {
+            "semantic_review" => review_rounds += 1,
+            "rework" => rework_rounds += 1,
+            _ => {}
+        }
+        if let Some(d) = duration {
+            match p["authority"].as_str() {
+                Some("human") => {
+                    human_ms_total += d;
+                    has_human = true;
+                }
+                Some("llm") => {
+                    llm_ms_total += d;
+                    has_llm = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut phases = Map::new();
+    for (phase, mut durations) in by_phase {
+        durations.sort_unstable();
+        phases.insert(
+            phase,
+            json!({
+                "count": durations.len(),
+                "p50_ms": percentile(&durations, 50.0),
+                "p95_ms": percentile(&durations, 95.0),
+            }),
+        );
+    }
+
+    json!({
+        "window_spans": spans.len(),
+        "phases": Value::Object(phases),
+        "proof_reuse": if proof_total > 0 {
+            json!({
+                "total": proof_total,
+                "reused": proof_reused,
+                "rate": proof_reused as f64 / proof_total as f64,
+            })
+        } else {
+            Value::Null
+        },
+        "rework_amplification": if review_rounds > 0 {
+            json!({
+                "reviews": review_rounds,
+                "rework_rounds": rework_rounds,
+                "rate": rework_rounds as f64 / review_rounds as f64,
+            })
+        } else {
+            Value::Null
+        },
+        "authority_time_ms": {
+            "human": has_human.then_some(human_ms_total),
+            "llm": has_llm.then_some(llm_ms_total),
+        },
+    })
+}
+
+/// Nearest-rank percentile over an already-sorted sample (1-indexed rank
+/// `ceil(p/100 * n)`, clamped to `[1, n]`). Well-defined on a single-element
+/// sample (p50 == p95 == that element); never called on an empty sample
+/// (callers only aggregate phases with at least one recorded duration).
+fn percentile(sorted: &[i64], p: f64) -> i64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let n = sorted.len();
+    let rank = (p / 100.0 * n as f64).ceil() as usize;
+    let idx = rank.clamp(1, n) - 1;
+    sorted[idx]
+}
+
+/// Render [`build_phase_latency`] as a digest section. Empty when the window
+/// carried no phase spans, so a repo not yet producing them sees no new
+/// output — additive, not invented.
+pub fn render_phase_latency(v: &Value) -> String {
+    let mut out = String::new();
+    if v["window_spans"].as_u64().unwrap_or(0) == 0 {
+        return out;
+    }
+    out.push_str("\nphase latency:\n");
+    if let Some(phases) = v["phases"].as_object() {
+        for (phase, ph) in phases {
+            out.push_str(&format!(
+                "  {:<16} p50 {}  p95 {}  (n={})\n",
+                phase,
+                human_ms(ph["p50_ms"].as_i64().unwrap_or(0)),
+                human_ms(ph["p95_ms"].as_i64().unwrap_or(0)),
+                ph["count"].as_u64().unwrap_or(0),
+            ));
+        }
+    }
+    if let Some(pr) = v["proof_reuse"].as_object() {
+        out.push_str(&format!(
+            "  proof reuse           {}/{} ({:.0}%)\n",
+            pr["reused"].as_u64().unwrap_or(0),
+            pr["total"].as_u64().unwrap_or(0),
+            pr["rate"].as_f64().unwrap_or(0.0) * 100.0,
+        ));
+    }
+    if let Some(ra) = v["rework_amplification"].as_object() {
+        out.push_str(&format!(
+            "  rework amplification   {}/{} ({:.2}x)\n",
+            ra["rework_rounds"].as_u64().unwrap_or(0),
+            ra["reviews"].as_u64().unwrap_or(0),
+            ra["rate"].as_f64().unwrap_or(0.0),
+        ));
+    }
+    let auth = &v["authority_time_ms"];
+    if !auth["human"].is_null() || !auth["llm"].is_null() {
+        out.push_str(&format!(
+            "  authority time         human {} / llm {}\n",
+            auth["human"]
+                .as_i64()
+                .map(human_ms)
+                .unwrap_or_else(|| "-".to_string()),
+            auth["llm"]
+                .as_i64()
+                .map(human_ms)
+                .unwrap_or_else(|| "-".to_string()),
+        ));
+    }
+    out
+}
+
+/// `ms` as the shortest human-readable unit, shared by the digest's phase-
+/// latency section and `rk status`'s critical-path rendering.
+pub fn human_ms(ms: i64) -> String {
+    let abs = ms.unsigned_abs();
+    if abs < 1_000 {
+        format!("{ms}ms")
+    } else if abs < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else if abs < 3_600_000 {
+        format!("{:.1}m", ms as f64 / 60_000.0)
+    } else {
+        format!("{:.1}h", ms as f64 / 3_600_000.0)
+    }
 }
 
 /// Repos currently at capacity on any lane (TKT-01M0P2KM83Y4MD5QYETR3JCKF2) —
@@ -1022,5 +1224,131 @@ mod tests {
             timeline_line(&row(1, 2, "dismiss + land"), 1, "running"),
             " ▶         dismiss + land"
         );
+    }
+
+    fn span(phase: &str, attempt: u64, created_at: &str, payload: Value) -> Value {
+        let mut p = json!({"task": "TKT-9", "phase": phase, "attempt": attempt});
+        for (k, v) in payload.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        tuple("task_span", created_at, p)
+    }
+
+    #[test]
+    fn phase_latency_computes_percentiles_and_rates_within_window() {
+        let cutoff = DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let events = vec![
+            span(
+                "verification",
+                1,
+                "2026-07-23T01:00:00Z",
+                json!({"duration_ms": 10_000, "proof_kind": "full-final", "proof_reused": false}),
+            ),
+            span(
+                "verification",
+                2,
+                "2026-07-23T01:05:00Z",
+                json!({"duration_ms": 20_000, "proof_kind": "full-final", "proof_reused": true}),
+            ),
+            span(
+                "semantic_review",
+                1,
+                "2026-07-23T01:10:00Z",
+                json!({"duration_ms": 5_000, "authority": "llm"}),
+            ),
+            span(
+                "rework",
+                1,
+                "2026-07-23T01:11:00Z",
+                json!({"duration_ms": 1_000, "authority": "llm"}),
+            ),
+            // Before the cutoff — must be dropped.
+            span(
+                "verification",
+                1,
+                "2026-07-22T23:00:00Z",
+                json!({"duration_ms": 999_999}),
+            ),
+        ];
+
+        let digest = build_phase_latency(&events, cutoff);
+        assert_eq!(digest["window_spans"], 4);
+        assert_eq!(digest["phases"]["verification"]["count"], 2);
+        assert_eq!(digest["phases"]["verification"]["p50_ms"], 10_000);
+        assert_eq!(digest["phases"]["verification"]["p95_ms"], 20_000);
+        assert_eq!(digest["proof_reuse"]["total"], 2);
+        assert_eq!(digest["proof_reuse"]["reused"], 1);
+        assert_eq!(digest["proof_reuse"]["rate"], 0.5);
+        assert_eq!(digest["rework_amplification"]["reviews"], 1);
+        assert_eq!(digest["rework_amplification"]["rework_rounds"], 1);
+        assert_eq!(digest["rework_amplification"]["rate"], 1.0);
+        assert_eq!(digest["authority_time_ms"]["llm"], 6_000);
+        assert_eq!(digest["authority_time_ms"]["human"], Value::Null);
+
+        let report = render_phase_latency(&digest);
+        assert!(report.contains("phase latency:"));
+        assert!(report.contains("verification"));
+        assert!(report.contains("proof reuse"));
+        assert!(report.contains("rework amplification"));
+    }
+
+    #[test]
+    fn phase_latency_percentile_on_a_single_sample_is_well_defined() {
+        let cutoff = DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let events = vec![span(
+            "merge",
+            1,
+            "2026-07-23T01:00:00Z",
+            json!({"duration_ms": 4_242}),
+        )];
+        let digest = build_phase_latency(&events, cutoff);
+        assert_eq!(digest["phases"]["merge"]["count"], 1);
+        assert_eq!(digest["phases"]["merge"]["p50_ms"], 4_242);
+        assert_eq!(digest["phases"]["merge"]["p95_ms"], 4_242);
+    }
+
+    #[test]
+    fn phase_latency_with_no_spans_in_window_invents_nothing() {
+        let cutoff = DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let digest = build_phase_latency(&[], cutoff);
+        assert_eq!(digest["window_spans"], 0);
+        assert_eq!(digest["proof_reuse"], Value::Null);
+        assert_eq!(digest["rework_amplification"], Value::Null);
+        assert_eq!(digest["authority_time_ms"]["human"], Value::Null);
+        assert_eq!(digest["authority_time_ms"]["llm"], Value::Null);
+        // A window with nothing to report adds no section to the report —
+        // additive-only, so an unaffected repo's digest is unchanged.
+        assert_eq!(render_phase_latency(&digest), "");
+    }
+
+    #[test]
+    fn phase_latency_deduplicates_a_replayed_span() {
+        let cutoff = DateTime::parse_from_rfc3339("2026-07-23T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let one = span(
+            "agent_launched",
+            1,
+            "2026-07-23T01:00:00Z",
+            json!({"duration_ms": 500}),
+        );
+        let events = vec![one.clone(), one.clone(), one];
+        let digest = build_phase_latency(&events, cutoff);
+        assert_eq!(digest["window_spans"], 1);
+        assert_eq!(digest["phases"]["agent_launched"]["count"], 1);
+    }
+
+    #[test]
+    fn human_ms_picks_the_shortest_readable_unit() {
+        assert_eq!(human_ms(500), "500ms");
+        assert_eq!(human_ms(1_500), "1.5s");
+        assert_eq!(human_ms(90_000), "1.5m");
+        assert_eq!(human_ms(5_400_000), "1.5h");
     }
 }

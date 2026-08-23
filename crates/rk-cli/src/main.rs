@@ -2,6 +2,7 @@
 
 mod agent_cmds;
 mod attention_cmds;
+mod critical_path;
 mod factory_cmds;
 mod factory_dashboard;
 mod factory_skill;
@@ -143,7 +144,10 @@ enum Command {
         #[arg(long)]
         llm: bool,
     },
-    /// Show one agent's status.
+    /// Show one agent's status, or (given a TKT- id) a ticket's task-to-main
+    /// critical path: queue wait, execution duration, attempts, terminal
+    /// reason, target/candidate, proof reuse, rework amplification, and
+    /// human- vs LLM-gated time per phase.
     Status(agent_cmds::NameArg),
     /// Print an agent's transcript (assistant text, tool calls, retries); --follow to stream.
     Log(agent_cmds::LogArgs),
