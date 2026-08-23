@@ -115,7 +115,10 @@ fn install_nested_verify_check(dir: &Path) {
     )
     .unwrap();
     git(dir, &["add", ".rk/checks.cue", ".rk/detach.pl"]);
-    git(dir, &["commit", "-m", "test: install nested-group verify check"]);
+    git(
+        dir,
+        &["commit", "-m", "test: install nested-group verify check"],
+    );
 }
 
 /// rk-daemon doesn't own the `rk` binary, so cargo never sets
