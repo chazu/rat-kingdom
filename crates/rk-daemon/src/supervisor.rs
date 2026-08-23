@@ -1669,6 +1669,35 @@ impl Supervisor {
         }
     }
 
+    /// Best-effort `AgentLaunched` phase span for a generation that has just
+    /// reached `Running`. The span covers the launch itself: `started_at` is
+    /// the journal row's `created_at` (stamped before worktree creation and
+    /// harness launch), `ended_at` is now, so `duration_ms` is the wall-clock
+    /// cost of standing the agent up. Called from both launch tails —
+    /// headless [`spawn`](Self::spawn) and [`spawn_attached`](Self::spawn_attached),
+    /// which is spawn's early-return branch — so an attached rat is not a
+    /// hole in the timeline.
+    ///
+    /// Attempt is left at the default `1`: a respawn of the same task dedups
+    /// onto the first launch, matching the `Completed` producer's own shape.
+    /// Telemetry never fails a spawn that already landed, hence the ignored
+    /// result.
+    fn record_agent_launched_span(&self, record: &AgentRecord) {
+        let Some(task) = &record.task else {
+            return;
+        };
+        let _ = crate::span::record_phase_span(
+            &self.space,
+            &record.repo_name,
+            &self.castle,
+            &crate::span::PhaseSpan::new(task, crate::span::Phase::AgentLaunched)
+                .repo(&record.repo_name)
+                .target(&record.target_branch)
+                .started_at(record.created_at)
+                .ended_at(Utc::now()),
+        );
+    }
+
     fn mark_spawn_failed(&self, name: &str, error: &rk_core::Error) {
         let detail = error.to_string();
         if let Err(e) = self.lock_registry().update(name, |record| {
@@ -1952,6 +1981,7 @@ impl Supervisor {
             .ok_or_else(|| rk_core::Error::other("spawn journal row vanished"))?;
         let session_token = self.track_session(&name, session.control.clone());
 
+        self.record_agent_launched_span(&record);
         self.emit_event(
             &repo_name,
             "agent_spawned",
@@ -2051,6 +2081,7 @@ impl Supervisor {
                 record.target_branch = target_branch.clone();
             })?
             .ok_or_else(|| rk_core::Error::other("spawn journal row vanished"))?;
+        self.record_agent_launched_span(&record);
         self.emit_event(
             &repo_name,
             "agent_spawned",
@@ -5752,6 +5783,28 @@ impl Supervisor {
             return Err(rk_core::Error::other(format!("agent {name} is not live")));
         }
         drop(registry);
+        // First checkpoint only: `revision == 1` is the one check-in that is a
+        // phase boundary — time-to-first-progress, measured from this
+        // generation's `created_at` to the check-in itself. Every later
+        // revision is ordinary progress, not a new phase, so it records
+        // nothing (the span key would dedup it onto this one anyway).
+        // Best-effort: the checkpoint above is already durable and must not be
+        // undone by a telemetry failure.
+        if updated.progress.as_ref().map(|p| p.revision) == Some(1) {
+            if let Some(task) = &updated.task {
+                let _ = crate::span::record_phase_span(
+                    &self.space,
+                    &updated.repo_name,
+                    &self.castle,
+                    &crate::span::PhaseSpan::new(task, crate::span::Phase::FirstProgress)
+                        .repo(&updated.repo_name)
+                        .target(&updated.target_branch)
+                        .started_at(updated.created_at)
+                        .ended_at(now)
+                        .terminal_reason(status.as_str()),
+                );
+            }
+        }
         self.emit_coordinator_event(
             &updated,
             "middle_rat_progress",
@@ -7715,6 +7768,117 @@ mod respawn_tests {
             profile: None,
             resolved_profile: None,
         }
+    }
+
+    /// The launch producer wires into the task-to-main span substrate
+    /// (`crate::span`): a spawn that reaches `Running` records exactly one
+    /// `AgentLaunched` span, carrying the wall-clock cost of standing the
+    /// agent up, and a relaunch of the same task dedups onto it (idempotent
+    /// on `(task, phase, attempt)`).
+    #[tokio::test]
+    async fn spawn_records_an_agent_launched_phase_span_exactly_once() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+
+        let launched = sup
+            .spawn_async(spawn_params(repo.path(), "TKT-launch"), 0)
+            .await
+            .unwrap();
+
+        // Filtered by phase, not counted wholesale: the fake harness can run
+        // to completion mid-test, and the `Completed` producer then records
+        // its own span against the same task.
+        let launch_spans = |sup: &Supervisor| -> Vec<serde_json::Value> {
+            crate::span::spans_for_task(&sup.space, &launched.repo_name, "TKT-launch")
+                .unwrap()
+                .into_iter()
+                .filter(|s| s["phase"] == "agent_launched")
+                .collect()
+        };
+
+        let spans = launch_spans(&sup);
+        assert_eq!(spans.len(), 1, "exactly one launch span: {spans:?}");
+        assert_eq!(spans[0]["repo"], launched.repo_name);
+        assert_eq!(spans[0]["target"], launched.target_branch);
+        assert!(
+            spans[0]["duration_ms"].as_i64().is_some_and(|ms| ms >= 0),
+            "launch span carries a stand-up duration: {:?}",
+            spans[0]
+        );
+
+        // A relaunch of the same task is a second GENERATION, not a second
+        // launch phase — the span key must absorb it, exactly as a restart or
+        // a replayed event is absorbed.
+        sup.spawn_async(spawn_params(repo.path(), "TKT-launch"), 0)
+            .await
+            .unwrap();
+        let spans = launch_spans(&sup);
+        assert_eq!(spans.len(), 1, "relaunch does not double-count: {spans:?}");
+    }
+
+    /// The check-in producer wires into the same substrate: the FIRST
+    /// checkpoint (`revision == 1`) records exactly one `FirstProgress` span
+    /// measuring launch-to-first-check-in, and a later checkpoint records no
+    /// second one — every revision after the first is ordinary progress, not
+    /// a new phase.
+    #[tokio::test]
+    async fn record_progress_records_a_phase_span_only_on_the_first_checkpoint() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+
+        let mut live = record(repo.path(), Some("rat/nibble/t"));
+        live.state = AgentState::Running;
+        live.created_at = Utc::now() - chrono::Duration::seconds(30);
+        sup.lock_registry().insert(live).unwrap();
+
+        let first = sup
+            .record_progress(
+                "Nibble",
+                "reading the ticket".into(),
+                None,
+                "working".into(),
+            )
+            .unwrap();
+        assert_eq!(first.progress.as_ref().unwrap().revision, 1);
+
+        let spans = crate::span::spans_for_task(&sup.space, "repo", "t").unwrap();
+        assert_eq!(spans.len(), 1, "exactly one first-progress span: {spans:?}");
+        assert_eq!(spans[0]["phase"], "first_progress");
+        assert_eq!(spans[0]["terminal_reason"], "working");
+        assert!(
+            spans[0]["duration_ms"]
+                .as_i64()
+                .is_some_and(|ms| ms >= 30_000),
+            "span measures this generation's launch to its first check-in: {:?}",
+            spans[0]
+        );
+
+        // Backdate the checkpoint past MIN_PROGRESS_INTERVAL so a SECOND
+        // check-in is genuinely accepted rather than rate-limited away before
+        // it can reach the span producer at all.
+        sup.lock_registry()
+            .update("Nibble", |record| {
+                if let Some(progress) = &mut record.progress {
+                    progress.updated_at =
+                        Utc::now() - MIN_PROGRESS_INTERVAL - chrono::Duration::seconds(1);
+                }
+            })
+            .unwrap();
+        let second = sup
+            .record_progress("Nibble", "still working".into(), None, "working".into())
+            .unwrap();
+        assert_eq!(second.progress.as_ref().unwrap().revision, 2);
+
+        let spans = crate::span::spans_for_task(&sup.space, "repo", "t").unwrap();
+        assert_eq!(
+            spans.len(),
+            1,
+            "a later checkpoint is not a new phase: {spans:?}"
+        );
     }
 
     /// The fleet-WIP admission check and the reservation must happen in one

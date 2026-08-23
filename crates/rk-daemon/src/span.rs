@@ -34,12 +34,23 @@ use serde_json::{json, Value};
 /// Durable `(Event, <scope>, "task_span")` phase-span record.
 pub const SPAN_IDENTITY: &str = "task_span";
 
-/// One phase of a ticket's task-to-main journey. Matches the parent ticket's
-/// acceptance criteria one-for-one: "ticket readiness and claim" (2 phases),
-/// "agent launch and first progress" (2), "completion" (1), "verification
-/// queue/start/end" (1 phase carrying up to three timestamps), "landing
-/// preparation" (1), "semantic review and bounded rework rounds" (2),
-/// "merge" (1), "delivery closure" (1), "actionable hold" (1).
+/// One phase of a ticket's task-to-main journey. The variants enumerate the
+/// parent ticket's acceptance criteria one-for-one: "ticket readiness and
+/// claim" (2 phases), "agent launch and first progress" (2), "completion"
+/// (1), "verification queue/start/end" (1 phase carrying up to three
+/// timestamps), "landing preparation" (1), "semantic review and bounded
+/// rework rounds" (2), "merge" (1), "delivery closure" (1), "actionable
+/// hold" (1).
+///
+/// Every variant but [`Phase::TicketReady`] has a wired producer: `Claimed`
+/// and `DeliveryClosure` in `tickets.rs`, `AgentLaunched`, `FirstProgress`
+/// and `Completed` in `supervisor.rs`, the rest in `landing.rs`.
+/// `TicketReady` is deliberately not wired here: readiness is a derived
+/// query state (`Tickets::ready()` re-evaluates open tickets against their
+/// dependencies) rather than a discrete transition any producer settles at,
+/// so there is no single call site holding its timing. Recording it needs a
+/// readiness-edge producer that does not exist yet
+/// (TKT-01M0QMT83E7YXH6ZXHMQG0VRS6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
