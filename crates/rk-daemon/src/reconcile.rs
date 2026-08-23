@@ -358,16 +358,22 @@ fn conflict_held_landing(lands: &[Tuple], git: &GitFacts) -> Vec<Violation> {
             // this same violation kind) falls back to the bare
             // `kind:scope:branch` id, unchanged from before this field
             // existed.
-            let chain_key = t.payload.get("chain_key").and_then(Value::as_str);
-            let id = match chain_key {
-                Some(chain_key) => format!(
-                    "{}:{}:{}:{}",
-                    kind::CONFLICT_HELD_LANDING,
-                    t.scope,
-                    branch,
-                    chain_key
-                ),
-                None => format!("{}:{}:{}", kind::CONFLICT_HELD_LANDING, t.scope, branch),
+            //
+            // The differentiator is the land tuple's OWN `t.id`, not the raw
+            // `chain_key` string: `chain_key` is `ConflictContext::dispatch_key`,
+            // which embeds a git `head_sha` — content that has no relationship
+            // to time and can sort either side of an earlier chain's id.
+            // `next_attention`'s cursor check is a bare lexicographic `>` over
+            // the whole id, so an unlucky hash would make a genuinely later
+            // conflict permanently unreachable past the previous chain's
+            // cursor. `t.id` (`rk_core::id::RecordId`, a ULID) is guaranteed
+            // unique AND lexicographically sortable by real creation time,
+            // which is exactly what "distinct AND reachable" requires.
+            let has_chain_key = t.payload.get("chain_key").and_then(Value::as_str).is_some();
+            let id = if has_chain_key {
+                format!("{}:{}:{}:{}", kind::CONFLICT_HELD_LANDING, t.scope, branch, t.id)
+            } else {
+                format!("{}:{}:{}", kind::CONFLICT_HELD_LANDING, t.scope, branch)
             };
             Some(Violation {
                 id,
@@ -926,6 +932,15 @@ mod tests {
         assert_eq!(report.violations.len(), 1);
         assert_eq!(report.violations[0].kind, kind::CONFLICT_HELD_LANDING);
         assert_eq!(report.violations[0].subject, "rat/x/tkt-1");
+        // Legacy path (no `chain_key`, the pre-existing workflow-`land`-step
+        // source of this violation): the id stays the bare `kind:scope:branch`
+        // shape it had before `chain_key` existed, not the tuple-id-suffixed
+        // shape a conflict-correction hold now gets — an already-decided
+        // legacy item must keep resolving to the same id it always has.
+        assert_eq!(
+            report.violations[0].id,
+            format!("{}:myrepo:rat/x/tkt-1", kind::CONFLICT_HELD_LANDING)
+        );
     }
 
     #[test]
@@ -948,6 +963,70 @@ mod tests {
             &git,
         );
         assert!(report.violations.is_empty());
+    }
+
+    /// A second, genuinely later conflict on the same branch must get a
+    /// violation id the orchestrator lease cursor can actually reach: the
+    /// cursor comparison in `attention::next_attention` is a plain
+    /// lexicographic `>` over the WHOLE id string
+    /// (`kind:scope:branch:chain_key`), so if `chain_key` alone decided
+    /// order, a later chain whose `head_sha` happens to sort lower than an
+    /// earlier chain's would produce an id that is LESS than the cursor —
+    /// permanently invisible to `attention.next`, exactly the bug this
+    /// field was added to fix (see the comment on `chain_key` above). The id
+    /// must instead be anchored to something guaranteed to increase with
+    /// real time regardless of what a `chain_key` string happens to contain
+    /// — the land tuple's own `RecordId`, which is monotonic and
+    /// lexicographically sortable by construction (`rk_core::id::RecordId`).
+    #[test]
+    fn a_later_conflict_chain_gets_an_id_that_sorts_after_an_earlier_terminal_chains_cursor() {
+        let mut earlier = branch_landed("myrepo", "feature", "main", false, false);
+        // Deliberately sorts HIGH as a bare string, despite being the
+        // earlier (lower-RecordId) tuple — the adversarial case a
+        // content-derived chain_key cannot defend against.
+        earlier.payload["chain_key"] = Value::String("zzzzzzzz-sha-from-first-conflict".into());
+        let report_one = build(
+            "myrepo",
+            &[],
+            &[],
+            &[earlier.clone()],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            &GitFacts::default(),
+        );
+        let cursor = report_one.violations[0].id.clone();
+
+        let mut later = branch_landed("myrepo", "feature", "main", false, false);
+        // Deliberately sorts LOW as a bare string — a genuinely NEW, later
+        // conflict (correcting the first) whose head_sha just happens to
+        // hash lower.
+        later.payload["chain_key"] = Value::String("aaaaaaaa-sha-from-second-conflict".into());
+        assert!(
+            later.id > earlier.id,
+            "test setup: the second tuple must actually be minted later"
+        );
+        // Only the latest land per branch surfaces (`inbox::dropped_lands`);
+        // the earlier chain's own violation has already disappeared from a
+        // fresh report exactly as `next_attention`'s doc comment describes.
+        let report_two = build(
+            "myrepo",
+            &[],
+            &[],
+            &[earlier, later],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            &GitFacts::default(),
+        );
+        assert_eq!(report_two.violations.len(), 1);
+        let next_id = report_two.violations[0].id.clone();
+
+        assert!(
+            next_id.as_str() > cursor.as_str(),
+            "a later conflict chain's id ({next_id}) must sort after an earlier terminal \
+             chain's cursor ({cursor}), or attention.next can never surface it again"
+        );
     }
 
     #[test]
