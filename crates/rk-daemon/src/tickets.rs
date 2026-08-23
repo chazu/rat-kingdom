@@ -257,6 +257,14 @@ impl Tickets {
         let tuple = Tuple::new(Category::Task, scope, id, self.castle.clone(), payload)
             .with_lifecycle(Lifecycle::Session);
         self.space.out(tuple.clone())?;
+        // A brand-new ticket is itself a readiness edge when it has no
+        // unresolved dependency (no deps at all, or every named dep already
+        // delivered) — it is actionable from the instant it exists, so that
+        // is when its `TicketReady` span settles. Best-effort: a failed scan
+        // never fails the creation that already landed.
+        if let Ok(by_id) = self.all_by_id() {
+            self.record_ready_if_unblocked(&tuple, &by_id);
+        }
         Ok((tuple, true))
     }
 
@@ -848,6 +856,40 @@ impl Tickets {
             span = span.candidate(record.merge_commit).target(record.target);
         }
         let _ = crate::span::record_phase_span(&self.space, &ticket.scope, &self.castle, &span);
+
+        // The readiness edge Phase::TicketReady was missing a producer for
+        // (TKT-01M0QMT83E7YXH6ZXHMQG0VRS6): `ready()` only ever re-derives
+        // the backlog on demand, so there was no discrete moment a producer
+        // could hang off. This delivered edge IS that moment for every open
+        // dependent of `ticket` — if this was the last blocker standing, the
+        // dependent just became actionable, so stamp its span here, exactly
+        // once (`record_phase_span` dedupes on (task, phase, attempt)).
+        if let Ok(by_id) = self.all_by_id() {
+            for dependent in by_id.values() {
+                if deps_of(dependent).iter().any(|d| d == &ticket.identity) {
+                    self.record_ready_if_unblocked(dependent, &by_id);
+                }
+            }
+        }
+    }
+
+    /// Stamp `ticket`'s `TicketReady` span if it is open and every one of its
+    /// dependencies is already delivered — the shared readiness check behind
+    /// both producers: a brand-new ticket with no unresolved dep (creation),
+    /// and an existing dependent whose last blocker just landed (the
+    /// undelivered → delivered edge in [`emit_ticket_closed`]). Idempotent
+    /// and best-effort like every other span write in this module: a still-
+    /// blocked ticket is silently skipped, and a failed write never fails
+    /// the mutation that triggered this check.
+    fn record_ready_if_unblocked(&self, ticket: &Tuple, by_id: &HashMap<String, Tuple>) {
+        if ticket.payload.get("status").and_then(Value::as_str) != Some("open") {
+            return;
+        }
+        if is_blocked(ticket, by_id) {
+            return;
+        }
+        let span = crate::span::PhaseSpan::new(&ticket.identity, crate::span::Phase::TicketReady);
+        let _ = crate::span::record_phase_span(&self.space, &ticket.scope, &self.castle, &span);
     }
 }
 
@@ -1340,7 +1382,9 @@ mod tests {
     /// The claim producer wires into the task-to-main span substrate: a won
     /// claim records exactly one `Claimed` span, a losing replay of the same
     /// claim call records no second one (idempotent on `(task, phase,
-    /// attempt)`, `crate::span`).
+    /// attempt)`, `crate::span`). Creation itself already stamped a
+    /// `TicketReady` span (`a` has no dependency, so it was actionable from
+    /// the start), so the claim adds exactly one span on top of that.
     #[tokio::test]
     async fn claim_records_a_claimed_phase_span_exactly_once() {
         let (t, space) = tickets_with_space();
@@ -1348,9 +1392,13 @@ mod tests {
         assert!(t.claim(&a.identity).await.unwrap());
         assert!(!t.claim(&a.identity).await.unwrap(), "already in_progress");
 
+        // Two spans minted in the same millisecond sort randomly through
+        // `spans_for_task`'s `RecordId`-based ordering (see `id.rs`'s sub-ms
+        // ordering, c74a9b5), so check by phase, not scan position.
         let spans = crate::span::spans_for_task(&space, &a.scope, &a.identity).unwrap();
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0]["phase"], "claimed");
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().any(|s| s["phase"] == "ticket_ready"));
+        assert!(spans.iter().any(|s| s["phase"] == "claimed"));
     }
 
     // Two drains race to claim a shared backlog; the atomic claim must hand each
@@ -1415,10 +1463,24 @@ mod tests {
         assert_eq!(ev.payload["ticket"], json!(a.identity));
         assert_eq!(ev.payload["status"], json!("closed"));
 
+        // Creation already stamped a `TicketReady` span (`a` has no
+        // dependency, so it was actionable from the start); delivery adds
+        // exactly one more, the delivery-closure span. Two spans minted in
+        // the same millisecond sort randomly through `spans_for_task`'s
+        // `RecordId`-based ordering (see `id.rs`'s sub-ms ordering, c74a9b5),
+        // so find by phase rather than scan position.
         let spans = crate::span::spans_for_task(&space, "myrepo", &a.identity).unwrap();
-        assert_eq!(spans.len(), 1, "exactly one delivery-closure span");
-        assert_eq!(spans[0]["phase"], "delivery_closure");
-        assert_eq!(spans[0]["candidate"], "abc123");
+        assert_eq!(
+            spans.len(),
+            2,
+            "ticket-ready plus one delivery-closure span"
+        );
+        assert!(spans.iter().any(|s| s["phase"] == "ticket_ready"));
+        let closure = spans
+            .iter()
+            .find(|s| s["phase"] == "delivery_closure")
+            .expect("delivery_closure span");
+        assert_eq!(closure["candidate"], "abc123");
 
         // Re-recording the same delivery replays the undelivered->delivered
         // edge guard (see `record_delivery`'s own doc) and must not record a
@@ -1427,7 +1489,63 @@ mod tests {
             .await
             .unwrap();
         let spans = crate::span::spans_for_task(&space, "myrepo", &a.identity).unwrap();
-        assert_eq!(spans.len(), 1, "replayed delivery does not double-count");
+        assert_eq!(spans.len(), 2, "replayed delivery does not double-count");
+    }
+
+    /// The readiness-edge producer wired for `TicketReady`
+    /// (TKT-01M0QMT83E7YXH6ZXHMQG0VRS6): a ticket with no dependency is
+    /// actionable the instant it exists, so creation itself stamps the span.
+    #[tokio::test]
+    async fn ticket_ready_span_records_on_creation_when_unblocked() {
+        let (t, space) = tickets_with_space();
+        let a = t.create(new("x", "myrepo", None)).await.unwrap();
+        let spans = crate::span::spans_for_task(&space, "myrepo", &a.identity).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["phase"], "ticket_ready");
+    }
+
+    /// A ticket created with an undelivered dependency is blocked, so
+    /// creation must not stamp `TicketReady` for it — the span settles later,
+    /// on the delivered edge of its last blocker (the dependent scan inside
+    /// `emit_ticket_closed`).
+    #[tokio::test]
+    async fn ticket_ready_span_waits_for_last_blocker_to_deliver() {
+        let (t, space) = tickets_with_space();
+        let a = t.create(new("a", "r", None)).await.unwrap();
+        let mut b_new = new("b", "r", None);
+        b_new.depends_on = vec![a.identity.clone()];
+        let b = t.create(b_new).await.unwrap();
+
+        // a is unblocked at creation; b is blocked on a and gets no span yet.
+        let a_spans = crate::span::spans_for_task(&space, "r", &a.identity).unwrap();
+        assert_eq!(a_spans.len(), 1);
+        assert_eq!(a_spans[0]["phase"], "ticket_ready");
+        assert!(crate::span::spans_for_task(&space, "r", &b.identity)
+            .unwrap()
+            .is_empty());
+
+        // A status-only finish is not delivery and must not unblock b.
+        set_status(&t, &a.identity, "done").await;
+        assert!(crate::span::spans_for_task(&space, "r", &b.identity)
+            .unwrap()
+            .is_empty());
+
+        // Recording the land resolves b's last blocker: exactly one
+        // TicketReady span for b, settled at the delivered edge.
+        t.record_delivery(&a.identity, &record("abc123"))
+            .await
+            .unwrap();
+        let b_spans = crate::span::spans_for_task(&space, "r", &b.identity).unwrap();
+        assert_eq!(b_spans.len(), 1);
+        assert_eq!(b_spans[0]["phase"], "ticket_ready");
+
+        // Re-recording the same delivery replays the undelivered->delivered
+        // edge guard and must not double-stamp b's span.
+        t.record_delivery(&a.identity, &record("abc123"))
+            .await
+            .unwrap();
+        let b_spans = crate::span::spans_for_task(&space, "r", &b.identity).unwrap();
+        assert_eq!(b_spans.len(), 1, "replayed delivery does not double-count");
     }
 
     #[tokio::test]

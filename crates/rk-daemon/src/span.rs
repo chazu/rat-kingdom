@@ -42,14 +42,16 @@ pub const SPAN_IDENTITY: &str = "task_span";
 /// rework rounds" (2), "merge" (1), "delivery closure" (1), "actionable
 /// hold" (1).
 ///
-/// Every variant but [`Phase::TicketReady`] has a wired producer: `Claimed`
-/// and `DeliveryClosure` in `tickets.rs`, `AgentLaunched`, `FirstProgress`
-/// and `Completed` in `supervisor.rs`, the rest in `landing.rs`.
-/// `TicketReady` is deliberately not wired here: readiness is a derived
-/// query state (`Tickets::ready()` re-evaluates open tickets against their
-/// dependencies) rather than a discrete transition any producer settles at,
-/// so there is no single call site holding its timing. Recording it needs a
-/// readiness-edge producer that does not exist yet
+/// Every variant has a wired producer: `TicketReady`, `Claimed` and
+/// `DeliveryClosure` in `tickets.rs`, `AgentLaunched`, `FirstProgress` and
+/// `Completed` in `supervisor.rs`, the rest in `landing.rs`. Readiness is a
+/// derived query state (`Tickets::ready()` re-evaluates open tickets against
+/// their dependencies on every call), not a discrete transition, so it has
+/// no single call site holding its timing the way the others do — instead
+/// `TicketReady` is stamped at the two points that can *prove* a ticket just
+/// became actionable: ticket creation (no unresolved dependency from the
+/// start) and the undelivered → delivered edge of each of its dependencies
+/// (the last blocker closing), both in `tickets.rs`
 /// (TKT-01M0QMT83E7YXH6ZXHMQG0VRS6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
