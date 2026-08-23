@@ -8913,6 +8913,53 @@ mod stuck_liveness_tests {
         }
     }
 
+    /// Kills and reaps the whole process GROUP of a real test process spawned
+    /// with `.process_group(0)`, on drop — including on a panicking `assert!`
+    /// unwinding past the point a manual cleanup call would otherwise sit.
+    /// Two things this fixes at once, learned from a live regression this
+    /// module caused against a concurrent managed `rk verify` run
+    /// (TKT-01M0HNF2HR9Y0PY44RHY4Q245P): a `child.kill()` on just the LEADER
+    /// pid never reaches a `sleep 300 &`-backgrounded descendant, which the
+    /// leader's own process group DOES reach; and that orphaned descendant,
+    /// left alive with this TEST PROCESS's inherited stdout/stderr pipes
+    /// still open (a plain `spawn()` never redirects them), holds a fd the
+    /// daemon's own verifier reads from open for the length of its sleep —
+    /// the verifier hangs waiting for an EOF that will not come until it
+    /// does. Every process this module spawns is created via
+    /// [`kill_tree`](self::kill_tree) for exactly this reason.
+    struct KillTree(std::process::Child);
+
+    impl Drop for KillTree {
+        fn drop(&mut self) {
+            let pid = self.0.id() as i32;
+            // SAFETY: signals the process group this exact test spawned via
+            // `.process_group(0)` moments earlier, immediately before
+            // reaping it below — never a pid this test does not own.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Spawn `command` as its own process-group leader with stdio fully
+    /// redirected away from this test process's own pipes, wrapped for
+    /// guaranteed group-kill-and-reap on drop. See [`KillTree`].
+    fn kill_tree(command: &str, arg: &str) -> KillTree {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        let child = std::process::Command::new(command)
+            .arg("-c")
+            .arg(arg)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        KillTree(child)
+    }
+
     /// A real process with a live child underneath it (`sleep 300 & wait`,
     /// mirroring `spawn_check_child`'s own leader shape) — standing in for a
     /// `cargo test`/compiler a rat's own tool-use launched, or an `rk verify`
@@ -8924,12 +8971,22 @@ mod stuck_liveness_tests {
     async fn long_silent_but_live_verifier_descendant_prevents_kill() {
         let home = tempfile::tempdir().unwrap();
         let s = sup(home.path());
-        let mut leader = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("sleep 300 & wait")
-            .spawn()
-            .unwrap();
-        let pid = leader.id();
+        let leader = kill_tree("sh", "sleep 300 & wait");
+        let pid = leader.0.id();
+        // The shell has not necessarily forked `sleep` yet the instant
+        // `spawn()` returns — wait for the descendant to actually show up in
+        // the process table before asserting on it, rather than racing a
+        // fixed sleep against however fast `sh` itself schedules.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::workflow_exec::process_liveness(pid).live_descendants == 0
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            crate::workflow_exec::process_liveness(pid).live_descendants > 0,
+            "the backgrounded sleep must be a live descendant before this test proceeds"
+        );
 
         let base = Utc::now() - chrono::Duration::seconds(600);
         let r = record("verifier-1", Some(pid), base);
@@ -8940,8 +8997,7 @@ mod stuck_liveness_tests {
             matches!(action, SweepAction::None),
             "a live verifier descendant must excuse silence, however long"
         );
-
-        let _ = leader.kill();
+        drop(leader);
     }
 
     /// Bounded output (assistant text / tool use) that keeps genuinely
@@ -8973,12 +9029,8 @@ mod stuck_liveness_tests {
     async fn truly_wedged_child_is_killed_after_grace() {
         let home = tempfile::tempdir().unwrap();
         let s = sup(home.path());
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("sleep 300")
-            .spawn()
-            .unwrap();
-        let pid = child.id();
+        let child = kill_tree("sh", "sleep 300");
+        let pid = child.0.id();
 
         let base = Utc::now() - chrono::Duration::seconds(120);
         let r = record("wedged-1", Some(pid), base);
@@ -9001,7 +9053,7 @@ mod stuck_liveness_tests {
             "capacity must be reclaimed once genuinely wedged, same as before this feature"
         );
 
-        let _ = child.kill();
+        drop(child);
     }
 
     /// A harness transport reconnect loop must NOT count as liveness even
