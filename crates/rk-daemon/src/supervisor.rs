@@ -4165,6 +4165,24 @@ impl Supervisor {
                 "tokens": record.usage.total(),
             }),
         );
+        if let Some(task) = &record.task {
+            let _ = crate::span::record_phase_span(
+                &self.space,
+                &record.repo_name,
+                &self.castle,
+                &crate::span::PhaseSpan::new(task, crate::span::Phase::Completed)
+                    .repo(&record.repo_name)
+                    .target(&record.target_branch)
+                    .candidate(&diff.head_sha)
+                    .terminal_reason(if declared_done {
+                        "declared-done"
+                    } else if is_error {
+                        "error"
+                    } else {
+                        "stopped"
+                    }),
+            );
+        }
         let boundary = is_reporting_boundary(record);
         self.emit_coordinator_event(
             record,
