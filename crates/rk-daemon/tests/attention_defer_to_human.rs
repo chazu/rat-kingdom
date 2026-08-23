@@ -1114,9 +1114,10 @@ async fn attention_next_alone_completes_a_terminal_record_left_dangling_by_a_cur
     // Phase 3, fabricated directly against the on-disk lease store while no
     // daemon is running — the crash window between cursor-advance and the
     // terminal write, with nothing left to write it.
-    let lease_store =
-        rk_daemon::orchestrator_lease::LeaseStore::load(layout.home().join("orchestrator-lease.json"))
-            .unwrap();
+    let lease_store = rk_daemon::orchestrator_lease::LeaseStore::load(
+        layout.home().join("orchestrator-lease.json"),
+    )
+    .unwrap();
     lease_store
         .advance_cursor(repo, "orch-1", generation, &item_id, chrono::Utc::now())
         .unwrap();

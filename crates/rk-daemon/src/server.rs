@@ -4453,7 +4453,11 @@ impl Daemon {
     /// `Self::record_decision`'s own doc comment, that must stay retryable,
     /// never be silently marked terminal) — healing it would be wrong, not
     /// merely unnecessary.
-    fn heal_dangling_defer_at_cursor(&self, repo: &str, cursor: Option<&str>) -> rk_core::Result<()> {
+    fn heal_dangling_defer_at_cursor(
+        &self,
+        repo: &str,
+        cursor: Option<&str>,
+    ) -> rk_core::Result<()> {
         let Some(cursor) = cursor else {
             return Ok(());
         };
