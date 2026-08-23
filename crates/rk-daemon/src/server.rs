@@ -8298,7 +8298,8 @@ impl Daemon {
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
         // `--hot`, or any `--top N` cap, follows the strongest trail first;
-        // otherwise the default oldest-first scan is unchanged.
+        // `newest` follows plain insertion recency; otherwise the default
+        // oldest-first scan is unchanged.
         let requested_top = params.top;
         let limit = requested_top
             .unwrap_or(MAX_SCAN_TUPLES)
@@ -8306,6 +8307,9 @@ impl Daemon {
         let result = if params.hot || params.top.is_some() {
             self.space
                 .scan_hot(&params.pattern, Some(limit.saturating_add(1)))
+        } else if params.newest {
+            self.space
+                .scan_newest_limited(&params.pattern, limit.saturating_add(1))
         } else {
             self.space
                 .scan_limited(&params.pattern, limit.saturating_add(1))
@@ -8815,7 +8819,10 @@ struct PatternParams {
 
 /// `space.scan` params: a match pattern plus the optional hot-ranking sugar.
 /// `hot` reorders by `category_weight × recency × strength` (strongest first);
-/// `top` caps to the N strongest and implies `hot`.
+/// `top` caps to the N strongest and implies `hot`. `newest` (ignored when
+/// `hot`/`top` is set) orders strictly by insertion recency with no
+/// weighting — for a caller that wants the tail of a time-windowed query
+/// (e.g. `rk digest`) rather than the strongest trail.
 #[derive(Deserialize, Default)]
 struct ScanParams {
     #[serde(flatten)]
@@ -8824,6 +8831,8 @@ struct ScanParams {
     hot: bool,
     #[serde(default)]
     top: Option<usize>,
+    #[serde(default)]
+    newest: bool,
 }
 
 #[derive(Deserialize)]
