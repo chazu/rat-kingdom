@@ -3649,7 +3649,7 @@ impl Daemon {
         params: AttentionDecideParams,
     ) -> Result<Value, AttentionDecideError> {
         let repo = self
-            .resolve_inbox_repo(Some(params.repo))
+            .resolve_inbox_repo(Some(params.repo.clone()))
             .map_err(|e| AttentionDecideError::Internal(e.to_string()))?
             .ok_or_else(|| AttentionDecideError::BadParams("repo is required".to_string()))?;
 
@@ -3695,6 +3695,31 @@ impl Daemon {
             }));
         };
         let authority = self.authority_policy.effective_authority(violation);
+
+        // Explicit disposition, distinct from the authority-ladder dispatch
+        // below: an omitted `disposition` (or `"execute"`) is every existing
+        // arm, byte-for-byte unchanged. `"defer_to_human"` is
+        // TKT-01M0QD49GNDXM70ANERKZYXS3C's addition — checked BEFORE the
+        // `match authority` so a leased orchestrator can hand an
+        // `Orchestrator`-authority item to a human instead of executing it,
+        // for an item it judges it cannot or should not execute (a legacy
+        // `conflict-held-landing` item with no bounded chain marker being
+        // the motivating case: `conflict.dispatch_correction` would simply
+        // fail against it forever, pinning the resumable cursor).
+        if let Some(disposition) = params.disposition.as_deref() {
+            if disposition == crate::attention::DISPOSITION_DEFER_TO_HUMAN {
+                return self
+                    .defer_attention_to_human(repo, violation, authority, params)
+                    .await;
+            }
+            if disposition != crate::attention::DISPOSITION_EXECUTE {
+                return Err(AttentionDecideError::BadParams(format!(
+                    "unrecognized disposition {disposition:?}: expected {:?} or {:?}",
+                    crate::attention::DISPOSITION_EXECUTE,
+                    crate::attention::DISPOSITION_DEFER_TO_HUMAN
+                )));
+            }
+        }
 
         match authority {
             crate::reconcile::Authority::Human => {
@@ -3751,6 +3776,7 @@ impl Daemon {
                     "attempting",
                     false,
                     false,
+                    None,
                 )
                 .map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
                 let outcome = self.execute_mechanical(violation).await;
@@ -3773,6 +3799,7 @@ impl Daemon {
                         &outcome_str,
                         succeeded,
                         succeeded,
+                        None,
                     )
                     .map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
                 outcome.map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
@@ -3878,6 +3905,7 @@ impl Daemon {
                         "attempting",
                         false,
                         false,
+                        None,
                     )
                     .map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
                     Some(self.execute_orchestrator(violation).await)
@@ -3903,6 +3931,7 @@ impl Daemon {
                         &outcome_str,
                         succeeded,
                         succeeded,
+                        None,
                     )
                     .map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
                 if succeeded {
@@ -3922,6 +3951,284 @@ impl Daemon {
             }
         }
     }
+
+    /// `attention.decide` with `disposition: "defer_to_human"` —
+    /// TKT-01M0QD49GNDXM70ANERKZYXS3C: a live, fenced lease holder hands an
+    /// `Orchestrator`-authority item to a human instead of executing it,
+    /// without ever claiming the underlying problem is resolved.
+    ///
+    /// Reuses every existing boundary rather than adding a second queue: the
+    /// SAME lease fencing the execute arm uses (stale/no lease refuses with
+    /// zero side effect, exactly as it does there), the SAME decision
+    /// journal (`Self::record_decision`, `gate: Some(_)` this time) so the
+    /// top-of-function replay check above already makes a decided deferral
+    /// idempotent with no extra code, the SAME orchestrator cursor
+    /// (`OrchestratorLease::advance_cursor`) so `attention.next` moves past
+    /// a deferred item exactly as it does past an executed one, and the SAME
+    /// `RecoveryAnnouncer`/`rk inbox`/`rk inbox ack` boundary every other
+    /// automated recovery escalation in this daemon surfaces through — so
+    /// the human gate is a normal `recovery-action` inbox row, cleared the
+    /// normal way, not a bespoke mechanism.
+    ///
+    /// FOUR phases, in order, each safe to repeat on a resumed/retried call:
+    /// 1. a non-`terminal` durable INTENT record, carrying the full gate
+    ///    text — `Self::record_decision`'s doc comment explains why a
+    ///    non-terminal record is harmless to write more than once (it is
+    ///    audit-trail only; `find_decision` never matches on it);
+    /// 2. `Self::ensure_defer_gate` — idempotently ensure exactly ONE
+    ///    `recovery_action`/inbox row exists for THIS violation id (a scan
+    ///    keyed on the id, not merely on `holder`, which two different
+    ///    violations could share);
+    /// 3. advance the lease cursor — `OrchestratorLease::advance_cursor` is
+    ///    an unconditional `Some(cursor)` SET, not a compare-and-swap, so
+    ///    re-setting it to the same `violation.id` on a retry is a no-op;
+    /// 4. the TERMINAL record — the ONLY write that makes the top-of-function
+    ///    replay check short-circuit every later call for this violation id.
+    ///
+    /// A crash between any two phases leaves the ones before it durable and
+    /// the ones after it never having run; a resumed caller simply calls
+    /// `attention.decide` again with the same params, which re-enters this
+    /// function from the top and re-runs every phase — steps 1 and 2 detect
+    /// their own prior work and do not duplicate it, step 3 is naturally
+    /// idempotent, and step 4 is what makes a FUTURE replay (after this one
+    /// completes) take the top-of-function short-circuit instead. Only step
+    /// 4 itself is not repeatable — which is exactly why it is last and
+    /// nothing follows it.
+    ///
+    /// Scoped to `Orchestrator`-authority items only: a `Mechanical` item
+    /// has a durable, deterministic fix (nothing to judge), and a `Human`
+    /// item is already refused with zero side effect before any lease is
+    /// even consulted — deferring either would just be a slower way to do
+    /// what already happens.
+    async fn defer_attention_to_human(
+        &self,
+        repo: String,
+        violation: &crate::reconcile::Violation,
+        authority: crate::reconcile::Authority,
+        params: AttentionDecideParams,
+    ) -> Result<Value, AttentionDecideError> {
+        if authority != crate::reconcile::Authority::Orchestrator {
+            return Err(AttentionDecideError::Refused(format!(
+                "{} has effective authority {authority:?}, not orchestrator: only an \
+                 orchestrator-authority item can be deferred to a human via \
+                 disposition=defer_to_human — a mechanical item has a deterministic fix, and a \
+                 human item is already refused with no lease required",
+                violation.id
+            )));
+        }
+        let holder = params.holder.ok_or_else(|| {
+            AttentionDecideError::BadParams("defer_to_human requires holder".into())
+        })?;
+        let generation = params.generation.ok_or_else(|| {
+            AttentionDecideError::BadParams("defer_to_human requires generation".into())
+        })?;
+        let reason = params
+            .reason
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                AttentionDecideError::BadParams(
+                    "defer_to_human requires a non-empty reason: why this item cannot or should \
+                     not be executed"
+                        .into(),
+                )
+            })?;
+        let requested_decision = params
+            .requested_decision
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                AttentionDecideError::BadParams(
+                    "defer_to_human requires a non-empty requested_decision: what a human must \
+                     decide"
+                        .into(),
+                )
+            })?;
+
+        // Fenced exactly like the execute arm: stale or absent, zero side
+        // effect — nothing has been written yet.
+        let now = (self.request_clock)();
+        self.orchestrator_lease
+            .renew(
+                &repo,
+                &holder,
+                generation,
+                self.authority_policy.lease_ttl_secs,
+                now,
+            )
+            .map_err(|e| AttentionDecideError::Refused(e.to_string()))?;
+
+        let attempt = self.orchestrator_attempt_hint(violation);
+        let blast_radius = params
+            .blast_radius
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "{} in {} — deferred, nothing mutated: no ticket, repository, or agent \
+                     action was taken",
+                    violation.subject, violation.scope
+                )
+            });
+        let resolving_action = params
+            .resolving_action
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "resolve {} in {} by hand, then re-run `rk attention next {}` to confirm the \
+                     item has cleared",
+                    violation.subject, violation.scope, violation.scope
+                )
+            });
+        let outcome = format!(
+            "deferred to human by {holder}: {reason} — requested decision: {requested_decision}"
+        );
+        let gate = DeferGate {
+            requested_decision: &requested_decision,
+            reason: &reason,
+            blast_radius: &blast_radius,
+            resolving_action: &resolving_action,
+        };
+
+        // Phase 1: non-terminal durable INTENT, full gate text included.
+        self.record_decision(
+            &repo,
+            violation,
+            authority,
+            &holder,
+            crate::attention::ACTION_DEFER_TO_HUMAN,
+            Some(generation),
+            attempt,
+            params.budget_usd,
+            params.budget_tokens,
+            &outcome,
+            false,
+            false,
+            Some(gate),
+        )
+        .map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
+
+        // Phase 2: idempotently ensure exactly one human gate exists for
+        // this EXACT violation id.
+        self.ensure_defer_gate(&repo, violation, &holder, &gate)
+            .map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
+
+        // Phase 3: advance the cursor (idempotent SET, safe to repeat).
+        self.orchestrator_lease
+            .advance_cursor(&repo, &holder, generation, &violation.id, now)
+            .map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
+
+        // Phase 4: the TERMINAL record — only past this point does a future
+        // replay short-circuit at the top of `attention_decide`.
+        let decision = self
+            .record_decision(
+                &repo,
+                violation,
+                authority,
+                &holder,
+                crate::attention::ACTION_DEFER_TO_HUMAN,
+                Some(generation),
+                attempt,
+                params.budget_usd,
+                params.budget_tokens,
+                &outcome,
+                false,
+                true,
+                Some(gate),
+            )
+            .map_err(|e| AttentionDecideError::Internal(e.to_string()))?;
+
+        Ok(json!({
+            "resolved": false,
+            "replay": false,
+            "gated": true,
+            "decision": decision,
+        }))
+    }
+
+    /// Idempotently ensure exactly one `recovery_action` escalation exists
+    /// for `violation.id` — `Self::defer_attention_to_human`'s phase 2.
+    /// `RecoveryAnnouncer::announce` itself always creates a fresh tuple
+    /// with no dedup of its own (by design — most callers, like a genuine
+    /// second respawn, WANT a fresh escalation each time), so a caller that
+    /// needs "exactly one gate for this exact item" must check first. Keyed
+    /// on `violation.id` alone, not `(violation.id, holder)`: a lease
+    /// replacement mid-retry must still find and reuse the ORIGINAL gate
+    /// rather than minting a second one under the new holder's name.
+    fn ensure_defer_gate(
+        &self,
+        repo: &str,
+        violation: &crate::reconcile::Violation,
+        holder: &str,
+        gate: &DeferGate<'_>,
+    ) -> rk_core::Result<String> {
+        if let Some(existing) = self.find_recovery_action_for_violation(repo, &violation.id)? {
+            return Ok(existing.id.to_string());
+        }
+        let sinks = crate::reactor::sink_factory().registry(
+            self.notify_config
+                .resolved(self.reactor_config.notify_escalations),
+        );
+        let notice = rk_core::notify::EscalationNotice::new(
+            format!("{}@{}", violation.id, holder),
+            "orchestrator-defer-to-human",
+            rk_core::notify::Severity::Critical,
+            repo.to_string(),
+            violation.subject.clone(),
+            format!(
+                "orchestrator {holder} deferred {} ({}) to a human instead of executing it: \
+                 {}\nDECISION NEEDED: {}\nBLAST RADIUS: {}\nRESOLVE WITH: {}",
+                violation.id, violation.detail, gate.reason, gate.requested_decision,
+                gate.blast_radius, gate.resolving_action
+            ),
+        )
+        // The exact-item dedup key this function's own lookup scans for —
+        // `instance: holder` on the `RecoveryAction` below is provenance,
+        // never a dedup key, and conflates two DIFFERENT violations a lease
+        // holder happens to defer in a row.
+        .with_ref("violation_id", violation.id.clone())
+        .with_ref("blast_radius", gate.blast_radius.to_string())
+        .with_ref("resolving_action", gate.resolving_action.to_string());
+        let outcome = self.recovery_announcer.announce(
+            &self.space,
+            &sinks,
+            crate::recovery::RecoveryAction {
+                kind: "orchestrator-defer-to-human".into(),
+                instance: holder.to_string(),
+                notice,
+            },
+            // Unlimited, not the orchestrator execute rate cap: deferring is
+            // the SAFE choice and must never be held back by a cap meant to
+            // throttle real mutations.
+            crate::recovery::RateCap::unlimited(),
+        )?;
+        Ok(outcome.event_id().to_string())
+    }
+
+    /// The durable `recovery_action` escalation already written for
+    /// `violation_id`, if any — `payload_search` narrows the scan (a cheap
+    /// substring match), then the exact `refs.violation_id` comparison below
+    /// guards against a different violation id that merely CONTAINS this one
+    /// as a substring (e.g. a legacy `kind:scope:branch` id is a literal
+    /// prefix of the chain-keyed id `reconcile::conflict_held_landing` mints
+    /// for a later conflict on the same branch) — the same two-step pattern
+    /// `Self::find_decision` already uses for the same reason.
+    fn find_recovery_action_for_violation(
+        &self,
+        repo: &str,
+        violation_id: &str,
+    ) -> rk_core::Result<Option<Tuple>> {
+        let mut pattern = Pattern::category(Category::Event)
+            .identity(crate::recovery::RECOVERY_ACTION_IDENTITY)
+            .scope(repo.to_string());
+        pattern.payload_search = Some(format!("\"violation_id\":\"{violation_id}\""));
+        Ok(self.space.scan(&pattern)?.into_iter().find(|t| {
+            t.payload
+                .get("notice")
+                .and_then(|n| n.get("refs"))
+                .and_then(|r| r.get("violation_id"))
+                .and_then(Value::as_str)
+                == Some(violation_id)
+        }))
+    }
+
 
     /// The one registered mechanical repair this tracer bullet wires up:
     /// `delivered-but-open`'s own doc comment names the fix — the delivery
@@ -4025,6 +4332,15 @@ impl Daemon {
     /// `attempt` is the in-flight attempt number for violation kinds that
     /// track a bounded chain (`Self::orchestrator_attempt_hint`); `None`
     /// for kinds with no such concept.
+    /// `gate` distinguishes a `DEFER_TO_HUMAN` record from every other
+    /// caller: a mechanical/orchestrator arm always passes `None` (nothing
+    /// here is waiting on a human), and `attention_decide`'s replay check at
+    /// the top of the function reads `gated` back verbatim so a replayed
+    /// deferral still says `gated: true` rather than defaulting to
+    /// "resolved". A deferral fills every `DeferGate` field, which is what
+    /// makes the envelope "precise" rather than a generic refusal, and what
+    /// lets `Self::ensure_defer_gate` reconstruct the SAME human-readable
+    /// gate text from a durable record alone if a retry ever needs to.
     #[allow(clippy::too_many_arguments)]
     fn record_decision(
         &self,
@@ -4040,6 +4356,7 @@ impl Daemon {
         outcome: &str,
         resolved: bool,
         terminal: bool,
+        gate: Option<DeferGate<'_>>,
     ) -> rk_core::Result<Value> {
         let payload = json!({
             "violation_id": violation.id,
@@ -4056,7 +4373,11 @@ impl Daemon {
             "budget_tokens": budget_tokens,
             "outcome": outcome,
             "resolved": resolved,
-            "gated": false,
+            "gated": gate.is_some(),
+            "requested_decision": gate.as_ref().map(|g| g.requested_decision),
+            "reason": gate.as_ref().map(|g| g.reason),
+            "blast_radius": gate.as_ref().map(|g| g.blast_radius),
+            "resolving_action": gate.as_ref().map(|g| g.resolving_action),
             "terminal": terminal,
             "decided_at": (self.request_clock)(),
         });
@@ -8476,6 +8797,22 @@ struct AttentionDecideParams {
     generation: Option<u64>,
     budget_usd: Option<f64>,
     budget_tokens: Option<u64>,
+    /// `crate::attention::DISPOSITION_EXECUTE` (the default, also what an
+    /// omitted value means) or `crate::attention::DISPOSITION_DEFER_TO_HUMAN`
+    /// — TKT-01M0QD49GNDXM70ANERKZYXS3C.
+    disposition: Option<String>,
+    /// `defer_to_human` only: why this item cannot or should not be
+    /// executed.
+    reason: Option<String>,
+    /// `defer_to_human` only: what a human must decide.
+    requested_decision: Option<String>,
+    /// `defer_to_human` only: what is affected if the wrong call is made.
+    /// Falls back to generic text derived from the violation if omitted.
+    blast_radius: Option<String>,
+    /// `defer_to_human` only: the concrete step a human takes to resolve
+    /// this. Falls back to generic text derived from the violation if
+    /// omitted.
+    resolving_action: Option<String>,
 }
 
 /// `attention.decide`'s three failure shapes, mapped to distinct wire error
@@ -8487,6 +8824,19 @@ enum AttentionDecideError {
     Refused(String),
     BadParams(String),
     Internal(String),
+}
+
+/// The full text of a `DEFER_TO_HUMAN` gate — bundled rather than four more
+/// positional `record_decision` args, and durable enough on its own that
+/// `Server::ensure_defer_gate` can rebuild the exact same inbox notice from a
+/// record alone, with no dependency on the original RPC call's params
+/// surviving a crash.
+#[derive(Clone, Copy)]
+struct DeferGate<'a> {
+    requested_decision: &'a str,
+    reason: &'a str,
+    blast_radius: &'a str,
+    resolving_action: &'a str,
 }
 
 /// `agent.list` view selector. Defaults keep the reply to the live registry so

@@ -91,7 +91,7 @@ pub enum AttentionCommand {
     /// converged / fully consumed).
     Next(AttentionNextArgs),
     /// Resolve one attention item, dispatched by its effective authority.
-    Decide(AttentionDecideArgs),
+    Decide(Box<AttentionDecideArgs>),
 }
 
 #[derive(Args)]
@@ -113,6 +113,26 @@ pub struct AttentionDecideArgs {
     pub budget_usd: Option<f64>,
     #[arg(long)]
     pub budget_tokens: Option<u64>,
+    /// `execute` (default) or `defer_to_human`: hand an orchestrator-authority
+    /// item to a human instead of executing it, without claiming it is
+    /// resolved.
+    #[arg(long)]
+    pub disposition: Option<String>,
+    /// `--disposition defer_to_human` only: why this item cannot or should
+    /// not be executed.
+    #[arg(long)]
+    pub reason: Option<String>,
+    /// `--disposition defer_to_human` only: what a human must decide.
+    #[arg(long)]
+    pub requested_decision: Option<String>,
+    /// `--disposition defer_to_human` only: what is affected if the wrong
+    /// call is made. Falls back to generic text if omitted.
+    #[arg(long)]
+    pub blast_radius: Option<String>,
+    /// `--disposition defer_to_human` only: the concrete step a human takes
+    /// to resolve this. Falls back to generic text if omitted.
+    #[arg(long)]
+    pub resolving_action: Option<String>,
 }
 
 pub async fn attention_next(layout: &Layout, args: AttentionNextArgs, as_json: bool) -> Result<()> {
@@ -153,6 +173,11 @@ pub async fn attention_decide(
                 "generation": args.generation,
                 "budget_usd": args.budget_usd,
                 "budget_tokens": args.budget_tokens,
+                "disposition": args.disposition,
+                "reason": args.reason,
+                "requested_decision": args.requested_decision,
+                "blast_radius": args.blast_radius,
+                "resolving_action": args.resolving_action,
             }),
         )
         .await?;

@@ -1140,7 +1140,7 @@ async fn main() -> Result<()> {
                 attention_cmds::attention_next(&layout, args, cli.json).await?
             }
             attention_cmds::AttentionCommand::Decide(args) => {
-                attention_cmds::attention_decide(&layout, args, cli.json).await?
+                attention_cmds::attention_decide(&layout, *args, cli.json).await?
             }
         },
         Command::Top { interval, all } => top::top(&layout, interval, all).await?,

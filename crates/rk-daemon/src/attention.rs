@@ -85,6 +85,23 @@ pub fn orchestrator_action_for(v: &Violation) -> Option<&'static str> {
 /// keyed for idempotent replay by its `violation_id` payload field.
 pub const DECISION_IDENTITY: &str = "orchestrator_decision";
 
+/// The two dispositions a leased orchestrator may select via
+/// `attention.decide`'s `disposition` parameter. `EXECUTE` (the default,
+/// also what an omitted `disposition` means) is every existing
+/// authority-ladder dispatch, unchanged. `DEFER_TO_HUMAN` is
+/// TKT-01M0QD49GNDXM70ANERKZYXS3C's addition: a durable, non-mutating
+/// hand-off to a human gate for an `Orchestrator`-authority item the caller
+/// judges it cannot or should not execute — e.g. a legacy `conflict-held-landing`
+/// item with no bounded chain marker, which `conflict.dispatch_correction`
+/// would otherwise simply fail against forever, pinning the resumable
+/// attention cursor behind an item nothing can ever execute.
+pub const DISPOSITION_EXECUTE: &str = "execute";
+pub const DISPOSITION_DEFER_TO_HUMAN: &str = "defer_to_human";
+
+/// `action` recorded on a decision-journal entry written by the
+/// `DEFER_TO_HUMAN` disposition.
+pub const ACTION_DEFER_TO_HUMAN: &str = "attention.defer_to_human";
+
 /// `decided_by` recorded on a decision journal entry for a mechanical
 /// repair, which acts with no LLM/orchestrator session in the loop at all.
 pub const DECIDED_BY_MECHANICAL: &str = "mechanical";
