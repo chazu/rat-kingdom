@@ -9944,10 +9944,7 @@ workflow: {
             .expect("a clean APPROVE must record a SemanticReview span");
         assert_eq!(review_span["terminal_reason"], "approved");
         assert_eq!(review_span["authority"], "llm");
-        assert!(
-            review_span["started_at"].is_string(),
-            "{review_span:?}"
-        );
+        assert!(review_span["started_at"].is_string(), "{review_span:?}");
         assert!(review_span["ended_at"].is_string(), "{review_span:?}");
         let review_duration = review_span["duration_ms"]
             .as_i64()
