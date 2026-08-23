@@ -1311,8 +1311,13 @@ impl Supervisor {
 
     /// Cancel the one managed verification run correlated with
     /// `request_key` — the RPC-disconnect half of the binding.
-    pub(crate) fn cancel_managed_verification_request(&self, request_key: &str, reason: &'static str) {
-        self.managed_verification.cancel_request(request_key, reason);
+    pub(crate) fn cancel_managed_verification_request(
+        &self,
+        request_key: &str,
+        reason: &'static str,
+    ) {
+        self.managed_verification
+            .cancel_request(request_key, reason);
     }
 
     /// Normalize `repo` — whatever shape reached
@@ -4611,11 +4616,7 @@ impl Supervisor {
         // so any `verify.run` execution it has in flight must not keep its
         // managed child running under the daemon alone
         // (TKT-01M0PA6C5WYRWS757R1SS2F2GR).
-        self.cancel_managed_verification_for_agent(
-            name,
-            Some(record.spawn_id()),
-            "agent_dismiss",
-        );
+        self.cancel_managed_verification_for_agent(name, Some(record.spawn_id()), "agent_dismiss");
         let control = self.lock_controls().remove(name);
         if let Some(control) = control {
             let _ = control.kill().await;

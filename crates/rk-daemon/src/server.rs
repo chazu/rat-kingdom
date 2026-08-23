@@ -1437,7 +1437,8 @@ impl Daemon {
                 )),
                 Ok(req) if req.method == "verify.run" => {
                     let key = verify_request_key(&req.caller, &req.id);
-                    self.dispatch_watching_disconnect(req, &mut read, &key).await
+                    self.dispatch_watching_disconnect(req, &mut read, &key)
+                        .await
                 }
                 Ok(req) => self.dispatch(req).await,
                 Err(e) => Outcome::Reply(Response::err(
@@ -6988,7 +6989,14 @@ impl Daemon {
         let request_key = verify_request_key(&req.caller, &req.id);
         match self
             .engine()
-            .verify_repo_check(caller_label, &dir, &params.repo, &check_name, generation, &request_key)
+            .verify_repo_check(
+                caller_label,
+                &dir,
+                &params.repo,
+                &check_name,
+                generation,
+                &request_key,
+            )
             .await
         {
             Ok(result) => Response::ok(req.id, result),

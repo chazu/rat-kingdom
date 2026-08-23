@@ -3238,8 +3238,9 @@ impl WorkflowEngine {
                     let p = progress.lock().unwrap();
                     (
                         p.queue_wait_ms,
-                        p.execution_started_at
-                            .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                        p.execution_started_at.map(|started| {
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                        }),
                     )
                 };
                 self.record_verification_cancellation(
