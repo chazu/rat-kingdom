@@ -372,8 +372,18 @@ mod tests {
 
         let spans = spans_for_task(&space, SYSTEM_SCOPE, task).unwrap();
         assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0]["proof_kind"], "focused-inner");
-        assert_eq!(spans[1]["proof_kind"], "full-final");
+        // Ordered by attempt, not by scan position: two spans minted in the
+        // same millisecond sort randomly by `RecordId` (see `id.rs`'s own
+        // doc on ULID sub-ms ordering), so `spans_for_task`'s "oldest first"
+        // is only an approximation under contention.
+        let by_attempt = |attempt: u64| {
+            spans
+                .iter()
+                .find(|s| s["attempt"] == attempt)
+                .unwrap_or_else(|| panic!("no span with attempt {attempt}"))
+        };
+        assert_eq!(by_attempt(1)["proof_kind"], "focused-inner");
+        assert_eq!(by_attempt(2)["proof_kind"], "full-final");
     }
 
     #[test]
