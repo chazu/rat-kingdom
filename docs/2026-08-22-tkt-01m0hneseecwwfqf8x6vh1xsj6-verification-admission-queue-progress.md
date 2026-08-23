@@ -121,3 +121,64 @@ properties, it is not yet something a rat can actually use, nor is it
 verified against the specific claims (fairness, restart safety, exact
 provenance, cross-repo concurrency, dedup) the ticket asks to be proven.
 TKT-01M0P3R59CFJP73ZGSEVTH75ED carries the remainder forward.
+
+## Completion (TKT-01M0P3R59CFJP73ZGSEVTH75ED, this dispatch)
+
+All four remaining items above landed:
+
+1. **`rk verify [--repo NAME] [--check NAME]`** (`crates/rk-cli/src/main.rs`):
+   calls `verify.run`, defaults `--repo` to `$RK_REPO`, prints stdout/stderr
+   and a `verify: <verdict> (exit <n>)` line, and exits the process with the
+   check's exact exit code (clamped to 1..=255 for the rare exit >255 case).
+2. **`prime.rs` completion guidance**: step 3 of `FRAGMENT_COMPLETION` now
+   recommends `rk verify` ahead of self-invoking a check directly, and states
+   plainly that a self-invoked full suite bypasses admission control
+   invisibly — documentation-level visibility, not an enforced telemetry
+   channel (confirmed by TKT-01M0CK4Z019SMBN9CTCZBYCTKX: the daemon has no
+   channel to observe a truly external invocation). All 28 `prime::tests`
+   pass unchanged, including the ordering/exact-text regression guards.
+3. **Acceptance-property tests**, split by what they need to exercise:
+   - `crates/rk-daemon/src/supervisor.rs` `verification_admission_tests`
+     (`Supervisor`-level, no `WorkflowEngine` needed): bounds concurrency to
+     the configured limit, FIFO grant order under contention, independent
+     repos never serialize against each other, and a fresh `Supervisor`
+     (standing in for a daemon restart) never inherits a predecessor's
+     leaked permit.
+   - `crates/rk-daemon/src/workflow_exec.rs` `mod tests` additions
+     (`WorkflowEngine`-level): `verify_repo_check` surfaces the exact child
+     exit code; a landing-gate-shaped direct `run_check_in` call and a
+     `verify_repo_check` call for the same bare repo name share one
+     admission bound (proven via marker files neither side ever observes
+     the other's, since a shared bound means the second cannot even spawn
+     its child until the first's whole `run_check_in` call — marker cleanup
+     included — has returned); and a durable proof reuses on an exact
+     clean-worktree match but never once the worktree is dirty.
+   - All new tests are stable across 5 repeated runs; the full
+     `cargo test --workspace` suite (env-stripped) passes with 0 failures.
+4. **The repo-keying open question — resolved, not fixed**: confirmed by
+   direct code tracing (not guessed) that `rk workflow run` (CLI
+   canonicalizes `--repo` to an absolute path) and reactor/trigger dispatch
+   (`record.path`, also absolute) key `run_check_in`'s admission acquire by
+   **absolute path**, while `LandingPipeline::run_gates_at` (`entry.repo_name`)
+   and `verify.run`/`verify_repo_check` (`VerifyRunParams.repo`) key it by
+   **bare name** — two genuinely different `HashMap<String, _>` keys for the
+   same repo, so paths 1/2 and 3/4 get separate bounds from each other, even
+   though 1+2 share one and 3+4 share another. This is the exact
+   pre-existing ambiguity `TestExecLock` already has, not something this
+   queue introduced. The new shared-bound test above only claims (and only
+   needs to claim) the 3/4 pairing, which is what the ticket's primary
+   audience (landing gates + agent/reviewer completion checks) actually
+   uses. Filed forward as TKT-01M0P5NM51SKT5ABXRCDZD07J3 rather than fixed
+   here (normalizing every call site, or `VerificationAdmission`'s own key
+   resolution, is a separable change with its own blast radius).
+
+One unrelated pre-existing issue surfaced by `mise run verify`'s clippy step
+(`cargo clippy --workspace --all-targets -- -D warnings`): `-D
+clippy::too_many_arguments` on `record_verification_admission_event` (8
+params), introduced by the original commit `21f2f0e` before this dispatch
+started (confirmed via `git stash` + re-running the same clippy invocation at
+the merge-base commit). Not fixed inline per
+`preexisting-failure-is-a-ticket-not-an-inline-fix` (TKT-43) — filed as
+TKT-01M0P5MZKV9C4SY65NKF7EG7JE. `cargo fmt --all --check`, `cargo build
+--workspace`, and `cargo test --workspace` (the other three `mise run verify`
+steps) are all clean.

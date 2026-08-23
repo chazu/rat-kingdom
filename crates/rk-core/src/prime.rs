@@ -500,7 +500,16 @@ const FRAGMENT_COMPLETION: &str = "\
    commands, inspect the repository's own instructions and configuration (for
    example its README, agent guidance, task runner, or named check). If the task
    or workflow provides a repository-owned verification check, use its documented
-   invocation rather than inventing a command. The check must exercise the
+   invocation rather than inventing a command. Prefer `rk verify [--repo NAME]
+   [--check NAME]` (default check `verify`) over self-invoking that check's
+   command directly: it runs through the daemon's bounded per-repo verification
+   admission queue — the same one a landing gate or a workflow `run` step gets —
+   and exits with the check's own exact exit code, satisfying this step's
+   exit-status requirement in one command. A self-invoked full suite is still
+   valid verification if you follow the exit-status discipline below, but it
+   bypasses admission control invisibly: the daemon has no way to observe or
+   bound a check it was never asked to run, so this is documentation-level
+   guidance, not an enforced telemetry channel. The check must exercise the
    relevant build, test, lint, or equivalent validation for this task and must
    actually run. A partial check is NOT verification. Prove the check command's
    OWN exit status, not the status of anything you routed it through: a
