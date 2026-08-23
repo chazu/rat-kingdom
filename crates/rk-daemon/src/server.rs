@@ -4891,16 +4891,11 @@ impl Daemon {
                 .iter()
                 .filter(|entry| entry.repo == repo.name)
                 .map(|entry| {
-                    let phase = match entry.status {
-                        crate::landing::LandingEntryStatus::Queued
-                        | crate::landing::LandingEntryStatus::RunningGates => {
-                            crate::span::Phase::VerificationQueued
-                        }
-                        crate::landing::LandingEntryStatus::AwaitingReview => {
-                            crate::span::Phase::SemanticReview
-                        }
-                        crate::landing::LandingEntryStatus::Landing => crate::span::Phase::Merge,
-                    };
+                    // One shared status -> phase mapping with the queue's own
+                    // per-phase clock (`LandingEntryStatus::phase`), so the
+                    // phase this probe is LABELLED with and the phase
+                    // `phase_age_secs` is MEASURED against can never disagree.
+                    let phase = entry.status.phase();
                     let mut capacity = std::collections::BTreeMap::new();
                     capacity.insert(
                         "queue_depth".to_string(),
@@ -4914,7 +4909,16 @@ impl Daemon {
                         task: entry.task.clone(),
                         phase,
                         attempt: 1,
-                        elapsed_ms: entry.age_secs.max(0) as u64 * 1000,
+                        // The CURRENT phase's own elapsed time, never the
+                        // entry's total queue age (`age_secs`): that is
+                        // cumulative across every phase the candidate has
+                        // already passed through, so charging it to the
+                        // phase that just started fires an instant
+                        // false-positive breach the moment a long-but-healthy
+                        // verification wait hands off to review. Mirrors the
+                        // terminal-span path, which uses each span's own
+                        // `duration_ms` rather than a task-lifetime total.
+                        elapsed_ms: entry.phase_age_secs.max(0) as u64 * 1000,
                         repo: Some(entry.repo.clone()),
                         target: Some(entry.target.clone()),
                         candidate: Some(entry.branch.clone()),
@@ -11041,5 +11045,157 @@ mod ticket_reopen_sweep_tests {
         assert_eq!(reopened, 1);
         let ticket = daemon.tickets.get(&id).unwrap().unwrap();
         assert_eq!(ticket.payload["status"], json!("open"));
+    }
+
+    /// Daemon-level coverage of the phase-latency sweep's live-probe wiring
+    /// — the seam the module's own unit tests cannot reach, because they
+    /// hand `evaluate_live_probes` an `elapsed_ms` directly and so never
+    /// exercise the landing-queue-entry -> probe conversion at all.
+    ///
+    /// The failure this pins: a candidate that spent a long-but-HEALTHY wait
+    /// in verification and has only just transitioned to review must not
+    /// have that prior wait charged against the review target. Reusing the
+    /// entry's cumulative queue age as the current phase's elapsed time
+    /// fired a `semantic_review` warning on the very next sweep tick, before
+    /// review had done anything at all.
+    fn phase_latency_daemon(targets: &[(&str, &str, &str)]) -> (tempfile::TempDir, Daemon, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path());
+        layout.ensure().unwrap();
+        let daemon = Daemon::new(layout, &Config::default()).unwrap();
+        let mut policy = rk_workflow::RepositoryPolicy::default();
+        for (phase, warning, intervention) in targets {
+            policy.phase_latency.targets.insert(
+                (*phase).to_string(),
+                rk_workflow::PhaseLatencyTarget {
+                    warning: (*warning).to_string(),
+                    intervention: (*intervention).to_string(),
+                },
+            );
+        }
+        daemon
+            .repos
+            .lock()
+            .unwrap()
+            .add(crate::repos::RepoRecord {
+                name: "some-repo".to_string(),
+                path: dir.path().join("some-repo"),
+                created_at: chrono::Utc::now(),
+                merge_mode: Default::default(),
+                remote: None,
+                host: None,
+                activated_policy: Some(crate::repos::ActivatedRepositoryPolicy {
+                    digest: "test-digest".to_string(),
+                    policy,
+                }),
+            })
+            .unwrap();
+        (dir, daemon, "some-repo".to_string())
+    }
+
+    /// Write the durable queue tuple for a candidate that has been in the
+    /// queue for `age_mins` in total but entered its CURRENT phase only
+    /// `phase_age_mins` ago.
+    fn aged_queue_entry_tuple(
+        task: &str,
+        status: &str,
+        age_mins: i64,
+        phase_age_mins: i64,
+    ) -> Tuple {
+        let now = chrono::Utc::now();
+        Tuple::new(
+            Category::Event,
+            "some-repo".to_string(),
+            "landing_queue_entry".to_string(),
+            "daemon".to_string(),
+            json!({
+                "repo_name": "some-repo",
+                "repo_path": "/tmp/some-repo",
+                "branch": "rat/aged-owner/tkt",
+                "target": "main",
+                "head_sha": "abc1234",
+                "diff_class": "trivial",
+                "task": task,
+                "seq": 1,
+                "status": status,
+                "rev": 0,
+                "enqueued_at": now - chrono::Duration::minutes(age_mins),
+                "phase_entered_at": now - chrono::Duration::minutes(phase_age_mins),
+            }),
+        )
+        .with_lifecycle(Lifecycle::Furniture)
+    }
+
+    #[test]
+    fn phase_latency_sweep_charges_only_the_current_phase_not_total_queue_age() {
+        let (_dir, daemon, _repo) = phase_latency_daemon(&[
+            ("verification", "20m", "45m"),
+            ("semantic_review", "20m", "45m"),
+        ]);
+
+        // 30m total in the queue, all but the last minute spent waiting in
+        // the verification lane, and review started 1m ago. 30m is PAST the
+        // 20m semantic_review warning while 1m is nowhere near it, so this
+        // asserts the fix rather than merely agreeing with it: charging
+        // total queue age here announces a breach, charging the phase's own
+        // elapsed time announces nothing.
+        daemon
+            .space
+            .out(aged_queue_entry_tuple(
+                "TKT-just-entered-review",
+                "awaiting_review",
+                30,
+                1,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            daemon.phase_latency_sweep_once(),
+            0,
+            "review just started: the 29m verification wait must not be \
+             charged against the semantic_review target"
+        );
+    }
+
+    #[test]
+    fn phase_latency_sweep_still_breaches_on_a_genuinely_slow_current_phase() {
+        let (_dir, daemon, _repo) = phase_latency_daemon(&[("semantic_review", "20m", "45m")]);
+
+        // Control for the test above: same entry shape, but review itself
+        // has genuinely been running 30m. The sweep must still fire — the
+        // fix must not have simply stopped reporting live probes.
+        daemon
+            .space
+            .out(aged_queue_entry_tuple(
+                "TKT-slow-review",
+                "awaiting_review",
+                60,
+                30,
+            ))
+            .unwrap();
+
+        assert_eq!(daemon.phase_latency_sweep_once(), 1);
+    }
+
+    /// The inverse misattribution: `Queued` and `RunningGates` are both the
+    /// verification phase, so a candidate being claimed out of the queue
+    /// must keep aging against the verification target. If the phase clock
+    /// restarted per STATUS rather than per PHASE, a wedged gate lane would
+    /// reset itself out of its own target on every claim.
+    #[test]
+    fn phase_latency_sweep_keeps_the_verification_clock_across_queued_to_running_gates() {
+        let (_dir, daemon, _repo) = phase_latency_daemon(&[("verification", "20m", "45m")]);
+
+        daemon
+            .space
+            .out(aged_queue_entry_tuple(
+                "TKT-wedged-gates",
+                "running_gates",
+                30,
+                30,
+            ))
+            .unwrap();
+
+        assert_eq!(daemon.phase_latency_sweep_once(), 1);
     }
 }
