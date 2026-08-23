@@ -293,6 +293,22 @@ struct VerificationAdmissionOutcome<'a> {
     verdict: &'a str,
 }
 
+/// One `verify.run` call's `Phase::VerificationQueued` occurrence, bundled
+/// so [`record_ad_hoc_verification_span`](WorkflowEngine::record_ad_hoc_verification_span)
+/// stays under the clippy `too_many_arguments` threshold without an
+/// `#[allow]`, matching [`VerificationAdmissionOutcome`] above — see that
+/// method for what each field means.
+struct AdHocVerificationSpan<'a> {
+    task: &'a str,
+    repo_name: &'a str,
+    check_name: &'a str,
+    candidate: &'a str,
+    queue_wait_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    proof_reused: bool,
+    terminal_reason: &'a str,
+}
+
 /// Decode a `spawn_check_child` outcome into the flat tuple `run_check_in`
 /// tracks. Factored out so a retried outcome (the shared cargo target-dir
 /// contention retry, and the initial attempt) decode identically.
@@ -3439,6 +3455,7 @@ impl WorkflowEngine {
     /// same drop-based cleanup `run_check_in` already relies on for a
     /// timeout — and this records a durable cancellation outcome instead of
     /// ever writing a reusable proof for it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn verify_repo_check(
         &self,
         agent: &str,
@@ -3483,9 +3500,16 @@ impl WorkflowEngine {
         if let Some(sha) = &candidate_sha {
             if let Some(cached) = self.lookup_verification_proof(repo_name, sha, &check) {
                 if let Some(task) = task {
-                    self.record_ad_hoc_verification_span(
-                        task, repo_name, check_name, sha, None, None, true, "reused",
-                    );
+                    self.record_ad_hoc_verification_span(AdHocVerificationSpan {
+                        task,
+                        repo_name,
+                        check_name,
+                        candidate: sha,
+                        queue_wait_ms: None,
+                        duration_ms: None,
+                        proof_reused: true,
+                        terminal_reason: "reused",
+                    });
                 }
                 return Ok(cached);
             }
@@ -3542,16 +3566,16 @@ impl WorkflowEngine {
                     reason,
                 );
                 if let Some(task) = task {
-                    self.record_ad_hoc_verification_span(
+                    self.record_ad_hoc_verification_span(AdHocVerificationSpan {
                         task,
                         repo_name,
                         check_name,
-                        candidate_sha.as_deref().unwrap_or("dirty"),
+                        candidate: candidate_sha.as_deref().unwrap_or("dirty"),
                         queue_wait_ms,
                         duration_ms,
-                        false,
-                        reason,
-                    );
+                        proof_reused: false,
+                        terminal_reason: reason,
+                    });
                 }
                 return Err(rk_core::Error::other(format!(
                     "verification cancelled ({reason}) for repo `{repo_name}` check `{check_name}`"
@@ -3575,19 +3599,19 @@ impl WorkflowEngine {
                     }),
                 )
             };
-            self.record_ad_hoc_verification_span(
+            self.record_ad_hoc_verification_span(AdHocVerificationSpan {
                 task,
                 repo_name,
                 check_name,
-                candidate_sha.as_deref().unwrap_or("dirty"),
+                candidate: candidate_sha.as_deref().unwrap_or("dirty"),
                 queue_wait_ms,
                 duration_ms,
-                false,
-                result
+                proof_reused: false,
+                terminal_reason: result
                     .get("verdict")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown"),
-            );
+            });
         }
 
         Ok(result)
@@ -3610,17 +3634,17 @@ impl WorkflowEngine {
     /// though they are for two different, unrelated occurrences. Pushing
     /// this producer's own numbering into a disjoint high range keeps the
     /// two producers from ever colliding without touching that shared key.
-    fn record_ad_hoc_verification_span(
-        &self,
-        task: &str,
-        repo_name: &str,
-        check_name: &str,
-        candidate: &str,
-        queue_wait_ms: Option<u64>,
-        duration_ms: Option<u64>,
-        proof_reused: bool,
-        terminal_reason: &str,
-    ) {
+    fn record_ad_hoc_verification_span(&self, occurrence: AdHocVerificationSpan<'_>) {
+        let AdHocVerificationSpan {
+            task,
+            repo_name,
+            check_name,
+            candidate,
+            queue_wait_ms,
+            duration_ms,
+            proof_reused,
+            terminal_reason,
+        } = occurrence;
         const AD_HOC_ATTEMPT_BASE: u32 = 10_000;
         let existing =
             crate::span::spans_for_task(&self.space, repo_name, task).unwrap_or_default();

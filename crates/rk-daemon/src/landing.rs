@@ -395,6 +395,22 @@ struct ShadowComparisonRequest {
     wait: Duration,
 }
 
+/// One check's settled outcome, bundled for
+/// [`LandingPipeline::record_check_verification_span`] the same way
+/// [`ShadowComparisonRequest`] is above — so the three per-check call sites
+/// in `run_gates_at`'s check loop stay under `clippy::too_many_arguments`
+/// without an `#[allow]`. `entry` (repo/target/task identity) stays a
+/// separate parameter on that method since it is loop-invariant context,
+/// not per-occurrence data.
+struct CheckVerificationSpan<'a> {
+    check_name: &'a str,
+    attempt: u32,
+    candidate: &'a str,
+    full_check_required: bool,
+    queue_wait_ms: Option<u64>,
+    duration_ms: Option<u64>,
+}
+
 fn required_payload_str<'a>(
     payload: &'a Value,
     field: &str,
@@ -5127,12 +5143,14 @@ impl LandingPipeline {
                     // report for it.
                     self.record_check_verification_span(
                         entry,
-                        &check.name,
-                        check_attempt,
-                        tested_sha,
-                        full_check_required,
-                        None,
-                        None,
+                        CheckVerificationSpan {
+                            check_name: &check.name,
+                            attempt: check_attempt,
+                            candidate: tested_sha,
+                            full_check_required,
+                            queue_wait_ms: None,
+                            duration_ms: None,
+                        },
                     );
                     queue_wait_ms.push((check.name.clone(), None));
                     passed_checks.push(check.name.clone());
@@ -5168,12 +5186,14 @@ impl LandingPipeline {
                 let check_queue_wait_ms = progress.lock().unwrap().queue_wait_ms();
                 self.record_check_verification_span(
                     entry,
-                    &check.name,
-                    check_attempt,
-                    tested_sha,
-                    full_check_required,
-                    check_queue_wait_ms,
-                    u64::try_from(check_started.elapsed().as_millis()).ok(),
+                    CheckVerificationSpan {
+                        check_name: &check.name,
+                        attempt: check_attempt,
+                        candidate: tested_sha,
+                        full_check_required,
+                        queue_wait_ms: check_queue_wait_ms,
+                        duration_ms: u64::try_from(check_started.elapsed().as_millis()).ok(),
+                    },
                 );
                 queue_wait_ms.push((check.name.clone(), check_queue_wait_ms));
                 passed_checks.push(check.name.clone());
@@ -5275,12 +5295,14 @@ impl LandingPipeline {
             let check_queue_wait_ms = progress.lock().unwrap().queue_wait_ms();
             self.record_check_verification_span(
                 entry,
-                &check.name,
-                check_attempt,
-                tested_sha,
-                full_check_required,
-                check_queue_wait_ms,
-                u64::try_from(check_started.elapsed().as_millis()).ok(),
+                CheckVerificationSpan {
+                    check_name: &check.name,
+                    attempt: check_attempt,
+                    candidate: tested_sha,
+                    full_check_required,
+                    queue_wait_ms: check_queue_wait_ms,
+                    duration_ms: u64::try_from(check_started.elapsed().as_millis()).ok(),
+                },
             );
             queue_wait_ms.push((check.name.clone(), check_queue_wait_ms));
             passed_checks.push(check.name);
@@ -5328,13 +5350,16 @@ impl LandingPipeline {
     fn record_check_verification_span(
         &self,
         entry: &LandingQueueEntry,
-        check_name: &str,
-        attempt: u32,
-        candidate: &str,
-        full_check_required: bool,
-        queue_wait_ms: Option<u64>,
-        duration_ms: Option<u64>,
+        occurrence: CheckVerificationSpan<'_>,
     ) {
+        let CheckVerificationSpan {
+            check_name,
+            attempt,
+            candidate,
+            full_check_required,
+            queue_wait_ms,
+            duration_ms,
+        } = occurrence;
         let _ = crate::span::record_phase_span(
             &self.space,
             &entry.repo_name,
