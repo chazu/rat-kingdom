@@ -221,8 +221,7 @@ impl PhaseSpan {
         now: DateTime<Utc>,
     ) -> Self {
         let ended_at = now;
-        let started_at =
-            duration_ms.map(|d| ended_at - chrono::Duration::milliseconds(d as i64));
+        let started_at = duration_ms.map(|d| ended_at - chrono::Duration::milliseconds(d as i64));
         let queued_at = match (started_at, queue_wait_ms) {
             (Some(started), Some(wait)) => {
                 Some(started - chrono::Duration::milliseconds(wait as i64))
@@ -275,8 +274,14 @@ pub fn record_phase_span(
     if span_exists(space, scope, &span.task, span.phase, span.attempt)? {
         return Ok(false);
     }
-    let tuple = Tuple::new(Category::Event, scope, SPAN_IDENTITY, castle, span.to_payload())
-        .with_lifecycle(Lifecycle::Furniture);
+    let tuple = Tuple::new(
+        Category::Event,
+        scope,
+        SPAN_IDENTITY,
+        castle,
+        span.to_payload(),
+    )
+    .with_lifecycle(Lifecycle::Furniture);
     space.out(tuple)?;
     Ok(true)
 }
@@ -293,9 +298,10 @@ fn span_exists(
         .scope(scope);
     pattern.payload_search = Some(format!("\"task\":\"{task}\""));
     pattern.payload_search_and = Some(format!("\"phase\":\"{}\"", phase.as_str()));
-    Ok(space.scan(&pattern)?.into_iter().any(|t| {
-        t.payload.get("attempt").and_then(Value::as_u64) == Some(u64::from(attempt))
-    }))
+    Ok(space
+        .scan(&pattern)?
+        .into_iter()
+        .any(|t| t.payload.get("attempt").and_then(Value::as_u64) == Some(u64::from(attempt))))
 }
 
 /// All recorded spans for `task`, oldest first — the read side a later
@@ -335,21 +341,15 @@ mod tests {
             Phase::Merge,
             Phase::DeliveryClosure,
         ] {
-            let wrote = record_phase_span(
-                &space,
-                SYSTEM_SCOPE,
-                "daemon",
-                &PhaseSpan::new(task, phase),
-            )
-            .unwrap();
+            let wrote =
+                record_phase_span(&space, SYSTEM_SCOPE, "daemon", &PhaseSpan::new(task, phase))
+                    .unwrap();
             assert!(wrote, "{phase:?} should write on first record");
         }
         let spans = spans_for_task(&space, SYSTEM_SCOPE, task).unwrap();
         assert_eq!(spans.len(), 9);
-        let phases: std::collections::BTreeSet<&str> = spans
-            .iter()
-            .map(|s| s["phase"].as_str().unwrap())
-            .collect();
+        let phases: std::collections::BTreeSet<&str> =
+            spans.iter().map(|s| s["phase"].as_str().unwrap()).collect();
         assert!(phases.contains("ticket_ready"));
         assert!(phases.contains("delivery_closure"));
         assert_eq!(phases.len(), 9, "every phase recorded exactly once");
@@ -490,7 +490,15 @@ mod tests {
         assert!(record_phase_span(&space, SYSTEM_SCOPE, "daemon", &b).unwrap());
         assert!(record_phase_span(&space, SYSTEM_SCOPE, "daemon", &c).unwrap());
 
-        assert_eq!(spans_for_task(&space, SYSTEM_SCOPE, "TKT-a").unwrap().len(), 2);
-        assert_eq!(spans_for_task(&space, SYSTEM_SCOPE, "TKT-ab").unwrap().len(), 1);
+        assert_eq!(
+            spans_for_task(&space, SYSTEM_SCOPE, "TKT-a").unwrap().len(),
+            2
+        );
+        assert_eq!(
+            spans_for_task(&space, SYSTEM_SCOPE, "TKT-ab")
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

@@ -12615,10 +12615,8 @@ checks: [
         // the ticket id and both idempotent (a second `run_gates` over the
         // same candidate must not double them).
         let spans = crate::span::spans_for_task(&space, "direct-repo", "add src").unwrap();
-        let phases: std::collections::BTreeSet<&str> = spans
-            .iter()
-            .map(|s| s["phase"].as_str().unwrap())
-            .collect();
+        let phases: std::collections::BTreeSet<&str> =
+            spans.iter().map(|s| s["phase"].as_str().unwrap()).collect();
         assert!(phases.contains("landing_prep"));
         assert!(phases.contains("verification"));
         assert_eq!(phases.len(), 2);

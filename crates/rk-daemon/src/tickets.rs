@@ -841,8 +841,9 @@ impl Tickets {
         if let Err(e) = self.space.out(event) {
             warn!(ticket = %ticket.identity, error = %e, "failed to emit ticket_closed event");
         }
-        let mut span = crate::span::PhaseSpan::new(&ticket.identity, crate::span::Phase::DeliveryClosure)
-            .terminal_reason(status.to_string());
+        let mut span =
+            crate::span::PhaseSpan::new(&ticket.identity, crate::span::Phase::DeliveryClosure)
+                .terminal_reason(status.to_string());
         if let Some(record) = delivery_of(ticket) {
             span = span.candidate(record.merge_commit).target(record.target);
         }
