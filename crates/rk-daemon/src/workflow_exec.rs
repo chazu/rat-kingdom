@@ -3583,7 +3583,10 @@ impl WorkflowEngine {
                 queue_wait_ms,
                 duration_ms,
                 false,
-                result.get("verdict").and_then(Value::as_str).unwrap_or("unknown"),
+                result
+                    .get("verdict")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
             );
         }
 
@@ -3619,7 +3622,8 @@ impl WorkflowEngine {
         terminal_reason: &str,
     ) {
         const AD_HOC_ATTEMPT_BASE: u32 = 10_000;
-        let existing = crate::span::spans_for_task(&self.space, repo_name, task).unwrap_or_default();
+        let existing =
+            crate::span::spans_for_task(&self.space, repo_name, task).unwrap_or_default();
         let ad_hoc_occurrences = u32::try_from(
             existing
                 .iter()
@@ -7954,13 +7958,99 @@ test a::flaky ... FAILED
                 "verify",
                 None,
                 "test-request",
-            None,
+                None,
             )
             .await
             .unwrap();
 
         assert_eq!(result["exit"], json!(37));
         assert_eq!(result["verdict"], json!("fail"));
+    }
+
+    /// TKT-01M0QJXVF5QP858YXF82E9WRWQ: the ad-hoc `verify.run` path (a rat's
+    /// own completion-protocol check, outside any landing gate) previously
+    /// recorded no task-to-main span at all — only a caller carrying a
+    /// ticket (`task: Some(...)`) gets one; the operator (`task: None`, no
+    /// ticket to correlate against) gets none, on purpose.
+    #[tokio::test]
+    async fn verify_repo_check_records_a_span_only_for_a_ticketed_caller() {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        let repo_dir = tempfile::tempdir().unwrap();
+        write_check(repo_dir.path(), "verify", "true", false);
+
+        // The operator path: no ticket, no span.
+        engine
+            .verify_repo_check(
+                "operator",
+                repo_dir.path(),
+                "ad-hoc-repo",
+                "verify",
+                None,
+                "operator-request",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            crate::span::spans_for_task(&engine.space, "ad-hoc-repo", "TKT-ad-hoc")
+                .unwrap()
+                .is_empty()
+        );
+
+        // A ticketed rat's own `rk verify` gets a span, correlated on its
+        // ticket, carrying the check name as `lane` and `proof_kind: "ad-hoc"`
+        // — distinct from a landing gate's own per-check spans.
+        let result = engine
+            .verify_repo_check(
+                "some-rat",
+                repo_dir.path(),
+                "ad-hoc-repo",
+                "verify",
+                None,
+                "rat-request",
+                Some("TKT-ad-hoc"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["verdict"], json!("pass"));
+
+        let spans =
+            crate::span::spans_for_task(&engine.space, "ad-hoc-repo", "TKT-ad-hoc").unwrap();
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0]["phase"], "verification");
+        assert_eq!(spans[0]["lane"], "verify");
+        assert_eq!(spans[0]["proof_kind"], "ad-hoc");
+        assert_eq!(spans[0]["proof_reused"], false);
+        assert_eq!(spans[0]["terminal_reason"], "pass");
+        // Deliberately far from a landing gate's small per-check plan
+        // positions (1, 2, 3, ...) so the two producers never collide on
+        // `record_phase_span`'s `(task, phase, attempt)` idempotency key.
+        assert!(spans[0]["attempt"].as_u64().unwrap() >= 10_000);
+
+        // A second ad-hoc call for the SAME ticket and check must not
+        // collide with (silently drop) the first — a rat re-running its own
+        // `rk verify` is a genuinely new occurrence, not a replay.
+        engine
+            .verify_repo_check(
+                "some-rat",
+                repo_dir.path(),
+                "ad-hoc-repo",
+                "verify",
+                None,
+                "rat-request-2",
+                Some("TKT-ad-hoc"),
+            )
+            .await
+            .unwrap();
+        let spans =
+            crate::span::spans_for_task(&engine.space, "ad-hoc-repo", "TKT-ad-hoc").unwrap();
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        let attempts: std::collections::BTreeSet<u64> = spans
+            .iter()
+            .map(|s| s["attempt"].as_u64().unwrap())
+            .collect();
+        assert_eq!(attempts.len(), 2, "{spans:?}");
     }
 
     /// TKT-01M0PA6C5WYRWS757R1SS2F2GR: `Supervisor::interrupt`/`dismiss`/the
@@ -7998,7 +8088,7 @@ test a::flaky ... FAILED
             "verify",
             Some(generation),
             "req-1",
-        None,
+            None,
         );
         tokio::pin!(first);
 
@@ -8036,7 +8126,7 @@ test a::flaky ... FAILED
             "verify",
             None,
             "req-2",
-        None,
+            None,
         );
         tokio::pin!(second);
         tokio::select! {
@@ -8176,7 +8266,7 @@ test a::flaky ... FAILED
             "verify",
             Some(generation),
             "req-1",
-        None,
+            None,
         );
         tokio::pin!(first);
 
@@ -8231,7 +8321,7 @@ test a::flaky ... FAILED
             "verify",
             None,
             "req-2",
-        None,
+            None,
         );
         tokio::pin!(second);
         tokio::select! {
@@ -8371,7 +8461,7 @@ test a::flaky ... FAILED
             "verify",
             None,
             "test-request",
-        None,
+            None,
         );
         let (landing_result, verify_result) = tokio::join!(landing, verify);
         landing_result.unwrap();
@@ -8490,7 +8580,7 @@ test a::flaky ... FAILED
             "verify",
             None,
             "test-request",
-        None,
+            None,
         );
         let (path_result, name_result) = tokio::join!(path_side, name_side);
         path_result.unwrap();
@@ -8549,7 +8639,7 @@ test a::flaky ... FAILED
                 "verify",
                 None,
                 "test-request",
-            None,
+                None,
             )
             .await
             .unwrap();
@@ -8570,7 +8660,7 @@ test a::flaky ... FAILED
                 "verify",
                 None,
                 "test-request",
-            None,
+                None,
             )
             .await
             .unwrap();
@@ -8594,7 +8684,7 @@ test a::flaky ... FAILED
                 "verify",
                 None,
                 "test-request",
-            None,
+                None,
             )
             .await
             .unwrap();

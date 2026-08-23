@@ -5060,7 +5060,9 @@ impl LandingPipeline {
             // the same task the same way the single aggregate span this
             // replaces always did (both default to the same low attempts) —
             // no regression, just decomposed to one span per check.
-            let check_attempt = u32::try_from(check_index).unwrap_or(u32::MAX).saturating_add(1);
+            let check_attempt = u32::try_from(check_index)
+                .unwrap_or(u32::MAX)
+                .saturating_add(1);
             let resolved = ResolvedRun {
                 command: check.command.clone(),
                 cwd: check.cwd.clone(),
@@ -8712,6 +8714,40 @@ workflow: {
             1,
             "a replayed decision must not spawn a second agent"
         );
+
+        // The dispatch rides the same SemanticReview/Rework span pair
+        // `route_rework` brackets its own bounded-rework dispatch with,
+        // alongside the AttentionHold already written while this chain
+        // awaited the orchestrator's decision — all three correlated on
+        // the ORIGINAL ticket ("add src"), not the correction ticket, and
+        // all under `Authority::Llm` (no distinct orchestrator variant).
+        let spans = crate::span::spans_for_task(&space, "code-repo", "add src").unwrap();
+        let review = spans
+            .iter()
+            .find(|s| s["phase"] == "semantic_review")
+            .expect("dispatch_held_conflict must record a SemanticReview span");
+        assert_eq!(review["authority"], "llm");
+        assert_eq!(review["terminal_reason"], "conflict-correction-requested");
+        let rework = spans
+            .iter()
+            .find(|s| s["phase"] == "rework")
+            .expect("dispatch_held_conflict must record a Rework span on a successful spawn");
+        assert_eq!(rework["authority"], "llm");
+        assert_eq!(rework["terminal_reason"], "conflict-correction-dispatched");
+        let hold = spans
+            .iter()
+            .find(|s| s["phase"] == "attention_hold")
+            .expect("the earlier orchestrator-decision hold must have its own span");
+        assert_eq!(hold["authority"], "llm");
+        // The replayed (already-dispatched) call must not double either span.
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|s| s["phase"] == "semantic_review")
+                .count(),
+            1
+        );
+        assert_eq!(spans.iter().filter(|s| s["phase"] == "rework").count(), 1);
 
         // Once the correction lands back onto `feature`, the held branch must
         // resubmit through the normal queue rather than land itself. Advance
@@ -12697,16 +12733,55 @@ checks: [
         assert!(!plans[0].payload["proof_key"].is_null());
 
         // The task-to-main span substrate rides alongside these same two
-        // events: a `landing_prep` span from the edge plan and a
-        // `verification` span from the settled gate run, both correlated on
-        // the ticket id and both idempotent (a second `run_gates` over the
-        // same candidate must not double them).
+        // events: a `landing_prep` span from the edge plan and one
+        // `verification` span PER CHECK from the settled gate run (not one
+        // aggregate span for the whole run), all correlated on the ticket
+        // id and idempotent (a second `run_gates` over the same candidate
+        // must not double any of them).
         let spans = crate::span::spans_for_task(&space, "direct-repo", "add src").unwrap();
         let phases: std::collections::BTreeSet<&str> =
             spans.iter().map(|s| s["phase"].as_str().unwrap()).collect();
         assert!(phases.contains("landing_prep"));
         assert!(phases.contains("verification"));
         assert_eq!(phases.len(), 2);
+
+        let verification_spans: Vec<&Value> = spans
+            .iter()
+            .filter(|s| s["phase"] == "verification")
+            .collect();
+        assert_eq!(
+            verification_spans.len(),
+            3,
+            "one span per check (steward-protected-paths, steward-diff-scope, verify), not one \
+             aggregate span for the whole gate run: {verification_spans:?}"
+        );
+        let lanes: std::collections::BTreeSet<&str> = verification_spans
+            .iter()
+            .map(|s| s["lane"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            lanes,
+            std::collections::BTreeSet::from([
+                "steward-protected-paths",
+                "steward-diff-scope",
+                "verify"
+            ])
+        );
+        let attempts: std::collections::BTreeSet<u64> = verification_spans
+            .iter()
+            .map(|s| s["attempt"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            attempts,
+            std::collections::BTreeSet::from([1, 2, 3]),
+            "each check's span is keyed by its plan position: {verification_spans:?}"
+        );
+        assert!(
+            verification_spans
+                .iter()
+                .all(|s| s["proof_kind"] == "full-final"),
+            "{verification_spans:?}"
+        );
     }
 
     #[tokio::test]
