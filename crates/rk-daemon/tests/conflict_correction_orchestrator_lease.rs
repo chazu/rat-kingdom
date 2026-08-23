@@ -165,6 +165,51 @@ async fn agent_spawn_count(client: &mut Client, repo: &str) -> usize {
     res["tuples"].as_array().unwrap().len()
 }
 
+/// The `task` (rework ticket) of every `agent_spawned` event recorded so
+/// far — lets a test prove WHICH chain's ticket a dispatch actually spawned
+/// for, not just that some dispatch happened.
+async fn agent_spawned_tasks(client: &mut Client, repo: &str) -> Vec<String> {
+    let res = client
+        .call(
+            "space.scan",
+            json!({"category": "event", "scope": repo, "identity": "agent_spawned"}),
+        )
+        .await
+        .unwrap();
+    res["tuples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["payload"]["task"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Every `landing_conflict_rework_dispatch` marker payload written for the
+/// exact `dispatch_key` a chain's `hold_conflict` used — lets a test prove a
+/// chain's OWN markers were untouched (still just its original
+/// `awaiting-orchestrator-decision` write) by a decision against a
+/// different chain on the same branch.
+async fn conflict_dispatch_markers_for(
+    client: &mut Client,
+    repo: &str,
+    dispatch_key: &str,
+) -> Vec<Value> {
+    let res = client
+        .call(
+            "space.scan",
+            json!({"category": "event", "scope": repo, "identity": "landing_conflict_rework_dispatch"}),
+        )
+        .await
+        .unwrap();
+    res["tuples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["payload"]["dispatch_key"].as_str() == Some(dispatch_key))
+        .map(|t| t["payload"].clone())
+        .collect()
+}
+
 fn allow(kinds: &[&str]) -> PolicyConfig {
     PolicyConfig {
         orchestrator_action_allowlist: kinds.iter().map(|s| s.to_string()).collect(),
@@ -180,16 +225,17 @@ async fn daemon_with_policy(home: &Path, cfg: PolicyConfig) -> Client {
     connect(&layout).await
 }
 
-/// The exact evidence `LandingPipeline::hold_conflict_for_orchestrator_decision`
-/// writes for a held conflict: a `branch_landed` event
-/// (`{merged: false, pr_opened: false}`, what `reconcile::conflict_held_landing`
-/// reads) and a `landing_conflict_rework_dispatch` marker in state
-/// `awaiting-orchestrator-decision` (what `dispatch_held_conflict` reads to
-/// reconstruct its `ConflictContext` and actually dispatch).
-async fn hold_conflict(
+/// The `branch_landed` half of the durable evidence
+/// `LandingPipeline::hold_conflict_for_orchestrator_decision` writes for a
+/// held conflict: `{merged: false, pr_opened: false}`, what
+/// `reconcile::conflict_held_landing` reads to build the attention
+/// violation. Mirrors `ConflictContext::dispatch_key`'s exact shape in
+/// `chain_key` so a fabricated hold gets the same distinct,
+/// cursor-reachable identity a real one does.
+#[allow(clippy::too_many_arguments)]
+async fn hold_conflict_branch_landed_only(
     client: &mut Client,
     repo: &str,
-    repo_path: &str,
     branch: &str,
     head_sha: &str,
     target: &str,
@@ -207,10 +253,6 @@ async fn hold_conflict(
                     "target": target,
                     "merged": false,
                     "pr_opened": false,
-                    // Mirrors `ConflictContext::dispatch_key` — the exact
-                    // shape `hold_conflict_for_orchestrator_decision` writes
-                    // — so a fabricated hold gets the same distinct,
-                    // cursor-reachable identity a real one does.
                     "chain_key": format!("{repo}\0{branch}\0{head_sha}\0{target}\0conflict-task\0{rework_ticket}"),
                     "detail": format!(
                         "merge conflict held for a bounded orchestrator-authority correction \
@@ -221,6 +263,29 @@ async fn hold_conflict(
         )
         .await
         .unwrap();
+}
+
+/// The `landing_conflict_rework_dispatch` half of the durable evidence: a
+/// marker in state `awaiting-orchestrator-decision`, what
+/// `dispatch_held_conflict` reads to reconstruct its `ConflictContext` and
+/// actually dispatch. Split out from [`hold_conflict_branch_landed_only`]
+/// because the real `hold_conflict_for_orchestrator_decision`
+/// (`landing.rs`) writes THIS marker first and the `branch_landed` event
+/// second (`record_conflict_state` then `self.space.out(... "branch_landed"
+/// ...)`) — a genuine window where a chain's marker exists before its own
+/// `branch_landed` event does, exploitable by
+/// `a_newer_chain_created_before_deciding_an_older_one_never_hijacks_its_dispatch`
+/// below.
+#[allow(clippy::too_many_arguments)]
+async fn hold_conflict_marker_only(
+    client: &mut Client,
+    repo: &str,
+    repo_path: &str,
+    branch: &str,
+    head_sha: &str,
+    target: &str,
+    rework_ticket: &str,
+) {
     client
         .call(
             "space.out",
@@ -252,6 +317,33 @@ async fn hold_conflict(
         )
         .await
         .unwrap();
+}
+
+/// The exact evidence `LandingPipeline::hold_conflict_for_orchestrator_decision`
+/// writes for a held conflict — both halves together, order-independent for
+/// every existing test in this file (only
+/// `a_newer_chain_created_before_deciding_an_older_one_never_hijacks_its_dispatch`
+/// needs them split and reordered).
+async fn hold_conflict(
+    client: &mut Client,
+    repo: &str,
+    repo_path: &str,
+    branch: &str,
+    head_sha: &str,
+    target: &str,
+    rework_ticket: &str,
+) {
+    hold_conflict_branch_landed_only(client, repo, branch, head_sha, target, rework_ticket).await;
+    hold_conflict_marker_only(
+        client,
+        repo,
+        repo_path,
+        branch,
+        head_sha,
+        target,
+        rework_ticket,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -854,4 +946,215 @@ async fn an_interrupted_dispatching_marker_fails_closed_and_stays_unresolved_on_
         Value::Null,
         "the cursor stays put across a retried, still-unresolved gate"
     );
+}
+
+/// Proves the "bind conflict-correction dispatch to the exact decided
+/// chain" fix (c36444f) end-to-end: a genuinely NEWER conflict chain (B)
+/// can have its dispatch marker recorded on the same (repo, branch) BEFORE
+/// an OLDER chain's (A) decision is made — the exact window the real
+/// `hold_conflict_for_orchestrator_decision` (`landing.rs`) itself creates,
+/// since it writes a chain's `landing_conflict_rework_dispatch` marker
+/// BEFORE its `branch_landed` event, not atomically with it. Without
+/// `chain_key` threaded from the deciding violation's own evidence all the
+/// way through to `dispatch_held_conflict`
+/// (`landing.rs::conflict_marker_for_chain_key`), "whichever chain is
+/// latest for this branch right now" would resolve A's decision against
+/// B's marker instead — silently dispatching the wrong chain's correction
+/// under a decision that named a different one, while A's own marker sits
+/// forever unresolved.
+///
+/// Chain B's marker deliberately reuses chain A's own `head_sha` (differing
+/// only by `rework_ticket`, hence still a distinct `chain_key`): the point
+/// under test is exact-CHAIN selection, not the unrelated
+/// `"conflicted-head-moved"` tip check every dispatch must also pass, and
+/// giving both chains the same real branch tip removes that confound so a
+/// wrong-chain dispatch shows up as a clean (wrong-ticket) SUCCESS rather
+/// than an ambiguous failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_newer_chain_created_before_deciding_an_older_one_never_hijacks_its_dispatch() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    let head_sha = branch_off_main(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(QUICK_DONE));
+    let mut client = daemon_with_policy(home.path(), allow(&["conflict-held-landing"])).await;
+    let repo = repo_name_of(repo_dir.path());
+    let repo = repo.as_str();
+    let repo_path = repo_dir.path().to_string_lossy().to_string();
+    client
+        .call("repo.add", json!({"name": repo, "path": &repo_path}))
+        .await
+        .unwrap();
+
+    // Chain A: held in full — marker AND branch_landed — so it surfaces as
+    // an attention item.
+    hold_conflict(
+        &mut client,
+        repo,
+        &repo_path,
+        "feature",
+        &head_sha,
+        "main",
+        "TKT-CHAIN-A",
+    )
+    .await;
+    let item_a = attention_next(&mut client, repo)
+        .await
+        .expect("chain A must surface");
+    let item_a_id = item_a["id"].as_str().unwrap().to_string();
+
+    // Chain B: ONLY its dispatch marker exists so far — no branch_landed
+    // event yet, so `attention.decide`'s report snapshot (built from
+    // branch_landed events, deduped to one per branch) still sees ONLY
+    // chain A. `dispatch_held_conflict`'s own, separate marker scan (over
+    // `landing_conflict_rework_dispatch` events directly) is NOT deduped
+    // this way, and sees B's marker too — exactly the asymmetry the
+    // TOCTOU fix closes.
+    let chain_key_b = format!("{repo}\0feature\0{head_sha}\0main\0conflict-task\0TKT-CHAIN-B");
+    hold_conflict_marker_only(
+        &mut client,
+        repo,
+        &repo_path,
+        "feature",
+        &head_sha,
+        "main",
+        "TKT-CHAIN-B",
+    )
+    .await;
+
+    let lease = client
+        .call("lease.acquire", json!({"repo": repo, "holder": "orch-1"}))
+        .await
+        .unwrap();
+    let generation = lease["generation"].as_u64().unwrap();
+
+    // Deciding A must dispatch A's OWN correction, never B's, even though
+    // B's marker was written more recently and is the "latest" marker for
+    // this branch by every ordinary newest-wins read.
+    let decided_a = decide(
+        &mut client,
+        repo,
+        &item_a_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
+    assert_eq!(decided_a["resolved"], true);
+    assert_eq!(decided_a["replay"], false);
+    let decision_a = &decided_a["decision"];
+    let outcome_a = decision_a["outcome"].as_str().unwrap().to_string();
+    assert!(outcome_a.contains("TKT-CHAIN-A"), "{outcome_a}");
+    assert!(!outcome_a.contains("TKT-CHAIN-B"), "{outcome_a}");
+    assert_eq!(
+        agent_spawn_count(&mut client, repo).await,
+        1,
+        "chain A's decision must dispatch exactly one agent"
+    );
+    assert_eq!(
+        agent_spawned_tasks(&mut client, repo).await,
+        vec!["TKT-CHAIN-A".to_string()],
+        "the spawned correction must be for chain A, not the newer chain B"
+    );
+
+    // Chain B's own marker must be completely untouched by A's decision —
+    // still its original single "awaiting-orchestrator-decision" write, not
+    // silently advanced nor gated with a spurious withhold.
+    let markers_b = conflict_dispatch_markers_for(&mut client, repo, &chain_key_b).await;
+    assert_eq!(
+        markers_b.len(),
+        1,
+        "chain B must be untouched by chain A's decision: {markers_b:?}"
+    );
+    assert_eq!(markers_b[0]["state"], "awaiting-orchestrator-decision");
+
+    // Now chain B's branch_landed event lands too (the "human's push"
+    // catching up in the tuplespace) — it becomes independently pending and
+    // decidable, on its own distinct identity, past chain A's now-advanced
+    // lease cursor.
+    hold_conflict_branch_landed_only(
+        &mut client,
+        repo,
+        "feature",
+        &head_sha,
+        "main",
+        "TKT-CHAIN-B",
+    )
+    .await;
+    let item_b = attention_next(&mut client, repo)
+        .await
+        .expect("chain B must surface once its own branch_landed event exists");
+    let item_b_id = item_b["id"].as_str().unwrap().to_string();
+    assert_ne!(
+        item_a_id, item_b_id,
+        "chains A and B must never share an attention/decision identity"
+    );
+
+    let decided_b = decide(
+        &mut client,
+        repo,
+        &item_b_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
+    assert_eq!(decided_b["resolved"], true);
+    assert_eq!(decided_b["replay"], false);
+    let outcome_b = decided_b["decision"]["outcome"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(outcome_b.contains("TKT-CHAIN-B"), "{outcome_b}");
+    assert_eq!(
+        agent_spawn_count(&mut client, repo).await,
+        2,
+        "chain B's own decision must dispatch its own, independent correction agent"
+    );
+    let spawns_after_b = agent_spawned_tasks(&mut client, repo).await;
+    assert_eq!(
+        spawns_after_b
+            .iter()
+            .filter(|t| t.as_str() == "TKT-CHAIN-A")
+            .count(),
+        1
+    );
+    assert_eq!(
+        spawns_after_b
+            .iter()
+            .filter(|t| t.as_str() == "TKT-CHAIN-B")
+            .count(),
+        1
+    );
+
+    // Replaying EITHER chain's decision must never double-spawn.
+    let replay_a = decide(
+        &mut client,
+        repo,
+        &item_a_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay_a["replay"], true);
+    let replay_b = decide(
+        &mut client,
+        repo,
+        &item_b_id,
+        Some("orch-1"),
+        Some(generation),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay_b["replay"], true);
+    assert_eq!(
+        agent_spawn_count(&mut client, repo).await,
+        2,
+        "replaying either chain's decision must never spawn a second agent for it"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
