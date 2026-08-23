@@ -82,7 +82,9 @@ use crate::landing_rework::{
 };
 use crate::supervisor::Supervisor;
 use crate::tickets::{NewTicket, Tickets};
-use crate::workflow_exec::{InstanceStatus, OnTimeout, ResolvedRun, WorkflowEngine};
+use crate::workflow_exec::{
+    verification_proof_key, InstanceStatus, OnTimeout, ResolvedRun, RunProgress, WorkflowEngine,
+};
 use chrono::{DateTime, Utc};
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple};
@@ -119,6 +121,15 @@ const GATE_INFRA_RETRY_IDENTITY: &str = "landing_gate_infra_retry";
 /// successful counterpart operators cannot decompose landing latency or hand
 /// a reviewer inspectable proof that the exact prepared candidate was tested.
 const GATE_PASS_IDENTITY: &str = "landing_gate_pass";
+
+/// Durable record of the gate plan [`LandingPipeline::gate_plan`] chose for
+/// one candidate — written once per gate run, BEFORE any check executes, so
+/// it exists even when a later check fails or the target moves out from
+/// under the run. States the [`LandingEdgeClass`], the exact checks selected,
+/// whether the full named check ran, and why — the "why a full check was
+/// required or skipped" evidence the durable-events acceptance criterion
+/// asks for. See [`LandingPipeline::run_gates_at`].
+const LANDING_EDGE_PLAN_IDENTITY: &str = "landing_edge_plan";
 
 /// Identity of the durable `work_key = (repo, branch, head_sha)` dedup
 /// marker (`Furniture`, scoped to the repo), written by
@@ -953,6 +964,105 @@ impl Default for RetrySchedule {
 /// with, in the order [`LandingPipeline::gate_plan`] wants them run.
 type GatePlan = Vec<(rk_workflow::Check, Vec<(String, String)>, Duration)>;
 
+/// Which of the two landing-edge classes `GateConfig::protected_targets`
+/// (`LandingPolicy::protected_targets`, `.rk/repo.cue`) puts a candidate's
+/// `target` in — the switch between "run the full named check exactly once"
+/// and "run only policy-selected focused checks", decided once per gate run
+/// by [`LandingPipeline::gate_plan`] and recorded durably alongside the plan
+/// (`LANDING_EDGE_PLAN_IDENTITY`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LandingEdgeClass {
+    /// `target` is one of `GateConfig::protected_targets` — a final delivery
+    /// destination. Runs the full `check_name` check, through the same
+    /// prepared-candidate proof-key cache `verify_repo_check` gives a rat's
+    /// own `verify.run` (never re-invented here — the existing
+    /// `landing_gate_pass`-fallback reuse in
+    /// `WorkflowEngine::lookup_verification_proof` already lets a reviewer's
+    /// later `verify.run` on this exact candidate sha skip re-running it).
+    ProtectedFinal,
+    /// `target` is not a protected/final target — an inner child-to-parent
+    /// edge. Runs only the checks `GateConfig::focused_checks` selects for
+    /// this candidate's changed paths; never the full suite by default.
+    Inner,
+}
+
+impl LandingEdgeClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            LandingEdgeClass::ProtectedFinal => "protected-final",
+            LandingEdgeClass::Inner => "inner",
+        }
+    }
+}
+
+/// Whether POSIX ERE `pattern` matches any line of `paths` — evaluated
+/// through `grep -E`, the same engine `steward-protected-paths`/
+/// `steward-diff-scope` already use for their own patterns (their command
+/// text in `.rk/checks.cue`), so a repo's `focusedChecks.paths` pattern
+/// behaves identically to `protectedPaths`. A pattern that fails to even
+/// spawn `grep` is treated as no match — fail-closed toward running FEWER
+/// focused checks, never toward silently promoting to the full suite.
+fn ere_matches_any(pattern: &str, paths: &[String]) -> bool {
+    if pattern.trim().is_empty() || paths.is_empty() {
+        return false;
+    }
+    let mut child = match std::process::Command::new("grep")
+        .arg("-qE")
+        .arg(pattern)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write as _;
+        let _ = stdin.write_all(paths.join("\n").as_bytes());
+    }
+    child.wait().map(|status| status.success()).unwrap_or(false)
+}
+
+/// Resolve `LandingPolicy::focused_checks` against one candidate's
+/// `changed_paths`: every rule whose `paths` matches at least one changed
+/// file (or that declares no `paths` at all, an unconditional catch-all)
+/// contributes its `checks`, deduped in first-seen order. Returns the deduped
+/// check names alongside one human-readable reason string per contributing
+/// rule (`"<class> -> [<checks>]"`), for the durable edge-plan event's
+/// `reason` field.
+fn select_focused_checks(
+    rules: &[rk_workflow::FocusedCheckRule],
+    changed_paths: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut selected = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut reasons = Vec::new();
+    for rule in rules {
+        let matches =
+            rule.paths.is_empty() || rule.paths.iter().any(|p| ere_matches_any(p, changed_paths));
+        if !matches {
+            continue;
+        }
+        let mut added = Vec::new();
+        for check_name in &rule.checks {
+            if seen.insert(check_name.clone()) {
+                selected.push(check_name.clone());
+                added.push(check_name.clone());
+            }
+        }
+        if !added.is_empty() {
+            let label = if rule.class.is_empty() {
+                "unlabeled rule"
+            } else {
+                rule.class.as_str()
+            };
+            reasons.push(format!("{label} -> [{}]", added.join(", ")));
+        }
+    }
+    (selected, reasons)
+}
+
 /// The gate/tier tuning steward.cue exposes as workflow params
 /// (`examples/workflows/steward.cue`'s `params` block) — same names, same
 /// defaults, now owned by the daemon-native pipeline instead of CUE.
@@ -991,6 +1101,14 @@ pub(crate) struct GateConfig {
     /// Harness for the shadow reviewer. Ignored when `shadow_review_model` is
     /// empty.
     pub(crate) shadow_review_harness: String,
+    /// PROTECTED FINAL TARGETS (`LandingPolicy::protected_targets`): target
+    /// branches this repo treats as protected/final delivery destinations.
+    /// See [`LandingEdgeClass`].
+    pub(crate) protected_targets: Vec<String>,
+    /// FOCUSED CHECKS (`LandingPolicy::focused_checks`): the changed-path ->
+    /// check-list rules an INNER edge (`target` not in `protected_targets`)
+    /// selects from instead of running the full `check_name` check.
+    pub(crate) focused_checks: Vec<rk_workflow::FocusedCheckRule>,
 }
 
 impl Default for GateConfig {
@@ -1003,6 +1121,8 @@ impl Default for GateConfig {
             gate_timeout: Duration::from_secs(60 * 60),
             review_timeout: Duration::from_secs(15 * 60),
             review_max_wait: Duration::from_secs(45 * 60),
+            protected_targets: vec!["main".into()],
+            focused_checks: Vec::new(),
             // Deliberately OFF in this bare default, unlike every other field
             // here: `gate_config` never reads these two from `Default` (it
             // takes them straight off the resolved `LandingPolicy`, whose own
@@ -1186,9 +1306,11 @@ impl LandingPipeline {
     /// `maxDiffLines`, `gateTimeout`, `reviewTimeout`). A repo registered
     /// without an activated policy falls back to `GateConfig::default()`'s
     /// values, matching `repository_policy`'s own legacy-translation
-    /// fallback. `check_name` is not repo.cue-configurable (out of this
-    /// ticket's scope): every repo's landing gate runs its named `verify`
-    /// check.
+    /// fallback. `check_name` is not repo.cue-configurable: every repo's
+    /// PROTECTED-FINAL edge (`protected_targets`, default `["main"]`) runs
+    /// this same named `verify` check; an INNER edge instead runs whatever
+    /// `focused_checks` selects (both repo.cue-configurable, see
+    /// [`LandingEdgeClass`]).
     fn gate_config(&self, repo: &rk_git::Repo) -> GateConfig {
         let policy = self.supervisor.repository_policy(repo).landing;
         let defaults = GateConfig::default();
@@ -1205,6 +1327,8 @@ impl LandingPipeline {
                 .unwrap_or(defaults.review_max_wait),
             shadow_review_model: policy.shadow_review_model,
             shadow_review_harness: policy.shadow_review_harness,
+            protected_targets: policy.protected_targets,
+            focused_checks: policy.focused_checks,
         }
     }
 
@@ -1647,7 +1771,7 @@ impl LandingPipeline {
         }
         let gates = self.gate_config(&git_repo);
         let checks_file = repo_path.join(".rk").join("checks.cue");
-        if let Err(error) = self.gate_plan(&checks_file, &entry.target, &gates) {
+        if let Err(error) = self.gate_plan(&checks_file, &entry.target, &gates, &[]) {
             let need = self.escalate(
                 &entry,
                 format!(
@@ -1847,7 +1971,7 @@ impl LandingPipeline {
             .join(".rk")
             .join("checks.cue");
         if self
-            .gate_plan(&checks_file, &entries[0].target, &gates)
+            .gate_plan(&checks_file, &entries[0].target, &gates, &[])
             .is_err()
         {
             let mut outcomes = Vec::with_capacity(entries.len());
@@ -3849,7 +3973,52 @@ impl LandingPipeline {
         self.touch_gate_worktree_marker(&entry.repo_name, &entry.target);
 
         let checks_file = repo_path.join(".rk").join("checks.cue");
-        let plan = self.gate_plan(&checks_file, &entry.target, gates)?;
+        // Best-effort: only feeds INNER-edge focused-check selection
+        // (`gate_plan`'s `select_focused_checks`), never a PROTECTED-FINAL
+        // edge's full-check decision, which does not look at changed paths
+        // at all. A target that fails to resolve as a revision (synthetic
+        // test target names, an exotic history shape) falls back to no
+        // known changed paths — the same fail-closed-toward-fewer-checks
+        // direction `ere_matches_any` already takes, never toward silently
+        // promoting to the full suite.
+        let changed_paths = {
+            let git_repo = git_repo.clone();
+            let target = entry.target.clone();
+            let sha = tested_sha.to_string();
+            blocking(move || Ok(git_repo.diff_stat(&target, &sha).map(|stat| stat.files).unwrap_or_default()))
+                .await?
+        };
+        let (plan, edge_class, full_check_required, reason) =
+            self.gate_plan(&checks_file, &entry.target, gates, &changed_paths)?;
+
+        let selected_checks: Vec<String> = plan.iter().map(|(check, _, _)| check.name.clone()).collect();
+        let proof_key = if full_check_required {
+            plan.iter()
+                .find(|(check, _, _)| check.name == gates.check_name)
+                .and_then(|(check, _, _)| verification_proof_key(&entry.repo_name, tested_sha, check))
+        } else {
+            None
+        };
+        self.space.out(
+            Tuple::new(
+                Category::Event,
+                entry.repo_name.clone(),
+                LANDING_EDGE_PLAN_IDENTITY,
+                "daemon",
+                json!({
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "task": entry.task,
+                    "candidate_sha": tested_sha,
+                    "edge_class": edge_class.as_str(),
+                    "selected_checks": selected_checks,
+                    "full_check_required": full_check_required,
+                    "proof_key": proof_key,
+                    "reason": reason,
+                }),
+            )
+            .with_lifecycle(Lifecycle::Furniture),
+        )?;
 
         let id = format!("landing:{}", entry.branch);
         for (check, env, timeout) in plan {
@@ -4053,6 +4222,9 @@ impl LandingPipeline {
                     "checks": passed_checks,
                     "duration_ms": u64::try_from(started.elapsed().as_millis())
                         .unwrap_or(u64::MAX),
+                    "edge_class": edge_class.as_str(),
+                    "full_check_required": full_check_required,
+                    "proof_key": proof_key,
                 }),
             )
             .with_lifecycle(Lifecycle::Furniture),
@@ -4303,17 +4475,31 @@ impl LandingPipeline {
             .passed())
     }
 
-    /// Resolve the three named checks (POLICY, DIFF-SCOPE, the run gate) into
-    /// `(check, env, timeout)` triples in the order they must run — same
-    /// registry lookup `WorkflowEngine::find_check` does, reimplemented here
-    /// because that method is private to `workflow_exec` and this pipeline
-    /// has no `run` step / `ctx.active_agent` to go through.
+    /// Resolve the protected-paths/diff-scope policy gates plus this edge's
+    /// selected checks into `(check, env, timeout)` triples, in the order
+    /// they must run — same registry lookup `WorkflowEngine::find_check`
+    /// does, reimplemented here because that method is private to
+    /// `workflow_exec` and this pipeline has no `run` step / `ctx.active_agent`
+    /// to go through.
+    ///
+    /// `target`'s edge class (`GateConfig::protected_targets`) decides what
+    /// follows the two policy gates: a PROTECTED-FINAL target always gets
+    /// the full `gates.check_name` check (preserving the pre-existing
+    /// behavior for every repo that never configures this policy — see
+    /// `default_protected_targets`); an INNER target instead gets whatever
+    /// `GateConfig::focused_checks` selects for `changed_paths`, which may be
+    /// nothing at all — this pipeline never silently falls back to the full
+    /// suite for an edge policy declined to name. Returns the plan alongside
+    /// the [`LandingEdgeClass`], whether the full check ran, and a
+    /// human-readable reason for both — [`LandingPipeline::run_gates_at`]
+    /// records all four durably before executing anything.
     fn gate_plan(
         &self,
         checks_file: &Path,
         target: &str,
         gates: &GateConfig,
-    ) -> rk_core::Result<GatePlan> {
+        changed_paths: &[String],
+    ) -> rk_core::Result<(GatePlan, LandingEdgeClass, bool, String)> {
         if !checks_file.exists() {
             return Err(rk_core::Error::other(format!(
                 "landing pipeline: no check registry at {}",
@@ -4336,9 +4522,8 @@ impl LandingPipeline {
 
         let protected_paths = find(PROTECTED_PATHS_CHECK)?;
         let diff_scope = find(DIFF_SCOPE_CHECK)?;
-        let verify = find(&gates.check_name)?;
 
-        Ok(vec![
+        let mut plan: GatePlan = vec![
             (
                 protected_paths,
                 vec![
@@ -4365,8 +4550,54 @@ impl LandingPipeline {
                 ],
                 POLICY_GATE_TIMEOUT,
             ),
-            (verify, Vec::new(), gates.gate_timeout),
-        ])
+        ];
+
+        let is_protected_final = gates.protected_targets.iter().any(|t| t == target);
+        let (edge_class, full_check_required, reason) = if is_protected_final {
+            let verify = find(&gates.check_name)?;
+            plan.push((verify, Vec::new(), gates.gate_timeout));
+            (
+                LandingEdgeClass::ProtectedFinal,
+                true,
+                format!(
+                    "target `{target}` is a protected final target (protectedTargets); running \
+                     the full `{}` check",
+                    gates.check_name
+                ),
+            )
+        } else {
+            let (selected, reasons) = select_focused_checks(&gates.focused_checks, changed_paths);
+            if selected.is_empty() {
+                (
+                    LandingEdgeClass::Inner,
+                    false,
+                    format!(
+                        "target `{target}` is not a protected final target and no focusedChecks \
+                         rule matched; running no check beyond protected-paths/diff-scope"
+                    ),
+                )
+            } else {
+                for check_name in &selected {
+                    let check = find(check_name)?;
+                    plan.push((
+                        check,
+                        vec![("RK_CHECK_TARGET".to_string(), target.to_string())],
+                        gates.gate_timeout,
+                    ));
+                }
+                (
+                    LandingEdgeClass::Inner,
+                    false,
+                    format!(
+                        "target `{target}` is not a protected final target; running \
+                         policy-selected focused checks: {}",
+                        reasons.join("; ")
+                    ),
+                )
+            }
+        };
+
+        Ok((plan, edge_class, full_check_required, reason))
     }
 
     /// Sibling marker file recording when `gate_worktree_path(repo, target)`
@@ -9155,6 +9386,18 @@ checks: [
             release = release_flag.display(),
         );
         write_checks(repo_dir.path(), &checks);
+        // `release` must be a protected-final target too, not just `main` —
+        // otherwise it is an INNER edge under the new focused-checks policy
+        // (default `focusedChecks: []`) and never runs the barrier-gated
+        // `verify` check this test depends on to prove genuine concurrency.
+        activate_landing_policy(
+            home.path(),
+            repo_dir.path(),
+            rk_workflow::LandingPolicy {
+                protected_targets: vec!["main".into(), "release".into()],
+                ..Default::default()
+            },
+        );
 
         git(repo_dir.path(), &["checkout", "-b", "feature-main"]);
         std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();

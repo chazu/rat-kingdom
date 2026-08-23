@@ -266,6 +266,18 @@ pub(crate) struct RunProgress {
     execution_started_at: Option<Instant>,
 }
 
+impl RunProgress {
+    /// Best-effort admission-queue wait this check settled with, once
+    /// `run_check_in`'s admission queue has settled — `None` before that
+    /// point, or when this check never contended for admission at all
+    /// (`sharedCargoTarget` unset). Exposed for the landing pipeline's own
+    /// durable edge events (`LandingPipeline::run_gates_at`), which race no
+    /// cancellation and so has no other use for the rest of [`RunProgress`].
+    pub(crate) fn queue_wait_ms(&self) -> Option<u64> {
+        self.queue_wait_ms
+    }
+}
+
 /// One check's admission-relevant outcome, bundled so
 /// [`record_verification_admission_event`](WorkflowEngine::record_verification_admission_event)
 /// stays under the clippy `too_many_arguments` threshold without an
@@ -5434,7 +5446,7 @@ async fn clean_candidate_sha(dir: &Path) -> Option<String> {
 /// ([`rk_core::action::canonical_digest`]). `None` only on a (practically
 /// unreachable) serialization failure — callers treat that as "cannot cache
 /// this", never as a false hit.
-fn verification_proof_key(
+pub(crate) fn verification_proof_key(
     repo_name: &str,
     candidate: &str,
     check: &rk_workflow::Check,

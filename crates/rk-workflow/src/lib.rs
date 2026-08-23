@@ -201,6 +201,49 @@ pub struct LandingPolicy {
         rename = "reviewDeathRetryJitterPct"
     )]
     pub review_death_retry_jitter_pct: u32,
+    /// PROTECTED FINAL TARGETS: target branches this repo treats as
+    /// protected/final delivery destinations. A landing edge whose `target`
+    /// is one of these is `LandingEdgeClass::ProtectedFinal`
+    /// (`crates/rk-daemon/src/landing.rs`) and runs the repo's full named
+    /// check (`GateConfig::check_name`, e.g. `verify`) exactly once, through
+    /// the same prepared-candidate proof-key cache
+    /// (`crate::workflow_exec::verification_proof_key`) `verify_repo_check`
+    /// already gives a rat's own `verify.run`. Any other target is an INNER
+    /// child-to-parent edge: it runs only the checks `focused_checks` below
+    /// selects, never the full check by default.
+    #[serde(default = "default_protected_targets", rename = "protectedTargets")]
+    pub protected_targets: Vec<String>,
+    /// FOCUSED CHECKS: ordered rules mapping changed-path patterns to the
+    /// named checks (`.rk/checks.cue`) an INNER landing edge runs INSTEAD OF
+    /// the full check. Every rule whose `paths` matches at least one changed
+    /// file — or that declares no `paths` at all, an unconditional catch-all
+    /// — contributes its `checks`, deduped in first-seen order. No rule
+    /// matching means no additional check runs beyond the protected-paths/
+    /// diff-scope policy gates: an inner edge never falls back to the full
+    /// suite by default.
+    #[serde(default, rename = "focusedChecks")]
+    pub focused_checks: Vec<FocusedCheckRule>,
+}
+
+/// One `LandingPolicy::focused_checks` rule: a changed-path (or named-class)
+/// selector paired with the checks it contributes to an inner landing edge's
+/// gate plan. See [`LandingPolicy::focused_checks`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusedCheckRule {
+    /// POSIX ERE alternatives matched against each changed path (the same
+    /// engine `protected_paths` uses — `grep -E`), so a repo's pattern
+    /// authoring stays consistent across both policies. Empty matches
+    /// unconditionally (a catch-all rule).
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Free-form label surfaced in landing events as this rule's selection
+    /// reason — a "named check class" (e.g. `"docs"`, `"rust-fast"`).
+    #[serde(default)]
+    pub class: String,
+    /// Named checks (`.rk/checks.cue`) this rule contributes when it
+    /// matches.
+    #[serde(default)]
+    pub checks: Vec<String>,
 }
 
 impl Default for LandingPolicy {
@@ -224,6 +267,8 @@ impl Default for LandingPolicy {
             review_death_retry_backoff_pct: default_review_death_retry_backoff_pct(),
             review_death_retry_max_delay: default_review_death_retry_max_delay(),
             review_death_retry_jitter_pct: default_review_death_retry_jitter_pct(),
+            protected_targets: default_protected_targets(),
+            focused_checks: Vec::new(),
         }
     }
 }
@@ -291,6 +336,13 @@ fn default_review_death_retry_max_delay() -> String {
 /// incident do not all retry on the exact same clock tick.
 fn default_review_death_retry_jitter_pct() -> u32 {
     20
+}
+
+/// `main` alone — every repo's pre-existing single protected/final target,
+/// so an unconfigured repo's behavior is unchanged for the target every
+/// landing candidate already used before this policy existed.
+fn default_protected_targets() -> Vec<String> {
+    vec!["main".to_string()]
 }
 
 /// Per-repository regenerable build-artifact paths (relative to a worktree
