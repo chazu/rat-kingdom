@@ -7518,6 +7518,12 @@ impl Daemon {
         // (TKT-01M0PA6C5WYRWS757R1SS2F2GR): `None` for the operator, who has
         // no live agent record to fence a namesake against.
         let mut generation: Option<rk_core::id::SpawnId> = None;
+        // The ticket this call's task-to-main span, if any, correlates on —
+        // `None` for the operator (no live agent record to read a task off
+        // of), `Some` for a supervised agent's own ticket. Never a distinct
+        // identity of its own: the same `task` string `AgentLaunched`/
+        // `FirstProgress` already carry for this same generation.
+        let mut task: Option<String> = None;
         let dir = if req.caller.is_empty() || req.caller == crate::client::OPERATOR {
             match self.repos.lock() {
                 Ok(registry) => match registry.get(&params.repo) {
@@ -7553,6 +7559,7 @@ impl Daemon {
                 );
             }
             generation = Some(record.spawn_id());
+            task = record.task.clone();
             match record.worktree {
                 Some(worktree) => worktree,
                 None => {
@@ -7579,6 +7586,7 @@ impl Daemon {
                 &check_name,
                 generation,
                 &request_key,
+                task.as_deref(),
             )
             .await
         {
