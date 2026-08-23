@@ -3550,12 +3550,26 @@ impl LandingPipeline {
         Ok(distinct.len() as u32)
     }
 
-    /// Exact reviewed-commit marker used for replay deduplication.
+    /// Exact reviewed-commit marker used for replay deduplication. A single
+    /// dispatch chain can carry both its opening "dispatching" marker and a
+    /// later terminal one (`"dispatched"`/`"dispatch-refused"`/a withhold
+    /// code); markers are read oldest-first, so a naive first-match would
+    /// always return the transient "dispatching" one. Prefer whichever
+    /// marker is terminal so a completed dispatch reads as complete instead
+    /// of replaying into the interrupted-dispatch diagnosis.
     fn rework_dispatch_marker(&self, ctx: &ReworkContext) -> rk_core::Result<Option<Tuple>> {
-        Ok(self
+        let matching: Vec<Tuple> = self
             .rework_dispatch_markers(ctx)?
             .into_iter()
-            .find(|marker| Self::marker_matches(marker, ctx)))
+            .filter(|marker| Self::marker_matches(marker, ctx))
+            .collect();
+        Ok(matching
+            .iter()
+            .find(|marker| {
+                marker.payload.get("state").and_then(Value::as_str) != Some("dispatching")
+            })
+            .or_else(|| matching.first())
+            .cloned())
     }
 
     fn rework_dispatch_has_state(&self, ctx: &ReworkContext, state: &str) -> rk_core::Result<bool> {
@@ -3741,6 +3755,9 @@ impl LandingPipeline {
                     agent = %record.name, ticket = %ctx.rework_ticket, attempt,
                     "landing pipeline: dispatched bounded rework agent from the reviewed branch"
                 );
+                // Terminal marker: a redelivery must never read this dispatch
+                // as interrupted just because the spawn journaled cleanly.
+                self.record_rework_state(entry, &ctx, attempt, "dispatched")?;
                 if let Err(e) = self
                     .tickets
                     .update(
@@ -3767,7 +3784,7 @@ impl LandingPipeline {
                                paused dispatch), then dispatch the rework ticket"
                         .into(),
                 };
-                self.escalate(entry, ctx.escalation(&withheld))?;
+                self.withhold_rework(entry, &ctx, attempt, &withheld)?;
                 warn!(
                     repo = %entry.repo_name, branch = %entry.branch, error = %e,
                     "landing pipeline: bounded rework dispatch refused"
@@ -3878,12 +3895,23 @@ impl LandingPipeline {
         Ok(distinct.len() as u32)
     }
 
-    /// Exact conflicted-commit marker used for replay deduplication.
+    /// Exact conflicted-commit marker used for replay deduplication. Mirrors
+    /// [`Self::rework_dispatch_marker`]'s terminal-preferring lookup: a
+    /// chain's opening "dispatching" marker is always the oldest, so prefer
+    /// whichever marker is terminal rather than first-match.
     fn conflict_dispatch_marker(&self, ctx: &ConflictContext) -> rk_core::Result<Option<Tuple>> {
-        Ok(self
+        let matching: Vec<Tuple> = self
             .conflict_dispatch_markers(ctx)?
             .into_iter()
-            .find(|marker| Self::conflict_marker_matches(marker, ctx)))
+            .filter(|marker| Self::conflict_marker_matches(marker, ctx))
+            .collect();
+        Ok(matching
+            .iter()
+            .find(|marker| {
+                marker.payload.get("state").and_then(Value::as_str) != Some("dispatching")
+            })
+            .or_else(|| matching.first())
+            .cloned())
     }
 
     fn conflict_dispatch_has_state(
@@ -4100,6 +4128,9 @@ impl LandingPipeline {
                     agent = %record.name, ticket = %ctx.rework_ticket, attempt,
                     "landing pipeline: dispatched bounded conflict-correction agent from the held branch"
                 );
+                // Terminal marker: a redelivery must never read this dispatch
+                // as interrupted just because the spawn journaled cleanly.
+                self.record_conflict_state(entry, &ctx, attempt, "dispatched")?;
                 if let Err(e) = self
                     .tickets
                     .update(
@@ -4126,7 +4157,7 @@ impl LandingPipeline {
                                paused dispatch), then dispatch the correction ticket"
                         .into(),
                 };
-                self.escalate(entry, ctx.escalation(&withheld))?;
+                self.withhold_conflict(entry, &ctx, attempt, &withheld)?;
                 warn!(
                     repo = %entry.repo_name, branch = %entry.branch, error = %e,
                     "landing pipeline: bounded conflict-correction dispatch refused"
@@ -8003,16 +8034,28 @@ workflow: {
             "bounded CONFLICT recovery must dispatch one agent"
         );
         let markers = scoped_tuples(&space, Category::Event, CONFLICT_DISPATCH_IDENTITY);
-        assert_eq!(markers.len(), 1, "one logical dispatch gets one marker");
-        assert_eq!(markers[0].payload["state"], "dispatching");
-        assert_eq!(markers[0].payload["repo"], "code-repo");
-        assert_eq!(markers[0].payload["source"], "feature");
-        assert_eq!(markers[0].payload["target"], "main");
-        assert_eq!(markers[0].payload["head_sha"], head_sha);
-        assert_eq!(markers[0].payload["target_head"], main_before);
-        assert_eq!(markers[0].payload["task"], "add src");
-        assert_eq!(markers[0].payload["rework_ticket"], ticket.identity);
-        let fork_point = markers[0].payload["fork_point"].as_str().unwrap();
+        assert_eq!(
+            markers.len(),
+            2,
+            "one logical dispatch gets a dispatching marker and a terminal dispatched marker"
+        );
+        let dispatching = markers
+            .iter()
+            .find(|m| m.payload["state"] == "dispatching")
+            .expect("dispatching marker must be recorded before the spawn");
+        let dispatched = markers
+            .iter()
+            .find(|m| m.payload["state"] == "dispatched")
+            .expect("a successful spawn must record a terminal dispatched marker");
+        assert_eq!(dispatching.payload["repo"], "code-repo");
+        assert_eq!(dispatching.payload["source"], "feature");
+        assert_eq!(dispatching.payload["target"], "main");
+        assert_eq!(dispatching.payload["head_sha"], head_sha);
+        assert_eq!(dispatching.payload["target_head"], main_before);
+        assert_eq!(dispatching.payload["task"], "add src");
+        assert_eq!(dispatching.payload["rework_ticket"], ticket.identity);
+        assert_eq!(dispatched.payload["rework_ticket"], ticket.identity);
+        let fork_point = dispatching.payload["fork_point"].as_str().unwrap();
         assert_ne!(
             fork_point, head_sha,
             "fork point must not be the source tip"
@@ -8022,12 +8065,12 @@ workflow: {
             "fork point must not be the target tip"
         );
         assert!(
-            markers[0].payload["conflict_evidence"]
+            dispatching.payload["conflict_evidence"]
                 .as_str()
                 .unwrap()
                 .contains("CONFLICT"),
             "{:?}",
-            markers[0].payload["conflict_evidence"]
+            dispatching.payload["conflict_evidence"]
         );
 
         // Once the correction lands back onto `feature`, the held branch must
@@ -8133,8 +8176,9 @@ workflow: {
         );
         assert_eq!(
             scoped_tuples(&space, Category::Event, CONFLICT_DISPATCH_IDENTITY).len(),
-            1,
-            "duplicate delivery must not append another dispatch marker"
+            2,
+            "the one dispatch gets its dispatching + terminal dispatched markers; \
+             duplicate delivery must not append a third"
         );
         let conflict_tickets = space
             .scan(&Pattern::category(Category::Task).scope("code-repo"))
@@ -8204,6 +8248,80 @@ workflow: {
         ] {
             assert!(text.contains(required), "missing {required:?}: {text}");
         }
+    }
+
+    /// [`refused_rework_spawn_reaches_a_terminal_state_not_stuck_dispatching`]'s
+    /// CONFLICT counterpart: a refused correction spawn must record a
+    /// terminal `dispatch-refused` marker rather than leaving the chain
+    /// stuck at `dispatching`, which would otherwise misdiagnose the next
+    /// redelivery as an interrupted daemon.
+    #[tokio::test]
+    async fn refused_conflict_spawn_reaches_a_terminal_state_not_stuck_dispatching() {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, main_before) = conflicting_repo();
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline.supervisor.set_dispatch_paused(true);
+        let entry = conflict_candidate_entry(repo_dir.path(), &head_sha);
+        pipeline.enqueue(entry.clone()).unwrap();
+
+        let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], LandingOutcome::ReworkFiled(_)));
+
+        assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
+        assert_eq!(rev_parse(repo_dir.path(), "feature"), head_sha);
+        assert!(
+            tuples(&space, Category::Event, "agent_spawned").is_empty(),
+            "a refused dispatch must not journal an agent"
+        );
+
+        let markers = scoped_tuples(&space, Category::Event, CONFLICT_DISPATCH_IDENTITY);
+        assert_eq!(
+            markers.len(),
+            2,
+            "a refusal still writes the dispatching marker, then a terminal one"
+        );
+        assert!(
+            markers.iter().any(|m| m.payload["state"] == "dispatching"),
+            "{markers:?}"
+        );
+        assert!(
+            markers
+                .iter()
+                .any(|m| m.payload["state"] == "dispatch-refused"),
+            "the refusal must be recorded as its own terminal state, not left dispatching: \
+             {markers:?}"
+        );
+
+        let needs = scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY);
+        assert_eq!(
+            needs.len(),
+            1,
+            "a refused dispatch must raise one human gate"
+        );
+        let text = needs[0].payload["text"].as_str().unwrap();
+        assert!(text.contains("dispatch-refused"), "{text}");
+
+        pipeline.supervisor.set_dispatch_paused(false);
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        pipeline
+            .route_conflict(
+                &entry,
+                &repo,
+                "CONFLICT (content): Merge conflict in src.rs",
+            )
+            .await
+            .unwrap();
+        assert!(
+            tuples(&space, Category::Event, "agent_spawned").is_empty(),
+            "a redelivery must not silently dispatch behind the existing human gate"
+        );
+        assert_eq!(
+            scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).len(),
+            1,
+            "replay must converge on the existing human gate rather than raise a second one"
+        );
     }
 
     /// Retry-exhaustion proof: a branch that already spent this repository's
@@ -8495,12 +8613,25 @@ workflow: {
         let spawns = tuples(&space, Category::Event, "agent_spawned");
         assert_eq!(spawns.len(), 1, "bounded REWORK must dispatch one agent");
         let markers = scoped_tuples(&space, Category::Event, REWORK_DISPATCH_IDENTITY);
-        assert_eq!(markers.len(), 1, "one logical dispatch gets one marker");
-        assert_eq!(markers[0].payload["state"], "dispatching");
-        assert_eq!(markers[0].payload["branch"], "feature");
-        assert_eq!(markers[0].payload["target"], "main");
-        assert_eq!(markers[0].payload["task"], "add src");
-        assert_eq!(markers[0].payload["rework_ticket"], ticket.identity);
+        assert_eq!(
+            markers.len(),
+            2,
+            "one logical dispatch gets a dispatching marker and a terminal dispatched marker"
+        );
+        let dispatching = markers
+            .iter()
+            .find(|m| m.payload["state"] == "dispatching")
+            .expect("dispatching marker must be recorded before the spawn");
+        let dispatched = markers
+            .iter()
+            .find(|m| m.payload["state"] == "dispatched")
+            .expect("a successful spawn must record a terminal dispatched marker");
+        for marker in [dispatching, dispatched] {
+            assert_eq!(marker.payload["branch"], "feature");
+            assert_eq!(marker.payload["target"], "main");
+            assert_eq!(marker.payload["task"], "add src");
+            assert_eq!(marker.payload["rework_ticket"], ticket.identity);
+        }
 
         // Bypass the processed-work-key shortcut to exercise the dispatch
         // marker itself, as a restart replay of the routed verdict would.
@@ -8517,12 +8648,88 @@ workflow: {
         );
         assert_eq!(
             scoped_tuples(&space, Category::Event, REWORK_DISPATCH_IDENTITY).len(),
-            1,
+            2,
             "replayed routing must not append another marker"
         );
         assert!(
             scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).is_empty(),
             "a journaled correction agent must not be mistaken for an interrupted dispatch"
+        );
+    }
+
+    /// The bug this fixes: a spawn refusal must leave the marker at a
+    /// terminal `dispatch-refused` state, not stuck at `dispatching` forever
+    /// — otherwise the NEXT redelivery reads the stuck marker as an
+    /// interrupted daemon and raises the wrong diagnosis.
+    #[tokio::test]
+    async fn refused_rework_spawn_reaches_a_terminal_state_not_stuck_dispatching() {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+
+        let space = Space::open_in_memory().unwrap();
+        space.out(verdict_tuple(&head_sha, "REWORK")).unwrap();
+
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline.supervisor.set_dispatch_paused(true);
+        pipeline
+            .enqueue(review_candidate_entry(repo_dir.path(), &head_sha))
+            .unwrap();
+
+        let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], LandingOutcome::ReworkFiled(_)));
+
+        let main_after = rev_parse(repo_dir.path(), "main");
+        assert_eq!(main_before, main_after, "branch must not have landed");
+
+        assert!(
+            tuples(&space, Category::Event, "agent_spawned").is_empty(),
+            "a refused dispatch must not journal an agent"
+        );
+        let markers = scoped_tuples(&space, Category::Event, REWORK_DISPATCH_IDENTITY);
+        assert_eq!(
+            markers.len(),
+            2,
+            "a refusal still writes the dispatching marker, then a terminal one"
+        );
+        assert!(
+            markers.iter().any(|m| m.payload["state"] == "dispatching"),
+            "{markers:?}"
+        );
+        assert!(
+            markers
+                .iter()
+                .any(|m| m.payload["state"] == "dispatch-refused"),
+            "the refusal must be recorded as its own terminal state, not left dispatching: \
+             {markers:?}"
+        );
+
+        let needs = scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY);
+        assert_eq!(
+            needs.len(),
+            1,
+            "a refused dispatch must raise one human gate"
+        );
+        let text = needs[0].payload["text"].as_str().unwrap();
+        assert!(text.contains("dispatch-refused"), "{text}");
+
+        // Unpausing and redelivering must not misdiagnose the refusal as an
+        // interrupted daemon (`dispatch-interrupted`) — the marker already
+        // carries its own terminal state.
+        pipeline.supervisor.set_dispatch_paused(false);
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        pipeline
+            .route_rework(&review_candidate_entry(repo_dir.path(), &head_sha), &repo)
+            .await
+            .unwrap();
+        assert!(
+            tuples(&space, Category::Event, "agent_spawned").is_empty(),
+            "a redelivery must not silently dispatch behind the existing human gate"
+        );
+        assert_eq!(
+            scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).len(),
+            1,
+            "replay must converge on the existing human gate rather than raise a second one"
         );
     }
 

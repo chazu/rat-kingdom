@@ -261,11 +261,13 @@ async fn bounded_rework_lands_intermediately_then_resubmits_parent_exactly_once(
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    // The one dispatch writes its opening "dispatching" marker, then a
+    // terminal "dispatched" marker once the spawn succeeds.
     assert_eq!(
         scan(&mut client, "rework-e2e-repo", "landing_rework_dispatch")
             .await
             .len(),
-        1
+        2
     );
     assert_eq!(
         scan(
