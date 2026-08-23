@@ -112,6 +112,21 @@ pub enum PrepareOutcome {
     },
 }
 
+/// Internal result of [`Repo::advance_target`] finding (or not finding) a
+/// live checkout of the target to keep in sync. Not exposed: callers
+/// translate it into their own outcome shape ([`MergeOutcome`] for
+/// [`Repo::merge_branch`]/[`Repo::revert_merge`], [`AdvanceOutcome`] for
+/// [`Repo::advance_target_to`]).
+enum TargetCheckout {
+    /// The ref now points at `merged` — either via a bare `update-ref` (no
+    /// worktree had it checked out) or by fast-forwarding a live checkout in
+    /// place.
+    Advanced,
+    /// A worktree has the target checked out but refused the fast-forward.
+    /// The ref was NOT moved.
+    Blocked { path: PathBuf, detail: String },
+}
+
 /// Outcome of [`Repo::advance_target_to`] — the compare-and-swap land.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdvanceOutcome {
@@ -122,6 +137,18 @@ pub enum AdvanceOutcome {
     /// under its ref. Retryable — rebuild the candidate on `actual` and gate
     /// again.
     Stale { expected: String, actual: String },
+    /// `target` is checked out in a worktree (the root or a linked one) that
+    /// refused a fast-forward onto `commit` — a dirty index/working tree or
+    /// diverged local edits that a bare `update-ref` would otherwise have
+    /// silently orphaned. **Nothing landed and nothing was lost**: the ref
+    /// was never touched and the candidate is still parked under its ref.
+    /// NOT retryable by simply rebuilding — the worktree at `path` needs a
+    /// human to look at it first (see [`AdvanceOutcome::retryable`]).
+    Blocked {
+        expected: String,
+        path: PathBuf,
+        detail: String,
+    },
 }
 
 impl AdvanceOutcome {
@@ -139,7 +166,7 @@ impl AdvanceOutcome {
     pub fn commit(&self) -> Option<&str> {
         match self {
             AdvanceOutcome::Advanced { commit } => Some(commit),
-            AdvanceOutcome::Stale { .. } => None,
+            AdvanceOutcome::Stale { .. } | AdvanceOutcome::Blocked { .. } => None,
         }
     }
 
@@ -149,6 +176,11 @@ impl AdvanceOutcome {
             AdvanceOutcome::Stale { expected, actual } => {
                 format!("target moved from {expected} to {actual}; candidate not landed")
             }
+            AdvanceOutcome::Blocked { path, detail, .. } => format!(
+                "target is checked out at {} and refused the fast-forward ({detail}); \
+                 candidate not landed, ref not moved",
+                path.display()
+            ),
         }
     }
 }
@@ -665,12 +697,32 @@ impl Repo {
                             detail: format!("{target} moved during {op_name}; {aftermath}"),
                         });
                     }
-                    self.advance_target(target, new_commit.trim(), target_before.trim())?;
-                    Ok(MergeOutcome {
-                        merged: true,
-                        commit: Some(new_commit.trim().to_string()),
-                        detail: success_detail,
-                    })
+                    match self.advance_target(target, new_commit.trim(), target_before.trim())? {
+                        TargetCheckout::Advanced => Ok(MergeOutcome {
+                            merged: true,
+                            commit: Some(new_commit.trim().to_string()),
+                            detail: success_detail,
+                        }),
+                        // Fail closed, hard: a live checkout of `target`
+                        // (root or a linked worktree) refused the
+                        // fast-forward — dirty index/working tree, or
+                        // diverged local edits. This is an `Err`, not a
+                        // clean `merged: false`, matching the pre-existing
+                        // contract for a dirty ROOT checkout
+                        // (`merge_refuses_a_conflicting_dirty_target_checkout`):
+                        // updating the ref behind a dirty checkout would make
+                        // HEAD and the files on disk disagree, which a
+                        // silent "conflict, try again" outcome would invite
+                        // a retry loop to eventually paper over. The ref is
+                        // never moved either way.
+                        TargetCheckout::Blocked { path, detail } => {
+                            Err(rk_core::Error::other(format!(
+                                "refusing to advance {target}: it is checked out at {} and \
+                                 the fast-forward was refused ({detail}) — ref left unmoved",
+                                path.display()
+                            )))
+                        }
+                    }
                 }
                 Err(e) => Ok(MergeOutcome {
                     merged: false,
@@ -843,7 +895,18 @@ impl Repo {
             return Ok(AdvanceOutcome::Advanced { commit });
         }
         match self.advance_target(target, &commit, &expected) {
-            Ok(()) => Ok(AdvanceOutcome::Advanced { commit }),
+            Ok(TargetCheckout::Advanced) => Ok(AdvanceOutcome::Advanced { commit }),
+            // Fail closed: a live checkout of `target` refused the
+            // fast-forward. The ref is untouched (git never got as far as
+            // `update-ref`/`merge --ff-only` succeeding) and the candidate
+            // stays parked under its ref — a clean, retryable-by-a-human
+            // outcome, not an error, so this cannot be mistaken for a lost
+            // race and silently retried against the same dirty checkout.
+            Ok(TargetCheckout::Blocked { path, detail }) => Ok(AdvanceOutcome::Blocked {
+                expected,
+                path,
+                detail,
+            }),
             Err(e) => {
                 // The read above is not the guard — git's own old-value check
                 // (`update-ref`'s third argument, or `merge --ff-only`'s
@@ -1015,20 +1078,36 @@ impl Repo {
     /// Advance `target` from `expected` to `merged` (a fast-forward — `merged`
     /// descends from `expected`).
     ///
-    /// If the operator has `target` checked out in the main worktree, moving
-    /// the ref alone leaves their index+working tree stale: the merged files
-    /// live in the new HEAD but not on disk, so `git status` reports them as
-    /// deleted. So when the root is on `target`, fast-forward it in place
-    /// (`merge --ff-only`), which advances the ref *and* refreshes the working
-    /// tree while preserving any non-conflicting local edits. If Git refuses
-    /// that checkout update, return the error and leave the target ref alone;
-    /// a bare ref move would create a checkout/ref split that lies to the
-    /// operator about what is actually on disk.
-    fn advance_target(&self, target: &str, merged: &str, expected: &str) -> rk_core::Result<()> {
-        let root_on_target = self.current_branch().ok().as_deref() == Some(target);
-        if root_on_target {
-            self.git(&["merge", "--ff-only", merged])?;
-            return Ok(());
+    /// If ANY worktree of this repo has `target` checked out — the root
+    /// itself (an operator's own checkout) or a linked worktree (e.g. an
+    /// agent's own worktree, sitting on its own branch, that a rework
+    /// candidate is being landed onto) — moving the ref alone leaves that
+    /// worktree's index+working tree stale: the merged files live in the new
+    /// HEAD but not on disk, so `git status` there reports a reverse diff
+    /// (looks like an uncommitted revert of everything the merge added). So
+    /// when `target` is checked out somewhere, fast-forward it in place
+    /// (`merge --ff-only`) in that worktree, which advances the ref *and*
+    /// refreshes the working tree while preserving any non-conflicting local
+    /// edits. If git refuses that checkout update — a dirty index/working
+    /// tree, or diverged local edits `--ff-only` cannot reconcile — the ref
+    /// is left untouched: a bare ref move behind a dirty checkout would
+    /// create a checkout/ref split that lies to whoever is sitting in that
+    /// worktree about what is actually on disk, and there is no safe way to
+    /// reconcile unknown local edits unattended.
+    fn advance_target(
+        &self,
+        target: &str,
+        merged: &str,
+        expected: &str,
+    ) -> rk_core::Result<TargetCheckout> {
+        if let Some(checkout) = self.worktree_checked_out_on(target) {
+            return match git_in(&checkout, &["merge", "--ff-only", merged]) {
+                Ok(_) => Ok(TargetCheckout::Advanced),
+                Err(e) => Ok(TargetCheckout::Blocked {
+                    path: checkout,
+                    detail: e.to_string(),
+                }),
+            };
         }
         self.git(&[
             "update-ref",
@@ -1036,7 +1115,26 @@ impl Repo {
             merged,
             expected,
         ])?;
-        Ok(())
+        Ok(TargetCheckout::Advanced)
+    }
+
+    /// Path of the worktree (the root, or a linked one) that currently has
+    /// `branch` checked out (non-detached), if any. Git allows a branch to be
+    /// checked out in at most one worktree at a time, so this is unambiguous.
+    fn worktree_checked_out_on(&self, branch: &str) -> Option<PathBuf> {
+        let list = self.git(&["worktree", "list", "--porcelain"]).ok()?;
+        let want = format!("refs/heads/{branch}");
+        let mut path: Option<&str> = None;
+        for line in list.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(p);
+            } else if let Some(b) = line.strip_prefix("branch ") {
+                if b == want {
+                    return path.map(PathBuf::from);
+                }
+            }
+        }
+        None
     }
 
     fn validate_branch_name(&self, branch: &str, role: &str) -> rk_core::Result<()> {
@@ -1638,6 +1736,182 @@ mod tests {
                 .is_empty(),
             "operator's working tree should be clean after auto-merge"
         );
+    }
+
+    /// TKT-01M0EHFDGZQDZM0CF4E04G6JKA: landing onto a non-main target that
+    /// happens to be checked out in an agent's own (linked, not root)
+    /// worktree must fast-forward that worktree in place, exactly like the
+    /// root-checked-out case above — not just move the ref and leave that
+    /// worktree's index staged against the new HEAD.
+    #[test]
+    fn merge_branch_fast_forwards_a_linked_worktree_checked_out_on_target() {
+        let (dir, repo) = scratch_repo();
+        let target_wt = dir.path().join("wt-target");
+        let target_branch = agent_branch("Peanut-9", "tkt-rework");
+        repo.create_worktree(&target_wt, &target_branch, "main")
+            .unwrap();
+
+        let fix_wt = dir.path().join("wt-fix");
+        repo.create_worktree(&fix_wt, "fix-branch", "main").unwrap();
+        std::fs::write(fix_wt.join("feature.txt"), "cheese\n").unwrap();
+        run(&fix_wt, &["add", "."]);
+        run(&fix_wt, &["commit", "-m", "add feature"]);
+        repo.remove_worktree(&fix_wt).unwrap();
+
+        let outcome = repo.merge_branch("fix-branch", &target_branch).unwrap();
+        assert!(outcome.merged, "{}", outcome.detail);
+
+        let log = git_in(&target_wt, &["log", "--oneline"]).unwrap();
+        assert!(log.contains("add feature"));
+        assert!(target_wt.join("feature.txt").exists());
+        assert!(
+            git_in(&target_wt, &["status", "--porcelain"])
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "the agent's own worktree should be clean after the ref it has \
+             checked out advances, not staged against the new HEAD"
+        );
+    }
+
+    /// A target branch not checked out anywhere (root or linked) still gets
+    /// a plain, fast `update-ref` advance — no worktree to keep in sync, so
+    /// this must not regress into always requiring one.
+    #[test]
+    fn merge_branch_bare_ref_move_when_target_not_checked_out_anywhere() {
+        let (dir, repo) = scratch_repo();
+        run(dir.path(), &["branch", "develop"]);
+
+        let fix_wt = dir.path().join("wt-fix3");
+        repo.create_worktree(&fix_wt, "fix-branch-3", "develop")
+            .unwrap();
+        std::fs::write(fix_wt.join("feature3.txt"), "x\n").unwrap();
+        run(&fix_wt, &["add", "."]);
+        run(&fix_wt, &["commit", "-m", "add feature3"]);
+        repo.remove_worktree(&fix_wt).unwrap();
+
+        let outcome = repo.merge_branch("fix-branch-3", "develop").unwrap();
+        assert!(outcome.merged, "{}", outcome.detail);
+        let log = git_in(dir.path(), &["log", "--oneline", "develop"]).unwrap();
+        assert!(log.contains("add feature3"));
+    }
+
+    /// A target checked out somewhere with GENUINE conflicting local edits
+    /// must fail closed: the ref never moves and the edits are never touched
+    /// — no automated reset, no silent overwrite. This is the acceptance
+    /// case distinguishing a real dirty worktree from the false-dirty
+    /// residue TKT-01M0EHFDGZQDZM0CF4E04G6JKA reported.
+    #[test]
+    fn merge_branch_fails_closed_on_a_genuinely_dirty_target_worktree() {
+        let (dir, repo) = scratch_repo();
+        let target_wt = dir.path().join("wt-target-dirty");
+        let target_branch = agent_branch("Peanut-9", "tkt-rework-2");
+        repo.create_worktree(&target_wt, &target_branch, "main")
+            .unwrap();
+        // Genuine uncommitted edit, on the same file the incoming merge also
+        // touches, so `--ff-only` cannot silently preserve it.
+        std::fs::write(target_wt.join("README.md"), "operator in-flight edit\n").unwrap();
+
+        let fix_wt = dir.path().join("wt-fix2");
+        repo.create_worktree(&fix_wt, "fix-branch-2", "main")
+            .unwrap();
+        std::fs::write(fix_wt.join("README.md"), "fixed readme\n").unwrap();
+        run(&fix_wt, &["add", "."]);
+        run(&fix_wt, &["commit", "-m", "change readme"]);
+        repo.remove_worktree(&fix_wt).unwrap();
+
+        let before = repo.rev_parse(&target_branch).unwrap();
+        let result = repo.merge_branch("fix-branch-2", &target_branch);
+        assert!(
+            result.is_err(),
+            "dirty target checkout must block ref advance, got: {result:?}"
+        );
+
+        let after = repo.rev_parse(&target_branch).unwrap();
+        assert_eq!(
+            before, after,
+            "target ref must not move behind a dirty checkout"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target_wt.join("README.md")).unwrap(),
+            "operator in-flight edit\n",
+            "genuine local edits must never be overwritten or reset"
+        );
+    }
+
+    /// The compare-and-swap half of the same fail-closed behavior, plus
+    /// idempotent replay: a blocked advance leaves the candidate parked and
+    /// the ref untouched, and once the worktree is resolved a retry with the
+    /// SAME (commit, base) lands exactly once — no double-apply, no reverse.
+    #[test]
+    fn advance_target_to_blocks_then_lands_once_worktree_is_resolved() {
+        let (dir, repo) = scratch_repo();
+        let target_wt = dir.path().join("wt-target-retry");
+        let target_branch = agent_branch("Peanut-9", "tkt-rework-3");
+        repo.create_worktree(&target_wt, &target_branch, "main")
+            .unwrap();
+        std::fs::write(target_wt.join("README.md"), "dirty\n").unwrap();
+
+        let fix_wt = dir.path().join("wt-fix4");
+        repo.create_worktree(&fix_wt, "fix-branch-4", "main")
+            .unwrap();
+        std::fs::write(fix_wt.join("README.md"), "fixed readme v2\n").unwrap();
+        run(&fix_wt, &["add", "."]);
+        run(&fix_wt, &["commit", "-m", "change readme again"]);
+        repo.remove_worktree(&fix_wt).unwrap();
+
+        let candidate = match repo.prepare_merge("fix-branch-4", &target_branch).unwrap() {
+            PrepareOutcome::Prepared(c) => c,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+
+        let first = repo
+            .advance_target_to(&target_branch, &candidate.commit, &candidate.base)
+            .unwrap();
+        assert!(
+            matches!(first, AdvanceOutcome::Blocked { .. }),
+            "expected Blocked, got {first:?}"
+        );
+        assert!(!first.advanced());
+        assert_eq!(repo.rev_parse(&target_branch).unwrap(), candidate.base);
+
+        // Resolve the worktree — the human/agent commits or discards the edit.
+        run(&target_wt, &["checkout", "--", "README.md"]);
+        assert!(git_in(&target_wt, &["status", "--porcelain"])
+            .unwrap()
+            .trim()
+            .is_empty());
+
+        // Retry with the exact same (commit, base): idempotent, lands once.
+        let second = repo
+            .advance_target_to(&target_branch, &candidate.commit, &candidate.base)
+            .unwrap();
+        assert!(second.advanced(), "{}", second.detail());
+        assert_eq!(second.commit(), Some(candidate.commit.as_str()));
+        assert_eq!(repo.rev_parse(&target_branch).unwrap(), candidate.commit);
+
+        assert!(git_in(&target_wt, &["status", "--porcelain"])
+            .unwrap()
+            .trim()
+            .is_empty());
+        let log = git_in(&target_wt, &["log", "--oneline"]).unwrap();
+        assert!(log.contains("change readme again"));
+
+        // A THIRD call with the same (now-stale) `base` never re-applies or
+        // reverses the merge — it reports the target moved (to exactly the
+        // commit this same candidate already landed), never an error and
+        // never a second advance.
+        let third = repo
+            .advance_target_to(&target_branch, &candidate.commit, &candidate.base)
+            .unwrap();
+        assert_eq!(
+            third,
+            AdvanceOutcome::Stale {
+                expected: candidate.base.clone(),
+                actual: candidate.commit.clone(),
+            }
+        );
+        assert_eq!(repo.rev_parse(&target_branch).unwrap(), candidate.commit);
     }
 
     #[test]

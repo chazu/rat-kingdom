@@ -2007,6 +2007,12 @@ impl LandingPipeline {
             if result.get("stale").and_then(Value::as_bool) == Some(true) {
                 return self.requeue_stale(&entry, &git_repo, &candidate, &result);
             }
+            if result.get("blocked").and_then(Value::as_bool) == Some(true) {
+                let outcome =
+                    LandingOutcome::Escalated(self.worktree_blocked_gate(&entry, &result)?);
+                self.mark_processed(&entry, &outcome)?;
+                return Ok(outcome);
+            }
             self.record_delivery(&entry, &result).await;
             let outcome = LandingOutcome::Landed(result);
             self.mark_processed(&entry, &outcome)?;
@@ -2184,6 +2190,16 @@ impl LandingPipeline {
             let mut outcomes = Vec::with_capacity(entries.len());
             for entry in entries {
                 let outcome = self.requeue_stale(&entry, &repo, &candidate, &result)?;
+                outcomes.push((entry, outcome));
+            }
+            return Ok(outcomes);
+        }
+        if result.get("blocked").and_then(Value::as_bool) == Some(true) {
+            let mut outcomes = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let outcome =
+                    LandingOutcome::Escalated(self.worktree_blocked_gate(&entry, &result)?);
+                self.mark_processed(&entry, &outcome)?;
                 outcomes.push((entry, outcome));
             }
             return Ok(outcomes);
@@ -2963,6 +2979,11 @@ impl LandingPipeline {
                 if result.get("stale").and_then(Value::as_bool) == Some(true) {
                     return self.requeue_stale(entry, git_repo, candidate, &result);
                 }
+                if result.get("blocked").and_then(Value::as_bool) == Some(true) {
+                    return Ok(LandingOutcome::Escalated(
+                        self.worktree_blocked_gate(entry, &result)?,
+                    ));
+                }
                 self.record_delivery(entry, &result).await;
                 Ok(LandingOutcome::Landed(result))
             }
@@ -3015,6 +3036,58 @@ impl LandingPipeline {
                 stat.lines,
                 entry.branch,
                 entry.target,
+                entry.branch,
+                entry.repo_path,
+                entry.target,
+                entry.task,
+            ),
+        )
+    }
+
+    /// A tested-and-approved candidate that could not land because `target`
+    /// is checked out somewhere (an operator's or an agent's own worktree)
+    /// and refused the fast-forward — a dirty index/working tree, or local
+    /// edits `git merge --ff-only` cannot reconcile
+    /// ([`rk_git::AdvanceOutcome::Blocked`]). The ref was never moved and
+    /// `candidate` is still parked under its ref: this is the fail-closed
+    /// recovery gate (rather than a silent ref move that would strand that
+    /// checkout's index against the new HEAD, or an unattended reset that
+    /// could discard genuine work).
+    fn worktree_blocked_gate(
+        &self,
+        entry: &LandingQueueEntry,
+        result: &Value,
+    ) -> rk_core::Result<Tuple> {
+        let worktree_path = result
+            .get("worktree_path")
+            .and_then(Value::as_str)
+            .unwrap_or("(unknown)");
+        let detail = result
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or("fast-forward refused");
+        self.escalate(
+            entry,
+            format!(
+                "steward: {} for {} passed gates and review but could not land onto {} \
+                 — branch held unmerged, target ref untouched.\n\
+                 EVIDENCE: {} is checked out at {worktree_path}, which refused a \
+                 fast-forward onto the tested merge {}: {detail}\n\
+                 DECISION NEEDED: inspect {worktree_path} for genuine uncommitted work \
+                 (commit or stash it), then let this land retry — do not discard \
+                 anything there without checking it first.\n\
+                 BLAST RADIUS: nothing merged; the tested candidate is still parked and \
+                 will be reused once the worktree is clean.\n\
+                 RESOLVE WITH: once {worktree_path} is clean, rk land {} --repo {} \
+                 --target {} --task {} --force --reason 'worktree at {worktree_path} resolved'",
+                entry.branch,
+                entry.task,
+                entry.target,
+                entry.target,
+                result
+                    .get("tested_sha")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?"),
                 entry.branch,
                 entry.repo_path,
                 entry.target,
@@ -7901,6 +7974,96 @@ workflow: {
         assert_eq!(
             events[0].payload["text"],
             "landing pipeline will land feature on non-main target base"
+        );
+    }
+
+    /// TKT-01M0EHFDGZQDZM0CF4E04G6JKA: an approved candidate landing onto a
+    /// non-main target that is checked out in a live linked worktree (an
+    /// agent sitting on its own branch, as in the Peanut-9 rework chain)
+    /// with a GENUINE conflicting uncommitted edit must fail closed — ref
+    /// untouched, edit untouched — and raise exactly one durable human
+    /// recovery gate, not silently land behind the checkout.
+    #[tokio::test]
+    async fn approved_landing_blocked_by_a_dirty_checked_out_target_escalates_durably() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+
+        // The rework target: a non-main branch checked out in its own live
+        // (linked) worktree, exactly like an agent's worktree.
+        git(repo_dir.path(), &["branch", "rat/peanut-9/tkt-rework"]);
+        let agent_wt = tempfile::tempdir().unwrap();
+        git(
+            repo_dir.path(),
+            &[
+                "worktree",
+                "add",
+                agent_wt.path().to_str().unwrap(),
+                "rat/peanut-9/tkt-rework",
+            ],
+        );
+        // Genuine uncommitted edit in that worktree, on the same file the
+        // incoming fix also touches — `--ff-only` cannot silently preserve it.
+        std::fs::write(
+            agent_wt.path().join("README.md"),
+            "agent's in-flight edit\n",
+        )
+        .unwrap();
+
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("README.md"), "# fixed\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "docs: fix readme"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "rework-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "rat/peanut-9/tkt-rework".into(),
+                head_sha,
+                diff_class: "doc-only".into(),
+                task: "fix readme".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let before = rev_parse(repo_dir.path(), "rat/peanut-9/tkt-rework");
+        let outcomes = pipeline
+            .drain_key("rework-repo", "rat/peanut-9/tkt-rework")
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let LandingOutcome::Escalated(need) = &outcomes[0] else {
+            panic!("expected Escalated, got {:?}", outcomes[0]);
+        };
+        assert_eq!(need.payload["agent"], "steward");
+        let text = need.payload["text"].as_str().unwrap();
+        assert!(
+            text.contains("could not land"),
+            "escalation must explain the blocked land: {text}"
+        );
+        assert!(
+            text.contains(agent_wt.path().to_str().unwrap()),
+            "escalation must name the blocked worktree: {text}"
+        );
+
+        // Fail closed: the ref never moved, and the agent's genuine edit
+        // survives untouched — no automated reset or overwrite.
+        let after = rev_parse(repo_dir.path(), "rat/peanut-9/tkt-rework");
+        assert_eq!(
+            before, after,
+            "target ref must not move behind a dirty checkout"
+        );
+        assert_eq!(
+            std::fs::read_to_string(agent_wt.path().join("README.md")).unwrap(),
+            "agent's in-flight edit\n",
+            "genuine local edits must never be overwritten or reset"
         );
     }
 
