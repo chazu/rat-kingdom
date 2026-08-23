@@ -5271,18 +5271,48 @@ impl Supervisor {
             })
             .await?
         };
-        if let rk_git::AdvanceOutcome::Stale { expected, actual } = advance {
-            return Ok(json!({
-                "branch": branch,
-                "target": target,
-                "delivered": false,
-                "merged": false,
-                "stale": true,
-                "tested_sha": candidate.commit,
-                "expected_target_sha": expected,
-                "actual_target_sha": actual,
-                "detail": "target moved after gates; candidate must be rebuilt and retested",
-            }));
+        match advance {
+            rk_git::AdvanceOutcome::Advanced { .. } => {}
+            rk_git::AdvanceOutcome::Stale { expected, actual } => {
+                return Ok(json!({
+                    "branch": branch,
+                    "target": target,
+                    "delivered": false,
+                    "merged": false,
+                    "stale": true,
+                    "tested_sha": candidate.commit,
+                    "expected_target_sha": expected,
+                    "actual_target_sha": actual,
+                    "detail": "target moved after gates; candidate must be rebuilt and retested",
+                }));
+            }
+            // `target` is checked out (root or a linked worktree, e.g. an
+            // agent's own worktree on its own branch) and refused the
+            // fast-forward — a genuinely dirty checkout, not a contended
+            // race. Nothing landed, the ref never moved, and the candidate
+            // is still parked under its ref: fail closed and let the caller
+            // (the landing pipeline) raise a durable human recovery gate
+            // rather than silently retrying against the same dirty worktree.
+            rk_git::AdvanceOutcome::Blocked {
+                expected,
+                path,
+                detail,
+            } => {
+                return Ok(json!({
+                    "branch": branch,
+                    "target": target,
+                    "delivered": false,
+                    "merged": false,
+                    "blocked": true,
+                    "tested_sha": candidate.commit,
+                    "expected_target_sha": expected,
+                    "worktree_path": path.display().to_string(),
+                    "detail": format!(
+                        "{target} is checked out at {} and refused a fast-forward: {detail}",
+                        path.display()
+                    ),
+                }));
+            }
         }
 
         let mut delivery = BranchDelivery {
