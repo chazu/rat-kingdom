@@ -452,10 +452,10 @@ mod tests {
     #[test]
     fn below_target_never_breaches() {
         let policy = policy_with("verification", "20m", "45m");
-        let breaches =
-            evaluate_live_probes(&[probe("TKT-a", Phase::VerificationQueued, 60_000)], &|_| {
-                policy.clone()
-            });
+        let breaches = evaluate_live_probes(
+            &[probe("TKT-a", Phase::VerificationQueued, 60_000)],
+            &|_| policy.clone(),
+        );
         assert!(breaches.is_empty());
     }
 
@@ -576,8 +576,8 @@ mod tests {
         let third = announce_breach(&space, &sinks, &announcer, "daemon", &breach).unwrap();
         assert!(third.is_none());
 
-        let mut pattern = Pattern::category(Category::Event)
-            .identity(crate::recovery::RECOVERY_ACTION_IDENTITY);
+        let mut pattern =
+            Pattern::category(Category::Event).identity(crate::recovery::RECOVERY_ACTION_IDENTITY);
         pattern.payload_search = Some(format!("\"{BREACH_KEY_REF}\":\"{}\"", breach.key()));
         assert_eq!(space.scan(&pattern).unwrap().len(), 1);
     }
@@ -604,8 +604,7 @@ mod tests {
         {
             let space = Space::open(&path).unwrap();
             let announcer = RecoveryAnnouncer::new();
-            let outcome =
-                announce_breach(&space, &sinks(), &announcer, "daemon", &breach).unwrap();
+            let outcome = announce_breach(&space, &sinks(), &announcer, "daemon", &breach).unwrap();
             assert!(outcome.is_some());
         }
         // Simulated restart: a brand new Space handle AND a brand new
@@ -613,8 +612,7 @@ mod tests {
         // survive a restart either) over the same durable file.
         let reopened = Space::open(&path).unwrap();
         let announcer = RecoveryAnnouncer::new();
-        let outcome =
-            announce_breach(&reopened, &sinks(), &announcer, "daemon", &breach).unwrap();
+        let outcome = announce_breach(&reopened, &sinks(), &announcer, "daemon", &breach).unwrap();
         assert!(outcome.is_none(), "restart must not duplicate the alert");
     }
 
@@ -626,29 +624,17 @@ mod tests {
         let policy = policy_with("verification", "20m", "45m");
         let probes = vec![probe("TKT-sweep", Phase::VerificationQueued, 25 * 60_000)];
 
-        let first = sweep_once(
-            &space,
-            &sinks,
-            &announcer,
-            "daemon",
-            &[],
-            &probes,
-            &|_| policy.clone(),
-        )
+        let first = sweep_once(&space, &sinks, &announcer, "daemon", &[], &probes, &|_| {
+            policy.clone()
+        })
         .unwrap();
         assert_eq!(first.len(), 1, "first sweep announces the new breach");
 
         // A repeated sweep tick observing the SAME still-in-flight occurrence
         // (same elapsed bucket crossing the same tier) must not re-announce.
-        let second = sweep_once(
-            &space,
-            &sinks,
-            &announcer,
-            "daemon",
-            &[],
-            &probes,
-            &|_| policy.clone(),
-        )
+        let second = sweep_once(&space, &sinks, &announcer, "daemon", &[], &probes, &|_| {
+            policy.clone()
+        })
         .unwrap();
         assert!(second.is_empty(), "repeated sweep must not duplicate");
 

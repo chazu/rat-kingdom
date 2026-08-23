@@ -4899,9 +4899,7 @@ impl Daemon {
                         crate::landing::LandingEntryStatus::AwaitingReview => {
                             crate::span::Phase::SemanticReview
                         }
-                        crate::landing::LandingEntryStatus::Landing => {
-                            crate::span::Phase::Merge
-                        }
+                        crate::landing::LandingEntryStatus::Landing => crate::span::Phase::Merge,
                     };
                     let mut capacity = std::collections::BTreeMap::new();
                     capacity.insert(
