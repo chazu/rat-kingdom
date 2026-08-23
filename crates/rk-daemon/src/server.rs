@@ -117,6 +117,18 @@ fn may_withdraw(caller: &str, proposer: &str) -> bool {
     caller.is_empty() || caller == OPERATOR_ACTOR || caller == proposer
 }
 
+/// Correlates one `verify.run` call with the connection handling it
+/// (TKT-01M0PA6C5WYRWS757R1SS2F2GR): `serve_conn` computes this before
+/// dispatch to watch for the connection dying mid-call, and
+/// `handle_verify_run` computes the SAME value to register under, so the two
+/// always agree without threading an extra value through `dispatch`. `req.id`
+/// alone is caller-controlled and not guaranteed unique fleet-wide, but this
+/// only ever needs to be unique among calls currently in flight, and the
+/// wire protocol allows exactly one in-flight request per connection.
+fn verify_request_key(caller: &str, id: &str) -> String {
+    format!("{caller}#{id}")
+}
+
 pub struct Daemon {
     layout: Layout,
     space: Space,
@@ -1423,6 +1435,10 @@ impl Daemon {
                     codes::FORBIDDEN,
                     format!("{} is not authorized for {}", req.caller, req.method),
                 )),
+                Ok(req) if req.method == "verify.run" => {
+                    let key = verify_request_key(&req.caller, &req.id);
+                    self.dispatch_watching_disconnect(req, &mut read, &key).await
+                }
                 Ok(req) => self.dispatch(req).await,
                 Err(e) => Outcome::Reply(Response::err(
                     "",
@@ -1461,6 +1477,52 @@ impl Daemon {
                 Outcome::LogFollow { response, spawn } => {
                     write_response(&mut write, &response).await?;
                     return self.stream_log(write, spawn).await;
+                }
+            }
+        }
+    }
+
+    /// Race `verify.run`'s dispatch against this connection dying — the
+    /// RPC-disconnect half of TKT-01M0PA6C5WYRWS757R1SS2F2GR's cancellation
+    /// binding: if the caller (an agent's own `rk verify`, or an operator's)
+    /// is killed mid-call, its managed child process must not keep running
+    /// under the daemon alone. Scoped to `verify.run` only, by the one call
+    /// site above — every other method already completes fast enough that a
+    /// lost caller costs nothing but an unread reply.
+    ///
+    /// The wire protocol is strictly one in-flight request per connection: a
+    /// caller always awaits its response before sending again. So any byte
+    /// this reads off the socket while `dispatch` is still pending is either
+    /// the peer closing (`Ok(0)`) or a protocol violation this daemon does
+    /// not support pipelining for — there is no legitimate next-request
+    /// framing to preserve either way, so a non-zero read is simply ignored
+    /// rather than risked as a would-be cancellation signal.
+    async fn dispatch_watching_disconnect(
+        &self,
+        req: Request,
+        read: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+        request_key: &str,
+    ) -> Outcome {
+        let dispatch_fut = self.dispatch(req);
+        tokio::pin!(dispatch_fut);
+        loop {
+            tokio::select! {
+                outcome = &mut dispatch_fut => return outcome,
+                ready = read.get_ref().readable() => {
+                    if ready.is_err() {
+                        continue;
+                    }
+                    let mut probe = [0u8; 1];
+                    match read.get_ref().try_read(&mut probe) {
+                        Ok(0) => {
+                            self.supervisor.cancel_managed_verification_request(
+                                request_key,
+                                "caller_disconnect",
+                            );
+                            return dispatch_fut.await;
+                        }
+                        Ok(_) | Err(_) => {}
+                    }
                 }
             }
         }
@@ -6857,12 +6919,21 @@ impl Daemon {
     /// — an agent cannot direct a verification run at a repo it is not
     /// working in, and runs in ITS OWN worktree (uncommitted branch work
     /// included), not a shared checkout.
+    ///
+    /// Bound to this exact call's lifecycle (TKT-01M0PA6C5WYRWS757R1SS2F2GR):
+    /// `verify_request_key` correlates it with `serve_conn`'s
+    /// [`dispatch_watching_disconnect`](Self::dispatch_watching_disconnect),
+    /// which cancels it the moment this RPC connection dies mid-call.
     async fn handle_verify_run(&self, req: Request) -> Response {
         let params: VerifyRunParams = match parse_params(&req.params) {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
         let check_name = params.check.as_deref().unwrap_or("verify").to_string();
+        // The agent generation this call is bound to for cancellation
+        // (TKT-01M0PA6C5WYRWS757R1SS2F2GR): `None` for the operator, who has
+        // no live agent record to fence a namesake against.
+        let mut generation: Option<rk_core::id::SpawnId> = None;
         let dir = if req.caller.is_empty() || req.caller == crate::client::OPERATOR {
             match self.repos.lock() {
                 Ok(registry) => match registry.get(&params.repo) {
@@ -6897,6 +6968,7 @@ impl Daemon {
                     ),
                 );
             }
+            generation = Some(record.spawn_id());
             match record.worktree {
                 Some(worktree) => worktree,
                 None => {
@@ -6913,9 +6985,10 @@ impl Daemon {
         } else {
             req.caller.as_str()
         };
+        let request_key = verify_request_key(&req.caller, &req.id);
         match self
             .engine()
-            .verify_repo_check(caller_label, &dir, &params.repo, &check_name)
+            .verify_repo_check(caller_label, &dir, &params.repo, &check_name, generation, &request_key)
             .await
         {
             Ok(result) => Response::ok(req.id, result),

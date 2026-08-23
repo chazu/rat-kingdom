@@ -621,6 +621,12 @@ pub struct Supervisor {
     /// configurable policy value that may be raised above 1. See
     /// [`VerificationAdmission`].
     verification_admission: VerificationAdmission,
+    /// In-flight `verify.run`-mediated verification executions, tracked so
+    /// their requesting agent's interrupt/dismiss/terminal death, or their
+    /// RPC caller's disconnect, can cancel the exact managed child process
+    /// group instead of leaving it orphaned under the daemon. See
+    /// [`ManagedVerificationRuns`].
+    managed_verification: ManagedVerificationRuns,
     /// `[disk] min_free_gb` (0 = disabled), applied by `Daemon::new` from
     /// config. Defaults to 0 here — a bare `Supervisor` constructed directly
     /// by a test or another crate stays disk-guard-free unless it opts in via
@@ -943,6 +949,89 @@ impl VerificationAdmission {
     }
 }
 
+/// One in-flight `verify.run`-mediated verification execution
+/// (TKT-01M0PA6C5WYRWS757R1SS2F2GR): a live post-deploy probe found that
+/// interrupting the requesting agent, or killing the RPC client blocked on
+/// `verify.run`, left the daemon-owned check process running under the
+/// daemon alone, still occupying its repo's admission slot. Registered by
+/// [`crate::workflow_exec::WorkflowEngine::verify_repo_check`] for the
+/// lifetime of exactly one call; `cancel` is the signal that call races its
+/// own execution against, so sending on it drops that execution's future —
+/// and with it, via the existing `ProcessGroupGuard`-on-drop discipline in
+/// `crate::workflow_exec`, SIGKILLs the exact managed child process group.
+struct ManagedVerificationRun {
+    generation: Option<rk_core::id::SpawnId>,
+    agent: String,
+    request_key: String,
+    cancel: tokio::sync::watch::Sender<Option<&'static str>>,
+}
+
+/// Registry of in-flight [`ManagedVerificationRun`]s, keyed by an opaque
+/// monotonic id. In-memory only, exactly like [`VerificationAdmission`]: a
+/// daemon restart drops every entry along with the managed child processes
+/// themselves — there is no state to leak or recover, because the daemon
+/// process that owned them is gone.
+#[derive(Default)]
+struct ManagedVerificationRuns {
+    next_id: AtomicU64,
+    runs: Mutex<HashMap<u64, ManagedVerificationRun>>,
+}
+
+impl ManagedVerificationRuns {
+    fn register(
+        &self,
+        agent: &str,
+        generation: Option<rk_core::id::SpawnId>,
+        request_key: &str,
+    ) -> (u64, tokio::sync::watch::Receiver<Option<&'static str>>) {
+        let (cancel, rx) = tokio::sync::watch::channel(None);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.runs.lock().unwrap().insert(
+            id,
+            ManagedVerificationRun {
+                generation,
+                agent: agent.to_string(),
+                request_key: request_key.to_string(),
+                cancel,
+            },
+        );
+        (id, rx)
+    }
+
+    fn unregister(&self, id: u64) {
+        self.runs.lock().unwrap().remove(&id);
+    }
+
+    /// Cancel every run belonging to `agent`, fenced to `generation` when
+    /// given: a namesake that has since taken over the name (a fresh
+    /// generation after a dismiss+respawn) is never touched by a signal meant
+    /// for its predecessor — the exact "never affects ... a newer
+    /// generation/namesake" guarantee the ticket asks for.
+    fn cancel_agent(
+        &self,
+        agent: &str,
+        generation: Option<rk_core::id::SpawnId>,
+        reason: &'static str,
+    ) {
+        for run in self.runs.lock().unwrap().values() {
+            if run.agent == agent && (generation.is_none() || run.generation == generation) {
+                let _ = run.cancel.send(Some(reason));
+            }
+        }
+    }
+
+    /// Cancel the one run correlated with `request_key` — an RPC connection
+    /// dying mid-call. Never touches a sibling call from the same agent on a
+    /// different connection, since each call mints its own key.
+    fn cancel_request(&self, request_key: &str, reason: &'static str) {
+        for run in self.runs.lock().unwrap().values() {
+            if run.request_key == request_key {
+                let _ = run.cancel.send(Some(reason));
+            }
+        }
+    }
+}
+
 /// Which of an archived record's leftovers `rk prune` should reclaim, beyond
 /// the record itself. Named fields rather than two positional `bool`s, because
 /// silently swapping them is exactly the bug worth designing out.
@@ -1057,6 +1146,7 @@ impl Supervisor {
             landing_pipeline: Mutex::new(None),
             test_exec_lock: TestExecLock::default(),
             verification_admission: VerificationAdmission::default(),
+            managed_verification: ManagedVerificationRuns::default(),
             min_free_disk_gb: AtomicU64::new(0),
             max_load_per_cpu_bits: AtomicU64::new(0f64.to_bits()),
             shared_cargo_target: AtomicBool::new(false),
@@ -1180,6 +1270,49 @@ impl Supervisor {
         self.verification_admission
             .acquire(&self.verification_repo_identity(repo), limit)
             .await
+    }
+
+    /// Register one managed `verify.run` execution for cancellation binding.
+    /// Returns an opaque id (for
+    /// [`unregister_managed_verification`](Self::unregister_managed_verification))
+    /// and the receiver half the execution races itself against — see
+    /// [`ManagedVerificationRuns`].
+    pub(crate) fn register_managed_verification(
+        &self,
+        agent: &str,
+        generation: Option<rk_core::id::SpawnId>,
+        request_key: &str,
+    ) -> (u64, tokio::sync::watch::Receiver<Option<&'static str>>) {
+        self.managed_verification
+            .register(agent, generation, request_key)
+    }
+
+    /// Drop a managed run's registration once its call has returned (whatever
+    /// the outcome) — must be called exactly once per
+    /// [`register_managed_verification`](Self::register_managed_verification),
+    /// or a settled call would remain a live cancellation target forever.
+    pub(crate) fn unregister_managed_verification(&self, id: u64) {
+        self.managed_verification.unregister(id);
+    }
+
+    /// Cancel every managed verification run belonging to `agent`, fenced to
+    /// `generation` when the caller has one (an agent record's current
+    /// [`AgentRecord::spawn_id`]) so a namesake's later generation is never
+    /// touched.
+    pub(crate) fn cancel_managed_verification_for_agent(
+        &self,
+        agent: &str,
+        generation: Option<rk_core::id::SpawnId>,
+        reason: &'static str,
+    ) {
+        self.managed_verification
+            .cancel_agent(agent, generation, reason);
+    }
+
+    /// Cancel the one managed verification run correlated with
+    /// `request_key` — the RPC-disconnect half of the binding.
+    pub(crate) fn cancel_managed_verification_request(&self, request_key: &str, reason: &'static str) {
+        self.managed_verification.cancel_request(request_key, reason);
     }
 
     /// Normalize `repo` — whatever shape reached
@@ -2204,6 +2337,17 @@ impl Supervisor {
             HarnessEvent::Exited { code } => {
                 let diff = self.diff_summary_for(name);
                 self.lock_controls().remove(name);
+                // The harness process behind this generation is provably
+                // gone — clean exit, crash, or kill alike. Any `verify.run`
+                // execution it still has in flight will never be read by a
+                // caller that no longer exists, so its managed child must not
+                // keep running under the daemon alone
+                // (TKT-01M0PA6C5WYRWS757R1SS2F2GR).
+                self.cancel_managed_verification_for_agent(
+                    name,
+                    Some(spawn),
+                    "agent_terminal_death",
+                );
                 let updated = self.lock_registry().update(name, |r| {
                     r.pid = None;
                     // A paused agent is live, but it is not mid-turn: its
@@ -4045,6 +4189,14 @@ impl Supervisor {
             });
             return Err(error);
         }
+        // The interrupted agent may have a `verify.run` execution of its own
+        // in flight (its completion check calling into the daemon-managed
+        // check runner) — that RPC caller was just stopped, so its managed
+        // child process must not keep running under the daemon alone
+        // (TKT-01M0PA6C5WYRWS757R1SS2F2GR). Fenced to the generation this
+        // interrupt actually observed, so a respawn racing in right behind it
+        // is never touched.
+        self.cancel_managed_verification_for_agent(name, Some(prior.spawn_id()), "agent_interrupt");
         Ok(())
     }
 
@@ -4455,6 +4607,15 @@ impl Supervisor {
         // provokes must not publish a late `harness_result` for an agent the
         // caller is deliberately tearing down (TKT-160).
         self.forget_completion(name);
+        // Same reasoning as `interrupt`: this generation is being torn down,
+        // so any `verify.run` execution it has in flight must not keep its
+        // managed child running under the daemon alone
+        // (TKT-01M0PA6C5WYRWS757R1SS2F2GR).
+        self.cancel_managed_verification_for_agent(
+            name,
+            Some(record.spawn_id()),
+            "agent_dismiss",
+        );
         let control = self.lock_controls().remove(name);
         if let Some(control) = control {
             let _ = control.kill().await;

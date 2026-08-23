@@ -172,6 +172,15 @@ const VERIFICATION_ADMISSION_IDENTITY: &str = "verification_admission";
 /// re-run entirely, admission queue included.
 const VERIFICATION_PROOF_IDENTITY: &str = "verification_proof";
 
+/// Durable `(Event, <repo>, "verification_cancelled")` outcome recorded by
+/// [`WorkflowEngine::verify_repo_check`] when its requesting agent is
+/// interrupted/dismissed/dies, or its RPC caller disconnects, before the run
+/// settled (TKT-01M0PA6C5WYRWS757R1SS2F2GR). Never written for a run that
+/// completes on its own, whatever its verdict — that's
+/// [`VERIFICATION_ADMISSION_IDENTITY`]'s job — and a cancelled run never
+/// writes [`VERIFICATION_PROOF_IDENTITY`] either, so it can never be reused.
+const VERIFICATION_CANCELLED_IDENTITY: &str = "verification_cancelled";
+
 /// Pause between a failed attempt and a `retryOnFail` retry. Fixed rather than
 /// configurable: this exists to ride out a transient condition (machine load,
 /// a build-lock hold), not to be tuned per workflow.
@@ -236,6 +245,19 @@ struct SettledAttempt {
     no_exit_code: bool,
     signal: Option<i32>,
     verdict: &'static str,
+}
+
+/// Best-effort timing [`WorkflowEngine::run_check_in`] reports into as it
+/// goes, for a caller (`verify_repo_check`) racing the whole call against
+/// cancellation. Written exactly once, right after the admission queue
+/// settles — never updated again — so a cancellation landing before that
+/// point sees both fields `None` ("still queued, never started"), and one
+/// landing after sees both set ("ran for at least this long before it was
+/// cancelled").
+#[derive(Default)]
+pub(crate) struct RunProgress {
+    queue_wait_ms: Option<u64>,
+    execution_started_at: Option<Instant>,
 }
 
 /// One check's admission-relevant outcome, bundled so
@@ -3099,6 +3121,7 @@ impl WorkflowEngine {
             &env,
             timeout,
             ctx.previous_result.as_ref(),
+            None,
         )
         .await
     }
@@ -3126,12 +3149,28 @@ impl WorkflowEngine {
     /// through the same admission queue as everything else. Never reuses a
     /// stale proof for a different prepared merge: the key binds the exact
     /// candidate sha, so a rebased or amended branch head simply misses.
+    ///
+    /// Bound to the requesting caller's lifecycle
+    /// (TKT-01M0PA6C5WYRWS757R1SS2F2GR): registers itself with
+    /// [`Supervisor::register_managed_verification`] for `generation` (the
+    /// live agent generation this call belongs to, when the caller is a
+    /// supervised agent — `None` for the operator) and `request_key` (this
+    /// exact RPC call, for a caller-disconnect cancellation). Races its own
+    /// `run_check_in` call against that registration's cancel signal: a
+    /// cancellation from an agent interrupt/dismiss/terminal death or an RPC
+    /// disconnect drops the run in flight — killing its managed child
+    /// process group and releasing its admission permit immediately, via the
+    /// same drop-based cleanup `run_check_in` already relies on for a
+    /// timeout — and this records a durable cancellation outcome instead of
+    /// ever writing a reusable proof for it.
     pub(crate) async fn verify_repo_check(
         &self,
         agent: &str,
         dir: &Path,
         repo_name: &str,
         check_name: &str,
+        generation: Option<rk_core::id::SpawnId>,
+        request_key: &str,
     ) -> rk_core::Result<Value> {
         let check = self.find_check(&dir.display().to_string(), check_name)?;
         let resolved = ResolvedRun {
@@ -3165,19 +3204,60 @@ impl WorkflowEngine {
             }
         }
 
-        let result = self
-            .run_check_in(
-                &format!("verify-run:{agent}"),
-                repo_name,
-                agent,
-                &exec_dir,
-                &resolved.command,
-                &resolved,
-                &[],
-                timeout,
-                None,
-            )
-            .await?;
+        let progress = Arc::new(Mutex::new(RunProgress::default()));
+        let (managed_id, mut cancel_rx) =
+            self.supervisor
+                .register_managed_verification(agent, generation, request_key);
+        let run_id = format!("verify-run:{agent}");
+        let run_fut = self.run_check_in(
+            &run_id,
+            repo_name,
+            agent,
+            &exec_dir,
+            &resolved.command,
+            &resolved,
+            &[],
+            timeout,
+            None,
+            Some(Arc::clone(&progress)),
+        );
+        tokio::pin!(run_fut);
+        let outcome = tokio::select! {
+            result = &mut run_fut => Ok(result),
+            _ = cancel_rx.changed() => {
+                let reason: Option<&'static str> = *cancel_rx.borrow();
+                Err(reason.unwrap_or("cancelled"))
+            }
+        };
+        self.supervisor.unregister_managed_verification(managed_id);
+
+        let result = match outcome {
+            Ok(result) => result?,
+            Err(reason) => {
+                let (queue_wait_ms, duration_ms) = {
+                    let p = progress.lock().unwrap();
+                    (
+                        p.queue_wait_ms,
+                        p.execution_started_at
+                            .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                    )
+                };
+                self.record_verification_cancellation(
+                    repo_name,
+                    agent,
+                    generation,
+                    request_key,
+                    candidate_sha.as_deref(),
+                    &check,
+                    queue_wait_ms,
+                    duration_ms,
+                    reason,
+                );
+                return Err(rk_core::Error::other(format!(
+                    "verification cancelled ({reason}) for repo `{repo_name}` check `{check_name}`"
+                )));
+            }
+        };
 
         if let Some(sha) = &candidate_sha {
             if result.get("verdict").and_then(Value::as_str) == Some("pass") {
@@ -3186,6 +3266,50 @@ impl WorkflowEngine {
         }
 
         Ok(result)
+    }
+
+    /// Durable record of a managed verification run cancelled before it could
+    /// settle (TKT-01M0PA6C5WYRWS757R1SS2F2GR) — never written for a run that
+    /// actually completed, whatever its verdict; that's
+    /// [`record_verification_admission_event`](Self::record_verification_admission_event)
+    /// and [`record_verification_proof`](Self::record_verification_proof)'s
+    /// job. `queue_wait_ms`/`duration_ms` are best-effort: `None` for either
+    /// means the cancellation landed before `run_check_in` ever wrote to its
+    /// progress cell (still queued behind the admission bound), not that the
+    /// value is unknown for a run that did start.
+    #[allow(clippy::too_many_arguments)]
+    fn record_verification_cancellation(
+        &self,
+        repo_name: &str,
+        agent: &str,
+        generation: Option<rk_core::id::SpawnId>,
+        request_key: &str,
+        candidate_sha: Option<&str>,
+        check: &rk_workflow::Check,
+        queue_wait_ms: Option<u64>,
+        duration_ms: Option<u64>,
+        reason: &str,
+    ) {
+        let proof_key = candidate_sha.and_then(|sha| verification_proof_key(repo_name, sha, check));
+        let _ = self.space.out(
+            Tuple::new(
+                Category::Event,
+                self.supervisor.verification_repo_identity(repo_name),
+                VERIFICATION_CANCELLED_IDENTITY,
+                "daemon",
+                json!({
+                    "agent": agent,
+                    "generation": generation.map(|g| g.to_string()),
+                    "request_key": request_key,
+                    "proof_key": proof_key,
+                    "command": check.command,
+                    "queue_wait_ms": queue_wait_ms,
+                    "duration_ms": duration_ms,
+                    "reason": reason,
+                }),
+            )
+            .with_lifecycle(Lifecycle::Furniture),
+        );
     }
 
     /// Best-effort exact-key lookup: a durable proof this repo already wrote
@@ -3313,6 +3437,13 @@ impl WorkflowEngine {
         env: &[(String, String)],
         timeout: Duration,
         previous_result: Option<&Value>,
+        // Best-effort progress sink for a caller racing this whole call
+        // against cancellation (`verify_repo_check`, the only caller that
+        // passes `Some` — TKT-01M0PA6C5WYRWS757R1SS2F2GR). Written once the
+        // admission queue settles, so a cancellation that drops this future
+        // mid-flight still leaves the caller something to report: whether it
+        // was still queued, or how long it had been executing.
+        progress: Option<Arc<Mutex<RunProgress>>>,
     ) -> rk_core::Result<Value> {
         // Serialize this check's entire run (every retry attempt) against
         // every other same-repo check also opted into `sharedCargoTarget`,
@@ -3424,6 +3555,11 @@ impl WorkflowEngine {
             None
         };
         let run_started = Instant::now();
+        if let Some(progress) = &progress {
+            let mut p = progress.lock().unwrap();
+            p.queue_wait_ms = admission_queue_wait_ms;
+            p.execution_started_at = Some(run_started);
+        }
 
         // Extra attempts on a non-"pass" verdict, for a check already
         // characterized as flaky for reasons outside the code under test
@@ -6285,6 +6421,7 @@ test a::flaky ... FAILED
                 &env,
                 timeout,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -6298,6 +6435,7 @@ test a::flaky ... FAILED
                 &resolved,
                 &env,
                 timeout,
+                None,
                 None,
             )
             .await
@@ -6349,6 +6487,7 @@ test a::flaky ... FAILED
                 &resolved,
                 &[],
                 timeout,
+                None,
                 None,
             )
             .await
@@ -6402,6 +6541,7 @@ test a::flaky ... FAILED
                 &[],
                 timeout,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -6448,6 +6588,7 @@ test a::flaky ... FAILED
                 &resolved,
                 &[],
                 timeout,
+                None,
                 None,
             )
             .await
@@ -6501,6 +6642,7 @@ test a::flaky ... FAILED
                 &resolved,
                 &[],
                 timeout,
+                None,
                 None,
             )
             .await
@@ -6917,12 +7059,143 @@ test a::flaky ... FAILED
         write_check(repo_dir.path(), "verify", "exit 37", false);
 
         let result = engine
-            .verify_repo_check("agent", repo_dir.path(), "repo-exact-exit", "verify")
+            .verify_repo_check(
+                "agent",
+                repo_dir.path(),
+                "repo-exact-exit",
+                "verify",
+                None,
+                "test-request",
+            )
             .await
             .unwrap();
 
         assert_eq!(result["exit"], json!(37));
         assert_eq!(result["verdict"], json!("fail"));
+    }
+
+    /// TKT-01M0PA6C5WYRWS757R1SS2F2GR: `Supervisor::interrupt`/`dismiss`/the
+    /// harness-exit handler all funnel into `cancel_managed_verification_for_agent`.
+    /// This is the live regression: a REAL `sh -c` child process (not a mock,
+    /// not a cancellation token in isolation) reports its own pid, cancelling
+    /// its run kills that exact OS process group, and a second call queued
+    /// behind the same repo's admission bound (limit 1) starts and completes
+    /// promptly afterward instead of waiting for its own timeout — proving
+    /// the permit was released as part of cancellation, not merely eventually
+    /// reclaimed.
+    #[tokio::test]
+    async fn cancelling_a_managed_verification_run_kills_its_real_process_group_and_frees_the_queued_follower(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        engine
+            .supervisor
+            .set_verification_admission_limits(1, HashMap::new());
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let pid_file = repo_dir.path().join("child.pid");
+        write_check(
+            repo_dir.path(),
+            "verify",
+            &format!("echo $$ > '{}'; sleep 30", pid_file.display()),
+            true,
+        );
+
+        let generation = rk_core::id::SpawnId::new();
+        let first = engine.verify_repo_check(
+            "Whisker",
+            repo_dir.path(),
+            "cancel-test-repo",
+            "verify",
+            Some(generation),
+            "req-1",
+        );
+        tokio::pin!(first);
+
+        // Poll until the child has actually started and reported its own
+        // pid — proof there is a real process to kill, not just a scheduled
+        // task.
+        let child_pid: i32 = loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                        if let Ok(pid) = text.trim().parse() {
+                            break pid;
+                        }
+                    }
+                }
+                _ = &mut first => panic!("the check must not settle on its own before it's cancelled"),
+            }
+        };
+
+        // A second call for the SAME repo, still bound by the admission
+        // limit of 1: it must not even start while the first holds the
+        // permit.
+        let second_dir = tempfile::tempdir().unwrap();
+        let second_marker = second_dir.path().join("ran");
+        write_check(
+            second_dir.path(),
+            "verify",
+            &format!("touch '{}'", second_marker.display()),
+            true,
+        );
+        let second = engine.verify_repo_check(
+            "Nibble",
+            second_dir.path(),
+            "cancel-test-repo",
+            "verify",
+            None,
+            "req-2",
+        );
+        tokio::pin!(second);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            _ = &mut second => panic!("the follower must stay queued behind the first run's admission permit"),
+        }
+        assert!(
+            !second_marker.exists(),
+            "the queued follower must not have started yet"
+        );
+
+        // Cancel exactly like `Supervisor::interrupt` does.
+        engine.supervisor.cancel_managed_verification_for_agent(
+            "Whisker",
+            Some(generation),
+            "agent_interrupt",
+        );
+
+        let error = first
+            .await
+            .expect_err("a cancelled run must return an error, not a verdict");
+        assert!(
+            error.to_string().contains("cancelled"),
+            "unexpected error: {error}"
+        );
+
+        // The real process must actually be gone shortly after — proof the
+        // managed child's process GROUP was killed, not just abandoned.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // Signal 0: existence check only, no signal actually delivered.
+            let alive = unsafe { libc::kill(child_pid, 0) == 0 };
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child process {child_pid} is still alive after cancellation"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The queued follower must now proceed promptly — the admission
+        // permit was released as part of cancellation, not left held until
+        // its own timeout.
+        tokio::time::timeout(Duration::from_secs(5), &mut second)
+            .await
+            .expect("the queued follower must start promptly once the first run is cancelled")
+            .expect("the follower's own check must pass");
+        assert!(second_marker.exists());
     }
 
     /// The ticket's explicit shared-bound goal: a landing gate (which calls
@@ -6990,8 +7263,16 @@ test a::flaky ... FAILED
             &[],
             Duration::from_secs(5),
             None,
+            None,
         );
-        let verify = engine.verify_repo_check("agent", verify_dir.path(), repo_name, "verify");
+        let verify = engine.verify_repo_check(
+            "agent",
+            verify_dir.path(),
+            repo_name,
+            "verify",
+            None,
+            "test-request",
+        );
         let (landing_result, verify_result) = tokio::join!(landing, verify);
         landing_result.unwrap();
         verify_result.unwrap();
@@ -7100,8 +7381,16 @@ test a::flaky ... FAILED
             &[],
             Duration::from_secs(5),
             None,
+            None,
         );
-        let name_side = engine.verify_repo_check("agent", name_dir.path(), repo_name, "verify");
+        let name_side = engine.verify_repo_check(
+            "agent",
+            name_dir.path(),
+            repo_name,
+            "verify",
+            None,
+            "test-request",
+        );
         let (path_result, name_result) = tokio::join!(path_side, name_side);
         path_result.unwrap();
         name_result.unwrap();
@@ -7152,7 +7441,14 @@ test a::flaky ... FAILED
         git(repo_dir.path(), &["commit", "-m", "add check"]);
 
         let first = engine
-            .verify_repo_check("agent", repo_dir.path(), "repo-proof-reuse", "verify")
+            .verify_repo_check(
+                "agent",
+                repo_dir.path(),
+                "repo-proof-reuse",
+                "verify",
+                None,
+                "test-request",
+            )
             .await
             .unwrap();
         assert_eq!(first["exit"], json!(0));
@@ -7165,7 +7461,14 @@ test a::flaky ... FAILED
         // Same clean candidate sha, same check: an exact-match reuse, no
         // second execution.
         let second = engine
-            .verify_repo_check("agent", repo_dir.path(), "repo-proof-reuse", "verify")
+            .verify_repo_check(
+                "agent",
+                repo_dir.path(),
+                "repo-proof-reuse",
+                "verify",
+                None,
+                "test-request",
+            )
             .await
             .unwrap();
         assert_eq!(second["reused"], json!(true));
@@ -7181,7 +7484,14 @@ test a::flaky ... FAILED
         // never consulted — a fresh run every time.
         std::fs::write(repo_dir.path().join("scratch.txt"), "uncommitted\n").unwrap();
         let third = engine
-            .verify_repo_check("agent", repo_dir.path(), "repo-proof-reuse", "verify")
+            .verify_repo_check(
+                "agent",
+                repo_dir.path(),
+                "repo-proof-reuse",
+                "verify",
+                None,
+                "test-request",
+            )
             .await
             .unwrap();
         assert!(
