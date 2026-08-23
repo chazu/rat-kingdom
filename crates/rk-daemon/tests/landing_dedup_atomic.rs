@@ -1072,3 +1072,156 @@ async fn same_head_resubmitted_under_a_different_task_fails_closed() {
 
     handle.abort();
 }
+
+/// TKT-01M0PH88BX7T8BHTT5224SHFKZ's exact incident shape: a nested-workflow
+/// branch is automatically processed/held for a PREDECESSOR step's branch as
+/// its target (the "chain onto the previous step's branch" shape —
+/// `docs/proposals/...` workflow branch-chaining), and an operator then
+/// submits the identical branch/head at `main` instead. Before this test's
+/// fix, `LandingPipeline::processed_marker` probed only `(repo, branch,
+/// head_sha)` — dropping `target` entirely — so the `main` submission read
+/// back as `already_processed` off the OTHER target's marker even though no
+/// `landing_processed` event for `main` existed and the held head was not an
+/// ancestor of `main`. Retargeting must be admitted as an independent,
+/// freshly-processed candidate: two processed markers, one per target, both
+/// landed, each ref carrying the change exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_head_retargeted_to_a_different_branch_is_independently_admissible() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo = repo_dir.path().join("dedup-retarget");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    write_checks(&repo, FAST_CHECKS);
+    std::fs::write(repo.join(".rk").join("triggers.cue"), LANDING_TRIGGER).unwrap();
+
+    let repo_name = repo_name_of(&repo);
+    // The predecessor step's branch a nested workflow chained this candidate
+    // onto — a real ref, distinct from `main`, standing in for
+    // `rat/cheesethief-11/...` in the live incident.
+    git(&repo, &["checkout", "-b", "predecessor-target"]);
+    git(&repo, &["checkout", "main"]);
+    let head_sha = make_branch(&repo, "rat/dedup-retarget/tkt-1", "work.txt", "v1\n");
+
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "dedup-castle".into()).unwrap();
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    client
+        .call(
+            "repo.add",
+            json!({"name": &repo_name, "path": repo.to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+
+    // First: processed against the predecessor's branch, exactly as a
+    // chained workflow step would land.
+    emit_harness_result(
+        &mut client,
+        &repo_name,
+        Completion {
+            agent: "Methuselah-11",
+            branch: "rat/dedup-retarget/tkt-1",
+            target: "predecessor-target",
+            head_sha: &head_sha,
+            task: "tkt-retarget",
+            diff_class: "trivial",
+        },
+    )
+    .await;
+
+    assert!(
+        wait_until_marker_count(&mut client, &repo_name, 1, 200).await,
+        "the predecessor-target completion never reached a processed marker"
+    );
+    assert!(
+        wait_until_queue_empty(&mut client, &repo_name, 50).await,
+        "the predecessor-target completion never drained the queue"
+    );
+    let main_before_retarget = git(&repo, &["rev-parse", "main"]);
+    let predecessor_after_first = git(&repo, &["rev-parse", "predecessor-target"]);
+
+    // The default delivery policy deletes the source branch on a successful
+    // land — exactly what happened to the live incident's source branch too
+    // once the predecessor step's own land went through. An operator
+    // recreating the exact head before retargeting (the only way `rk land`
+    // can resolve a branch argument at all) is what the live incident's
+    // "operator then submitted the same exact branch/head to target main"
+    // actually required.
+    git(&repo, &["branch", "rat/dedup-retarget/tkt-1", &head_sha]);
+
+    // Then: the operator resubmits the IDENTICAL branch/head at `main`. This
+    // is the retarget — a distinct candidate, not a redelivery.
+    emit_harness_result(
+        &mut client,
+        &repo_name,
+        Completion {
+            agent: "operator",
+            branch: "rat/dedup-retarget/tkt-1",
+            target: "main",
+            head_sha: &head_sha,
+            task: "tkt-retarget",
+            diff_class: "trivial",
+        },
+    )
+    .await;
+
+    assert!(
+        wait_until_marker_count(&mut client, &repo_name, 2, 300).await,
+        "the retargeted-to-main completion never reached its own processed marker"
+    );
+    assert!(
+        wait_until_queue_empty(&mut client, &repo_name, 50).await,
+        "the retargeted-to-main completion never drained the queue"
+    );
+
+    let markers = processed_markers(&mut client, &repo_name).await;
+    assert_eq!(
+        markers.len(),
+        2,
+        "retargeting must be admitted as an independent candidate, not read back as \
+         already_processed off the other target's marker: {markers:?}"
+    );
+    let mut targets: Vec<String> = markers
+        .iter()
+        .map(|m| {
+            m["payload"]["target"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    targets.sort();
+    assert_eq!(
+        targets,
+        vec!["main".to_string(), "predecessor-target".to_string()],
+        "each marker must record its own target, not collapse to one: {markers:?}"
+    );
+    let outcomes: Vec<Value> = markers
+        .iter()
+        .map(|m| m["payload"]["outcome"].clone())
+        .collect();
+    assert!(
+        outcomes.iter().all(|o| o == "landed"),
+        "both the original and the retargeted candidate must have landed: {outcomes:?}"
+    );
+
+    // No duplicate delivery: `main` picked up the change exactly once on the
+    // retarget, and the predecessor branch — already landed and untouched by
+    // the second completion — did not move again.
+    let main_after_retarget = git(&repo, &["rev-parse", "main"]);
+    assert_ne!(
+        main_before_retarget, main_after_retarget,
+        "the retargeted candidate must actually land onto main, not no-op as already_processed"
+    );
+    assert!(repo.join("work.txt").exists());
+    let predecessor_after_second = git(&repo, &["rev-parse", "predecessor-target"]);
+    assert_eq!(
+        predecessor_after_first, predecessor_after_second,
+        "landing the retarget onto main must not re-touch the original target"
+    );
+
+    handle.abort();
+}
