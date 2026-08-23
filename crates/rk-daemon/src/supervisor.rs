@@ -1486,20 +1486,30 @@ impl Supervisor {
             out.insert(
                 repo,
                 json!({
+                    // `waiting_reason` fires on raw occupancy OR a non-empty
+                    // durable queue: `try_reserve_lane_wip` refuses a NEW
+                    // arrival whenever anyone else is queued ahead of it, even
+                    // in the brief window right after a slot frees but before
+                    // the queue's head has retried to claim it — that freed
+                    // slot is already logically spoken for, so occupancy
+                    // alone would under-report "full" during exactly that
+                    // window.
                     "implementation": {
                         "limit": impl_limit,
                         "occupied": impl_occupied,
                         "waiting_count": impl_waiting,
                         "oldest_wait_secs": impl_oldest_wait_secs,
-                        "waiting_reason": (impl_limit != 0 && impl_occupied >= impl_limit)
-                            .then_some("implementation_lane_full"),
+                        "waiting_reason":
+                            (impl_limit != 0 && (impl_occupied >= impl_limit || impl_waiting > 0))
+                                .then_some("implementation_lane_full"),
                     },
                     "review": {
                         "limit": review_limit,
                         "occupied": review_occupied,
                         "waiting_count": review_waiting,
                         "oldest_wait_secs": review_oldest_wait_secs,
-                        "waiting_reason": (review_limit != 0 && review_occupied >= review_limit)
+                        "waiting_reason": (review_limit != 0
+                            && (review_occupied >= review_limit || review_waiting > 0))
                             .then_some("review_lane_full"),
                     },
                     // The verification lane's own admission (`VerificationAdmission`)
@@ -7891,6 +7901,195 @@ mod respawn_tests {
             matches!(&refused, Err(e) if e.to_string() == IMPLEMENTATION_LANE_REFUSED),
             "the predecessor's live record, persisted in agents.json, must still occupy the \
              lane after a restart: {refused:?}"
+        );
+    }
+
+    /// Real FIFO admission order (TKT-01M0P2KM83Y4MD5QYETR3JCKF2), not just
+    /// FIFO reporting: with the lane saturated, the FIRST request refused
+    /// must be admitted before a SECOND, distinct request that was refused
+    /// later — even if the second one happens to retry first once capacity
+    /// frees. A caller that "retries faster" must not be able to jump the
+    /// queue ahead of one that was refused earlier.
+    #[tokio::test]
+    async fn implementation_lane_admits_the_longest_waiting_request_first() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let repo_name = Repo::discover(repo.path()).unwrap().name();
+        let sup = supervisor(home.path());
+        sup.set_implementation_admission_limits(0, HashMap::from([(repo_name, 1)]));
+
+        let occupying = sup
+            .spawn_async(spawn_params(repo.path(), "occupying"), 0)
+            .await
+            .unwrap();
+        assert!(occupying.state.is_live());
+
+        // Two DISTINCT logical requests, both refused while the lane is full —
+        // "first-in-line" strictly before "second-in-line" is queued.
+        let first_params = spawn_params(repo.path(), "first-in-line");
+        let first_refusal = sup.spawn_async(first_params.clone(), 0).await;
+        assert!(matches!(
+            &first_refusal,
+            Err(e) if e.to_string() == IMPLEMENTATION_LANE_REFUSED
+        ));
+
+        let second_params = spawn_params(repo.path(), "second-in-line");
+        let second_refusal = sup.spawn_async(second_params.clone(), 0).await;
+        assert!(matches!(
+            &second_refusal,
+            Err(e) if e.to_string() == IMPLEMENTATION_LANE_REFUSED
+        ));
+
+        // Free the only occupied slot.
+        sup.lock_registry()
+            .update(&occupying.name, |r| r.state = AgentState::Completed)
+            .unwrap();
+
+        // The second waiter retries FIRST (simulating a faster poller) but
+        // must still be refused: it is not at the head of the durable queue.
+        let second_retry = sup.spawn_async(second_params.clone(), 0).await;
+        assert!(
+            matches!(&second_retry, Err(e) if e.to_string() == IMPLEMENTATION_LANE_REFUSED),
+            "the second waiter must not be admitted ahead of the first, even though it \
+             retried first: {second_retry:?}"
+        );
+
+        // The first waiter's retry is admitted — it was at the head of the line.
+        let first_retry = sup.spawn_async(first_params, 0).await;
+        assert!(
+            first_retry.is_ok(),
+            "the longest-waiting request must be admitted once a slot frees: {first_retry:?}"
+        );
+
+        // With the first now occupying the lane's only slot again, the second
+        // waiter is STILL refused — proving the first retry didn't leave the
+        // second's queue position stale/skipped.
+        let second_again = sup.spawn_async(second_params, 0).await;
+        assert!(matches!(
+            &second_again,
+            Err(e) if e.to_string() == IMPLEMENTATION_LANE_REFUSED
+        ));
+    }
+
+    /// The durable wait-queue's ordering survives a daemon restart: a waiter
+    /// queued by a predecessor process is still honored ahead of a brand-new
+    /// request that only shows up after the restart, because the queue entry
+    /// itself is read back from `lane_waiters.json`, not reconstructed from
+    /// in-memory state that a restart would have dropped.
+    #[tokio::test]
+    async fn implementation_lane_wait_order_survives_a_restart() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let repo_name = Repo::discover(repo.path()).unwrap().name();
+
+        let before_restart = supervisor(home.path());
+        before_restart
+            .set_implementation_admission_limits(0, HashMap::from([(repo_name.clone(), 1)]));
+        let occupying = before_restart
+            .spawn_async(spawn_params(repo.path(), "occupying"), 0)
+            .await
+            .unwrap();
+        let queued_params = spawn_params(repo.path(), "queued-before-restart");
+        let refusal = before_restart.spawn_async(queued_params.clone(), 0).await;
+        assert!(matches!(
+            &refusal,
+            Err(e) if e.to_string() == IMPLEMENTATION_LANE_REFUSED
+        ));
+        // Free the slot but do NOT let the queued waiter retry before the
+        // restart — the durable record must carry the ordering across it.
+        before_restart
+            .lock_registry()
+            .update(&occupying.name, |r| r.state = AgentState::Completed)
+            .unwrap();
+        drop(before_restart);
+
+        let after_restart = supervisor(home.path());
+        after_restart
+            .set_implementation_admission_limits(0, HashMap::from([(repo_name, 1)]));
+
+        // A brand-new request, never queued anywhere, must still lose to the
+        // waiter the predecessor process recorded before it died.
+        let newcomer = after_restart
+            .spawn_async(spawn_params(repo.path(), "newcomer-after-restart"), 0)
+            .await;
+        assert!(
+            matches!(&newcomer, Err(e) if e.to_string() == IMPLEMENTATION_LANE_REFUSED),
+            "a request with no wait history must not jump ahead of a waiter the predecessor \
+             process durably queued: {newcomer:?}"
+        );
+
+        let queued_retry = after_restart.spawn_async(queued_params, 0).await;
+        assert!(
+            queued_retry.is_ok(),
+            "the pre-restart waiter must be admitted once it retries post-restart: \
+             {queued_retry:?}"
+        );
+    }
+
+    /// If `lane_waiters.json` cannot be written, admission must fail CLOSED
+    /// rather than silently proceed as if the durable queue had been updated
+    /// — proceeding anyway would leave an on-disk phantom waiter that
+    /// outlives its own (in-memory-only) admission, wrongly blocking every
+    /// real waiter behind it. Forces the failure by making the home
+    /// directory unwritable, so the atomic rename `persist_lane_waiters`
+    /// depends on cannot create its temp file.
+    #[tokio::test]
+    async fn implementation_lane_refuses_admission_rather_than_silently_lose_durable_queue_order() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let repo_name = Repo::discover(repo.path()).unwrap().name();
+        let sup = supervisor(home.path());
+        sup.set_implementation_admission_limits(0, HashMap::from([(repo_name, 1)]));
+
+        let occupying = sup
+            .spawn_async(spawn_params(repo.path(), "occupying"), 0)
+            .await
+            .unwrap();
+        let waiter_params = spawn_params(repo.path(), "waiter");
+        let refusal = sup.spawn_async(waiter_params.clone(), 0).await;
+        assert!(matches!(
+            &refusal,
+            Err(e) if e.to_string() == IMPLEMENTATION_LANE_REFUSED
+        ));
+
+        sup.lock_registry()
+            .update(&occupying.name, |r| r.state = AgentState::Completed)
+            .unwrap();
+
+        // Make the home directory unwritable: `lane_waiters.json` already
+        // exists (from the refusal above), but the atomic-write discipline
+        // still needs to create a fresh `.tmp` file beside it, which this
+        // blocks.
+        let original_mode = std::fs::metadata(home.path()).unwrap().permissions().mode();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let retry_while_undurable = sup.spawn_async(waiter_params.clone(), 0).await;
+
+        // Restore permissions BEFORE any assertion can panic and unwind past
+        // this point — tempdir's own Drop cleanup must be able to delete
+        // files inside `home`, and a failed assertion must not leak a
+        // read-only directory on disk.
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(original_mode))
+            .unwrap();
+
+        assert!(
+            matches!(&retry_while_undurable, Err(e) if e.to_string() == IMPLEMENTATION_LANE_REFUSED),
+            "admission must fail closed when it cannot durably persist the queue-clear, not \
+             silently admit while the on-disk record goes stale: {retry_while_undurable:?}"
+        );
+
+        // Once writes succeed again, the exact same retry is admitted —
+        // proving the earlier refusal was purely about durability, not a
+        // corrupted in-memory queue state.
+        let retry_once_durable = sup.spawn_async(waiter_params, 0).await;
+        assert!(
+            retry_once_durable.is_ok(),
+            "the same request must succeed once persistence recovers: {retry_once_durable:?}"
         );
     }
 }

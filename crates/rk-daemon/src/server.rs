@@ -517,6 +517,31 @@ impl Daemon {
         self.supervisor.set_shared_cargo_target(enabled);
     }
 
+    /// Test-only hook mirroring `set_min_free_disk_gb`: `Daemon::new_in_memory`
+    /// bypasses the `config.policy.*` wiring `Daemon::new` does, so a test
+    /// needing a non-default implementation-lane cap sets it directly.
+    #[doc(hidden)]
+    pub fn set_implementation_admission_limits(
+        &self,
+        default_limit: u32,
+        overrides: std::collections::HashMap<String, u32>,
+    ) {
+        self.supervisor
+            .set_implementation_admission_limits(default_limit, overrides);
+    }
+
+    /// Test-only hook, same rationale as
+    /// [`set_implementation_admission_limits`](Self::set_implementation_admission_limits).
+    #[doc(hidden)]
+    pub fn set_review_admission_limits(
+        &self,
+        default_limit: u32,
+        overrides: std::collections::HashMap<String, u32>,
+    ) {
+        self.supervisor
+            .set_review_admission_limits(default_limit, overrides);
+    }
+
     #[doc(hidden)]
     pub fn set_request_clock_for_tests(&mut self, clock: fn() -> DateTime<Utc>) {
         self.request_clock = clock;

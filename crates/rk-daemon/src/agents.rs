@@ -368,15 +368,36 @@ struct LaneWaiter {
     repo: String,
     lane_tag: String,
     key: String,
+    /// When this waiter was FIRST refused — never updated again. What
+    /// [`Registry::lane_wait_stats`] reports as wait age: "how long has this
+    /// request been waiting", not "is it still alive".
     requested_at: DateTime<Utc>,
+    /// Refreshed every time this SAME key is refused again (an active
+    /// retry) — what [`Registry::evict_stale_lane_waiters`] checks staleness
+    /// against, deliberately separate from `requested_at`: an actively
+    /// retrying waiter must keep its place in line no matter how long it has
+    /// been waiting in total, only an ABANDONED one (no retry seen in
+    /// [`LANE_WAIT_STALE_SECS`]) should ever be evicted.
+    last_seen: DateTime<Utc>,
 }
 
-/// How long a durably-recorded waiter may sit at the head of a lane's queue
-/// before it is treated as abandoned (crashed caller, cancelled ticket,
-/// dismissed workflow instance) and evicted — otherwise a dead waiter that
-/// never returns to retry would permanently jam admission for every other
-/// waiter behind it, even once capacity is free.
+/// How long a durably-recorded waiter may go without a retry before it is
+/// treated as abandoned (crashed caller, cancelled ticket, dismissed workflow
+/// instance) and evicted — otherwise a dead waiter that never returns to
+/// retry would permanently jam admission for every other waiter behind it,
+/// even once capacity is free. Checked against `last_seen`, not
+/// `requested_at` — see [`LaneWaiter`].
 const LANE_WAIT_STALE_SECS: i64 = 600;
+
+/// How often a still-queued waiter's `last_seen` heartbeat is actually
+/// written to disk. A caller commonly retries every ~250ms
+/// ([`crate::workflow_exec::FLEET_CAPACITY_POLL`]); persisting on every one
+/// of those retries would mean a disk write several times a second per
+/// waiting request. Throttling to once per this interval keeps the on-disk
+/// staleness clock accurate to within one interval of the truth — more than
+/// precise enough against a 10-minute eviction window — while bounding write
+/// volume to a small, constant rate regardless of retry frequency.
+const LANE_WAIT_HEARTBEAT_PERSIST_SECS: i64 = 60;
 
 const LANE_WAITERS_FILE: &str = "lane_waiters.json";
 
@@ -592,7 +613,26 @@ impl Registry {
             self.record_lane_wait(repo, lane, key);
             return false;
         }
-        self.clear_lane_wait(repo, lane, key);
+        // Fail CLOSED, not open, if this admission's matching queue-clear
+        // cannot be made durable: admitting anyway while the on-disk queue
+        // still names `key` as (or near) the head risks a phantom waiter
+        // that outlives its own admission, wrongly blocking every real
+        // waiter behind it until it ages out after `LANE_WAIT_STALE_SECS`.
+        // Refusing here costs this one attempt (the in-memory queue is
+        // untouched, so the very next retry gets an identical, correct
+        // decision) — a bounded cost, unlike silently violating the
+        // durable-ordering claim this whole mechanism exists to make.
+        if let Err(e) = self.clear_lane_wait(repo, lane, key) {
+            tracing::error!(
+                repo,
+                lane = lane.tag(),
+                key,
+                error = %e,
+                "refusing admission: could not durably clear this waiter's lane_waiters.json \
+                 record"
+            );
+            return false;
+        }
         *self.lane_reservations.entry(lane.key(repo)).or_insert(0) += 1;
         true
     }
@@ -610,53 +650,89 @@ impl Registry {
         }
     }
 
-    /// Durably record that `key` was refused admission to `(repo, lane)`,
-    /// unless an entry for the exact same `(repo, lane, key)` is already
-    /// queued — the idempotence that keeps a caller retrying every few
-    /// hundred milliseconds from growing the queue past one entry.
+    /// Durably record that `key` was refused admission to `(repo, lane)`. A
+    /// repeat refusal for a key already queued is treated as a liveness
+    /// heartbeat: `last_seen` is refreshed (in memory always; on disk at most
+    /// once every [`LANE_WAIT_HEARTBEAT_PERSIST_SECS`], to bound write volume
+    /// under a caller that retries every ~250ms) instead of minting a second
+    /// entry — the idempotence the durable-queue contract requires. A write
+    /// failure here is logged but does not change this call's own outcome:
+    /// the refusal was already correct regardless of durability, and the
+    /// in-memory queue (which the very next admission decision reads) is
+    /// unaffected either way — only cross-restart durability is at risk,
+    /// which the log line surfaces rather than swallows.
     fn record_lane_wait(&mut self, repo: &str, lane: Lane, key: &str) {
-        let already_queued = self
+        let now = Utc::now();
+        let mut should_persist = false;
+        let mut already_queued = false;
+        if let Some(existing) = self
             .lane_waiters
-            .iter()
-            .any(|w| w.repo == repo && w.lane_tag == lane.tag() && w.key == key);
-        if already_queued {
-            return;
+            .iter_mut()
+            .find(|w| w.repo == repo && w.lane_tag == lane.tag() && w.key == key)
+        {
+            already_queued = true;
+            should_persist =
+                (now - existing.last_seen).num_seconds() >= LANE_WAIT_HEARTBEAT_PERSIST_SECS;
+            existing.last_seen = now;
         }
-        self.lane_waiters.push(LaneWaiter {
-            repo: repo.to_string(),
-            lane_tag: lane.tag().to_string(),
-            key: key.to_string(),
-            requested_at: Utc::now(),
-        });
-        let _ = self.persist_lane_waiters();
+        if !already_queued {
+            self.lane_waiters.push(LaneWaiter {
+                repo: repo.to_string(),
+                lane_tag: lane.tag().to_string(),
+                key: key.to_string(),
+                requested_at: now,
+                last_seen: now,
+            });
+            should_persist = true;
+        }
+        if should_persist {
+            if let Err(e) = self.persist_lane_waiters() {
+                tracing::error!(
+                    repo, lane = lane.tag(), key, error = %e,
+                    "failed to persist a lane wait record; this waiter's queue position will \
+                     not survive a restart until the next successful write"
+                );
+            }
+        }
     }
 
     /// Clear `key`'s durable wait record for `(repo, lane)`, if any — a no-op
-    /// (and cheap: no write) for the common case of a spawn admitted on its
-    /// first attempt, which was never queued at all.
-    fn clear_lane_wait(&mut self, repo: &str, lane: Lane, key: &str) {
+    /// (and cheap: no write, `Ok`) for the common case of a spawn admitted on
+    /// its first attempt, which was never queued at all. Propagates a write
+    /// failure to the caller rather than swallowing it: see
+    /// [`try_reserve_lane_wip`](Self::try_reserve_lane_wip)'s fail-closed
+    /// handling of this specific error.
+    fn clear_lane_wait(&mut self, repo: &str, lane: Lane, key: &str) -> rk_core::Result<()> {
         let before = self.lane_waiters.len();
         self.lane_waiters
             .retain(|w| !(w.repo == repo && w.lane_tag == lane.tag() && w.key == key));
         if self.lane_waiters.len() != before {
-            let _ = self.persist_lane_waiters();
+            self.persist_lane_waiters()?;
         }
+        Ok(())
     }
 
-    /// Evict any waiter on `(repo, lane)` that has sat past
-    /// [`LANE_WAIT_STALE_SECS`] — an abandoned caller (crashed, ticket
-    /// cancelled, workflow instance dismissed) that will never retry again
-    /// must not permanently jam admission for everyone behind it.
+    /// Evict any waiter on `(repo, lane)` that has gone [`LANE_WAIT_STALE_SECS`]
+    /// without a retry (`last_seen`, not `requested_at` — an actively
+    /// retrying waiter keeps its place no matter how long it has waited in
+    /// total) — an abandoned caller (crashed, ticket cancelled, workflow
+    /// instance dismissed) that will never retry again must not permanently
+    /// jam admission for everyone behind it.
     fn evict_stale_lane_waiters(&mut self, repo: &str, lane: Lane) {
         let now = Utc::now();
         let before = self.lane_waiters.len();
         self.lane_waiters.retain(|w| {
             !(w.repo == repo
                 && w.lane_tag == lane.tag()
-                && (now - w.requested_at).num_seconds() > LANE_WAIT_STALE_SECS)
+                && (now - w.last_seen).num_seconds() > LANE_WAIT_STALE_SECS)
         });
         if self.lane_waiters.len() != before {
-            let _ = self.persist_lane_waiters();
+            if let Err(e) = self.persist_lane_waiters() {
+                tracing::error!(
+                    repo, lane = lane.tag(), error = %e,
+                    "failed to persist lane_waiters.json after evicting stale waiters"
+                );
+            }
         }
     }
 
