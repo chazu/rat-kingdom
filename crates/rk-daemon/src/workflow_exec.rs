@@ -742,7 +742,11 @@ impl ManagedChildMarker {
 
 impl Drop for ManagedChildMarker {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(self.layout.managed_children_dir().join(self.pid.to_string()));
+        let _ = std::fs::remove_file(
+            self.layout
+                .managed_children_dir()
+                .join(self.pid.to_string()),
+        );
     }
 }
 
@@ -4028,7 +4032,9 @@ impl WorkflowEngine {
         // dropped — durable marker removed — on every exit from this
         // `.await` below, including this whole future being dropped out from
         // under it by `verify_repo_check`'s cancellation race.
-        let _managed_marker = child.id().map(|pid| ManagedChildMarker::create(&self.layout, pid));
+        let _managed_marker = child
+            .id()
+            .map(|pid| ManagedChildMarker::create(&self.layout, pid));
 
         collect_child_output(child, timeout, command).await
     }
@@ -6519,7 +6525,10 @@ test a::flaky ... FAILED
         // and no `ManagedChildMarker` for it was ever created.
         let mut decoy = spawn_sleeper();
         let decoy_pid = decoy.id().unwrap();
-        assert!(pid_alive(decoy_pid), "the decoy must be alive before the test");
+        assert!(
+            pid_alive(decoy_pid),
+            "the decoy must be alive before the test"
+        );
 
         // Hand-write a marker for that pid carrying a signature that cannot
         // possibly match the decoy's real one — the exact shape a stale
