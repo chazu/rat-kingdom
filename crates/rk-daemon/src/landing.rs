@@ -3412,11 +3412,12 @@ impl LandingPipeline {
         else {
             return;
         };
+        let landed_at = Utc::now();
         let record = crate::tickets::DeliveryRecord {
             merge_commit: merge_commit.to_string(),
             branch: entry.branch.clone(),
             target: entry.target.clone(),
-            landed_at: Utc::now().to_rfc3339(),
+            landed_at: landed_at.to_rfc3339(),
         };
         let _ = crate::span::record_phase_span(
             &self.space,
@@ -3425,7 +3426,8 @@ impl LandingPipeline {
             &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::Merge)
                 .repo(&entry.repo_name)
                 .target(&entry.target)
-                .candidate(merge_commit),
+                .candidate(merge_commit)
+                .ended_at(landed_at),
         );
         match self.tickets.record_delivery(&entry.task, &record).await {
             Ok(_) => info!(
@@ -7376,6 +7378,103 @@ workflow: {
             stored.payload.get("status").and_then(Value::as_str),
             Some("in_progress"),
             "an empty land must not close the ticket"
+        );
+    }
+
+    /// `record_delivery`'s `Merge` span must carry `ended_at` — without it
+    /// `task_to_main_ms` (`crates/rk-cli/src/critical_path.rs`) has no end
+    /// anchor and stays `null` forever, even for a ticket that fully landed
+    /// (TKT-01M0QZFFT9WFDTG0CS4GVD03QX). A ticket created with no unresolved
+    /// dependency already gets a `TicketReady` span at creation
+    /// (TKT-01M0QMT83E7YXH6ZXHMQG0VRS6), so landing it end to end is enough
+    /// to prove `task_to_main_ms` computes.
+    #[tokio::test]
+    async fn merge_span_carries_ended_at_and_completes_task_to_main() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+        std::fs::write(repo_dir.path().join("docs").join("note.md"), "note\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "docs: add note"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let ticket = pipeline
+            .tickets
+            .create(crate::tickets::NewTicket {
+                title: "add note".into(),
+                body: None,
+                scope: Some("docs-repo".into()),
+                parent: None,
+                priority: "normal".into(),
+                labels: vec![],
+                depends_on: vec![],
+                created_by: None,
+                coalesce_key: None,
+            })
+            .await
+            .unwrap();
+        pipeline
+            .tickets
+            .set_status(&ticket.identity, "in_progress")
+            .await
+            .unwrap();
+
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "docs-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha,
+                diff_class: "doc-only".into(),
+                task: ticket.identity.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        pipeline.drain_key("docs-repo", "main").await.unwrap();
+
+        let stored = pipeline.tickets.get(&ticket.identity).unwrap().unwrap();
+        assert!(
+            crate::tickets::is_delivered(&stored),
+            "expected a real delivery: {stored:?}"
+        );
+        let record = crate::tickets::delivery_of(&stored).expect("delivery record");
+
+        let spans = crate::span::spans_for_task(&space, "docs-repo", &ticket.identity).unwrap();
+        let merge = spans
+            .iter()
+            .find(|s| s["phase"] == "merge")
+            .expect("a merge span must be recorded");
+        let merge_ended_at: chrono::DateTime<chrono::Utc> = merge["ended_at"]
+            .as_str()
+            .expect("merge span must carry ended_at")
+            .parse()
+            .expect("ended_at must be a valid timestamp");
+        let record_landed_at: chrono::DateTime<chrono::Utc> =
+            record.landed_at.parse().expect("landed_at must parse");
+        assert_eq!(
+            merge_ended_at, record_landed_at,
+            "the merge span's ended_at must match the delivery record's landed_at: {merge:?}"
+        );
+
+        // `rk-cli`'s `build_critical_path` anchors `task_to_main_ms` on
+        // `ticket_ready.queued_at|started_at` and `merge.ended_at`; asserting
+        // both are present here (without depending on rk-cli from rk-daemon)
+        // proves that computation now has both endpoints to work with.
+        let ticket_ready = spans
+            .iter()
+            .find(|s| s["phase"] == "ticket_ready")
+            .expect("ticket creation with no unresolved dependency must stamp ticket_ready");
+        assert!(
+            ticket_ready["queued_at"].is_string() || ticket_ready["started_at"].is_string(),
+            "ticket_ready span must carry a start anchor: {ticket_ready:?}"
         );
     }
 
