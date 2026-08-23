@@ -20,7 +20,7 @@ use rk_workflow::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -112,10 +112,10 @@ pub(crate) struct ResolvedRun {
 
 /// What a blown `run` wall-clock bound does to the instance (TKT-169).
 ///
-/// The command is killed either way — `kill_on_drop` owns that, and a hung suite
-/// never survives its budget. The choice here is only whether the kill is
-/// reported as an ERROR (which ends the run where it stands) or as a RESULT the
-/// following steps get to route on.
+/// The command is killed either way — `ProcessGroupGuard` owns that, and a
+/// hung suite never survives its budget. The choice here is only whether the
+/// kill is reported as an ERROR (which ends the run where it stands) or as a
+/// RESULT the following steps get to route on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OnTimeout {
     /// Fail the instance immediately. The default, and the only behaviour before
@@ -645,15 +645,101 @@ async fn abort_task<T>(task: &mut JoinHandle<T>) {
     let _ = task.await;
 }
 
-/// Guarantees a gate child's WHOLE process group dies, not just the `sh -c`
-/// wrapper `kill_on_drop` reaches. `spawn_check_child` puts the child in its
-/// own group via `.process_group(0)` (mirroring rk-harness's launcher); this
-/// guard sends the negative-pid signal that actually reaches everything in
-/// it. Disarmed only on the clean-completion path — every other exit from
-/// `collect_child_output` (reader/wait join failure, timeout, or this
-/// function's future simply being dropped out from under it) drops the guard
-/// still armed and kills whatever the check left running, so a `mise`/
-/// `cargo`/`rustc` grandchild can no longer outlive its `sh -c` parent.
+/// One row of the system-wide process table, used to walk a managed check
+/// child's REAL descendant tree instead of trusting it to stay in the one
+/// process group `spawn_check_child` put its leader in. `mise` (and
+/// potentially any other check command) does not keep every descendant in
+/// that leader's group — a live smoke test found `mise run verify` moving
+/// its own task execution into a SECOND, freshly created group (a `shell`
+/// child, and `cargo` under that), which a plain `kill(-leader_pid,
+/// SIGKILL)` never reaches: killing the leader's group only removes the
+/// leader, and the orphaned nested group survives, reparented to init
+/// (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD). Captured as `(pid, ppid, pgid)` so
+/// descendants can be found by walking live `ppid` links and the exact
+/// groups to signal collected from `pgid`.
+struct ProcessTableRow {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+}
+
+/// A snapshot of every process the OS reports right now, via `ps`(1) — the
+/// same portable, no-extra-dependency approach `process_signature` already
+/// uses elsewhere in this file. Best-effort: an empty result (a transient
+/// `ps` failure, or none on a platform without it) simply means a caller
+/// falls back to signalling only the root process group it already knew
+/// about, same as before this tree-walk existed.
+fn live_process_table() -> Vec<ProcessTableRow> {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-Ao", "pid=,ppid=,pgid="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let pgid = fields.next()?.parse().ok()?;
+            Some(ProcessTableRow { pid, ppid, pgid })
+        })
+        .collect()
+}
+
+/// Every distinct process-group id live under `root` right now: `root`'s own
+/// group plus every descendant's, found by walking `ppid` links in `table`
+/// breadth-first from `root` — so a descendant that `setsid`/`setpgid`ed
+/// itself into a group of its own (exactly what a `mise` task does) is still
+/// found and its group still collected, not just the leader's. `root` is
+/// treated as its own group even if `table` (a racy snapshot) no longer
+/// contains it, which is correct for every caller here: they only ever name
+/// a process-group LEADER (`.process_group(0)` makes a spawned check's own
+/// pid equal its pgid).
+fn descendant_process_groups(root: u32, table: &[ProcessTableRow]) -> Vec<i32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for row in table {
+        children.entry(row.ppid).or_default().push(row.pid);
+    }
+    let mut groups = HashSet::new();
+    groups.insert(root as i32);
+    let mut visited = HashSet::from([root]);
+    let mut queue = VecDeque::from([root]);
+    while let Some(pid) = queue.pop_front() {
+        if let Some(row) = table.iter().find(|row| row.pid == pid) {
+            groups.insert(row.pgid as i32);
+        }
+        for &child in children.get(&pid).into_iter().flatten() {
+            if visited.insert(child) {
+                queue.push_back(child);
+            }
+        }
+    }
+    groups.into_iter().collect()
+}
+
+/// Guarantees a gate child's WHOLE process TREE dies, not just the single
+/// process group `spawn_check_child` put its leader in.
+/// `spawn_check_child` puts the child in its own group via
+/// `.process_group(0)` (mirroring rk-harness's launcher) and deliberately
+/// does NOT set `.kill_on_drop(true)` — this guard is the SOLE killer, by
+/// design: it walks the live descendant tree from that pid
+/// ([`descendant_process_groups`]) and sends the negative-pid signal to
+/// EVERY group found, reaching a `mise`/`cargo`/`rustc` descendant even if it
+/// moved itself into a group of its own. That walk needs the leader and its
+/// descendants to still be alive and correctly parented when it runs — a
+/// `kill_on_drop` racing ahead of it (as `abort_task` used to trigger on the
+/// timeout/error paths below) would reparent a nested descendant to init
+/// first, breaking the `ppid`-chain discovery that finds its group at all
+/// (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD). Disarmed only on the clean-completion
+/// path — every other exit from `collect_child_output` (reader/wait join
+/// failure, timeout, or this function's future simply being dropped out
+/// from under it) drops the guard still armed and kills whatever the check
+/// left running.
 struct ProcessGroupGuard(Option<u32>);
 
 impl ProcessGroupGuard {
@@ -665,11 +751,16 @@ impl ProcessGroupGuard {
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         if let Some(pid) = self.0 {
-            // SAFETY: plain kill(2) on a process group we created ourselves
-            // via `.process_group(0)` — the negative pid targets the group,
-            // not the single process.
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            let table = live_process_table();
+            for pgid in descendant_process_groups(pid, &table) {
+                // SAFETY: plain kill(2) on a process group either this
+                // process created directly (`.process_group(0)`) or a live
+                // descendant of it created for itself — discovered via the
+                // OS's own real `ppid` links moments before this signal, so
+                // never a group this daemon has no relation to.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
             }
         }
     }
@@ -805,14 +896,21 @@ pub(crate) fn reap_stale_managed_children(layout: &Layout) {
             let recorded = std::fs::read_to_string(entry.path()).unwrap_or_default();
             let recorded = recorded.trim();
             if !recorded.is_empty() && process_signature(pid).as_deref() == Some(recorded) {
-                // SAFETY: plain kill(2) on a pid whose CURRENT identity was
-                // just confirmed, still, to match the process this daemon
-                // itself spawned as a process-group leader
-                // (`spawn_check_child` always spawns via `.process_group(0)`)
-                // — same negative-pid group signal `ProcessGroupGuard` sends
-                // to a live check's group.
-                unsafe {
-                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                // The pid's CURRENT identity was just confirmed, still, to
+                // match the process this daemon itself spawned as a
+                // process-group leader (`spawn_check_child` always spawns
+                // via `.process_group(0)`) — safe to walk its live
+                // descendant tree and signal every group found, same as
+                // `ProcessGroupGuard` does for a check cancelled while this
+                // daemon generation is still alive.
+                let table = live_process_table();
+                for pgid in descendant_process_groups(pid, &table) {
+                    // SAFETY: plain kill(2) on a process group either the
+                    // identity-confirmed pid above or one of its live
+                    // descendants created for itself.
+                    unsafe {
+                        libc::kill(-pgid, libc::SIGKILL);
+                    }
                 }
             }
         }
@@ -837,8 +935,10 @@ async fn collect_child_output(
 
     // Put the child in a task whose cancellation/drop semantics own the
     // immediate process. Join failure and timeout both abort this task,
-    // dropping the kill_on_drop child; `group_guard` above is what reaches
-    // any grandchildren it left behind.
+    // dropping (detaching, not killing — no `kill_on_drop` here) the child;
+    // `group_guard` above is the only thing that actually signals it and
+    // whatever tree it left behind, and it needs the process still alive
+    // and correctly parented to find that tree at all.
     let mut wait_task = tokio::spawn(async move { child.wait().await });
     let mut stdout_task = tokio::spawn(read_capped(stdout));
     let mut stderr_task = tokio::spawn(read_capped(stderr));
@@ -929,8 +1029,10 @@ async fn collect_child_output(
             }
             _ = &mut sleep => {
                 // The child dies here unconditionally: aborting the wait task
-                // drops the `kill_on_drop` child. What an `OnTimeout::Fail`
-                // policy does with this — error out, but only after the
+                // detaches it, and this function returning (below) drops
+                // `group_guard`, whose own tree-walk kill is what actually
+                // signals it. What an `OnTimeout::Fail` policy does with
+                // this — error out, but only after the
                 // caller has had the chance to persist gate-failure evidence —
                 // is the caller's decision, not this function's; it just
                 // reports the outcome (TKT-01M02QT9KTDY2CN6YJEVP3VCF8).
@@ -3981,13 +4083,23 @@ impl WorkflowEngine {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            // Kill the suite if the timeout below drops the wait future, so a
-            // hung check leaves no orphan behind.
-            .kill_on_drop(true)
+            // Deliberately NOT `.kill_on_drop(true)`: that would let
+            // `abort_task`'s `JoinHandle::abort()` (the timeout/error paths
+            // in `collect_child_output`) drop this `Child` — and with
+            // `kill_on_drop` set, SIGKILL its pid — before
+            // `ProcessGroupGuard` gets to snapshot the live descendant tree.
+            // A descendant already reparented to init by then is invisible
+            // to that snapshot's `ppid`-chain walk, exactly the bug this
+            // check's own group-only kill used to have
+            // (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD). Tokio's own orphan reaper
+            // still reaps this child once it exits regardless of
+            // `kill_on_drop`, so nothing here leaks a zombie by omitting it —
+            // `ProcessGroupGuard` is the sole, and sufficient, killer.
+            //
             // Its own process group (mirroring rk-harness's launcher): lets
             // `ProcessGroupGuard` in `collect_child_output` reach every
             // descendant this check spawns (mise/cargo/rustc under `sh -c`),
-            // not just the `sh` wrapper `kill_on_drop` kills on its own.
+            // not just the `sh` wrapper itself.
             .process_group(0);
         // Named checks routinely shell back into `rk` (escalation needs, rework
         // tickets), but the child inherits the DAEMON's environment — and the
@@ -6406,9 +6518,11 @@ test a::flaky ... FAILED
 
     #[tokio::test]
     async fn timeout_kills_the_whole_process_group_not_just_the_wrapper() {
-        // `kill_on_drop` alone only reaches the `sh -c` wrapper's own pid; a
-        // grandchild it backgrounds (mise/cargo/rustc in the real case) is
-        // untouched unless the whole process group is signalled.
+        // No `.kill_on_drop(true)` — mirroring `spawn_check_child` exactly:
+        // the wrapper's own pid alone would never reach a grandchild it
+        // backgrounds (mise/cargo/rustc in the real case) anyway; only the
+        // whole process group being signalled does, which `ProcessGroupGuard`
+        // alone is responsible for.
         let temp = tempfile::tempdir().unwrap();
         let pid_file = temp.path().join("grandchild.pid");
         let command = format!("sleep 600 & echo $! > {}; wait", pid_file.display());
@@ -6417,7 +6531,6 @@ test a::flaky ... FAILED
             .arg(&command)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
             .process_group(0);
         let child = cmd.spawn().unwrap();
 
@@ -6434,6 +6547,72 @@ test a::flaky ... FAILED
         // SAFETY: signal 0 only probes liveness/permission; it affects nothing.
         let alive = unsafe { libc::kill(grandchild_pid, 0) == 0 };
         assert!(!alive, "grandchild `sleep` survived the gate timeout");
+    }
+
+    /// The exact real-world gap (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD): a check
+    /// command that moves part of ITS OWN work into a second, freshly
+    /// created process group — precisely what a live smoke test observed
+    /// `mise run verify` do (the leader stayed in `spawn_check_child`'s
+    /// group; a nested shell/cargo pair ended up in a NEW group of their
+    /// own). The old `kill(-leader_pid, SIGKILL)` reached only the leader's
+    /// group; the nested one survived, reparented to init. Modeled here with
+    /// `perl`'s `setpgrp(0, 0)` (portable, no `setsid`(1) binary required —
+    /// absent on macOS) instead of a real `mise`, since what's under test is
+    /// `ProcessGroupGuard` walking the live descendant tree, not `mise`
+    /// itself.
+    #[tokio::test]
+    async fn timeout_kills_a_nested_process_group_the_check_command_moved_itself_into() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested_pid_file = temp.path().join("nested.pid");
+        let script = temp.path().join("detach.pl");
+        std::fs::write(
+            &script,
+            "setpgrp(0, 0);\n\
+             open(my $fh, '>', $ARGV[0]) or die $!;\n\
+             print $fh $$;\n\
+             close $fh;\n\
+             sleep 300;\n",
+        )
+        .unwrap();
+        let command = format!(
+            "perl {} {} & wait",
+            script.display(),
+            nested_pid_file.display()
+        );
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(&command)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0);
+        let child = cmd.spawn().unwrap();
+
+        let outcome = collect_child_output(child, Duration::from_millis(300), &command)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RunOutcome::TimedOut));
+
+        // Give the perl child a moment to actually call `setpgrp` and write
+        // its own pid before asserting anything — this races the guard's
+        // kill signal against perl's own startup, not just against the
+        // liveness check below.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !nested_pid_file.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid_text = std::fs::read_to_string(&nested_pid_file).unwrap();
+        let nested_pid: i32 = pid_text.trim().parse().unwrap();
+
+        // Give the group-kill signal(s) a moment to land, then confirm the
+        // process that detached into its own group is actually dead, not
+        // merely orphaned under init.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // SAFETY: signal 0 only probes liveness/permission; it affects nothing.
+        let alive = unsafe { libc::kill(nested_pid, 0) == 0 };
+        assert!(
+            !alive,
+            "a descendant that moved itself into a new process group survived the gate timeout"
+        );
     }
 
     /// Polls `ps` STAT rather than raw `kill(pid, 0)`: these sleepers are
@@ -6457,15 +6636,133 @@ test a::flaky ... FAILED
     /// A real process, its own process-group leader (mirroring exactly how
     /// `spawn_check_child` spawns a check), that just sleeps — standing in
     /// for a managed check child in every test below.
+    ///
+    /// Deliberately `sleep 300 & wait`, not a bare `sleep 300`: `sh -c
+    /// '<single simple command>'` is exactly the shape `sh`'s tail-call
+    /// optimization targets — with nothing left to do after the command,
+    /// `sh` `exec`s directly into it instead of forking, which keeps the
+    /// pid but silently changes `comm` from `sh` to `sleep`. That exec can
+    /// land at any point after `spawn()` returns, racing
+    /// `ManagedChildMarker::create`'s `process_signature` capture right
+    /// after it: if the marker was written before the exec but the reap
+    /// sweep's re-check runs after, `reap_stale_managed_children`'s
+    /// identity fence sees a changed `comm` and — correctly, by design —
+    /// refuses to signal what looks like a different process (TKT-
+    /// 01M0PN18QNWPKKARFV4KRWGP6S). Backgrounding the sleep and `wait`ing
+    /// on it gives `sh` more work to do after spawning it, which suppresses
+    /// the tail-call exec: the leader's `comm` stays `sh` for its entire
+    /// life, so its recorded signature can never drift out from under it.
+    /// Mirrors `spawn_sleeper_with_nested_group`'s already-stable `& wait`
+    /// shape below.
     fn spawn_sleeper() -> tokio::process::Child {
         tokio::process::Command::new("sh")
             .arg("-c")
-            .arg("sleep 300")
+            .arg("sleep 300 & wait")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .process_group(0)
             .spawn()
             .unwrap()
+    }
+
+    /// Like [`spawn_sleeper`], but the leader also backgrounds a `perl`
+    /// descendant that moves ITSELF into a second, freshly created process
+    /// group before sleeping (`setpgrp(0, 0)` — portable, no `setsid`(1)
+    /// binary required, which macOS lacks) — modeling exactly what a live
+    /// smoke test found `mise run <task>` do under a real managed check
+    /// leader (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD). Returns the leader `Child`
+    /// together with the nested descendant's own pid, only once that
+    /// descendant has actually reported it.
+    async fn spawn_sleeper_with_nested_group(dir: &Path) -> (tokio::process::Child, u32) {
+        let nested_pid_file = dir.join("nested.pid");
+        let script = dir.join("detach.pl");
+        std::fs::write(
+            &script,
+            "setpgrp(0, 0);\n\
+             open(my $fh, '>', $ARGV[0]) or die $!;\n\
+             print $fh $$;\n\
+             close $fh;\n\
+             sleep 300;\n",
+        )
+        .unwrap();
+        let command = format!(
+            "perl '{}' '{}' & wait",
+            script.display(),
+            nested_pid_file.display()
+        );
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let nested_pid: u32 = loop {
+            if let Ok(text) = std::fs::read_to_string(&nested_pid_file) {
+                if let Ok(pid) = text.trim().parse() {
+                    break pid;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        (child, nested_pid)
+    }
+
+    /// The nested-group counterpart to the identity-fenced reap test below
+    /// (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD): the daemon only ever marks the
+    /// LEADER's pid (`ManagedChildMarker::create` is called once, from
+    /// `spawn_check_child`, on the pid `.process_group(0)` made a leader) —
+    /// never anything it later forks. A daemon generation that dies with a
+    /// check still running whose command (`mise run <task>` in production)
+    /// had already moved part of its own work into a SECOND process group
+    /// must still have that nested group reaped, found by walking the
+    /// leader's live descendant tree at reap time, not just the leader's own
+    /// group.
+    #[tokio::test]
+    async fn reap_stale_managed_children_kills_a_nested_process_group_the_orphaned_child_moved_itself_into(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let script_dir = tempfile::tempdir().unwrap();
+        let (mut child, nested_pid) = spawn_sleeper_with_nested_group(script_dir.path()).await;
+        let pid = child.id().unwrap();
+        assert!(pid_alive(pid), "the leader must be alive before the test");
+        assert!(
+            pid_alive(nested_pid),
+            "the nested descendant must be alive before the test"
+        );
+        assert_ne!(
+            pid, nested_pid,
+            "the nested descendant must be a genuinely different process from the leader"
+        );
+
+        // Simulate the marker surviving its own generation's death, exactly
+        // like the test below — only the LEADER's pid is ever marked.
+        std::mem::forget(ManagedChildMarker::create(&layout, pid));
+        assert!(
+            layout.managed_children_dir().join(pid.to_string()).exists(),
+            "the marker must exist before reaping"
+        );
+
+        reap_stale_managed_children(&layout);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        for target in [pid, nested_pid] {
+            while pid_alive(target) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pid {target} survived reap_stale_managed_children's nested-group walk"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        assert!(
+            !layout.managed_children_dir().join(pid.to_string()).exists(),
+            "the marker must be removed once considered, win or lose"
+        );
+        // Reap the OS zombie: this test process is its direct parent.
+        let _ = child.wait().await;
     }
 
     /// The reap half of item (3) (TKT-01M0PBNGGZTNQPXB16214V4D7M): a marker
@@ -6559,9 +6856,15 @@ test a::flaky ... FAILED
         );
 
         // Cleanup: this decoy is never reaped by design, so kill it by hand
-        // and wait on it ourselves, same as the test above.
+        // and wait on it ourselves, same as the test above. Signal the whole
+        // group (`-decoy_pid`, valid because `spawn_sleeper` makes it its own
+        // leader), not just the leader pid: `spawn_sleeper` backgrounds its
+        // actual `sleep` under `sh -c 'sleep 300 & wait'` to keep the
+        // leader's identity stable (see that function's doc comment), so a
+        // leader-only kill would leave that backgrounded sleep orphaned for
+        // the rest of its 300s.
         let _ = std::process::Command::new("kill")
-            .args(["-9", &decoy_pid.to_string()])
+            .args(["-9", &format!("-{decoy_pid}")])
             .status();
         let _ = decoy.wait().await;
     }
@@ -7482,6 +7785,212 @@ test a::flaky ... FAILED
             .expect("the queued follower must start promptly once the first run is cancelled")
             .expect("the follower's own check must pass");
         assert!(second_marker.exists());
+    }
+
+    /// TKT-01M0PN2JSN24AHGQHFJ4XGAVKD's exact real-world gap, exercised
+    /// through the REAL production cancellation path (`verify_repo_check`'s
+    /// `tokio::select!` against `cancel_managed_verification_for_agent`), not
+    /// `collect_child_output` called directly: a check command that moves
+    /// part of its own work into a SECOND process group (`mise run <task>`
+    /// in production; modeled here with `perl`'s `setpgrp(0, 0)`, portable
+    /// and needing no `setsid`(1) binary — absent on macOS) must have that
+    /// nested group killed too, not just its leader's. Also proves the two
+    /// other properties this fix must not regress: the admission permit is
+    /// still released promptly (the queued follower still starts), and the
+    /// tree-walk kill touches ONLY this check's own descendants — a
+    /// completely unrelated process, its own group, spawned independently
+    /// of any managed check, survives the cancellation untouched.
+    #[tokio::test]
+    async fn cancelling_a_managed_verification_run_kills_its_nested_process_group_frees_the_queued_follower_and_spares_unrelated_processes(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        engine
+            .supervisor
+            .set_verification_admission_limits(1, HashMap::new());
+
+        // An UNRELATED process, its own independent group, with no
+        // connection whatsoever to the managed check machinery under test —
+        // the negative control for "no unrelated process/group is killed".
+        let unrelated_dir = tempfile::tempdir().unwrap();
+        let unrelated_pid_file = unrelated_dir.path().join("unrelated.pid");
+        let mut unrelated_cmd = tokio::process::Command::new("sh");
+        unrelated_cmd
+            .arg("-c")
+            .arg(format!(
+                "echo $$ > '{}'; sleep 30",
+                unrelated_pid_file.display()
+            ))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let mut unrelated_child = unrelated_cmd.spawn().unwrap();
+        let unrelated_pid: i32 = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&unrelated_pid_file) {
+                    if let Ok(pid) = text.trim().parse() {
+                        break pid;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "unrelated sibling process never reported its own pid"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let pid_file = repo_dir.path().join("child.pid");
+        let nested_pid_file = repo_dir.path().join("nested.pid");
+        let script = repo_dir.path().join("detach.pl");
+        std::fs::write(
+            &script,
+            "setpgrp(0, 0);\n\
+             open(my $fh, '>', $ARGV[0]) or die $!;\n\
+             print $fh $$;\n\
+             close $fh;\n\
+             sleep 300;\n",
+        )
+        .unwrap();
+        write_check(
+            repo_dir.path(),
+            "verify",
+            &format!(
+                "echo $$ > '{}'; perl '{}' '{}' & wait",
+                pid_file.display(),
+                script.display(),
+                nested_pid_file.display()
+            ),
+            true,
+        );
+
+        let generation = rk_core::id::SpawnId::new();
+        let first = engine.verify_repo_check(
+            "Whisker",
+            repo_dir.path(),
+            "nested-cancel-test-repo",
+            "verify",
+            Some(generation),
+            "req-1",
+        );
+        tokio::pin!(first);
+
+        // Poll until BOTH the leader and its self-detached nested descendant
+        // have reported their own pids — proof there is a genuine two-group
+        // tree to kill, not just a leader that hasn't forked its nested
+        // group yet.
+        let child_pid: i32 = loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                        if let Ok(pid) = text.trim().parse() {
+                            break pid;
+                        }
+                    }
+                }
+                _ = &mut first => panic!("the check must not settle on its own before it's cancelled"),
+            }
+        };
+        let nested_pid: i32 = loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                    if let Ok(text) = std::fs::read_to_string(&nested_pid_file) {
+                        if let Ok(pid) = text.trim().parse() {
+                            break pid;
+                        }
+                    }
+                }
+                _ = &mut first => panic!("the check must not settle on its own before it's cancelled"),
+            }
+        };
+        assert_ne!(
+            child_pid, nested_pid,
+            "the nested descendant must be a genuinely different process from the leader"
+        );
+
+        // A second call for the SAME repo, still bound by the admission
+        // limit of 1: it must not even start while the first holds the
+        // permit.
+        let second_dir = tempfile::tempdir().unwrap();
+        let second_marker = second_dir.path().join("ran");
+        write_check(
+            second_dir.path(),
+            "verify",
+            &format!("touch '{}'", second_marker.display()),
+            true,
+        );
+        let second = engine.verify_repo_check(
+            "Nibble",
+            second_dir.path(),
+            "nested-cancel-test-repo",
+            "verify",
+            None,
+            "req-2",
+        );
+        tokio::pin!(second);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            _ = &mut second => panic!("the follower must stay queued behind the first run's admission permit"),
+        }
+        assert!(
+            !second_marker.exists(),
+            "the queued follower must not have started yet"
+        );
+
+        // Cancel exactly like `Supervisor::interrupt` does.
+        engine.supervisor.cancel_managed_verification_for_agent(
+            "Whisker",
+            Some(generation),
+            "agent_interrupt",
+        );
+
+        let error = first
+            .await
+            .expect_err("a cancelled run must return an error, not a verdict");
+        assert!(
+            error.to_string().contains("cancelled"),
+            "unexpected error: {error}"
+        );
+
+        // Both the leader AND the nested descendant it moved into a group of
+        // its own must actually be gone shortly after — proof the tree-walk
+        // reached the nested group, not just the leader's own.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        for pid in [child_pid, nested_pid] {
+            loop {
+                // Signal 0: existence check only, no signal actually delivered.
+                let alive = unsafe { libc::kill(pid, 0) == 0 };
+                if !alive {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "process {pid} is still alive after cancellation"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        // The queued follower must now proceed promptly — the admission
+        // permit was released as part of cancellation, not left held until
+        // its own timeout.
+        tokio::time::timeout(Duration::from_secs(5), &mut second)
+            .await
+            .expect("the queued follower must start promptly once the first run is cancelled")
+            .expect("the follower's own check must pass");
+        assert!(second_marker.exists());
+
+        // The negative control: a process with no relation to the cancelled
+        // check's tree must be completely unaffected.
+        let unrelated_alive = unsafe { libc::kill(unrelated_pid, 0) == 0 };
+        assert!(
+            unrelated_alive,
+            "an unrelated process must survive a cancellation it had nothing to do with"
+        );
+        let _ = unrelated_child.start_kill();
+        let _ = unrelated_child.wait().await;
     }
 
     /// The ticket's explicit shared-bound goal: a landing gate (which calls

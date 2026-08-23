@@ -83,6 +83,44 @@ fn install_verify_check(dir: &Path) {
     git(dir, &["commit", "-m", "test: install verify check"]);
 }
 
+/// Like [`install_verify_check`], but the check's leader ALSO backgrounds a
+/// `perl` descendant that moves itself into a second, freshly created
+/// process group before sleeping (`setpgrp(0, 0)` — portable, no
+/// `setsid`(1) binary required, which macOS lacks) — modeling exactly what
+/// a live smoke test found `mise run verify` do
+/// (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD): the leader stayed in
+/// `spawn_check_child`'s own group, but a nested shell/cargo pair ended up
+/// in a NEW group of their own, which the daemon's old group-only kill never
+/// reached. Writes both `verify.pid` (the leader) and `nested.pid` (the
+/// self-detached descendant) — both committed, like the check script
+/// itself, so a live agent's own worktree checkout actually sees them.
+fn install_nested_verify_check(dir: &Path) {
+    let rk_dir = dir.join(".rk");
+    std::fs::create_dir_all(&rk_dir).unwrap();
+    std::fs::write(
+        rk_dir.join("detach.pl"),
+        "setpgrp(0, 0);\n\
+         open(my $fh, '>', 'nested.pid') or die $!;\n\
+         print $fh $$;\n\
+         close $fh;\n\
+         sleep 300;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        rk_dir.join("checks.cue"),
+        r#"checks: [
+    {name: "verify", command: "echo $$ > verify.pid; perl .rk/detach.pl & wait", timeout: "30s", environmentPolicy: "strip_rk_spawn"},
+]
+"#,
+    )
+    .unwrap();
+    git(dir, &["add", ".rk/checks.cue", ".rk/detach.pl"]);
+    git(
+        dir,
+        &["commit", "-m", "test: install nested-group verify check"],
+    );
+}
+
 /// rk-daemon doesn't own the `rk` binary, so cargo never sets
 /// `CARGO_BIN_EXE_rk` for this test binary — fall back to the real target
 /// dir, same resolution `foreman.rs` uses.
@@ -436,6 +474,59 @@ async fn interrupting_a_live_agent_kills_its_own_in_flight_verify_run() {
         .unwrap();
 
     wait_for_death(child_pid).await;
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+/// The exact real-world gap this ticket fixes (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD),
+/// proven over the real daemon-over-socket path a live smoke test actually
+/// hit: `rk interrupt <agent>` while its `verify.run` check has already
+/// moved part of its own work into a SECOND process group. Broadens
+/// [`interrupting_a_live_agent_kills_its_own_in_flight_verify_run`] with
+/// [`install_nested_verify_check`] instead of [`install_verify_check`] and
+/// asserts on BOTH the leader and the nested descendant — the leader alone
+/// dying was already true before this fix (killpg on its own group), so
+/// this only earns its keep by checking the nested one too.
+#[tokio::test]
+async fn interrupting_a_live_agent_kills_a_nested_process_group_its_verify_run_moved_itself_into() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    install_nested_verify_check(repo_dir.path());
+
+    let rk = rk_bin();
+    std::env::set_var(
+        "RK_FAKE_HARNESS_CMD",
+        fixture::with_rk_done(&hold_for_verify_script(&rk)),
+    );
+
+    let mut client = start_daemon(&layout).await;
+    let (agent, worktree) =
+        spawn_verify_holder(&mut client, repo_dir.path(), "nested-interrupt-cancel").await;
+
+    let child_pid = wait_for_pid(&worktree.join("verify.pid")).await;
+    let nested_pid = wait_for_pid(&worktree.join("nested.pid")).await;
+    assert_ne!(
+        child_pid, nested_pid,
+        "the nested descendant must be a genuinely different process from the leader"
+    );
+    assert!(
+        process_alive(child_pid),
+        "the agent's own verify run must have a real leader child alive before interrupt"
+    );
+    assert!(
+        process_alive(nested_pid),
+        "the check's self-detached descendant must be alive before interrupt"
+    );
+
+    client
+        .call("agent.interrupt", json!({"name": agent}))
+        .await
+        .unwrap();
+
+    wait_for_death(child_pid).await;
+    wait_for_death(nested_pid).await;
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
