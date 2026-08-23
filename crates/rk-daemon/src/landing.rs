@@ -3295,6 +3295,15 @@ impl LandingPipeline {
             target: entry.target.clone(),
             landed_at: Utc::now().to_rfc3339(),
         };
+        let _ = crate::span::record_phase_span(
+            &self.space,
+            &entry.repo_name,
+            "daemon",
+            &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::Merge)
+                .repo(&entry.repo_name)
+                .target(&entry.target)
+                .candidate(merge_commit),
+        );
         match self.tickets.record_delivery(&entry.task, &record).await {
             Ok(_) => info!(
                 task = %entry.task,
@@ -3511,6 +3520,16 @@ impl LandingPipeline {
     ) -> rk_core::Result<()> {
         self.escalate(entry, ctx.escalation(withheld))?;
         self.record_rework_state(entry, ctx, attempt, withheld.code)?;
+        let _ = crate::span::record_phase_span(
+            &self.space,
+            &entry.repo_name,
+            "daemon",
+            &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::AttentionHold)
+                .attempt(attempt)
+                .repo(&entry.repo_name)
+                .authority(crate::span::Authority::Human)
+                .terminal_reason(withheld.code),
+        );
         Ok(())
     }
 
@@ -3726,6 +3745,16 @@ impl LandingPipeline {
 
         // Marker first: replay gates an interrupted spawn instead of duplicating it.
         self.record_rework_state(entry, &ctx, attempt, "dispatching")?;
+        let _ = crate::span::record_phase_span(
+            &self.space,
+            &entry.repo_name,
+            "daemon",
+            &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::SemanticReview)
+                .attempt(attempt)
+                .repo(&entry.repo_name)
+                .authority(crate::span::Authority::Llm)
+                .terminal_reason("rework-requested"),
+        );
 
         let params = crate::supervisor::SpawnParams {
             repo: entry.repo_path.clone(),
@@ -3758,6 +3787,16 @@ impl LandingPipeline {
                 // Terminal marker: a redelivery must never read this dispatch
                 // as interrupted just because the spawn journaled cleanly.
                 self.record_rework_state(entry, &ctx, attempt, "dispatched")?;
+                let _ = crate::span::record_phase_span(
+                    &self.space,
+                    &entry.repo_name,
+                    "daemon",
+                    &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::Rework)
+                        .attempt(attempt)
+                        .repo(&entry.repo_name)
+                        .authority(crate::span::Authority::Llm)
+                        .terminal_reason("dispatched"),
+                );
                 if let Err(e) = self
                     .tickets
                     .update(
@@ -3856,6 +3895,16 @@ impl LandingPipeline {
     ) -> rk_core::Result<()> {
         self.escalate(entry, ctx.escalation(withheld))?;
         self.record_conflict_state(entry, ctx, attempt, withheld.code)?;
+        let _ = crate::span::record_phase_span(
+            &self.space,
+            &entry.repo_name,
+            "daemon",
+            &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::AttentionHold)
+                .attempt(attempt)
+                .repo(&entry.repo_name)
+                .authority(crate::span::Authority::Human)
+                .terminal_reason(withheld.code),
+        );
         Ok(())
     }
 
@@ -4164,6 +4213,16 @@ impl LandingPipeline {
                 ),
             }),
         ))?;
+        let _ = crate::span::record_phase_span(
+            &self.space,
+            &entry.repo_name,
+            "daemon",
+            &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::AttentionHold)
+                .attempt(attempt)
+                .repo(&entry.repo_name)
+                .authority(crate::span::Authority::Llm)
+                .terminal_reason("awaiting-orchestrator-decision"),
+        );
         info!(
             repo = %entry.repo_name, branch = %entry.branch, head_sha = %entry.head_sha,
             ticket = %ctx.rework_ticket, attempt,
@@ -4949,6 +5008,20 @@ impl LandingPipeline {
             )
             .with_lifecycle(Lifecycle::Furniture),
         )?;
+        let _ = crate::span::record_phase_span(
+            &self.space,
+            &entry.repo_name,
+            "daemon",
+            &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::LandingPrep)
+                .repo(&entry.repo_name)
+                .target(&entry.target)
+                .candidate(tested_sha)
+                .proof_kind(if full_check_required {
+                    "full-final"
+                } else {
+                    "focused-inner"
+                }),
+        );
 
         let id = format!("landing:{}", entry.branch);
         for (check, env, timeout) in plan {
@@ -5170,6 +5243,30 @@ impl LandingPipeline {
             )
             .with_lifecycle(Lifecycle::Furniture),
         )?;
+        let total_queue_wait_ms = queue_wait_ms
+            .iter()
+            .filter_map(|(_, wait)| *wait)
+            .sum::<u64>();
+        let _ = crate::span::record_phase_span(
+            &self.space,
+            &entry.repo_name,
+            "daemon",
+            &crate::span::PhaseSpan::from_durations(
+                &entry.task,
+                crate::span::Phase::VerificationQueued,
+                Some(total_queue_wait_ms),
+                u64::try_from(started.elapsed().as_millis()).ok(),
+                Utc::now(),
+            )
+            .repo(&entry.repo_name)
+            .target(&entry.target)
+            .candidate(tested_sha)
+            .proof_kind(if full_check_required {
+                "full-final"
+            } else {
+                "focused-inner"
+            }),
+        );
         Ok(GateRunOutcome::Pass)
     }
 
@@ -12511,6 +12608,18 @@ checks: [
             json!(["steward-protected-paths", "steward-diff-scope", "verify"])
         );
         assert!(!plans[0].payload["proof_key"].is_null());
+
+        // The task-to-main span substrate rides alongside these same two
+        // events: a `landing_prep` span from the edge plan and a
+        // `verification` span from the settled gate run, both correlated on
+        // the ticket id and both idempotent (a second `run_gates` over the
+        // same candidate must not double them).
+        let spans = crate::span::spans_for_task(&space, "direct-repo", "add src").unwrap();
+        let phases: std::collections::BTreeSet<&str> =
+            spans.iter().map(|s| s["phase"].as_str().unwrap()).collect();
+        assert!(phases.contains("landing_prep"));
+        assert!(phases.contains("verification"));
+        assert_eq!(phases.len(), 2);
     }
 
     #[tokio::test]

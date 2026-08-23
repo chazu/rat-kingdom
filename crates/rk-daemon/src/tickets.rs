@@ -466,6 +466,7 @@ impl Tickets {
             return Ok(false);
         };
         let open = existing.payload.get("status").and_then(Value::as_str) == Some("open");
+        let scope = existing.scope.clone();
         let mut payload = existing.payload.clone();
         if open {
             if let Some(obj) = payload.as_object_mut() {
@@ -476,6 +477,16 @@ impl Tickets {
         // Always write the ticket back — with the new status on a win, unchanged
         // on a loss — so a losing claim never destroys the ticket it took.
         self.space.out(with_payload(existing, payload))?;
+        if open {
+            // Best-effort span: the claim itself already landed above and must
+            // never be undone by a telemetry failure.
+            let _ = crate::span::record_phase_span(
+                &self.space,
+                &scope,
+                &self.castle,
+                &crate::span::PhaseSpan::new(id, crate::span::Phase::Claimed),
+            );
+        }
         Ok(open)
     }
 
@@ -830,6 +841,13 @@ impl Tickets {
         if let Err(e) = self.space.out(event) {
             warn!(ticket = %ticket.identity, error = %e, "failed to emit ticket_closed event");
         }
+        let mut span =
+            crate::span::PhaseSpan::new(&ticket.identity, crate::span::Phase::DeliveryClosure)
+                .terminal_reason(status.to_string());
+        if let Some(record) = delivery_of(ticket) {
+            span = span.candidate(record.merge_commit).target(record.target);
+        }
+        let _ = crate::span::record_phase_span(&self.space, &ticket.scope, &self.castle, &span);
     }
 }
 
@@ -1319,6 +1337,22 @@ mod tests {
         assert!(!t.claim("TKT-999").await.unwrap());
     }
 
+    /// The claim producer wires into the task-to-main span substrate: a won
+    /// claim records exactly one `Claimed` span, a losing replay of the same
+    /// claim call records no second one (idempotent on `(task, phase,
+    /// attempt)`, `crate::span`).
+    #[tokio::test]
+    async fn claim_records_a_claimed_phase_span_exactly_once() {
+        let (t, space) = tickets_with_space();
+        let a = t.create(new("x", "r", None)).await.unwrap();
+        assert!(t.claim(&a.identity).await.unwrap());
+        assert!(!t.claim(&a.identity).await.unwrap(), "already in_progress");
+
+        let spans = crate::span::spans_for_task(&space, &a.scope, &a.identity).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["phase"], "claimed");
+    }
+
     // Two drains race to claim a shared backlog; the atomic claim must hand each
     // ticket to exactly one of them (never both), so no ticket is double-grabbed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1380,6 +1414,20 @@ mod tests {
         assert_eq!(ev.scope, "myrepo", "event is scoped to the ticket's repo");
         assert_eq!(ev.payload["ticket"], json!(a.identity));
         assert_eq!(ev.payload["status"], json!("closed"));
+
+        let spans = crate::span::spans_for_task(&space, "myrepo", &a.identity).unwrap();
+        assert_eq!(spans.len(), 1, "exactly one delivery-closure span");
+        assert_eq!(spans[0]["phase"], "delivery_closure");
+        assert_eq!(spans[0]["candidate"], "abc123");
+
+        // Re-recording the same delivery replays the undelivered->delivered
+        // edge guard (see `record_delivery`'s own doc) and must not record a
+        // second span on top of it.
+        t.record_delivery(&a.identity, &record("abc123"))
+            .await
+            .unwrap();
+        let spans = crate::span::spans_for_task(&space, "myrepo", &a.identity).unwrap();
+        assert_eq!(spans.len(), 1, "replayed delivery does not double-count");
     }
 
     #[tokio::test]
