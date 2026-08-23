@@ -1439,7 +1439,9 @@ impl Supervisor {
     /// [`crate::agents::Lane`].
     pub(crate) fn lane_admission_limit_for(&self, repo: &str, lane: crate::agents::Lane) -> usize {
         (match lane {
-            crate::agents::Lane::Implementation => self.implementation_admission_limits.limit_for(repo),
+            crate::agents::Lane::Implementation => {
+                self.implementation_admission_limits.limit_for(repo)
+            }
             crate::agents::Lane::Review => self.review_admission_limits.limit_for(repo),
         }) as usize
     }
@@ -7821,9 +7823,7 @@ mod respawn_tests {
              double-launched: {results:?}"
         );
 
-        let unrelated = sup
-            .spawn_async(spawn_params(repo_b.path(), "b-0"), 0)
-            .await;
+        let unrelated = sup.spawn_async(spawn_params(repo_b.path(), "b-0"), 0).await;
         assert!(
             unrelated.is_ok(),
             "repo-b's unconfigured (unbounded) lane must not be affected by repo-a's \
@@ -7892,8 +7892,7 @@ mod respawn_tests {
         drop(before_restart);
 
         let after_restart = supervisor(home.path());
-        after_restart
-            .set_implementation_admission_limits(0, HashMap::from([(repo_name, 1)]));
+        after_restart.set_implementation_admission_limits(0, HashMap::from([(repo_name, 1)]));
         let refused = after_restart
             .spawn_async(spawn_params(repo.path(), "post-restart"), 0)
             .await;
@@ -8006,8 +8005,7 @@ mod respawn_tests {
         drop(before_restart);
 
         let after_restart = supervisor(home.path());
-        after_restart
-            .set_implementation_admission_limits(0, HashMap::from([(repo_name, 1)]));
+        after_restart.set_implementation_admission_limits(0, HashMap::from([(repo_name, 1)]));
 
         // A brand-new request, never queued anywhere, must still lose to the
         // waiter the predecessor process recorded before it died.

@@ -1218,7 +1218,10 @@ impl Default for PolicyConfig {
             verification_admission_limit: 0,
             verification_admission_limit_by_repo: BTreeMap::new(),
             implementation_admission_limit: 0,
-            implementation_admission_limit_by_repo: BTreeMap::from([("rat-kingdom".to_string(), 2)]),
+            implementation_admission_limit_by_repo: BTreeMap::from([(
+                "rat-kingdom".to_string(),
+                2,
+            )]),
             review_admission_limit: 0,
             review_admission_limit_by_repo: BTreeMap::new(),
         }

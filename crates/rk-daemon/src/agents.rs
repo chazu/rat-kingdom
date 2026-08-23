@@ -599,7 +599,13 @@ impl Registry {
     /// eventually call [`release_lane_wip`](Registry::release_lane_wip) with
     /// the same `repo`/`lane`/`cap` exactly once, mirroring `try_reserve_wip`'s
     /// contract.
-    pub(crate) fn try_reserve_lane_wip(&mut self, repo: &str, lane: Lane, cap: usize, key: &str) -> bool {
+    pub(crate) fn try_reserve_lane_wip(
+        &mut self,
+        repo: &str,
+        lane: Lane,
+        cap: usize,
+        key: &str,
+    ) -> bool {
         if cap == 0 {
             return true;
         }
@@ -755,7 +761,10 @@ impl Registry {
     }
 
     fn persist_lane_waiters(&self) -> rk_core::Result<()> {
-        write_atomic(&self.lane_waiters_path, &serde_json::to_vec_pretty(&self.lane_waiters)?)
+        write_atomic(
+            &self.lane_waiters_path,
+            &serde_json::to_vec_pretty(&self.lane_waiters)?,
+        )
     }
 
     /// Mark all live agents orphaned (called once at daemon startup).

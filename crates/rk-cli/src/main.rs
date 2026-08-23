@@ -1006,9 +1006,7 @@ async fn main() -> Result<()> {
                         // repos with an explicit override or a live agent are
                         // reported at all (see `Supervisor::capacity_summary`),
                         // so this stays silent for a fleet that hasn't opted in.
-                        for (repo, lanes) in
-                            status["capacity"].as_object().into_iter().flatten()
-                        {
+                        for (repo, lanes) in status["capacity"].as_object().into_iter().flatten() {
                             for lane in ["implementation", "review", "verification"] {
                                 let Some(entry) = lanes.get(lane) else {
                                     continue;

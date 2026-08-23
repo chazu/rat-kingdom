@@ -315,7 +315,10 @@ async fn implementation_burst_across_all_three_dispatch_paths_stays_bounded_and_
             let reviewer_live = agents.iter().any(|a| {
                 a["repo_name"].as_str() == Some(repo_name.as_str())
                     && a["role"].as_str() == Some("reviewer")
-                    && matches!(a["state"].as_str(), Some("spawning") | Some("running") | Some("completed"))
+                    && matches!(
+                        a["state"].as_str(),
+                        Some("spawning") | Some("running") | Some("completed")
+                    )
             });
             if reviewer_live {
                 reviewer_went_live_at = Some(reviewer_spawn_started.elapsed());
@@ -426,7 +429,10 @@ async fn implementation_burst_across_all_three_dispatch_paths_stays_bounded_and_
         .iter()
         .filter(|a| a["role"].as_str() == Some("reviewer"))
         .count();
-    assert_eq!(reviewer_count, 1, "exactly one reviewer agent, no duplicate");
+    assert_eq!(
+        reviewer_count, 1,
+        "exactly one reviewer agent, no duplicate"
+    );
 
     // Every ticket was claimed exactly once — none left stranded `ready`/`open`.
     let tickets = client
@@ -437,7 +443,12 @@ async fn implementation_burst_across_all_three_dispatch_paths_stays_bounded_and_
         .as_array()
         .unwrap()
         .iter()
-        .filter(|t| matches!(t["payload"]["status"].as_str(), Some("ready") | Some("open")))
+        .filter(|t| {
+            matches!(
+                t["payload"]["status"].as_str(),
+                Some("ready") | Some("open")
+            )
+        })
         .count();
     assert_eq!(
         stranded, 0,

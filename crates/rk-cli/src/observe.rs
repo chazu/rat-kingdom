@@ -163,7 +163,9 @@ fn print_capacity_section(capacity: &Value) {
                     ),
                     _ => String::new(),
                 };
-                lines.push(format!("  {repo} {lane}: {occupied}/{limit} ({reason}){queue}"));
+                lines.push(format!(
+                    "  {repo} {lane}: {occupied}/{limit} ({reason}){queue}"
+                ));
             }
         }
     }
