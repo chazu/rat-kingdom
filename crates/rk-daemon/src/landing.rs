@@ -5421,9 +5421,9 @@ impl LandingPipeline {
         tested_sha: &str,
         check: &rk_workflow::Check,
     ) -> rk_core::Result<Option<Value>> {
-        if let Some(hit) = self
-            .engine
-            .lookup_verification_proof(&entry.repo_name, tested_sha, check)
+        if let Some(hit) =
+            self.engine
+                .lookup_verification_proof(&entry.repo_name, tested_sha, check)
         {
             return Ok(Some(hit));
         }
@@ -13420,7 +13420,10 @@ checks: [
         git(repo_dir.path(), &["checkout", "main"]);
         std::fs::write(repo_dir.path().join("other.rs"), "fn y() {}\n").unwrap();
         git(repo_dir.path(), &["add", "."]);
-        git(repo_dir.path(), &["commit", "-m", "feat: unrelated main commit"]);
+        git(
+            repo_dir.path(),
+            &["commit", "-m", "feat: unrelated main commit"],
+        );
 
         let candidate = match git_repo.prepare_merge("feature", "main").unwrap() {
             rk_git::PrepareOutcome::Prepared(candidate) => candidate,
