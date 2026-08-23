@@ -4148,6 +4148,13 @@ impl LandingPipeline {
                 "target": ctx.target,
                 "merged": false,
                 "pr_opened": false,
+                // Distinguishes THIS chain from a later, distinct conflict on
+                // the same branch: `reconcile::conflict_held_landing` folds
+                // this into the violation id, so a second conflict after this
+                // one is corrected gets its own attention item and decision
+                // record rather than replaying (or being permanently blocked
+                // behind the cursor of) this chain's own terminal decision.
+                "chain_key": ctx.dispatch_key(),
                 "detail": format!(
                     "merge conflict held for a bounded Orchestrator-authority correction \
                      decision (attempt {attempt} of this repository's cap, ticket {}); resolve \
@@ -4224,13 +4231,8 @@ impl LandingPipeline {
             .payload
             .get("state")
             .and_then(Value::as_str)
-            .unwrap_or_default();
-        if state != landing_conflict::CONFLICT_STATE_AWAITING_DECISION {
-            return Ok(format!(
-                "conflict-correction chain for {repo}/{branch} is already '{state}'; not \
-                 re-dispatching"
-            ));
-        }
+            .unwrap_or_default()
+            .to_string();
         let ctx = ConflictContext::from_marker_payload(&marker.payload).ok_or_else(|| {
             rk_core::Error::other(format!(
                 "conflict dispatch marker for {repo}/{branch} is missing a required field"
@@ -4242,29 +4244,79 @@ impl LandingPipeline {
             .and_then(Value::as_u64)
             .and_then(|a| u32::try_from(a).ok())
             .unwrap_or(1);
-        // A crash between this call recording "dispatching" and the spawn
-        // actually journaling looks identical to a fresh, never-attempted
-        // hold — the same ambiguity `route_conflict`'s own top-of-function
-        // guard resolves for the original dispatch path. Detect and hold for
-        // a human rather than guess.
-        if self.conflict_dispatch_has_state(&ctx, "dispatching")?
-            && !self.conflict_agent_was_journaled(&ctx)
-        {
-            let entry = Self::synthetic_conflict_entry(&ctx);
-            let withheld = Withheld {
-                code: "dispatch-interrupted",
-                detail: format!(
-                    "a durable dispatch attempt exists for correction ticket {} based on {} at \
-                     {}, but the supervisor registry contains no rat for it; the daemon may have \
-                     stopped between recording the marker and journaling the spawn",
-                    ctx.rework_ticket, ctx.branch, ctx.head_sha
-                ),
-                decision: "confirm that no correction agent exists, then dispatch the recorded \
-                           correction ticket exactly once or abandon it"
-                    .into(),
-            };
-            self.withhold_conflict(&entry, &ctx, attempt, &withheld)?;
-            return Err(rk_core::Error::other(withheld.detail));
+
+        // Every state but the one this call is meant to act on is handled
+        // explicitly — never a blanket "not awaiting-decision, so already
+        // done" — because that blanket check previously made the
+        // `"dispatching"`-without-a-journaled-agent crash window below
+        // UNREACHABLE: this match now runs BEFORE any journal check, so a
+        // retry after a crash between recording `"dispatching"` and the
+        // spawn actually journaling can still be told apart from a genuine
+        // prior success, rather than short-circuiting to a false `Ok` that
+        // `Server::execute_orchestrator`/`attention.decide` would then
+        // journal as a resolved decision and advance the lease cursor past
+        // — with zero worker ever dispatched.
+        match state.as_str() {
+            landing_conflict::CONFLICT_STATE_AWAITING_DECISION => {}
+            "dispatched" => {
+                return Ok(format!(
+                    "conflict-correction chain for {repo}/{branch} already dispatched (ticket \
+                     {}); not re-dispatching",
+                    ctx.rework_ticket
+                ));
+            }
+            "dispatching" if self.conflict_agent_was_journaled(&ctx) => {
+                // The spawn DID succeed — only the terminal "dispatched"
+                // marker write never completed. Converging on success here
+                // is correct, not a guess: the supervisor's own durable
+                // journal is the proof.
+                return Ok(format!(
+                    "conflict-correction chain for {repo}/{branch} already dispatched \
+                     (journaled, ticket {}); not re-dispatching",
+                    ctx.rework_ticket
+                ));
+            }
+            "dispatching" => {
+                // A crash between this call recording "dispatching" and the
+                // spawn actually journaling looks identical to a fresh,
+                // never-attempted hold — the same ambiguity
+                // `route_conflict`'s own top-of-function guard resolves for
+                // the original dispatch path. Fail closed with a truthful
+                // interruption gate rather than guessing either way; guarded
+                // so a repeated retry does not raise a second human gate for
+                // the exact same interruption.
+                let entry = Self::synthetic_conflict_entry(&ctx);
+                let withheld = Withheld {
+                    code: "dispatch-interrupted",
+                    detail: format!(
+                        "a durable dispatch attempt exists for correction ticket {} based on {} \
+                         at {}, but the supervisor registry contains no rat for it; the daemon \
+                         may have stopped between recording the marker and journaling the spawn",
+                        ctx.rework_ticket, ctx.branch, ctx.head_sha
+                    ),
+                    decision: "confirm that no correction agent exists, then dispatch the \
+                               recorded correction ticket exactly once or abandon it"
+                        .into(),
+                };
+                if !self.conflict_dispatch_has_state(&ctx, "dispatch-interrupted")? {
+                    self.withhold_conflict(&entry, &ctx, attempt, &withheld)?;
+                }
+                return Err(rk_core::Error::other(withheld.detail));
+            }
+            other => {
+                // A terminal human gate already raised for this exact chain
+                // (`dispatch-refused`, `conflicted-head-moved`,
+                // `dispatch-interrupted`) — retrying must never silently
+                // report success behind an unresolved gate. Refusing here
+                // (rather than a blanket `Ok`) keeps the decision journal
+                // entry `resolved: false, terminal: false`: retryable once a
+                // human clears the gate, never permanently poisoned as
+                // "already decided" and never falsely marked done.
+                return Err(rk_core::Error::other(format!(
+                    "conflict-correction chain for {repo}/{branch} is already terminally \
+                     '{other}'; resolve the existing human gate before retrying"
+                )));
+            }
         }
 
         let git_repo = {

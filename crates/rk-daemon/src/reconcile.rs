@@ -348,8 +348,29 @@ fn conflict_held_landing(lands: &[Tuple], git: &GitFacts) -> Vec<Violation> {
                 .and_then(Value::as_str)
                 .filter(|d| !d.trim().is_empty())
                 .unwrap_or("no detail recorded");
+            // Distinct held conflicts on the SAME branch (this one corrected,
+            // then a later, genuinely new conflict) must never share an id:
+            // `find_decision`'s terminal-replay lookup and the orchestrator
+            // lease's cursor both key off `Violation::id` alone, so a shared
+            // id would either replay the OLD chain's decision forever or
+            // leave the new chain permanently behind the cursor. A land with
+            // no `chain_key` (the pre-existing workflow-`land`-step source of
+            // this same violation kind) falls back to the bare
+            // `kind:scope:branch` id, unchanged from before this field
+            // existed.
+            let chain_key = t.payload.get("chain_key").and_then(Value::as_str);
+            let id = match chain_key {
+                Some(chain_key) => format!(
+                    "{}:{}:{}:{}",
+                    kind::CONFLICT_HELD_LANDING,
+                    t.scope,
+                    branch,
+                    chain_key
+                ),
+                None => format!("{}:{}:{}", kind::CONFLICT_HELD_LANDING, t.scope, branch),
+            };
             Some(Violation {
-                id: format!("{}:{}:{}", kind::CONFLICT_HELD_LANDING, t.scope, branch),
+                id,
                 kind: kind::CONFLICT_HELD_LANDING.into(),
                 scope: t.scope.clone(),
                 subject: branch.to_string(),
