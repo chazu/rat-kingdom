@@ -139,18 +139,40 @@ rework and the landing-dedup fix) with no semantic conflicts remaining.
   — forces `lane_waiters.json` to be unwritable (chmod) and proves admission
   fails closed rather than silently proceeding on an undurable clear.
 
-`crates/rk-daemon/tests/capacity_lanes_dispatch_load.rs` (new, real daemon
-over a socket): drives a genuine implementation burst against ONE repository
-through all three real dispatch callers simultaneously — drain's own refill
-loop, a workflow `for_each` fan-out, and direct operator `agent.spawn` calls,
-all competing for the same six-ticket pool / lane cap of 2 — while a
-concurrent reviewer spawn proves the review lane (cap 1) is never starved.
-Asserts: peak live non-reviewer agents for the repo never exceeds 2 across
-all three paths at once; the reviewer starts within 10s despite the burst;
-the fan-out still completes; every ticket is claimed exactly once (no
-stranding, no double-claim between drain and the fan-out sharing one pool);
-and the final agent count is exactly 9 (6 tickets + 2 operator + 1 reviewer)
-— no duplicate launches anywhere. Stable across repeated runs.
+`crates/rk-daemon/tests/capacity_lanes_dispatch_load.rs` (real daemon over a
+socket): drives a genuine implementation burst against ONE repository through
+all three real dispatch callers simultaneously — drain's own refill loop, a
+workflow `for_each` fan-out, and direct operator `agent.spawn` calls, all
+competing for the same six-ticket pool / lane cap of 2 — while a concurrent
+reviewer spawn proves the review lane (cap 1) is never starved, AND a
+concurrent operator `verify.run` call proves the wholly independent
+verification lane (cap 1) is never starved either. Asserts: peak live
+non-reviewer agents for the repo never exceeds 2 across all three
+implementation paths at once; the reviewer starts within 10s despite the
+burst; the `verify.run` call — spawned as its own task the moment the burst
+begins, racing the drain/fan-out/operator saturation for real, not run after
+it settles — starts and completes within 10s, returns `verdict: "pass"`
+/`exit: 0`, and its check script (which appends to a log file on every
+execution) proves it ran EXACTLY once; the fan-out still completes; every
+ticket is claimed exactly once (no stranding, no double-claim between drain
+and the fan-out sharing one pool); and the final agent count is exactly 9 (6
+tickets + 2 operator + 1 reviewer) — no duplicate launches anywhere,
+including from the concurrent verification run, which is a managed check
+execution and must never itself produce an agent record. That final count is
+read only after the poll loop's break condition requires the fan-out, the
+reviewer, AND the verify.run call to have ALL settled, so the assertion is
+race-robust rather than a lucky snapshot taken while one of the three
+concurrent proofs might still be mid-flight. Stable across repeated runs.
+
+Closing this gap needed one small addition beyond the test itself:
+`Daemon::set_verification_admission_limits` (`crates/rk-daemon/src/server.rs`),
+a `#[doc(hidden)]` test-only hook mirroring the pre-existing
+`set_implementation_admission_limits`/`set_review_admission_limits` ones —
+`Daemon::with_space_for_tests` bypasses `Daemon::new`'s
+`config.policy.verification_admission_limit*` wiring, and no such hook
+previously existed for an integration test (as opposed to an in-module unit
+test with direct field access) to configure the verification lane's cap
+without going through a full `config.cue`.
 
 All of the above pass, plus the full pre-existing `respawn_tests` /
 `verification_admission_tests` / managed-verification-cancellation /

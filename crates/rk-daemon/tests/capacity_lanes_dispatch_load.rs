@@ -19,7 +19,7 @@ use rk_core::config::DrainConfig;
 mod support;
 
 use rk_core::paths::Layout;
-use rk_daemon::Daemon;
+use rk_daemon::{Client, Daemon};
 use rk_ledger::Budget;
 use rk_space::Space;
 use serde_json::json;
@@ -98,7 +98,31 @@ workflow: {
 
 const LOAD_DEADLINE: Duration = Duration::from_secs(60);
 const REVIEWER_START_DEADLINE: Duration = Duration::from_secs(10);
+const VERIFY_START_DEADLINE: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// A fast, single-shot "verify" check the load test's concurrent `verify.run`
+/// call resolves — proves the wholly independent verification lane
+/// (`verification_admission_limit_by_repo`, the ticket's third lane) is
+/// exercised at the same time the implementation/review lanes are saturated,
+/// not just configured. Appends one line to `verify-runs.log` on every
+/// execution so the test can prove the check ran EXACTLY once — no dispatch
+/// path double-launches it, and no admission race causes the daemon to run
+/// it twice.
+const VERIFY_CHECK: &str = r#"checks: [
+    {name: "verify", command: "echo run >> verify-runs.log", timeout: "10s", environmentPolicy: "strip_rk_spawn"},
+]
+"#;
+
+/// Unlike `.rk/repo.cue`, the operator's `verify.run` path resolves the
+/// check registry from the repo's registered root checkout directly
+/// (`Server::handle_verify_run`'s operator branch), not a git worktree — so,
+/// unlike `managed_verification_cancel_e2e.rs`'s own `install_verify_check`,
+/// this deliberately does NOT commit: an uncommitted `checks.cue` proves the
+/// operator path never needed git in the first place.
+fn install_verify_check(dir: &Path) {
+    std::fs::write(dir.join(".rk").join("checks.cue"), VERIFY_CHECK).unwrap();
+}
 
 /// Unlike drain (reopens the ticket, a later cycle reclaims it) and a
 /// workflow `spawn`/`for_each` step (its own internal poll-and-retry loop on
@@ -134,6 +158,7 @@ async fn implementation_burst_across_all_three_dispatch_paths_stays_bounded_and_
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     init_repo(repo_dir.path());
+    install_verify_check(repo_dir.path());
     let repo_name = repo_dir
         .path()
         .file_name()
@@ -168,6 +193,7 @@ async fn implementation_burst_across_all_three_dispatch_paths_stays_bounded_and_
     });
     daemon.set_implementation_admission_limits(0, HashMap::from([(repo_name.clone(), 2)]));
     daemon.set_review_admission_limits(0, HashMap::from([(repo_name.clone(), 1)]));
+    daemon.set_verification_admission_limits(0, HashMap::from([(repo_name.clone(), 1)]));
     tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
 
@@ -206,6 +232,28 @@ async fn implementation_burst_across_all_three_dispatch_paths_stays_bounded_and_
         .await
         .unwrap();
     let instance_id = started["instance"]["id"].as_str().unwrap().to_string();
+
+    // Concurrently with the burst above — and the implementation-lane
+    // contention it creates between drain, the fan-out, and the operator
+    // dispatch below — issue a REAL managed `verify.run` against the SAME
+    // repo through the wholly independent verification lane. Spawned as its
+    // own task right as the burst begins, so it genuinely races the
+    // saturation instead of running only after it settles; proves a final-
+    // target verification is never starved by implementation-lane pressure,
+    // the same guarantee already proven for the review lane below.
+    let verify_started = tokio::time::Instant::now();
+    let verify_layout = layout.clone();
+    let repo_for_verify = repo_name.clone();
+    let mut verify_task: Option<tokio::task::JoinHandle<rk_core::Result<serde_json::Value>>> =
+        Some(tokio::spawn(async move {
+            let mut verify_client = Client::connect_as_operator(&verify_layout).await.unwrap();
+            verify_client
+                .call(
+                    "verify.run",
+                    json!({"repo": repo_for_verify, "check": "verify"}),
+                )
+                .await
+        }));
 
     // Dispatch path 3: direct operator `agent.spawn` RPC calls — bypasses
     // tickets and the workflow engine entirely, the exact path
@@ -246,6 +294,8 @@ async fn implementation_burst_across_all_three_dispatch_paths_stays_bounded_and_
     let mut peak_live_non_reviewer = 0usize;
     let mut reviewer_went_live_at: Option<Duration> = None;
     let mut fanout_completed = false;
+    let mut verify_completed_at: Option<Duration> = None;
+    let mut verify_result: Option<serde_json::Value> = None;
     let deadline = tokio::time::Instant::now() + LOAD_DEADLINE;
     while tokio::time::Instant::now() < deadline {
         let agents = client.call("agent.list", json!({})).await.unwrap();
@@ -284,7 +334,17 @@ async fn implementation_burst_across_all_three_dispatch_paths_stays_bounded_and_
             }
         }
 
-        if fanout_completed && reviewer_went_live_at.is_some() {
+        if verify_completed_at.is_none() && verify_task.as_ref().is_some_and(|h| h.is_finished()) {
+            let outcome = verify_task
+                .take()
+                .unwrap()
+                .await
+                .expect("verify.run task must not panic");
+            verify_result = Some(outcome.unwrap_or_else(|e| panic!("verify.run RPC failed: {e}")));
+            verify_completed_at = Some(verify_started.elapsed());
+        }
+
+        if fanout_completed && reviewer_went_live_at.is_some() && verify_completed_at.is_some() {
             break;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -313,9 +373,42 @@ async fn implementation_burst_across_all_three_dispatch_paths_stays_bounded_and_
          {peak_live_non_reviewer}"
     );
 
+    assert!(
+        verify_completed_at.is_some(),
+        "the concurrent verify.run against the same repo's verification lane must complete \
+         despite implementation-lane saturation from drain + fan-out + operator dispatch — a \
+         starved verification lane would never let it finish at all"
+    );
+    assert!(
+        verify_completed_at.unwrap() <= VERIFY_START_DEADLINE,
+        "verify.run must start and complete within a bounded time even while the \
+         implementation lane is saturated by the burst: took {:?}",
+        verify_completed_at.unwrap()
+    );
+    let verify_result = verify_result.expect("verify_completed_at implies a recorded result");
+    assert_eq!(
+        verify_result["verdict"],
+        json!("pass"),
+        "the concurrent verify check must pass: {verify_result:#?}"
+    );
+    assert_eq!(verify_result["exit"], json!(0));
+    let verify_log =
+        std::fs::read_to_string(repo_dir.path().join("verify-runs.log")).unwrap_or_default();
+    assert_eq!(
+        verify_log.lines().count(),
+        1,
+        "the verify check must have run EXACTLY once — no duplicate launch from the \
+         implementation burst racing its admission: log was {verify_log:?}"
+    );
+
     // No duplicate launches anywhere: exactly one agent per ticket (6),
     // exactly one per direct operator spawn (2), and exactly one reviewer —
-    // 9 total, no more, no fewer.
+    // 9 total, no more, no fewer. `verify.run` is a managed check execution,
+    // not an agent, so it must never contribute to this count either way —
+    // and this read is race-robust rather than a lucky snapshot: the poll
+    // loop above only breaks once the fan-out, the reviewer, AND the
+    // concurrent verify.run have ALL settled, so nothing here can still be
+    // mid-flight and land an agent record after this list is taken.
     let final_agents = client.call("agent.list", json!({})).await.unwrap();
     let final_agents = final_agents["agents"].as_array().unwrap();
     let repo_agents: Vec<_> = final_agents

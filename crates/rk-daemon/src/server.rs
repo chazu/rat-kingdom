@@ -542,6 +542,22 @@ impl Daemon {
             .set_review_admission_limits(default_limit, overrides);
     }
 
+    /// Test-only hook, same rationale as
+    /// [`set_implementation_admission_limits`](Self::set_implementation_admission_limits):
+    /// `Daemon::with_space_for_tests`/`new_in_memory` bypass `Daemon::new`'s
+    /// `config.policy.verification_admission_limit*` wiring, so an
+    /// integration test driving a real `verify.run` concurrently with the
+    /// implementation/review lanes needs to configure it directly.
+    #[doc(hidden)]
+    pub fn set_verification_admission_limits(
+        &self,
+        default_limit: u32,
+        overrides: std::collections::HashMap<String, u32>,
+    ) {
+        self.supervisor
+            .set_verification_admission_limits(default_limit, overrides);
+    }
+
     #[doc(hidden)]
     pub fn set_request_clock_for_tests(&mut self, clock: fn() -> DateTime<Utc>) {
         self.request_clock = clock;
