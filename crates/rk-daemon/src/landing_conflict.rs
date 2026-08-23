@@ -23,6 +23,15 @@ use serde_json::{json, Value};
 /// budgets, even when they land on the same branch.
 pub(crate) const CONFLICT_DISPATCH_IDENTITY: &str = "landing_conflict_rework_dispatch";
 
+/// Marker state written when authority resolves to `Orchestrator` but
+/// nothing has dispatched yet — evidence collection and ticket filing are
+/// daemon-owned and complete, but the actual correction spawn is withheld
+/// until a leased, fenced orchestrator decision authorizes it through
+/// `attention.decide`. Distinct from `"dispatching"`/`"dispatched"`, which
+/// are only ever written by that authorized dispatch itself
+/// (`LandingPipeline::dispatch_held_conflict`), never by `route_conflict`.
+pub(crate) const CONFLICT_STATE_AWAITING_DECISION: &str = "awaiting-orchestrator-decision";
+
 /// How many characters of git's own conflict report are kept in the
 /// structured recovery item and the agent prompt. `rk-git`'s own
 /// `failure_reason` already caps to a few lines, but this is a second,
@@ -224,6 +233,12 @@ pub(crate) fn route(
 #[derive(Debug, Clone)]
 pub(crate) struct ConflictContext {
     pub(crate) repo: String,
+    /// Filesystem root `Repo::discover` needs to act on this chain again
+    /// later, out of band from the `LandingQueueEntry` that first observed
+    /// the conflict — an authorized [`crate::landing::LandingPipeline::dispatch_held_conflict`]
+    /// call only has the marker to reconstruct this context from, not the
+    /// original queue entry.
+    pub(crate) repo_path: String,
     /// Source: the branch that failed to merge, and the correction's base.
     pub(crate) branch: String,
     /// Exact source head at conflict time; never silently retargeted to a
@@ -323,6 +338,7 @@ impl ConflictContext {
         json!({
             "dispatch_key": self.dispatch_key(),
             "repo": self.repo,
+            "repo_path": self.repo_path,
             "source": self.branch,
             "branch": self.branch,
             "head_sha": self.head_sha,
@@ -337,6 +353,31 @@ impl ConflictContext {
             "state": state,
             "diff_files": self.diff_files,
             "diff_lines": self.diff_lines,
+        })
+    }
+
+    /// Reconstruct a context from its own [`Self::marker_payload`] — the
+    /// inverse used by [`crate::landing::LandingPipeline::dispatch_held_conflict`],
+    /// which only has the durable marker (not the original
+    /// `LandingQueueEntry`) to act from once an orchestrator decision
+    /// authorizes the dispatch. `None` if any required field is absent or
+    /// the wrong shape — a corrupt or foreign marker must never be silently
+    /// coerced into a chain to dispatch against.
+    pub(crate) fn from_marker_payload(payload: &Value) -> Option<Self> {
+        let field = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_string);
+        Some(Self {
+            repo: field("repo")?,
+            repo_path: field("repo_path")?,
+            branch: field("branch")?,
+            head_sha: field("head_sha")?,
+            target: field("target")?,
+            target_head: field("target_head")?,
+            fork_point: field("fork_point")?,
+            task: field("task")?,
+            rework_ticket: field("rework_ticket")?,
+            conflict_detail: field("conflict_evidence")?,
+            diff_files: payload.get("diff_files").and_then(Value::as_u64)?,
+            diff_lines: payload.get("diff_lines").and_then(Value::as_u64)?,
         })
     }
 }
@@ -360,6 +401,7 @@ mod tests {
     fn ctx() -> ConflictContext {
         ConflictContext {
             repo: "code-repo".into(),
+            repo_path: "/repos/code-repo".into(),
             branch: "feature".into(),
             head_sha: "abc123".into(),
             target: "main".into(),
@@ -548,5 +590,33 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Merge conflict in src.rs"));
+        assert_eq!(payload["repo_path"], "/repos/code-repo");
+    }
+
+    #[test]
+    fn from_marker_payload_round_trips_marker_payload() {
+        let original = ctx();
+        let payload = original.marker_payload(2, Some("Whisker"), "dispatching");
+        let reconstructed =
+            ConflictContext::from_marker_payload(&payload).expect("payload has every field");
+        assert_eq!(reconstructed.repo, original.repo);
+        assert_eq!(reconstructed.repo_path, original.repo_path);
+        assert_eq!(reconstructed.branch, original.branch);
+        assert_eq!(reconstructed.head_sha, original.head_sha);
+        assert_eq!(reconstructed.target, original.target);
+        assert_eq!(reconstructed.target_head, original.target_head);
+        assert_eq!(reconstructed.fork_point, original.fork_point);
+        assert_eq!(reconstructed.task, original.task);
+        assert_eq!(reconstructed.rework_ticket, original.rework_ticket);
+        assert_eq!(reconstructed.conflict_detail, original.conflict_detail);
+        assert_eq!(reconstructed.diff_files, original.diff_files);
+        assert_eq!(reconstructed.diff_lines, original.diff_lines);
+    }
+
+    #[test]
+    fn from_marker_payload_refuses_a_marker_missing_a_required_field() {
+        let mut payload = ctx().marker_payload(1, None, "dispatching");
+        payload.as_object_mut().unwrap().remove("repo_path");
+        assert!(ConflictContext::from_marker_payload(&payload).is_none());
     }
 }

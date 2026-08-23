@@ -3999,6 +3999,7 @@ impl LandingPipeline {
         let ticket = self.file_conflict_rework_ticket(entry).await?;
         let ctx = ConflictContext {
             repo: entry.repo_name.clone(),
+            repo_path: entry.repo_path.clone(),
             branch: entry.branch.clone(),
             head_sha: entry.head_sha.clone(),
             target: entry.target.clone(),
@@ -4075,7 +4076,9 @@ impl LandingPipeline {
             ReworkRoute::Dispatch { attempt } => attempt,
         };
 
-        // Spawn cuts from branch tip, so never dispatch after the conflicted tip moves.
+        // A correction cuts from branch tip, so never open an orchestrator
+        // decision after the conflicted tip has already moved — the evidence
+        // it would decide against is already stale.
         let tip = {
             let repo = git_repo.clone();
             let branch = entry.branch.clone();
@@ -4098,16 +4101,209 @@ impl LandingPipeline {
             return Ok(LandingOutcome::ReworkFiled(ticket));
         }
 
+        // Authority::Orchestrator means a dispatch decision is SAFE to make
+        // without a human, not that this daemon process may make it
+        // unattended: TKT-01M0E8PNFQZ70F3ZFG3KCS39ZG's own contract requires
+        // a live, fenced orchestrator lease over this repository before the
+        // correction agent may be spawned. This process only collects
+        // evidence and holds — `Server::execute_orchestrator` is the only
+        // caller of `dispatch_held_conflict`, and it is only reachable once
+        // `attention.decide` has fenced the call through
+        // `crate::orchestrator_lease::LeaseStore`.
+        self.hold_conflict_for_orchestrator_decision(entry, &ctx, attempt)?;
+        Ok(LandingOutcome::ReworkFiled(ticket))
+    }
+
+    /// Record the durable evidence a conflict-correction dispatch decision
+    /// needs, then wait: no `spawn_async` call happens on this path. Writes
+    /// the marker `route_conflict`'s own replay guard (top of that function)
+    /// already checks, in state [`landing_conflict::CONFLICT_STATE_AWAITING_DECISION`]
+    /// rather than `"dispatching"` — that state is reserved for
+    /// [`Self::dispatch_held_conflict`]'s own crash window, which this call
+    /// never enters. Also emits a `branch_landed` event with the same
+    /// `{merged: false, pr_opened: false}` shape every other dropped land in
+    /// this daemon uses, so `crate::reconcile::conflict_held_landing` (and
+    /// `rk inbox`'s own copy of the same check) surfaces this exact hold as
+    /// an `Authority::Orchestrator` attention item with no separate
+    /// violation-detection code required.
+    fn hold_conflict_for_orchestrator_decision(
+        &self,
+        entry: &LandingQueueEntry,
+        ctx: &ConflictContext,
+        attempt: u32,
+    ) -> rk_core::Result<()> {
+        self.record_conflict_state(
+            entry,
+            ctx,
+            attempt,
+            landing_conflict::CONFLICT_STATE_AWAITING_DECISION,
+        )?;
+        self.space.out(Tuple::new(
+            Category::Event,
+            entry.repo_name.clone(),
+            "branch_landed",
+            "daemon",
+            json!({
+                "branch": ctx.branch,
+                "target": ctx.target,
+                "merged": false,
+                "pr_opened": false,
+                "detail": format!(
+                    "merge conflict held for a bounded Orchestrator-authority correction \
+                     decision (attempt {attempt} of this repository's cap, ticket {}); resolve \
+                     via attention.decide over a live orchestrator lease, or rk spawn --repo {} \
+                     --ticket {} --base {}",
+                    ctx.rework_ticket, ctx.repo, ctx.rework_ticket, ctx.branch
+                ),
+            }),
+        ))?;
+        info!(
+            repo = %entry.repo_name, branch = %entry.branch, head_sha = %entry.head_sha,
+            ticket = %ctx.rework_ticket, attempt,
+            "landing pipeline: CONFLICT held for a leased orchestrator decision, not dispatching unattended"
+        );
+        Ok(())
+    }
+
+    /// The most recent [`CONFLICT_DISPATCH_IDENTITY`] marker for a
+    /// (repo, branch) pair, regardless of its exact dispatch key — an
+    /// orchestrator decision only knows the violation's subject (the branch
+    /// name), not the chain's full identity, so this is how
+    /// [`Self::dispatch_held_conflict`] locates the held chain to act on.
+    /// Newest by tuple id, matching every other "latest wins" marker lookup
+    /// in this module.
+    fn latest_conflict_marker(&self, repo: &str, branch: &str) -> rk_core::Result<Option<Tuple>> {
+        let pattern = Pattern::category(Category::Event)
+            .identity(CONFLICT_DISPATCH_IDENTITY)
+            .scope(repo);
+        Ok(self
+            .space
+            .scan(&pattern)?
+            .into_iter()
+            .filter(|t| t.payload.get("branch").and_then(Value::as_str) == Some(branch))
+            .max_by(|a, b| a.id.cmp(&b.id)))
+    }
+
+    /// The in-flight attempt number for a conflict chain awaiting an
+    /// orchestrator decision, if one is held — `Server::orchestrator_attempt_hint`'s
+    /// read-only lookup for the `CONFLICT_HELD_LANDING` kind, folded into
+    /// the decision journal envelope before the actual dispatch mutation
+    /// runs. Returns `None` for a branch with no held chain at all rather
+    /// than guessing an attempt number.
+    pub(crate) fn pending_conflict_attempt(&self, repo: &str, branch: &str) -> Option<u32> {
+        let marker = self.latest_conflict_marker(repo, branch).ok()??;
+        marker
+            .payload
+            .get("attempt")
+            .and_then(Value::as_u64)
+            .and_then(|a| u32::try_from(a).ok())
+    }
+
+    /// Execute the bounded correction spawn a leased orchestrator decision
+    /// has just authorized for a conflict this pipeline is holding. The ONLY
+    /// caller is `Server::execute_orchestrator`, itself only reachable after
+    /// `attention.decide`'s `Authority::Orchestrator` arm has fenced the
+    /// call through a live lease and journaled the decision — this function
+    /// performs the mutation that decision authorizes, never authenticates
+    /// on its own. Idempotent: a chain whose marker has already advanced
+    /// past [`landing_conflict::CONFLICT_STATE_AWAITING_DECISION`] (a prior
+    /// call already dispatched, or a human resolved the branch by hand) is a
+    /// no-op success, not a second spawn.
+    pub(crate) async fn dispatch_held_conflict(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> rk_core::Result<String> {
+        let Some(marker) = self.latest_conflict_marker(repo, branch)? else {
+            return Err(rk_core::Error::other(format!(
+                "no conflict-correction chain for {repo}/{branch} has ever been held for a \
+                 decision"
+            )));
+        };
+        let state = marker
+            .payload
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if state != landing_conflict::CONFLICT_STATE_AWAITING_DECISION {
+            return Ok(format!(
+                "conflict-correction chain for {repo}/{branch} is already '{state}'; not \
+                 re-dispatching"
+            ));
+        }
+        let ctx = ConflictContext::from_marker_payload(&marker.payload).ok_or_else(|| {
+            rk_core::Error::other(format!(
+                "conflict dispatch marker for {repo}/{branch} is missing a required field"
+            ))
+        })?;
+        let attempt = marker
+            .payload
+            .get("attempt")
+            .and_then(Value::as_u64)
+            .and_then(|a| u32::try_from(a).ok())
+            .unwrap_or(1);
+        // A crash between this call recording "dispatching" and the spawn
+        // actually journaling looks identical to a fresh, never-attempted
+        // hold — the same ambiguity `route_conflict`'s own top-of-function
+        // guard resolves for the original dispatch path. Detect and hold for
+        // a human rather than guess.
+        if self.conflict_dispatch_has_state(&ctx, "dispatching")?
+            && !self.conflict_agent_was_journaled(&ctx)
+        {
+            let entry = Self::synthetic_conflict_entry(&ctx);
+            let withheld = Withheld {
+                code: "dispatch-interrupted",
+                detail: format!(
+                    "a durable dispatch attempt exists for correction ticket {} based on {} at \
+                     {}, but the supervisor registry contains no rat for it; the daemon may have \
+                     stopped between recording the marker and journaling the spawn",
+                    ctx.rework_ticket, ctx.branch, ctx.head_sha
+                ),
+                decision: "confirm that no correction agent exists, then dispatch the recorded \
+                           correction ticket exactly once or abandon it"
+                    .into(),
+            };
+            self.withhold_conflict(&entry, &ctx, attempt, &withheld)?;
+            return Err(rk_core::Error::other(withheld.detail));
+        }
+
+        let git_repo = {
+            let repo_path = PathBuf::from(&ctx.repo_path);
+            blocking(move || rk_git::Repo::discover(&repo_path)).await?
+        };
+        let tip = {
+            let repo = git_repo.clone();
+            let branch = ctx.branch.clone();
+            blocking(move || repo.rev_parse(&branch)).await?
+        };
+        let entry = Self::synthetic_conflict_entry(&ctx);
+        if tip != ctx.head_sha {
+            let withheld = Withheld {
+                code: "conflicted-head-moved",
+                detail: format!(
+                    "the conflicted head {} is no longer {}'s tip (now {tip}), so a correction \
+                     cut from the branch would start from work this conflict was never \
+                     evidenced against",
+                    ctx.head_sha, ctx.branch
+                ),
+                decision: "re-attempt the merge at the branch's current tip, or reset it back to \
+                           the conflicted head and let the correction dispatch"
+                    .into(),
+            };
+            self.withhold_conflict(&entry, &ctx, attempt, &withheld)?;
+            return Err(rk_core::Error::other(withheld.detail));
+        }
+
         // Marker first: replay gates an interrupted spawn instead of duplicating it.
-        self.record_conflict_state(entry, &ctx, attempt, "dispatching")?;
+        self.record_conflict_state(&entry, &ctx, attempt, "dispatching")?;
 
         let params = crate::supervisor::SpawnParams {
-            repo: entry.repo_path.clone(),
+            repo: ctx.repo_path.clone(),
             task: ctx.rework_ticket.clone(),
             prompt: Some(ctx.prompt()),
             role: "rat".to_string(),
             // A correction always lands back on the conflicted (held) branch.
-            base: Some(entry.branch.clone()),
+            base: Some(ctx.branch.clone()),
             review: None,
             coordination: None,
             harness: None,
@@ -4124,13 +4320,14 @@ impl LandingPipeline {
         match self.supervisor.spawn_async(params, 0).await {
             Ok(record) => {
                 info!(
-                    repo = %entry.repo_name, branch = %entry.branch, head_sha = %entry.head_sha,
+                    repo = %ctx.repo, branch = %ctx.branch, head_sha = %ctx.head_sha,
                     agent = %record.name, ticket = %ctx.rework_ticket, attempt,
-                    "landing pipeline: dispatched bounded conflict-correction agent from the held branch"
+                    "landing pipeline: orchestrator-authorized dispatch of bounded \
+                     conflict-correction agent from the held branch"
                 );
                 // Terminal marker: a redelivery must never read this dispatch
                 // as interrupted just because the spawn journaled cleanly.
-                self.record_conflict_state(entry, &ctx, attempt, "dispatched")?;
+                self.record_conflict_state(&entry, &ctx, attempt, "dispatched")?;
                 if let Err(e) = self
                     .tickets
                     .update(
@@ -4147,6 +4344,10 @@ impl LandingPipeline {
                         "landing pipeline: failed to record conflict-correction assignee"
                     );
                 }
+                Ok(format!(
+                    "dispatched {} for {repo}/{branch} (ticket {})",
+                    record.name, ctx.rework_ticket
+                ))
             }
             Err(e) => {
                 // Refusal holds the branch and becomes a visible human gate.
@@ -4157,14 +4358,31 @@ impl LandingPipeline {
                                paused dispatch), then dispatch the correction ticket"
                         .into(),
                 };
-                self.withhold_conflict(entry, &ctx, attempt, &withheld)?;
+                self.withhold_conflict(&entry, &ctx, attempt, &withheld)?;
                 warn!(
-                    repo = %entry.repo_name, branch = %entry.branch, error = %e,
-                    "landing pipeline: bounded conflict-correction dispatch refused"
+                    repo = %ctx.repo, branch = %ctx.branch, error = %e,
+                    "landing pipeline: orchestrator-authorized conflict-correction dispatch refused"
                 );
+                Err(rk_core::Error::other(withheld.detail))
             }
         }
-        Ok(LandingOutcome::ReworkFiled(ticket))
+    }
+
+    /// The minimal [`LandingQueueEntry`] `escalate`/`record_conflict_state`
+    /// actually read (`repo_name`, `task`) — [`Self::dispatch_held_conflict`]
+    /// only has a [`ConflictContext`] reconstructed from a durable marker,
+    /// not the original queue entry, and rebuilding the whole entry from
+    /// scratch is not worth a second struct just for these two call sites.
+    fn synthetic_conflict_entry(ctx: &ConflictContext) -> LandingQueueEntry {
+        LandingQueueEntry {
+            repo_name: ctx.repo.clone(),
+            repo_path: ctx.repo_path.clone(),
+            branch: ctx.branch.clone(),
+            target: ctx.target.clone(),
+            head_sha: ctx.head_sha.clone(),
+            task: ctx.task.clone(),
+            ..Default::default()
+        }
     }
 
     /// File the historical steward-shaped follow-up directly and idempotently.
@@ -7922,9 +8140,15 @@ workflow: {
             .unwrap();
     }
 
-    fn conflict_context(head: &str, task: &str, rework_ticket: &str) -> ConflictContext {
+    fn conflict_context(
+        repo_path: &str,
+        head: &str,
+        task: &str,
+        rework_ticket: &str,
+    ) -> ConflictContext {
         ConflictContext {
             repo: "code-repo".into(),
+            repo_path: repo_path.into(),
             branch: "feature".into(),
             head_sha: head.into(),
             target: "main".into(),
@@ -7993,13 +8217,17 @@ workflow: {
         }
     }
 
-    /// AC1/autonomous-rework proof: the landing conflict itself resolves into
-    /// exactly one durable, structured recovery item (repo/source/target/
-    /// fork-point/exact-heads/bounded-evidence, all on the dispatch marker),
-    /// and dispatches one bounded correction agent cut from the held branch's
-    /// own tip, without mutating either the branch or the target.
+    /// AC1/AC4 proof: an Orchestrator-authority landing conflict resolves
+    /// into exactly one durable, structured recovery item (repo/source/
+    /// target/fork-point/exact-heads/bounded-evidence, all on the dispatch
+    /// marker) and WAITS — no correction agent is dispatched unattended.
+    /// Only once `dispatch_held_conflict` runs (standing in for
+    /// `Server::execute_orchestrator`, itself only reachable after
+    /// `attention.decide` has fenced the call through a live orchestrator
+    /// lease) does the bounded correction agent spawn, cut from the held
+    /// branch's own tip, without mutating either the branch or the target.
     #[tokio::test]
-    async fn conflict_recovery_dispatches_one_bounded_correction_without_mutating_the_original_branch(
+    async fn conflict_recovery_holds_for_an_orchestrator_decision_then_dispatches_one_bounded_correction(
     ) {
         let home = tempfile::tempdir().unwrap();
         let (repo_dir, head_sha, main_before) = conflicting_repo();
@@ -8027,35 +8255,34 @@ workflow: {
             "the original conflicted branch must be untouched — the correction is a fresh agent"
         );
 
-        let spawns = tuples(&space, Category::Event, "agent_spawned");
-        assert_eq!(
-            spawns.len(),
-            1,
-            "bounded CONFLICT recovery must dispatch one agent"
+        assert!(
+            tuples(&space, Category::Event, "agent_spawned").is_empty(),
+            "Authority::Orchestrator must never dispatch unattended — nothing has fenced this \
+             through a live lease yet"
         );
         let markers = scoped_tuples(&space, Category::Event, CONFLICT_DISPATCH_IDENTITY);
         assert_eq!(
             markers.len(),
-            2,
-            "one logical dispatch gets a dispatching marker and a terminal dispatched marker"
+            1,
+            "holding for a decision writes exactly one marker, not a dispatching/dispatched pair"
         );
-        let dispatching = markers
-            .iter()
-            .find(|m| m.payload["state"] == "dispatching")
-            .expect("dispatching marker must be recorded before the spawn");
-        let dispatched = markers
-            .iter()
-            .find(|m| m.payload["state"] == "dispatched")
-            .expect("a successful spawn must record a terminal dispatched marker");
-        assert_eq!(dispatching.payload["repo"], "code-repo");
-        assert_eq!(dispatching.payload["source"], "feature");
-        assert_eq!(dispatching.payload["target"], "main");
-        assert_eq!(dispatching.payload["head_sha"], head_sha);
-        assert_eq!(dispatching.payload["target_head"], main_before);
-        assert_eq!(dispatching.payload["task"], "add src");
-        assert_eq!(dispatching.payload["rework_ticket"], ticket.identity);
-        assert_eq!(dispatched.payload["rework_ticket"], ticket.identity);
-        let fork_point = dispatching.payload["fork_point"].as_str().unwrap();
+        let held = &markers[0];
+        assert_eq!(
+            held.payload["state"], "awaiting-orchestrator-decision",
+            "{held:?}"
+        );
+        assert_eq!(held.payload["repo"], "code-repo");
+        assert_eq!(
+            held.payload["repo_path"],
+            repo_dir.path().display().to_string()
+        );
+        assert_eq!(held.payload["source"], "feature");
+        assert_eq!(held.payload["target"], "main");
+        assert_eq!(held.payload["head_sha"], head_sha);
+        assert_eq!(held.payload["target_head"], main_before);
+        assert_eq!(held.payload["task"], "add src");
+        assert_eq!(held.payload["rework_ticket"], ticket.identity);
+        let fork_point = held.payload["fork_point"].as_str().unwrap();
         assert_ne!(
             fork_point, head_sha,
             "fork point must not be the source tip"
@@ -8065,12 +8292,64 @@ workflow: {
             "fork point must not be the target tip"
         );
         assert!(
-            dispatching.payload["conflict_evidence"]
+            held.payload["conflict_evidence"]
                 .as_str()
                 .unwrap()
                 .contains("CONFLICT"),
             "{:?}",
-            dispatching.payload["conflict_evidence"]
+            held.payload["conflict_evidence"]
+        );
+
+        // The hold must also be visible through the SAME `conflict-held-landing`
+        // attention item every other convergence violation surfaces through —
+        // no separate, bespoke visibility path.
+        let lands = scoped_tuples(&space, Category::Event, "branch_landed");
+        assert_eq!(lands.len(), 1, "{lands:?}");
+        assert_eq!(lands[0].payload["branch"], "feature");
+        assert_eq!(lands[0].payload["target"], "main");
+        assert_eq!(lands[0].payload["merged"], false);
+        assert_eq!(lands[0].payload["pr_opened"], false);
+
+        // Standing in for `Server::execute_orchestrator`, reachable only
+        // after `attention.decide` fenced the call through a live lease.
+        let dispatch_detail = pipeline
+            .dispatch_held_conflict("code-repo", "feature")
+            .await
+            .unwrap();
+        assert!(
+            dispatch_detail.contains(&ticket.identity),
+            "{dispatch_detail}"
+        );
+
+        let spawns = tuples(&space, Category::Event, "agent_spawned");
+        assert_eq!(
+            spawns.len(),
+            1,
+            "the authorized decision must dispatch exactly one agent"
+        );
+        let markers = scoped_tuples(&space, Category::Event, CONFLICT_DISPATCH_IDENTITY);
+        assert_eq!(
+            markers.len(),
+            3,
+            "the hold marker plus a dispatching marker and a terminal dispatched marker"
+        );
+        assert!(markers.iter().any(|m| m.payload["state"] == "dispatching"));
+        let dispatched = markers
+            .iter()
+            .find(|m| m.payload["state"] == "dispatched")
+            .expect("a successful spawn must record a terminal dispatched marker");
+        assert_eq!(dispatched.payload["rework_ticket"], ticket.identity);
+
+        // A second decision for the same chain must not double-dispatch.
+        let replay = pipeline
+            .dispatch_held_conflict("code-repo", "feature")
+            .await
+            .unwrap();
+        assert!(replay.contains("already"), "{replay}");
+        assert_eq!(
+            tuples(&space, Category::Event, "agent_spawned").len(),
+            1,
+            "a replayed decision must not spawn a second agent"
         );
 
         // Once the correction lands back onto `feature`, the held branch must
@@ -8169,16 +8448,15 @@ workflow: {
 
         assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
         assert_eq!(rev_parse(repo_dir.path(), "feature"), head_sha);
-        assert_eq!(
-            tuples(&space, Category::Event, "agent_spawned").len(),
-            1,
-            "duplicate delivery must not spawn a second correction agent"
+        assert!(
+            tuples(&space, Category::Event, "agent_spawned").is_empty(),
+            "Authority::Orchestrator must never dispatch unattended, duplicate or not"
         );
         assert_eq!(
             scoped_tuples(&space, Category::Event, CONFLICT_DISPATCH_IDENTITY).len(),
-            2,
-            "the one dispatch gets its dispatching + terminal dispatched markers; \
-             duplicate delivery must not append a third"
+            1,
+            "the one hold gets its awaiting-orchestrator-decision marker; duplicate delivery \
+             must not append a second"
         );
         let conflict_tickets = space
             .scan(&Pattern::category(Category::Task).scope("code-repo"))
@@ -8207,7 +8485,12 @@ workflow: {
             let space = Space::open(&layout.db_path()).unwrap();
             let pipeline = test_pipeline(home.path(), space.clone());
             let ticket = pipeline.file_conflict_rework_ticket(&entry).await.unwrap();
-            let ctx = conflict_context(&entry.head_sha, &entry.task, &ticket.identity);
+            let ctx = conflict_context(
+                &entry.repo_path,
+                &entry.head_sha,
+                &entry.task,
+                &ticket.identity,
+            );
             put_conflict_marker(&space, &ctx, None, "dispatching");
         }
 
@@ -8251,23 +8534,32 @@ workflow: {
     }
 
     /// [`refused_rework_spawn_reaches_a_terminal_state_not_stuck_dispatching`]'s
-    /// CONFLICT counterpart: a refused correction spawn must record a
-    /// terminal `dispatch-refused` marker rather than leaving the chain
-    /// stuck at `dispatching`, which would otherwise misdiagnose the next
-    /// redelivery as an interrupted daemon.
+    /// CONFLICT counterpart, now exercised against the authorized-dispatch
+    /// call directly (`route_conflict` itself never spawns any more): a
+    /// refused correction spawn must record a terminal `dispatch-refused`
+    /// marker rather than leaving the chain stuck at `dispatching`, which
+    /// would otherwise misdiagnose the next decision as an interrupted
+    /// daemon.
     #[tokio::test]
     async fn refused_conflict_spawn_reaches_a_terminal_state_not_stuck_dispatching() {
         let home = tempfile::tempdir().unwrap();
         let (repo_dir, head_sha, main_before) = conflicting_repo();
         let space = Space::open_in_memory().unwrap();
         let pipeline = test_pipeline(home.path(), space.clone());
-        pipeline.supervisor.set_dispatch_paused(true);
         let entry = conflict_candidate_entry(repo_dir.path(), &head_sha);
         pipeline.enqueue(entry.clone()).unwrap();
 
         let outcomes = pipeline.drain_key("code-repo", "main").await.unwrap();
         assert_eq!(outcomes.len(), 1);
         assert!(matches!(outcomes[0], LandingOutcome::ReworkFiled(_)));
+
+        // Only pause dispatch once the chain is already held for a decision
+        // — the hold itself must never touch the supervisor at all.
+        pipeline.supervisor.set_dispatch_paused(true);
+        let refusal = pipeline
+            .dispatch_held_conflict("code-repo", "feature")
+            .await;
+        assert!(refusal.is_err(), "{refusal:?}");
 
         assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
         assert_eq!(rev_parse(repo_dir.path(), "feature"), head_sha);
@@ -8279,8 +8571,8 @@ workflow: {
         let markers = scoped_tuples(&space, Category::Event, CONFLICT_DISPATCH_IDENTITY);
         assert_eq!(
             markers.len(),
-            2,
-            "a refusal still writes the dispatching marker, then a terminal one"
+            3,
+            "the hold marker, then a dispatching marker, then a terminal refused one"
         );
         assert!(
             markers.iter().any(|m| m.payload["state"] == "dispatching"),
@@ -8304,18 +8596,14 @@ workflow: {
         assert!(text.contains("dispatch-refused"), "{text}");
 
         pipeline.supervisor.set_dispatch_paused(false);
-        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
-        pipeline
-            .route_conflict(
-                &entry,
-                &repo,
-                "CONFLICT (content): Merge conflict in src.rs",
-            )
+        let replay = pipeline
+            .dispatch_held_conflict("code-repo", "feature")
             .await
             .unwrap();
+        assert!(replay.contains("already"), "{replay}");
         assert!(
             tuples(&space, Category::Event, "agent_spawned").is_empty(),
-            "a redelivery must not silently dispatch behind the existing human gate"
+            "a redelivered decision must not silently dispatch behind the existing human gate"
         );
         assert_eq!(
             scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).len(),
@@ -8332,7 +8620,12 @@ workflow: {
         let home = tempfile::tempdir().unwrap();
         let (repo_dir, head_sha, main_before) = conflicting_repo();
         let space = Space::open_in_memory().unwrap();
-        let prior = conflict_context("prior-conflicted-head", "add src", "TKT-prior-correction");
+        let prior = conflict_context(
+            &repo_dir.path().display().to_string(),
+            "prior-conflicted-head",
+            "add src",
+            "TKT-prior-correction",
+        );
         put_conflict_marker(&space, &prior, Some("Prior-Rat"), "dispatching");
         let pipeline = test_pipeline(home.path(), space.clone());
         let entry = conflict_candidate_entry(repo_dir.path(), &head_sha);
