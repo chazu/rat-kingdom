@@ -3919,13 +3919,15 @@ impl LandingPipeline {
                 {
                     continue;
                 }
-                let key = field("dispatch_key").map(str::to_string).unwrap_or_else(|| {
-                    format!(
-                        "{}\0{}",
-                        field("head_sha").unwrap_or_default(),
-                        field("rework_ticket").unwrap_or_default()
-                    )
-                });
+                let key = field("dispatch_key")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}\0{}",
+                            field("head_sha").unwrap_or_default(),
+                            field("rework_ticket").unwrap_or_default()
+                        )
+                    });
                 distinct.insert(format!("{identity}\0{key}"));
             }
         }
@@ -10335,7 +10337,10 @@ workflow: {
         git(repo_dir.path(), &["checkout", "feature"]);
         std::fs::write(repo_dir.path().join("src.rs"), "fn x() { fixed() }\n").unwrap();
         git(repo_dir.path(), &["add", "src.rs"]);
-        git(repo_dir.path(), &["commit", "-m", "fix: reviewer correction"]);
+        git(
+            repo_dir.path(),
+            &["commit", "-m", "fix: reviewer correction"],
+        );
         let corrected_head = rev_parse(repo_dir.path(), "feature");
         git(repo_dir.path(), &["checkout", "main"]);
         assert_ne!(corrected_head, head_sha);
