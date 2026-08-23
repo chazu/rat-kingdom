@@ -71,6 +71,11 @@ pub fn orchestrator_action_for(v: &Violation) -> Option<&'static str> {
         // "redispatch" judgment call `reconcile.rs` names as this kind's
         // reason for Orchestrator authority.
         kind::TERMINAL_ASSIGNEE_ACTIVE_WORK => Some("ticket.reopen_if_in_progress"),
+        // The dispatch decision `landing_conflict.rs`'s own doc comment
+        // names as needing fleet-wide context: a bounded correction agent
+        // was evidenced and held (`LandingPipeline::dispatch_held_conflict`)
+        // but never spawned unattended — TKT-01M0E8PNFQZ70F3ZFG3KCS39ZG.
+        kind::CONFLICT_HELD_LANDING => Some("conflict.dispatch_correction"),
         _ => None,
     }
 }
@@ -207,6 +212,9 @@ mod tests {
             kind::TERMINAL_ASSIGNEE_ACTIVE_WORK
         ))
         .is_some());
+        assert!(
+            orchestrator_action_for(&report_first_violation(kind::CONFLICT_HELD_LANDING)).is_some()
+        );
         assert!(mechanical_action_for(&report_first_violation(
             kind::WORKFLOW_SETTLED_AGENT_STILL_LIVE
         ))

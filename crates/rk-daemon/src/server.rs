@@ -3746,6 +3746,8 @@ impl Daemon {
                     action,
                     None,
                     None,
+                    None,
+                    None,
                     "attempting",
                     false,
                     false,
@@ -3764,6 +3766,8 @@ impl Daemon {
                         authority,
                         crate::attention::DECIDED_BY_MECHANICAL,
                         action,
+                        None,
+                        None,
                         None,
                         None,
                         &outcome_str,
@@ -3805,6 +3809,11 @@ impl Daemon {
                         now,
                     )
                     .map_err(|e| AttentionDecideError::Refused(e.to_string()))?;
+                // Read-only, before any mutation: folds into both decision
+                // writes below so a kind with a bounded attempt chain
+                // (conflict-correction) records which attempt this decision
+                // authorized, not just that one was authorized.
+                let attempt = self.orchestrator_attempt_hint(violation);
 
                 let sinks = crate::reactor::sink_factory().registry(
                     self.notify_config
@@ -3862,6 +3871,8 @@ impl Daemon {
                         authority,
                         &holder,
                         action,
+                        Some(generation),
+                        attempt,
                         params.budget_usd,
                         params.budget_tokens,
                         "attempting",
@@ -3885,6 +3896,8 @@ impl Daemon {
                         authority,
                         &holder,
                         action,
+                        Some(generation),
+                        attempt,
                         params.budget_usd,
                         params.budget_tokens,
                         &outcome_str,
@@ -3937,10 +3950,51 @@ impl Daemon {
                 let reopened = self.tickets.reopen_if_in_progress(&v.subject).await?;
                 Ok(format!("{} reopened: {reopened}", v.subject))
             }
+            // `v.subject` is the held branch (`reconcile::conflict_held_landing`'s
+            // own violation shape); `dispatch_held_conflict` is the only
+            // caller of the actual `spawn_async` mutation for this chain —
+            // reaching this arm at all already proves a live, fenced
+            // orchestrator lease authorized it.
+            crate::reconcile::kind::CONFLICT_HELD_LANDING => {
+                let chain_key = Self::conflict_chain_key(v);
+                self.landing()
+                    .dispatch_held_conflict(&v.scope, &v.subject, chain_key.as_deref())
+                    .await
+            }
             other => Err(rk_core::Error::other(format!(
                 "no orchestrator repair implemented for kind {other}"
             ))),
         }
+    }
+
+    /// The in-flight attempt number a pending orchestrator repair is acting
+    /// on, if its kind tracks one — folded into the decision envelope
+    /// (`Self::record_decision`) so a durable decision records not just
+    /// THAT a correction was authorized but which attempt in the chain's
+    /// bounded budget it was. Kinds with no attempt concept (a ticket
+    /// reopen has exactly one shape, not a numbered chain) return `None`.
+    /// Read-only: a cheap marker lookup, distinct from actually executing
+    /// the repair.
+    fn orchestrator_attempt_hint(&self, v: &crate::reconcile::Violation) -> Option<u32> {
+        match v.kind.as_str() {
+            crate::reconcile::kind::CONFLICT_HELD_LANDING => {
+                let chain_key = Self::conflict_chain_key(v);
+                self.landing()
+                    .pending_conflict_attempt(&v.scope, &v.subject, chain_key.as_deref())
+            }
+            _ => None,
+        }
+    }
+
+    /// The `chain_key:` evidence reference `reconcile::conflict_held_landing`
+    /// attaches to a `CONFLICT_HELD_LANDING` violation, if any — binds a
+    /// decision to the EXACT chain it named rather than "whichever chain is
+    /// newest for this branch" at dispatch time. Absent for a legacy
+    /// violation from before that field existed.
+    fn conflict_chain_key(v: &crate::reconcile::Violation) -> Option<String> {
+        v.evidence
+            .iter()
+            .find_map(|e| e.strip_prefix("chain_key:").map(str::to_string))
     }
 
     /// Durably record one attention decision (evidence, selected action,
@@ -3963,6 +4017,14 @@ impl Daemon {
     /// rate window passes, or simply retried — is free to try again rather
     /// than being permanently told "already decided" for an item nothing
     /// ever actually resolved).
+    /// `generation` is the deciding holder's lease generation at the moment
+    /// of this decision (`None` for `Mechanical`, which acts with no lease
+    /// at all) — recording it, not just `decided_by`'s holder name, is what
+    /// lets a reader confirm a decision was actually made under a live,
+    /// fenced lease rather than trust the holder string alone.
+    /// `attempt` is the in-flight attempt number for violation kinds that
+    /// track a bounded chain (`Self::orchestrator_attempt_hint`); `None`
+    /// for kinds with no such concept.
     #[allow(clippy::too_many_arguments)]
     fn record_decision(
         &self,
@@ -3971,6 +4033,8 @@ impl Daemon {
         authority: crate::reconcile::Authority,
         decided_by: &str,
         action: &str,
+        generation: Option<u64>,
+        attempt: Option<u32>,
         budget_usd: Option<f64>,
         budget_tokens: Option<u64>,
         outcome: &str,
@@ -3985,7 +4049,9 @@ impl Daemon {
             "authority": authority,
             "evidence": violation.evidence,
             "decided_by": decided_by,
+            "generation": generation,
             "action": action,
+            "attempt": attempt,
             "budget_usd": budget_usd,
             "budget_tokens": budget_tokens,
             "outcome": outcome,
