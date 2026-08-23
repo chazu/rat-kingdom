@@ -3991,17 +3991,27 @@ impl LandingPipeline {
             let git_repo = git_repo.clone();
             let target = entry.target.clone();
             let sha = tested_sha.to_string();
-            blocking(move || Ok(git_repo.diff_stat(&target, &sha).map(|stat| stat.files).unwrap_or_default()))
-                .await?
+            blocking(move || {
+                Ok(git_repo
+                    .diff_stat(&target, &sha)
+                    .map(|stat| stat.files)
+                    .unwrap_or_default())
+            })
+            .await?
         };
         let (plan, edge_class, full_check_required, reason) =
             self.gate_plan(&checks_file, &entry.target, gates, &changed_paths)?;
 
-        let selected_checks: Vec<String> = plan.iter().map(|(check, _, _)| check.name.clone()).collect();
+        let selected_checks: Vec<String> = plan
+            .iter()
+            .map(|(check, _, _)| check.name.clone())
+            .collect();
         let proof_key = if full_check_required {
             plan.iter()
                 .find(|(check, _, _)| check.name == gates.check_name)
-                .and_then(|(check, _, _)| verification_proof_key(&entry.repo_name, tested_sha, check))
+                .and_then(|(check, _, _)| {
+                    verification_proof_key(&entry.repo_name, tested_sha, check)
+                })
         } else {
             None
         };
@@ -10846,7 +10856,10 @@ checks: [
             outcomes[0]
         );
         assert_eq!(
-            std::fs::read_to_string(&lint_marker).unwrap().lines().count(),
+            std::fs::read_to_string(&lint_marker)
+                .unwrap()
+                .lines()
+                .count(),
             1,
             "the inner edge must run its policy-selected focused check"
         );
@@ -10863,7 +10876,11 @@ checks: [
         assert_eq!(plans[0].payload["full_check_required"], false);
         assert_eq!(
             plans[0].payload["selected_checks"],
-            json!(["steward-protected-paths", "steward-diff-scope", "lint-check"])
+            json!([
+                "steward-protected-paths",
+                "steward-diff-scope",
+                "lint-check"
+            ])
         );
 
         // Promote the (now child-carrying) parent onto the protected final
@@ -10889,7 +10906,10 @@ checks: [
             outcomes[0]
         );
         assert_eq!(
-            std::fs::read_to_string(&verify_marker).unwrap().lines().count(),
+            std::fs::read_to_string(&verify_marker)
+                .unwrap()
+                .lines()
+                .count(),
             1,
             "the protected-final edge must run the full check exactly once"
         );
@@ -10965,7 +10985,11 @@ checks: [
         git(repo_dir.path(), &["checkout", "-b", "parent"]);
         git(repo_dir.path(), &["checkout", "-b", "child"]);
         std::fs::create_dir_all(repo_dir.path().join("migrations")).unwrap();
-        std::fs::write(repo_dir.path().join("migrations").join("x.sql"), "select 1;\n").unwrap();
+        std::fs::write(
+            repo_dir.path().join("migrations").join("x.sql"),
+            "select 1;\n",
+        )
+        .unwrap();
         git(repo_dir.path(), &["add", "."]);
         git(repo_dir.path(), &["commit", "-m", "add migration"]);
         let head_sha = rev_parse(repo_dir.path(), "child");
@@ -10985,7 +11009,10 @@ checks: [
                 ..Default::default()
             })
             .unwrap();
-        let outcomes = pipeline.drain_key("escalation-repo", "parent").await.unwrap();
+        let outcomes = pipeline
+            .drain_key("escalation-repo", "parent")
+            .await
+            .unwrap();
         assert_eq!(outcomes.len(), 1);
         assert!(
             matches!(outcomes[0], LandingOutcome::GateHeld),
@@ -11071,7 +11098,11 @@ checks: [
         assert_eq!(plans.len(), 1);
         assert_eq!(
             plans[0].payload["selected_checks"],
-            json!(["steward-protected-paths", "steward-diff-scope", "lint-check"])
+            json!([
+                "steward-protected-paths",
+                "steward-diff-scope",
+                "lint-check"
+            ])
         );
     }
 
@@ -11193,7 +11224,10 @@ checks: [
             .await
             .unwrap());
         assert_eq!(
-            std::fs::read_to_string(&counter_file).unwrap().lines().count(),
+            std::fs::read_to_string(&counter_file)
+                .unwrap()
+                .lines()
+                .count(),
             1,
             "the landing gate must run the full check exactly once"
         );
@@ -11215,7 +11249,10 @@ checks: [
             .unwrap();
         assert_eq!(result["reused"], true, "result: {result}");
         assert_eq!(
-            std::fs::read_to_string(&counter_file).unwrap().lines().count(),
+            std::fs::read_to_string(&counter_file)
+                .unwrap()
+                .lines()
+                .count(),
             1,
             "the reviewer's verify.run must not re-execute the full check"
         );
