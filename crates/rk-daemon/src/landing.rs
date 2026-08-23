@@ -3663,6 +3663,7 @@ impl LandingPipeline {
         entry: &LandingQueueEntry,
         ctx: &ReworkContext,
         attempt: u32,
+        round: u32,
         withheld: &Withheld,
     ) -> rk_core::Result<()> {
         self.escalate(entry, ctx.escalation(withheld))?;
@@ -3673,10 +3674,14 @@ impl LandingPipeline {
         // recovery, budget, and reviewed-head-moved routes all return early
         // above that point) — this is the only place those routes' review
         // phase gets closed out. The one exception (`dispatch-refused`,
-        // reached AFTER that write) targets the SAME `(task, attempt)` key,
-        // so `record_phase_span`'s dedup makes this a harmless no-op there,
-        // correctly leaving the original "rework-requested" span as the
-        // review's terminal record rather than overwriting it.
+        // reached AFTER that write) targets the SAME `(task, phase, round)`
+        // key, so `record_phase_span`'s dedup makes this a harmless no-op
+        // there, correctly leaving the original "rework-requested" span as
+        // the review's terminal record rather than overwriting it. `round`
+        // is the shared, cross-kind number `Self::correction_round` derives
+        // — NOT `attempt`, which numbers only this chain's own kind and can
+        // collide with a conflict-correction round's span on the same task
+        // (see `Self::correction_round`'s doc).
         let _ = crate::span::record_phase_span(
             &self.space,
             &entry.repo_name,
@@ -3684,7 +3689,7 @@ impl LandingPipeline {
             &Self::timed_review_span(
                 &entry.task,
                 crate::span::Phase::SemanticReview,
-                attempt,
+                round,
                 &entry.repo_name,
                 self.phase_started_at(entry),
                 hold_at,
@@ -3904,6 +3909,19 @@ impl LandingPipeline {
     /// so one filter serves both; keys are namespaced by identity because the
     /// two kinds number independently and could otherwise coincide.
     fn correction_rounds_used(&self, entry: &LandingQueueEntry) -> rk_core::Result<u32> {
+        self.correction_rounds(entry, None)
+    }
+
+    /// Shared implementation behind [`Self::correction_rounds_used`] and
+    /// [`Self::correction_round`]: counts distinct dispatched/dispatching
+    /// bounded-correction rounds — rework and conflict alike — for `entry`,
+    /// optionally excluding one exact `(identity, dispatch_key)` round from
+    /// the count.
+    fn correction_rounds(
+        &self,
+        entry: &LandingQueueEntry,
+        exclude: Option<(&str, &str)>,
+    ) -> rk_core::Result<u32> {
         let mut distinct: BTreeSet<String> = BTreeSet::new();
         for identity in [REWORK_DISPATCH_IDENTITY, CONFLICT_DISPATCH_IDENTITY] {
             let pattern = Pattern::category(Category::Event)
@@ -3928,10 +3946,47 @@ impl LandingPipeline {
                             field("rework_ticket").unwrap_or_default()
                         )
                     });
+                if exclude == Some((identity, key.as_str())) {
+                    continue;
+                }
                 distinct.insert(format!("{identity}\0{key}"));
             }
         }
         Ok(distinct.len() as u32)
+    }
+
+    /// The shared, cross-kind round number for one bounded-correction round
+    /// (rework or conflict), for use as the `attempt` on the `SemanticReview`
+    /// / `Rework` / `AttentionHold` spans that round writes.
+    ///
+    /// [`Self::rework_attempts_used`] and [`Self::conflict_attempts_used`]
+    /// number their own kind's rounds independently, both starting at 1 — a
+    /// task that interleaves one rework round and one conflict round would
+    /// have both write their opening `SemanticReview` span at `attempt: 1`,
+    /// and [`crate::span::record_phase_span`]'s dedup on `(task, phase,
+    /// attempt)` would silently drop the second round's span. This derives
+    /// the attempt from the same shared, cross-kind count
+    /// [`Self::approved_review_attempt`] already uses for the APPROVE case,
+    /// so rework and conflict rounds share one numbering line and can never
+    /// collide.
+    ///
+    /// Excludes `identity`/`dispatch_key`'s own round from the count before
+    /// adding 1, rather than requiring the caller only invoke this before
+    /// that round's own marker is durably written: that makes the result
+    /// stable regardless of whether this round's own `"dispatching"` marker
+    /// already exists in the space — a fresh dispatch (marker not yet
+    /// written) and a crash replay reproducing the same round for the same
+    /// chain (marker already written) both read the identical number, which
+    /// is what lets the replay path's span write hit the same `(task, phase,
+    /// attempt)` dedup key the original attempt would have used.
+    fn correction_round(
+        &self,
+        entry: &LandingQueueEntry,
+        identity: &str,
+        dispatch_key: &str,
+    ) -> rk_core::Result<u32> {
+        self.correction_rounds(entry, Some((identity, dispatch_key)))
+            .map(|n| n.saturating_add(1))
     }
 
     /// File the ticket, then dispatch one exact-base correction or hold behind
@@ -3960,6 +4015,13 @@ impl LandingPipeline {
             diff_files: stat.files.len() as u64,
             diff_lines: stat.lines,
         };
+        // Shared, cross-kind round number for every SemanticReview/Rework
+        // span this chain's round writes below — see `Self::correction_round`.
+        // Excludes this exact dispatch_key from the count, so it reads the
+        // same whether this round's own marker is durably written yet or
+        // not; safe to compute once, up front, and reuse through every
+        // branch of this function.
+        let round = self.correction_round(entry, REWORK_DISPATCH_IDENTITY, &ctx.dispatch_key())?;
 
         // The coalesced ticket completes the dispatch key before side effects.
         if let Some(marker) = self.rework_dispatch_marker(&ctx)? {
@@ -3987,7 +4049,7 @@ impl LandingPipeline {
                                recorded rework ticket exactly once or abandon it"
                         .into(),
                 };
-                self.withhold_rework(entry, &ctx, attempt, &withheld)?;
+                self.withhold_rework(entry, &ctx, attempt, round, &withheld)?;
                 warn!(
                     repo = %entry.repo_name, branch = %entry.branch,
                     head_sha = %entry.head_sha, ticket = %ctx.rework_ticket, attempt,
@@ -4009,7 +4071,7 @@ impl LandingPipeline {
         let route = landing_rework::route(&policy, review.as_ref(), attempts_used, spent_usd);
         let attempt = match route {
             ReworkRoute::Withhold(withheld) => {
-                self.withhold_rework(entry, &ctx, attempts_used, &withheld)?;
+                self.withhold_rework(entry, &ctx, attempts_used, round, &withheld)?;
                 return Ok(LandingOutcome::ReworkFiled(ticket));
             }
             ReworkRoute::Dispatch { attempt } => attempt,
@@ -4033,7 +4095,7 @@ impl LandingPipeline {
                            reviewed head and let the rework dispatch"
                     .into(),
             };
-            self.withhold_rework(entry, &ctx, attempts_used, &withheld)?;
+            self.withhold_rework(entry, &ctx, attempts_used, round, &withheld)?;
             return Ok(LandingOutcome::ReworkFiled(ticket));
         }
 
@@ -4050,7 +4112,7 @@ impl LandingPipeline {
             &Self::timed_review_span(
                 &entry.task,
                 crate::span::Phase::SemanticReview,
-                attempt,
+                round,
                 &entry.repo_name,
                 self.phase_started_at(entry),
                 review_ended_at,
@@ -4096,7 +4158,7 @@ impl LandingPipeline {
                     &Self::timed_review_span(
                         &entry.task,
                         crate::span::Phase::Rework,
-                        attempt,
+                        round,
                         &entry.repo_name,
                         Some(review_ended_at),
                         Utc::now(),
@@ -4129,7 +4191,7 @@ impl LandingPipeline {
                                paused dispatch), then dispatch the rework ticket"
                         .into(),
                 };
-                self.withhold_rework(entry, &ctx, attempt, &withheld)?;
+                self.withhold_rework(entry, &ctx, attempt, round, &withheld)?;
                 warn!(
                     repo = %entry.repo_name, branch = %entry.branch, error = %e,
                     "landing pipeline: bounded rework dispatch refused"
@@ -4197,6 +4259,7 @@ impl LandingPipeline {
         entry: &LandingQueueEntry,
         ctx: &ConflictContext,
         attempt: u32,
+        round: u32,
         withheld: &Withheld,
     ) -> rk_core::Result<()> {
         self.escalate(entry, ctx.escalation(withheld))?;
@@ -4204,8 +4267,11 @@ impl LandingPipeline {
         // Mirrors `withhold_rework`: closes out the review/correction phase
         // for the withhold routes that never reach `dispatch_held_conflict`'s
         // own "conflict-correction-requested" write, and is a dedup no-op
-        // (same `(task, attempt)` key) for the one route that does. `entry`
-        // here is usually the synthetic conflict entry
+        // (same `(task, phase, round)` key) for the one route that does.
+        // `round` is the shared, cross-kind number `Self::correction_round`
+        // derives, not `attempt`, which numbers only conflict-correction
+        // rounds and can collide with a rework round's span on the same task.
+        // `entry` here is usually the synthetic conflict entry
         // (`Self::synthetic_conflict_entry`), which carries no durable queue
         // clock, so `duration_ms` is left absent rather than fabricated.
         let _ = crate::span::record_phase_span(
@@ -4215,7 +4281,7 @@ impl LandingPipeline {
             &Self::timed_review_span(
                 &entry.task,
                 crate::span::Phase::SemanticReview,
-                attempt,
+                round,
                 &entry.repo_name,
                 self.phase_started_at(entry),
                 Utc::now(),
@@ -4387,6 +4453,10 @@ impl LandingPipeline {
             diff_files: stat.files.len() as u64,
             diff_lines: stat.lines,
         };
+        // Shared, cross-kind round number for every SemanticReview span this
+        // chain's round writes below — see `Self::correction_round`.
+        let round =
+            self.correction_round(entry, CONFLICT_DISPATCH_IDENTITY, &ctx.dispatch_key())?;
 
         // The coalesced ticket completes the dispatch key before side effects.
         if let Some(marker) = self.conflict_dispatch_marker(&ctx)? {
@@ -4414,7 +4484,7 @@ impl LandingPipeline {
                                recorded correction ticket exactly once or abandon it"
                         .into(),
                 };
-                self.withhold_conflict(entry, &ctx, attempt, &withheld)?;
+                self.withhold_conflict(entry, &ctx, attempt, round, &withheld)?;
                 warn!(
                     repo = %entry.repo_name, branch = %entry.branch,
                     head_sha = %entry.head_sha, ticket = %ctx.rework_ticket, attempt,
@@ -4446,7 +4516,7 @@ impl LandingPipeline {
         let route = landing_conflict::route(&policy, &evidence, attempts_used, spent_usd);
         let attempt = match route {
             ReworkRoute::Withhold(withheld) => {
-                self.withhold_conflict(entry, &ctx, attempts_used, &withheld)?;
+                self.withhold_conflict(entry, &ctx, attempts_used, round, &withheld)?;
                 return Ok(LandingOutcome::ReworkFiled(ticket));
             }
             ReworkRoute::Dispatch { attempt } => attempt,
@@ -4473,7 +4543,7 @@ impl LandingPipeline {
                            the conflicted head and let the correction dispatch"
                     .into(),
             };
-            self.withhold_conflict(entry, &ctx, attempts_used, &withheld)?;
+            self.withhold_conflict(entry, &ctx, attempts_used, round, &withheld)?;
             return Ok(LandingOutcome::ReworkFiled(ticket));
         }
 
@@ -4755,6 +4825,17 @@ impl LandingPipeline {
             .and_then(Value::as_u64)
             .and_then(|a| u32::try_from(a).ok())
             .unwrap_or(1);
+        // Shared, cross-kind round number for every SemanticReview/Rework
+        // span this chain's round writes below — see `Self::correction_round`.
+        // Excludes this exact dispatch_key from the count, so it reads the
+        // same whether this round's own "dispatching" marker is durably
+        // written yet or not (a fresh dispatch vs. a crash replay of this
+        // same call).
+        let round = self.correction_round(
+            &Self::synthetic_conflict_entry(&ctx),
+            CONFLICT_DISPATCH_IDENTITY,
+            &ctx.dispatch_key(),
+        )?;
 
         // Every state but the one this call is meant to act on is handled
         // explicitly — never a blanket "not awaiting-decision, so already
@@ -4810,7 +4891,7 @@ impl LandingPipeline {
                         .into(),
                 };
                 if !self.conflict_dispatch_has_state(&ctx, "dispatch-interrupted")? {
-                    self.withhold_conflict(&entry, &ctx, attempt, &withheld)?;
+                    self.withhold_conflict(&entry, &ctx, attempt, round, &withheld)?;
                 }
                 return Err(rk_core::Error::other(withheld.detail));
             }
@@ -4853,7 +4934,7 @@ impl LandingPipeline {
                            the conflicted head and let the correction dispatch"
                     .into(),
             };
-            self.withhold_conflict(&entry, &ctx, attempt, &withheld)?;
+            self.withhold_conflict(&entry, &ctx, attempt, round, &withheld)?;
             return Err(rk_core::Error::other(withheld.detail));
         }
 
@@ -4877,7 +4958,7 @@ impl LandingPipeline {
             &Self::timed_review_span(
                 &entry.task,
                 crate::span::Phase::SemanticReview,
-                attempt,
+                round,
                 &entry.repo_name,
                 self.phase_started_at(&entry),
                 review_ended_at,
@@ -4923,7 +5004,7 @@ impl LandingPipeline {
                     &Self::timed_review_span(
                         &entry.task,
                         crate::span::Phase::Rework,
-                        attempt,
+                        round,
                         &entry.repo_name,
                         Some(review_ended_at),
                         Utc::now(),
@@ -4960,7 +5041,7 @@ impl LandingPipeline {
                                paused dispatch), then dispatch the correction ticket"
                         .into(),
                 };
-                self.withhold_conflict(&entry, &ctx, attempt, &withheld)?;
+                self.withhold_conflict(&entry, &ctx, attempt, round, &withheld)?;
                 warn!(
                     repo = %ctx.repo, branch = %ctx.branch, error = %e,
                     "landing pipeline: orchestrator-authorized conflict-correction dispatch refused"
@@ -10384,6 +10465,100 @@ workflow: {
             .as_i64()
             .expect("the approval must carry a real duration_ms, not null");
         assert!(duration >= 0, "{approval:?}");
+    }
+
+    /// The bug this fixes: `rework_attempts_used` and `conflict_attempts_used`
+    /// number their own kind's bounded-correction rounds independently, both
+    /// starting at 1. A task that goes through one rework round and then one
+    /// conflict-correction round would have both write their opening
+    /// `SemanticReview` span at `attempt: 1`, and `record_phase_span`'s dedup
+    /// on `(task, phase, attempt)` would silently drop the second round's
+    /// span — the same telemetry gap
+    /// `approve_after_a_real_rework_round_records_its_own_review_span` covers
+    /// for the APPROVE-after-rework case, but for rework<->conflict
+    /// interleaving. Both rounds are driven through the real routing paths
+    /// (`drain_key` -> `route_rework`, then `route_conflict` ->
+    /// `dispatch_held_conflict`), not hand-written markers, so this proves
+    /// the fix through the actual attempt-derivation code
+    /// (`Self::correction_round`).
+    #[tokio::test]
+    async fn interleaved_rework_then_conflict_rounds_record_distinct_review_spans() {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+
+        let space = Space::open_in_memory().unwrap();
+        space.out(verdict_tuple(&head_sha, "REWORK")).unwrap();
+
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(review_candidate_entry(repo_dir.path(), &head_sha))
+            .unwrap();
+
+        // Round 1: a real REWORK round, routed through the full pipeline.
+        let reworked = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert!(
+            matches!(reworked.as_slice(), [LandingOutcome::ReworkFiled(_)]),
+            "expected a real REWORK round, got {reworked:?}"
+        );
+
+        // Round 2: a conflict-correction round on the SAME repo/branch/
+        // target/task, routed and dispatched for real too. `route_conflict`
+        // never inspects the working tree for an actual conflict itself —
+        // the `detail` string is evidence it records, not something it
+        // verifies — so the clean `review_candidate_repo` fixture is enough
+        // to exercise this path on the exact same task the rework round
+        // above used.
+        let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let conflict_entry = conflict_candidate_entry(repo_dir.path(), &head_sha);
+        let held = pipeline
+            .route_conflict(
+                &conflict_entry,
+                &repo,
+                "CONFLICT (content): Merge conflict in src.rs",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(held, LandingOutcome::ReworkFiled(_)));
+        pipeline
+            .dispatch_held_conflict("code-repo", "feature", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rev_parse(repo_dir.path(), "main"),
+            main_before,
+            "neither round lands the branch"
+        );
+
+        let review_spans: Vec<Value> = crate::span::spans_for_task(&space, "code-repo", "add src")
+            .unwrap()
+            .into_iter()
+            .filter(|s| s["phase"] == "semantic_review")
+            .collect();
+        assert_eq!(
+            review_spans.len(),
+            2,
+            "both rounds must record their own SemanticReview span, not collapse onto one: \
+             {review_spans:?}"
+        );
+        let rework_span = review_spans
+            .iter()
+            .find(|s| s["terminal_reason"] == "rework-requested")
+            .expect("the rework round must record its own SemanticReview span");
+        let conflict_span = review_spans
+            .iter()
+            .find(|s| s["terminal_reason"] == "conflict-correction-requested")
+            .expect(
+                "the conflict round must record its own SemanticReview span, not dedup-drop \
+                 against the rework round's",
+            );
+        assert_eq!(rework_span["attempt"], 1, "{rework_span:?}");
+        assert_eq!(
+            conflict_span["attempt"], 2,
+            "a conflict round after one rework round must share the rework round's numbering \
+             line, not restart at 1: {conflict_span:?}"
+        );
+        assert_ne!(rework_span["attempt"], conflict_span["attempt"]);
     }
 
     /// The bug this fixes: a spawn refusal must leave the marker at a
