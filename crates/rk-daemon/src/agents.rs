@@ -658,8 +658,8 @@ impl Registry {
 
     /// Durably record that `key` was refused admission to `(repo, lane)`. A
     /// repeat refusal for a key already queued is treated as a liveness
-    /// heartbeat: `last_seen` is refreshed (in memory always; on disk at most
-    /// once every [`LANE_WAIT_HEARTBEAT_PERSIST_SECS`], to bound write volume
+    /// heartbeat: `last_seen` is refreshed and persisted at most once every
+    /// [`LANE_WAIT_HEARTBEAT_PERSIST_SECS`], to bound write volume
     /// under a caller that retries every ~250ms) instead of minting a second
     /// entry — the idempotence the durable-queue contract requires. A write
     /// failure here is logged but does not change this call's own outcome:
@@ -668,37 +668,58 @@ impl Registry {
     /// unaffected either way — only cross-restart durability is at risk,
     /// which the log line surfaces rather than swallows.
     fn record_lane_wait(&mut self, repo: &str, lane: Lane, key: &str) {
-        let now = Utc::now();
-        let mut should_persist = false;
-        let mut already_queued = false;
-        if let Some(existing) = self
+        self.record_lane_wait_at(repo, lane, key, Utc::now());
+    }
+
+    /// Clock-injected implementation of [`record_lane_wait`](Self::record_lane_wait).
+    /// Keeping `last_seen` at the last successfully persisted heartbeat is
+    /// intentional: comparing against a timestamp refreshed on every 250ms
+    /// retry would prevent the 60-second persistence threshold from ever
+    /// being reached.
+    fn record_lane_wait_at(&mut self, repo: &str, lane: Lane, key: &str, now: DateTime<Utc>) {
+        if let Some(index) = self
             .lane_waiters
-            .iter_mut()
-            .find(|w| w.repo == repo && w.lane_tag == lane.tag() && w.key == key)
+            .iter()
+            .position(|w| w.repo == repo && w.lane_tag == lane.tag() && w.key == key)
         {
-            already_queued = true;
-            should_persist =
-                (now - existing.last_seen).num_seconds() >= LANE_WAIT_HEARTBEAT_PERSIST_SECS;
-            existing.last_seen = now;
-        }
-        if !already_queued {
-            self.lane_waiters.push(LaneWaiter {
-                repo: repo.to_string(),
-                lane_tag: lane.tag().to_string(),
-                key: key.to_string(),
-                requested_at: now,
-                last_seen: now,
-            });
-            should_persist = true;
-        }
-        if should_persist {
+            if (now - self.lane_waiters[index].last_seen).num_seconds()
+                < LANE_WAIT_HEARTBEAT_PERSIST_SECS
+            {
+                return;
+            }
+            let previous = self.lane_waiters[index].last_seen;
+            self.lane_waiters[index].last_seen = now;
             if let Err(e) = self.persist_lane_waiters() {
+                // Keep the old persisted timestamp in memory so the next
+                // retry attempts the durable heartbeat again immediately.
+                self.lane_waiters[index].last_seen = previous;
                 tracing::error!(
                     repo, lane = lane.tag(), key, error = %e,
-                    "failed to persist a lane wait record; this waiter's queue position will \
-                     not survive a restart until the next successful write"
+                    "failed to persist a lane wait heartbeat; retrying on the next refusal"
                 );
             }
+            return;
+        }
+
+        self.lane_waiters.push(LaneWaiter {
+            repo: repo.to_string(),
+            lane_tag: lane.tag().to_string(),
+            key: key.to_string(),
+            requested_at: now,
+            last_seen: now,
+        });
+        if let Err(e) = self.persist_lane_waiters() {
+            // Force the next retry to attempt persistence again rather than
+            // waiting a full heartbeat interval after this failed first write.
+            if let Some(inserted) = self.lane_waiters.last_mut() {
+                inserted.last_seen = now
+                    - chrono::TimeDelta::try_seconds(LANE_WAIT_HEARTBEAT_PERSIST_SECS)
+                        .expect("positive heartbeat interval");
+            }
+            tracing::error!(
+                repo, lane = lane.tag(), key, error = %e,
+                "failed to persist a new lane wait record; retrying on the next refusal"
+            );
         }
     }
 
@@ -1133,6 +1154,49 @@ mod tests {
         r.usage.input = 100;
         r.usage.output = 50;
         r
+    }
+
+    /// An actively retrying waiter must refresh its durable heartbeat even
+    /// when every individual retry arrives sooner than the write-throttle
+    /// interval. Otherwise updating the in-memory timestamp on every retry
+    /// makes the interval perpetually zero and a restart later misclassifies
+    /// the active request as abandoned.
+    #[test]
+    fn active_lane_waiter_persists_heartbeat_across_a_long_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.json");
+        let start = Utc::now() - chrono::TimeDelta::try_minutes(11).unwrap();
+        {
+            let mut reg = Registry::load(&path).unwrap();
+            reg.record_lane_wait_at("repo", Lane::Implementation, "active", start);
+            for elapsed_secs in (30..=660).step_by(30) {
+                reg.record_lane_wait_at(
+                    "repo",
+                    Lane::Implementation,
+                    "active",
+                    start + chrono::TimeDelta::try_seconds(elapsed_secs).unwrap(),
+                );
+            }
+        }
+
+        let mut reloaded = Registry::load(&path).unwrap();
+        assert_eq!(reloaded.lane_waiters.len(), 1);
+        assert!(
+            (Utc::now() - reloaded.lane_waiters[0].last_seen).num_seconds() < 5,
+            "the on-disk heartbeat must advance while sub-minute retries continue"
+        );
+        assert!(
+            (Utc::now() - reloaded.lane_waiters[0].requested_at).num_seconds()
+                >= LANE_WAIT_STALE_SECS,
+            "the request has waited longer than the stale threshold in total"
+        );
+
+        reloaded.evict_stale_lane_waiters("repo", Lane::Implementation);
+        assert_eq!(
+            reloaded.lane_waiters.len(),
+            1,
+            "restart recovery must retain an old but actively retrying waiter"
+        );
     }
 
     /// TKT-147: the predicate a workflow gate leans on to tell a rat that
