@@ -96,6 +96,32 @@ repo: #RepositoryPolicy
 	// Percent of the clamped backoff added as jitter, uniform over
 	// [0, jitterPct]. 0 disables jitter.
 	reviewDeathRetryJitterPct: int | *20
+	// PROTECTED FINAL TARGETS: target branches this repo treats as
+	// protected/final delivery destinations. A landing edge whose target is
+	// one of these runs the repo's full named check exactly once, through
+	// the daemon's managed-verification proof-key cache. Any other target is
+	// an inner child-to-parent edge and runs only the checks focusedChecks
+	// below selects, never the full check by default.
+	protectedTargets: [...string] | *["main"]
+	// FOCUSED CHECKS: ordered rules mapping changed-path patterns to the
+	// named checks (.rk/checks.cue) an inner landing edge runs INSTEAD OF the
+	// full check. Every rule whose paths matches at least one changed file —
+	// or that declares no paths at all, an unconditional catch-all —
+	// contributes its checks, deduped in first-seen order. No rule matching
+	// means no additional check runs beyond protectedPaths/diffScope: an
+	// inner edge never falls back to the full suite by default.
+	focusedChecks: [...#FocusedCheckRule] | *[]
+}
+
+#FocusedCheckRule: {
+	// POSIX ERE alternatives matched against each changed path (the same
+	// engine protectedPaths uses — grep -E). Empty matches unconditionally.
+	paths: [...string] | *[]
+	// Free-form label surfaced in landing events as this rule's selection
+	// reason — a "named check class" (e.g. "docs", "rust-fast").
+	class: string | *""
+	// Named checks (.rk/checks.cue) this rule contributes when it matches.
+	checks: [...string]
 }
 
 // Regenerable build-artifact paths (relative to a worktree root) the daemon's
