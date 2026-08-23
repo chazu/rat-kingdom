@@ -369,23 +369,37 @@ fn conflict_held_landing(lands: &[Tuple], git: &GitFacts) -> Vec<Violation> {
             // cursor. `t.id` (`rk_core::id::RecordId`, a ULID) is guaranteed
             // unique AND lexicographically sortable by real creation time,
             // which is exactly what "distinct AND reachable" requires.
-            let has_chain_key = t.payload.get("chain_key").and_then(Value::as_str).is_some();
-            let id = if has_chain_key {
-                format!("{}:{}:{}:{}", kind::CONFLICT_HELD_LANDING, t.scope, branch, t.id)
-            } else {
-                format!("{}:{}:{}", kind::CONFLICT_HELD_LANDING, t.scope, branch)
+            let chain_key = t.payload.get("chain_key").and_then(Value::as_str);
+            let id = match chain_key {
+                Some(_) => format!("{}:{}:{}:{}", kind::CONFLICT_HELD_LANDING, t.scope, branch, t.id),
+                None => format!("{}:{}:{}", kind::CONFLICT_HELD_LANDING, t.scope, branch),
             };
+            let mut evidence = vec![
+                format!("branch_landed:{}", t.id),
+                format!("branch:{branch}"),
+                format!("target:{target}"),
+            ];
+            // Binds `Server::execute_orchestrator`/`orchestrator_attempt_hint`
+            // to THIS exact chain: both only ever receive `(scope, subject)`
+            // from the violation, and `subject` is just the branch name — the
+            // same branch a genuinely later, distinct conflict can also carry.
+            // Without the chain_key riding along in evidence, a decision
+            // authorized against THIS violation could resolve its marker via
+            // a fresh, independent "latest for branch" read at dispatch time
+            // and act on whichever chain is newest then, not the one actually
+            // named by `violation.id` — a TOCTOU window between the report
+            // snapshot `attention.decide` authorized against and the
+            // dispatch's own re-read moments later.
+            if let Some(chain_key) = chain_key {
+                evidence.push(format!("chain_key:{chain_key}"));
+            }
             Some(Violation {
                 id,
                 kind: kind::CONFLICT_HELD_LANDING.into(),
                 scope: t.scope.clone(),
                 subject: branch.to_string(),
                 detail: format!("land did not merge {branch} -> {target}: {why}"),
-                evidence: vec![
-                    format!("branch_landed:{}", t.id),
-                    format!("branch:{branch}"),
-                    format!("target:{target}"),
-                ],
+                evidence,
                 authority: Authority::Orchestrator,
             })
         })
@@ -974,13 +988,20 @@ mod tests {
     /// earlier chain's would produce an id that is LESS than the cursor —
     /// permanently invisible to `attention.next`, exactly the bug this
     /// field was added to fix (see the comment on `chain_key` above). The id
-    /// must instead be anchored to something guaranteed to increase with
-    /// real time regardless of what a `chain_key` string happens to contain
-    /// — the land tuple's own `RecordId`, which is monotonic and
-    /// lexicographically sortable by construction (`rk_core::id::RecordId`).
+    /// must instead be anchored to something that increases with real time
+    /// regardless of what a `chain_key` string happens to contain — the
+    /// land tuple's own `RecordId` (`rk_core::id::RecordId`, a ULID).
+    /// `RecordId::floor_at` pins each tuple's id to an explicit,
+    /// millisecond-distinct instant instead of `Tuple::new`'s current-time
+    /// default: two back-to-back `Tuple::new` calls can legitimately land in
+    /// the SAME millisecond, and a ULID's sub-millisecond ordering is random
+    /// (`RecordId`'s own doc comment), which would make this test flaky if
+    /// it depended on wall-clock scheduling for the property under test.
     #[test]
     fn a_later_conflict_chain_gets_an_id_that_sorts_after_an_earlier_terminal_chains_cursor() {
+        use chrono::{TimeZone, Utc};
         let mut earlier = branch_landed("myrepo", "feature", "main", false, false);
+        earlier.id = rk_core::id::RecordId::floor_at(Utc.timestamp_millis_opt(1_000).unwrap());
         // Deliberately sorts HIGH as a bare string, despite being the
         // earlier (lower-RecordId) tuple — the adversarial case a
         // content-derived chain_key cannot defend against.
@@ -998,6 +1019,7 @@ mod tests {
         let cursor = report_one.violations[0].id.clone();
 
         let mut later = branch_landed("myrepo", "feature", "main", false, false);
+        later.id = rk_core::id::RecordId::floor_at(Utc.timestamp_millis_opt(2_000).unwrap());
         // Deliberately sorts LOW as a bare string — a genuinely NEW, later
         // conflict (correcting the first) whose head_sha just happens to
         // hash lower.

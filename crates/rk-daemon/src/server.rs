@@ -3956,8 +3956,9 @@ impl Daemon {
             // reaching this arm at all already proves a live, fenced
             // orchestrator lease authorized it.
             crate::reconcile::kind::CONFLICT_HELD_LANDING => {
+                let chain_key = Self::conflict_chain_key(v);
                 self.landing()
-                    .dispatch_held_conflict(&v.scope, &v.subject)
+                    .dispatch_held_conflict(&v.scope, &v.subject, chain_key.as_deref())
                     .await
             }
             other => Err(rk_core::Error::other(format!(
@@ -3976,11 +3977,24 @@ impl Daemon {
     /// the repair.
     fn orchestrator_attempt_hint(&self, v: &crate::reconcile::Violation) -> Option<u32> {
         match v.kind.as_str() {
-            crate::reconcile::kind::CONFLICT_HELD_LANDING => self
-                .landing()
-                .pending_conflict_attempt(&v.scope, &v.subject),
+            crate::reconcile::kind::CONFLICT_HELD_LANDING => {
+                let chain_key = Self::conflict_chain_key(v);
+                self.landing()
+                    .pending_conflict_attempt(&v.scope, &v.subject, chain_key.as_deref())
+            }
             _ => None,
         }
+    }
+
+    /// The `chain_key:` evidence reference `reconcile::conflict_held_landing`
+    /// attaches to a `CONFLICT_HELD_LANDING` violation, if any — binds a
+    /// decision to the EXACT chain it named rather than "whichever chain is
+    /// newest for this branch" at dispatch time. Absent for a legacy
+    /// violation from before that field existed.
+    fn conflict_chain_key(v: &crate::reconcile::Violation) -> Option<String> {
+        v.evidence
+            .iter()
+            .find_map(|e| e.strip_prefix("chain_key:").map(str::to_string))
     }
 
     /// Durably record one attention decision (evidence, selected action,

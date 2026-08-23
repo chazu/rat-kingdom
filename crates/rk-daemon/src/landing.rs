@@ -4179,7 +4179,54 @@ impl LandingPipeline {
     /// [`Self::dispatch_held_conflict`] locates the held chain to act on.
     /// Newest by tuple id, matching every other "latest wins" marker lookup
     /// in this module.
-    fn latest_conflict_marker(&self, repo: &str, branch: &str) -> rk_core::Result<Option<Tuple>> {
+    /// How far one chain's own state machine has actually progressed
+    /// (awaiting-decision -> dispatching -> a terminal state). Used instead
+    /// of raw id order to pick the "current" marker WITHIN one chain's own
+    /// markers: a chain's "dispatching" and terminal writes land
+    /// microseconds apart within the SAME call (`record_conflict_state`
+    /// then `withhold_conflict`), often inside one millisecond, and a
+    /// ULID's sub-millisecond ordering is random (`RecordId`'s own doc
+    /// comment) — id order alone picked the still-"dispatching" write over
+    /// that same chain's own terminal one often enough to make a bare
+    /// `max_by(id)` a genuinely flaky read, not a rare theoretical one. A
+    /// bare "state != dispatching" filter is not a safe substitute either —
+    /// it matches a chain's FIRST marker (the original awaiting-decision
+    /// hold) just as readily as its terminal one.
+    fn conflict_state_rank(marker: &Tuple) -> u8 {
+        match marker.payload.get("state").and_then(Value::as_str) {
+            Some(landing_conflict::CONFLICT_STATE_AWAITING_DECISION) => 0,
+            Some("dispatching") => 1,
+            _ => 2,
+        }
+    }
+
+    /// The dispatch_key a marker belongs to, falling back to the same
+    /// `head_sha`+`rework_ticket` pair [`Self::conflict_marker_matches`]
+    /// uses for a marker written before that field existed.
+    fn conflict_marker_chain_key(marker: &Tuple) -> String {
+        marker
+            .payload
+            .get("dispatch_key")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "{}\0{}",
+                    marker
+                        .payload
+                        .get("head_sha")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    marker
+                        .payload
+                        .get("rework_ticket")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                )
+            })
+    }
+
+    fn conflict_markers_for_branch(&self, repo: &str, branch: &str) -> rk_core::Result<Vec<Tuple>> {
         let pattern = Pattern::category(Category::Event)
             .identity(CONFLICT_DISPATCH_IDENTITY)
             .scope(repo);
@@ -4188,7 +4235,57 @@ impl LandingPipeline {
             .scan(&pattern)?
             .into_iter()
             .filter(|t| t.payload.get("branch").and_then(Value::as_str) == Some(branch))
-            .max_by(|a, b| a.id.cmp(&b.id)))
+            .collect())
+    }
+
+    /// The current marker for the EXACT chain `chain_key` names — never a
+    /// different, possibly newer chain on the same branch. This is what
+    /// [`Self::dispatch_held_conflict`] and [`Self::pending_conflict_attempt`]
+    /// use whenever the caller (an already-decided `Violation`) knows which
+    /// chain it means: `Self::latest_conflict_marker`'s "whichever chain is
+    /// newest for this branch right now" is a DIFFERENT, weaker query, only
+    /// appropriate when no chain_key is available at all (a legacy
+    /// violation predating that field).
+    fn conflict_marker_for_chain_key(
+        &self,
+        repo: &str,
+        branch: &str,
+        chain_key: &str,
+    ) -> rk_core::Result<Option<Tuple>> {
+        Ok(self
+            .conflict_markers_for_branch(repo, branch)?
+            .into_iter()
+            .filter(|m| Self::conflict_marker_chain_key(m) == chain_key)
+            .max_by_key(|m| (Self::conflict_state_rank(m), m.id)))
+    }
+
+    /// The most recent chain's current marker for a (repo, branch) pair,
+    /// regardless of its exact chain_key — used ONLY when the caller has no
+    /// chain_key to bind to (a legacy violation, from before that field
+    /// existed). Prefer [`Self::conflict_marker_for_chain_key`] whenever a
+    /// chain_key is available: picking "whichever chain is newest right
+    /// now" is a materially different, weaker query than "the chain this
+    /// specific decision named," and can rebind to a genuinely newer chain
+    /// that appeared on the same branch after the decision was authorized
+    /// but before this dispatch's own independent read.
+    fn latest_conflict_marker(&self, repo: &str, branch: &str) -> rk_core::Result<Option<Tuple>> {
+        let markers = self.conflict_markers_for_branch(repo, branch)?;
+        let mut by_chain: HashMap<String, Vec<Tuple>> = HashMap::new();
+        for marker in markers {
+            by_chain
+                .entry(Self::conflict_marker_chain_key(&marker))
+                .or_default()
+                .push(marker);
+        }
+        // Distinct CHAINS are always separated by real elapsed time (a new
+        // conflict only opens after the prior one visibly resolved), so
+        // picking the chain with the greatest max tuple id is safe — the
+        // flakiness risk above is specific to markers WITHIN one chain.
+        let latest_chain = by_chain
+            .into_values()
+            .max_by_key(|group| group.iter().map(|m| m.id).max());
+        Ok(latest_chain
+            .and_then(|group| group.into_iter().max_by_key(|m| (Self::conflict_state_rank(m), m.id))))
     }
 
     /// The in-flight attempt number for a conflict chain awaiting an
@@ -4196,9 +4293,20 @@ impl LandingPipeline {
     /// read-only lookup for the `CONFLICT_HELD_LANDING` kind, folded into
     /// the decision journal envelope before the actual dispatch mutation
     /// runs. Returns `None` for a branch with no held chain at all rather
-    /// than guessing an attempt number.
-    pub(crate) fn pending_conflict_attempt(&self, repo: &str, branch: &str) -> Option<u32> {
-        let marker = self.latest_conflict_marker(repo, branch).ok()??;
+    /// than guessing an attempt number. `chain_key` (from the violation's
+    /// own evidence, when present) binds this to the EXACT chain the
+    /// decision named; `None` falls back to the branch's newest chain,
+    /// which is only correct for a legacy violation with no chain_key.
+    pub(crate) fn pending_conflict_attempt(
+        &self,
+        repo: &str,
+        branch: &str,
+        chain_key: Option<&str>,
+    ) -> Option<u32> {
+        let marker = match chain_key {
+            Some(key) => self.conflict_marker_for_chain_key(repo, branch, key).ok()??,
+            None => self.latest_conflict_marker(repo, branch).ok()??,
+        };
         marker
             .payload
             .get("attempt")
@@ -4216,12 +4324,24 @@ impl LandingPipeline {
     /// past [`landing_conflict::CONFLICT_STATE_AWAITING_DECISION`] (a prior
     /// call already dispatched, or a human resolved the branch by hand) is a
     /// no-op success, not a second spawn.
+    /// `chain_key` (from the deciding `Violation`'s own evidence, when
+    /// present) binds this dispatch to the EXACT chain that violation
+    /// named — never a different, possibly newer chain that appeared on
+    /// the same branch between when `attention.decide` authorized this call
+    /// and this function's own independent marker read. `None` falls back
+    /// to the branch's newest chain, correct only for a legacy violation
+    /// with no chain_key.
     pub(crate) async fn dispatch_held_conflict(
         &self,
         repo: &str,
         branch: &str,
+        chain_key: Option<&str>,
     ) -> rk_core::Result<String> {
-        let Some(marker) = self.latest_conflict_marker(repo, branch)? else {
+        let marker = match chain_key {
+            Some(key) => self.conflict_marker_for_chain_key(repo, branch, key)?,
+            None => self.latest_conflict_marker(repo, branch)?,
+        };
+        let Some(marker) = marker else {
             return Err(rk_core::Error::other(format!(
                 "no conflict-correction chain for {repo}/{branch} has ever been held for a \
                  decision"
@@ -8365,7 +8485,7 @@ workflow: {
         // Standing in for `Server::execute_orchestrator`, reachable only
         // after `attention.decide` fenced the call through a live lease.
         let dispatch_detail = pipeline
-            .dispatch_held_conflict("code-repo", "feature")
+            .dispatch_held_conflict("code-repo", "feature", None)
             .await
             .unwrap();
         assert!(
@@ -8394,7 +8514,7 @@ workflow: {
 
         // A second decision for the same chain must not double-dispatch.
         let replay = pipeline
-            .dispatch_held_conflict("code-repo", "feature")
+            .dispatch_held_conflict("code-repo", "feature", None)
             .await
             .unwrap();
         assert!(replay.contains("already"), "{replay}");
@@ -8609,7 +8729,7 @@ workflow: {
         // — the hold itself must never touch the supervisor at all.
         pipeline.supervisor.set_dispatch_paused(true);
         let refusal = pipeline
-            .dispatch_held_conflict("code-repo", "feature")
+            .dispatch_held_conflict("code-repo", "feature", None)
             .await;
         assert!(refusal.is_err(), "{refusal:?}");
 
@@ -8647,12 +8767,21 @@ workflow: {
         let text = needs[0].payload["text"].as_str().unwrap();
         assert!(text.contains("dispatch-refused"), "{text}");
 
+        // A retry against an already-refused chain must stay REFUSED, not
+        // silently converge on a phantom `Ok`: `dispatch-refused` is a
+        // terminal human gate exactly like `dispatch-interrupted`, and only
+        // a human clearing it (not a repeated automated call) may unblock
+        // the chain. See the `dispatch_held_conflict` `other` match arm.
         pipeline.supervisor.set_dispatch_paused(false);
         let replay = pipeline
-            .dispatch_held_conflict("code-repo", "feature")
+            .dispatch_held_conflict("code-repo", "feature", None)
             .await
-            .unwrap();
-        assert!(replay.contains("already"), "{replay}");
+            .unwrap_err()
+            .to_string();
+        assert!(
+            replay.contains("already terminally") && replay.contains("dispatch-refused"),
+            "{replay}"
+        );
         assert!(
             tuples(&space, Category::Event, "agent_spawned").is_empty(),
             "a redelivered decision must not silently dispatch behind the existing human gate"
@@ -8661,6 +8790,11 @@ workflow: {
             scoped_tuples(&space, Category::Need, STEWARD_NEED_IDENTITY).len(),
             1,
             "replay must converge on the existing human gate rather than raise a second one"
+        );
+        assert_eq!(
+            scoped_tuples(&space, Category::Event, CONFLICT_DISPATCH_IDENTITY).len(),
+            3,
+            "a refused retry must not write a fresh marker on top of the existing terminal one"
         );
     }
 
