@@ -98,6 +98,19 @@ fn branch_off_main(dir: &Path) -> String {
     head_sha
 }
 
+/// A second, genuinely distinct commit on an existing `branch` — simulates a
+/// held conflict's correction landing back on the branch, then conflicting
+/// again with `target` a second time. Returns the new tip.
+fn advance_branch(dir: &Path, branch: &str, file: &str) -> String {
+    git(dir, &["checkout", branch]);
+    std::fs::write(dir.join(file), "more feature work\n").unwrap();
+    git(dir, &["add", file]);
+    git(dir, &["commit", "-m", &format!("feat: {file}")]);
+    let head_sha = git(dir, &["rev-parse", branch]);
+    git(dir, &["checkout", "main"]);
+    head_sha
+}
+
 async fn attention_next(client: &mut Client, repo: &str) -> Option<Value> {
     let res = client
         .call("attention.next", json!({"repo": repo}))
@@ -113,6 +126,19 @@ async fn decide(
     holder: Option<&str>,
     generation: Option<u64>,
 ) -> rk_core::Result<Value> {
+    decide_with_budget(client, repo, item, holder, generation, None, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn decide_with_budget(
+    client: &mut Client,
+    repo: &str,
+    item: &str,
+    holder: Option<&str>,
+    generation: Option<u64>,
+    budget_usd: Option<f64>,
+    budget_tokens: Option<u64>,
+) -> rk_core::Result<Value> {
     client
         .call(
             "attention.decide",
@@ -121,6 +147,8 @@ async fn decide(
                 "item": item,
                 "holder": holder,
                 "generation": generation,
+                "budget_usd": budget_usd,
+                "budget_tokens": budget_tokens,
             }),
         )
         .await
@@ -179,6 +207,11 @@ async fn hold_conflict(
                     "target": target,
                     "merged": false,
                     "pr_opened": false,
+                    // Mirrors `ConflictContext::dispatch_key` — the exact
+                    // shape `hold_conflict_for_orchestrator_decision` writes
+                    // — so a fabricated hold gets the same distinct,
+                    // cursor-reachable identity a real one does.
+                    "chain_key": format!("{repo}\0{branch}\0{head_sha}\0{target}\0conflict-task\0{rework_ticket}"),
                     "detail": format!(
                         "merge conflict held for a bounded orchestrator-authority correction \
                          decision, ticket {rework_ticket}"
@@ -483,4 +516,310 @@ async fn conflict_correction_decision_and_lease_survive_a_genuine_daemon_restart
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
     handle_b.abort();
     let _ = handle_b.await;
+}
+
+/// TKT-01M0Q95QVGNE8ZABH5Z1WQB3J0: a correction that lands back on the held
+/// branch can itself conflict again — a genuinely SECOND, later chain on the
+/// exact same (repo, branch). `reconcile::conflict_held_landing` must give
+/// it its own attention/decision identity (not replay or permanently shadow
+/// the first chain's terminal decision — see the `reconcile.rs` fix that
+/// anchors this id to the land tuple's own monotonic `RecordId`), and each
+/// chain must still only ever dispatch once, independent of the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_sequential_conflict_chains_on_the_same_branch_each_lease_exactly_once() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    let head_sha_1 = branch_off_main(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(QUICK_DONE));
+    let mut client = daemon_with_policy(home.path(), allow(&["conflict-held-landing"])).await;
+    let repo = repo_name_of(repo_dir.path());
+    let repo = repo.as_str();
+    let repo_path = repo_dir.path().to_string_lossy().to_string();
+    client
+        .call("repo.add", json!({"name": repo, "path": &repo_path}))
+        .await
+        .unwrap();
+
+    // Chain one: held, then dispatched under a live lease.
+    hold_conflict(
+        &mut client,
+        repo,
+        &repo_path,
+        "feature",
+        &head_sha_1,
+        "main",
+        "TKT-CHAIN-ONE",
+    )
+    .await;
+    let item1 = attention_next(&mut client, repo)
+        .await
+        .expect("the first chain must surface");
+    let item1_id = item1["id"].as_str().unwrap().to_string();
+
+    let lease = client
+        .call("lease.acquire", json!({"repo": repo, "holder": "orch-1"}))
+        .await
+        .unwrap();
+    let generation = lease["generation"].as_u64().unwrap();
+
+    let decided1 = decide_with_budget(
+        &mut client,
+        repo,
+        &item1_id,
+        Some("orch-1"),
+        Some(generation),
+        Some(2.5),
+        Some(10_000),
+    )
+    .await
+    .unwrap();
+    assert_eq!(decided1["resolved"], true);
+    assert_eq!(decided1["replay"], false);
+    // The full decision-journal envelope a valid, fenced dispatch must
+    // record — holder, generation, authority, action, bounded evidence
+    // references, attempt, budget, outcome, and terminal state — not just
+    // the handful `resolved`/`replay` on the RPC response's own top level.
+    let decision1 = &decided1["decision"];
+    assert_eq!(decision1["decided_by"], "orch-1");
+    assert_eq!(decision1["generation"], generation);
+    assert_eq!(decision1["authority"], "orchestrator");
+    assert_eq!(decision1["action"], "conflict.dispatch_correction");
+    assert_eq!(decision1["attempt"], 1);
+    assert_eq!(decision1["budget_usd"], 2.5);
+    assert_eq!(decision1["budget_tokens"], 10_000);
+    assert_eq!(decision1["terminal"], true);
+    let evidence1 = decision1["evidence"]
+        .as_array()
+        .expect("evidence must be a bounded list of references, not an unbounded blob");
+    assert!(
+        !evidence1.is_empty() && evidence1.len() <= 8,
+        "evidence must be a short, bounded list of references: {evidence1:?}"
+    );
+    assert!(
+        evidence1
+            .iter()
+            .any(|e| e.as_str().is_some_and(|s| s.starts_with("branch_landed:"))),
+        "evidence must reference the exact branch_landed event that proves the hold: {evidence1:?}"
+    );
+    let outcome1 = decision1["outcome"].as_str().unwrap().to_string();
+    assert!(outcome1.contains("TKT-CHAIN-ONE"), "{outcome1}");
+    assert_eq!(
+        agent_spawn_count(&mut client, repo).await,
+        1,
+        "chain one must dispatch exactly one correction agent"
+    );
+
+    // Chain two: the correction lands back on `feature`, conflicts again at
+    // a genuinely new head — a second, distinct hold on the SAME branch.
+    let head_sha_2 = advance_branch(repo_dir.path(), "feature", "feature-2.txt");
+    hold_conflict(
+        &mut client,
+        repo,
+        &repo_path,
+        "feature",
+        &head_sha_2,
+        "main",
+        "TKT-CHAIN-TWO",
+    )
+    .await;
+    let item2 = attention_next(&mut client, repo)
+        .await
+        .expect(
+            "a second, later conflict on the same branch must surface past the first chain's \
+             cursor, not be permanently hidden behind it",
+        );
+    let item2_id = item2["id"].as_str().unwrap().to_string();
+    assert_ne!(
+        item1_id, item2_id,
+        "sequential conflicts on the same branch must never share an attention/decision identity"
+    );
+
+    let decided2 = decide(&mut client, repo, &item2_id, Some("orch-1"), Some(generation))
+        .await
+        .unwrap();
+    assert_eq!(decided2["resolved"], true);
+    assert_eq!(decided2["replay"], false);
+    let outcome2 = decided2["decision"]["outcome"].as_str().unwrap().to_string();
+    assert!(outcome2.contains("TKT-CHAIN-TWO"), "{outcome2}");
+    assert_eq!(
+        agent_spawn_count(&mut client, repo).await,
+        2,
+        "chain two must dispatch its own correction agent, independent of chain one"
+    );
+
+    // Replay inside EITHER chain must not double-dispatch.
+    let replay1 = decide(&mut client, repo, &item1_id, Some("orch-1"), Some(generation))
+        .await
+        .unwrap();
+    assert_eq!(replay1["replay"], true);
+    let replay2 = decide(&mut client, repo, &item2_id, Some("orch-1"), Some(generation))
+        .await
+        .unwrap();
+    assert_eq!(replay2["replay"], true);
+    assert_eq!(
+        agent_spawn_count(&mut client, repo).await,
+        2,
+        "replaying either chain's decision must never spawn a second agent for it"
+    );
+
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
+/// A durable `"dispatching"` marker with no journaled worker looks identical
+/// to a fresh, never-attempted hold UNLESS `dispatch_held_conflict` checks
+/// the supervisor's own registry — the exact ambiguity `landing.rs`'s
+/// `dispatch_held_conflict` match on `state` resolves by failing closed with
+/// `"dispatch-interrupted"` rather than guessing. This never reaches
+/// `route_conflict`/`hold_conflict_for_orchestrator_decision` at all (no
+/// `agent.spawn` in this daemon's fake-harness env is configured), so the
+/// marker is pre-seeded directly in state `"dispatching"`, as a genuine
+/// daemon crash between recording that state and the spawn journaling would
+/// leave it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interrupted_dispatching_marker_fails_closed_and_stays_unresolved_on_retry() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    let head_sha = branch_off_main(repo_dir.path());
+
+    let mut client = daemon_with_policy(home.path(), allow(&["conflict-held-landing"])).await;
+    let repo = repo_name_of(repo_dir.path());
+    let repo = repo.as_str();
+    let repo_path = repo_dir.path().to_string_lossy().to_string();
+    client
+        .call("repo.add", json!({"name": repo, "path": &repo_path}))
+        .await
+        .unwrap();
+
+    // The durable evidence a real `route_conflict` writes, EXCEPT the
+    // dispatch marker is seeded straight into `"dispatching"` — no
+    // `"awaiting-orchestrator-decision"` middle step — with no corresponding
+    // rat ever registered in the supervisor. This is precisely the crash
+    // window: a daemon that recorded "dispatching" and died before either
+    // the spawn call or the terminal "dispatched" marker landed.
+    client
+        .call(
+            "space.out",
+            json!({
+                "category": "event",
+                "scope": repo,
+                "identity": "branch_landed",
+                "payload": {
+                    "branch": "feature",
+                    "target": "main",
+                    "merged": false,
+                    "pr_opened": false,
+                    "chain_key": format!("{repo}\0feature\0{head_sha}\0main\0conflict-task\0TKT-INTERRUPTED"),
+                    "detail": "merge conflict held for a bounded orchestrator-authority correction decision, ticket TKT-INTERRUPTED",
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    client
+        .call(
+            "space.out",
+            json!({
+                "category": "event",
+                "scope": repo,
+                "identity": "landing_conflict_rework_dispatch",
+                "lifecycle": "furniture",
+                "payload": {
+                    "dispatch_key": format!("{repo}\0feature\0{head_sha}\0main\0conflict-task\0TKT-INTERRUPTED"),
+                    "repo": repo,
+                    "repo_path": &repo_path,
+                    "source": "feature",
+                    "branch": "feature",
+                    "head_sha": head_sha,
+                    "target": "main",
+                    "target_head": "target-head-placeholder",
+                    "fork_point": "fork-point-placeholder",
+                    "task": "conflict-task",
+                    "rework_ticket": "TKT-INTERRUPTED",
+                    "conflict_evidence": "CONFLICT (content): Merge conflict in feature.txt",
+                    "agent": Value::Null,
+                    "attempt": 1,
+                    "state": "dispatching",
+                    "diff_files": 1,
+                    "diff_lines": 1,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+
+    let item = attention_next(&mut client, repo)
+        .await
+        .expect("an interrupted dispatch is still a held conflict-held-landing item");
+    let item_id = item["id"].as_str().unwrap().to_string();
+
+    let lease = client
+        .call("lease.acquire", json!({"repo": repo, "holder": "orch-1"}))
+        .await
+        .unwrap();
+    let generation = lease["generation"].as_u64().unwrap();
+    assert_eq!(
+        lease["cursor"], Value::Null,
+        "a fresh lease starts with no cursor"
+    );
+
+    // First decide: hits the crash-window arm. Must fail closed, not report
+    // phantom success, and must never spawn (no fake harness env is even
+    // configured for this test).
+    let first = decide(&mut client, repo, &item_id, Some("orch-1"), Some(generation))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        first.contains("the supervisor registry contains no rat for it")
+            && first.contains("daemon may have stopped between recording the marker"),
+        "{first}"
+    );
+    assert_eq!(
+        agent_spawn_count(&mut client, repo).await,
+        0,
+        "an interrupted dispatch must never spawn a correction agent"
+    );
+
+    // The lease cursor must NOT have advanced past this violation — a
+    // failed, non-terminal attempt resolved nothing.
+    let after_first = client
+        .call("lease.acquire", json!({"repo": repo, "holder": "orch-1"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        after_first["cursor"],
+        Value::Null,
+        "a failed, non-terminal decision must never advance the lease cursor"
+    );
+
+    // Retry: `dispatch_held_conflict` now sees the marker it just wrote in
+    // state `"dispatch-interrupted"` — a terminal human gate — and must
+    // refuse again rather than silently converging on success just because
+    // it is being asked a second time.
+    let second = decide(&mut client, repo, &item_id, Some("orch-1"), Some(generation))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        second.contains("already terminally") && second.contains("dispatch-interrupted"),
+        "{second}"
+    );
+    assert_eq!(
+        agent_spawn_count(&mut client, repo).await,
+        0,
+        "a retry against an unresolved human gate must never spawn either"
+    );
+    let after_second = client
+        .call("lease.acquire", json!({"repo": repo, "holder": "orch-1"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        after_second["cursor"],
+        Value::Null,
+        "the cursor stays put across a retried, still-unresolved gate"
+    );
 }
