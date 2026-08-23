@@ -1538,7 +1538,7 @@ impl LandingPipeline {
     /// double-land protection on its next `enqueue`).
     ///
     /// Stamps the target's current tip as `target_head` so a later probe can
-    /// tell — for a non-`landed` outcome only, [`Self::marker_is_current`] —
+    /// tell — for a non-`landed` outcome only, [`Self::admission_marker`] —
     /// whether this verdict still describes the live ref or was left behind
     /// by the target moving on. Best-effort: `None` (omitted as JSON `null`)
     /// when the tip cannot be resolved, which reads back as "still current"
@@ -1558,7 +1558,7 @@ impl LandingPipeline {
             // A reconciled entry's marker already exists from the run that
             // performed the side effects; writing a second would corrupt the
             // one-current-marker-per-work-key invariant `processed_marker`
-            // reads (module doc on `marker_is_current`: a stale non-`landed`
+            // reads (module doc on `admission_marker`: a stale non-`landed`
             // predecessor may still be sitting there too, which is fine —
             // `.last()` picks this one, not it).
             LandingOutcome::Reconciled(_) => return Ok(()),
