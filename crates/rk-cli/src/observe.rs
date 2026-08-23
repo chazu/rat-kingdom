@@ -380,9 +380,15 @@ fn print_capacity_section(capacity: &Value) {
     }
 }
 
+/// `digest`'s window is always the tail of the feed, and the daemon's default
+/// `space.scan` is oldest-first bounded by `MAX_SCAN_TUPLES` — on a castle
+/// with more history than that cap, the oldest-first scan never reaches
+/// events from the requested `--since` window at all (TKT-01M0QZFTYQW4WV200TYGCN46XA).
+/// `newest: true` asks the daemon for `scan_newest_limited` instead, so the
+/// cap is spent on the newest tuples rather than the oldest.
 async fn scan_category(client: &mut Client, category: &str) -> Result<Vec<Value>> {
     let result = client
-        .call("space.scan", json!({"category": category}))
+        .call("space.scan", json!({"category": category, "newest": true}))
         .await?;
     Ok(result["tuples"].as_array().cloned().unwrap_or_default())
 }
