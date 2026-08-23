@@ -10,6 +10,7 @@ repo: #RepositoryPolicy
 	delivery: #DeliveryPolicy | *{}
 	landing: #LandingPolicy | *{}
 	reap: #ReapPolicy | *{}
+	phaseLatency: #PhaseLatencyPolicy | *{}
 }
 
 #WorkPolicy: {
@@ -133,6 +134,26 @@ repo: #RepositoryPolicy
 	class: string | *""
 	// Named checks (.rk/checks.cue) this rule contributes when it matches.
 	checks: [...string]
+}
+
+// PHASE LATENCY POLICY (TKT-01M0P974MQK5XE1MR9KQCWT654): per-phase warning
+// and intervention wall-clock targets over the durable task-to-main
+// phase-span substrate (crates/rk-daemon/src/span.rs). STACK NEUTRALITY: the
+// daemon has no built-in notion of what latency is normal for any phase, so
+// this defaults to an empty map (no targets, nothing ever breaches) — a repo
+// opts in per phase by name, matching Phase::as_str() in span.rs (e.g.
+// "verification", "landing_prep", "semantic_review").
+#PhaseLatencyPolicy: {
+	targets: [string]: #PhaseLatencyTarget
+}
+
+#PhaseLatencyTarget: {
+	// Below this elapsed wall-clock time, the phase is healthy: no attention
+	// item. Empty disables the warning tier for this phase.
+	warning: string | *""
+	// Above this elapsed wall-clock time, the phase escalates from warning to
+	// intervention. Empty disables the intervention tier for this phase.
+	intervention: string | *""
 }
 
 // Regenerable build-artifact paths (relative to a worktree root) the daemon's

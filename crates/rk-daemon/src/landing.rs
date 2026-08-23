@@ -203,6 +203,17 @@ pub(crate) struct LandingQueueSnapshotEntry {
     /// entry written before that field existed — under-reporting age rather
     /// than fabricating one.
     pub(crate) age_secs: i64,
+    /// Seconds since this entry entered the phase it is in RIGHT NOW
+    /// ([`LandingQueueEntry::phase_entered_at`]) — total queue age MINUS
+    /// whatever it spent in earlier phases. This is the only age a per-phase
+    /// latency consumer may use: `age_secs` is deliberately cumulative
+    /// (see [`LandingQueueEntry::enqueued_at`]), so reusing it as the
+    /// elapsed time of the current phase reports every prior phase's wait
+    /// against the phase that just started. `0` for a legacy entry written
+    /// before the field existed, matching `age_secs`' under-report-rather-
+    /// than-fabricate rule — a phase-latency sweep reading `0` raises
+    /// nothing, which is the safe direction.
+    pub(crate) phase_age_secs: i64,
 }
 
 /// Every candidate currently sitting in the landing queue, across every
@@ -255,6 +266,10 @@ pub(crate) fn landing_queue_snapshot(space: &Space) -> Vec<LandingQueueSnapshotE
                 .enqueued_at
                 .map(|enqueued_at| (now - enqueued_at).num_seconds().max(0))
                 .unwrap_or(0);
+            let phase_age_secs = entry
+                .phase_entered_at
+                .map(|entered_at| (now - entered_at).num_seconds().max(0))
+                .unwrap_or(0);
             Some(LandingQueueSnapshotEntry {
                 repo: entry.repo_name,
                 target: entry.target,
@@ -262,6 +277,7 @@ pub(crate) fn landing_queue_snapshot(space: &Space) -> Vec<LandingQueueSnapshotE
                 task: entry.task,
                 status: entry.status,
                 age_secs,
+                phase_age_secs,
             })
         })
         .collect()
@@ -517,6 +533,29 @@ pub(crate) struct LandingQueueEntry {
     /// `None` only for a durable tuple written before this field existed.
     #[serde(default)]
     pub(crate) enqueued_at: Option<DateTime<Utc>>,
+    /// When this candidate entered the PHASE it is currently in — the
+    /// per-phase counterpart to [`LandingQueueEntry::enqueued_at`], and the
+    /// only clock a phase-latency consumer may read (see
+    /// [`LandingQueueSnapshotEntry::phase_age_secs`]).
+    ///
+    /// Maintained exclusively by [`LandingQueueEntry::transition_to`], which
+    /// resets it when — and only when — a status transition changes the
+    /// mapped [`crate::span::Phase`]. The reset is deliberately phase-
+    /// granular rather than status-granular: `Queued` and `RunningGates`
+    /// BOTH map to `Phase::VerificationQueued`, so a candidate being claimed
+    /// out of the queue must keep aging against the verification target it
+    /// has already been accruing against — resetting there would hide a
+    /// genuinely wedged verification lane exactly the way reusing total
+    /// queue age fabricates a review breach.
+    ///
+    /// PRESERVED across [`LandingQueue::requeue_tail`] for the same reason
+    /// `enqueued_at` is: a requeue re-enters `Queued`, still the
+    /// verification phase, so a candidate stuck in a requeue loop keeps
+    /// aging instead of zeroing its phase clock on every retry.
+    ///
+    /// `None` only for a durable tuple written before this field existed.
+    #[serde(default)]
+    pub(crate) phase_entered_at: Option<DateTime<Utc>>,
     /// Whether this exact prepared candidate has already spent its one
     /// automatic gate-infrastructure-death retry (bounded fail-safe recovery
     /// — see [`LandingPipeline::run_gates_at`]). Persisted durably and set
@@ -555,6 +594,28 @@ pub(crate) struct LandingQueueEntry {
     pub(crate) gate_infra_retry_check: Option<String>,
 }
 
+impl LandingQueueEntry {
+    /// Move this entry to `status`, maintaining the per-phase clock
+    /// [`LandingQueueEntry::phase_entered_at`] alongside it. EVERY status
+    /// write goes through here (`enqueue`, `claim_next`, `claim_batch`,
+    /// `set_status`, `persist`) so the clock cannot drift out of step with
+    /// the status it describes.
+    ///
+    /// The clock restarts only when the transition crosses a
+    /// [`crate::span::Phase`] boundary — see the field's doc for why that is
+    /// phase-granular and not status-granular. A first-ever transition on an
+    /// entry that has no clock yet (a fresh enqueue, or a legacy durable
+    /// tuple written before the field existed) starts one, so an entry
+    /// carried forward across a daemon upgrade begins aging from its next
+    /// transition rather than staying `None` forever.
+    fn transition_to(&mut self, status: LandingEntryStatus, now: DateTime<Utc>) {
+        if self.phase_entered_at.is_none() || status.phase() != self.status.phase() {
+            self.phase_entered_at = Some(now);
+        }
+        self.status = status;
+    }
+}
+
 /// See [`LandingQueueEntry::status`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -564,6 +625,29 @@ pub(crate) enum LandingEntryStatus {
     RunningGates,
     AwaitingReview,
     Landing,
+}
+
+impl LandingEntryStatus {
+    /// The task-to-main [`crate::span::Phase`] a candidate in this status is
+    /// living in. Deliberately the ONE definition of that mapping: the
+    /// phase-latency sweep (`crate::server`) labels its live probes with it,
+    /// and [`LandingQueueEntry::transition_to`] decides whether to restart
+    /// the per-phase clock with it. Two copies could disagree, and a
+    /// disagreement is precisely the misattribution bug this exists to
+    /// prevent — a phase boundary the sweep sees but the clock does not
+    /// silently reintroduces prior-phase elapsed time.
+    pub(crate) fn phase(self) -> crate::span::Phase {
+        match self {
+            // Both are the verification lane: `Queued` is waiting for a gate
+            // slot, `RunningGates` is holding one. A candidate crossing
+            // between them has not left the phase.
+            LandingEntryStatus::Queued | LandingEntryStatus::RunningGates => {
+                crate::span::Phase::VerificationQueued
+            }
+            LandingEntryStatus::AwaitingReview => crate::span::Phase::SemanticReview,
+            LandingEntryStatus::Landing => crate::span::Phase::Merge,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,7 +708,11 @@ impl LandingQueue {
     fn enqueue(&self, mut entry: LandingQueueEntry) -> rk_core::Result<u64> {
         let seq = self.next_seq(&entry.repo_name)?;
         entry.seq = seq;
-        entry.status = LandingEntryStatus::Queued;
+        // Through `transition_to`, not a bare assignment, so the per-phase
+        // clock is maintained here too: a fresh candidate starts one, and a
+        // `requeue_tail` clone re-entering `Queued` from `RunningGates`
+        // (same phase) carries its existing one forward untouched.
+        entry.transition_to(LandingEntryStatus::Queued, Utc::now());
         entry.rev = 0;
         // Only a genuinely fresh candidate gets a fresh timestamp — a
         // `requeue_tail` call passes a clone carrying its original
@@ -776,7 +864,7 @@ impl LandingQueue {
         let mut entry: LandingQueueEntry = serde_json::from_value(tuple.payload.clone())
             .map_err(|e| rk_core::Error::other(format!("landing queue entry: {e}")))?;
         if entry.status != LandingEntryStatus::Landing {
-            entry.status = LandingEntryStatus::RunningGates;
+            entry.transition_to(LandingEntryStatus::RunningGates, Utc::now());
         }
         entry.rev = entry.rev.wrapping_add(1);
         // Write-then-delete (T4 crash-safety, module doc): the successor
@@ -813,7 +901,7 @@ impl LandingQueue {
             let mut entry: LandingQueueEntry = serde_json::from_value(tuple.payload.clone())
                 .map_err(|error| rk_core::Error::other(format!("landing queue entry: {error}")))?;
             if entry.status != LandingEntryStatus::Landing {
-                entry.status = LandingEntryStatus::RunningGates;
+                entry.transition_to(LandingEntryStatus::RunningGates, Utc::now());
             }
             entry.rev = entry.rev.wrapping_add(1);
             self.write(&entry)?;
@@ -836,7 +924,7 @@ impl LandingQueue {
             return Ok(());
         };
         let mut updated = entry.clone();
-        updated.status = status;
+        updated.transition_to(status, Utc::now());
         updated.rev = entry.rev.wrapping_add(1);
         self.write(&updated)?;
         self.space.delete(tuple.id)?;
@@ -853,7 +941,7 @@ impl LandingQueue {
         let Some(tuple) = self.find(entry)? else {
             return Ok(());
         };
-        entry.status = status;
+        entry.transition_to(status, Utc::now());
         entry.rev = entry.rev.wrapping_add(1);
         self.write(entry)?;
         self.space.delete(tuple.id)?;
@@ -866,7 +954,12 @@ impl LandingQueue {
         let mut retry = entry.clone();
         retry.seq = 0;
         retry.rev = 0;
-        retry.status = LandingEntryStatus::Queued;
+        // Status is deliberately left as-is for `enqueue` to transition:
+        // its `transition_to(Queued, …)` needs the PRIOR status to decide
+        // whether this requeue crosses a phase boundary (`RunningGates` ->
+        // `Queued` does not; `Landing` -> `Queued` does). Zeroing it here
+        // first would make every requeue look like a same-phase move and
+        // carry a stale merge-phase clock into the verification lane.
         retry.candidate_sha = None;
         retry.candidate_base = None;
         retry.candidate_ref = None;
@@ -6710,6 +6803,175 @@ workflow: {
             "requeue must not reset age, got {}",
             requeued.age_secs
         );
+    }
+
+    /// The per-phase clock is a SEPARATE reading from total queue age, and
+    /// the two must diverge exactly at a phase boundary: `phase_age_secs`
+    /// restarts, `age_secs` keeps counting. Reusing the cumulative one as
+    /// the current phase's elapsed time is what made the phase-latency
+    /// sweep fire an instant false-positive review breach on a candidate
+    /// that had merely spent a long-but-healthy wait in verification.
+    #[test]
+    fn phase_clock_restarts_across_a_phase_boundary_while_total_age_keeps_running() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let space = Space::open_in_memory().unwrap();
+        let queue = LandingQueue::new(space.clone(), &layout);
+
+        // A candidate that has been in the verification lane for 15m.
+        let fifteen_min_ago = Utc::now() - chrono::Duration::minutes(15);
+        let base = LandingQueueEntry {
+            repo_name: "alpha".into(),
+            repo_path: "/repos/alpha".into(),
+            branch: "b1".into(),
+            target: "main".into(),
+            head_sha: "sha-old".into(),
+            diff_class: "trivial".into(),
+            task: "TKT-1".into(),
+            enqueued_at: Some(fifteen_min_ago),
+            phase_entered_at: Some(fifteen_min_ago),
+            ..Default::default()
+        };
+        queue.enqueue(base).unwrap();
+
+        let phase_age = |branch: &str| {
+            landing_queue_snapshot(&space)
+                .into_iter()
+                .find(|e| e.branch == branch)
+                .map(|e| (e.age_secs, e.phase_age_secs))
+                .unwrap()
+        };
+        let (age, phase) = phase_age("b1");
+        assert!(age >= 15 * 60 - 5 && phase >= 15 * 60 - 5);
+
+        // Queued -> RunningGates is NOT a phase boundary (both are
+        // `VerificationQueued`): the verification clock must keep running,
+        // or a wedged gate lane would reset itself out of every target.
+        let claimed = queue.claim_next("alpha", "main").unwrap().unwrap();
+        assert_eq!(claimed.status, LandingEntryStatus::RunningGates);
+        assert_eq!(claimed.phase_entered_at, Some(fifteen_min_ago));
+        let (age, phase) = phase_age("b1");
+        assert!(
+            age >= 15 * 60 - 5 && phase >= 15 * 60 - 5,
+            "same-phase transition must not reset the phase clock, got {phase}"
+        );
+
+        // RunningGates -> AwaitingReview IS a phase boundary
+        // (`VerificationQueued` -> `SemanticReview`): review just started,
+        // so its clock is ~0 even though the candidate is still 15m old.
+        queue
+            .set_status(&claimed, LandingEntryStatus::AwaitingReview)
+            .unwrap();
+        let (age, phase) = phase_age("b1");
+        assert!(age >= 15 * 60 - 5, "total queue age keeps counting");
+        assert!(
+            phase < 60,
+            "review clock must start at the transition, not inherit 15m of \
+             verification wait, got {phase}"
+        );
+    }
+
+    /// A requeue back into `Queued` from `RunningGates` stays inside the
+    /// verification phase, so — exactly like `enqueued_at` — the phase clock
+    /// survives it: a candidate stuck in a stale-target requeue loop must not
+    /// look freshly-phased on every cycle, which is the wedge probe O18 wants
+    /// surfaced rather than hidden.
+    #[test]
+    fn requeue_within_the_verification_phase_carries_the_phase_clock_forward() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let space = Space::open_in_memory().unwrap();
+        let queue = LandingQueue::new(space.clone(), &layout);
+
+        let fifteen_min_ago = Utc::now() - chrono::Duration::minutes(15);
+        queue
+            .enqueue(LandingQueueEntry {
+                repo_name: "alpha".into(),
+                repo_path: "/repos/alpha".into(),
+                branch: "b1".into(),
+                target: "main".into(),
+                head_sha: "sha-old".into(),
+                diff_class: "trivial".into(),
+                task: "TKT-1".into(),
+                enqueued_at: Some(fifteen_min_ago),
+                phase_entered_at: Some(fifteen_min_ago),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let claimed = queue.claim_next("alpha", "main").unwrap().unwrap();
+        queue.requeue_tail(&claimed).unwrap();
+        // The replacement is written before the claimed row is removed
+        // (`requeue_tail`'s crash-safety ordering) — the caller retires the
+        // claimed row afterwards, so do the same here or the snapshot sees
+        // both generations of this branch.
+        queue.remove(&claimed).unwrap();
+
+        let requeued = landing_queue_snapshot(&space)
+            .into_iter()
+            .find(|e| e.branch == "b1")
+            .unwrap();
+        assert_eq!(requeued.status, LandingEntryStatus::Queued);
+        assert!(
+            requeued.phase_age_secs >= 15 * 60 - 5,
+            "requeue must not reset the verification clock, got {}",
+            requeued.phase_age_secs
+        );
+    }
+
+    /// A durable tuple written before `phase_entered_at` existed reads as
+    /// `None`, which must render as `0` — under-reporting the phase age
+    /// rather than fabricating one from `enqueued_at`, so an upgrade can
+    /// never replay a backlog of instant breaches. The next real transition
+    /// starts a clock for it.
+    #[test]
+    fn legacy_entry_without_a_phase_clock_reports_zero_then_starts_one() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let space = Space::open_in_memory().unwrap();
+        let queue = LandingQueue::new(space.clone(), &layout);
+
+        // Hand-write the pre-upgrade tuple shape: `enqueued_at` present,
+        // `phase_entered_at` absent entirely.
+        let payload = json!({
+            "repo_name": "alpha",
+            "repo_path": "/repos/alpha",
+            "branch": "b1",
+            "target": "main",
+            "head_sha": "sha-legacy",
+            "diff_class": "trivial",
+            "task": "TKT-legacy",
+            "seq": 1,
+            "rev": 0,
+            "status": "queued",
+            "enqueued_at": Utc::now() - chrono::Duration::hours(5),
+        });
+        space
+            .out(
+                Tuple::new(
+                    Category::Event,
+                    "alpha".to_string(),
+                    LANDING_QUEUE_IDENTITY,
+                    "daemon",
+                    payload,
+                )
+                .with_lifecycle(Lifecycle::Furniture),
+            )
+            .unwrap();
+
+        let legacy = landing_queue_snapshot(&space)
+            .into_iter()
+            .find(|e| e.branch == "b1")
+            .unwrap();
+        assert!(legacy.age_secs >= 5 * 3600 - 5, "total age still reads");
+        assert_eq!(
+            legacy.phase_age_secs, 0,
+            "no phase clock must under-report, never inherit total age"
+        );
+
+        // The next transition adopts one rather than leaving it `None`.
+        let claimed = queue.claim_next("alpha", "main").unwrap().unwrap();
+        assert!(claimed.phase_entered_at.is_some());
     }
 
     #[test]

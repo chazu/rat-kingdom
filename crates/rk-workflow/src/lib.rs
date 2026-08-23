@@ -405,6 +405,33 @@ pub struct ReapPolicy {
     pub artifact_paths: Vec<String>,
 }
 
+/// Per-phase wall-clock warning/intervention targets over the durable
+/// task-to-main phase-span substrate (`crates/rk-daemon/src/span.rs`,
+/// TKT-01M0P974EZZTPMGVP4S0E76NXH). STACK NEUTRALITY: the daemon has no
+/// built-in notion of what latency is normal for any phase, so this defaults
+/// to an empty map — nothing ever breaches until a repo opts in per phase by
+/// name (`crate::span::Phase::as_str()` in rk-daemon, e.g. `"verification"`,
+/// `"landing_prep"`, `"semantic_review"`), the same "each repo declares its
+/// own list" idiom [`ReapPolicy::artifact_paths`] already uses.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseLatencyPolicy {
+    #[serde(default)]
+    pub targets: HashMap<String, PhaseLatencyTarget>,
+}
+
+/// One phase's warning/intervention wall-clock budget, as duration strings
+/// (`"20m"`, `"90s"`, `"1h"` — the same grammar [`LandingPolicy::gate_timeout`]
+/// and friends use, validated by the same [`validate_duration_str`]). An
+/// empty string disables that tier for this phase; both empty disables the
+/// phase entirely, which is the zero-value default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseLatencyTarget {
+    #[serde(default)]
+    pub warning: String,
+    #[serde(default)]
+    pub intervention: String,
+}
+
 /// Versioned repository behavior activated into the daemon's repo registry.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryPolicy {
@@ -416,6 +443,8 @@ pub struct RepositoryPolicy {
     pub landing: LandingPolicy,
     #[serde(default)]
     pub reap: ReapPolicy,
+    #[serde(default, rename = "phaseLatency")]
+    pub phase_latency: PhaseLatencyPolicy,
 }
 
 impl RepositoryPolicy {
@@ -1327,6 +1356,33 @@ fn validate_repository_policy(policy: &RepositoryPolicy) -> rk_core::Result<()> 
         "repo.landing.reviewDeathRetryMaxDelay",
         &policy.landing.review_death_retry_max_delay,
     )?;
+    for (phase, target) in &policy.phase_latency.targets {
+        let warning_secs = if target.warning.trim().is_empty() {
+            None
+        } else {
+            validate_duration_str(
+                &format!("repo.phaseLatency.targets.{phase}.warning"),
+                &target.warning,
+            )?;
+            Some(duration_str_to_secs(&target.warning))
+        };
+        let intervention_secs = if target.intervention.trim().is_empty() {
+            None
+        } else {
+            validate_duration_str(
+                &format!("repo.phaseLatency.targets.{phase}.intervention"),
+                &target.intervention,
+            )?;
+            Some(duration_str_to_secs(&target.intervention))
+        };
+        if let (Some(warning), Some(intervention)) = (warning_secs, intervention_secs) {
+            if intervention < warning {
+                return Err(rk_core::Error::other(format!(
+                    "repo.phaseLatency.targets.{phase}.intervention must be >= warning"
+                )));
+            }
+        }
+    }
     for rel in &policy.reap.artifact_paths {
         let path = Path::new(rel);
         let resolves_to_root = rel.split('/').all(|seg| seg.is_empty() || seg == ".");
@@ -1369,6 +1425,20 @@ fn validate_duration_str(name: &str, value: &str) -> rk_core::Result<()> {
     }
     digits.parse::<u64>().map_err(|_| invalid())?;
     Ok(())
+}
+
+/// Seconds represented by an already-[`validate_duration_str`]-validated
+/// duration string. Only called after validation succeeds, so the digits are
+/// known-parseable; `unwrap_or(0)` is defensive, not a silent fallback path.
+fn duration_str_to_secs(value: &str) -> u64 {
+    let trimmed = value.trim();
+    let (digits, multiplier) = match trimmed.chars().last() {
+        Some('s') => (&trimmed[..trimmed.len() - 1], 1),
+        Some('m') => (&trimmed[..trimmed.len() - 1], 60),
+        Some('h') => (&trimmed[..trimmed.len() - 1], 3600),
+        _ => (trimmed, 1),
+    };
+    digits.parse::<u64>().unwrap_or(0) * multiplier
 }
 
 fn validate_branch_value(name: &str, value: &str) -> rk_core::Result<()> {
@@ -2856,6 +2926,69 @@ checks: [
         let disabled =
             load_repository_policy_str(r#"repo: {landing: {shadowReviewModel: ""}}"#).unwrap();
         assert_eq!(disabled.landing.shadow_review_model, "");
+    }
+
+    #[test]
+    fn repository_policy_loads_versioned_phase_latency_policy() {
+        let policy = load_repository_policy_str(
+            r#"
+            repo: {
+                phaseLatency: {
+                    targets: {
+                        verification: {warning: "20m", intervention: "45m"}
+                        semantic_review: {warning: "10m"}
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let verification = policy.phase_latency.targets.get("verification").unwrap();
+        assert_eq!(verification.warning, "20m");
+        assert_eq!(verification.intervention, "45m");
+        let review = policy.phase_latency.targets.get("semantic_review").unwrap();
+        assert_eq!(review.warning, "10m");
+        assert_eq!(review.intervention, "");
+    }
+
+    #[test]
+    fn repository_policy_phase_latency_defaults_to_empty_stack_neutral() {
+        let policy = load_repository_policy_str("repo: {}").unwrap();
+        assert!(policy.phase_latency.targets.is_empty());
+    }
+
+    #[test]
+    fn repository_policy_rejects_intervention_below_warning() {
+        let err = load_repository_policy_str(
+            r#"
+            repo: {
+                phaseLatency: {
+                    targets: {
+                        verification: {warning: "45m", intervention: "20m"}
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("intervention must be >= warning"));
+    }
+
+    #[test]
+    fn repository_policy_rejects_malformed_phase_latency_duration() {
+        let err = load_repository_policy_str(
+            r#"
+            repo: {
+                phaseLatency: {
+                    targets: {
+                        verification: {warning: "20mm"}
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must be a duration"));
     }
 
     #[test]
