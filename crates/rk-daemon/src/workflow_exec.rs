@@ -6636,10 +6636,28 @@ test a::flaky ... FAILED
     /// A real process, its own process-group leader (mirroring exactly how
     /// `spawn_check_child` spawns a check), that just sleeps — standing in
     /// for a managed check child in every test below.
+    ///
+    /// Deliberately `sleep 300 & wait`, not a bare `sleep 300`: `sh -c
+    /// '<single simple command>'` is exactly the shape `sh`'s tail-call
+    /// optimization targets — with nothing left to do after the command,
+    /// `sh` `exec`s directly into it instead of forking, which keeps the
+    /// pid but silently changes `comm` from `sh` to `sleep`. That exec can
+    /// land at any point after `spawn()` returns, racing
+    /// `ManagedChildMarker::create`'s `process_signature` capture right
+    /// after it: if the marker was written before the exec but the reap
+    /// sweep's re-check runs after, `reap_stale_managed_children`'s
+    /// identity fence sees a changed `comm` and — correctly, by design —
+    /// refuses to signal what looks like a different process (TKT-
+    /// 01M0PN18QNWPKKARFV4KRWGP6S). Backgrounding the sleep and `wait`ing
+    /// on it gives `sh` more work to do after spawning it, which suppresses
+    /// the tail-call exec: the leader's `comm` stays `sh` for its entire
+    /// life, so its recorded signature can never drift out from under it.
+    /// Mirrors `spawn_sleeper_with_nested_group`'s already-stable `& wait`
+    /// shape below.
     fn spawn_sleeper() -> tokio::process::Child {
         tokio::process::Command::new("sh")
             .arg("-c")
-            .arg("sleep 300")
+            .arg("sleep 300 & wait")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .process_group(0)
@@ -6838,9 +6856,15 @@ test a::flaky ... FAILED
         );
 
         // Cleanup: this decoy is never reaped by design, so kill it by hand
-        // and wait on it ourselves, same as the test above.
+        // and wait on it ourselves, same as the test above. Signal the whole
+        // group (`-decoy_pid`, valid because `spawn_sleeper` makes it its own
+        // leader), not just the leader pid: `spawn_sleeper` backgrounds its
+        // actual `sleep` under `sh -c 'sleep 300 & wait'` to keep the
+        // leader's identity stable (see that function's doc comment), so a
+        // leader-only kill would leave that backgrounded sleep orphaned for
+        // the rest of its 300s.
         let _ = std::process::Command::new("kill")
-            .args(["-9", &decoy_pid.to_string()])
+            .args(["-9", &format!("-{decoy_pid}")])
             .status();
         let _ = decoy.wait().await;
     }
