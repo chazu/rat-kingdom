@@ -10251,6 +10251,7 @@ mod authorize_reasoned_tests {
             created_at: now,
             updated_at: now,
             archived_at: None,
+            liveness: Default::default(),
         };
         let mut records = HashMap::new();
         records.insert(record.name.clone(), record);
@@ -10714,6 +10715,7 @@ mod ticket_reopen_sweep_tests {
             created_at: now,
             updated_at: now,
             archived_at: None,
+            liveness: Default::default(),
         };
         let mut records = HashMap::new();
         records.insert(record.name.clone(), record);

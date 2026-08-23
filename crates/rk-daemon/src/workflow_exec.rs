@@ -690,11 +690,21 @@ async fn abort_task<T>(task: &mut JoinHandle<T>) {
 /// leader, and the orphaned nested group survives, reparented to init
 /// (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD). Captured as `(pid, ppid, pgid)` so
 /// descendants can be found by walking live `ppid` links and the exact
-/// groups to signal collected from `pgid`.
+/// groups to signal collected from `pgid`. `stat` is the same STAT field
+/// `pid_alive` test helpers already poll elsewhere in this file (a leading
+/// `Z` or an empty read means gone/zombie, never "still doing work") — kept
+/// here too so a supervisor liveness check can tell a merely-listed pid from
+/// one actually alive without a second `ps` invocation. `comm` is that same
+/// liveness check's OTHER need: which command a live descendant actually is,
+/// so it can tell a real verifier/build descendant from an arbitrary blocked
+/// subprocess (a bare `sleep`, a hung network read) — see
+/// [`is_verifier_command`].
 struct ProcessTableRow {
     pid: u32,
     ppid: u32,
     pgid: u32,
+    stat: String,
+    comm: String,
 }
 
 /// A snapshot of every process the OS reports right now, via `ps`(1) — the
@@ -705,7 +715,7 @@ struct ProcessTableRow {
 /// about, same as before this tree-walk existed.
 fn live_process_table() -> Vec<ProcessTableRow> {
     let Ok(output) = std::process::Command::new("ps")
-        .args(["-Ao", "pid=,ppid=,pgid="])
+        .args(["-Ao", "pid=,ppid=,pgid=,stat=,comm="])
         .output()
     else {
         return Vec::new();
@@ -720,9 +730,99 @@ fn live_process_table() -> Vec<ProcessTableRow> {
             let pid = fields.next()?.parse().ok()?;
             let ppid = fields.next()?.parse().ok()?;
             let pgid = fields.next()?.parse().ok()?;
-            Some(ProcessTableRow { pid, ppid, pgid })
+            let stat = fields.next()?.to_string();
+            // `comm` is the last field but may itself be an absolute path
+            // (macOS `ps` reports one for some binaries, a bare name for
+            // others) — collected as everything remaining on the line, not
+            // just one more `split_whitespace` token, since a path could in
+            // principle contain no further whitespace anyway; normalized to
+            // its basename by `is_verifier_command`.
+            let comm = fields.next()?.to_string();
+            Some(ProcessTableRow {
+                pid,
+                ppid,
+                pgid,
+                stat,
+                comm,
+            })
         })
         .collect()
+}
+
+/// Whether `row` is a real, running process right now — not exited and not a
+/// zombie awaiting reap (a leading `Z` STAT), which `kill(pid, 0)` alone
+/// cannot distinguish from "still doing work" (the same gotcha
+/// `rk-harness/src/fake.rs`'s `still_running` helper documents).
+fn row_alive(row: &ProcessTableRow) -> bool {
+    !(row.stat.is_empty() || row.stat.starts_with('Z'))
+}
+
+/// Command names recognized as genuine verifier/build work — matched against
+/// `ps`'s `comm` (basename only; `ps` itself may report a full path).
+/// Deliberately a static allowlist, not a denylist: an unrecognized live
+/// descendant is NOT evidence of anything by this function, on purpose. A
+/// live regression test found the opposite policy (any live descendant at
+/// all counts) excusing a genuinely wedged fake harness whose script's LAST
+/// command forked a plain `sleep` — indistinguishable from a real compiler
+/// descendant by process-tree PRESENCE alone. Naming the command is the
+/// cheapest signal that actually tells the two apart. `rk` covers both an
+/// agent's own `rk verify` CLI call and any other `rk` subcommand it might
+/// shell out to; `mise` covers the `mise run <check>`/`mise verify` task
+/// runner this repo's own checks are declared through; `cargo`/`rustc` cover
+/// a rat directly running `cargo test`/`cargo build` without going through
+/// either. Extend this list, don't loosen the policy, if a legitimate
+/// descendant is missed.
+fn is_verifier_command(comm: &str) -> bool {
+    let name = comm.rsplit('/').next().unwrap_or(comm);
+    matches!(name, "rk" | "mise" | "cargo" | "rustc")
+}
+
+/// Liveness evidence for one harness generation's own OS process, gathered
+/// directly from the process table rather than inferred from the daemon's
+/// event stream: whether `root` itself is still a real running process, and
+/// how many of its live descendants are RECOGNIZED verifier/build work (see
+/// [`is_verifier_command`]) — e.g. a `cargo test`/compiler the rat's own
+/// shell tool-use launched, or an `rk verify` CLI call blocked on the
+/// daemon's RPC, neither of which the harness event stream has any
+/// visibility into on its own. Reuses the exact `ppid`-walk
+/// [`descendant_process_groups`] already does for check-process teardown
+/// (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD), just counting live pids instead of
+/// collecting groups to signal.
+pub(crate) struct ProcessLiveness {
+    pub(crate) child_alive: bool,
+    /// Count of live descendants whose OWN command is recognized as
+    /// verifier/build work. An arbitrary live descendant that is NOT
+    /// recognized (a bare `sleep`, a hung shell, a blocked network client)
+    /// is deliberately excluded — see [`is_verifier_command`].
+    pub(crate) live_verifier_descendants: usize,
+}
+
+pub(crate) fn process_liveness(root: u32) -> ProcessLiveness {
+    let table = live_process_table();
+    let child_alive = table.iter().any(|row| row.pid == root && row_alive(row));
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for row in &table {
+        children.entry(row.ppid).or_default().push(row.pid);
+    }
+    let mut visited = HashSet::from([root]);
+    let mut queue = VecDeque::from([root]);
+    let mut live_verifier_descendants = 0usize;
+    while let Some(pid) = queue.pop_front() {
+        for &child in children.get(&pid).into_iter().flatten() {
+            if visited.insert(child) {
+                queue.push_back(child);
+                if let Some(row) = table.iter().find(|row| row.pid == child) {
+                    if row_alive(row) && is_verifier_command(&row.comm) {
+                        live_verifier_descendants += 1;
+                    }
+                }
+            }
+        }
+    }
+    ProcessLiveness {
+        child_alive,
+        live_verifier_descendants,
+    }
 }
 
 /// Every distinct process-group id live under `root` right now: `root`'s own
@@ -7639,6 +7739,7 @@ test a::flaky ... FAILED
             created_at: now,
             updated_at: now,
             archived_at: None,
+            liveness: Default::default(),
         };
         // The workflow's own `spawn` step ran and its `wait` completed against
         // this generation.

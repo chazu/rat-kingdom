@@ -763,6 +763,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             archived_at: None,
+            liveness: Default::default(),
         }
     }
 
