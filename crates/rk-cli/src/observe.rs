@@ -153,7 +153,17 @@ fn print_capacity_section(capacity: &Value) {
                     .or_else(|| entry["in_flight"].as_u64())
                     .unwrap_or(0);
                 let limit = entry["limit"].as_u64().unwrap_or(0);
-                lines.push(format!("  {repo} {lane}: {occupied}/{limit} ({reason})"));
+                let queue = match (
+                    entry["waiting_count"].as_u64(),
+                    entry["oldest_wait_secs"].as_i64(),
+                ) {
+                    (Some(n), Some(age)) if n > 0 => format!(
+                        ", {n} waiting (oldest {})",
+                        crate::top::human_secs(age.max(0) as u64)
+                    ),
+                    _ => String::new(),
+                };
+                lines.push(format!("  {repo} {lane}: {occupied}/{limit} ({reason}){queue}"));
             }
         }
     }

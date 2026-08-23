@@ -1021,11 +1021,23 @@ async fn main() -> Result<()> {
                                     .as_u64()
                                     .or_else(|| entry["in_flight"].as_u64())
                                     .unwrap_or(0);
-                                let waiting = entry["waiting_reason"]
+                                let reason = entry["waiting_reason"]
                                     .as_str()
                                     .map(|r| format!(" ({r})"))
                                     .unwrap_or_default();
-                                println!("  capacity {repo} {lane}: {occupied}/{limit}{waiting}");
+                                let queue = match (
+                                    entry["waiting_count"].as_u64(),
+                                    entry["oldest_wait_secs"].as_i64(),
+                                ) {
+                                    (Some(n), Some(age)) if n > 0 => format!(
+                                        ", {n} waiting (oldest {})",
+                                        top::human_secs(age.max(0) as u64)
+                                    ),
+                                    _ => String::new(),
+                                };
+                                println!(
+                                    "  capacity {repo} {lane}: {occupied}/{limit}{reason}{queue}"
+                                );
                             }
                         }
                     }

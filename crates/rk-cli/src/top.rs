@@ -203,7 +203,18 @@ fn capacity_summary(snap: &Snapshot) -> Option<String> {
                     "verification" => "verify",
                     other => other,
                 };
-                saturated.push(format!("{repo}:{short} {occupied}/{limit}"));
+                // Durable FIFO wait-queue depth/age (implementation + review
+                // lanes only — see `Supervisor::capacity_summary`).
+                let waiting = match (
+                    entry["waiting_count"].as_u64(),
+                    entry["oldest_wait_secs"].as_i64(),
+                ) {
+                    (Some(n), Some(age)) if n > 0 => {
+                        format!(" [{n} waiting, oldest {}]", human_secs(age.max(0) as u64))
+                    }
+                    _ => String::new(),
+                };
+                saturated.push(format!("{repo}:{short} {occupied}/{limit}{waiting}"));
             }
         }
     }

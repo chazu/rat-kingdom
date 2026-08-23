@@ -1470,9 +1470,13 @@ impl Supervisor {
             let impl_limit = self.implementation_admission_limits.limit_for(&repo);
             let impl_occupied =
                 reg.live_or_reserved_lane_wip(&repo, crate::agents::Lane::Implementation) as u32;
+            let (impl_waiting, impl_oldest_wait_secs) =
+                reg.lane_wait_stats(&repo, crate::agents::Lane::Implementation);
             let review_limit = self.review_admission_limits.limit_for(&repo);
             let review_occupied =
                 reg.live_or_reserved_lane_wip(&repo, crate::agents::Lane::Review) as u32;
+            let (review_waiting, review_oldest_wait_secs) =
+                reg.lane_wait_stats(&repo, crate::agents::Lane::Review);
             let verify_limit = self
                 .verification_admission
                 .limit_for(&self.verification_repo_identity(&repo));
@@ -1485,15 +1489,25 @@ impl Supervisor {
                     "implementation": {
                         "limit": impl_limit,
                         "occupied": impl_occupied,
+                        "waiting_count": impl_waiting,
+                        "oldest_wait_secs": impl_oldest_wait_secs,
                         "waiting_reason": (impl_limit != 0 && impl_occupied >= impl_limit)
                             .then_some("implementation_lane_full"),
                     },
                     "review": {
                         "limit": review_limit,
                         "occupied": review_occupied,
+                        "waiting_count": review_waiting,
+                        "oldest_wait_secs": review_oldest_wait_secs,
                         "waiting_reason": (review_limit != 0 && review_occupied >= review_limit)
                             .then_some("review_lane_full"),
                     },
+                    // The verification lane's own admission (`VerificationAdmission`)
+                    // is a `tokio::sync::Semaphore`, independently proven FIFO
+                    // (`acquire_verification_admission_grants_permits_in_fifo_order`)
+                    // — it does not track queue depth/age the way the durable
+                    // `Registry` wait-queue does for the other two lanes, so only
+                    // `waiting_reason` is available here.
                     "verification": {
                         "limit": verify_limit,
                         "in_flight": verify_in_flight,
@@ -1755,12 +1769,21 @@ impl Supervisor {
             crate::agents::Lane::Implementation => IMPLEMENTATION_LANE_REFUSED,
             crate::agents::Lane::Review => REVIEW_LANE_REFUSED,
         };
+        // Stable across THIS caller's own retries (a workflow fan-out step
+        // polling `is_fleet_wip_refusal` every 250ms, or drain reopening then
+        // reclaiming the same ticket) so the durable wait queue holds this
+        // logical request's place in line instead of minting a fresh entry
+        // per attempt — see `Registry::try_reserve_lane_wip`/`LaneWaiter`.
+        let lane_wait_key = match &params.workflow_instance {
+            Some(instance) => format!("workflow:{instance}:{}", params.task),
+            None => format!("{}:{}", params.role, params.task),
+        };
         let name = {
             let mut reg = self.lock_registry();
             if !reg.try_reserve_wip(fleet_wip_cap) {
                 return Err(rk_core::Error::other(FLEET_WIP_CAP_REFUSED));
             }
-            if !reg.try_reserve_lane_wip(&repo_name, lane, lane_cap) {
+            if !reg.try_reserve_lane_wip(&repo_name, lane, lane_cap, &lane_wait_key) {
                 reg.release_wip(fleet_wip_cap);
                 return Err(rk_core::Error::other(lane_refused));
             }
