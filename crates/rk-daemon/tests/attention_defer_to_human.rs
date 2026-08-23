@@ -1033,3 +1033,146 @@ async fn a_cursor_advanced_before_a_crash_still_converges_to_one_terminal_decisi
         .unwrap();
     assert_eq!(lease_after["cursor"].as_str().unwrap(), item_id);
 }
+
+/// The gap the operator audit named explicitly: a caller that only ever
+/// calls `attention.next` in a loop — never retaining or replaying an old
+/// item id through `attention.decide` — has no way to trigger a fresh
+/// `defer` call for an item the cursor has already passed. If phase 3
+/// (cursor advance) ran before a crash and phase 4 (the terminal record)
+/// never did, such a caller would otherwise leave that terminal audit
+/// record incomplete FOREVER: `attention.next` never re-offers an item the
+/// cursor is already past, so nothing would ever again invoke
+/// `defer_attention_to_human` for this exact id.
+///
+/// This reproduces exactly that crash window — intent and gate durably
+/// written, cursor durably advanced past the item, no terminal record — via
+/// a genuine daemon restart (the ONLY way to force the daemon's own
+/// in-memory `LeaseStore` to observe a cursor written by a separate
+/// `LeaseStore` handle on the same file; the running daemon never re-reads
+/// its lease file), then proves a SINGLE `attention.next` call self-heals:
+/// it completes the dangling terminal record, never duplicates the gate,
+/// and lets the queue reach a later, genuinely bounded conflict — with no
+/// `attention.decide` call for the stuck item ever made by the test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attention_next_alone_completes_a_terminal_record_left_dangling_by_a_cursor_advanced_before_a_crash(
+) {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+    let head_sha = branch_off_main(repo_dir.path(), "other-feature", "other.txt");
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    let config = rk_core::config::Config {
+        policy: allow(&["conflict-held-landing"]),
+        ..rk_core::config::Config::default()
+    };
+    let repo = repo_name_of(repo_dir.path());
+    let repo = repo.as_str();
+    let repo_path = repo_dir.path().to_string_lossy().to_string();
+
+    let daemon_a = Daemon::new(layout.clone(), &config).unwrap();
+    let handle_a = tokio::spawn(daemon_a.run());
+    let mut client = connect(&layout).await;
+
+    client
+        .call("repo.add", json!({"name": repo, "path": &repo_path}))
+        .await
+        .unwrap();
+    legacy_held_conflict(&mut client, repo, "feature", "main").await;
+    let item = attention_next(&mut client, repo).await.unwrap();
+    let item_id = item["id"].as_str().unwrap().to_string();
+
+    // A genuinely later, bounded conflict on another branch — proves the
+    // queue is truly unstuck, not merely that the stuck item disappears.
+    bounded_held_conflict(
+        &mut client,
+        repo,
+        &repo_path,
+        "other-feature",
+        &head_sha,
+        "main",
+        "TKT-BOUNDED",
+    )
+    .await;
+
+    let lease = client
+        .call("lease.acquire", json!({"repo": repo, "holder": "orch-1"}))
+        .await
+        .unwrap();
+    let generation = lease["generation"].as_u64().unwrap();
+
+    // Phases 1 and 2, exactly as a real `defer` call would leave them.
+    fabricate_defer_intent(&mut client, repo, &item_id, "orch-1").await;
+    fabricate_defer_gate(&mut client, repo, &item_id, "orch-1").await;
+    assert_eq!(terminal_decision_count(&mut client, repo).await, 0);
+
+    handle_a.abort();
+    let _ = handle_a.await;
+    std::fs::remove_file(layout.pid_file()).ok();
+    std::fs::remove_file(layout.socket_path()).ok();
+
+    // Phase 3, fabricated directly against the on-disk lease store while no
+    // daemon is running — the crash window between cursor-advance and the
+    // terminal write, with nothing left to write it.
+    let lease_store =
+        rk_daemon::orchestrator_lease::LeaseStore::load(layout.home().join("orchestrator-lease.json"))
+            .unwrap();
+    lease_store
+        .advance_cursor(repo, "orch-1", generation, &item_id, chrono::Utc::now())
+        .unwrap();
+
+    let daemon_b = Daemon::new(layout.clone(), &config).unwrap();
+    let handle_b = tokio::spawn(daemon_b.run());
+    let mut client = connect(&layout).await;
+
+    // The ONLY call this test makes from here on is `attention.next` — no
+    // `attention.decide` for `item_id` is ever issued, which is exactly the
+    // "attention.next-only consumer" shape the audit named.
+    let next = attention_next(&mut client, repo)
+        .await
+        .expect("the queue must be unstuck: a later bounded conflict is reachable");
+    assert_ne!(
+        next["id"], item_id,
+        "the healed item must never be re-offered"
+    );
+    assert_eq!(next["kind"], "conflict-held-landing");
+    assert_eq!(next["subject"], "other-feature");
+
+    assert_eq!(
+        terminal_decision_count(&mut client, repo).await,
+        1,
+        "a single attention.next call must complete the dangling terminal record"
+    );
+    assert_eq!(
+        recovery_action_count(&mut client, repo).await,
+        1,
+        "healing must never duplicate the human gate"
+    );
+    let decisions = client
+        .call(
+            "space.scan",
+            json!({"category": "event", "scope": repo, "identity": "orchestrator_decision"}),
+        )
+        .await
+        .unwrap();
+    let healed = decisions["tuples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| &t["payload"])
+        .find(|p| p["terminal"] == true)
+        .expect("a terminal decision must now exist");
+    assert_eq!(healed["violation_id"], item_id);
+    assert_eq!(healed["gated"], true);
+    assert_eq!(healed["resolved"], false);
+    assert_eq!(healed["requested_decision"], "fabricated intent");
+    assert_eq!(healed["reason"], "fabricated intent");
+
+    // A second `attention.next` call is a no-op: nothing left to heal.
+    let _ = attention_next(&mut client, repo).await;
+    assert_eq!(terminal_decision_count(&mut client, repo).await, 1);
+    assert_eq!(recovery_action_count(&mut client, repo).await, 1);
+
+    handle_b.abort();
+    let _ = handle_b.await;
+}

@@ -3604,6 +3604,16 @@ impl Daemon {
             Ok(lease) => lease.and_then(|l| l.cursor),
             Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
         };
+        // Self-heal BEFORE computing the next item: an `attention.next`-only
+        // consumer never retains an old item id to replay through
+        // `attention.decide`, so this is the only place that can ever close
+        // a terminal record left dangling by a crash between
+        // `defer_attention_to_human`'s cursor-advance and terminal-write
+        // phases. A no-op on every call where the cursor's decision is
+        // already terminal.
+        if let Err(e) = self.heal_dangling_defer_at_cursor(&report.scope, cursor.as_deref()) {
+            return Response::err(req.id, codes::INTERNAL, e.to_string());
+        }
         let item =
             crate::attention::next_attention(&report, &self.authority_policy, cursor.as_deref());
         Response::ok(req.id, json!({"repo": report.scope, "item": item}))
@@ -4420,6 +4430,84 @@ impl Daemon {
             .filter(|t| t.payload.get("violation_id").and_then(Value::as_str) == Some(violation_id))
             .find(|t| t.payload.get("terminal").and_then(Value::as_bool) == Some(true))
             .map(|t| t.payload))
+    }
+
+    /// Self-heals the ONE crash window nothing else in this daemon can
+    /// reach: `defer_attention_to_human`'s phase 3 (cursor advance)
+    /// succeeding while phase 4 (the terminal decision record) never runs.
+    /// Once the cursor has moved past a violation id,
+    /// `crate::attention::next_attention` never offers that id again, so a
+    /// caller that only ever calls `attention.next` in a loop — never
+    /// retaining or replaying the old item id through `attention.decide` —
+    /// has no way to trigger the retry that closes the gap: the terminal
+    /// record would stay stuck on a non-`terminal` "attempting" intent
+    /// forever even though the gate and the cursor advance it describes
+    /// already happened for real. Called from `handle_attention_next` on
+    /// every call, not just after a genuine crash: it is a cheap, idempotent
+    /// no-op once the cursor's decision is already terminal, which is the
+    /// overwhelmingly common case.
+    ///
+    /// Scoped to a `gated` (i.e. `DEFER_TO_HUMAN`) intent only: an
+    /// execute/mechanical "attempting" record left non-terminal at the
+    /// cursor means that attempt genuinely failed or was rate-held (per
+    /// `Self::record_decision`'s own doc comment, that must stay retryable,
+    /// never be silently marked terminal) — healing it would be wrong, not
+    /// merely unnecessary.
+    fn heal_dangling_defer_at_cursor(&self, repo: &str, cursor: Option<&str>) -> rk_core::Result<()> {
+        let Some(cursor) = cursor else {
+            return Ok(());
+        };
+        let mut pattern = Pattern::category(Category::Event)
+            .identity(crate::attention::DECISION_IDENTITY)
+            .scope(repo.to_string());
+        pattern.payload_search = Some(format!("\"violation_id\":\"{cursor}\""));
+        let records: Vec<Value> = self
+            .space
+            .scan(&pattern)?
+            .into_iter()
+            .filter(|t| t.payload.get("violation_id").and_then(Value::as_str) == Some(cursor))
+            .map(|t| t.payload)
+            .collect();
+        if records
+            .iter()
+            .any(|p| p.get("terminal").and_then(Value::as_bool) == Some(true))
+        {
+            return Ok(()); // Already complete — the overwhelmingly common case.
+        }
+        // The newest non-terminal, gated intent for this exact id: its own
+        // durable payload already carries every field a terminal record
+        // needs (requested decision, reason, blast radius, resolving
+        // action, holder, generation, budget, outcome) — only `terminal`
+        // and `decided_at` change.
+        let Some(mut healed) = records
+            .into_iter()
+            .filter(|p| p.get("gated").and_then(Value::as_bool) == Some(true))
+            .max_by_key(|p| {
+                p.get("decided_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+        else {
+            return Ok(()); // Cursor points at a non-defer decision, or nothing was ever recorded.
+        };
+        healed["terminal"] = json!(true);
+        healed["decided_at"] = json!((self.request_clock)());
+        let decided_by = healed
+            .get("decided_by")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let tuple = Tuple::new(
+            Category::Event,
+            repo,
+            crate::attention::DECISION_IDENTITY,
+            &decided_by,
+            healed,
+        )
+        .with_lifecycle(Lifecycle::Furniture);
+        self.space.out(tuple)?;
+        Ok(())
     }
 
     /// `reconcile.repair` — dry-run or apply mechanical repair for the two
