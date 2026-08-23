@@ -1,0 +1,229 @@
+//! WIP-4 verification-admission saturation regression
+//! (TKT-01M0HNFDHR7GHRDE618RB77VX6), closing the load-flake parent
+//! TKT-01M0D2APS09AXKB4AHAYHCPSPX.
+//!
+//! Deterministic, fixture-backed (fake harness / real check subprocesses —
+//! no paid model agents): drives more concurrent `verify.run` requests than
+//! a WIP=4 `verification_admission_limit_by_repo` cap against one repo, and
+//! proves (a) peak concurrent check execution never exceeds the cap, (b)
+//! every queued check eventually starts (none starved), and (c) one
+//! deliberately failing check's exact exit status/verdict is reported for
+//! IT alone, never coalesced with its siblings' passing results.
+//!
+//! Closest existing template:
+//! `capacity_lanes_dispatch_load.rs` (per-repo admission lanes under load)
+//! and `workflow_exec.rs`'s
+//! `landing_gate_and_verify_run_share_one_admission_bound_for_the_same_repo_name`
+//! (marker-file peak-concurrency proof).
+
+mod support;
+
+use rk_core::paths::Layout;
+use rk_daemon::{Client, Daemon};
+use rk_ledger::Budget;
+use rk_space::Space;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::path::Path;
+use std::process::Command;
+use std::time::Duration;
+use support::connect;
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn init_repo(dir: &Path) -> String {
+    git(dir, &["init", "-b", "main"]);
+    git(dir, &["config", "user.email", "r@x"]);
+    git(dir, &["config", "user.name", "R"]);
+    std::fs::write(dir.join("README.md"), "# x\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-m", "init"]);
+    dir.file_name().unwrap().to_string_lossy().to_string()
+}
+
+/// Escapes a shell command string for embedding inside a CUE double-quoted
+/// `command: "..."` field.
+fn cue_command(body: &str) -> String {
+    body.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// One marker/peak-concurrency check body: on start, drops its own pid
+/// marker into `shared`, snapshots how many markers currently exist (the
+/// live concurrency count at that instant) into `peak.log`, records that it
+/// started at all into `started.log`, sleeps briefly so overlapping
+/// invocations have a real window to collide in, then removes its marker.
+/// `fail` appends a distinct nonzero exit with a distinct stderr line, so
+/// the test can prove that ONE check's red result is reported exactly,
+/// never swallowed into its siblings' green ones.
+fn marker_check_body(shared: &Path, fail: bool) -> String {
+    let shared = shared.display();
+    let tail = if fail {
+        r#"; echo "sat-distinct-failure" 1>&2; exit 7"#
+    } else {
+        ""
+    };
+    format!(
+        r#"f="{shared}/m-$$"; touch "$f"; n=$(ls "{shared}"/m-* 2>/dev/null | wc -l | tr -d ' '); echo "$n" >> "{shared}/peak.log"; echo started >> "{shared}/started.log"; sleep 0.3; rm -f "$f"{tail}"#
+    )
+}
+
+/// `n` checks named `sat-0`..`sat-{n-1}` sharing one repo's verification
+/// admission lane; the LAST one is the deliberately failing check.
+fn write_saturation_checks(repo: &Path, shared: &Path, n: usize) {
+    let mut checks = String::from("checks: [\n");
+    for i in 0..n {
+        let fail = i == n - 1;
+        let body = marker_check_body(shared, fail);
+        // `sharedCargoTarget: true` is what actually routes a check through
+        // the per-repo verification admission queue at all
+        // (`workflow_exec.rs::run_check_in`: `admission_limit` is 0 —
+        // disabled — for any check that doesn't opt in). This mirrors the
+        // repo's own real `.rk/checks.cue` `verify` check, the one entry
+        // this whole ticket's admission queue exists to bound.
+        checks.push_str(&format!(
+            "    {{name: \"sat-{i}\", command: \"{}\", timeout: \"10s\", environmentPolicy: \"strip_rk_spawn\", sharedCargoTarget: true}},\n",
+            cue_command(&body)
+        ));
+    }
+    checks.push_str("]\n");
+    let rk_dir = repo.join(".rk");
+    std::fs::create_dir_all(&rk_dir).unwrap();
+    std::fs::write(rk_dir.join("checks.cue"), checks).unwrap();
+}
+
+async fn run_verify(layout: &Layout, repo: &str, check: &str) -> Value {
+    let mut client = Client::connect_as_operator(layout).await.unwrap();
+    client
+        .call("verify.run", json!({"repo": repo, "check": check}))
+        .await
+        .unwrap_or_else(|e| panic!("verify.run({repo}, {check}) failed: {e}"))
+}
+
+const SATURATION_DEADLINE: Duration = Duration::from_secs(20);
+const N_CHECKS: usize = 8;
+const WIP_LIMIT: u32 = 4;
+
+/// The core WIP-4 saturation proof: `N_CHECKS` (8) concurrent `verify.run`
+/// requests against one repo whose `verification_admission_limit_by_repo`
+/// is capped at 4 (an eight-core host's declared policy). Proves admission
+/// stays within policy (peak concurrent execution <= 4), every queued check
+/// eventually starts (all 8 record a `started` line, none starved out),
+/// and the one deliberately failing check's exact red result (`exit: 7`)
+/// is attributed to it alone — every other check still reports `exit: 0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn wip4_admission_saturation_stays_bounded_starves_nothing_and_keeps_exact_child_failures_red(
+) {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_name = init_repo(repo_dir.path());
+    let shared = tempfile::tempdir().unwrap();
+    write_saturation_checks(repo_dir.path(), shared.path(), N_CHECKS);
+
+    let layout = Layout::at(home.path());
+    let space = Space::open_in_memory().unwrap();
+    let daemon = Daemon::with_space_for_tests(
+        layout.clone(),
+        "test-castle".into(),
+        "fake".into(),
+        Budget::default(),
+        space,
+    )
+    .unwrap();
+    daemon.set_verification_admission_limits(0, HashMap::from([(repo_name.clone(), WIP_LIMIT)]));
+    tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    client
+        .call(
+            "repo.add",
+            json!({"name": &repo_name, "path": repo_dir.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+
+    // Fire all N_CHECKS concurrently, each over its own connection — a
+    // single `Client` serializes its own calls, so genuine overlap needs
+    // one connection per in-flight request (same technique
+    // `capacity_lanes_dispatch_load.rs`'s concurrent `verify.run` task
+    // uses).
+    let mut handles = Vec::new();
+    for i in 0..N_CHECKS {
+        let layout = layout.clone();
+        let repo_name = repo_name.clone();
+        handles.push(tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                SATURATION_DEADLINE,
+                run_verify(&layout, &repo_name, &format!("sat-{i}")),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "sat-{i} never completed within {SATURATION_DEADLINE:?} — admission starved it"
+                )
+            });
+            (i, result)
+        }));
+    }
+
+    let mut results: Vec<(usize, Value)> = Vec::new();
+    for h in handles {
+        results.push(h.await.unwrap());
+    }
+    results.sort_by_key(|(i, _)| *i);
+
+    for (i, result) in &results {
+        if *i == N_CHECKS - 1 {
+            assert_eq!(
+                result["exit"],
+                json!(7),
+                "the deliberately failing check sat-{i} must report its own exact exit \
+                 status, not a coalesced/misattributed one: {result:#?}"
+            );
+            assert_eq!(result["verdict"], json!("fail"), "{result:#?}");
+        } else {
+            assert_eq!(
+                result["exit"],
+                json!(0),
+                "check sat-{i} must pass unaffected by its failing sibling: {result:#?}"
+            );
+            assert_eq!(result["verdict"], json!("pass"), "{result:#?}");
+        }
+    }
+
+    let started = std::fs::read_to_string(shared.path().join("started.log")).unwrap_or_default();
+    assert_eq!(
+        started.lines().count(),
+        N_CHECKS,
+        "every one of the {N_CHECKS} queued checks must eventually start — a starved check \
+         would leave started.log short: {started:?}"
+    );
+
+    let peak_log = std::fs::read_to_string(shared.path().join("peak.log")).unwrap_or_default();
+    let peak: usize = peak_log
+        .lines()
+        .filter_map(|l| l.trim().parse::<usize>().ok())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        peak <= WIP_LIMIT as usize,
+        "admission must stay within the repository's WIP={WIP_LIMIT} policy at all times: \
+         observed peak concurrent execution was {peak}, log: {peak_log:?}"
+    );
+    assert!(
+        peak >= 2,
+        "the test must actually exercise real overlap to be a meaningful saturation proof, \
+         not just 8 checks running one at a time: observed peak was only {peak}"
+    );
+}
