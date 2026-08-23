@@ -888,7 +888,8 @@ impl Tickets {
         if is_blocked(ticket, by_id) {
             return;
         }
-        let span = crate::span::PhaseSpan::new(&ticket.identity, crate::span::Phase::TicketReady);
+        let span = crate::span::PhaseSpan::new(&ticket.identity, crate::span::Phase::TicketReady)
+            .queued_at(chrono::Utc::now());
         let _ = crate::span::record_phase_span(&self.space, &ticket.scope, &self.castle, &span);
     }
 }
