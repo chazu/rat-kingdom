@@ -916,15 +916,21 @@ impl VerificationAdmission {
     /// timing requirement (the caller times execution itself). `None` when
     /// admission control is disabled for `repo` (limit 0): every caller must
     /// treat that as "proceed unbounded", matching pre-existing behaviour.
-    async fn acquire(&self, repo: &str, limit: u32) -> Option<(tokio::sync::OwnedSemaphorePermit, std::time::Duration)> {
+    async fn acquire(
+        &self,
+        repo: &str,
+        limit: u32,
+    ) -> Option<(tokio::sync::OwnedSemaphorePermit, std::time::Duration)> {
         if limit == 0 {
             return None;
         }
         let sem = {
             let mut semaphores = self.semaphores.lock().unwrap();
-            Arc::clone(semaphores.entry(repo.to_string()).or_insert_with(|| {
-                Arc::new(tokio::sync::Semaphore::new(limit as usize))
-            }))
+            Arc::clone(
+                semaphores
+                    .entry(repo.to_string())
+                    .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(limit as usize))),
+            )
         };
         let started = std::time::Instant::now();
         // A semaphore is only ever closed by `close()`, which nothing here
@@ -7370,10 +7376,7 @@ mod verification_admission_tests {
         let s = sup(home.path());
         s.set_verification_admission_limits(1, HashMap::new());
 
-        let (first, _wait) = s
-            .acquire_verification_admission("repo-a", 1)
-            .await
-            .unwrap();
+        let (first, _wait) = s.acquire_verification_admission("repo-a", 1).await.unwrap();
 
         let s2 = s.clone();
         let mut second = Box::pin(s2.acquire_verification_admission("repo-a", 1));
@@ -7445,10 +7448,7 @@ mod verification_admission_tests {
         let s = sup(home.path());
         s.set_verification_admission_limits(1, HashMap::new());
 
-        let (_a, _wait) = s
-            .acquire_verification_admission("repo-a", 1)
-            .await
-            .unwrap();
+        let (_a, _wait) = s.acquire_verification_admission("repo-a", 1).await.unwrap();
         let _ = tokio::time::timeout(
             Duration::from_millis(100),
             s.acquire_verification_admission("repo-b", 1),

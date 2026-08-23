@@ -3196,7 +3196,11 @@ impl WorkflowEngine {
                 .iter()
                 .find(|t| t.payload.get("key").and_then(Value::as_str) == Some(key.as_str()))
             {
-                let mut result = t.payload.get("result").cloned().unwrap_or_else(|| json!({}));
+                let mut result = t
+                    .payload
+                    .get("result")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
                 if let Value::Object(map) = &mut result {
                     map.insert("reused".into(), json!(true));
                     map.insert("reused_from".into(), json!("verification_proof"));
@@ -4993,7 +4997,11 @@ async fn clean_candidate_sha(dir: &Path) -> Option<String> {
 /// ([`rk_core::action::canonical_digest`]). `None` only on a (practically
 /// unreachable) serialization failure — callers treat that as "cannot cache
 /// this", never as a false hit.
-fn verification_proof_key(repo_name: &str, candidate: &str, check: &rk_workflow::Check) -> Option<String> {
+fn verification_proof_key(
+    repo_name: &str,
+    candidate: &str,
+    check: &rk_workflow::Check,
+) -> Option<String> {
     rk_core::action::canonical_digest(&json!({
         "repo": repo_name,
         "candidate": candidate,
