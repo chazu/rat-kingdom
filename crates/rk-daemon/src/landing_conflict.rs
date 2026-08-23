@@ -156,7 +156,10 @@ pub(crate) fn classify_conflict_authority(
             format!(
                 "the conflicted diff is {} file(s) / {} line(s), over this repository's \
                  maxDiffFiles/maxDiffLines budget of {}/{}",
-                evidence.diff_files, evidence.diff_lines, evidence.max_diff_files, evidence.max_diff_lines
+                evidence.diff_files,
+                evidence.diff_lines,
+                evidence.max_diff_files,
+                evidence.max_diff_lines
             ),
             "judge the blast radius yourself, then dispatch a correction or resolve the branch \
              by hand",
@@ -383,7 +386,11 @@ mod tests {
     fn classifier_holds_unreadable_protected_or_oversized_conflicts_for_a_human() {
         let cases: [(ConflictEvidence, Authority, Option<&str>); 4] = [
             (evidence("CONFLICT in a.rs"), Authority::Orchestrator, None),
-            (evidence("   "), Authority::Human, Some("unbounded-conflict-evidence")),
+            (
+                evidence("   "),
+                Authority::Human,
+                Some("unbounded-conflict-evidence"),
+            ),
             (
                 ConflictEvidence {
                     protected_path_hit: true,
@@ -482,8 +489,14 @@ mod tests {
         };
         let text = ctx().escalation(&withheld);
         assert!(text.contains("EVIDENCE:"), "{text}");
-        assert!(text.contains("DECISION NEEDED: judge it yourself"), "{text}");
-        assert!(text.contains("BLAST RADIUS: 3 file(s) / 42 line(s)"), "{text}");
+        assert!(
+            text.contains("DECISION NEEDED: judge it yourself"),
+            "{text}"
+        );
+        assert!(
+            text.contains("BLAST RADIUS: 3 file(s) / 42 line(s)"),
+            "{text}"
+        );
         assert!(
             text.contains("rk spawn --repo code-repo --ticket TKT-2 --base feature"),
             "{text}"
@@ -494,11 +507,18 @@ mod tests {
     #[test]
     fn the_ticket_coalesce_key_is_namespaced_apart_from_review_rework() {
         let key = ticket_coalesce_key("code-repo", "feature", "abc123", "main", "TKT-1");
-        assert_eq!(key, "landing-conflict-rework:code-repo:feature:abc123:main:TKT-1");
+        assert_eq!(
+            key,
+            "landing-conflict-rework:code-repo:feature:abc123:main:TKT-1"
+        );
         assert_ne!(
             key,
             crate::landing_rework::ticket_coalesce_key(
-                "code-repo", "feature", "abc123", "main", "TKT-1"
+                "code-repo",
+                "feature",
+                "abc123",
+                "main",
+                "TKT-1"
             )
         );
     }

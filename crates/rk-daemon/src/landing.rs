@@ -4196,10 +4196,8 @@ impl LandingPipeline {
             return Ok(());
         };
         let payload = &marker.payload;
-        let original_branch =
-            required_payload_str(payload, "branch", "conflict dispatch marker")?;
-        let original_target =
-            required_payload_str(payload, "target", "conflict dispatch marker")?;
+        let original_branch = required_payload_str(payload, "branch", "conflict dispatch marker")?;
+        let original_target = required_payload_str(payload, "target", "conflict dispatch marker")?;
         let original_task = required_payload_str(payload, "task", "conflict dispatch marker")?;
         let repo = rk_git::Repo::discover(Path::new(&entry.repo_path))?;
         let head_sha = repo.rev_parse(original_branch)?;
@@ -7999,7 +7997,11 @@ workflow: {
         );
 
         let spawns = tuples(&space, Category::Event, "agent_spawned");
-        assert_eq!(spawns.len(), 1, "bounded CONFLICT recovery must dispatch one agent");
+        assert_eq!(
+            spawns.len(),
+            1,
+            "bounded CONFLICT recovery must dispatch one agent"
+        );
         let markers = scoped_tuples(&space, Category::Event, CONFLICT_DISPATCH_IDENTITY);
         assert_eq!(markers.len(), 1, "one logical dispatch gets one marker");
         assert_eq!(markers[0].payload["state"], "dispatching");
@@ -8011,8 +8013,14 @@ workflow: {
         assert_eq!(markers[0].payload["task"], "add src");
         assert_eq!(markers[0].payload["rework_ticket"], ticket.identity);
         let fork_point = markers[0].payload["fork_point"].as_str().unwrap();
-        assert_ne!(fork_point, head_sha, "fork point must not be the source tip");
-        assert_ne!(fork_point, main_before, "fork point must not be the target tip");
+        assert_ne!(
+            fork_point, head_sha,
+            "fork point must not be the source tip"
+        );
+        assert_ne!(
+            fork_point, main_before,
+            "fork point must not be the target tip"
+        );
         assert!(
             markers[0].payload["conflict_evidence"]
                 .as_str()
@@ -8042,12 +8050,18 @@ workflow: {
             task: ticket.identity.clone(),
             ..Default::default()
         };
-        pipeline.resubmit_conflict_reworked_parent(&correction).unwrap();
+        pipeline
+            .resubmit_conflict_reworked_parent(&correction)
+            .unwrap();
         let pending = pipeline
             .queue
             .scan_current("code-repo", Some("main"))
             .unwrap();
-        assert_eq!(pending.len(), 1, "held branch must be requeued exactly once");
+        assert_eq!(
+            pending.len(),
+            1,
+            "held branch must be requeued exactly once"
+        );
         assert_eq!(pending[0].payload["branch"], "feature");
         assert_eq!(pending[0].payload["target"], "main");
         assert_eq!(pending[0].payload["task"], "add src");
@@ -8066,7 +8080,10 @@ workflow: {
         pipeline.enqueue(entry.clone()).unwrap();
 
         let outcome = pipeline.drain_key("code-repo", "main").await.unwrap();
-        assert!(matches!(outcome.as_slice(), [LandingOutcome::ReworkFiled(_)]));
+        assert!(matches!(
+            outcome.as_slice(),
+            [LandingOutcome::ReworkFiled(_)]
+        ));
         assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
         assert_eq!(rev_parse(repo_dir.path(), "feature"), head_sha);
         no_spawns(&space);
@@ -8157,7 +8174,11 @@ workflow: {
         let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
         for _ in 0..2 {
             let replay = pipeline
-                .route_conflict(&entry, &repo, "CONFLICT (content): Merge conflict in src.rs")
+                .route_conflict(
+                    &entry,
+                    &repo,
+                    "CONFLICT (content): Merge conflict in src.rs",
+                )
                 .await
                 .unwrap();
             assert!(matches!(replay, LandingOutcome::ReworkFiled(_)));
@@ -8200,7 +8221,10 @@ workflow: {
         pipeline.enqueue(entry.clone()).unwrap();
 
         let outcome = pipeline.drain_key("code-repo", "main").await.unwrap();
-        assert!(matches!(outcome.as_slice(), [LandingOutcome::ReworkFiled(_)]));
+        assert!(matches!(
+            outcome.as_slice(),
+            [LandingOutcome::ReworkFiled(_)]
+        ));
         assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
         assert_eq!(rev_parse(repo_dir.path(), "feature"), head_sha);
         no_spawns(&space);
@@ -8220,7 +8244,11 @@ workflow: {
 
         let repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
         pipeline
-            .route_conflict(&entry, &repo, "CONFLICT (content): Merge conflict in src.rs")
+            .route_conflict(
+                &entry,
+                &repo,
+                "CONFLICT (content): Merge conflict in src.rs",
+            )
             .await
             .unwrap();
         assert_eq!(
