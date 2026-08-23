@@ -112,10 +112,10 @@ pub(crate) struct ResolvedRun {
 
 /// What a blown `run` wall-clock bound does to the instance (TKT-169).
 ///
-/// The command is killed either way — `kill_on_drop` owns that, and a hung suite
-/// never survives its budget. The choice here is only whether the kill is
-/// reported as an ERROR (which ends the run where it stands) or as a RESULT the
-/// following steps get to route on.
+/// The command is killed either way — `ProcessGroupGuard` owns that, and a
+/// hung suite never survives its budget. The choice here is only whether the
+/// kill is reported as an ERROR (which ends the run where it stands) or as a
+/// RESULT the following steps get to route on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OnTimeout {
     /// Fail the instance immediately. The default, and the only behaviour before
@@ -722,18 +722,24 @@ fn descendant_process_groups(root: u32, table: &[ProcessTableRow]) -> Vec<i32> {
     groups.into_iter().collect()
 }
 
-/// Guarantees a gate child's WHOLE process TREE dies, not just the `sh -c`
-/// wrapper `kill_on_drop` reaches or the single process group
-/// `spawn_check_child` put its leader in. `spawn_check_child` puts the child
-/// in its own group via `.process_group(0)` (mirroring rk-harness's
-/// launcher); this guard walks the live descendant tree from that pid
+/// Guarantees a gate child's WHOLE process TREE dies, not just the single
+/// process group `spawn_check_child` put its leader in.
+/// `spawn_check_child` puts the child in its own group via
+/// `.process_group(0)` (mirroring rk-harness's launcher) and deliberately
+/// does NOT set `.kill_on_drop(true)` — this guard is the SOLE killer, by
+/// design: it walks the live descendant tree from that pid
 /// ([`descendant_process_groups`]) and sends the negative-pid signal to
 /// EVERY group found, reaching a `mise`/`cargo`/`rustc` descendant even if it
-/// moved itself into a group of its own. Disarmed only on the
-/// clean-completion path — every other exit from `collect_child_output`
-/// (reader/wait join failure, timeout, or this function's future simply
-/// being dropped out from under it) drops the guard still armed and kills
-/// whatever the check left running.
+/// moved itself into a group of its own. That walk needs the leader and its
+/// descendants to still be alive and correctly parented when it runs — a
+/// `kill_on_drop` racing ahead of it (as `abort_task` used to trigger on the
+/// timeout/error paths below) would reparent a nested descendant to init
+/// first, breaking the `ppid`-chain discovery that finds its group at all
+/// (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD). Disarmed only on the clean-completion
+/// path — every other exit from `collect_child_output` (reader/wait join
+/// failure, timeout, or this function's future simply being dropped out
+/// from under it) drops the guard still armed and kills whatever the check
+/// left running.
 struct ProcessGroupGuard(Option<u32>);
 
 impl ProcessGroupGuard {
@@ -929,8 +935,10 @@ async fn collect_child_output(
 
     // Put the child in a task whose cancellation/drop semantics own the
     // immediate process. Join failure and timeout both abort this task,
-    // dropping the kill_on_drop child; `group_guard` above is what reaches
-    // any grandchildren it left behind.
+    // dropping (detaching, not killing — no `kill_on_drop` here) the child;
+    // `group_guard` above is the only thing that actually signals it and
+    // whatever tree it left behind, and it needs the process still alive
+    // and correctly parented to find that tree at all.
     let mut wait_task = tokio::spawn(async move { child.wait().await });
     let mut stdout_task = tokio::spawn(read_capped(stdout));
     let mut stderr_task = tokio::spawn(read_capped(stderr));
@@ -1021,8 +1029,10 @@ async fn collect_child_output(
             }
             _ = &mut sleep => {
                 // The child dies here unconditionally: aborting the wait task
-                // drops the `kill_on_drop` child. What an `OnTimeout::Fail`
-                // policy does with this — error out, but only after the
+                // detaches it, and this function returning (below) drops
+                // `group_guard`, whose own tree-walk kill is what actually
+                // signals it. What an `OnTimeout::Fail` policy does with
+                // this — error out, but only after the
                 // caller has had the chance to persist gate-failure evidence —
                 // is the caller's decision, not this function's; it just
                 // reports the outcome (TKT-01M02QT9KTDY2CN6YJEVP3VCF8).
@@ -4073,13 +4083,23 @@ impl WorkflowEngine {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            // Kill the suite if the timeout below drops the wait future, so a
-            // hung check leaves no orphan behind.
-            .kill_on_drop(true)
+            // Deliberately NOT `.kill_on_drop(true)`: that would let
+            // `abort_task`'s `JoinHandle::abort()` (the timeout/error paths
+            // in `collect_child_output`) drop this `Child` — and with
+            // `kill_on_drop` set, SIGKILL its pid — before
+            // `ProcessGroupGuard` gets to snapshot the live descendant tree.
+            // A descendant already reparented to init by then is invisible
+            // to that snapshot's `ppid`-chain walk, exactly the bug this
+            // check's own group-only kill used to have
+            // (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD). Tokio's own orphan reaper
+            // still reaps this child once it exits regardless of
+            // `kill_on_drop`, so nothing here leaks a zombie by omitting it —
+            // `ProcessGroupGuard` is the sole, and sufficient, killer.
+            //
             // Its own process group (mirroring rk-harness's launcher): lets
             // `ProcessGroupGuard` in `collect_child_output` reach every
             // descendant this check spawns (mise/cargo/rustc under `sh -c`),
-            // not just the `sh` wrapper `kill_on_drop` kills on its own.
+            // not just the `sh` wrapper itself.
             .process_group(0);
         // Named checks routinely shell back into `rk` (escalation needs, rework
         // tickets), but the child inherits the DAEMON's environment — and the
@@ -6498,9 +6518,11 @@ test a::flaky ... FAILED
 
     #[tokio::test]
     async fn timeout_kills_the_whole_process_group_not_just_the_wrapper() {
-        // `kill_on_drop` alone only reaches the `sh -c` wrapper's own pid; a
-        // grandchild it backgrounds (mise/cargo/rustc in the real case) is
-        // untouched unless the whole process group is signalled.
+        // No `.kill_on_drop(true)` — mirroring `spawn_check_child` exactly:
+        // the wrapper's own pid alone would never reach a grandchild it
+        // backgrounds (mise/cargo/rustc in the real case) anyway; only the
+        // whole process group being signalled does, which `ProcessGroupGuard`
+        // alone is responsible for.
         let temp = tempfile::tempdir().unwrap();
         let pid_file = temp.path().join("grandchild.pid");
         let command = format!("sleep 600 & echo $! > {}; wait", pid_file.display());
@@ -6509,7 +6531,6 @@ test a::flaky ... FAILED
             .arg(&command)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
             .process_group(0);
         let child = cmd.spawn().unwrap();
 
@@ -6563,7 +6584,6 @@ test a::flaky ... FAILED
             .arg(&command)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
             .process_group(0);
         let child = cmd.spawn().unwrap();
 
