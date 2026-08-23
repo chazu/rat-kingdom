@@ -3954,6 +3954,12 @@ impl LandingPipeline {
     ) -> rk_core::Result<GateRunOutcome> {
         let started = Instant::now();
         let mut passed_checks = Vec::new();
+        // Best-effort per-check admission-queue wait (`RunProgress::queue_wait_ms`,
+        // only ever `Some` for a check that opted into `sharedCargoTarget` AND
+        // actually contended for the per-repo verification-admission slot) —
+        // the durable-events acceptance criterion's "queue wait" field,
+        // recorded alongside `duration_ms` on the final `landing_gate_pass`.
+        let mut queue_wait_ms: Vec<(String, Option<u64>)> = Vec::new();
         let repo_path = PathBuf::from(&entry.repo_path);
         let gate_dir = self.gate_worktree_path(&entry.repo_name, &entry.target);
         {
@@ -4039,6 +4045,7 @@ impl LandingPipeline {
                 retry_on_fail: 0,
                 shared_cargo_target: check.shared_cargo_target,
             };
+            let progress = Arc::new(Mutex::new(RunProgress::default()));
 
             // Resuming after a crash landed between spending the retry
             // budget and the retry attempt completing (`gate_infra_retry_check`'s
@@ -4079,6 +4086,10 @@ impl LandingPipeline {
                     if !passed {
                         return Ok(GateRunOutcome::InfraRetryExhausted);
                     }
+                    // Never executed this attempt at all — resumed straight
+                    // from durable evidence — so there is no queue wait to
+                    // report for it.
+                    queue_wait_ms.push((check.name.clone(), None));
                     passed_checks.push(check.name.clone());
                     continue;
                 }
@@ -4094,7 +4105,7 @@ impl LandingPipeline {
                         &env,
                         timeout,
                         None,
-                        None,
+                        Some(Arc::clone(&progress)),
                     )
                     .await;
                 if !self
@@ -4109,6 +4120,7 @@ impl LandingPipeline {
                 {
                     return Ok(GateRunOutcome::InfraRetryExhausted);
                 }
+                queue_wait_ms.push((check.name.clone(), progress.lock().unwrap().queue_wait_ms()));
                 passed_checks.push(check.name.clone());
                 continue;
             }
@@ -4125,7 +4137,7 @@ impl LandingPipeline {
                     &env,
                     timeout,
                     None,
-                    None,
+                    Some(Arc::clone(&progress)),
                 )
                 .await;
             match outcome {
@@ -4177,7 +4189,7 @@ impl LandingPipeline {
                             &env,
                             timeout,
                             None,
-                            None,
+                            Some(Arc::clone(&progress)),
                         )
                         .await;
                     if !self
@@ -4205,6 +4217,7 @@ impl LandingPipeline {
                     return Ok(GateRunOutcome::Fail);
                 }
             }
+            queue_wait_ms.push((check.name.clone(), progress.lock().unwrap().queue_wait_ms()));
             passed_checks.push(check.name);
         }
         self.space.out(
@@ -4225,6 +4238,10 @@ impl LandingPipeline {
                     "edge_class": edge_class.as_str(),
                     "full_check_required": full_check_required,
                     "proof_key": proof_key,
+                    "queue_wait_ms": queue_wait_ms
+                        .iter()
+                        .map(|(name, wait)| (name.clone(), json!(wait)))
+                        .collect::<serde_json::Map<String, Value>>(),
                 }),
             )
             .with_lifecycle(Lifecycle::Furniture),
