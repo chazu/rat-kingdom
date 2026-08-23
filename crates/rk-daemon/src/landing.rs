@@ -10779,4 +10779,445 @@ checks: [
         assert!(reclaims.is_empty(), "{reclaims:?}");
         assert!(pipeline.gate_worktree_path("myrepo", "main").exists());
     }
+
+    // --- TKT-01M0P2KM9YBHYDKA51XRAP0H20: policy-driven edge classification ---
+
+    fn lint_focused_policy() -> rk_workflow::LandingPolicy {
+        rk_workflow::LandingPolicy {
+            protected_targets: vec!["main".into()],
+            focused_checks: vec![rk_workflow::FocusedCheckRule {
+                paths: Vec::new(),
+                class: "lint".into(),
+                checks: vec!["lint-check".into()],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_child_to_parent_to_main_runs_focused_then_full_check() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let marker_dir = tempfile::tempdir().unwrap();
+        let lint_marker = marker_dir.path().join("lint-ran");
+        let verify_marker = marker_dir.path().join("verify-ran");
+        let checks = format!(
+            r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "lint-check", command: "echo x >> '{lint}'", timeout: "30s"}},
+    {{name: "verify", command: "echo x >> '{verify}'", timeout: "30s"}},
+]
+"#,
+            lint = lint_marker.display(),
+            verify = verify_marker.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+        activate_landing_policy(home.path(), repo_dir.path(), lint_focused_policy());
+
+        git(repo_dir.path(), &["checkout", "-b", "parent"]);
+        git(repo_dir.path(), &["checkout", "-b", "child"]);
+        std::fs::write(repo_dir.path().join("feature.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add feature"]);
+        let child_head = rev_parse(repo_dir.path(), "child");
+        git(repo_dir.path(), &["checkout", "parent"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "nested-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "child".into(),
+                target: "parent".into(),
+                head_sha: child_head,
+                diff_class: "doc-only".into(),
+                task: "add feature".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let outcomes = pipeline.drain_key("nested-repo", "parent").await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(outcomes[0], LandingOutcome::Landed(_)),
+            "{:?}",
+            outcomes[0]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lint_marker).unwrap().lines().count(),
+            1,
+            "the inner edge must run its policy-selected focused check"
+        );
+        assert!(
+            !verify_marker.exists(),
+            "the inner edge must never run the full check"
+        );
+
+        let plans = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_EDGE_PLAN_IDENTITY))
+            .unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].payload["edge_class"], "inner");
+        assert_eq!(plans[0].payload["full_check_required"], false);
+        assert_eq!(
+            plans[0].payload["selected_checks"],
+            json!(["steward-protected-paths", "steward-diff-scope", "lint-check"])
+        );
+
+        // Promote the (now child-carrying) parent onto the protected final
+        // target: this hop must run the full check, exactly once.
+        let parent_head = rev_parse(repo_dir.path(), "parent");
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "nested-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "parent".into(),
+                target: "main".into(),
+                head_sha: parent_head,
+                diff_class: "doc-only".into(),
+                task: "promote parent".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let outcomes = pipeline.drain_key("nested-repo", "main").await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(outcomes[0], LandingOutcome::Landed(_)),
+            "{:?}",
+            outcomes[0]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&verify_marker).unwrap().lines().count(),
+            1,
+            "the protected-final edge must run the full check exactly once"
+        );
+
+        let plans = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_EDGE_PLAN_IDENTITY))
+            .unwrap();
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[1].payload["edge_class"], "protected-final");
+        assert_eq!(plans[1].payload["full_check_required"], true);
+        assert!(!plans[1].payload["proof_key"].is_null());
+    }
+
+    #[tokio::test]
+    async fn direct_to_main_delivery_runs_the_full_check_exactly_once() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        write_checks(repo_dir.path(), ALL_PASS_CHECKS);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let gates = GateConfig::default();
+        let mut entry = LandingQueueEntry {
+            repo_name: "direct-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha,
+            diff_class: "doc-only".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+        assert!(pipeline
+            .run_gates(&mut entry, &git_repo, &gates)
+            .await
+            .unwrap());
+
+        let plans = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_EDGE_PLAN_IDENTITY))
+            .unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].payload["edge_class"], "protected-final");
+        assert_eq!(plans[0].payload["full_check_required"], true);
+        assert_eq!(
+            plans[0].payload["selected_checks"],
+            json!(["steward-protected-paths", "steward-diff-scope", "verify"])
+        );
+        assert!(!plans[0].payload["proof_key"].is_null());
+    }
+
+    #[tokio::test]
+    async fn protected_path_touch_holds_an_inner_edge_the_same_as_a_final_one() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let checks = r#"checks: [
+    {name: "steward-protected-paths", command: "target=$RK_CHECK_TARGET; ! git diff --name-only \"$target\"...HEAD | grep -qE \"$RK_CHECK_PROTECTED_PATHS\"", timeout: "30s"},
+    {name: "steward-diff-scope", command: "true", timeout: "30s"},
+    {name: "lint-check", command: "true", timeout: "30s"},
+    {name: "verify", command: "true", timeout: "30s"},
+]
+"#;
+        write_checks(repo_dir.path(), checks);
+        activate_landing_policy(home.path(), repo_dir.path(), lint_focused_policy());
+
+        git(repo_dir.path(), &["checkout", "-b", "parent"]);
+        git(repo_dir.path(), &["checkout", "-b", "child"]);
+        std::fs::create_dir_all(repo_dir.path().join("migrations")).unwrap();
+        std::fs::write(repo_dir.path().join("migrations").join("x.sql"), "select 1;\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "add migration"]);
+        let head_sha = rev_parse(repo_dir.path(), "child");
+        git(repo_dir.path(), &["checkout", "parent"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "escalation-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "child".into(),
+                target: "parent".into(),
+                head_sha,
+                diff_class: "doc-only".into(),
+                task: "add migration".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let outcomes = pipeline.drain_key("escalation-repo", "parent").await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(outcomes[0], LandingOutcome::GateHeld),
+            "{:?}",
+            outcomes[0]
+        );
+
+        let plans = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_EDGE_PLAN_IDENTITY))
+            .unwrap();
+        assert_eq!(plans.len(), 1, "the plan is recorded before any check runs");
+        assert_eq!(plans[0].payload["edge_class"], "inner");
+        assert_eq!(plans[0].payload["full_check_required"], false);
+        assert!(
+            space
+                .scan(&Pattern::category(Category::Event).identity(GATE_PASS_IDENTITY))
+                .unwrap()
+                .is_empty(),
+            "a protected-path violation must never reach a green gate run"
+        );
+    }
+
+    #[tokio::test]
+    async fn focused_check_failure_holds_an_inner_edge_without_running_the_full_check() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let marker_dir = tempfile::tempdir().unwrap();
+        let verify_marker = marker_dir.path().join("verify-ran");
+        let checks = format!(
+            r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "lint-check", command: "exit 1", timeout: "30s"}},
+    {{name: "verify", command: "echo x >> '{verify}'", timeout: "30s"}},
+]
+"#,
+            verify = verify_marker.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+        activate_landing_policy(home.path(), repo_dir.path(), lint_focused_policy());
+
+        git(repo_dir.path(), &["checkout", "-b", "parent"]);
+        git(repo_dir.path(), &["checkout", "-b", "child"]);
+        std::fs::write(repo_dir.path().join("feature.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add feature"]);
+        let head_sha = rev_parse(repo_dir.path(), "child");
+        git(repo_dir.path(), &["checkout", "parent"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "focused-fail-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "child".into(),
+                target: "parent".into(),
+                head_sha,
+                diff_class: "doc-only".into(),
+                task: "add feature".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let outcomes = pipeline
+            .drain_key("focused-fail-repo", "parent")
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(outcomes[0], LandingOutcome::GateHeld),
+            "{:?}",
+            outcomes[0]
+        );
+        assert!(
+            !verify_marker.exists(),
+            "the full check must never run once the focused check already failed"
+        );
+
+        let plans = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_EDGE_PLAN_IDENTITY))
+            .unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0].payload["selected_checks"],
+            json!(["steward-protected-paths", "steward-diff-scope", "lint-check"])
+        );
+    }
+
+    #[tokio::test]
+    async fn target_movement_requeues_and_recomputes_a_fresh_edge_plan_and_proof_key() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let checks = format!(
+            r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "git -C '{repo}' update-ref refs/heads/main refs/heads/moving-target", timeout: "30s"}},
+]
+"#,
+            repo = repo_dir.path().display()
+        );
+        write_checks(repo_dir.path(), &checks);
+        git(repo_dir.path(), &["checkout", "-b", "moving-target"]);
+        std::fs::write(repo_dir.path().join("sibling.txt"), "sibling\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(
+            repo_dir.path(),
+            &["commit", "-m", "sibling advances target"],
+        );
+        git(repo_dir.path(), &["checkout", "main"]);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("feature.txt"), "feature\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feature"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(LandingQueueEntry {
+                repo_name: "movement-repo".into(),
+                repo_path: repo_dir.path().display().to_string(),
+                branch: "feature".into(),
+                target: "main".into(),
+                head_sha,
+                diff_class: "doc-only".into(),
+                task: "add feature".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let outcomes = pipeline.drain_key("movement-repo", "main").await.unwrap();
+        assert!(matches!(
+            outcomes.first(),
+            Some(LandingOutcome::Requeued { .. })
+        ));
+        assert!(matches!(outcomes.last(), Some(LandingOutcome::Landed(_))));
+
+        let plans = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_EDGE_PLAN_IDENTITY))
+            .unwrap();
+        assert_eq!(
+            plans.len(),
+            2,
+            "one edge plan per attempt, never reused across a target move: {plans:?}"
+        );
+        assert_eq!(plans[0].payload["edge_class"], "protected-final");
+        assert_eq!(plans[1].payload["edge_class"], "protected-final");
+        let candidate_a = plans[0].payload["candidate_sha"].as_str().unwrap();
+        let candidate_b = plans[1].payload["candidate_sha"].as_str().unwrap();
+        assert_ne!(
+            candidate_a, candidate_b,
+            "the retried attempt must test a freshly rebuilt candidate"
+        );
+        let proof_a = plans[0].payload["proof_key"].as_str().unwrap();
+        let proof_b = plans[1].payload["proof_key"].as_str().unwrap();
+        assert_ne!(
+            proof_a, proof_b,
+            "target movement must invalidate the prior attempt's proof key"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_verify_run_reuses_the_landing_gates_full_check_proof_without_rerunning() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let marker_dir = tempfile::tempdir().unwrap();
+        let counter_file = marker_dir.path().join("verify-runs");
+        let checks = format!(
+            r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "echo x >> '{counter}'", timeout: "30s"}},
+]
+"#,
+            counter = counter_file.display(),
+        );
+        write_checks(repo_dir.path(), &checks);
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let gates = GateConfig::default();
+        let mut entry = LandingQueueEntry {
+            repo_name: "replay-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            diff_class: "doc-only".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+        assert!(pipeline
+            .run_gates(&mut entry, &git_repo, &gates)
+            .await
+            .unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&counter_file).unwrap().lines().count(),
+            1,
+            "the landing gate must run the full check exactly once"
+        );
+
+        // A reviewer's own `verify.run`, against the exact same prepared
+        // candidate, must reuse that proof rather than duplicating it.
+        let gate_dir = pipeline.gate_worktree_path("replay-repo", "main");
+        let result = pipeline
+            .engine
+            .verify_repo_check(
+                "reviewer-rat",
+                &gate_dir,
+                "replay-repo",
+                "verify",
+                None,
+                "replay-request",
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["reused"], true, "result: {result}");
+        assert_eq!(
+            std::fs::read_to_string(&counter_file).unwrap().lines().count(),
+            1,
+            "the reviewer's verify.run must not re-execute the full check"
+        );
+    }
 }
