@@ -2931,7 +2931,10 @@ impl LandingPipeline {
                 // transition below moves the durable candidate into `Landing`
                 // (`Phase::Merge`) — that transition resets
                 // `phase_entered_at`, so reading it any later would silently
-                // lose the review's elapsed time.
+                // lose the review's elapsed time. The round is derived, not
+                // assumed to be the first: an approval on resubmission after a
+                // correction round would otherwise dedup away against that
+                // round's span (see `Self::approved_review_attempt`).
                 let _ = crate::span::record_phase_span(
                     &self.space,
                     &entry.repo_name,
@@ -2939,7 +2942,7 @@ impl LandingPipeline {
                     &Self::timed_review_span(
                         &entry.task,
                         crate::span::Phase::SemanticReview,
-                        1,
+                        self.approved_review_attempt(entry),
                         &entry.repo_name,
                         self.phase_started_at(entry),
                         Utc::now(),
@@ -3861,6 +3864,72 @@ impl LandingPipeline {
             span = span.started_at(started);
         }
         span
+    }
+
+    /// Round number for the `SemanticReview` span an APPROVE verdict closes.
+    ///
+    /// [`crate::span::record_phase_span`] dedups on `(task, phase, attempt)`,
+    /// and every bounded-correction round this pipeline dispatches already
+    /// writes its own `SemanticReview` span numbered from 1
+    /// ([`Self::route_rework`]'s `attempts_used + 1`,
+    /// [`Self::dispatch_held_conflict`]'s `attempt`). The same `entry.task`
+    /// persists across the correction/resubmit cycle, so a hardcoded `1` here
+    /// would silently no-op against the first round's "rework-requested" span
+    /// and leave the approval that actually landed the task with no durable
+    /// record at all — the task would read as terminally rework-requested,
+    /// exactly the telemetry gap this instrumentation exists to close.
+    ///
+    /// Derived from the durable dispatch markers those rounds number
+    /// themselves from, NOT from the spans already recorded. An APPROVE can be
+    /// re-routed from the verdict cache after a restart; counting spans would
+    /// make each replay pick the next free attempt and write a duplicate,
+    /// breaking the replay idempotency the rest of this instrumentation
+    /// depends on. The markers are settled by the time an approval reads them,
+    /// so every replay derives the same round.
+    fn approved_review_attempt(&self, entry: &LandingQueueEntry) -> u32 {
+        self.correction_rounds_used(entry)
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    /// Distinct bounded-correction rounds — review rework and conflict
+    /// correction alike — already dispatched for `entry`'s branch/target/task.
+    ///
+    /// Counted off the same durable markers and the same distinct-dispatch-key
+    /// rule [`Self::rework_attempts_used`] and [`Self::conflict_attempts_used`]
+    /// number their own rounds by, so an approval's round follows on from
+    /// whichever kind of round preceded it. Both marker payloads carry
+    /// `dispatch_key`/`branch`/`target`/`task`/`state`
+    /// (`ReworkContext::marker_payload`, `ConflictContext::marker_payload`),
+    /// so one filter serves both; keys are namespaced by identity because the
+    /// two kinds number independently and could otherwise coincide.
+    fn correction_rounds_used(&self, entry: &LandingQueueEntry) -> rk_core::Result<u32> {
+        let mut distinct: BTreeSet<String> = BTreeSet::new();
+        for identity in [REWORK_DISPATCH_IDENTITY, CONFLICT_DISPATCH_IDENTITY] {
+            let pattern = Pattern::category(Category::Event)
+                .identity(identity)
+                .scope(&entry.repo_name);
+            for marker in self.space.scan(&pattern)? {
+                let payload = &marker.payload;
+                let field = |key: &str| payload.get(key).and_then(Value::as_str);
+                if field("branch") != Some(entry.branch.as_str())
+                    || field("target") != Some(entry.target.as_str())
+                    || field("task") != Some(entry.task.as_str())
+                    || !matches!(field("state"), Some("dispatching" | "dispatched"))
+                {
+                    continue;
+                }
+                let key = field("dispatch_key").map(str::to_string).unwrap_or_else(|| {
+                    format!(
+                        "{}\0{}",
+                        field("head_sha").unwrap_or_default(),
+                        field("rework_ticket").unwrap_or_default()
+                    )
+                });
+                distinct.insert(format!("{identity}\0{key}"));
+            }
+        }
+        Ok(distinct.len() as u32)
     }
 
     /// File the ticket, then dispatch one exact-base correction or hold behind
@@ -10204,6 +10273,112 @@ workflow: {
             review_after_replay["duration_ms"], review_span["duration_ms"],
             "replay must not re-time the review span"
         );
+    }
+
+    /// The regression this pins: a task that goes through a REWORK round and
+    /// is then APPROVEd on resubmission must still record the approval that
+    /// actually landed it.
+    ///
+    /// `record_phase_span` dedups on `(task, phase, attempt)`, and `entry.task`
+    /// persists across the whole rework/resubmit cycle, so an APPROVE that
+    /// assumed it was always round 1 would silently no-op against the earlier
+    /// round's "rework-requested" `SemanticReview` span — leaving the task
+    /// permanently reading as terminally rework-requested with no record of
+    /// the approval at all, exactly the telemetry gap this instrumentation
+    /// exists to close.
+    ///
+    /// Both rounds are driven through the REAL routing path (`drain_key` ->
+    /// `route_rework`, then `drain_key` -> `route_verdict_prepared`), NOT a
+    /// hand-written `put_rework_marker`: the marker is what
+    /// `approved_review_attempt` counts the round from, so a hand-written one
+    /// would prove nothing about the collision this fixes.
+    #[tokio::test]
+    async fn approve_after_a_real_rework_round_records_its_own_review_span() {
+        let home = tempfile::tempdir().unwrap();
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+
+        let space = Space::open_in_memory().unwrap();
+        space.out(verdict_tuple(&head_sha, "REWORK")).unwrap();
+
+        let pipeline = test_pipeline(home.path(), space.clone());
+        pipeline
+            .enqueue(review_candidate_entry(repo_dir.path(), &head_sha))
+            .unwrap();
+
+        // Round 1: a genuine REWORK verdict, routed for real. This is what
+        // writes the attempt=1 `SemanticReview` span the approval below would
+        // otherwise collide with.
+        let reworked = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert!(
+            matches!(reworked.as_slice(), [LandingOutcome::ReworkFiled(_)]),
+            "expected a real REWORK round, got {reworked:?}"
+        );
+        assert_eq!(
+            rev_parse(repo_dir.path(), "main"),
+            main_before,
+            "a rework round must not land the branch"
+        );
+        let rework_round = crate::span::spans_for_task(&space, "code-repo", "add src")
+            .unwrap()
+            .into_iter()
+            .find(|s| s["phase"] == "semantic_review")
+            .expect("route_rework must record the round it closed");
+        assert_eq!(rework_round["terminal_reason"], "rework-requested");
+        assert_eq!(
+            rework_round["attempt"], 1,
+            "the first rework round numbers itself 1: {rework_round:?}"
+        );
+
+        // The correction lands on the reviewed branch and the same task is
+        // resubmitted — a fresh head, so a fresh review rather than a cache
+        // hit on the REWORK verdict above.
+        git(repo_dir.path(), &["checkout", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() { fixed() }\n").unwrap();
+        git(repo_dir.path(), &["add", "src.rs"]);
+        git(repo_dir.path(), &["commit", "-m", "fix: reviewer correction"]);
+        let corrected_head = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+        assert_ne!(corrected_head, head_sha);
+
+        space
+            .out(verdict_tuple(&corrected_head, "APPROVE"))
+            .unwrap();
+        pipeline
+            .enqueue(review_candidate_entry(repo_dir.path(), &corrected_head))
+            .unwrap();
+        let approved = pipeline.drain_key("code-repo", "main").await.unwrap();
+        assert!(
+            matches!(approved.as_slice(), [LandingOutcome::Landed(_)]),
+            "the corrected branch must land, got {approved:?}"
+        );
+
+        // The approval's own span survives alongside the rework round's
+        // instead of being dedup-dropped against it.
+        let review_spans: Vec<Value> = crate::span::spans_for_task(&space, "code-repo", "add src")
+            .unwrap()
+            .into_iter()
+            .filter(|s| s["phase"] == "semantic_review")
+            .collect();
+        assert_eq!(
+            review_spans.len(),
+            2,
+            "both review rounds must be recorded, not collapsed: {review_spans:?}"
+        );
+        let approval = review_spans
+            .iter()
+            .find(|s| s["terminal_reason"] == "approved")
+            .expect("the APPROVE that landed the task must record its own SemanticReview span");
+        assert_eq!(
+            approval["attempt"], 2,
+            "an approval after one rework round is round 2: {approval:?}"
+        );
+        assert_eq!(approval["authority"], "llm");
+        assert!(approval["started_at"].is_string(), "{approval:?}");
+        assert!(approval["ended_at"].is_string(), "{approval:?}");
+        let duration = approval["duration_ms"]
+            .as_i64()
+            .expect("the approval must carry a real duration_ms, not null");
+        assert!(duration >= 0, "{approval:?}");
     }
 
     /// The bug this fixes: a spawn refusal must leave the marker at a
