@@ -777,26 +777,29 @@ enum SweepAction {
 }
 
 /// Evidence [`Supervisor::gather_liveness_evidence`] found for one generation
-/// already silent past the stuck bar. A live verifier descendant or
-/// genuinely advancing bounded output [`proves_alive`](Self::proves_alive);
-/// a bare top-level process with neither ([`child_alive`](Self::child_alive)
-/// true but nothing under it, and nothing new said) is a truly wedged child,
-/// not proof of life — matching this feature's own title: it is active
-/// verifier DESCENDANTS being counted, not just the harness's own pid still
-/// technically existing. A reconnect loop vetoes the whole thing even when
-/// output looks like it is changing (a transport retry commonly logs its own
-/// error to stderr on every attempt).
+/// already silent past the stuck bar. A RECOGNIZED live verifier/build
+/// descendant (`rk`, `mise`, `cargo`, `rustc` — see
+/// [`crate::workflow_exec::is_verifier_command`]) or genuinely advancing
+/// bounded output [`proves_alive`](Self::proves_alive). `child_alive` alone
+/// does not: a live regression test caught an EARLIER, unclassified version
+/// of this check (any live descendant at all counts) excusing a genuinely
+/// wedged fake harness whose script's LAST command forked a plain `sleep` —
+/// indistinguishable from a real compiler descendant by process-tree
+/// PRESENCE alone, which is exactly why the descendant's own command is now
+/// checked, not just that one exists. A reconnect loop vetoes the whole
+/// thing even when output looks like it is changing (a transport retry
+/// commonly logs its own error to stderr on every attempt).
 #[derive(Debug, Clone, Copy, Default)]
 struct LivenessEvidence {
     child_alive: bool,
-    live_descendants: usize,
+    live_verifier_descendants: usize,
     output_progressed: bool,
     reconnect_loop: bool,
 }
 
 impl LivenessEvidence {
     fn proves_alive(&self) -> bool {
-        !self.reconnect_loop && (self.live_descendants > 0 || self.output_progressed)
+        !self.reconnect_loop && (self.live_verifier_descendants > 0 || self.output_progressed)
     }
 }
 
@@ -804,8 +807,8 @@ fn describe_stuck(idle_secs: u64, evidence: Option<&LivenessEvidence>) -> String
     match evidence {
         Some(e) => format!(
             "no events for {idle_secs}s while still running (child_alive={}, \
-             live_descendants={}, output_progressed={}, reconnect_loop={})",
-            e.child_alive, e.live_descendants, e.output_progressed, e.reconnect_loop
+             live_verifier_descendants={}, output_progressed={}, reconnect_loop={})",
+            e.child_alive, e.live_verifier_descendants, e.output_progressed, e.reconnect_loop
         ),
         None => format!("no events for {idle_secs}s while still running"),
     }
@@ -3804,7 +3807,7 @@ impl Supervisor {
             .map(crate::workflow_exec::process_liveness)
             .unwrap_or(crate::workflow_exec::ProcessLiveness {
                 child_alive: false,
-                live_descendants: 0,
+                live_verifier_descendants: 0,
             });
 
         let window = chrono::Duration::seconds(cfg.stuck_after_secs.max(1) as i64);
@@ -3820,7 +3823,7 @@ impl Supervisor {
 
         LivenessEvidence {
             child_alive: process.child_alive,
-            live_descendants: process.live_descendants,
+            live_verifier_descendants: process.live_verifier_descendants,
             output_progressed,
             reconnect_loop,
         }
@@ -8971,21 +8974,29 @@ mod stuck_liveness_tests {
     async fn long_silent_but_live_verifier_descendant_prevents_kill() {
         let home = tempfile::tempdir().unwrap();
         let s = sup(home.path());
-        let leader = kill_tree("sh", "sleep 300 & wait");
+        // Use a real long-lived executable whose basename is `cargo`, so the
+        // process-table classifier sees recognized build work without running
+        // Cargo recursively from this test. On macOS `ps ... comm=` reports
+        // the invoked executable path, including this copied basename.
+        let tools = tempfile::tempdir().unwrap();
+        let fake_cargo = tools.path().join("cargo");
+        std::fs::copy("/bin/sleep", &fake_cargo).unwrap();
+        let script = format!("\"{}\" 300 & wait", fake_cargo.display());
+        let leader = kill_tree("sh", &script);
         let pid = leader.0.id();
-        // The shell has not necessarily forked `sleep` yet the instant
+        // The shell has not necessarily forked the fake cargo yet the instant
         // `spawn()` returns — wait for the descendant to actually show up in
         // the process table before asserting on it, rather than racing a
         // fixed sleep against however fast `sh` itself schedules.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while crate::workflow_exec::process_liveness(pid).live_descendants == 0
+        while crate::workflow_exec::process_liveness(pid).live_verifier_descendants == 0
             && std::time::Instant::now() < deadline
         {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(
-            crate::workflow_exec::process_liveness(pid).live_descendants > 0,
-            "the backgrounded sleep must be a live descendant before this test proceeds"
+            crate::workflow_exec::process_liveness(pid).live_verifier_descendants > 0,
+            "the backgrounded fake cargo must be recognized before this test proceeds"
         );
 
         let base = Utc::now() - chrono::Duration::seconds(600);
