@@ -332,6 +332,114 @@ pub struct Registry {
     /// lands in the registry must not both admit against the same free slot.
     /// In-memory only, same rationale as `reserved`.
     wip_reservations: usize,
+    /// Outstanding per-`(repo, lane)` admission reservations taken by
+    /// [`try_reserve_lane_wip`](Registry::try_reserve_lane_wip) and not yet
+    /// resolved by [`release_lane_wip`](Registry::release_lane_wip). Same
+    /// TOCTOU-closing role as `wip_reservations`, but scoped to one repo's
+    /// one lane instead of the whole fleet, so one repository's implementation
+    /// burst can never register against another repository's — or against the
+    /// review lane's — count. Keyed by [`Lane::key`]. In-memory only, same
+    /// rationale as `reserved`.
+    lane_reservations: HashMap<String, usize>,
+    /// Durable path for [`lane_waiters`](Self::lane_waiters) —
+    /// `lane_waiters.json` beside `agents.json`.
+    lane_waiters_path: PathBuf,
+    /// Durably-recorded, FIFO-ordered waiters for a saturated lane, one entry
+    /// per distinct `(repo, lane, key)` currently refused admission. See
+    /// [`LaneWaiter`] and [`Registry::try_reserve_lane_wip`].
+    lane_waiters: Vec<LaneWaiter>,
+}
+
+/// One durably-recorded waiter for a saturated capacity lane
+/// (TKT-01M0P2KM83Y4MD5QYETR3JCKF2) — created the first time `key` is refused
+/// admission to `(repo, lane)`, cleared once that same key is finally
+/// admitted (or evicted as stale). `key` is a caller-supplied identifier for
+/// one logical unit of work (e.g. `workflow:<instance>:<task>` for a fan-out
+/// spawn, `<role>:<task>` for drain/operator dispatch) that stays stable
+/// across that caller's own retries — without that stability, a caller
+/// polling every few hundred milliseconds would mint a fresh queue entry on
+/// every attempt instead of holding its place in line. Persisted to
+/// `lane_waiters.json` (same atomic-write discipline as `agents.json`), so a
+/// daemon restart neither loses a waiter's place in line nor duplicates it:
+/// idempotent because insertion is keyed on `(repo, lane, key)` and a repeat
+/// insert is a no-op.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LaneWaiter {
+    repo: String,
+    lane_tag: String,
+    key: String,
+    /// When this waiter was FIRST refused — never updated again. What
+    /// [`Registry::lane_wait_stats`] reports as wait age: "how long has this
+    /// request been waiting", not "is it still alive".
+    requested_at: DateTime<Utc>,
+    /// Refreshed every time this SAME key is refused again (an active
+    /// retry) — what [`Registry::evict_stale_lane_waiters`] checks staleness
+    /// against, deliberately separate from `requested_at`: an actively
+    /// retrying waiter must keep its place in line no matter how long it has
+    /// been waiting in total, only an ABANDONED one (no retry seen in
+    /// [`LANE_WAIT_STALE_SECS`]) should ever be evicted.
+    last_seen: DateTime<Utc>,
+}
+
+/// How long a durably-recorded waiter may go without a retry before it is
+/// treated as abandoned (crashed caller, cancelled ticket, dismissed workflow
+/// instance) and evicted — otherwise a dead waiter that never returns to
+/// retry would permanently jam admission for every other waiter behind it,
+/// even once capacity is free. Checked against `last_seen`, not
+/// `requested_at` — see [`LaneWaiter`].
+const LANE_WAIT_STALE_SECS: i64 = 600;
+
+/// How often a still-queued waiter's `last_seen` heartbeat is actually
+/// written to disk. A caller commonly retries every ~250ms
+/// ([`crate::workflow_exec::FLEET_CAPACITY_POLL`]); persisting on every one
+/// of those retries would mean a disk write several times a second per
+/// waiting request. Throttling to once per this interval keeps the on-disk
+/// staleness clock accurate to within one interval of the truth — more than
+/// precise enough against a 10-minute eviction window — while bounding write
+/// volume to a small, constant rate regardless of retry frequency.
+const LANE_WAIT_HEARTBEAT_PERSIST_SECS: i64 = 60;
+
+const LANE_WAITERS_FILE: &str = "lane_waiters.json";
+
+/// Which capacity lane a spawn admits against
+/// (TKT-01M0P2KM83Y4MD5QYETR3JCKF2), distinct from the pre-existing
+/// fleet-wide `[drain] max_wip` ceiling ([`Registry::try_reserve_wip`]): that
+/// ceiling has no repo dimension at all, so one repository's implementation
+/// burst can exhaust it for every other repository. A lane reservation is
+/// always additionally scoped to one repository, and `Review` is a wholly
+/// separate counter from `Implementation` so a saturated implementation lane
+/// can never starve a reviewer's admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lane {
+    /// Every role except `"reviewer"` — drain, workflow fan-out, and operator
+    /// `agent.spawn` dispatch all admit against this.
+    Implementation,
+    /// `role == "reviewer"` only.
+    Review,
+}
+
+impl Lane {
+    /// The lane a spawn with this role admits against.
+    pub(crate) fn for_role(role: &str) -> Self {
+        if role == "reviewer" {
+            Lane::Review
+        } else {
+            Lane::Implementation
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Lane::Implementation => "implementation",
+            Lane::Review => "review",
+        }
+    }
+
+    /// NUL can't appear in a repo name, so this is an unambiguous joiner —
+    /// same convention as `supervisor::MergeQueue::key`.
+    fn key(self, repo: &str) -> String {
+        format!("{repo}\u{0}{}", self.tag())
+    }
 }
 
 impl Registry {
@@ -349,6 +457,13 @@ impl Registry {
         } else {
             Vec::new()
         };
+        let lane_waiters_path = path.with_file_name(LANE_WAITERS_FILE);
+        let lane_waiters: Vec<LaneWaiter> = if lane_waiters_path.exists() {
+            let data = std::fs::read_to_string(&lane_waiters_path)?;
+            serde_json::from_str(&data)?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             path: path.to_path_buf(),
             archive_path,
@@ -356,6 +471,9 @@ impl Registry {
             archived,
             reserved: HashSet::new(),
             wip_reservations: 0,
+            lane_reservations: HashMap::new(),
+            lane_waiters_path,
+            lane_waiters,
         })
     }
 
@@ -440,6 +558,213 @@ impl Registry {
             return;
         }
         self.wip_reservations = self.wip_reservations.saturating_sub(1);
+    }
+
+    /// Live rows plus outstanding reservations for one `(repo, lane)` pair —
+    /// what [`try_reserve_lane_wip`](Registry::try_reserve_lane_wip) checks a
+    /// cap against. Scoped by `record.repo_name` and, within that repo, by
+    /// whether the role matches the lane ([`Lane::for_role`]), so this can
+    /// never be inflated by another repository's agents or by the other lane's.
+    pub(crate) fn live_or_reserved_lane_wip(&self, repo: &str, lane: Lane) -> usize {
+        self.agents
+            .values()
+            .filter(|r| r.repo_name == repo && r.state.is_live() && Lane::for_role(&r.role) == lane)
+            .count()
+            + self
+                .lane_reservations
+                .get(&lane.key(repo))
+                .copied()
+                .unwrap_or(0)
+    }
+
+    /// Atomically check one repository's lane ceiling AND its durable FIFO
+    /// wait queue, and reserve one slot, in the same critical section — same
+    /// atomicity contract as [`try_reserve_wip`](Registry::try_reserve_wip)
+    /// (always called with the registry lock held, from inside
+    /// [`Supervisor::spawn`](crate::supervisor::Supervisor::spawn)), but scoped
+    /// to `(repo, lane)` instead of the whole fleet. `cap == 0` means this
+    /// lane is unbounded for `repo` — always admits, reserves nothing, and
+    /// never touches the wait queue.
+    ///
+    /// `key` identifies the caller's own logical request (stable across ITS
+    /// OWN retries — see [`LaneWaiter`]). A free slot admits immediately when
+    /// the wait queue for `(repo, lane)` is empty or `key` is already at its
+    /// head (this caller has been waiting longest); otherwise it is held for
+    /// whoever IS at the head, and this call is refused and durably queued
+    /// behind them — real FIFO admission order, not just FIFO reporting,
+    /// enforced for free by reusing the one lock every admission decision
+    /// already serializes on.
+    ///
+    /// Every path that calls this with `cap != 0` and gets back `true` must
+    /// eventually call [`release_lane_wip`](Registry::release_lane_wip) with
+    /// the same `repo`/`lane`/`cap` exactly once, mirroring `try_reserve_wip`'s
+    /// contract.
+    pub(crate) fn try_reserve_lane_wip(
+        &mut self,
+        repo: &str,
+        lane: Lane,
+        cap: usize,
+        key: &str,
+    ) -> bool {
+        if cap == 0 {
+            return true;
+        }
+        self.evict_stale_lane_waiters(repo, lane);
+        let blocked_behind_someone_else = self
+            .lane_waiters
+            .iter()
+            .find(|w| w.repo == repo && w.lane_tag == lane.tag())
+            .is_some_and(|head| head.key != key);
+        if blocked_behind_someone_else || self.live_or_reserved_lane_wip(repo, lane) >= cap {
+            self.record_lane_wait(repo, lane, key);
+            return false;
+        }
+        // Fail CLOSED, not open, if this admission's matching queue-clear
+        // cannot be made durable: admitting anyway while the on-disk queue
+        // still names `key` as (or near) the head risks a phantom waiter
+        // that outlives its own admission, wrongly blocking every real
+        // waiter behind it until it ages out after `LANE_WAIT_STALE_SECS`.
+        // Refusing here costs this one attempt (the in-memory queue is
+        // untouched, so the very next retry gets an identical, correct
+        // decision) — a bounded cost, unlike silently violating the
+        // durable-ordering claim this whole mechanism exists to make.
+        if let Err(e) = self.clear_lane_wait(repo, lane, key) {
+            tracing::error!(
+                repo,
+                lane = lane.tag(),
+                key,
+                error = %e,
+                "refusing admission: could not durably clear this waiter's lane_waiters.json \
+                 record"
+            );
+            return false;
+        }
+        *self.lane_reservations.entry(lane.key(repo)).or_insert(0) += 1;
+        true
+    }
+
+    /// Release a reservation taken by
+    /// [`try_reserve_lane_wip`](Registry::try_reserve_lane_wip). `repo`/`lane`/
+    /// `cap` must match the paired call (`cap == 0` reserved nothing, so
+    /// releases nothing).
+    pub(crate) fn release_lane_wip(&mut self, repo: &str, lane: Lane, cap: usize) {
+        if cap == 0 {
+            return;
+        }
+        if let Some(count) = self.lane_reservations.get_mut(&lane.key(repo)) {
+            *count = count.saturating_sub(1);
+        }
+    }
+
+    /// Durably record that `key` was refused admission to `(repo, lane)`. A
+    /// repeat refusal for a key already queued is treated as a liveness
+    /// heartbeat: `last_seen` is refreshed (in memory always; on disk at most
+    /// once every [`LANE_WAIT_HEARTBEAT_PERSIST_SECS`], to bound write volume
+    /// under a caller that retries every ~250ms) instead of minting a second
+    /// entry — the idempotence the durable-queue contract requires. A write
+    /// failure here is logged but does not change this call's own outcome:
+    /// the refusal was already correct regardless of durability, and the
+    /// in-memory queue (which the very next admission decision reads) is
+    /// unaffected either way — only cross-restart durability is at risk,
+    /// which the log line surfaces rather than swallows.
+    fn record_lane_wait(&mut self, repo: &str, lane: Lane, key: &str) {
+        let now = Utc::now();
+        let mut should_persist = false;
+        let mut already_queued = false;
+        if let Some(existing) = self
+            .lane_waiters
+            .iter_mut()
+            .find(|w| w.repo == repo && w.lane_tag == lane.tag() && w.key == key)
+        {
+            already_queued = true;
+            should_persist =
+                (now - existing.last_seen).num_seconds() >= LANE_WAIT_HEARTBEAT_PERSIST_SECS;
+            existing.last_seen = now;
+        }
+        if !already_queued {
+            self.lane_waiters.push(LaneWaiter {
+                repo: repo.to_string(),
+                lane_tag: lane.tag().to_string(),
+                key: key.to_string(),
+                requested_at: now,
+                last_seen: now,
+            });
+            should_persist = true;
+        }
+        if should_persist {
+            if let Err(e) = self.persist_lane_waiters() {
+                tracing::error!(
+                    repo, lane = lane.tag(), key, error = %e,
+                    "failed to persist a lane wait record; this waiter's queue position will \
+                     not survive a restart until the next successful write"
+                );
+            }
+        }
+    }
+
+    /// Clear `key`'s durable wait record for `(repo, lane)`, if any — a no-op
+    /// (and cheap: no write, `Ok`) for the common case of a spawn admitted on
+    /// its first attempt, which was never queued at all. Propagates a write
+    /// failure to the caller rather than swallowing it: see
+    /// [`try_reserve_lane_wip`](Self::try_reserve_lane_wip)'s fail-closed
+    /// handling of this specific error.
+    fn clear_lane_wait(&mut self, repo: &str, lane: Lane, key: &str) -> rk_core::Result<()> {
+        let before = self.lane_waiters.len();
+        self.lane_waiters
+            .retain(|w| !(w.repo == repo && w.lane_tag == lane.tag() && w.key == key));
+        if self.lane_waiters.len() != before {
+            self.persist_lane_waiters()?;
+        }
+        Ok(())
+    }
+
+    /// Evict any waiter on `(repo, lane)` that has gone [`LANE_WAIT_STALE_SECS`]
+    /// without a retry (`last_seen`, not `requested_at` — an actively
+    /// retrying waiter keeps its place no matter how long it has waited in
+    /// total) — an abandoned caller (crashed, ticket cancelled, workflow
+    /// instance dismissed) that will never retry again must not permanently
+    /// jam admission for everyone behind it.
+    fn evict_stale_lane_waiters(&mut self, repo: &str, lane: Lane) {
+        let now = Utc::now();
+        let before = self.lane_waiters.len();
+        self.lane_waiters.retain(|w| {
+            !(w.repo == repo
+                && w.lane_tag == lane.tag()
+                && (now - w.last_seen).num_seconds() > LANE_WAIT_STALE_SECS)
+        });
+        if self.lane_waiters.len() != before {
+            if let Err(e) = self.persist_lane_waiters() {
+                tracing::error!(
+                    repo, lane = lane.tag(), error = %e,
+                    "failed to persist lane_waiters.json after evicting stale waiters"
+                );
+            }
+        }
+    }
+
+    /// How many distinct requests are currently durably waiting on `(repo,
+    /// lane)`, and the age in seconds of the oldest one — what
+    /// `Supervisor::capacity_summary` surfaces as `waiting_count`/
+    /// `oldest_wait_secs` for `rk top`/`rk status`/`rk digest`.
+    pub(crate) fn lane_wait_stats(&self, repo: &str, lane: Lane) -> (usize, Option<i64>) {
+        let now = Utc::now();
+        let mut count = 0usize;
+        let mut oldest_secs: Option<i64> = None;
+        for w in &self.lane_waiters {
+            if w.repo == repo && w.lane_tag == lane.tag() {
+                count += 1;
+                let age = (now - w.requested_at).num_seconds().max(0);
+                oldest_secs = Some(oldest_secs.map_or(age, |o: i64| o.max(age)));
+            }
+        }
+        (count, oldest_secs)
+    }
+
+    fn persist_lane_waiters(&self) -> rk_core::Result<()> {
+        write_atomic(
+            &self.lane_waiters_path,
+            &serde_json::to_vec_pretty(&self.lane_waiters)?,
+        )
     }
 
     /// Mark all live agents orphaned (called once at daemon startup).

@@ -352,6 +352,24 @@ impl Daemon {
                 .into_iter()
                 .collect(),
         );
+        daemon.supervisor.set_implementation_admission_limits(
+            config.policy.implementation_admission_limit,
+            config
+                .policy
+                .implementation_admission_limit_by_repo
+                .clone()
+                .into_iter()
+                .collect(),
+        );
+        daemon.supervisor.set_review_admission_limits(
+            config.policy.review_admission_limit,
+            config
+                .policy
+                .review_admission_limit_by_repo
+                .clone()
+                .into_iter()
+                .collect(),
+        );
         daemon
             .supervisor
             .set_done_kill_grace_secs(config.supervisor.done_kill_grace_secs);
@@ -497,6 +515,47 @@ impl Daemon {
     #[doc(hidden)]
     pub fn set_shared_cargo_target(&self, enabled: bool) {
         self.supervisor.set_shared_cargo_target(enabled);
+    }
+
+    /// Test-only hook mirroring `set_min_free_disk_gb`: `Daemon::new_in_memory`
+    /// bypasses the `config.policy.*` wiring `Daemon::new` does, so a test
+    /// needing a non-default implementation-lane cap sets it directly.
+    #[doc(hidden)]
+    pub fn set_implementation_admission_limits(
+        &self,
+        default_limit: u32,
+        overrides: std::collections::HashMap<String, u32>,
+    ) {
+        self.supervisor
+            .set_implementation_admission_limits(default_limit, overrides);
+    }
+
+    /// Test-only hook, same rationale as
+    /// [`set_implementation_admission_limits`](Self::set_implementation_admission_limits).
+    #[doc(hidden)]
+    pub fn set_review_admission_limits(
+        &self,
+        default_limit: u32,
+        overrides: std::collections::HashMap<String, u32>,
+    ) {
+        self.supervisor
+            .set_review_admission_limits(default_limit, overrides);
+    }
+
+    /// Test-only hook, same rationale as
+    /// [`set_implementation_admission_limits`](Self::set_implementation_admission_limits):
+    /// `Daemon::with_space_for_tests`/`new_in_memory` bypass `Daemon::new`'s
+    /// `config.policy.verification_admission_limit*` wiring, so an
+    /// integration test driving a real `verify.run` concurrently with the
+    /// implementation/review lanes needs to configure it directly.
+    #[doc(hidden)]
+    pub fn set_verification_admission_limits(
+        &self,
+        default_limit: u32,
+        overrides: std::collections::HashMap<String, u32>,
+    ) {
+        self.supervisor
+            .set_verification_admission_limits(default_limit, overrides);
     }
 
     #[doc(hidden)]
@@ -7842,6 +7901,10 @@ impl Daemon {
             // without this a slowly-draining queue and a wedged one are
             // indistinguishable from the outside (probe O18).
             "landing_queue": crate::landing::landing_queue_summary(&self.space),
+            // Per-repo configured capacity/occupancy/waiting-reason for the
+            // implementation, review, and verification lanes
+            // (TKT-01M0P2KM83Y4MD5QYETR3JCKF2) — see `Supervisor::capacity_summary`.
+            "capacity": self.supervisor.capacity_summary(),
         })
     }
 }

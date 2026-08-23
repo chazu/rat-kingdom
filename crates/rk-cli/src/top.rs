@@ -135,10 +135,13 @@ fn draw_header(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         .iter()
         .filter(|a| matches!(a["state"].as_str(), Some("spawning" | "running")))
         .count();
+    let lanes = capacity_summary(snap)
+        .map(|s| format!("{s} · "))
+        .unwrap_or_default();
     let line = Line::from(vec![
         Span::styled("rk top ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!(
-            "castle {} · up {} · {} tuples · {} agents ({} live) · fleet {} · {} · ",
+            "castle {} · up {} · {} tuples · {} agents ({} live) · fleet {} · {} · {}",
             snap.status["castle"].as_str().unwrap_or("?"),
             human_secs(snap.status["uptime_secs"].as_u64().unwrap_or(0)),
             snap.status["tuples"].as_u64().unwrap_or(0),
@@ -146,6 +149,7 @@ fn draw_header(frame: &mut Frame, area: Rect, snap: &Snapshot) {
             live,
             spend,
             landing_queue_summary(snap),
+            lanes,
         )),
         Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" quit · "),
@@ -172,6 +176,53 @@ fn landing_queue_summary(snap: &Snapshot) -> String {
         .unwrap_or(0)
         .max(0) as u64;
     format!("landing {depth} queued (oldest {})", human_secs(oldest))
+}
+
+/// `lanes ok` / `lanes rat-kingdom:impl 2/2, grmpl:review 1/1` — repos
+/// currently at capacity on any lane (TKT-01M0P2KM83Y4MD5QYETR3JCKF2), so a
+/// saturated lane reads as an at-a-glance reason a spawn is waiting instead of
+/// requiring a separate `status` call. Silent when nothing is at capacity —
+/// most fleets run with lanes disabled (limit 0) or comfortably under, and a
+/// permanently-present "lanes ok" would just be noise on every refresh.
+fn capacity_summary(snap: &Snapshot) -> Option<String> {
+    let capacity = snap.status["capacity"].as_object()?;
+    let mut saturated: Vec<String> = Vec::new();
+    for (repo, lanes) in capacity {
+        for lane in ["implementation", "review", "verification"] {
+            let Some(entry) = lanes.get(lane) else {
+                continue;
+            };
+            if entry["waiting_reason"].is_string() {
+                let occupied = entry["occupied"]
+                    .as_u64()
+                    .or_else(|| entry["in_flight"].as_u64())
+                    .unwrap_or(0);
+                let limit = entry["limit"].as_u64().unwrap_or(0);
+                let short = match lane {
+                    "implementation" => "impl",
+                    "verification" => "verify",
+                    other => other,
+                };
+                // Durable FIFO wait-queue depth/age (implementation + review
+                // lanes only — see `Supervisor::capacity_summary`).
+                let waiting = match (
+                    entry["waiting_count"].as_u64(),
+                    entry["oldest_wait_secs"].as_i64(),
+                ) {
+                    (Some(n), Some(age)) if n > 0 => {
+                        format!(" [{n} waiting, oldest {}]", human_secs(age.max(0) as u64))
+                    }
+                    _ => String::new(),
+                };
+                saturated.push(format!("{repo}:{short} {occupied}/{limit}{waiting}"));
+            }
+        }
+    }
+    if saturated.is_empty() {
+        None
+    } else {
+        Some(format!("lanes {}", saturated.join(", ")))
+    }
 }
 
 fn draw_agents(frame: &mut Frame, area: Rect, snap: &Snapshot) {

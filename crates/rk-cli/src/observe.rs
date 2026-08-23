@@ -105,11 +105,17 @@ pub async fn digest(layout: &Layout, since: &str, llm: bool, as_json: bool) -> R
         .as_array()
         .cloned()
         .unwrap_or_default();
+    // Current lane capacity is a live snapshot, not a `since`-windowed event
+    // count like everything else `build_digest` groups — so it rides along
+    // separately rather than joining that pure function's signature.
+    let capacity = client.call("status", json!({})).await?["capacity"].clone();
 
     let digest = build_digest(
         since, cutoff, &events, &obstacles, &needs, &instances, &rollup, &inbox,
     );
     if as_json {
+        let mut digest = digest;
+        digest["capacity"] = capacity;
         println!("{digest}");
         return Ok(());
     }
@@ -124,7 +130,51 @@ pub async fn digest(layout: &Layout, since: &str, llm: bool, as_json: bool) -> R
         }
     }
     println!("{report}");
+    print_capacity_section(&capacity);
     Ok(())
+}
+
+/// Repos currently at capacity on any lane (TKT-01M0P2KM83Y4MD5QYETR3JCKF2) —
+/// the reason a drain/fan-out/operator spawn would be waiting right now.
+/// Silent when nothing is saturated, same reasoning as `rk top`'s equivalent.
+fn print_capacity_section(capacity: &Value) {
+    let Some(repos) = capacity.as_object() else {
+        return;
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for (repo, lanes) in repos {
+        for lane in ["implementation", "review", "verification"] {
+            let Some(entry) = lanes.get(lane) else {
+                continue;
+            };
+            if let Some(reason) = entry["waiting_reason"].as_str() {
+                let occupied = entry["occupied"]
+                    .as_u64()
+                    .or_else(|| entry["in_flight"].as_u64())
+                    .unwrap_or(0);
+                let limit = entry["limit"].as_u64().unwrap_or(0);
+                let queue = match (
+                    entry["waiting_count"].as_u64(),
+                    entry["oldest_wait_secs"].as_i64(),
+                ) {
+                    (Some(n), Some(age)) if n > 0 => format!(
+                        ", {n} waiting (oldest {})",
+                        crate::top::human_secs(age.max(0) as u64)
+                    ),
+                    _ => String::new(),
+                };
+                lines.push(format!(
+                    "  {repo} {lane}: {occupied}/{limit} ({reason}){queue}"
+                ));
+            }
+        }
+    }
+    if !lines.is_empty() {
+        println!("\ncapacity (waiting):");
+        for line in lines {
+            println!("{line}");
+        }
+    }
 }
 
 async fn scan_category(client: &mut Client, category: &str) -> Result<Vec<Value>> {
