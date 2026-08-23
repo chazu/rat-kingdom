@@ -238,6 +238,21 @@ struct SettledAttempt {
     verdict: &'static str,
 }
 
+/// One check's admission-relevant outcome, bundled so
+/// [`record_verification_admission_event`](WorkflowEngine::record_verification_admission_event)
+/// stays under the clippy `too_many_arguments` threshold without an
+/// `#[allow]` (continuation of TKT-01M0P5NM51SKT5ABXRCDZD07J3) — see that
+/// method for what each field means.
+struct VerificationAdmissionOutcome<'a> {
+    repo: &'a str,
+    agent: &'a str,
+    command: &'a str,
+    queue_wait_ms: Option<u64>,
+    duration: Duration,
+    exit: i64,
+    verdict: &'a str,
+}
+
 /// Decode a `spawn_check_child` outcome into the flat tuple `run_check_in`
 /// tracks. Factored out so a retried outcome (the shared cargo target-dir
 /// contention retry, and the initial attempt) decode identically.
@@ -3518,15 +3533,15 @@ impl WorkflowEngine {
                     stderr_truncated,
                     &history,
                 );
-                self.record_verification_admission_event(
+                self.record_verification_admission_event(VerificationAdmissionOutcome {
                     repo,
                     agent,
                     command,
-                    admission_queue_wait_ms,
-                    run_started.elapsed(),
+                    queue_wait_ms: admission_queue_wait_ms,
+                    duration: run_started.elapsed(),
                     exit,
                     verdict,
-                );
+                });
                 return Err(rk_core::Error::other(stderr));
             }
             if verdict == "pass" || attempt == attempts {
@@ -3585,15 +3600,15 @@ impl WorkflowEngine {
             result["retries"] = json!(history);
         }
 
-        self.record_verification_admission_event(
+        self.record_verification_admission_event(VerificationAdmissionOutcome {
             repo,
             agent,
             command,
-            admission_queue_wait_ms,
-            run_started.elapsed(),
+            queue_wait_ms: admission_queue_wait_ms,
+            duration: run_started.elapsed(),
             exit,
             verdict,
-        );
+        });
 
         // A non-"pass" verdict is a gate that said no (or never finished).
         // Persist a durable, bounded record of what it said BEFORE a following
@@ -3790,33 +3805,34 @@ impl WorkflowEngine {
     /// own admission block). Written unconditionally otherwise, whatever the
     /// verdict: an operator diagnosing contention needs the failed/timed-out
     /// runs' timing as much as the passing ones'.
-    fn record_verification_admission_event(
-        &self,
-        repo: &str,
-        agent: &str,
-        command: &str,
-        queue_wait_ms: Option<u64>,
-        duration: Duration,
-        exit: i64,
-        verdict: &str,
-    ) {
-        let Some(queue_wait_ms) = queue_wait_ms else {
+    ///
+    /// Scoped by [`Supervisor::verification_repo_identity`] — the SAME
+    /// resolution [`run_check_in`](Self::run_check_in) used to key the
+    /// admission permit itself (continuation of TKT-01M0P5NM51SKT5ABXRCDZD07J3)
+    /// — rather than [`repo_name_of`]'s directory basename. Before this, the
+    /// event's scope and the semaphore's key could disagree: a workflow `run`
+    /// step's absolute repo path admitted against one bound while its event
+    /// logged under a basename that happened to look identical to a landing
+    /// gate's bare name, so the log read as unified even when execution was
+    /// split across two independent semaphores.
+    fn record_verification_admission_event(&self, outcome: VerificationAdmissionOutcome<'_>) {
+        let Some(queue_wait_ms) = outcome.queue_wait_ms else {
             return;
         };
-        let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        let duration_ms = u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX);
         let _ = self.space.out(
             Tuple::new(
                 Category::Event,
-                repo_name_of(repo),
+                self.supervisor.verification_repo_identity(outcome.repo),
                 VERIFICATION_ADMISSION_IDENTITY,
                 "daemon",
                 json!({
-                    "agent": agent,
-                    "command": command,
+                    "agent": outcome.agent,
+                    "command": outcome.command,
                     "queue_wait_ms": queue_wait_ms,
                     "duration_ms": duration_ms,
-                    "exit": exit,
-                    "verdict": verdict,
+                    "exit": outcome.exit,
+                    "verdict": outcome.verdict,
                 }),
             )
             .with_lifecycle(Lifecycle::Furniture),
@@ -6995,6 +7011,115 @@ test a::flaky ... FAILED
             verify_saw.trim(),
             "no",
             "verify.run must never observe the landing gate's marker for the same reason"
+        );
+    }
+
+    /// The continuation's required cross-shape proof
+    /// (TKT-01M0P5NM51SKT5ABXRCDZD07J3): a workflow `run` step / reactor
+    /// dispatch reaches `run_check_in` with the repo's absolute,
+    /// already-canonicalized checkout PATH, while a landing gate /
+    /// `verify.run` reaches it with the repo's bare registered NAME. Register
+    /// one repo under both identities and show the two shapes contend for the
+    /// SAME admission permit, not two — via
+    /// `Supervisor::verification_repo_identity`'s path-to-registered-name
+    /// resolution — using the identical marker-file technique as
+    /// `landing_gate_and_verify_run_share_one_admission_bound_for_the_same_repo_name`.
+    #[tokio::test]
+    async fn workflow_path_shape_and_landing_name_shape_share_one_admission_bound_for_the_same_registered_repo(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        engine
+            .supervisor
+            .set_verification_admission_limits(1, HashMap::new());
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_name = "acme-cross-shape";
+        {
+            let mut registry =
+                crate::repos::RepoRegistry::load(&home.path().join("repos.json")).unwrap();
+            registry
+                .add(crate::repos::RepoRecord {
+                    name: repo_name.into(),
+                    path: repo_dir.path().to_path_buf(),
+                    created_at: Utc::now(),
+                    merge_mode: Default::default(),
+                    remote: None,
+                    host: None,
+                    activated_policy: None,
+                })
+                .unwrap();
+        }
+        let repo_path = repo_dir.path().display().to_string();
+
+        let shared = tempfile::tempdir().unwrap();
+        let shared_path = shared.path().display().to_string();
+
+        // The "workflow run step / reactor dispatch" side: `run_check_in`
+        // called with the repo's absolute PATH, exactly matching what
+        // `instance.repo`/`record.path` carry.
+        let path_resolved = ResolvedRun {
+            command: format!(
+                "touch '{shared_path}/path-marker'; sleep 0.3; \
+                 if [ -f '{shared_path}/name-marker' ]; then echo yes; else echo no; fi \
+                 > '{shared_path}/path-saw'; rm -f '{shared_path}/path-marker'"
+            ),
+            cwd: None,
+            expect_exit: None,
+            timeout: "5s".into(),
+            on_timeout: OnTimeout::Fail,
+            environment_policy: rk_workflow::CheckEnvironmentPolicy::StripRkSpawn,
+            retry_on_fail: 0,
+            shared_cargo_target: true,
+        };
+        let path_dir = tempfile::tempdir().unwrap();
+
+        // The "landing gate / verify.run" side: through `verify_repo_check`,
+        // called with the repo's bare registered NAME, starting shortly
+        // after the path side so it would see the path side's marker if the
+        // two were NOT serialized against each other.
+        let name_dir = tempfile::tempdir().unwrap();
+        write_check(
+            name_dir.path(),
+            "verify",
+            &format!(
+                "sleep 0.05; touch '{shared_path}/name-marker'; \
+                 if [ -f '{shared_path}/path-marker' ]; then echo yes; else echo no; fi \
+                 > '{shared_path}/name-saw'; rm -f '{shared_path}/name-marker'"
+            ),
+            true,
+        );
+
+        let path_side = engine.run_check_in(
+            "inst-path",
+            &repo_path,
+            "daemon",
+            path_dir.path(),
+            &path_resolved.command,
+            &path_resolved,
+            &[],
+            Duration::from_secs(5),
+            None,
+        );
+        let name_side = engine.verify_repo_check("agent", name_dir.path(), repo_name, "verify");
+        let (path_result, name_result) = tokio::join!(path_side, name_side);
+        path_result.unwrap();
+        name_result.unwrap();
+
+        let path_saw = std::fs::read_to_string(shared.path().join("path-saw")).unwrap_or_default();
+        let name_saw = std::fs::read_to_string(shared.path().join("name-saw")).unwrap_or_default();
+        assert_eq!(
+            path_saw.trim(),
+            "no",
+            "the path-shaped caller must never observe the name-shaped caller's marker: a \
+             shared bound means the name side cannot even start its child process until the \
+             path side's whole run_check_in call (marker removal included) has returned"
+        );
+        assert_eq!(
+            name_saw.trim(),
+            "no",
+            "the name-shaped caller must never observe the path-shaped caller's marker for the \
+             same reason"
         );
     }
 

@@ -1165,7 +1165,8 @@ impl Supervisor {
     /// queue-wait/execution timing at all before calling
     /// [`acquire_verification_admission`](Self::acquire_verification_admission).
     pub(crate) fn verification_admission_limit_for(&self, repo: &str) -> u32 {
-        self.verification_admission.limit_for(repo)
+        self.verification_admission
+            .limit_for(&self.verification_repo_identity(repo))
     }
 
     /// Acquire one bounded per-repo verification admission permit for `repo`.
@@ -1176,7 +1177,42 @@ impl Supervisor {
         repo: &str,
         limit: u32,
     ) -> Option<(tokio::sync::OwnedSemaphorePermit, std::time::Duration)> {
-        self.verification_admission.acquire(repo, limit).await
+        self.verification_admission
+            .acquire(&self.verification_repo_identity(repo), limit)
+            .await
+    }
+
+    /// Normalize `repo` — whatever shape reached
+    /// [`WorkflowEngine::run_check_in`](crate::workflow_exec::WorkflowEngine::run_check_in)
+    /// — to the one stable identity every [`VerificationAdmission`] bound,
+    /// and the durable event recording it, must agree on (continuation of
+    /// TKT-01M0HNESEECWWFQF8X6VH1XSJ6). Four call paths reach `run_check_in`
+    /// with two different shapes: a workflow `run` step or reactor dispatch
+    /// passes the repo's absolute, already-canonicalized checkout PATH
+    /// (`instance.repo` / the registry's own `record.path`); a landing gate
+    /// or `verify.run` passes its already-registered bare NAME
+    /// (`entry.repo_name` / `VerifyRunParams.repo`). An absolute path is
+    /// resolved here to its registered NAME via the repo registry —
+    /// deliberately NOT to its directory basename (contrast
+    /// `crate::workflow_exec::repo_name_of`): two independently registered
+    /// repos can share a directory basename, so keying on basename would
+    /// collide two distinct admission bounds into one. A path with no
+    /// registry match, or a string that was already a bare name, is returned
+    /// unchanged — a bare name is already the stable identity
+    /// landing/`verify.run` use, and an unregistered path has no name to
+    /// resolve to.
+    pub(crate) fn verification_repo_identity(&self, repo: &str) -> String {
+        let path = std::path::Path::new(repo);
+        if path.is_absolute() {
+            if let Ok(registry) =
+                crate::repos::RepoRegistry::load(&self.layout.home().join("repos.json"))
+            {
+                if let Some(record) = registry.get_by_path(path) {
+                    return record.name.clone();
+                }
+            }
+        }
+        repo.to_string()
     }
 
     /// Pause or resume new-agent admission ([`spawn`](Self::spawn)). Used by
@@ -7489,6 +7525,100 @@ mod verification_admission_tests {
         .expect(
             "a fresh Supervisor must start with a full complement of permits, unaffected by a predecessor's leaked one",
         )
+        .unwrap();
+    }
+
+    /// Register one repo under `home/repos.json`, standing in for
+    /// `handle_repo_add`'s already-canonicalized-path effect.
+    fn register_repo(home: &Path, name: &str, path: &Path) {
+        let mut registry = crate::repos::RepoRegistry::load(&home.join("repos.json")).unwrap();
+        registry
+            .add(crate::repos::RepoRecord {
+                name: name.into(),
+                path: path.to_path_buf(),
+                created_at: Utc::now(),
+                merge_mode: Default::default(),
+                remote: None,
+                host: None,
+                activated_policy: None,
+            })
+            .unwrap();
+    }
+
+    /// The resolution [`Supervisor::verification_admission_limit_for`],
+    /// [`Supervisor::acquire_verification_admission`], and
+    /// `record_verification_admission_event` (`crate::workflow_exec`) all go
+    /// through (continuation of TKT-01M0P5NM51SKT5ABXRCDZD07J3): a registered
+    /// repo's absolute path resolves to its registered NAME, matching what a
+    /// landing gate/`verify.run` already pass directly.
+    #[tokio::test]
+    async fn verification_repo_identity_resolves_a_registered_path_to_its_name() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        register_repo(home.path(), "acme", repo_dir.path());
+        let s = sup(home.path());
+
+        assert_eq!(
+            s.verification_repo_identity(&repo_dir.path().display().to_string()),
+            "acme"
+        );
+    }
+
+    /// An absolute path with no registry match, and a string that was already
+    /// a bare name, both pass through unchanged — there is nothing to
+    /// resolve an unregistered path to, and a bare name is already the
+    /// stable identity landing/`verify.run` use.
+    #[tokio::test]
+    async fn verification_repo_identity_leaves_unregistered_paths_and_bare_names_unchanged() {
+        let home = tempfile::tempdir().unwrap();
+        let s = sup(home.path());
+
+        assert_eq!(
+            s.verification_repo_identity("some-bare-name"),
+            "some-bare-name"
+        );
+        assert_eq!(
+            s.verification_repo_identity("/no/such/registered/repo"),
+            "/no/such/registered/repo"
+        );
+    }
+
+    /// The acceptance property basename-keying would have broken: two
+    /// INDEPENDENTLY registered repos that merely happen to share a
+    /// directory basename must never collide into one admission bound.
+    #[tokio::test]
+    async fn verification_repo_identity_does_not_collide_two_repos_sharing_a_directory_basename() {
+        let home = tempfile::tempdir().unwrap();
+        let parent_a = tempfile::tempdir().unwrap();
+        let parent_b = tempfile::tempdir().unwrap();
+        let repo_a = parent_a.path().join("backend");
+        let repo_b = parent_b.path().join("backend");
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::create_dir_all(&repo_b).unwrap();
+        register_repo(home.path(), "team-a-backend", &repo_a);
+        register_repo(home.path(), "team-b-backend", &repo_b);
+        let s = sup(home.path());
+
+        assert_eq!(
+            s.verification_repo_identity(&repo_a.display().to_string()),
+            "team-a-backend"
+        );
+        assert_eq!(
+            s.verification_repo_identity(&repo_b.display().to_string()),
+            "team-b-backend"
+        );
+
+        s.set_verification_admission_limits(1, HashMap::new());
+        let (_a, _wait) = s
+            .acquire_verification_admission(&repo_a.display().to_string(), 1)
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_millis(100),
+            s.acquire_verification_admission(&repo_b.display().to_string(), 1),
+        )
+        .await
+        .expect("two repos sharing a directory basename must not share an admission bound")
         .unwrap();
     }
 }
