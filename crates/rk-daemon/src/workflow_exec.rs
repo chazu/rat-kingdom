@@ -6876,21 +6876,26 @@ test a::flaky ... FAILED
         let _ = decoy.wait().await;
     }
 
-    /// Poll `ps`'s own `comm=` column for `pid` until it stops reading
-    /// `sh` — i.e. until a tail-call exec has actually landed — rather than
-    /// racing sh's own, unspecified timing for when it inlines a single
-    /// simple command. Used by the two tests below so neither one is a coin
-    /// flip on when (or whether, this run) the exec happens to occur before
-    /// the assertion.
+    /// Read `pid`'s current `comm` via `ps`, or `None` if the process is
+    /// gone or `ps` itself failed.
+    fn comm_of(pid: u32) -> Option<String> {
+        std::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|c| !c.is_empty())
+    }
+
+    /// Poll `pid`'s `comm` until it stops reading `sh`. Used only AFTER the
+    /// barrier below has been released, to confirm the resulting exec has
+    /// actually landed — never to establish ordering by itself, since
+    /// polling after the fact only proves an exec eventually happened, not
+    /// that it happened after some earlier event the test cares about.
     async fn wait_for_comm_to_leave_sh(pid: u32) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let comm = std::process::Command::new("ps")
-                .args(["-o", "comm=", "-p", &pid.to_string()])
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-            if matches!(&comm, Some(c) if !c.is_empty() && !c.contains("sh")) {
+            if matches!(comm_of(pid), Some(c) if !c.contains("sh")) {
                 return;
             }
             assert!(
@@ -6901,29 +6906,61 @@ test a::flaky ... FAILED
         }
     }
 
+    /// Spawn `sh -c '<script>'` gated on `barrier` NOT existing: the leader
+    /// polls for `barrier` in a loop (never the last statement in the
+    /// script, so sh has trailing work and never tail-call-execs while
+    /// waiting) and only reaches `exec sleep 300` — an EXPLICIT, so
+    /// deterministic-once-reached, tail-call — once the caller creates
+    /// `barrier`. This is what turns "was the marker captured before or
+    /// after the exec" from a race against sh's own unspecified tail-call
+    /// timing into something the TEST controls outright: the leader is
+    /// PROVABLY still `sh`, not just probably, for as long as `barrier` is
+    /// absent.
+    fn spawn_sh_blocked_until_barrier(barrier: &Path) -> tokio::process::Child {
+        let command = format!(
+            "while [ ! -f '{}' ]; do sleep 0.02; done; exec sleep 300",
+            barrier.display()
+        );
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
     /// TKT-01M0PR64A3H2S9W7KR54Q68VN9: `process_signature`'s identity is PID
     /// plus start time, deliberately excluding `comm`, because `comm` is not
     /// stable across exec — `sh -c '<single simple command>'` (exactly what
     /// `spawn_check_child` runs for every named check and raw `run` step)
     /// can have `sh` tail-call-exec directly into that command at any point
     /// after `spawn()` returns, same pid, same start time, but `comm` flips.
-    /// Force that exec deterministically with `exec sleep 300` (rather than
-    /// leaving it to sh's own unspecified timing) and prove the signature
-    /// captured right after spawn and the signature captured strictly after
-    /// `comm` has flipped are the same string.
+    /// A barrier (see `spawn_sh_blocked_until_barrier`) proves `before` is
+    /// captured while the leader is STILL, provably, `sh` — not merely
+    /// likely to still be `sh` — before the exec that flips `comm` is even
+    /// reachable, so this cannot pass by accident on a build that still
+    /// includes `comm` in the signature.
     #[tokio::test]
     async fn process_signature_survives_a_tail_call_exec_that_changes_comm() {
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg("exec sleep 300")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
+        let script_dir = tempfile::tempdir().unwrap();
+        let barrier = script_dir.path().join("release");
+        let mut child = spawn_sh_blocked_until_barrier(&barrier);
         let pid = child.id().unwrap();
-        let before = process_signature(pid).expect("the process must be alive right after spawn");
+        assert!(pid_alive(pid), "the leader must be alive before the test");
+        assert_eq!(
+            comm_of(pid).as_deref(),
+            Some("sh"),
+            "the leader must still be sh, blocked on the absent barrier, before `before` is \
+             captured — otherwise this proves nothing about ordering"
+        );
 
+        let before = process_signature(pid).expect("the leader must be alive right after spawn");
+
+        // Only now can the leader reach `exec sleep 300` — `before` is
+        // provably pre-exec.
+        std::fs::write(&barrier, "go").unwrap();
         wait_for_comm_to_leave_sh(pid).await;
 
         let after = process_signature(pid).expect("the process must still be alive after the exec");
@@ -6940,45 +6977,54 @@ test a::flaky ... FAILED
 
     /// The production regression this ticket exists for
     /// (TKT-01M0PR64A3H2S9W7KR54Q68VN9): `spawn_check_child` calls
-    /// `ManagedChildMarker::create` immediately after `spawn()`, exactly like
-    /// this test does, so the signature it records can land BEFORE `sh`
-    /// tail-call-execs into the check command — same pid, `comm` now
-    /// different from what was recorded. A `comm`-inclusive identity would
-    /// make `reap_stale_managed_children`'s fail-closed fence refuse to
-    /// touch this process ever again across a daemon restart, defeating the
+    /// `ManagedChildMarker::create` immediately after `spawn()`, so the
+    /// signature it records can land BEFORE `sh` tail-call-execs into the
+    /// check command — same pid, `comm` now different from what was
+    /// recorded. A `comm`-inclusive identity would make
+    /// `reap_stale_managed_children`'s fail-closed fence refuse to touch
+    /// this process ever again across a daemon restart, defeating the
     /// orphan-reap feature (TKT-01M0PBNGGZTNQPXB16214V4D7M) for exactly the
-    /// single-bare-command class of check most likely to hit it. Force the
-    /// exec deterministically and wait for `comm` to actually flip BEFORE
-    /// reaping, so this is never a race against sh's own tail-call timing —
-    /// it is a strict "the exec has already happened" precondition.
+    /// single-bare-command class of check most likely to hit it.
+    ///
+    /// The barrier (see `spawn_sh_blocked_until_barrier`) makes the ordering
+    /// this test depends on PROVABLE rather than merely likely: the marker
+    /// is written while the leader is confirmed still `sh` — the exec is
+    /// physically unreachable until the barrier file is created, which
+    /// happens strictly after `ManagedChildMarker::create` returns. Without
+    /// that guarantee, a fast-enough tail-call exec could land before the
+    /// marker is even written, in which case the OLD comm-inclusive
+    /// implementation would ALSO pass this test — proving nothing about the
+    /// fix.
     #[tokio::test]
     async fn reap_stale_managed_children_kills_a_genuinely_orphaned_child_that_tail_call_execd_after_the_marker_was_written(
     ) {
         let home = tempfile::tempdir().unwrap();
         let layout = Layout::at(home.path());
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg("exec sleep 300")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .process_group(0)
-            .spawn()
-            .unwrap();
+        let script_dir = tempfile::tempdir().unwrap();
+        let barrier = script_dir.path().join("release");
+        let mut child = spawn_sh_blocked_until_barrier(&barrier);
         let pid = child.id().unwrap();
         assert!(pid_alive(pid), "the child must be alive before the test");
+        assert_eq!(
+            comm_of(pid).as_deref(),
+            Some("sh"),
+            "the leader must still be sh, blocked on the absent barrier, when the marker is \
+             written — this is what makes the exec happen strictly AFTER the marker, not a race"
+        );
 
-        // Marker written right after spawn, exactly like `spawn_check_child`
-        // does — mirroring the real ordering rather than engineering around
-        // it.
+        // Marker written while the leader is provably still `sh`, mirroring
+        // spawn_check_child's real ordering (marker written immediately
+        // after spawn) with the ordering made airtight instead of merely
+        // likely.
         std::mem::forget(ManagedChildMarker::create(&layout, pid));
         assert!(
             layout.managed_children_dir().join(pid.to_string()).exists(),
             "the marker must exist before reaping"
         );
 
-        // Wait for the tail-call exec to actually land before reaping, so
-        // the sweep below is guaranteed to run against a process whose
-        // `comm` has already changed from what the marker recorded.
+        // Only now can the leader reach `exec sleep 300` — strictly after
+        // the marker was written.
+        std::fs::write(&barrier, "go").unwrap();
         wait_for_comm_to_leave_sh(pid).await;
 
         reap_stale_managed_children(&layout);
