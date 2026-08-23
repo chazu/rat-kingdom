@@ -20,7 +20,7 @@ use rk_workflow::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -645,15 +645,95 @@ async fn abort_task<T>(task: &mut JoinHandle<T>) {
     let _ = task.await;
 }
 
-/// Guarantees a gate child's WHOLE process group dies, not just the `sh -c`
-/// wrapper `kill_on_drop` reaches. `spawn_check_child` puts the child in its
-/// own group via `.process_group(0)` (mirroring rk-harness's launcher); this
-/// guard sends the negative-pid signal that actually reaches everything in
-/// it. Disarmed only on the clean-completion path — every other exit from
-/// `collect_child_output` (reader/wait join failure, timeout, or this
-/// function's future simply being dropped out from under it) drops the guard
-/// still armed and kills whatever the check left running, so a `mise`/
-/// `cargo`/`rustc` grandchild can no longer outlive its `sh -c` parent.
+/// One row of the system-wide process table, used to walk a managed check
+/// child's REAL descendant tree instead of trusting it to stay in the one
+/// process group `spawn_check_child` put its leader in. `mise` (and
+/// potentially any other check command) does not keep every descendant in
+/// that leader's group — a live smoke test found `mise run verify` moving
+/// its own task execution into a SECOND, freshly created group (a `shell`
+/// child, and `cargo` under that), which a plain `kill(-leader_pid,
+/// SIGKILL)` never reaches: killing the leader's group only removes the
+/// leader, and the orphaned nested group survives, reparented to init
+/// (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD). Captured as `(pid, ppid, pgid)` so
+/// descendants can be found by walking live `ppid` links and the exact
+/// groups to signal collected from `pgid`.
+struct ProcessTableRow {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+}
+
+/// A snapshot of every process the OS reports right now, via `ps`(1) — the
+/// same portable, no-extra-dependency approach `process_signature` already
+/// uses elsewhere in this file. Best-effort: an empty result (a transient
+/// `ps` failure, or none on a platform without it) simply means a caller
+/// falls back to signalling only the root process group it already knew
+/// about, same as before this tree-walk existed.
+fn live_process_table() -> Vec<ProcessTableRow> {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-Ao", "pid=,ppid=,pgid="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let pgid = fields.next()?.parse().ok()?;
+            Some(ProcessTableRow { pid, ppid, pgid })
+        })
+        .collect()
+}
+
+/// Every distinct process-group id live under `root` right now: `root`'s own
+/// group plus every descendant's, found by walking `ppid` links in `table`
+/// breadth-first from `root` — so a descendant that `setsid`/`setpgid`ed
+/// itself into a group of its own (exactly what a `mise` task does) is still
+/// found and its group still collected, not just the leader's. `root` is
+/// treated as its own group even if `table` (a racy snapshot) no longer
+/// contains it, which is correct for every caller here: they only ever name
+/// a process-group LEADER (`.process_group(0)` makes a spawned check's own
+/// pid equal its pgid).
+fn descendant_process_groups(root: u32, table: &[ProcessTableRow]) -> Vec<i32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for row in table {
+        children.entry(row.ppid).or_default().push(row.pid);
+    }
+    let mut groups = HashSet::new();
+    groups.insert(root as i32);
+    let mut visited = HashSet::from([root]);
+    let mut queue = VecDeque::from([root]);
+    while let Some(pid) = queue.pop_front() {
+        if let Some(row) = table.iter().find(|row| row.pid == pid) {
+            groups.insert(row.pgid as i32);
+        }
+        for &child in children.get(&pid).into_iter().flatten() {
+            if visited.insert(child) {
+                queue.push_back(child);
+            }
+        }
+    }
+    groups.into_iter().collect()
+}
+
+/// Guarantees a gate child's WHOLE process TREE dies, not just the `sh -c`
+/// wrapper `kill_on_drop` reaches or the single process group
+/// `spawn_check_child` put its leader in. `spawn_check_child` puts the child
+/// in its own group via `.process_group(0)` (mirroring rk-harness's
+/// launcher); this guard walks the live descendant tree from that pid
+/// ([`descendant_process_groups`]) and sends the negative-pid signal to
+/// EVERY group found, reaching a `mise`/`cargo`/`rustc` descendant even if it
+/// moved itself into a group of its own. Disarmed only on the
+/// clean-completion path — every other exit from `collect_child_output`
+/// (reader/wait join failure, timeout, or this function's future simply
+/// being dropped out from under it) drops the guard still armed and kills
+/// whatever the check left running.
 struct ProcessGroupGuard(Option<u32>);
 
 impl ProcessGroupGuard {
@@ -665,11 +745,16 @@ impl ProcessGroupGuard {
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         if let Some(pid) = self.0 {
-            // SAFETY: plain kill(2) on a process group we created ourselves
-            // via `.process_group(0)` — the negative pid targets the group,
-            // not the single process.
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            let table = live_process_table();
+            for pgid in descendant_process_groups(pid, &table) {
+                // SAFETY: plain kill(2) on a process group either this
+                // process created directly (`.process_group(0)`) or a live
+                // descendant of it created for itself — discovered via the
+                // OS's own real `ppid` links moments before this signal, so
+                // never a group this daemon has no relation to.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
             }
         }
     }
@@ -805,14 +890,21 @@ pub(crate) fn reap_stale_managed_children(layout: &Layout) {
             let recorded = std::fs::read_to_string(entry.path()).unwrap_or_default();
             let recorded = recorded.trim();
             if !recorded.is_empty() && process_signature(pid).as_deref() == Some(recorded) {
-                // SAFETY: plain kill(2) on a pid whose CURRENT identity was
-                // just confirmed, still, to match the process this daemon
-                // itself spawned as a process-group leader
-                // (`spawn_check_child` always spawns via `.process_group(0)`)
-                // — same negative-pid group signal `ProcessGroupGuard` sends
-                // to a live check's group.
-                unsafe {
-                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                // The pid's CURRENT identity was just confirmed, still, to
+                // match the process this daemon itself spawned as a
+                // process-group leader (`spawn_check_child` always spawns
+                // via `.process_group(0)`) — safe to walk its live
+                // descendant tree and signal every group found, same as
+                // `ProcessGroupGuard` does for a check cancelled while this
+                // daemon generation is still alive.
+                let table = live_process_table();
+                for pgid in descendant_process_groups(pid, &table) {
+                    // SAFETY: plain kill(2) on a process group either the
+                    // identity-confirmed pid above or one of its live
+                    // descendants created for itself.
+                    unsafe {
+                        libc::kill(-pgid, libc::SIGKILL);
+                    }
                 }
             }
         }
@@ -6434,6 +6526,73 @@ test a::flaky ... FAILED
         // SAFETY: signal 0 only probes liveness/permission; it affects nothing.
         let alive = unsafe { libc::kill(grandchild_pid, 0) == 0 };
         assert!(!alive, "grandchild `sleep` survived the gate timeout");
+    }
+
+    /// The exact real-world gap (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD): a check
+    /// command that moves part of ITS OWN work into a second, freshly
+    /// created process group — precisely what a live smoke test observed
+    /// `mise run verify` do (the leader stayed in `spawn_check_child`'s
+    /// group; a nested shell/cargo pair ended up in a NEW group of their
+    /// own). The old `kill(-leader_pid, SIGKILL)` reached only the leader's
+    /// group; the nested one survived, reparented to init. Modeled here with
+    /// `perl`'s `setpgrp(0, 0)` (portable, no `setsid`(1) binary required —
+    /// absent on macOS) instead of a real `mise`, since what's under test is
+    /// `ProcessGroupGuard` walking the live descendant tree, not `mise`
+    /// itself.
+    #[tokio::test]
+    async fn timeout_kills_a_nested_process_group_the_check_command_moved_itself_into() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested_pid_file = temp.path().join("nested.pid");
+        let script = temp.path().join("detach.pl");
+        std::fs::write(
+            &script,
+            "setpgrp(0, 0);\n\
+             open(my $fh, '>', $ARGV[0]) or die $!;\n\
+             print $fh $$;\n\
+             close $fh;\n\
+             sleep 300;\n",
+        )
+        .unwrap();
+        let command = format!(
+            "perl {} {} & wait",
+            script.display(),
+            nested_pid_file.display()
+        );
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(&command)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let child = cmd.spawn().unwrap();
+
+        let outcome = collect_child_output(child, Duration::from_millis(300), &command)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RunOutcome::TimedOut));
+
+        // Give the perl child a moment to actually call `setpgrp` and write
+        // its own pid before asserting anything — this races the guard's
+        // kill signal against perl's own startup, not just against the
+        // liveness check below.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !nested_pid_file.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid_text = std::fs::read_to_string(&nested_pid_file).unwrap();
+        let nested_pid: i32 = pid_text.trim().parse().unwrap();
+
+        // Give the group-kill signal(s) a moment to land, then confirm the
+        // process that detached into its own group is actually dead, not
+        // merely orphaned under init.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // SAFETY: signal 0 only probes liveness/permission; it affects nothing.
+        let alive = unsafe { libc::kill(nested_pid, 0) == 0 };
+        assert!(
+            !alive,
+            "a descendant that moved itself into a new process group survived the gate timeout"
+        );
     }
 
     /// Polls `ps` STAT rather than raw `kill(pid, 0)`: these sleepers are

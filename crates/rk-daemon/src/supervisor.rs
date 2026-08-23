@@ -958,7 +958,9 @@ impl VerificationAdmission {
 /// lifetime of exactly one call; `cancel` is the signal that call races its
 /// own execution against, so sending on it drops that execution's future —
 /// and with it, via the existing `ProcessGroupGuard`-on-drop discipline in
-/// `crate::workflow_exec`, SIGKILLs the exact managed child process group.
+/// `crate::workflow_exec`, SIGKILLs the check's entire live descendant
+/// process tree — not just its own leader group, which a check command
+/// (`mise run <task>`) can itself move part of its work out of.
 struct ManagedVerificationRun {
     generation: Option<rk_core::id::SpawnId>,
     agent: String,
