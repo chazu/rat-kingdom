@@ -172,6 +172,15 @@ const VERIFICATION_ADMISSION_IDENTITY: &str = "verification_admission";
 /// re-run entirely, admission queue included.
 const VERIFICATION_PROOF_IDENTITY: &str = "verification_proof";
 
+/// Durable `(Event, <repo>, "verification_cancelled")` outcome recorded by
+/// [`WorkflowEngine::verify_repo_check`] when its requesting agent is
+/// interrupted/dismissed/dies, or its RPC caller disconnects, before the run
+/// settled (TKT-01M0PA6C5WYRWS757R1SS2F2GR). Never written for a run that
+/// completes on its own, whatever its verdict — that's
+/// [`VERIFICATION_ADMISSION_IDENTITY`]'s job — and a cancelled run never
+/// writes [`VERIFICATION_PROOF_IDENTITY`] either, so it can never be reused.
+const VERIFICATION_CANCELLED_IDENTITY: &str = "verification_cancelled";
+
 /// Pause between a failed attempt and a `retryOnFail` retry. Fixed rather than
 /// configurable: this exists to ride out a transient condition (machine load,
 /// a build-lock hold), not to be tuned per workflow.
@@ -236,6 +245,19 @@ struct SettledAttempt {
     no_exit_code: bool,
     signal: Option<i32>,
     verdict: &'static str,
+}
+
+/// Best-effort timing [`WorkflowEngine::run_check_in`] reports into as it
+/// goes, for a caller (`verify_repo_check`) racing the whole call against
+/// cancellation. Written exactly once, right after the admission queue
+/// settles — never updated again — so a cancellation landing before that
+/// point sees both fields `None` ("still queued, never started"), and one
+/// landing after sees both set ("ran for at least this long before it was
+/// cancelled").
+#[derive(Default)]
+pub(crate) struct RunProgress {
+    queue_wait_ms: Option<u64>,
+    execution_started_at: Option<Instant>,
 }
 
 /// One check's admission-relevant outcome, bundled so
@@ -650,6 +672,151 @@ impl Drop for ProcessGroupGuard {
                 libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
             }
         }
+    }
+}
+
+/// Durable counterpart to [`ProcessGroupGuard`]: while that guard reaches a
+/// check's whole process group for as long as ITS OWNING PROCESS is alive,
+/// nothing previously reached it across a daemon restart. A check child is
+/// spawned by a connection-handling task that `server.rs`'s accept loop
+/// starts with a bare, detached `tokio::spawn` — not the `background_tasks`
+/// `JoinSet` `Daemon::run`'s own doc comment explains exists specifically so
+/// aborting the outer future tears down every task it owns. So a same-
+/// process simulated crash (`handle.abort()`, the technique
+/// `live_landing_restart.rs` and `managed_verification_cancel_e2e.rs` both
+/// use) never reaches that task, and a real `SIGKILL` reaches the task but
+/// not this child either — it lives in ITS OWN process group precisely so an
+/// operator `interrupt`'s SIGINT does not land on it, which equally means no
+/// signal the OS delivers to the dying daemon process ever reaches it. Either
+/// way the child is orphaned, not killed, unless something explicit reaps it.
+///
+/// This guard is that "something": written the moment the child's pid is
+/// known (mirroring `ProcessGroupGuard`'s own `child.id()` capture),
+/// removed on every exit from `spawn_check_child`'s scope including this
+/// future being dropped out from under it (the managed-verification
+/// cancellation race in `verify_repo_check`) — so a run that finishes,
+/// times out, errors, or gets cancelled all leave nothing durable behind.
+/// [`reap_stale_managed_children`] is the other half: called once at the
+/// START of every `Daemon::run`, before this directory is trusted again, so
+/// anything still here at that point can only be an actual orphan left by a
+/// daemon generation that is provably gone — not a false positive, since
+/// this daemon does not even accept connections yet when it sweeps.
+///
+/// The marker's content, not just its filename, is what makes reaping safe:
+/// a bare pid is not a stable identity across the (however unlikely, however
+/// long the gap between a dead generation and the next daemon start) window
+/// in which the OS can recycle it for an unrelated process. The file also
+/// carries [`process_signature`] as recorded the moment this daemon spawned
+/// the child, so the reap sweep can tell "the exact process I spawned,
+/// simply still running" apart from "a stranger now squatting its old pid"
+/// and refuse to signal the latter.
+struct ManagedChildMarker {
+    layout: Layout,
+    pid: u32,
+}
+
+impl ManagedChildMarker {
+    fn create(layout: &Layout, pid: u32) -> Self {
+        let dir = layout.managed_children_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        // Best-effort: if the child has already exited in the (negligible)
+        // window between `spawn()` and this call, there is no signature to
+        // record and therefore nothing safe to reap later — skip the write
+        // rather than persist an unverifiable marker. Written atomically
+        // (temp file + rename, same directory/filesystem) so a daemon that
+        // dies mid-write never leaves a torn, unparseable marker behind for
+        // the reap sweep to trip over.
+        if let Some(signature) = process_signature(pid) {
+            let path = dir.join(pid.to_string());
+            let tmp = dir.join(format!("{pid}.tmp-{}", std::process::id()));
+            if std::fs::write(&tmp, signature).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+        Self {
+            layout: layout.clone(),
+            pid,
+        }
+    }
+}
+
+impl Drop for ManagedChildMarker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(
+            self.layout
+                .managed_children_dir()
+                .join(self.pid.to_string()),
+        );
+    }
+}
+
+/// A best-effort process identity: `pid`'s start time and command name, as
+/// `ps` reports them right now. Not a cryptographic identity — just enough
+/// to distinguish "the same process this daemon spawned" from "the OS
+/// reused this pid for something this daemon never spawned", which is all
+/// [`reap_stale_managed_children`] needs: two distinct processes are
+/// vanishingly unlikely to share both an exact start second and a command
+/// name, whereas the SAME process obviously reports the same pair every
+/// time it's asked. `None` covers both "no process is live at this pid at
+/// all" and "`ps` itself failed" — both must be treated identically by every
+/// caller (nothing to compare against, so no confident answer either way).
+fn process_signature(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "lstart=,comm=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Kill and clear every marker [`ManagedChildMarker`] left behind by a
+/// daemon generation that is gone by the time this one starts — see that
+/// type's doc comment for why a daemon restart cannot rely on anything else
+/// (task-tree teardown, signal delivery) to reach these children. Called
+/// once from `Daemon::run`, right after `on_daemon_started` and before the
+/// accept loop can serve a single request — so before any NEW managed check
+/// can possibly exist — meaning every marker this sees genuinely predates
+/// this process.
+///
+/// Fails CLOSED on identity: a marker is only ever signalled when the pid it
+/// names is CURRENTLY live AND its [`process_signature`] still matches what
+/// was recorded at spawn time. A pid with no live process at all is simply
+/// stale (the child already exited on its own) — nothing to kill. A pid that
+/// IS live but whose signature has changed means the OS has handed that pid
+/// to a process this daemon never spawned; sending it a signal on the
+/// strength of a recycled number alone would be exactly the bug this check
+/// exists to prevent, so that case is left strictly alone. Every marker is
+/// removed once considered either way, so a later restart never re-examines
+/// the same stale entry.
+pub(crate) fn reap_stale_managed_children(layout: &Layout) {
+    let dir = layout.managed_children_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
+            let recorded = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            let recorded = recorded.trim();
+            if !recorded.is_empty() && process_signature(pid).as_deref() == Some(recorded) {
+                // SAFETY: plain kill(2) on a pid whose CURRENT identity was
+                // just confirmed, still, to match the process this daemon
+                // itself spawned as a process-group leader
+                // (`spawn_check_child` always spawns via `.process_group(0)`)
+                // — same negative-pid group signal `ProcessGroupGuard` sends
+                // to a live check's group.
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(entry.path());
     }
 }
 
@@ -3099,6 +3266,7 @@ impl WorkflowEngine {
             &env,
             timeout,
             ctx.previous_result.as_ref(),
+            None,
         )
         .await
     }
@@ -3126,12 +3294,28 @@ impl WorkflowEngine {
     /// through the same admission queue as everything else. Never reuses a
     /// stale proof for a different prepared merge: the key binds the exact
     /// candidate sha, so a rebased or amended branch head simply misses.
+    ///
+    /// Bound to the requesting caller's lifecycle
+    /// (TKT-01M0PA6C5WYRWS757R1SS2F2GR): registers itself with
+    /// [`Supervisor::register_managed_verification`] for `generation` (the
+    /// live agent generation this call belongs to, when the caller is a
+    /// supervised agent — `None` for the operator) and `request_key` (this
+    /// exact RPC call, for a caller-disconnect cancellation). Races its own
+    /// `run_check_in` call against that registration's cancel signal: a
+    /// cancellation from an agent interrupt/dismiss/terminal death or an RPC
+    /// disconnect drops the run in flight — killing its managed child
+    /// process group and releasing its admission permit immediately, via the
+    /// same drop-based cleanup `run_check_in` already relies on for a
+    /// timeout — and this records a durable cancellation outcome instead of
+    /// ever writing a reusable proof for it.
     pub(crate) async fn verify_repo_check(
         &self,
         agent: &str,
         dir: &Path,
         repo_name: &str,
         check_name: &str,
+        generation: Option<rk_core::id::SpawnId>,
+        request_key: &str,
     ) -> rk_core::Result<Value> {
         let check = self.find_check(&dir.display().to_string(), check_name)?;
         let resolved = ResolvedRun {
@@ -3165,19 +3349,61 @@ impl WorkflowEngine {
             }
         }
 
-        let result = self
-            .run_check_in(
-                &format!("verify-run:{agent}"),
-                repo_name,
-                agent,
-                &exec_dir,
-                &resolved.command,
-                &resolved,
-                &[],
-                timeout,
-                None,
-            )
-            .await?;
+        let progress = Arc::new(Mutex::new(RunProgress::default()));
+        let (managed_id, mut cancel_rx) =
+            self.supervisor
+                .register_managed_verification(agent, generation, request_key);
+        let run_id = format!("verify-run:{agent}");
+        let run_fut = self.run_check_in(
+            &run_id,
+            repo_name,
+            agent,
+            &exec_dir,
+            &resolved.command,
+            &resolved,
+            &[],
+            timeout,
+            None,
+            Some(Arc::clone(&progress)),
+        );
+        tokio::pin!(run_fut);
+        let outcome = tokio::select! {
+            result = &mut run_fut => Ok(result),
+            _ = cancel_rx.changed() => {
+                let reason: Option<&'static str> = *cancel_rx.borrow();
+                Err(reason.unwrap_or("cancelled"))
+            }
+        };
+        self.supervisor.unregister_managed_verification(managed_id);
+
+        let result = match outcome {
+            Ok(result) => result?,
+            Err(reason) => {
+                let (queue_wait_ms, duration_ms) = {
+                    let p = progress.lock().unwrap();
+                    (
+                        p.queue_wait_ms,
+                        p.execution_started_at.map(|started| {
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                        }),
+                    )
+                };
+                self.record_verification_cancellation(
+                    repo_name,
+                    agent,
+                    generation,
+                    request_key,
+                    candidate_sha.as_deref(),
+                    &check,
+                    queue_wait_ms,
+                    duration_ms,
+                    reason,
+                );
+                return Err(rk_core::Error::other(format!(
+                    "verification cancelled ({reason}) for repo `{repo_name}` check `{check_name}`"
+                )));
+            }
+        };
 
         if let Some(sha) = &candidate_sha {
             if result.get("verdict").and_then(Value::as_str) == Some("pass") {
@@ -3186,6 +3412,50 @@ impl WorkflowEngine {
         }
 
         Ok(result)
+    }
+
+    /// Durable record of a managed verification run cancelled before it could
+    /// settle (TKT-01M0PA6C5WYRWS757R1SS2F2GR) — never written for a run that
+    /// actually completed, whatever its verdict; that's
+    /// [`record_verification_admission_event`](Self::record_verification_admission_event)
+    /// and [`record_verification_proof`](Self::record_verification_proof)'s
+    /// job. `queue_wait_ms`/`duration_ms` are best-effort: `None` for either
+    /// means the cancellation landed before `run_check_in` ever wrote to its
+    /// progress cell (still queued behind the admission bound), not that the
+    /// value is unknown for a run that did start.
+    #[allow(clippy::too_many_arguments)]
+    fn record_verification_cancellation(
+        &self,
+        repo_name: &str,
+        agent: &str,
+        generation: Option<rk_core::id::SpawnId>,
+        request_key: &str,
+        candidate_sha: Option<&str>,
+        check: &rk_workflow::Check,
+        queue_wait_ms: Option<u64>,
+        duration_ms: Option<u64>,
+        reason: &str,
+    ) {
+        let proof_key = candidate_sha.and_then(|sha| verification_proof_key(repo_name, sha, check));
+        let _ = self.space.out(
+            Tuple::new(
+                Category::Event,
+                self.supervisor.verification_repo_identity(repo_name),
+                VERIFICATION_CANCELLED_IDENTITY,
+                "daemon",
+                json!({
+                    "agent": agent,
+                    "generation": generation.map(|g| g.to_string()),
+                    "request_key": request_key,
+                    "proof_key": proof_key,
+                    "command": check.command,
+                    "queue_wait_ms": queue_wait_ms,
+                    "duration_ms": duration_ms,
+                    "reason": reason,
+                }),
+            )
+            .with_lifecycle(Lifecycle::Furniture),
+        );
     }
 
     /// Best-effort exact-key lookup: a durable proof this repo already wrote
@@ -3313,6 +3583,13 @@ impl WorkflowEngine {
         env: &[(String, String)],
         timeout: Duration,
         previous_result: Option<&Value>,
+        // Best-effort progress sink for a caller racing this whole call
+        // against cancellation (`verify_repo_check`, the only caller that
+        // passes `Some` — TKT-01M0PA6C5WYRWS757R1SS2F2GR). Written once the
+        // admission queue settles, so a cancellation that drops this future
+        // mid-flight still leaves the caller something to report: whether it
+        // was still queued, or how long it had been executing.
+        progress: Option<Arc<Mutex<RunProgress>>>,
     ) -> rk_core::Result<Value> {
         // Serialize this check's entire run (every retry attempt) against
         // every other same-repo check also opted into `sharedCargoTarget`,
@@ -3424,6 +3701,11 @@ impl WorkflowEngine {
             None
         };
         let run_started = Instant::now();
+        if let Some(progress) = &progress {
+            let mut p = progress.lock().unwrap();
+            p.queue_wait_ms = admission_queue_wait_ms;
+            p.execution_started_at = Some(run_started);
+        }
 
         // Extra attempts on a non-"pass" verdict, for a check already
         // characterized as flaky for reasons outside the code under test
@@ -3743,6 +4025,16 @@ impl WorkflowEngine {
         let child = child_command.spawn().map_err(|e| {
             rk_core::Error::other(format!("run step: failed to spawn `{command}`: {e}"))
         })?;
+        // Durable counterpart to `group_guard` inside `collect_child_output`:
+        // that guard only reaches this child for as long as ITS OWN task is
+        // alive, which a daemon restart cannot guarantee (see
+        // `ManagedChildMarker`'s doc comment). Held in this local, so it is
+        // dropped — durable marker removed — on every exit from this
+        // `.await` below, including this whole future being dropped out from
+        // under it by `verify_repo_check`'s cancellation race.
+        let _managed_marker = child
+            .id()
+            .map(|pid| ManagedChildMarker::create(&self.layout, pid));
 
         collect_child_output(child, timeout, command).await
     }
@@ -6144,6 +6436,136 @@ test a::flaky ... FAILED
         assert!(!alive, "grandchild `sleep` survived the gate timeout");
     }
 
+    /// Polls `ps` STAT rather than raw `kill(pid, 0)`: these sleepers are
+    /// spawned as DIRECT children of the test process, so a signal-0
+    /// liveness check keeps reporting "alive" for a zombie — killed but not
+    /// yet reaped by its parent (this process, which never calls `wait` on
+    /// it) — exactly the gotcha `rk-harness/src/fake.rs`'s own `still_running`
+    /// helper documents. `None`/empty STAT or a leading `Z` both mean gone.
+    fn pid_alive(pid: u32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("failed to invoke `ps`");
+        if !output.status.success() {
+            return false;
+        }
+        let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        !(stat.is_empty() || stat.starts_with('Z'))
+    }
+
+    /// A real process, its own process-group leader (mirroring exactly how
+    /// `spawn_check_child` spawns a check), that just sleeps — standing in
+    /// for a managed check child in every test below.
+    fn spawn_sleeper() -> tokio::process::Child {
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    /// The reap half of item (3) (TKT-01M0PBNGGZTNQPXB16214V4D7M): a marker
+    /// left behind with NO owning `ManagedChildMarker` guard still alive to
+    /// remove it (`std::mem::forget`, modeling a daemon generation that died
+    /// before its own drop path could ever run) names a process that is
+    /// STILL the exact one this "daemon" spawned — same pid, same
+    /// `process_signature`. `reap_stale_managed_children` must kill it.
+    #[tokio::test]
+    async fn reap_stale_managed_children_kills_a_genuinely_orphaned_child_whose_signature_still_matches(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let mut child = spawn_sleeper();
+        let pid = child.id().unwrap();
+        assert!(pid_alive(pid), "the sleeper must be alive before the test");
+
+        // Simulate the marker surviving its own generation's death: create
+        // it, then `forget` it so its `Drop` (which would otherwise remove
+        // the file the instant this scope ends) never runs.
+        std::mem::forget(ManagedChildMarker::create(&layout, pid));
+        assert!(
+            layout.managed_children_dir().join(pid.to_string()).exists(),
+            "the marker must exist before reaping"
+        );
+
+        reap_stale_managed_children(&layout);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while pid_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the genuinely orphaned sleeper survived reap_stale_managed_children"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !layout.managed_children_dir().join(pid.to_string()).exists(),
+            "the marker must be removed once considered, win or lose"
+        );
+        // Reap the OS zombie: this test process is its direct parent.
+        let _ = child.wait().await;
+    }
+
+    /// The fail-closed half: a marker recording a WRONG signature for a
+    /// CURRENTLY LIVE pid — modeling the OS having recycled that exact pid
+    /// for a process this daemon never spawned in the gap between a dead
+    /// generation and this one starting. `reap_stale_managed_children` must
+    /// never signal it: killing on the strength of a bare, reused pid number
+    /// alone is exactly the bug this identity check exists to prevent.
+    #[tokio::test]
+    async fn reap_stale_managed_children_never_signals_a_pid_reused_by_an_unrelated_process() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        // A REAL, currently-alive, unrelated process standing in for "the OS
+        // reused this pid" — this test never spawned it as a managed check,
+        // and no `ManagedChildMarker` for it was ever created.
+        let mut decoy = spawn_sleeper();
+        let decoy_pid = decoy.id().unwrap();
+        assert!(
+            pid_alive(decoy_pid),
+            "the decoy must be alive before the test"
+        );
+
+        // Hand-write a marker for that pid carrying a signature that cannot
+        // possibly match the decoy's real one — the exact shape a stale
+        // marker from a LONG-dead generation would have once its originally
+        // recorded process has exited and the pid later got recycled onto
+        // this unrelated decoy.
+        let dir = layout.managed_children_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(decoy_pid.to_string()),
+            "Thu Jan  1 00:00:00 1970 definitely-not-sh",
+        )
+        .unwrap();
+
+        reap_stale_managed_children(&layout);
+
+        // Give a wrongly-issued kill every chance to land before asserting
+        // survival — this must NOT be a race the assertion wins by luck.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            pid_alive(decoy_pid),
+            "reap_stale_managed_children signalled a pid it never spawned, on a mismatched \
+             signature alone"
+        );
+        assert!(
+            !dir.join(decoy_pid.to_string()).exists(),
+            "the stale/mismatched marker must still be cleared so it is never re-examined"
+        );
+
+        // Cleanup: this decoy is never reaped by design, so kill it by hand
+        // and wait on it ourselves, same as the test above.
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &decoy_pid.to_string()])
+            .status();
+        let _ = decoy.wait().await;
+    }
+
     #[test]
     fn timeline_rows_flatten_and_label_steps() {
         let steps: Vec<Step> = serde_json::from_value(serde_json::json!([
@@ -6285,6 +6707,7 @@ test a::flaky ... FAILED
                 &env,
                 timeout,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -6298,6 +6721,7 @@ test a::flaky ... FAILED
                 &resolved,
                 &env,
                 timeout,
+                None,
                 None,
             )
             .await
@@ -6349,6 +6773,7 @@ test a::flaky ... FAILED
                 &resolved,
                 &[],
                 timeout,
+                None,
                 None,
             )
             .await
@@ -6402,6 +6827,7 @@ test a::flaky ... FAILED
                 &[],
                 timeout,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -6448,6 +6874,7 @@ test a::flaky ... FAILED
                 &resolved,
                 &[],
                 timeout,
+                None,
                 None,
             )
             .await
@@ -6501,6 +6928,7 @@ test a::flaky ... FAILED
                 &resolved,
                 &[],
                 timeout,
+                None,
                 None,
             )
             .await
@@ -6917,12 +7345,143 @@ test a::flaky ... FAILED
         write_check(repo_dir.path(), "verify", "exit 37", false);
 
         let result = engine
-            .verify_repo_check("agent", repo_dir.path(), "repo-exact-exit", "verify")
+            .verify_repo_check(
+                "agent",
+                repo_dir.path(),
+                "repo-exact-exit",
+                "verify",
+                None,
+                "test-request",
+            )
             .await
             .unwrap();
 
         assert_eq!(result["exit"], json!(37));
         assert_eq!(result["verdict"], json!("fail"));
+    }
+
+    /// TKT-01M0PA6C5WYRWS757R1SS2F2GR: `Supervisor::interrupt`/`dismiss`/the
+    /// harness-exit handler all funnel into `cancel_managed_verification_for_agent`.
+    /// This is the live regression: a REAL `sh -c` child process (not a mock,
+    /// not a cancellation token in isolation) reports its own pid, cancelling
+    /// its run kills that exact OS process group, and a second call queued
+    /// behind the same repo's admission bound (limit 1) starts and completes
+    /// promptly afterward instead of waiting for its own timeout — proving
+    /// the permit was released as part of cancellation, not merely eventually
+    /// reclaimed.
+    #[tokio::test]
+    async fn cancelling_a_managed_verification_run_kills_its_real_process_group_and_frees_the_queued_follower(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let engine = test_engine(home.path());
+        engine
+            .supervisor
+            .set_verification_admission_limits(1, HashMap::new());
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let pid_file = repo_dir.path().join("child.pid");
+        write_check(
+            repo_dir.path(),
+            "verify",
+            &format!("echo $$ > '{}'; sleep 30", pid_file.display()),
+            true,
+        );
+
+        let generation = rk_core::id::SpawnId::new();
+        let first = engine.verify_repo_check(
+            "Whisker",
+            repo_dir.path(),
+            "cancel-test-repo",
+            "verify",
+            Some(generation),
+            "req-1",
+        );
+        tokio::pin!(first);
+
+        // Poll until the child has actually started and reported its own
+        // pid — proof there is a real process to kill, not just a scheduled
+        // task.
+        let child_pid: i32 = loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                        if let Ok(pid) = text.trim().parse() {
+                            break pid;
+                        }
+                    }
+                }
+                _ = &mut first => panic!("the check must not settle on its own before it's cancelled"),
+            }
+        };
+
+        // A second call for the SAME repo, still bound by the admission
+        // limit of 1: it must not even start while the first holds the
+        // permit.
+        let second_dir = tempfile::tempdir().unwrap();
+        let second_marker = second_dir.path().join("ran");
+        write_check(
+            second_dir.path(),
+            "verify",
+            &format!("touch '{}'", second_marker.display()),
+            true,
+        );
+        let second = engine.verify_repo_check(
+            "Nibble",
+            second_dir.path(),
+            "cancel-test-repo",
+            "verify",
+            None,
+            "req-2",
+        );
+        tokio::pin!(second);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            _ = &mut second => panic!("the follower must stay queued behind the first run's admission permit"),
+        }
+        assert!(
+            !second_marker.exists(),
+            "the queued follower must not have started yet"
+        );
+
+        // Cancel exactly like `Supervisor::interrupt` does.
+        engine.supervisor.cancel_managed_verification_for_agent(
+            "Whisker",
+            Some(generation),
+            "agent_interrupt",
+        );
+
+        let error = first
+            .await
+            .expect_err("a cancelled run must return an error, not a verdict");
+        assert!(
+            error.to_string().contains("cancelled"),
+            "unexpected error: {error}"
+        );
+
+        // The real process must actually be gone shortly after — proof the
+        // managed child's process GROUP was killed, not just abandoned.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // Signal 0: existence check only, no signal actually delivered.
+            let alive = unsafe { libc::kill(child_pid, 0) == 0 };
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child process {child_pid} is still alive after cancellation"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The queued follower must now proceed promptly — the admission
+        // permit was released as part of cancellation, not left held until
+        // its own timeout.
+        tokio::time::timeout(Duration::from_secs(5), &mut second)
+            .await
+            .expect("the queued follower must start promptly once the first run is cancelled")
+            .expect("the follower's own check must pass");
+        assert!(second_marker.exists());
     }
 
     /// The ticket's explicit shared-bound goal: a landing gate (which calls
@@ -6990,8 +7549,16 @@ test a::flaky ... FAILED
             &[],
             Duration::from_secs(5),
             None,
+            None,
         );
-        let verify = engine.verify_repo_check("agent", verify_dir.path(), repo_name, "verify");
+        let verify = engine.verify_repo_check(
+            "agent",
+            verify_dir.path(),
+            repo_name,
+            "verify",
+            None,
+            "test-request",
+        );
         let (landing_result, verify_result) = tokio::join!(landing, verify);
         landing_result.unwrap();
         verify_result.unwrap();
@@ -7100,8 +7667,16 @@ test a::flaky ... FAILED
             &[],
             Duration::from_secs(5),
             None,
+            None,
         );
-        let name_side = engine.verify_repo_check("agent", name_dir.path(), repo_name, "verify");
+        let name_side = engine.verify_repo_check(
+            "agent",
+            name_dir.path(),
+            repo_name,
+            "verify",
+            None,
+            "test-request",
+        );
         let (path_result, name_result) = tokio::join!(path_side, name_side);
         path_result.unwrap();
         name_result.unwrap();
@@ -7152,7 +7727,14 @@ test a::flaky ... FAILED
         git(repo_dir.path(), &["commit", "-m", "add check"]);
 
         let first = engine
-            .verify_repo_check("agent", repo_dir.path(), "repo-proof-reuse", "verify")
+            .verify_repo_check(
+                "agent",
+                repo_dir.path(),
+                "repo-proof-reuse",
+                "verify",
+                None,
+                "test-request",
+            )
             .await
             .unwrap();
         assert_eq!(first["exit"], json!(0));
@@ -7165,7 +7747,14 @@ test a::flaky ... FAILED
         // Same clean candidate sha, same check: an exact-match reuse, no
         // second execution.
         let second = engine
-            .verify_repo_check("agent", repo_dir.path(), "repo-proof-reuse", "verify")
+            .verify_repo_check(
+                "agent",
+                repo_dir.path(),
+                "repo-proof-reuse",
+                "verify",
+                None,
+                "test-request",
+            )
             .await
             .unwrap();
         assert_eq!(second["reused"], json!(true));
@@ -7181,7 +7770,14 @@ test a::flaky ... FAILED
         // never consulted — a fresh run every time.
         std::fs::write(repo_dir.path().join("scratch.txt"), "uncommitted\n").unwrap();
         let third = engine
-            .verify_repo_check("agent", repo_dir.path(), "repo-proof-reuse", "verify")
+            .verify_repo_check(
+                "agent",
+                repo_dir.path(),
+                "repo-proof-reuse",
+                "verify",
+                None,
+                "test-request",
+            )
             .await
             .unwrap();
         assert!(

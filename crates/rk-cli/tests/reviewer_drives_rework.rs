@@ -76,6 +76,15 @@ fn fake_harness(rk_bin: &str) -> String {
         r#"
 read -r _prompt
 echo '{{"type":"system","subtype":"init","session_id":"wf-fake"}}'
+# Both roles declare themselves finished BEFORE producing any observable
+# side effect (the reviewer's verdict artifact, the rat's commit), as a real
+# primed rat does. A generation that reaches the exit-flush without a
+# `task_done` publishes as a failure (TKT-175), and every `evaluate` in this
+# workflow gates on `is_error: false`. Declaring done first also closes a
+# race: the workflow's `read` step reacts to the verdict artifact as soon as
+# it lands, and that reaction can tear this generation down before a
+# `task_done` call queued *after* the artifact write gets to run.
+"{rk_bin}" done "did the work" >/dev/null 2>&1
 if [ "$RK_ROLE" = "reviewer" ]; then
     COUNT_FILE="$RK_HOME/review-count"
     n=$(cat "$COUNT_FILE" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$COUNT_FILE"
@@ -86,11 +95,6 @@ else
     git add . >/dev/null 2>&1
     git -c user.email=r@x -c user.name=R commit -q -m "work: $RK_TASK"
 fi
-# Both roles declare themselves finished before the turn ends, as a real primed
-# rat does. A generation that reaches the exit-flush without a `task_done`
-# publishes as a failure (TKT-175), and every `evaluate` in this workflow gates
-# on `is_error: false`.
-"{rk_bin}" done "did the work" >/dev/null 2>&1
 {RESULT_LINE}
 "#
     )
