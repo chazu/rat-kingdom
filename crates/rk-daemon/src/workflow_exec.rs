@@ -690,11 +690,16 @@ async fn abort_task<T>(task: &mut JoinHandle<T>) {
 /// leader, and the orphaned nested group survives, reparented to init
 /// (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD). Captured as `(pid, ppid, pgid)` so
 /// descendants can be found by walking live `ppid` links and the exact
-/// groups to signal collected from `pgid`.
+/// groups to signal collected from `pgid`. `stat` is the same STAT field
+/// `pid_alive` test helpers already poll elsewhere in this file (a leading
+/// `Z` or an empty read means gone/zombie, never "still doing work") — kept
+/// here too so a supervisor liveness check can tell a merely-listed pid from
+/// one actually alive without a second `ps` invocation.
 struct ProcessTableRow {
     pid: u32,
     ppid: u32,
     pgid: u32,
+    stat: String,
 }
 
 /// A snapshot of every process the OS reports right now, via `ps`(1) — the
@@ -705,7 +710,7 @@ struct ProcessTableRow {
 /// about, same as before this tree-walk existed.
 fn live_process_table() -> Vec<ProcessTableRow> {
     let Ok(output) = std::process::Command::new("ps")
-        .args(["-Ao", "pid=,ppid=,pgid="])
+        .args(["-Ao", "pid=,ppid=,pgid=,stat="])
         .output()
     else {
         return Vec::new();
@@ -720,9 +725,68 @@ fn live_process_table() -> Vec<ProcessTableRow> {
             let pid = fields.next()?.parse().ok()?;
             let ppid = fields.next()?.parse().ok()?;
             let pgid = fields.next()?.parse().ok()?;
-            Some(ProcessTableRow { pid, ppid, pgid })
+            let stat = fields.next()?.to_string();
+            Some(ProcessTableRow {
+                pid,
+                ppid,
+                pgid,
+                stat,
+            })
         })
         .collect()
+}
+
+/// Whether `row` is a real, running process right now — not exited and not a
+/// zombie awaiting reap (a leading `Z` STAT), which `kill(pid, 0)` alone
+/// cannot distinguish from "still doing work" (the same gotcha
+/// `rk-harness/src/fake.rs`'s `still_running` helper documents).
+fn row_alive(row: &ProcessTableRow) -> bool {
+    !(row.stat.is_empty() || row.stat.starts_with('Z'))
+}
+
+/// Liveness evidence for one harness generation's own OS process, gathered
+/// directly from the process table rather than inferred from the daemon's
+/// event stream: whether `root` itself is still a real running process, and
+/// how many of its live descendants are still running underneath it — e.g. a
+/// `cargo test`/compiler the rat's own shell tool-use launched, or an `rk
+/// verify` CLI call blocked on the daemon's RPC, neither of which the
+/// harness event stream has any visibility into on its own. Reuses the exact
+/// `ppid`-walk [`descendant_process_groups`] already does for check-process
+/// teardown (TKT-01M0PN2JSN24AHGQHFJ4XGAVKD), just counting live pids instead
+/// of collecting groups to signal.
+pub(crate) struct ProcessLiveness {
+    pub(crate) child_alive: bool,
+    pub(crate) live_descendants: usize,
+}
+
+pub(crate) fn process_liveness(root: u32) -> ProcessLiveness {
+    let table = live_process_table();
+    let child_alive = table.iter().any(|row| row.pid == root && row_alive(row));
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for row in &table {
+        children.entry(row.ppid).or_default().push(row.pid);
+    }
+    let mut visited = HashSet::from([root]);
+    let mut queue = VecDeque::from([root]);
+    let mut live_descendants = 0usize;
+    while let Some(pid) = queue.pop_front() {
+        for &child in children.get(&pid).into_iter().flatten() {
+            if visited.insert(child) {
+                queue.push_back(child);
+                if table
+                    .iter()
+                    .find(|row| row.pid == child)
+                    .is_some_and(row_alive)
+                {
+                    live_descendants += 1;
+                }
+            }
+        }
+    }
+    ProcessLiveness {
+        child_alive,
+        live_descendants,
+    }
 }
 
 /// Every distinct process-group id live under `root` right now: `root`'s own
@@ -7639,6 +7703,7 @@ test a::flaky ... FAILED
             created_at: now,
             updated_at: now,
             archived_at: None,
+            liveness: Default::default(),
         };
         // The workflow's own `spawn` step ran and its `wait` completed against
         // this generation.

@@ -571,6 +571,7 @@ mod tests {
                     now
                 },
                 archived_at: None,
+                liveness: Default::default(),
             }
         }
 

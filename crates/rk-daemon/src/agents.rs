@@ -189,6 +189,56 @@ pub struct AgentRecord {
     /// marker in every rendered view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
+    /// Durable liveness evidence for the supervisor's stuck sweep
+    /// (`Supervisor::decide_sweep`), persisted alongside the rest of this
+    /// generation's state so a daemon restart re-reads exactly what the
+    /// previous process observed instead of granting a fresh grace window.
+    /// See [`LivenessObservation`].
+    #[serde(default)]
+    pub liveness: LivenessObservation,
+}
+
+/// Evidence a stuck sweep uses to tell a genuinely wedged/dead generation
+/// apart from one that is silent on the harness event stream but still doing
+/// real work underneath it — a live verifier descendant (`cargo test`, an
+/// `rk verify` CLI call blocked on the daemon), or bounded stdout/stderr/tool
+/// output that is still advancing. Written outside of
+/// [`Registry::update`](Registry::update) (via
+/// [`Registry::update_quiet`](Registry::update_quiet)) so recording it never
+/// itself resets the very silence clock (`AgentRecord::updated_at`) the sweep
+/// measures — this can only ever EXCUSE a generation already past that bar,
+/// never move the bar itself.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LivenessObservation {
+    /// Session token ([`Supervisor`](crate::supervisor::Supervisor)'s
+    /// `session_tokens`) this observation was recorded against. A respawn
+    /// mints a fresh token for the same agent name/generation
+    /// (`AgentRecord::spawn`/`created_at` is deliberately reused —
+    /// see `session_tokens`' own doc comment), so a mismatch here means this
+    /// evidence describes a predecessor process and must be read as absent,
+    /// never as current proof of life.
+    #[serde(default)]
+    pub session: Option<rk_core::id::SpawnId>,
+    /// Fingerprint of the last bounded output event (assistant text, tool
+    /// use, or stderr) observed for this session, and when it last actually
+    /// CHANGED — distinct from `updated_at`, which every event that touches
+    /// the registry bumps regardless of whether anything new was said.
+    #[serde(default)]
+    pub output_fingerprint: u64,
+    #[serde(default)]
+    pub output_changed_at: Option<DateTime<Utc>>,
+    /// Harness transport `Retry` events observed for this session since the
+    /// last real forward-progress event (assistant text, tool use, or
+    /// nonzero usage). A burst of these with nothing else moving is a
+    /// reconnect loop, not liveness — it must not, by itself, excuse a
+    /// generation from the stuck sweep.
+    #[serde(default)]
+    pub reconnect_events: u32,
+    /// When the CURRENT stuck episode was first observed unhealthy. `None`
+    /// = not currently in one. Persisted so the sweep's kill-grace clock
+    /// survives a daemon restart instead of resetting to a fresh window.
+    #[serde(default)]
+    pub ceiling_started_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1017,6 +1067,36 @@ impl Registry {
         Ok(Some(snapshot))
     }
 
+    /// Like [`update`](Self::update), but never touches `updated_at`, and
+    /// only persists to disk when `mutate` reports it actually changed
+    /// something (returns `true`).
+    ///
+    /// The stuck sweep's silence clock IS `updated_at`
+    /// (`Supervisor::decide_sweep`) — recording supplementary liveness
+    /// evidence (a bounded-output fingerprint, a reconnect-loop counter, the
+    /// sweep's own persisted grace ceiling) through the bumping `update`
+    /// would make observing that evidence itself reset the very silence it
+    /// is meant to explain, silently widening the stuck bar for every write.
+    /// The conditional persist matters for the same reason `resume_if_paused`
+    /// avoids the registry entirely on `AssistantText`/`ToolUse`: those are
+    /// the chattiest event paths in the harness pump, and this is the seam
+    /// that now observes them for liveness evidence — an unconditional write
+    /// would turn every token into a disk write.
+    pub fn update_quiet<F>(&mut self, name: &str, mutate: F) -> rk_core::Result<Option<AgentRecord>>
+    where
+        F: FnOnce(&mut AgentRecord) -> bool,
+    {
+        let Some(record) = self.agents.get_mut(name) else {
+            return Ok(None);
+        };
+        let changed = mutate(record);
+        let snapshot = record.clone();
+        if changed {
+            self.persist()?;
+        }
+        Ok(Some(snapshot))
+    }
+
     pub fn remove(&mut self, name: &str) -> rk_core::Result<Option<AgentRecord>> {
         let removed = self.agents.remove(name);
         if removed.is_some() {
@@ -1132,6 +1212,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             archived_at: None,
+            liveness: Default::default(),
         }
     }
 

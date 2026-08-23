@@ -935,6 +935,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             archived_at: None,
+            liveness: Default::default(),
         }
     }
 

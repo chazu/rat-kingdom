@@ -30,6 +30,25 @@ use tracing::{debug, info, warn};
 
 const MIN_PROGRESS_INTERVAL: chrono::Duration = chrono::Duration::seconds(5);
 
+/// Harness transport `Retry` events observed since the last real
+/// forward-progress event (assistant text, tool use, or nonzero usage) at or
+/// past which the stuck sweep treats the run as a reconnect loop rather than
+/// liveness — see [`LivenessEvidence`].
+const RECONNECT_LOOP_THRESHOLD: u32 = 3;
+
+/// Fingerprint of one bounded-output event, so the stuck sweep can tell
+/// "another event of this kind arrived, but it said exactly the same thing"
+/// (a wedged process re-emitting stale output) from genuine new content,
+/// without keeping the raw text around a second time (it already lives in
+/// `agent_log`/`stderr_tail`).
+fn output_fingerprint(kind: &str, text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut hasher);
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Error text [`Supervisor::spawn`] returns when `fleet_wip_cap` refused
 /// admission. Matched by name (not a dedicated [`rk_core::Error`] variant, to
 /// avoid widening a shared enum for one internal admission-control signal) by
@@ -335,6 +354,7 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
         created_at: now,
         updated_at: now,
         archived_at: None,
+        liveness: crate::agents::LivenessObservation::default(),
     }
 }
 
@@ -736,8 +756,12 @@ struct SweepState {
     last_cost_usd: f64,
     /// When the previous sweep observed this agent (burn-rate denominator).
     last_observed: DateTime<Utc>,
-    /// When the current STUCK/RUNAWAY episode was first flagged (soft-steered).
-    /// `None` = not currently flagged. The kill escalation measures from here.
+    /// When the current RUNAWAY episode was first flagged (soft-steered).
+    /// `None` = not currently flagged. The kill escalation measures from
+    /// here. In-memory only (a daemon restart is a fresh burn-rate episode —
+    /// unlike the STUCK axis, whose ceiling is persisted on the record
+    /// itself; see `AgentRecord::liveness::ceiling_started_at` and
+    /// `Supervisor::update_stuck_ceiling`).
     flagged_at: Option<DateTime<Utc>>,
 }
 
@@ -750,6 +774,41 @@ enum SweepAction {
     Soft { kind: &'static str, detail: String },
     /// Still flagged past the grace window: obstacle tuple + kill.
     Hard { kind: &'static str, detail: String },
+}
+
+/// Evidence [`Supervisor::gather_liveness_evidence`] found for one generation
+/// already silent past the stuck bar. A live verifier descendant or
+/// genuinely advancing bounded output [`proves_alive`](Self::proves_alive);
+/// a bare top-level process with neither ([`child_alive`](Self::child_alive)
+/// true but nothing under it, and nothing new said) is a truly wedged child,
+/// not proof of life — matching this feature's own title: it is active
+/// verifier DESCENDANTS being counted, not just the harness's own pid still
+/// technically existing. A reconnect loop vetoes the whole thing even when
+/// output looks like it is changing (a transport retry commonly logs its own
+/// error to stderr on every attempt).
+#[derive(Debug, Clone, Copy, Default)]
+struct LivenessEvidence {
+    child_alive: bool,
+    live_descendants: usize,
+    output_progressed: bool,
+    reconnect_loop: bool,
+}
+
+impl LivenessEvidence {
+    fn proves_alive(&self) -> bool {
+        !self.reconnect_loop && (self.live_descendants > 0 || self.output_progressed)
+    }
+}
+
+fn describe_stuck(idle_secs: u64, evidence: Option<&LivenessEvidence>) -> String {
+    match evidence {
+        Some(e) => format!(
+            "no events for {idle_secs}s while still running (child_alive={}, \
+             live_descendants={}, output_progressed={}, reconnect_loop={})",
+            e.child_alive, e.live_descendants, e.output_progressed, e.reconnect_loop
+        ),
+        None => format!("no events for {idle_secs}s while still running"),
+    }
 }
 
 /// One crashed agent's rolling self-healing-respawn state across sweeps.
@@ -2511,6 +2570,7 @@ impl Supervisor {
                 });
             }
             HarnessEvent::Usage { usage } => {
+                let real_usage = usage.total() > 0;
                 let updated = self.lock_registry().update(name, |r| {
                     r.usage.add(&usage);
                     // Incremental cost for harnesses that don't self-report
@@ -2519,6 +2579,12 @@ impl Supervisor {
                         if let Some(price) = self.pricing.lookup(model) {
                             r.cost_usd += price.cost(&usage);
                         }
+                    }
+                    // Nonzero usage means the model actually answered — proof
+                    // this generation is not stuck in a transport reconnect
+                    // loop (see `LivenessEvidence::reconnect_loop`).
+                    if real_usage {
+                        r.liveness.reconnect_events = 0;
                     }
                 });
                 if let Ok(Some(record)) = updated {
@@ -2736,14 +2802,17 @@ impl Supervisor {
             // Formerly dropped on the floor; now persisted as the agent's
             // transcript so the operator can `rk log` a run without --attach.
             HarnessEvent::AssistantText { text } => {
+                self.record_output_progress(name, "text", &text, true);
                 self.log
                     .append(name, spawn, crate::agent_log::LogEvent::Text { text });
             }
             HarnessEvent::ToolUse { name: tool } => {
+                self.record_output_progress(name, "tool", &tool, true);
                 self.log
                     .append(name, spawn, crate::agent_log::LogEvent::Tool { name: tool });
             }
             HarnessEvent::Retry { attempt, error } => {
+                self.record_reconnect_event(name);
                 self.log.append(
                     name,
                     spawn,
@@ -2756,8 +2825,31 @@ impl Supervisor {
                     spawn,
                     crate::agent_log::LogEvent::Stderr { text: text.clone() },
                 );
+                // stderr already unconditionally hits the registry (via the
+                // bumping `update`, for `stderr_tail`) regardless of this
+                // feature, so folding the fingerprint in here costs nothing
+                // extra — unlike `record_output_progress`, which throttles
+                // specifically because `AssistantText`/`ToolUse` otherwise
+                // never touch the registry at all. Deliberately does NOT
+                // reset `reconnect_events`: a transport-retry loop typically
+                // logs its own error to stderr on every attempt, and that
+                // chatter must not mask the loop it is reporting
+                // (`LivenessEvidence::reconnect_loop` vetoes stale-but-
+                // changing output for exactly this reason).
+                let fingerprint = output_fingerprint("stderr", &text);
+                let session = self.lock_session_tokens().get(name).copied();
                 let _ = self.lock_registry().update(name, |r| {
                     crate::agents::append_stderr_tail(&mut r.stderr_tail, &text);
+                    if r.liveness.session != session {
+                        r.liveness = crate::agents::LivenessObservation {
+                            session,
+                            ..Default::default()
+                        };
+                    }
+                    if r.liveness.output_fingerprint != fingerprint {
+                        r.liveness.output_fingerprint = fingerprint;
+                        r.liveness.output_changed_at = Some(Utc::now());
+                    }
                 });
             }
             HarnessEvent::ControlDelivered { envelope } => {
@@ -2780,6 +2872,65 @@ impl Supervisor {
                 }
             }
         }
+    }
+
+    /// Record one bounded-output liveness event (`AssistantText`/`ToolUse`)
+    /// for the stuck sweep, throttled like [`record_progress`](Self::record_progress)
+    /// — these are the chattiest events in the harness pump and deliberately
+    /// never otherwise touch the registry (see [`resume_if_paused`](Self::resume_if_paused)'s
+    /// doc comment), so this only actually persists once per
+    /// [`MIN_PROGRESS_INTERVAL`] even though it is called on every one. A
+    /// stale (respawned-over) session's evidence is discarded, not merged,
+    /// the moment a fresh one is observed — see
+    /// [`LivenessObservation::session`](crate::agents::LivenessObservation::session).
+    fn record_output_progress(&self, name: &str, kind: &str, text: &str, resets_reconnect: bool) {
+        let now = Utc::now();
+        let session = self.lock_session_tokens().get(name).copied();
+        let fingerprint = output_fingerprint(kind, text);
+        let _ = self.lock_registry().update_quiet(name, |r| {
+            let mut changed = false;
+            if r.liveness.session != session {
+                r.liveness = crate::agents::LivenessObservation {
+                    session,
+                    ..Default::default()
+                };
+                changed = true;
+            }
+            let fresh = r
+                .liveness
+                .output_changed_at
+                .is_some_and(|at| now - at < MIN_PROGRESS_INTERVAL);
+            if !fresh && r.liveness.output_fingerprint != fingerprint {
+                r.liveness.output_fingerprint = fingerprint;
+                r.liveness.output_changed_at = Some(now);
+                changed = true;
+            }
+            if resets_reconnect && r.liveness.reconnect_events != 0 {
+                r.liveness.reconnect_events = 0;
+                changed = true;
+            }
+            changed
+        });
+    }
+
+    /// Record a harness transport `Retry` event for the stuck sweep. Never
+    /// throttled (unlike [`record_output_progress`](Self::record_output_progress)):
+    /// a retry storm is exactly what
+    /// [`LivenessEvidence::reconnect_loop`](LivenessEvidence::reconnect_loop)
+    /// needs an accurate count of, and retries are inherently rate-limited by
+    /// the harness's own backoff, never per-token chatty.
+    fn record_reconnect_event(&self, name: &str) {
+        let session = self.lock_session_tokens().get(name).copied();
+        let _ = self.lock_registry().update_quiet(name, |r| {
+            if r.liveness.session != session {
+                r.liveness = crate::agents::LivenessObservation {
+                    session,
+                    ..Default::default()
+                };
+            }
+            r.liveness.reconnect_events = r.liveness.reconnect_events.saturating_add(1);
+            true
+        });
     }
 
     /// Lift a [`Paused`](AgentState::Paused) record back to `Running` — the
@@ -3547,6 +3698,8 @@ impl Supervisor {
         });
 
         // Burn rate (USD/min) since the previous sweep of this agent.
+        // Unaffected by everything below: liveness evidence excuses SILENCE,
+        // never cost.
         let dt_min = (now - st.last_observed).num_milliseconds() as f64 / 60_000.0;
         let burn = if dt_min > 0.0 {
             (record.cost_usd - st.last_cost_usd) / dt_min
@@ -3555,13 +3708,39 @@ impl Supervisor {
         };
         st.last_cost_usd = record.cost_usd;
         st.last_observed = now;
-
-        let idle_secs = (now - record.updated_at).num_seconds().max(0) as u64;
-        let stuck = cfg.stuck_after_secs > 0 && idle_secs >= cfg.stuck_after_secs;
         let running_away = cfg.burn_usd_per_min > 0.0 && burn >= cfg.burn_usd_per_min;
 
+        // The silence bar is UNCHANGED from before this feature — evidence
+        // gathered below can only EXCUSE a generation already past it, never
+        // move the bar itself or flag one earlier.
+        let idle_secs = (now - record.updated_at).num_seconds().max(0) as u64;
+        let silent = cfg.stuck_after_secs > 0 && idle_secs >= cfg.stuck_after_secs;
+        let evidence = silent.then(|| self.gather_liveness_evidence(record, now, cfg));
+        let alive = evidence
+            .as_ref()
+            .is_some_and(LivenessEvidence::proves_alive);
+        // An operator's own `rk progress` check-in is an auditable override,
+        // not a required babysitting path: it is read here exactly like any
+        // other excusing signal (never mandatory for a healthy check to
+        // survive) and never touched by the event-pump seams above.
+        let window = chrono::Duration::seconds(cfg.stuck_after_secs.max(1) as i64);
+        let operator_overrode = silent
+            && record
+                .progress
+                .as_ref()
+                .is_some_and(|p| now - p.updated_at < window);
+        let stuck = silent && !alive && !operator_overrode;
+
+        // The stuck episode's ceiling is persisted on the record itself
+        // (`AgentRecord::liveness::ceiling_started_at`), independent of this
+        // in-memory `SweepState` — restart-safe by construction, since it is
+        // read back from the very same `agents.json` a fresh daemon loads.
+        // Kept deliberately separate from `st.flagged_at` (which still
+        // governs ONLY the runaway axis below) so a stuck episode's clock can
+        // never leak into, or be reset by, an unrelated burn-rate episode.
+        let stuck_ceiling = self.update_stuck_ceiling(&record.name, stuck, now);
+
         if !stuck && !running_away {
-            // Recovered (or never flagged): clear any open episode.
             st.flagged_at = None;
             return SweepAction::None;
         }
@@ -3569,10 +3748,7 @@ impl Supervisor {
         // Stuck takes precedence in the message; both post an obstacle whose
         // `type` a reactor #Trigger can match ("stuck" / "runaway").
         let (kind, detail): (&'static str, String) = if stuck {
-            (
-                "stuck",
-                format!("no events for {idle_secs}s while still running"),
-            )
+            ("stuck", describe_stuck(idle_secs, evidence.as_ref()))
         } else {
             (
                 "runaway",
@@ -3580,11 +3756,20 @@ impl Supervisor {
             )
         };
 
-        match st.flagged_at {
-            None => {
-                st.flagged_at = Some(now);
-                SweepAction::Soft { kind, detail }
+        let flagged_since = if stuck {
+            stuck_ceiling
+        } else {
+            match st.flagged_at {
+                None => {
+                    st.flagged_at = Some(now);
+                    None
+                }
+                some => some,
             }
+        };
+
+        match flagged_since {
+            None => SweepAction::Soft { kind, detail },
             Some(flagged) => {
                 let elapsed = (now - flagged).num_seconds().max(0) as u64;
                 if elapsed >= cfg.kill_grace_secs {
@@ -3594,6 +3779,93 @@ impl Supervisor {
                 }
             }
         }
+    }
+
+    /// Gather this generation's liveness evidence: whether its harness's own
+    /// process still has a live verifier descendant underneath it (a `cargo
+    /// test`/compiler its own tool-use launched, or an `rk verify` CLI call
+    /// blocked on the daemon — see [`crate::workflow_exec::process_liveness`]),
+    /// and whether its bounded output (assistant text, tool use, stderr) has
+    /// genuinely advanced within the same window the silence bar itself
+    /// uses. Only called once a generation is already silent past that bar
+    /// (see [`decide_sweep`](Self::decide_sweep)) — this can only excuse it,
+    /// never flag one earlier.
+    fn gather_liveness_evidence(
+        &self,
+        record: &AgentRecord,
+        now: DateTime<Utc>,
+        cfg: &SupervisorConfig,
+    ) -> LivenessEvidence {
+        let session = self.lock_session_tokens().get(&record.name).copied();
+        let session_matches = record.liveness.session == session;
+
+        let process = record
+            .pid
+            .map(crate::workflow_exec::process_liveness)
+            .unwrap_or(crate::workflow_exec::ProcessLiveness {
+                child_alive: false,
+                live_descendants: 0,
+            });
+
+        let window = chrono::Duration::seconds(cfg.stuck_after_secs.max(1) as i64);
+        // A stale (respawned-over) session's stored evidence describes a
+        // predecessor process, never proof of THIS generation's liveness.
+        let output_progressed = session_matches
+            && record
+                .liveness
+                .output_changed_at
+                .is_some_and(|at| now - at < window);
+        let reconnect_loop =
+            session_matches && record.liveness.reconnect_events >= RECONNECT_LOOP_THRESHOLD;
+
+        LivenessEvidence {
+            child_alive: process.child_alive,
+            live_descendants: process.live_descendants,
+            output_progressed,
+            reconnect_loop,
+        }
+    }
+
+    /// Read-modify-write the persisted stuck-episode ceiling for `name`'s
+    /// CURRENT session (a stale, respawned-over session's ceiling is
+    /// discarded, never inherited — same rule as
+    /// [`gather_liveness_evidence`](Self::gather_liveness_evidence)). Returns
+    /// what the ceiling held BEFORE this write: `None` means this sweep is
+    /// the first to observe the episode (matches `SweepAction::Soft`'s
+    /// "just flagged" moment, whether that is because it is genuinely new or
+    /// because a fresh daemon generation is seeing it for the first time);
+    /// `Some(started)` is the elapsed-time anchor `kill_grace_secs` measures
+    /// from, unchanged by a restart in between.
+    fn update_stuck_ceiling(
+        &self,
+        name: &str,
+        stuck: bool,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let session = self.lock_session_tokens().get(name).copied();
+        let mut previous = None;
+        let _ = self.lock_registry().update_quiet(name, |r| {
+            if r.liveness.session != session {
+                r.liveness = crate::agents::LivenessObservation {
+                    session,
+                    ..Default::default()
+                };
+            }
+            previous = r.liveness.ceiling_started_at;
+            if stuck {
+                if r.liveness.ceiling_started_at.is_none() {
+                    r.liveness.ceiling_started_at = Some(now);
+                    return true;
+                }
+                false
+            } else if r.liveness.ceiling_started_at.is_some() {
+                r.liveness.ceiling_started_at = None;
+                true
+            } else {
+                false
+            }
+        });
+        previous
     }
 
     fn steer_flagged(&self, record: &AgentRecord, kind: &str) {
@@ -7147,6 +7419,7 @@ mod respawn_tests {
             created_at: now,
             updated_at: now,
             archived_at: None,
+            liveness: Default::default(),
         }
     }
 
@@ -8555,5 +8828,256 @@ mod verification_admission_tests {
         .await
         .expect("two repos sharing a directory basename must not share an admission bound")
         .unwrap();
+    }
+}
+
+/// TKT-01M0HNF2HR9Y0PY44RHY4Q245P: durable liveness evidence for the stuck
+/// sweep, replacing "silence past `stuck_after_secs` is stuck" with "silence
+/// past `stuck_after_secs` AND no live verifier descendant, no advancing
+/// bounded output, no operator override, and not a reconnect loop is stuck".
+/// Every test here calls `decide_sweep` directly with an explicit `now`, so
+/// elapsed time is simulated rather than slept — no test in this module
+/// actually waits on a wall-clock grace window.
+#[cfg(test)]
+mod stuck_liveness_tests {
+    use super::*;
+    use rk_ledger::{Budget, FleetBudget};
+    use std::path::Path;
+
+    fn sup(home: &Path) -> Arc<Supervisor> {
+        let layout = Layout::at(home);
+        let tickets = Arc::new(crate::tickets::Tickets::new(
+            Space::open_in_memory().unwrap(),
+            "castle".into(),
+        ));
+        Arc::new(
+            Supervisor::new(
+                layout,
+                "castle".into(),
+                "fake".into(),
+                Budget::default(),
+                FleetBudget::default(),
+                Space::open_in_memory().unwrap(),
+                tickets,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn cfg(stuck_after_secs: u64, kill_grace_secs: u64) -> SupervisorConfig {
+        SupervisorConfig {
+            enabled: true,
+            stuck_after_secs,
+            kill_grace_secs,
+            burn_usd_per_min: 0.0,
+            ..SupervisorConfig::default()
+        }
+    }
+
+    fn record(name: &str, pid: Option<u32>, updated_at: DateTime<Utc>) -> AgentRecord {
+        let now = Utc::now();
+        AgentRecord {
+            name: name.to_string(),
+            spawn: Some(rk_core::id::SpawnId::new()),
+            role: "worker".into(),
+            coordination: None,
+            harness: "fake".into(),
+            permission_mode: None,
+            model: None,
+            repo_root: PathBuf::from("/tmp"),
+            repo_name: "repo".into(),
+            task: Some("task".into()),
+            branch: None,
+            fork_point: None,
+            worktree: None,
+            target_branch: "main".into(),
+            parent: None,
+            workflow_instance: None,
+            review: None,
+            coordinator: None,
+            session_id: None,
+            attach_target: None,
+            pid,
+            merge_commit: None,
+            state: AgentState::Running,
+            crashed: false,
+            stderr_tail: None,
+            result: None,
+            progress: None,
+            usage: TokenUsage::default(),
+            cost_usd: 0.0,
+            created_at: now,
+            updated_at,
+            archived_at: None,
+            liveness: crate::agents::LivenessObservation::default(),
+        }
+    }
+
+    /// A real process with a live child underneath it (`sleep 300 & wait`,
+    /// mirroring `spawn_check_child`'s own leader shape) — standing in for a
+    /// `cargo test`/compiler a rat's own tool-use launched, or an `rk verify`
+    /// CLI call still blocked on the daemon. Silence has run WAY past
+    /// `stuck_after_secs` (the "long" in "long silent-but-live verifier"),
+    /// but the live descendant alone must still excuse it — the event stream
+    /// itself never has to say a word.
+    #[tokio::test]
+    async fn long_silent_but_live_verifier_descendant_prevents_kill() {
+        let home = tempfile::tempdir().unwrap();
+        let s = sup(home.path());
+        let mut leader = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300 & wait")
+            .spawn()
+            .unwrap();
+        let pid = leader.id();
+
+        let base = Utc::now() - chrono::Duration::seconds(600);
+        let r = record("verifier-1", Some(pid), base);
+        s.lock_registry().insert(r.clone()).unwrap();
+
+        let action = s.decide_sweep(&r, base + chrono::Duration::seconds(590), &cfg(60, 30));
+        assert!(
+            matches!(action, SweepAction::None),
+            "a live verifier descendant must excuse silence, however long"
+        );
+
+        let _ = leader.kill();
+    }
+
+    /// Bounded output (assistant text / tool use) that keeps genuinely
+    /// changing is liveness on its own, with no live descendant and no
+    /// process at all (`pid: None`) — the harness event pump proves it, not
+    /// the OS.
+    #[tokio::test]
+    async fn advancing_bounded_output_prevents_kill_with_no_process_at_all() {
+        let home = tempfile::tempdir().unwrap();
+        let s = sup(home.path());
+        let base = Utc::now() - chrono::Duration::seconds(120);
+        let now = base + chrono::Duration::seconds(90);
+        let mut r = record("chatty-1", None, base);
+        r.liveness.output_changed_at = Some(now - chrono::Duration::seconds(5));
+        s.lock_registry().insert(r.clone()).unwrap();
+
+        let action = s.decide_sweep(&r, now, &cfg(60, 30));
+        assert!(
+            matches!(action, SweepAction::None),
+            "recently-advancing bounded output must excuse silence"
+        );
+    }
+
+    /// No descendant, no output, no lease, no override: a process that is
+    /// genuinely alive by `kill(pid, 0)` but has done nothing at all is
+    /// exactly what this feature must still catch — proof this is COUNTING
+    /// live verifier descendants, not just checking the top-level pid.
+    #[tokio::test]
+    async fn truly_wedged_child_is_killed_after_grace() {
+        let home = tempfile::tempdir().unwrap();
+        let s = sup(home.path());
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        let base = Utc::now() - chrono::Duration::seconds(120);
+        let r = record("wedged-1", Some(pid), base);
+        s.lock_registry().insert(r.clone()).unwrap();
+        let c = cfg(60, 30);
+
+        let flagged = base + chrono::Duration::seconds(70);
+        let first = s.decide_sweep(&r, flagged, &c);
+        assert!(
+            matches!(first, SweepAction::Soft { kind: "stuck", .. }),
+            "a bare alive-but-idle process must still flag stuck"
+        );
+
+        let still_within_grace = s.decide_sweep(&r, flagged + chrono::Duration::seconds(29), &c);
+        assert!(matches!(still_within_grace, SweepAction::None));
+
+        let past_grace = s.decide_sweep(&r, flagged + chrono::Duration::seconds(31), &c);
+        assert!(
+            matches!(past_grace, SweepAction::Hard { kind: "stuck", .. }),
+            "capacity must be reclaimed once genuinely wedged, same as before this feature"
+        );
+
+        let _ = child.kill();
+    }
+
+    /// A harness transport reconnect loop must NOT count as liveness even
+    /// though it is producing bounded-output-shaped chatter (a retry's own
+    /// error text, commonly logged to stderr on every attempt) — the
+    /// reconnect counter vetoes the whole evidence bundle.
+    #[tokio::test]
+    async fn transport_reconnect_loop_is_killed_after_grace() {
+        let home = tempfile::tempdir().unwrap();
+        let s = sup(home.path());
+        let base = Utc::now() - chrono::Duration::seconds(120);
+        let mut r = record("reconnecting-1", None, base);
+        r.liveness.reconnect_events = RECONNECT_LOOP_THRESHOLD;
+        s.lock_registry().insert(r.clone()).unwrap();
+        let c = cfg(60, 30);
+
+        let flagged = base + chrono::Duration::seconds(70);
+        // Fresh "output" arrives inside the same sweep as the reconnect
+        // burst — without the veto this alone would read as advancing
+        // output and excuse it.
+        r.liveness.output_changed_at = Some(flagged - chrono::Duration::seconds(1));
+        let first = s.decide_sweep(&r, flagged, &c);
+        assert!(
+            matches!(first, SweepAction::Soft { kind: "stuck", .. }),
+            "reconnect-loop chatter must not be read as liveness"
+        );
+
+        let past_grace = s.decide_sweep(&r, flagged + chrono::Duration::seconds(31), &c);
+        assert!(matches!(
+            past_grace,
+            SweepAction::Hard { kind: "stuck", .. }
+        ));
+    }
+
+    /// The kill-grace ceiling is persisted on the record itself
+    /// (`AgentRecord::liveness::ceiling_started_at`), so a fresh `Supervisor`
+    /// over the SAME on-disk registry (a daemon restart) must resume the
+    /// SAME clock, not grant a new grace window from its own construction
+    /// time.
+    #[tokio::test]
+    async fn stuck_ceiling_survives_a_restart_without_resetting() {
+        let home = tempfile::tempdir().unwrap();
+        let sup1 = sup(home.path());
+        let base = Utc::now() - chrono::Duration::seconds(120);
+        let r = record("restart-1", None, base);
+        sup1.lock_registry().insert(r.clone()).unwrap();
+        let c = cfg(60, 30);
+
+        let flagged = base + chrono::Duration::seconds(70);
+        let first = sup1.decide_sweep(&r, flagged, &c);
+        assert!(matches!(first, SweepAction::Soft { kind: "stuck", .. }));
+
+        // Simulate a daemon restart: a brand-new Supervisor over the same
+        // home directory, with an entirely empty in-memory sweep/session
+        // state, reloading the registry (and its `liveness`) from disk.
+        let sup2 = sup(home.path());
+        let reloaded = sup2.lock_registry().get("restart-1").unwrap().clone();
+        assert_eq!(
+            reloaded.liveness.ceiling_started_at,
+            Some(flagged),
+            "the ceiling must reload exactly as the predecessor persisted it"
+        );
+
+        let still_within_original_grace =
+            sup2.decide_sweep(&reloaded, flagged + chrono::Duration::seconds(29), &c);
+        assert!(
+            matches!(still_within_original_grace, SweepAction::None),
+            "must not escalate before the ORIGINAL ceiling's grace elapses"
+        );
+
+        let past_original_grace =
+            sup2.decide_sweep(&reloaded, flagged + chrono::Duration::seconds(31), &c);
+        assert!(
+            matches!(past_original_grace, SweepAction::Hard { kind: "stuck", .. }),
+            "the post-restart sweep must escalate on the PRE-restart clock, \
+             proving the ceiling was never reset by the restart"
+        );
     }
 }
