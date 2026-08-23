@@ -698,3 +698,182 @@ async fn daemon_restart_never_blocks_progress_on_a_run_that_was_in_flight_when_i
     let _ = handle_b.await;
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
+
+/// Sets up two independently registered repos and two SEPARATE operator
+/// connections, each issuing its own FIRST `verify.run` call — so both
+/// genuinely mint `req.id == "1"` (`Client::next_id` starts at 0 and is
+/// incremented once per call, fresh per `Client` instance) under the exact
+/// same caller (`"operator"`). Before the Warbeak-11 REWORK, `server.rs`'s
+/// `verify_request_key` keyed the process-global `ManagedVerificationRuns`
+/// request index on `(req.caller, req.id)` alone, so both registrations here
+/// used to collide on the identical string key `"operator#1"` — this is the
+/// exact repro shape that made disconnecting one connection able to cancel
+/// the other's genuinely unrelated run. Returns both real check-child pids,
+/// confirmed alive, plus the two in-flight call tasks so the caller can pick
+/// which connection dies first.
+async fn spawn_two_colliding_verify_runs(
+    layout: &Layout,
+    repo_a: &Path,
+    repo_a_name: &str,
+    repo_b: &Path,
+    repo_b_name: &str,
+) -> (
+    i32,
+    i32,
+    tokio::task::JoinHandle<rk_core::Result<serde_json::Value>>,
+    tokio::task::JoinHandle<rk_core::Result<serde_json::Value>>,
+) {
+    let doomed_a = Client::connect_as_operator(layout).await.unwrap();
+    let repo_a_for_call = repo_a_name.to_string();
+    let call_a = tokio::spawn(async move {
+        let mut doomed_a = doomed_a;
+        doomed_a
+            .call(
+                "verify.run",
+                json!({"repo": repo_a_for_call, "check": "verify"}),
+            )
+            .await
+    });
+
+    let doomed_b = Client::connect_as_operator(layout).await.unwrap();
+    let repo_b_for_call = repo_b_name.to_string();
+    let call_b = tokio::spawn(async move {
+        let mut doomed_b = doomed_b;
+        doomed_b
+            .call(
+                "verify.run",
+                json!({"repo": repo_b_for_call, "check": "verify"}),
+            )
+            .await
+    });
+
+    let pid_a = wait_for_pid(&repo_a.join("verify.pid")).await;
+    let pid_b = wait_for_pid(&repo_b.join("verify.pid")).await;
+    assert!(
+        process_alive(pid_a),
+        "repo A's check child must be alive before either connection disconnects"
+    );
+    assert!(
+        process_alive(pid_b),
+        "repo B's check child must be alive before either connection disconnects"
+    );
+
+    (pid_a, pid_b, call_a, call_b)
+}
+
+async fn register_two_repos(
+    client: &mut Client,
+) -> (tempfile::TempDir, String, tempfile::TempDir, String) {
+    let repo_a = tempfile::tempdir().unwrap();
+    let repo_a_name = init_repo(repo_a.path());
+    install_verify_check(repo_a.path());
+
+    let repo_b = tempfile::tempdir().unwrap();
+    let repo_b_name = init_repo(repo_b.path());
+    install_verify_check(repo_b.path());
+
+    client
+        .call(
+            "repo.add",
+            json!({"name": &repo_a_name, "path": repo_a.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+    client
+        .call(
+            "repo.add",
+            json!({"name": &repo_b_name, "path": repo_b.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+
+    (repo_a, repo_a_name, repo_b, repo_b_name)
+}
+
+/// The Warbeak-11 REWORK's core regression proof, first disconnect order:
+/// two concurrent connections sharing a caller and a colliding request id
+/// (see [`spawn_two_colliding_verify_runs`]) — killing connection A's socket
+/// must cancel ONLY repo A's real managed child. Repo B's genuinely
+/// concurrent run, registered under what used to be the identical string
+/// key, must be provably unaffected. This is also the "repeated/reused
+/// client ids cannot cancel a newer connection" acceptance item: A and B's
+/// wire-level `(caller, id)` pair is identical, so only a daemon-issued
+/// per-connection identity (not that pair) can be what keeps them apart.
+#[tokio::test]
+async fn concurrent_connections_sharing_a_caller_and_colliding_request_id_stay_isolated_when_the_first_disconnects(
+) {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    let mut client = start_daemon(&layout).await;
+    let (repo_a, repo_a_name, repo_b, repo_b_name) = register_two_repos(&mut client).await;
+
+    let (pid_a, pid_b, call_a, call_b) = spawn_two_colliding_verify_runs(
+        &layout,
+        repo_a.path(),
+        &repo_a_name,
+        repo_b.path(),
+        &repo_b_name,
+    )
+    .await;
+
+    // Kill only connection A's socket mid-call.
+    call_a.abort();
+    let _ = call_a.await;
+    wait_for_death(pid_a).await;
+
+    // The regression this REWORK item exists for: B's genuinely concurrent,
+    // colliding-key run must be UNAFFECTED by A's disconnect.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        process_alive(pid_b),
+        "repo B's verify run, sharing caller+request-id with repo A's, must be unaffected by \
+         repo A's connection disconnecting"
+    );
+
+    // Cleanup: cancel B's own connection too so its child does not outlive
+    // this test.
+    call_b.abort();
+    let _ = call_b.await;
+    wait_for_death(pid_b).await;
+}
+
+/// The mirror of
+/// [`concurrent_connections_sharing_a_caller_and_colliding_request_id_stay_isolated_when_the_first_disconnects`]
+/// with the disconnect order reversed — the acceptance criterion is
+/// "disconnecting EITHER kills only its own child", which a single order
+/// cannot prove: fixing the bug asymmetrically (e.g. always keying off the
+/// first-registered run for a colliding key) could pass one order and fail
+/// the other.
+#[tokio::test]
+async fn concurrent_connections_sharing_a_caller_and_colliding_request_id_stay_isolated_when_the_second_disconnects(
+) {
+    let home = tempfile::tempdir().unwrap();
+    let layout = Layout::at(home.path());
+    let mut client = start_daemon(&layout).await;
+    let (repo_a, repo_a_name, repo_b, repo_b_name) = register_two_repos(&mut client).await;
+
+    let (pid_a, pid_b, call_a, call_b) = spawn_two_colliding_verify_runs(
+        &layout,
+        repo_a.path(),
+        &repo_a_name,
+        repo_b.path(),
+        &repo_b_name,
+    )
+    .await;
+
+    // This time, kill only connection B's socket mid-call.
+    call_b.abort();
+    let _ = call_b.await;
+    wait_for_death(pid_b).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        process_alive(pid_a),
+        "repo A's verify run, sharing caller+request-id with repo B's, must be unaffected by \
+         repo B's connection disconnecting"
+    );
+
+    call_a.abort();
+    let _ = call_a.await;
+    wait_for_death(pid_a).await;
+}

@@ -24,6 +24,7 @@ use rk_space::{CoordinatorEvent, Space};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -118,15 +119,26 @@ fn may_withdraw(caller: &str, proposer: &str) -> bool {
 }
 
 /// Correlates one `verify.run` call with the connection handling it
-/// (TKT-01M0PA6C5WYRWS757R1SS2F2GR): `serve_conn` computes this before
-/// dispatch to watch for the connection dying mid-call, and
+/// (TKT-01M0PA6C5WYRWS757R1SS2F2GR, fenced by connection identity per the
+/// Warbeak-11 REWORK on it): `dispatch_watching_disconnect` computes this
+/// before dispatch to watch for the connection dying mid-call, and
 /// `handle_verify_run` computes the SAME value to register under, so the two
-/// always agree without threading an extra value through `dispatch`. `req.id`
-/// alone is caller-controlled and not guaranteed unique fleet-wide, but this
-/// only ever needs to be unique among calls currently in flight, and the
-/// wire protocol allows exactly one in-flight request per connection.
-fn verify_request_key(caller: &str, id: &str) -> String {
-    format!("{caller}#{id}")
+/// always agree. `conn_id` is threaded down from `serve_conn`'s own
+/// [`Daemon::conn_seq`], a daemon-issued, monotonically increasing counter
+/// minted exactly once per accepted connection and never sent to the client
+/// — it cannot be forged, replayed, or reused by a later connection the way
+/// `req.caller` (an agent's own name, shared across every connection it
+/// opens) or `req.id` (client-controlled, and reset to `"1"` at the start of
+/// every fresh `Client` connection) can be. Two concurrent connections from
+/// the SAME caller sending the same `req.id` therefore still mint distinct
+/// keys, so disconnecting one can never cancel or be confused with the
+/// other's in-flight run. This only ever needs to be unique among calls
+/// currently in flight, and the wire protocol allows exactly one in-flight
+/// request per connection, so `conn_id` alone (without `req.id`) would
+/// already be sufficient; `req.id` is kept in the key for log/debug
+/// readability, not for its uniqueness contribution.
+fn verify_request_key(conn_id: u64, id: &str) -> String {
+    format!("{conn_id}#{id}")
 }
 
 pub struct Daemon {
@@ -218,6 +230,17 @@ pub struct Daemon {
     started: Instant,
     shutdown_tx: watch::Sender<bool>,
     request_clock: RequestClock,
+    /// Daemon-issued, monotonically increasing, unforgeable per-connection
+    /// identity (TKT-01M0PA6C5WYRWS757R1SS2F2GR REWORK): minted once per
+    /// accepted connection in `serve_conn` and never transmitted to the
+    /// client, so it cannot be forged or replayed. Fences
+    /// `verify_request_key` to the actual connection rather than the
+    /// caller-controlled `(req.caller, req.id)` pair, which is not
+    /// connection-unique — `req.id` resets to `"1"` at the start of every
+    /// fresh `Client` connection, so two concurrent connections from the
+    /// same caller used to be able to collide in the process-global
+    /// `ManagedVerificationRuns` request index.
+    conn_seq: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -638,6 +661,7 @@ impl Daemon {
             started: Instant::now(),
             shutdown_tx,
             request_clock: Utc::now,
+            conn_seq: AtomicU64::new(0),
         })
     }
 
@@ -1376,6 +1400,11 @@ impl Daemon {
         let mut read = BufReader::new(read);
         let mut buf = Vec::new();
         let mut noted_client_build = false;
+        // Minted once per accepted connection — see `Daemon::conn_seq` and
+        // `verify_request_key` for why this, and not `req.caller`/`req.id`,
+        // is what fences a `verify.run` registration to the connection that
+        // made it.
+        let conn_id = self.conn_seq.fetch_add(1, Ordering::Relaxed);
 
         loop {
             buf.clear();
@@ -1442,11 +1471,10 @@ impl Daemon {
                     format!("{} is not authorized for {}", req.caller, req.method),
                 )),
                 Ok(req) if req.method == "verify.run" => {
-                    let key = verify_request_key(&req.caller, &req.id);
-                    self.dispatch_watching_disconnect(req, &mut read, &key)
+                    self.dispatch_watching_disconnect(req, &mut read, conn_id)
                         .await
                 }
-                Ok(req) => self.dispatch(req).await,
+                Ok(req) => self.dispatch(req, conn_id).await,
                 Err(e) => Outcome::Reply(Response::err(
                     "",
                     codes::BAD_PARAMS,
@@ -1504,13 +1532,20 @@ impl Daemon {
     /// not support pipelining for — there is no legitimate next-request
     /// framing to preserve either way, so a non-zero read is simply ignored
     /// rather than risked as a would-be cancellation signal.
+    ///
+    /// `conn_id` is `serve_conn`'s daemon-issued per-connection identity
+    /// (Warbeak-11 REWORK), threaded down to `dispatch` -> `handle_verify_run`
+    /// so both halves of the binding compute the identical
+    /// [`verify_request_key`] from the connection that actually made this
+    /// call, never from the caller-controlled `(req.caller, req.id)` pair.
     async fn dispatch_watching_disconnect(
         &self,
         req: Request,
         read: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
-        request_key: &str,
+        conn_id: u64,
     ) -> Outcome {
-        let dispatch_fut = self.dispatch(req);
+        let request_key = verify_request_key(conn_id, &req.id);
+        let dispatch_fut = self.dispatch(req, conn_id);
         tokio::pin!(dispatch_fut);
         loop {
             tokio::select! {
@@ -1522,7 +1557,7 @@ impl Daemon {
                     let mut probe = [0u8; 1];
                     if let Ok(0) = read.get_ref().try_read(&mut probe) {
                         self.supervisor.cancel_managed_verification_request(
-                            request_key,
+                            &request_key,
                             "caller_disconnect",
                         );
                         return dispatch_fut.await;
@@ -2267,7 +2302,7 @@ impl Daemon {
         }
     }
 
-    async fn dispatch(&self, req: Request) -> Outcome {
+    async fn dispatch(&self, req: Request, conn_id: u64) -> Outcome {
         debug!(method = %req.method, id = %req.id, "dispatch");
         let id = req.id.clone();
         let reply = |r: Response| Outcome::Reply(r);
@@ -2500,7 +2535,7 @@ impl Daemon {
                 )
             }
             "workflow.run" => reply(self.handle_workflow_run(req).await),
-            "verify.run" => reply(self.handle_verify_run(req).await),
+            "verify.run" => reply(self.handle_verify_run(req, conn_id).await),
             "factory.propose_action" => reply(self.handle_factory_propose_action(req)),
             "factory.approve_action" => reply(self.handle_factory_approve_action(req)),
             "factory.execute_action" => reply(self.handle_factory_execute_action(req).await),
@@ -6928,7 +6963,11 @@ impl Daemon {
     /// `verify_request_key` correlates it with `serve_conn`'s
     /// [`dispatch_watching_disconnect`](Self::dispatch_watching_disconnect),
     /// which cancels it the moment this RPC connection dies mid-call.
-    async fn handle_verify_run(&self, req: Request) -> Response {
+    /// `conn_id` is that same connection's daemon-issued identity, threaded
+    /// down through `dispatch` so both sides compute the identical key —
+    /// see [`verify_request_key`] for why this, not `req.caller`, is what
+    /// fences the registration.
+    async fn handle_verify_run(&self, req: Request, conn_id: u64) -> Response {
         let params: VerifyRunParams = match parse_params(&req.params) {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
@@ -6989,7 +7028,7 @@ impl Daemon {
         } else {
             req.caller.as_str()
         };
-        let request_key = verify_request_key(&req.caller, &req.id);
+        let request_key = verify_request_key(conn_id, &req.id);
         match self
             .engine()
             .verify_repo_check(
