@@ -1172,6 +1172,34 @@ pub struct PolicyConfig {
     /// `rk_daemon::Reap::artifact_paths_by_repo`). A repo absent here uses the
     /// fleet-wide default above.
     pub verification_admission_limit_by_repo: BTreeMap<String, u32>,
+    /// Fleet-wide default max concurrent LIVE implementing agents (every role
+    /// except `"reviewer"`) for one repository at a time — the
+    /// "implementation lane" (TKT-01M0P2KM83Y4MD5QYETR3JCKF2). Checked
+    /// atomically alongside the pre-existing fleet-wide `[drain] max_wip`
+    /// ceiling inside `Supervisor::spawn`, so drain, workflow fan-out, and
+    /// operator `agent.spawn` dispatch are ALL bound by it — the fleet-wide
+    /// ceiling has no repo dimension at all (one repo can exhaust it), this
+    /// one does. `0` (the default) disables it: zero behaviour change for a
+    /// repo that hasn't opted in, matching this file's `0 = disabled`
+    /// convention.
+    pub implementation_admission_limit: u32,
+    /// Per-repo override of
+    /// [`implementation_admission_limit`](Self::implementation_admission_limit),
+    /// keyed by repo name, same fallback role as
+    /// [`verification_admission_limit_by_repo`](Self::verification_admission_limit_by_repo).
+    /// Seeded with `rat-kingdom: 2` — this throughput program's own explicit
+    /// default cap on implementing rats for this repository.
+    pub implementation_admission_limit_by_repo: BTreeMap<String, u32>,
+    /// Fleet-wide default max concurrent LIVE `role == "reviewer"` agents for
+    /// one repository at a time — the "review lane", independent of
+    /// [`implementation_admission_limit`](Self::implementation_admission_limit)
+    /// so a saturated implementation lane can never starve a reviewer's
+    /// admission. `0` (the default) disables it.
+    pub review_admission_limit: u32,
+    /// Per-repo override of [`review_admission_limit`](Self::review_admission_limit),
+    /// keyed by repo name, same fallback role as the other admission limits
+    /// above.
+    pub review_admission_limit_by_repo: BTreeMap<String, u32>,
 }
 
 impl Default for PolicyConfig {
@@ -1189,6 +1217,10 @@ impl Default for PolicyConfig {
             orchestrator_lease_ttl_secs: 300,
             verification_admission_limit: 0,
             verification_admission_limit_by_repo: BTreeMap::new(),
+            implementation_admission_limit: 0,
+            implementation_admission_limit_by_repo: BTreeMap::from([("rat-kingdom".to_string(), 2)]),
+            review_admission_limit: 0,
+            review_admission_limit_by_repo: BTreeMap::new(),
         }
     }
 }

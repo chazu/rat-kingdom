@@ -65,12 +65,18 @@ const LIVENESS_POLL: Duration = Duration::from_secs(5);
 /// it opens.
 const FLEET_CAPACITY_POLL: Duration = Duration::from_millis(250);
 
-/// Whether a spawn attempt failed because the fleet-WIP ceiling had no free
-/// slot at the moment `Supervisor::spawn` atomically checked (as opposed to a
-/// genuine spawn failure) — a `Step::Spawn` retries on this rather than
-/// failing the step.
+/// Whether a spawn attempt failed because the fleet-WIP ceiling, or this
+/// repository's own implementation/review capacity lane
+/// (TKT-01M0P2KM83Y4MD5QYETR3JCKF2), had no free slot at the moment
+/// `Supervisor::spawn` atomically checked (as opposed to a genuine spawn
+/// failure) — a `Step::Spawn` retries on this rather than failing the step.
+/// All three refusal reasons are treated identically for retry purposes: the
+/// distinct error strings exist only so a caller that DOES want to
+/// distinguish them (for observability) can.
 pub(crate) fn is_fleet_wip_refusal(error: &rk_core::Error) -> bool {
-    matches!(error, rk_core::Error::Other(msg) if msg == FLEET_WIP_CAP_REFUSED)
+    matches!(error, rk_core::Error::Other(msg) if msg == FLEET_WIP_CAP_REFUSED
+        || msg == crate::supervisor::IMPLEMENTATION_LANE_REFUSED
+        || msg == crate::supervisor::REVIEW_LANE_REFUSED)
 }
 
 static PERSIST_SEQ: AtomicU64 = AtomicU64::new(0);

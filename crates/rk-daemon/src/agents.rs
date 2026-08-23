@@ -332,6 +332,56 @@ pub struct Registry {
     /// lands in the registry must not both admit against the same free slot.
     /// In-memory only, same rationale as `reserved`.
     wip_reservations: usize,
+    /// Outstanding per-`(repo, lane)` admission reservations taken by
+    /// [`try_reserve_lane_wip`](Registry::try_reserve_lane_wip) and not yet
+    /// resolved by [`release_lane_wip`](Registry::release_lane_wip). Same
+    /// TOCTOU-closing role as `wip_reservations`, but scoped to one repo's
+    /// one lane instead of the whole fleet, so one repository's implementation
+    /// burst can never register against another repository's — or against the
+    /// review lane's — count. Keyed by [`Lane::key`]. In-memory only, same
+    /// rationale as `reserved`.
+    lane_reservations: HashMap<String, usize>,
+}
+
+/// Which capacity lane a spawn admits against
+/// (TKT-01M0P2KM83Y4MD5QYETR3JCKF2), distinct from the pre-existing
+/// fleet-wide `[drain] max_wip` ceiling ([`Registry::try_reserve_wip`]): that
+/// ceiling has no repo dimension at all, so one repository's implementation
+/// burst can exhaust it for every other repository. A lane reservation is
+/// always additionally scoped to one repository, and `Review` is a wholly
+/// separate counter from `Implementation` so a saturated implementation lane
+/// can never starve a reviewer's admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lane {
+    /// Every role except `"reviewer"` — drain, workflow fan-out, and operator
+    /// `agent.spawn` dispatch all admit against this.
+    Implementation,
+    /// `role == "reviewer"` only.
+    Review,
+}
+
+impl Lane {
+    /// The lane a spawn with this role admits against.
+    pub(crate) fn for_role(role: &str) -> Self {
+        if role == "reviewer" {
+            Lane::Review
+        } else {
+            Lane::Implementation
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Lane::Implementation => "implementation",
+            Lane::Review => "review",
+        }
+    }
+
+    /// NUL can't appear in a repo name, so this is an unambiguous joiner —
+    /// same convention as `supervisor::MergeQueue::key`.
+    fn key(self, repo: &str) -> String {
+        format!("{repo}\u{0}{}", self.tag())
+    }
 }
 
 impl Registry {
@@ -356,6 +406,7 @@ impl Registry {
             archived,
             reserved: HashSet::new(),
             wip_reservations: 0,
+            lane_reservations: HashMap::new(),
         })
     }
 
@@ -440,6 +491,58 @@ impl Registry {
             return;
         }
         self.wip_reservations = self.wip_reservations.saturating_sub(1);
+    }
+
+    /// Live rows plus outstanding reservations for one `(repo, lane)` pair —
+    /// what [`try_reserve_lane_wip`](Registry::try_reserve_lane_wip) checks a
+    /// cap against. Scoped by `record.repo_name` and, within that repo, by
+    /// whether the role matches the lane ([`Lane::for_role`]), so this can
+    /// never be inflated by another repository's agents or by the other lane's.
+    pub(crate) fn live_or_reserved_lane_wip(&self, repo: &str, lane: Lane) -> usize {
+        self.agents
+            .values()
+            .filter(|r| r.repo_name == repo && r.state.is_live() && Lane::for_role(&r.role) == lane)
+            .count()
+            + self
+                .lane_reservations
+                .get(&lane.key(repo))
+                .copied()
+                .unwrap_or(0)
+    }
+
+    /// Atomically check one repository's lane ceiling and reserve one slot in
+    /// the same critical section — same atomicity contract as
+    /// [`try_reserve_wip`](Registry::try_reserve_wip) (always called with the
+    /// registry lock held, from inside
+    /// [`Supervisor::spawn`](crate::supervisor::Supervisor::spawn)), but scoped
+    /// to `(repo, lane)` instead of the whole fleet. `cap == 0` means this
+    /// lane is unbounded for `repo` — always admits, reserves nothing. Every
+    /// path that calls this with `cap != 0` and gets back `true` must
+    /// eventually call [`release_lane_wip`](Registry::release_lane_wip) with
+    /// the same `repo`/`lane`/`cap` exactly once, mirroring `try_reserve_wip`'s
+    /// contract.
+    pub(crate) fn try_reserve_lane_wip(&mut self, repo: &str, lane: Lane, cap: usize) -> bool {
+        if cap == 0 {
+            return true;
+        }
+        if self.live_or_reserved_lane_wip(repo, lane) >= cap {
+            return false;
+        }
+        *self.lane_reservations.entry(lane.key(repo)).or_insert(0) += 1;
+        true
+    }
+
+    /// Release a reservation taken by
+    /// [`try_reserve_lane_wip`](Registry::try_reserve_lane_wip). `repo`/`lane`/
+    /// `cap` must match the paired call (`cap == 0` reserved nothing, so
+    /// releases nothing).
+    pub(crate) fn release_lane_wip(&mut self, repo: &str, lane: Lane, cap: usize) {
+        if cap == 0 {
+            return;
+        }
+        if let Some(count) = self.lane_reservations.get_mut(&lane.key(repo)) {
+            *count = count.saturating_sub(1);
+        }
     }
 
     /// Mark all live agents orphaned (called once at daemon startup).

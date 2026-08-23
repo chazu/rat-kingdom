@@ -39,6 +39,20 @@ const MIN_PROGRESS_INTERVAL: chrono::Duration = chrono::Duration::seconds(5);
 pub(crate) const FLEET_WIP_CAP_REFUSED: &str =
     "fleet WIP cap reached: no free slot to admit this spawn";
 
+/// Error text [`Supervisor::spawn`] returns when a repository's implementation
+/// lane (`Lane::Implementation` — every role except `"reviewer"`) had no free
+/// slot (TKT-01M0P2KM83Y4MD5QYETR3JCKF2). A distinct string from
+/// [`FLEET_WIP_CAP_REFUSED`] purely for observability (so a caller can tell
+/// which ceiling refused); [`crate::workflow_exec::is_fleet_wip_refusal`]
+/// treats both identically for retry purposes.
+pub(crate) const IMPLEMENTATION_LANE_REFUSED: &str =
+    "implementation lane at capacity for this repository: no free slot to admit this spawn";
+
+/// Same as [`IMPLEMENTATION_LANE_REFUSED`], for `Lane::Review`
+/// (`role == "reviewer"`).
+pub(crate) const REVIEW_LANE_REFUSED: &str =
+    "review lane at capacity for this repository: no free slot to admit this spawn";
+
 // Review-tiering diff_class thresholds (Phase 0 of the steward remediation).
 // The steward trigger reads `diff_class` off the completion payload to decide
 // whether a diff is worth an LLM reviewer's judgment at all; these bounds are
@@ -627,6 +641,15 @@ pub struct Supervisor {
     /// group instead of leaving it orphaned under the daemon. See
     /// [`ManagedVerificationRuns`].
     managed_verification: ManagedVerificationRuns,
+    /// `[policy] implementation_admission_limit` / `_by_repo` — the
+    /// implementation lane's configured limits (TKT-01M0P2KM83Y4MD5QYETR3JCKF2).
+    /// See [`LaneLimits`] and [`crate::agents::Lane::Implementation`].
+    implementation_admission_limits: LaneLimits,
+    /// `[policy] review_admission_limit` / `_by_repo` — the review lane's
+    /// configured limits, independent of `implementation_admission_limits` so
+    /// a saturated implementation lane can never starve it. See
+    /// [`crate::agents::Lane::Review`].
+    review_admission_limits: LaneLimits,
     /// `[disk] min_free_gb` (0 = disabled), applied by `Daemon::new` from
     /// config. Defaults to 0 here — a bare `Supervisor` constructed directly
     /// by a test or another crate stays disk-guard-free unless it opts in via
@@ -916,6 +939,28 @@ impl VerificationAdmission {
             .unwrap_or(self.default_limit.load(Ordering::Relaxed) as u32)
     }
 
+    /// Repos with an explicit per-repo override — a starting point for
+    /// capacity reporting (`Supervisor::capacity_summary`), which unions this
+    /// with any repo that currently has live agents.
+    fn overridden_repos(&self, out: &mut std::collections::BTreeSet<String>) {
+        out.extend(self.overrides.lock().unwrap().keys().cloned());
+    }
+
+    /// How many of `repo`'s configured permits are currently checked out, for
+    /// reporting only (`Supervisor::capacity_summary`) — never consulted for
+    /// admission itself. `0` whenever the limit is `0` (disabled) or no check
+    /// has ever run for `repo` (no semaphore created yet).
+    fn in_flight(&self, repo: &str) -> u32 {
+        let limit = self.limit_for(repo);
+        if limit == 0 {
+            return 0;
+        }
+        match self.semaphores.lock().unwrap().get(repo) {
+            Some(sem) => limit.saturating_sub(sem.available_permits() as u32),
+            None => 0,
+        }
+    }
+
     /// Acquire one admission permit for `repo`, waiting in FIFO order behind
     /// any earlier waiter. Returns the held permit together with how long
     /// this call waited for it — the queue-wait half of the ticket's durable
@@ -1041,6 +1086,47 @@ impl ManagedVerificationRuns {
     }
 }
 
+/// Fleet-wide default + per-repo overrides for one capacity lane's limit
+/// (TKT-01M0P2KM83Y4MD5QYETR3JCKF2) — the config-side counterpart to
+/// [`crate::agents::Lane`]. Deliberately holds only the configured NUMBER, not
+/// any occupancy state: unlike [`VerificationAdmission`] (which bounds check
+/// runs that have no `AgentRecord` of their own), an implementation/review
+/// lane's occupancy is the durable `Registry` itself
+/// ([`Registry::live_or_reserved_lane_wip`](crate::agents::Registry::live_or_reserved_lane_wip)),
+/// so this struct needs no restart-recovery story beyond "re-read the config".
+/// Same lock-free-on-the-hot-path shape as `VerificationAdmission`'s own
+/// `default_limit`/`overrides`.
+#[derive(Default)]
+struct LaneLimits {
+    default_limit: AtomicU64,
+    overrides: Mutex<HashMap<String, u32>>,
+}
+
+impl LaneLimits {
+    fn set(&self, default_limit: u32, overrides: HashMap<String, u32>) {
+        self.default_limit
+            .store(u64::from(default_limit), Ordering::Relaxed);
+        *self.overrides.lock().unwrap() = overrides;
+    }
+
+    /// The configured limit for `repo` — its own override if set, else the
+    /// fleet-wide default. `0` means this lane is unbounded for `repo`.
+    fn limit_for(&self, repo: &str) -> u32 {
+        self.overrides
+            .lock()
+            .unwrap()
+            .get(repo)
+            .copied()
+            .unwrap_or(self.default_limit.load(Ordering::Relaxed) as u32)
+    }
+
+    /// Repos with an explicit per-repo override — see
+    /// [`VerificationAdmission::overridden_repos`], same reporting-only role.
+    fn overridden_repos(&self, out: &mut std::collections::BTreeSet<String>) {
+        out.extend(self.overrides.lock().unwrap().keys().cloned());
+    }
+}
+
 /// Which of an archived record's leftovers `rk prune` should reclaim, beyond
 /// the record itself. Named fields rather than two positional `bool`s, because
 /// silently swapping them is exactly the bug worth designing out.
@@ -1156,6 +1242,8 @@ impl Supervisor {
             test_exec_lock: TestExecLock::default(),
             verification_admission: VerificationAdmission::default(),
             managed_verification: ManagedVerificationRuns::default(),
+            implementation_admission_limits: LaneLimits::default(),
+            review_admission_limits: LaneLimits::default(),
             min_free_disk_gb: AtomicU64::new(0),
             max_load_per_cpu_bits: AtomicU64::new(0f64.to_bits()),
             shared_cargo_target: AtomicBool::new(false),
@@ -1327,6 +1415,95 @@ impl Supervisor {
     ) {
         self.managed_verification
             .cancel_request(request_key, reason);
+    }
+
+    /// Set `[policy] implementation_admission_limit` / `_by_repo`. Applied by
+    /// `Daemon::new` from config, same pattern as
+    /// [`set_verification_admission_limits`](Supervisor::set_verification_admission_limits).
+    pub fn set_implementation_admission_limits(
+        &self,
+        default_limit: u32,
+        overrides: HashMap<String, u32>,
+    ) {
+        self.implementation_admission_limits
+            .set(default_limit, overrides);
+    }
+
+    /// Set `[policy] review_admission_limit` / `_by_repo`. Same pattern as
+    /// [`set_implementation_admission_limits`](Supervisor::set_implementation_admission_limits).
+    pub fn set_review_admission_limits(&self, default_limit: u32, overrides: HashMap<String, u32>) {
+        self.review_admission_limits.set(default_limit, overrides);
+    }
+
+    /// The configured limit for `lane` in `repo` (0 = unbounded). See
+    /// [`crate::agents::Lane`].
+    pub(crate) fn lane_admission_limit_for(&self, repo: &str, lane: crate::agents::Lane) -> usize {
+        (match lane {
+            crate::agents::Lane::Implementation => self.implementation_admission_limits.limit_for(repo),
+            crate::agents::Lane::Review => self.review_admission_limits.limit_for(repo),
+        }) as usize
+    }
+
+    /// Configured capacity, current occupancy, and whether admission is
+    /// currently exhausted, per repository, across all three lanes
+    /// (TKT-01M0P2KM83Y4MD5QYETR3JCKF2) — what `rk top`/`rk status`/`rk digest`
+    /// surface so an operator can see the configured ceiling and the reason a
+    /// request would wait, not just the raw agent list. Reports every repo
+    /// that either has an explicit per-repo override configured on any lane,
+    /// or currently has a live agent — a repo with neither is fleet-default
+    /// (usually unbounded) and has nothing occupying it, so omitting it keeps
+    /// this proportional to what's actually interesting.
+    pub fn capacity_summary(&self) -> serde_json::Value {
+        let mut repos: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        self.implementation_admission_limits
+            .overridden_repos(&mut repos);
+        self.review_admission_limits.overridden_repos(&mut repos);
+        self.verification_admission.overridden_repos(&mut repos);
+        for record in self.list() {
+            if record.state.is_live() {
+                repos.insert(record.repo_name.clone());
+            }
+        }
+        let reg = self.lock_registry();
+        let mut out = serde_json::Map::new();
+        for repo in repos {
+            let impl_limit = self.implementation_admission_limits.limit_for(&repo);
+            let impl_occupied =
+                reg.live_or_reserved_lane_wip(&repo, crate::agents::Lane::Implementation) as u32;
+            let review_limit = self.review_admission_limits.limit_for(&repo);
+            let review_occupied =
+                reg.live_or_reserved_lane_wip(&repo, crate::agents::Lane::Review) as u32;
+            let verify_limit = self
+                .verification_admission
+                .limit_for(&self.verification_repo_identity(&repo));
+            let verify_in_flight = self
+                .verification_admission
+                .in_flight(&self.verification_repo_identity(&repo));
+            out.insert(
+                repo,
+                json!({
+                    "implementation": {
+                        "limit": impl_limit,
+                        "occupied": impl_occupied,
+                        "waiting_reason": (impl_limit != 0 && impl_occupied >= impl_limit)
+                            .then_some("implementation_lane_full"),
+                    },
+                    "review": {
+                        "limit": review_limit,
+                        "occupied": review_occupied,
+                        "waiting_reason": (review_limit != 0 && review_occupied >= review_limit)
+                            .then_some("review_lane_full"),
+                    },
+                    "verification": {
+                        "limit": verify_limit,
+                        "in_flight": verify_in_flight,
+                        "waiting_reason": (verify_limit != 0 && verify_in_flight >= verify_limit)
+                            .then_some("verification_lane_full"),
+                    },
+                }),
+            );
+        }
+        serde_json::Value::Object(out)
     }
 
     /// Normalize `repo` — whatever shape reached
@@ -1565,10 +1742,27 @@ impl Supervisor {
         // concurrent spawns until the journal row is inserted; picking
         // without reserving let two near-simultaneous spawns grab the same
         // name and collide on the worktree path.
+        // Independently of `fleet_wip_cap` above, also admit against this
+        // repository's own capacity lane (TKT-01M0P2KM83Y4MD5QYETR3JCKF2) —
+        // `Lane::Implementation` for every role but `"reviewer"`,
+        // `Lane::Review` for reviewers — in the SAME critical section, so a
+        // repo-scoped burst on one lane can never race past this repo's own
+        // cap the way the fleet-wide ceiling (with no repo dimension) can be
+        // exhausted by a single repository today.
+        let lane = crate::agents::Lane::for_role(&params.role);
+        let lane_cap = self.lane_admission_limit_for(&repo_name, lane);
+        let lane_refused = match lane {
+            crate::agents::Lane::Implementation => IMPLEMENTATION_LANE_REFUSED,
+            crate::agents::Lane::Review => REVIEW_LANE_REFUSED,
+        };
         let name = {
             let mut reg = self.lock_registry();
             if !reg.try_reserve_wip(fleet_wip_cap) {
                 return Err(rk_core::Error::other(FLEET_WIP_CAP_REFUSED));
+            }
+            if !reg.try_reserve_lane_wip(&repo_name, lane, lane_cap) {
+                reg.release_wip(fleet_wip_cap);
+                return Err(rk_core::Error::other(lane_refused));
             }
             reg.reserve_name()
         };
@@ -1582,6 +1776,7 @@ impl Supervisor {
                 let mut reg = self.lock_registry();
                 reg.release_name(&name);
                 reg.release_wip(fleet_wip_cap);
+                reg.release_lane_wip(&repo_name, lane, lane_cap);
                 return Err(rk_core::Error::other(
                     "onboarder task must be a stable onb- session id",
                 ));
@@ -1618,15 +1813,23 @@ impl Supervisor {
             let mut reg = self.lock_registry();
             reg.release_name(&name);
             reg.release_wip(fleet_wip_cap);
+            reg.release_lane_wip(&repo_name, lane, lane_cap);
             return Err(e);
         }
         // The reservation's job is done: this spawn now has a live registry
         // row (state `Spawning`), which itself counts toward the fleet-WIP
-        // ceiling from here on — worktree creation and harness launch (both
-        // potentially slow) proceed without holding the reservation, and any
-        // failure from here is recorded on that row via `mark_spawn_failed`,
-        // which naturally frees its slot by leaving the live count.
-        self.lock_registry().release_wip(fleet_wip_cap);
+        // ceiling (and this repo's lane ceiling) from here on — worktree
+        // creation and harness launch (both potentially slow) proceed without
+        // holding the reservation, and any failure from here is recorded on
+        // that row via `mark_spawn_failed`, which naturally frees its slot by
+        // leaving the live count (for both ceilings alike, since
+        // `live_or_reserved_lane_wip` filters on `state.is_live()` the same
+        // way `live_or_reserved_wip` does).
+        {
+            let mut reg = self.lock_registry();
+            reg.release_wip(fleet_wip_cap);
+            reg.release_lane_wip(&repo_name, lane, lane_cap);
+        }
         if let Err(e) = repo.create_worktree(&worktree, &branch, &target_branch) {
             self.mark_spawn_failed(&name, &e);
             return Err(e);
@@ -7537,6 +7740,135 @@ mod respawn_tests {
             .await
             .expect("the failed attempt's reservation must have been released");
         assert!(record.state.is_live());
+    }
+
+    /// The implementation lane (TKT-01M0P2KM83Y4MD5QYETR3JCKF2) is scoped per
+    /// repository, unlike the fleet-wide `[drain] max_wip` ceiling tested
+    /// above: saturating one repo's lane must refuse further spawns for THAT
+    /// repo (proven with the same atomic-concurrency shape as
+    /// `fleet_wip_admission_is_atomic_under_concurrent_spawns`) while a
+    /// second, unconfigured repo's lane is entirely unaffected — one
+    /// repository cannot consume another's capacity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn implementation_lane_is_scoped_per_repo() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_a = tempfile::tempdir().unwrap();
+        let repo_b = tempfile::tempdir().unwrap();
+        init_repo(repo_a.path());
+        init_repo(repo_b.path());
+        let repo_a_name = Repo::discover(repo_a.path()).unwrap().name();
+        let sup = supervisor(home.path());
+        sup.set_implementation_admission_limits(0, HashMap::from([(repo_a_name, 1)]));
+
+        // fleet_wip_cap passed as 0 (disabled) throughout, isolating the new
+        // per-repo lane ceiling as the only thing under test.
+        let handles: Vec<_> = (0..3)
+            .map(|i| {
+                let sup = Arc::clone(&sup);
+                let params = spawn_params(repo_a.path(), &format!("a-{i}"));
+                tokio::spawn(async move { sup.spawn_async(params, 0).await })
+            })
+            .collect();
+        let mut results = Vec::with_capacity(handles.len());
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+        let admitted = results.iter().filter(|r| r.is_ok()).count();
+        let refused = results
+            .iter()
+            .filter(|r| matches!(r, Err(e) if e.to_string() == IMPLEMENTATION_LANE_REFUSED))
+            .count();
+        assert_eq!(
+            admitted, 1,
+            "repo-a's lane cap of 1 must admit exactly 1: {results:?}"
+        );
+        assert_eq!(
+            refused, 2,
+            "the other 2 concurrent attempts against repo-a must be refused cleanly, not \
+             double-launched: {results:?}"
+        );
+
+        let unrelated = sup
+            .spawn_async(spawn_params(repo_b.path(), "b-0"), 0)
+            .await;
+        assert!(
+            unrelated.is_ok(),
+            "repo-b's unconfigured (unbounded) lane must not be affected by repo-a's \
+             saturation: {unrelated:?}"
+        );
+    }
+
+    /// A saturated implementation lane must never starve the review lane for
+    /// the SAME repository — they are independent counters
+    /// (TKT-01M0P2KM83Y4MD5QYETR3JCKF2's core "implementation admission
+    /// cannot starve either lane" requirement).
+    #[tokio::test]
+    async fn implementation_lane_saturation_does_not_starve_the_review_lane() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let repo_name = Repo::discover(repo.path()).unwrap().name();
+        let sup = supervisor(home.path());
+        sup.set_implementation_admission_limits(0, HashMap::from([(repo_name.clone(), 1)]));
+        sup.set_review_admission_limits(0, HashMap::from([(repo_name, 1)]));
+
+        let occupying = sup
+            .spawn_async(spawn_params(repo.path(), "impl-occupying"), 0)
+            .await
+            .unwrap();
+        assert!(occupying.state.is_live());
+        let overflow = sup
+            .spawn_async(spawn_params(repo.path(), "impl-overflow"), 0)
+            .await;
+        assert!(matches!(
+            &overflow,
+            Err(e) if e.to_string() == IMPLEMENTATION_LANE_REFUSED
+        ));
+
+        let mut reviewer_params = spawn_params(repo.path(), "reviewer-task");
+        reviewer_params.role = "reviewer".into();
+        let reviewer = sup.spawn_async(reviewer_params, 0).await;
+        assert!(
+            reviewer.is_ok(),
+            "a fully-saturated implementation lane must not starve the review lane for the \
+             same repo: {reviewer:?}"
+        );
+    }
+
+    /// Implementation-lane occupancy is durable and idempotent across a
+    /// daemon restart WITHOUT any dedicated recovery procedure: it is
+    /// recomputed from `AgentRecord.state` in `agents.json` (persisted on
+    /// every insert), the exact same mechanism the pre-existing fleet-wide
+    /// WIP ceiling already relies on — so a live row a predecessor process
+    /// inserted still occupies its repo's lane for a freshly constructed
+    /// `Supervisor` reading the same `home`.
+    #[tokio::test]
+    async fn implementation_lane_occupancy_survives_a_restart() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let repo_name = Repo::discover(repo.path()).unwrap().name();
+
+        let before_restart = supervisor(home.path());
+        before_restart
+            .set_implementation_admission_limits(0, HashMap::from([(repo_name.clone(), 1)]));
+        let mut live = record(repo.path(), Some("main"));
+        live.repo_name = repo_name.clone();
+        live.state = AgentState::Running;
+        before_restart.lock_registry().insert(live).unwrap();
+        drop(before_restart);
+
+        let after_restart = supervisor(home.path());
+        after_restart
+            .set_implementation_admission_limits(0, HashMap::from([(repo_name, 1)]));
+        let refused = after_restart
+            .spawn_async(spawn_params(repo.path(), "post-restart"), 0)
+            .await;
+        assert!(
+            matches!(&refused, Err(e) if e.to_string() == IMPLEMENTATION_LANE_REFUSED),
+            "the predecessor's live record, persisted in agents.json, must still occupy the \
+             lane after a restart: {refused:?}"
+        );
     }
 }
 

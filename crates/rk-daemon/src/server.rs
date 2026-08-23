@@ -352,6 +352,24 @@ impl Daemon {
                 .into_iter()
                 .collect(),
         );
+        daemon.supervisor.set_implementation_admission_limits(
+            config.policy.implementation_admission_limit,
+            config
+                .policy
+                .implementation_admission_limit_by_repo
+                .clone()
+                .into_iter()
+                .collect(),
+        );
+        daemon.supervisor.set_review_admission_limits(
+            config.policy.review_admission_limit,
+            config
+                .policy
+                .review_admission_limit_by_repo
+                .clone()
+                .into_iter()
+                .collect(),
+        );
         daemon
             .supervisor
             .set_done_kill_grace_secs(config.supervisor.done_kill_grace_secs);
@@ -7842,6 +7860,10 @@ impl Daemon {
             // without this a slowly-draining queue and a wedged one are
             // indistinguishable from the outside (probe O18).
             "landing_queue": crate::landing::landing_queue_summary(&self.space),
+            // Per-repo configured capacity/occupancy/waiting-reason for the
+            // implementation, review, and verification lanes
+            // (TKT-01M0P2KM83Y4MD5QYETR3JCKF2) — see `Supervisor::capacity_summary`.
+            "capacity": self.supervisor.capacity_summary(),
         })
     }
 }

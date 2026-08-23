@@ -1001,6 +1001,33 @@ async fn main() -> Result<()> {
                                 top::human_secs(oldest),
                             );
                         }
+                        // Per-repo implementation/verification/review lane
+                        // capacity (TKT-01M0P2KM83Y4MD5QYETR3JCKF2) — only
+                        // repos with an explicit override or a live agent are
+                        // reported at all (see `Supervisor::capacity_summary`),
+                        // so this stays silent for a fleet that hasn't opted in.
+                        for (repo, lanes) in
+                            status["capacity"].as_object().into_iter().flatten()
+                        {
+                            for lane in ["implementation", "review", "verification"] {
+                                let Some(entry) = lanes.get(lane) else {
+                                    continue;
+                                };
+                                let limit = entry["limit"].as_u64().unwrap_or(0);
+                                if limit == 0 {
+                                    continue;
+                                }
+                                let occupied = entry["occupied"]
+                                    .as_u64()
+                                    .or_else(|| entry["in_flight"].as_u64())
+                                    .unwrap_or(0);
+                                let waiting = entry["waiting_reason"]
+                                    .as_str()
+                                    .map(|r| format!(" ({r})"))
+                                    .unwrap_or_default();
+                                println!("  capacity {repo} {lane}: {occupied}/{limit}{waiting}");
+                            }
+                        }
                     }
                 }
                 Err(_) => {
