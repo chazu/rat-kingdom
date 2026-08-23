@@ -218,6 +218,33 @@ measure and report, not to patch the substrate it is measuring).
    the "duplicate semantic-review time" half of the temporary target above
    can only be evaluated by round count, not duration, today.
 
+   **FIXED for new spans** (commit `28c1543`, "record durable elapsed time
+   for semantic-review and rework spans" — already on `main`, and confirmed
+   live in this same castle, not just in the source): a fourth correlation
+   identity, `TKT-01M0R4ZPYA7003QDRK6BET0WZN` (an unrelated, already-merged
+   ticket, candidate `d6b5a84e77aa39bc6cd4e20a903a0fd70ec0ff5d` — the exact
+   commit this castle's daemon is running per `rk daemon status` at capture
+   time), shows a clean-APPROVE `semantic_review` span with
+   `duration_ms: 100419`, `authority: "llm"`, `terminal_reason: "approved"`.
+   Bundled as
+   `scripts/fixtures/rk-task-to-main-tracer/timed-semantic-review.TKT-01M0R4ZPYA7003QDRK6BET0WZN.json`
+   and covered by `--self-test`. This does not retroactively populate
+   `duration_ms` on spans written before the fix, or on any span whose
+   landing-queue phase-transition clock (`LandingQueueEntry::phase_entered_at`)
+   was not yet available when the phase started — by design the substrate
+   never fabricates a duration for those. Example #3 above
+   (`TKT-01M0P974MQK5XE1MR9KQCWT654`) and its `rework-requested`/`dispatched`
+   pair are exactly such legacy spans and correctly still read `null`; a
+   currently in-flight ticket in this same castle
+   (`TKT-01M0R2DFMPFVZTTX6VZ5JHZM4Q`, queued at `2026-08-23T19:44:00Z`,
+   before this fix's queue-entry clock existed) shows the identical legacy
+   `null` pattern under the *current* deployed build — proof the fix is
+   additive, not retroactive, and that "unavailable" is still rendered
+   honestly rather than as a fabricated `0`. Net effect: "duplicate
+   semantic-review time" can now be evaluated on real elapsed duration for
+   any ticket reviewed after this fix went live; the round-count proxy
+   remains the only signal for spans that predate it.
+
 4. **This castle is very active**, and `rk digest`'s bounded scan (#2) means
    any future re-run of this tracer's `--live` mode should keep pulling
    per-ticket evidence via `rk status <TKT-id>` on specific correlation
