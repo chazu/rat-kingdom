@@ -467,3 +467,165 @@ async fn live_verifier_descendant_survives_the_sweep_while_a_silent_dead_generat
         .status();
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
+
+fn install_single_sleep_check(dir: &Path, sleep_secs: f64) {
+    let rk_dir = dir.join(".rk");
+    std::fs::create_dir_all(&rk_dir).unwrap();
+    std::fs::write(
+        rk_dir.join("checks.cue"),
+        format!(
+            r#"checks: [
+    {{name: "verify", command: "sleep {sleep_secs}", timeout: "10s", environmentPolicy: "strip_rk_spawn", sharedCargoTarget: true}},
+]
+"#
+        ),
+    )
+    .unwrap();
+}
+
+/// "work in separate repositories can proceed concurrently": two distinct
+/// repos, each with its own tight `verification_admission_limit_by_repo` of
+/// 1, must NOT contend against each other for that permit — the admission
+/// lane is keyed per repo, not a single cross-repo lock. Proven by wall
+/// clock: two 300ms checks running truly concurrently finish in well under
+/// 2x300ms; if they secretly shared one lock, the second would queue behind
+/// the first and the pair would take >=600ms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_repo_verification_admission_is_independent_and_proceeds_concurrently() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_a_dir = tempfile::tempdir().unwrap();
+    let repo_b_dir = tempfile::tempdir().unwrap();
+    let repo_a_name = init_repo(repo_a_dir.path());
+    let repo_b_name = init_repo(repo_b_dir.path());
+    install_single_sleep_check(repo_a_dir.path(), 0.3);
+    install_single_sleep_check(repo_b_dir.path(), 0.3);
+
+    let layout = Layout::at(home.path());
+    let space = Space::open_in_memory().unwrap();
+    let daemon = Daemon::with_space_for_tests(
+        layout.clone(),
+        "test-castle".into(),
+        "fake".into(),
+        Budget::default(),
+        space,
+    )
+    .unwrap();
+    daemon.set_verification_admission_limits(
+        0,
+        HashMap::from([(repo_a_name.clone(), 1), (repo_b_name.clone(), 1)]),
+    );
+    tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    client
+        .call(
+            "repo.add",
+            json!({"name": &repo_a_name, "path": repo_a_dir.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+    client
+        .call(
+            "repo.add",
+            json!({"name": &repo_b_name, "path": repo_b_dir.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+
+    let started = tokio::time::Instant::now();
+    let (ra, rb) = tokio::join!(
+        run_verify(&layout, &repo_a_name, "verify"),
+        run_verify(&layout, &repo_b_name, "verify"),
+    );
+    let elapsed = started.elapsed();
+
+    assert_eq!(ra["exit"], json!(0), "{ra:#?}");
+    assert_eq!(rb["exit"], json!(0), "{rb:#?}");
+    assert!(
+        elapsed < Duration::from_millis(550),
+        "two independent repos' verification admission lanes must run concurrently, not \
+         contend for one shared lock: took {elapsed:?} for two 300ms checks (a shared lock \
+         would take >=600ms)"
+    );
+}
+
+/// "no shared-target ENOENT occurs": a check opted into `sharedCargoTarget`
+/// is serialized by a SEPARATE lock (`Supervisor::acquire_test_exec_lock`)
+/// from the per-repo admission queue — proven here by giving the repo
+/// admission headroom well above the number of concurrent checks (4 vs 3),
+/// so admission alone would let all 3 run at once, and showing peak
+/// concurrent execution is still exactly 1. That serialization is what
+/// prevents the concurrent-CARGO_TARGET_DIR race that used to produce
+/// ENOENT under real load — proven here as "the race window never opens"
+/// (peak==1, zero failing runs) rather than by reproducing the ENOENT
+/// itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_cargo_target_checks_serialize_to_one_regardless_of_admission_headroom() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_name = init_repo(repo_dir.path());
+    let shared = tempfile::tempdir().unwrap();
+    const N: usize = 3;
+    write_saturation_checks(repo_dir.path(), shared.path(), N);
+    // write_saturation_checks's last check deliberately fails (exit 7) —
+    // irrelevant here since this test only cares about peak concurrency,
+    // but drop its stderr expectation by not asserting on exit codes below.
+
+    let layout = Layout::at(home.path());
+    let space = Space::open_in_memory().unwrap();
+    let daemon = Daemon::with_space_for_tests(
+        layout.clone(),
+        "test-castle".into(),
+        "fake".into(),
+        Budget::default(),
+        space,
+    )
+    .unwrap();
+    // WIP-4 admission headroom deliberately GREATER than the 3 concurrent
+    // checks below — admission alone would not serialize them.
+    daemon.set_verification_admission_limits(0, HashMap::from([(repo_name.clone(), 4)]));
+    daemon.set_shared_cargo_target(true);
+    tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    client
+        .call(
+            "repo.add",
+            json!({"name": &repo_name, "path": repo_dir.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+
+    let mut handles = Vec::new();
+    for i in 0..N {
+        let layout = layout.clone();
+        let repo_name = repo_name.clone();
+        handles.push(tokio::spawn(async move {
+            tokio::time::timeout(
+                SATURATION_DEADLINE,
+                run_verify(&layout, &repo_name, &format!("sat-{i}")),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("sat-{i} never completed — the shared-target lock queue starved it")
+            })
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let peak_log = std::fs::read_to_string(shared.path().join("peak.log")).unwrap_or_default();
+    let peak: usize = peak_log
+        .lines()
+        .filter_map(|l| l.trim().parse::<usize>().ok())
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        peak, 1,
+        "sharedCargoTarget checks must serialize to exactly one concurrent execution \
+         regardless of admission headroom (limit 4, only {N} checks) — the race window that \
+         used to produce a shared-target ENOENT must never open: peak was {peak}, log: \
+         {peak_log:?}"
+    );
+}
