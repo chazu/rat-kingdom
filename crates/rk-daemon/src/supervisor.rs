@@ -2780,13 +2780,45 @@ impl Supervisor {
                     warn!(agent = name, "completion event for an unknown agent");
                     return;
                 };
-                // A deliberate stop wins races with a final harness event.
+                // A deliberate stop, or a completion already settled by
+                // `reconcile_task_done` reacting to the durable `task_done`
+                // tuple directly, wins races with a final harness event.
                 // SIGINT/SIGTERM can prompt an adapter to flush a `Completed`
                 // event before its process exits; accepting that event as a
                 // normal completion would erase the terminal cause and could
-                // make an unfinished run look successful.
-                if pre.state == AgentState::Stopped {
+                // make an unfinished run look successful. And once
+                // `reconcile_task_done` has already CASed this generation to
+                // `Completed`, `claim_completion` below refuses the claim
+                // (`claim.publish = false`) for the harness's own event — the
+                // `else` arm of the state assignment reads that as "no proof
+                // this is the last turn" and downgrades to `Paused`, which
+                // would silently un-complete an already-published generation.
+                // Both cases are "this generation's disposition is already
+                // decided by something other than this event" — merge
+                // usage/cost only, never touch state.
+                if matches!(pre.state, AgentState::Stopped | AgentState::Completed) {
+                    // `result` is handled differently per branch: a `Stopped`
+                    // record's `result` is the budget-stop detail message
+                    // (`enforce_budget::budget_stop_detail`) and must stand —
+                    // a harness's post-kill text is exactly what TKT-173/175
+                    // distrust. A `Completed`-via-`reconcile_task_done` record
+                    // has no such authoritative detail: its `result` is
+                    // whatever summary the generation's own `rk done` call
+                    // happened to carry (often terser than the harness's own
+                    // final turn text — see `agent_lifecycle.rs`'s
+                    // `WORKING_FAKE`, `rk_done "work done"` immediately
+                    // followed by `"result":"committed gnawed.txt"`), so this
+                    // naturally-arriving event's richer text is allowed to
+                    // upgrade it in place. Neither branch re-publishes: the
+                    // durable `harness_result` this generation already
+                    // produced (via `reconcile_task_done`'s `route_completion`
+                    // call, exactly once) is untouched — this only updates the
+                    // live `agent.status` view.
+                    let completed_via_reconcile = pre.state == AgentState::Completed;
                     let _ = self.lock_registry().update(name, |r| {
+                        if completed_via_reconcile {
+                            r.result = Some(result.clone());
+                        }
                         if usage.total() > 0 {
                             r.usage = usage;
                         }
@@ -8383,6 +8415,46 @@ mod respawn_tests {
             },
         );
         assert_eq!(sup.status("Nibble").unwrap().state, AgentState::Running);
+    }
+
+    /// TKT-01M0J5KT4TCH03W48MR9T7EJ27: the durable `task_done`
+    /// reconciler can settle a generation before the harness emits its own
+    /// natural completion event. That later event must merge final usage but
+    /// must never downgrade the already-published `Completed` state to
+    /// `Paused` merely because the completion claim was already consumed.
+    #[test]
+    fn a_late_harness_completion_cannot_uncomplete_a_reconciled_generation() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.state = AgentState::Completed;
+        let generation = rec.created_at;
+        let spawn = rec.spawn_id();
+        sup.lock_registry().insert(rec).unwrap();
+
+        let usage = TokenUsage {
+            input: 11,
+            output: 7,
+            ..Default::default()
+        };
+        sup.handle_event(
+            "Nibble",
+            generation,
+            spawn,
+            spawn,
+            HarnessEvent::Completed {
+                result: "natural harness completion arrived late".into(),
+                is_error: false,
+                usage: usage.clone(),
+                cost_usd: Some(0.25),
+                session_id: None,
+            },
+        );
+
+        let settled = sup.status("Nibble").unwrap();
+        assert_eq!(settled.state, AgentState::Completed);
+        assert_eq!(settled.usage, usage);
     }
 
     /// Probe O6/O8, REVIEWER path: a reviewer that pauses must not fail its
