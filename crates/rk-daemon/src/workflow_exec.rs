@@ -3863,10 +3863,15 @@ impl WorkflowEngine {
     /// Best-effort exact-key lookup: a durable proof this repo already wrote
     /// for `candidate_sha` under this check's exact command/toolchain/env
     /// policy, then — as a free secondary win — an unrelated landing gate's
-    /// `landing_gate_pass` for the same candidate sha and check name
-    /// (matched more loosely: that event carries no command text, so it is
-    /// a best-effort source, not the primary exactness guarantee the
-    /// dedicated cache above provides).
+    /// `landing_gate_pass` for the same candidate sha and check name. That
+    /// secondary source is matched on the SAME `verification_proof_key`
+    /// digest as the primary cache (`check_proof_keys`, a per-check digest
+    /// `run_gates_at` stores on the event alongside the plain `checks` name
+    /// list) — not merely on `check.name` appearing in that list, which said
+    /// nothing about whether the command/toolchain/environment that
+    /// actually ran still matches this caller's. An older `landing_gate_pass`
+    /// event written before `check_proof_keys` existed carries none, so it
+    /// simply misses here rather than false-matching.
     ///
     /// `pub(crate)`: also called from `landing.rs`'s `run_gates_at`
     /// (TKT-01M0QRZ7QT8CQD74GHRN81XFT5) so a landing gate can reuse a
@@ -3909,14 +3914,10 @@ impl WorkflowEngine {
             if let Some(t) = tuples.iter().find(|t| {
                 t.payload.get("candidate_sha").and_then(Value::as_str) == Some(candidate_sha)
                     && t.payload
-                        .get("checks")
-                        .and_then(Value::as_array)
-                        .map(|checks| {
-                            checks
-                                .iter()
-                                .any(|c| c.as_str() == Some(check.name.as_str()))
-                        })
-                        .unwrap_or(false)
+                        .get("check_proof_keys")
+                        .and_then(|v| v.get(check.name.as_str()))
+                        .and_then(Value::as_str)
+                        == Some(key.as_str())
             }) {
                 return Some(json!({
                     "exit": 0,

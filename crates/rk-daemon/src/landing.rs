@@ -5993,6 +5993,15 @@ impl LandingPipeline {
         // the durable-events acceptance criterion's "queue wait" field,
         // recorded alongside `duration_ms` on the final `landing_gate_pass`.
         let mut queue_wait_ms: Vec<(String, Option<u64>)> = Vec::new();
+        // One `verification_proof_key` digest per passed check — the SAME
+        // identity components (repo, candidate, check name, command,
+        // toolchain, environment policy) `lookup_verification_proof`'s
+        // primary exact-match cache already keys on. Stored on the final
+        // `landing_gate_pass` event so that event's OWN fallback reuse path
+        // can require a real digest match instead of trusting a bare check
+        // name, which said nothing about whether the command/toolchain/
+        // environment that actually ran still matches a later caller's.
+        let mut check_proof_keys: Vec<(String, Option<String>)> = Vec::new();
         let repo_path = PathBuf::from(&entry.repo_path);
         let gate_dir = self.gate_worktree_path(&entry.repo_name, &entry.target);
         {
@@ -6214,6 +6223,10 @@ impl LandingPipeline {
                     },
                 );
                 queue_wait_ms.push((check.name.clone(), check_queue_wait_ms));
+                check_proof_keys.push((
+                    check.name.clone(),
+                    verification_proof_key(&entry.repo_name, tested_sha, &check),
+                ));
                 passed_checks.push(check.name.clone());
                 continue;
             }
@@ -6236,6 +6249,10 @@ impl LandingPipeline {
                     },
                 );
                 queue_wait_ms.push((check.name.clone(), None));
+                check_proof_keys.push((
+                    check.name.clone(),
+                    verification_proof_key(&entry.repo_name, tested_sha, &check),
+                ));
                 passed_checks.push(check.name.clone());
                 continue;
             }
@@ -6346,6 +6363,10 @@ impl LandingPipeline {
                 },
             );
             queue_wait_ms.push((check.name.clone(), check_queue_wait_ms));
+            check_proof_keys.push((
+                check.name.clone(),
+                verification_proof_key(&entry.repo_name, tested_sha, &check),
+            ));
             passed_checks.push(check.name);
         }
         self.space.out(
@@ -6366,6 +6387,10 @@ impl LandingPipeline {
                     "edge_class": edge_class.as_str(),
                     "full_check_required": full_check_required,
                     "proof_key": proof_key,
+                    "check_proof_keys": check_proof_keys
+                        .iter()
+                        .map(|(name, key)| (name.clone(), json!(key)))
+                        .collect::<serde_json::Map<String, Value>>(),
                     "queue_wait_ms": queue_wait_ms
                         .iter()
                         .map(|(name, wait)| (name.clone(), json!(wait)))
@@ -7117,6 +7142,16 @@ mod tests {
         std::fs::write(rk_dir.join("checks.cue"), src).unwrap();
         git(repo, &["add", ".rk/checks.cue"]);
         git(repo, &["commit", "-m", "add checks registry"]);
+    }
+
+    /// Overwrites `checks.cue` WITHOUT committing — `LandingPipeline::gate_plan`
+    /// reads this file straight off disk (`repo_path`, the registered repo's
+    /// own working directory), not from the git tree of any tested candidate
+    /// sha, so a caller can change what a check runs between two
+    /// `run_gates_at` calls against the identical candidate without touching
+    /// git history at all. Used to reproduce that exact gap.
+    fn write_checks_uncommitted(repo: &Path, src: &str) {
+        std::fs::write(repo.join(".rk").join("checks.cue"), src).unwrap();
     }
 
     const ALL_PASS_CHECKS: &str = r#"
@@ -16103,5 +16138,295 @@ checks: [
             .scan(&Pattern::category(Category::Event).identity(GATE_PASS_IDENTITY))
             .unwrap();
         assert_eq!(pass_events.len(), 2, "pass events: {pass_events:?}");
+    }
+
+    /// Builds a `checks.cue` registry identical to the replay test's own,
+    /// except the "verify" check's command/toolchain/environmentPolicy are
+    /// parameterized — so the three tests below can each vary exactly one
+    /// `verification_proof_key` identity component while holding the other
+    /// two fixed.
+    fn checks_cue_with_verify(cmd: &str, toolchain: &str, env_policy: &str) -> String {
+        format!(
+            r#"checks: [
+    {{name: "steward-protected-paths", command: "true", timeout: "30s"}},
+    {{name: "steward-diff-scope", command: "true", timeout: "30s"}},
+    {{name: "verify", command: "{cmd}", timeout: "30s", toolchain: "{toolchain}", environmentPolicy: "{env_policy}"}},
+]
+"#
+        )
+    }
+
+    /// The bug this module's `check_proof_keys` field fixes
+    /// (TKT-01M0QWJ1EGZ0E9PZZP0JA0SA2A): the `landing_gate_pass` fallback in
+    /// `WorkflowEngine::lookup_verification_proof` used to match on nothing
+    /// but `candidate_sha` + check NAME, so if the checks registry changed
+    /// between two `run_gates_at` calls against the identical prepared
+    /// candidate — possible because `gate_plan` reads `checks.cue` live off
+    /// disk, not pinned to the candidate's own git tree — a replay could
+    /// silently skip re-verifying a check whose actual command changed.
+    /// Before the fix this test fails: the second run reuses the first
+    /// run's stale `landing_gate_pass` for "verify" and the command below
+    /// never executes a second time.
+    #[tokio::test]
+    async fn landing_gate_replay_reruns_verify_when_its_command_changed() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let verify_log = home.path().join("verify.log");
+        write_checks(
+            repo_dir.path(),
+            &checks_cue_with_verify(
+                &format!("echo x >> '{}'; exit 0", verify_log.display()),
+                "rust-1.95.0",
+                "inherit",
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let gates = GateConfig::default();
+
+        let candidate = match git_repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+
+        let mut entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: rev_parse(repo_dir.path(), "feature"),
+            candidate_sha: Some(candidate.commit.clone()),
+            candidate_base: Some(candidate.base.clone()),
+            candidate_ref: Some(candidate.candidate_ref.clone()),
+            diff_class: "feature".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+
+        let outcome = pipeline
+            .run_gates_at(&mut entry, &git_repo, &gates, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(outcome, GateRunOutcome::Pass);
+        assert_eq!(
+            std::fs::read_to_string(&verify_log)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "first run must execute the check once"
+        );
+
+        // Mutate the registry ON DISK, same candidate sha, same log file —
+        // only the "verify" command text changes (still appends to the same
+        // log, so a re-execution is unambiguous either way).
+        write_checks_uncommitted(
+            repo_dir.path(),
+            &checks_cue_with_verify(
+                &format!("echo y >> '{}'; exit 0", verify_log.display()),
+                "rust-1.95.0",
+                "inherit",
+            ),
+        );
+
+        let outcome = pipeline
+            .run_gates_at(&mut entry, &git_repo, &gates, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(outcome, GateRunOutcome::Pass);
+        assert_eq!(
+            std::fs::read_to_string(&verify_log)
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "a changed verify command must re-execute, never reuse a stale landing_gate_pass proof"
+        );
+
+        let reuse_events = space
+            .scan(&Pattern::category(Category::Event).identity(VERIFICATION_PROOF_REUSE_IDENTITY))
+            .unwrap();
+        assert!(
+            reuse_events.iter().all(|t| t.payload["check"] != "verify"),
+            "verify must never be credited as reused once its command changed: {reuse_events:?}"
+        );
+        // The two unchanged cheap checks still reuse — the fix must not cost
+        // the exact-match fast path anything.
+        assert_eq!(
+            reuse_events
+                .iter()
+                .filter(|t| t.payload["reused_from"] == "landing_gate_pass")
+                .count(),
+            2,
+            "the two unrelated, unchanged checks must still reuse via landing_gate_pass: {reuse_events:?}"
+        );
+    }
+
+    /// Same shape as the command-change test above, but only `toolchain`
+    /// changes — `command` and `environmentPolicy` stay byte-identical.
+    /// `verification_proof_key` folds toolchain into its digest, so this
+    /// must also force a fresh run rather than a false-positive reuse.
+    #[tokio::test]
+    async fn landing_gate_replay_reruns_verify_when_its_toolchain_changed() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let verify_log = home.path().join("verify.log");
+        let verify_command = format!("echo x >> '{}'; exit 0", verify_log.display());
+        write_checks(
+            repo_dir.path(),
+            &checks_cue_with_verify(&verify_command, "rust-1.95.0", "inherit"),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let gates = GateConfig::default();
+
+        let candidate = match git_repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+
+        let mut entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: rev_parse(repo_dir.path(), "feature"),
+            candidate_sha: Some(candidate.commit.clone()),
+            candidate_base: Some(candidate.base.clone()),
+            candidate_ref: Some(candidate.candidate_ref.clone()),
+            diff_class: "feature".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+
+        pipeline
+            .run_gates_at(&mut entry, &git_repo, &gates, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&verify_log)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        write_checks_uncommitted(
+            repo_dir.path(),
+            &checks_cue_with_verify(&verify_command, "rust-1.96.0", "inherit"),
+        );
+
+        pipeline
+            .run_gates_at(&mut entry, &git_repo, &gates, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&verify_log)
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "a changed toolchain must re-execute, never reuse a stale landing_gate_pass proof"
+        );
+        let reuse_events = space
+            .scan(&Pattern::category(Category::Event).identity(VERIFICATION_PROOF_REUSE_IDENTITY))
+            .unwrap();
+        assert!(
+            reuse_events.iter().all(|t| t.payload["check"] != "verify"),
+            "verify must never be credited as reused once its toolchain changed: {reuse_events:?}"
+        );
+    }
+
+    /// Same shape again, but only `environmentPolicy` changes.
+    #[tokio::test]
+    async fn landing_gate_replay_reruns_verify_when_its_environment_policy_changed() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let verify_log = home.path().join("verify.log");
+        let verify_command = format!("echo x >> '{}'; exit 0", verify_log.display());
+        write_checks(
+            repo_dir.path(),
+            &checks_cue_with_verify(&verify_command, "rust-1.95.0", "inherit"),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let gates = GateConfig::default();
+
+        let candidate = match git_repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+
+        let mut entry = LandingQueueEntry {
+            repo_name: "code-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: rev_parse(repo_dir.path(), "feature"),
+            candidate_sha: Some(candidate.commit.clone()),
+            candidate_base: Some(candidate.base.clone()),
+            candidate_ref: Some(candidate.candidate_ref.clone()),
+            diff_class: "feature".into(),
+            task: "add src".into(),
+            ..Default::default()
+        };
+
+        pipeline
+            .run_gates_at(&mut entry, &git_repo, &gates, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&verify_log)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        write_checks_uncommitted(
+            repo_dir.path(),
+            &checks_cue_with_verify(&verify_command, "rust-1.95.0", "strip_rk_spawn"),
+        );
+
+        pipeline
+            .run_gates_at(&mut entry, &git_repo, &gates, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&verify_log).unwrap().lines().count(),
+            2,
+            "a changed environment policy must re-execute, never reuse a stale landing_gate_pass proof"
+        );
+        let reuse_events = space
+            .scan(&Pattern::category(Category::Event).identity(VERIFICATION_PROOF_REUSE_IDENTITY))
+            .unwrap();
+        assert!(
+            reuse_events.iter().all(|t| t.payload["check"] != "verify"),
+            "verify must never be credited as reused once its environment policy changed: {reuse_events:?}"
+        );
     }
 }
