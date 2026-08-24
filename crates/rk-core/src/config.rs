@@ -890,6 +890,31 @@ pub struct SupervisorConfig {
     /// escalated at raised severity instead, same as any other rate-capped
     /// recovery action.
     pub respawn_rate_cap_per_hour: u32,
+    /// Bound on how many times the pre-work harness-transport-outage retry
+    /// sweep (TKT-01M0HND8M25GYN1ZTRET3S5769) will relaunch one agent whose
+    /// launch failed before the harness ever reached `Started`, before
+    /// giving up and escalating a `need` for a human. Zero disables the
+    /// sweep entirely. Distinct from `respawn_max_attempts`: this schedule
+    /// is durable (survives a daemon restart without resetting) and gated
+    /// by [`transport_breaker_trip_threshold`](Self::transport_breaker_trip_threshold)
+    /// first.
+    pub transport_retry_max_attempts: u32,
+    /// Base backoff (seconds) between retries of the same outage episode.
+    /// Grows exponentially per attempt (`base * 2^(attempts-1)`), like
+    /// `respawn_backoff_secs`.
+    pub transport_retry_backoff_secs: u64,
+    /// Upper bound (seconds) on a deterministic per-attempt jitter added to
+    /// the backoff, so many agents of the same provider failing at once
+    /// don't all retry in lockstep. `0` disables jitter.
+    pub transport_retry_jitter_secs: u64,
+    /// Consecutive castle-wide pre-work transport failures for one provider
+    /// (any agent) that trip the circuit breaker. `0` disables the breaker
+    /// (failures are still tracked per-agent, but no provider is ever
+    /// refused).
+    pub transport_breaker_trip_threshold: u32,
+    /// How long a tripped provider breaker stays open with no further
+    /// failures before it closes on its own. `0` disables the breaker.
+    pub transport_breaker_cooldown_secs: u64,
 }
 
 impl Default for SupervisorConfig {
@@ -907,6 +932,11 @@ impl Default for SupervisorConfig {
             respawn_max_attempts: 3,
             respawn_backoff_secs: 300,
             respawn_rate_cap_per_hour: 10,
+            transport_retry_max_attempts: 5,
+            transport_retry_backoff_secs: 30,
+            transport_retry_jitter_secs: 15,
+            transport_breaker_trip_threshold: 3,
+            transport_breaker_cooldown_secs: 120,
         }
     }
 }

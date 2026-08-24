@@ -306,6 +306,7 @@ fn terminal_record(name: &str, created_at: DateTime<Utc>) -> AgentRecord {
         updated_at: created_at,
         archived_at: None,
         liveness: Default::default(),
+        transport_outage: None,
     }
 }
 

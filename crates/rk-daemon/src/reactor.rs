@@ -3198,6 +3198,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             archived_at: None,
             liveness: Default::default(),
+            transport_outage: None,
         }
     }
 

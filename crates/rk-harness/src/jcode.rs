@@ -247,6 +247,17 @@ fn post_process(mut session: HarnessSession) -> HarnessSession {
                         break;
                     }
                 }
+                // jcode is out of scope for pre-work transport classification
+                // (Claude/Codex only, per this ticket); forward untouched.
+                HarnessEvent::TransportFailure { outcome } => {
+                    if tx
+                        .send(HarnessEvent::TransportFailure { outcome })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 HarnessEvent::Exited { code } => {
                     if flush_text(&tx, &mut pending_text).await.is_err() {
                         break;

@@ -373,6 +373,12 @@ impl Daemon {
         daemon
             .supervisor
             .set_done_kill_grace_secs(config.supervisor.done_kill_grace_secs);
+        daemon.supervisor.set_transport_breaker_trip_threshold(
+            config.supervisor.transport_breaker_trip_threshold,
+        );
+        daemon
+            .supervisor
+            .set_transport_breaker_cooldown_secs(config.supervisor.transport_breaker_cooldown_secs);
         daemon.supervisor.set_sinks(
             crate::reactor::sink_factory()
                 .registry(config.notify.resolved(config.reactor.notify_escalations)),
@@ -451,6 +457,10 @@ impl Daemon {
         // `min_free_disk_gb` — see `Supervisor::schedule_done_kill`.
         self.supervisor
             .set_done_kill_grace_secs(cfg.done_kill_grace_secs);
+        self.supervisor
+            .set_transport_breaker_trip_threshold(cfg.transport_breaker_trip_threshold);
+        self.supervisor
+            .set_transport_breaker_cooldown_secs(cfg.transport_breaker_cooldown_secs);
         self.sweep_config = cfg;
     }
 
@@ -870,6 +880,13 @@ impl Daemon {
                                 let sinks = crate::reactor::sink_factory()
                                     .registry(notify_config.resolved(notify_escalations));
                                 supervisor.respawn_sweep(&cfg, &sinks);
+                                // Pre-work harness transport-outage retry
+                                // (TKT-01M0HND8M25GYN1ZTRET3S5769): independent
+                                // of the crash-loop respawn sweep above — a
+                                // `transport_outage` episode is never a
+                                // `RespawnState` entry — so the two never
+                                // double-count or double-launch.
+                                supervisor.transport_retry_sweep(&cfg, &sinks);
                             })
                             .await
                             {
@@ -10252,6 +10269,7 @@ mod authorize_reasoned_tests {
             updated_at: now,
             archived_at: None,
             liveness: Default::default(),
+            transport_outage: None,
         };
         let mut records = HashMap::new();
         records.insert(record.name.clone(), record);
@@ -10716,6 +10734,7 @@ mod ticket_reopen_sweep_tests {
             updated_at: now,
             archived_at: None,
             liveness: Default::default(),
+            transport_outage: None,
         };
         let mut records = HashMap::new();
         records.insert(record.name.clone(), record);

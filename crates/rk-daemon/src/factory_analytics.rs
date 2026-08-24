@@ -787,6 +787,7 @@ mod tests {
             updated_at: Utc.timestamp_opt(1_030, 0).unwrap(),
             archived_at: None,
             liveness: Default::default(),
+            transport_outage: None,
         }
     }
 

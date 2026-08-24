@@ -6,6 +6,7 @@ pub mod claude;
 pub mod codex;
 pub mod fake;
 pub mod jcode;
+pub mod transport;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -103,6 +104,40 @@ impl TokenUsage {
     }
 }
 
+/// Provider transport-failure classification, carried as typed data instead
+/// of vendor prose. Adapters classify from their own child's stderr — the
+/// daemon must never pattern-match provider message text, which is
+/// unversioned and changes wording across releases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportClass {
+    Certificate,
+    Authentication,
+    Unavailable,
+    Generic,
+}
+
+/// One classified transport outcome for a launch attempt that failed before
+/// the agent produced any work (no `Started`/`AssistantText`/`ToolUse` was
+/// ever observed for the generation).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportOutcome {
+    /// Harness kind ("claude" | "codex"), matching [`Harness::kind`].
+    pub provider: String,
+    pub class: TransportClass,
+    /// Whether the supervisor's bounded retry schedule should re-attempt
+    /// this generation. `Authentication` is not retryable: a rejected
+    /// credential does not heal by reconnecting, so it escalates after one
+    /// attempt instead of burning the retry ceiling on a certain repeat.
+    pub retryable: bool,
+    /// The generation's session id, when the provider assigned one before
+    /// failing. A pre-work failure normally has none.
+    pub generation: Option<String>,
+    /// A short, single-line, secret-redacted excerpt of the evidence that
+    /// drove the classification.
+    pub evidence: String,
+}
+
 /// Normalized events every adapter maps its native protocol onto.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -136,6 +171,12 @@ pub enum HarnessEvent {
     /// harness. This acknowledgement is separate from child prose/tool
     /// output and is the durable audit boundary in the daemon.
     ControlDelivered { envelope: ControlEnvelope },
+    /// The launch failed before the harness ever reached its `Started`
+    /// handshake, and the failure was classified as a provider transport
+    /// problem (certificate, authentication, unavailable, or generic) rather
+    /// than an ordinary launch/task failure. Published immediately before
+    /// the `Exited` event it precedes.
+    TransportFailure { outcome: TransportOutcome },
 }
 
 /// What a given adapter can do; the orchestrator adapts per-capability.
@@ -261,6 +302,54 @@ extern "C" {
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
+/// Wrap a harness session's event stream to detect a pre-work transport
+/// failure: stderr observed before the harness ever reaches its `Started`
+/// handshake, followed by the child exiting. On such an exit the buffered
+/// stderr is classified ([`transport::classify`]) and, if it matches a known
+/// transport signal, a `TransportFailure` event is published immediately
+/// before the `Exited` event it precedes — a caller reading the stream in
+/// order always sees why before it sees the process is gone. A generation
+/// that has already reached `Started` is left alone: ordinary task-failure
+/// behavior (after real work has started) is unchanged, and this can never
+/// fire for it.
+pub(crate) fn watch_pre_work_transport_failure(
+    provider: &'static str,
+    session: HarnessSession,
+) -> HarnessSession {
+    let mut inbound = session.events;
+    let (tx, outbound) = mpsc::channel(256);
+    tokio::spawn(async move {
+        let mut stderr_buf: Vec<String> = Vec::new();
+        let mut started = false;
+        while let Some(event) = inbound.recv().await {
+            match &event {
+                HarnessEvent::Started { .. } => started = true,
+                HarnessEvent::Stderr { text } if !started => stderr_buf.push(text.clone()),
+                HarnessEvent::Exited { .. } if !started => {
+                    if let Some(outcome) = transport::classify(provider, &stderr_buf) {
+                        if tx
+                            .send(HarnessEvent::TransportFailure { outcome })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if tx.send(event).await.is_err() {
+                return;
+            }
+        }
+    });
+    HarnessSession {
+        events: outbound,
+        control: session.control,
+        pid: session.pid,
+    }
+}
+
 /// A coding-agent CLI adapter.
 pub trait Harness: Send + Sync {
     fn kind(&self) -> &'static str;
@@ -290,7 +379,7 @@ pub(crate) mod runner {
     use std::process::Stdio;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::process::{ChildStdout, Command};
+    use tokio::process::{ChildStderr, ChildStdout, Command};
     use tokio::sync::mpsc::error::TrySendError;
     use tracing::{debug, warn};
 
@@ -408,6 +497,37 @@ pub(crate) mod runner {
                         })
                         .await;
                     *stdout = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Drains any remaining buffered stderr after a child has exited. A
+    /// fast-exiting child's final stderr line(s) can still be sitting unread
+    /// in the OS pipe at the moment `child.wait()` resolves — the live
+    /// select loop's stderr branch simply never got a turn — and without
+    /// this they are lost. That silently drops exactly the evidence a
+    /// pre-`Started` transport-failure classification depends on, so this is
+    /// drained on every exit path alongside `drain_stdout`, not just on a
+    /// best-effort basis.
+    async fn drain_stderr(
+        stderr: &mut Option<tokio::io::Lines<BufReader<ChildStderr>>>,
+        event_tx: &mpsc::Sender<HarnessEvent>,
+    ) {
+        loop {
+            let line = match stderr.as_mut() {
+                Some(lines) => lines.next_line().await,
+                None => return,
+            };
+            match line {
+                Ok(Some(text)) => {
+                    if event_tx.send(HarnessEvent::Stderr { text }).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(None) | Err(_) => {
+                    *stderr = None;
                     return;
                 }
             }
@@ -789,14 +909,18 @@ pub(crate) mod runner {
                         let Some(envelope) = pending.take() else {
                             let _ = tokio::time::timeout(
                                 Duration::from_millis(500),
-                                drain_stdout(
-                                    &mut stdout,
-                                    parse,
-                                    &event_tx,
-                                    &mut awaiting_ack,
-                                    &mut awaiting_ack_started,
-                                    &mut delivered,
-                                ),
+                                async {
+                                    drain_stdout(
+                                        &mut stdout,
+                                        parse,
+                                        &event_tx,
+                                        &mut awaiting_ack,
+                                        &mut awaiting_ack_started,
+                                        &mut delivered,
+                                    )
+                                    .await;
+                                    drain_stderr(&mut stderr, &event_tx).await;
+                                },
                             )
                             .await;
                             if let Some(envelope) = awaiting_ack.take() {
@@ -816,14 +940,18 @@ pub(crate) mod runner {
                         };
                         let _ = tokio::time::timeout(
                             Duration::from_millis(500),
-                            drain_stdout(
-                                &mut stdout,
-                                parse,
-                                &event_tx,
-                                &mut awaiting_ack,
-                                &mut awaiting_ack_started,
-                                &mut delivered,
-                            ),
+                            async {
+                                drain_stdout(
+                                    &mut stdout,
+                                    parse,
+                                    &event_tx,
+                                    &mut awaiting_ack,
+                                    &mut awaiting_ack_started,
+                                    &mut delivered,
+                                )
+                                .await;
+                                drain_stderr(&mut stderr, &event_tx).await;
+                            },
                         )
                         .await;
                         let Some(session_id) = session_id.clone() else {
