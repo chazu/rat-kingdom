@@ -373,6 +373,7 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
         archived_at: None,
         liveness: crate::agents::LivenessObservation::default(),
         transport_outage: None,
+        recovery: None,
     }
 }
 
@@ -7768,6 +7769,7 @@ mod respawn_tests {
             archived_at: None,
             liveness: Default::default(),
             transport_outage: None,
+            recovery: None,
         }
     }
 
@@ -9344,6 +9346,7 @@ mod stuck_liveness_tests {
             archived_at: None,
             liveness: crate::agents::LivenessObservation::default(),
             transport_outage: None,
+            recovery: None,
         }
     }
 
