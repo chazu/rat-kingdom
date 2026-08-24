@@ -9078,7 +9078,10 @@ mod respawn_tests {
         );
         let redetected = sup.status(&name).unwrap();
         assert!(
-            redetected.recovery.as_ref().is_some_and(|r| r.ack.is_none()),
+            redetected
+                .recovery
+                .as_ref()
+                .is_some_and(|r| r.ack.is_none()),
             "a second, unrelated post-commit outage on the same name must be detected \
              fresh, not blocked by the first (already-continued) recovery: {:?}",
             redetected.recovery
