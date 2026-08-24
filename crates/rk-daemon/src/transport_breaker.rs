@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderBreakerState {
@@ -77,7 +78,14 @@ impl TransportBreakers {
         if threshold > 0 && state.consecutive_failures >= threshold {
             state.opened_at = Some(now);
         }
-        let _ = self.persist();
+        // Surfaced, not silently discarded: this struct's whole reason to
+        // exist is that a restart must not lose the breaker's state, so a
+        // failed write here — not just a failed read — undermines the
+        // durability guarantee the doc comment promises. The in-memory
+        // state stays correct for this process either way.
+        if let Err(e) = self.persist() {
+            warn!(error = %e, %provider, "failed to persist transport breaker state — a restart before the next successful write would lose this transition");
+        }
     }
 
     /// A generation of `provider` reached `Started` — proof of life. Closes
@@ -87,7 +95,9 @@ impl TransportBreakers {
             if state.consecutive_failures != 0 || state.opened_at.is_some() {
                 state.consecutive_failures = 0;
                 state.opened_at = None;
-                let _ = self.persist();
+                if let Err(e) = self.persist() {
+                    warn!(error = %e, %provider, "failed to persist transport breaker state — a restart before the next successful write would re-trip a breaker that already recovered");
+                }
             }
         }
     }

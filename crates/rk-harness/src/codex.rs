@@ -300,10 +300,9 @@ mod tests {
             })
             .unwrap();
         let mut events = Vec::new();
-        while let Some(event) =
-            tokio::time::timeout(Duration::from_secs(5), session.events.recv())
-                .await
-                .expect("fixture must not hang")
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(5), session.events.recv())
+            .await
+            .expect("fixture must not hang")
         {
             let exited = matches!(event, HarnessEvent::Exited { .. });
             events.push(event);
@@ -390,9 +389,13 @@ echo '{"type":"item.completed","item":{"item_type":"agent_message","text":"done"
         assert!(events
             .iter()
             .any(|e| matches!(e, HarnessEvent::Started { .. })));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, HarnessEvent::Completed { is_error: false, .. })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            HarnessEvent::Completed {
+                is_error: false,
+                ..
+            }
+        )));
     }
 
     #[test]

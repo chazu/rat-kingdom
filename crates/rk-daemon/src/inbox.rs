@@ -25,7 +25,7 @@
 //! nobody is going to back. Otherwise this rank only grows, and an inbox rank
 //! that can never be emptied trains the operator to skip the whole queue.
 
-use crate::agents::{AgentRecord, AgentState};
+use crate::agents::{AgentRecord, AgentState, TransportOutageState};
 use crate::landing::LandingQueueSummary;
 use crate::workflow_exec::{settled_at, Instance, InstanceStatus};
 use chrono::{DateTime, Utc};
@@ -196,12 +196,28 @@ pub fn build(
     let mut items = Vec::new();
 
     // Registry agents that dropped out of their run and need a hand back up.
+    // A record mid (or exhausted from) a pre-work transport-outage episode
+    // gets its own dedicated row instead of the generic one — see
+    // `transport_outage_item`. It is never BOTH: this replaces, not adds to,
+    // the generic agent-failed/agent-orphaned row for the same agent. Names
+    // collected here let the `needs` loop below tell an episode already
+    // covered by a live-agent row from one whose record is gone.
+    let mut transport_outage_rows: HashSet<&str> = HashSet::new();
     for a in agents {
-        let (kind, action) = match a.state {
-            AgentState::Failed => ("agent-failed", format!("rk respawn {}", a.name)),
-            AgentState::Orphaned => ("agent-orphaned", format!("rk respawn {}", a.name)),
-            _ => continue,
+        if !matches!(a.state, AgentState::Failed | AgentState::Orphaned) {
+            continue;
+        }
+        if let Some(outage) = &a.transport_outage {
+            items.push(transport_outage_item(a, outage));
+            transport_outage_rows.insert(a.name.as_str());
+            continue;
+        }
+        let kind = match a.state {
+            AgentState::Failed => "agent-failed",
+            AgentState::Orphaned => "agent-orphaned",
+            _ => unreachable!("filtered above"),
         };
+        let action = format!("rk respawn {}", a.name);
         let detail = match &a.result {
             Some(r) if !r.is_empty() => format!("{} — {r}", a.task.as_deref().unwrap_or("-")),
             _ => a.task.clone().unwrap_or_else(|| "-".into()),
@@ -276,7 +292,21 @@ pub fn build(
 
     // Need tuples: a rat asked the room for help. No single resolving command,
     // so the action inspects the request in context for the operator to route.
+    // `transport_outage_exhausted` is special-cased: `escalate_transport_outage`
+    // emits it for the same episode the agent loop above may have already
+    // turned into a `transport-outage` row — skip it here ONLY when that row
+    // exists (keyed by agent name, `transport_outage_rows`), so the operator
+    // never sees two rows for one problem. If the `AgentRecord` is gone
+    // (archived or pruned) there is no other row for this episode, so fall
+    // back to a typed row read straight from the tuple rather than dropping
+    // the incident.
     for t in needs {
+        if t.payload.get("type").and_then(|v| v.as_str()) == Some("transport_outage_exhausted") {
+            if !transport_outage_rows.contains(t.identity.as_str()) {
+                items.push(transport_outage_need_item(t));
+            }
+            continue;
+        }
         let text = t
             .payload
             .get("text")
@@ -424,6 +454,80 @@ pub fn build(
     // spawn time, instances by start time, tuples oldest-first) within a rank.
     items.sort_by_key(|b| std::cmp::Reverse(b.urgency));
     items
+}
+
+/// One row for an agent whose generation is mid (or exhausted from) a
+/// pre-work harness transport-outage episode (TKT-01M0HND8M25GYN1ZTRET3S5769).
+/// Built from the structured `AgentRecord.transport_outage` fields, never
+/// from the `transport_outage_exhausted` need's prose text (that tuple is
+/// skipped in the `needs` loop for exactly this reason when a matching row
+/// is emitted here — it would otherwise double up with this row).
+///
+/// Two urgencies for one `kind`, not two kinds: `ceiling_hit` is the only
+/// thing that turns this from "automated recovery in progress, nothing to do
+/// yet" into "exhausted its retries, needs a human" — the operator wants to
+/// glance at the detail either way, but only the latter should outrank a
+/// `need`. Manually `rk respawn`ing a still-retrying episode would race
+/// `transport_retry_sweep`'s own schedule, so the action differs too.
+fn transport_outage_item(a: &AgentRecord, outage: &TransportOutageState) -> InboxItem {
+    let (urgency, action, status) = if outage.ceiling_hit {
+        (
+            urgency::FAILED,
+            format!("rk respawn {}", a.name),
+            "exhausted its retry ceiling — needs a human",
+        )
+    } else {
+        (
+            urgency::OBSTACLE,
+            format!("rk status {}", a.name),
+            "auto-retrying under the castle-wide circuit breaker",
+        )
+    };
+    InboxItem {
+        urgency,
+        kind: "transport-outage".into(),
+        subject: a.name.clone(),
+        scope: a.repo_name.clone(),
+        detail: format!(
+            "{} pre-work transport failure ({:?}), attempt {} — {status}",
+            outage.provider, outage.class, outage.attempts
+        ),
+        action,
+    }
+}
+
+/// Fallback for a `transport_outage_exhausted` need whose `AgentRecord` is
+/// gone (archived or pruned) by the time `rk inbox` reads — read entirely
+/// from the tuple's own typed fields, same shape as [`transport_outage_item`],
+/// so the incident cannot silently disappear just because its agent record
+/// did. Only used when no live-agent row already covers this episode.
+fn transport_outage_need_item(t: &Tuple) -> InboxItem {
+    let provider = t
+        .payload
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let class = t
+        .payload
+        .get("class")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let attempts = t
+        .payload
+        .get("attempts")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    InboxItem {
+        urgency: urgency::FAILED,
+        kind: "transport-outage".into(),
+        subject: t.identity.clone(),
+        scope: t.scope.clone(),
+        detail: format!(
+            "{provider} pre-work transport failure ({class}), attempt {attempts} — \
+             exhausted its retry ceiling — needs a human (agent record archived/gone)"
+        ),
+        action: format!("rk respawn {}", t.identity),
+    }
 }
 
 /// One row per open ballot: a system-scope `Suggestion` that has neither
@@ -1156,6 +1260,115 @@ mod tests {
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].subject, "Gone");
         assert_eq!(inbox[0].action, "rk respawn Gone");
+    }
+
+    fn outage(ceiling_hit: bool) -> TransportOutageState {
+        TransportOutageState {
+            provider: "claude".into(),
+            class: rk_harness::TransportClass::Unavailable,
+            retryable: true,
+            attempts: 2,
+            last_failure_at: Utc::now(),
+            evidence: "503 Service Unavailable".into(),
+            ceiling_hit,
+            circuit_refused: false,
+        }
+    }
+
+    fn transport_outage_need(agent: &str) -> Tuple {
+        Tuple::new(
+            Category::Need,
+            "repo",
+            agent,
+            "castle",
+            json!({
+                "type": "transport_outage_exhausted",
+                "agent": agent,
+                "provider": "claude",
+                "class": "unavailable",
+                "attempts": 3,
+                "text": format!("agent {agent} could not reach its claude harness"),
+            }),
+        )
+    }
+
+    /// A `Failed` agent mid an unexhausted transport-outage episode gets
+    /// exactly one row (the dedicated `transport-outage` kind, lower urgency
+    /// than an ordinary failure since it is still auto-retrying) — never
+    /// the generic `agent-failed` row on top of it.
+    #[test]
+    fn transport_outage_suppresses_generic_agent_row() {
+        let mut a = agent("Nibble", AgentState::Failed);
+        a.transport_outage = Some(outage(false));
+        let inbox = build(
+            &[a],
+            &[],
+            &[],
+            &[],
+            &BranchEvents::default(),
+            &Ballots::default(),
+        );
+        assert_eq!(inbox.len(), 1, "must be exactly one row: {inbox:#?}");
+        assert_eq!(inbox[0].kind, "transport-outage");
+        assert_eq!(inbox[0].urgency, urgency::OBSTACLE);
+        assert_eq!(inbox[0].action, "rk status Nibble");
+    }
+
+    /// Once the episode is exhausted (`ceiling_hit`), `escalate_transport_outage`
+    /// has also emitted a `transport_outage_exhausted` need for the same
+    /// agent. The live `AgentRecord` row wins and the need is deduped away —
+    /// the operator must see exactly one row, not two, for one problem.
+    #[test]
+    fn transport_outage_need_deduped_against_live_agent_row() {
+        let mut a = agent("Nibble", AgentState::Failed);
+        a.transport_outage = Some(outage(true));
+        let needs = vec![transport_outage_need("Nibble")];
+        let inbox = build(
+            &[a],
+            &[],
+            &[],
+            &needs,
+            &BranchEvents::default(),
+            &Ballots::default(),
+        );
+        let rows: Vec<&InboxItem> = inbox
+            .iter()
+            .filter(|i| i.kind == "transport-outage")
+            .collect();
+        assert_eq!(rows.len(), 1, "must dedupe to one row: {inbox:#?}");
+        assert_eq!(rows[0].urgency, urgency::FAILED);
+        assert_eq!(rows[0].action, "rk respawn Nibble");
+    }
+
+    /// If the `AgentRecord` is gone (archived/pruned) by the time `rk inbox`
+    /// reads, the episode must not silently disappear just because the row
+    /// that would normally dedupe it isn't there — fall back to a row built
+    /// from the need tuple's own typed fields.
+    #[test]
+    fn transport_outage_need_falls_back_when_agent_record_gone() {
+        let needs = vec![transport_outage_need("Ghost")];
+        let inbox = build(
+            &[],
+            &[],
+            &[],
+            &needs,
+            &BranchEvents::default(),
+            &Ballots::default(),
+        );
+        let rows: Vec<&InboxItem> = inbox
+            .iter()
+            .filter(|i| i.kind == "transport-outage")
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the incident must not disappear when the agent record is gone: {inbox:#?}"
+        );
+        assert_eq!(rows[0].subject, "Ghost");
+        assert_eq!(rows[0].urgency, urgency::FAILED);
+        assert_eq!(rows[0].action, "rk respawn Ghost");
+        assert!(rows[0].detail.contains("claude"));
+        assert!(rows[0].detail.contains("unavailable"));
     }
 
     #[test]
