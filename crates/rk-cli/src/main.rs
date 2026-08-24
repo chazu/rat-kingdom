@@ -164,6 +164,15 @@ enum Command {
     Revert(agent_cmds::RevertArgs),
     /// Relaunch a failed/orphaned agent in its preserved worktree.
     Respawn(agent_cmds::NameArg),
+    /// Resume an agent parked by a post-commit transport outage, optionally
+    /// under a different harness. Surfaced by `rk inbox` as a
+    /// `recovery-action` row.
+    #[command(name = "continue-recovery")]
+    ContinueRecovery(agent_cmds::RecoveryActionArgs),
+    /// Decline to continue a parked post-commit recovery: leave the generation
+    /// terminal instead of resuming it.
+    #[command(name = "abandon-recovery")]
+    AbandonRecovery(agent_cmds::RecoveryActionArgs),
     /// Attach interactively to an attach-mode rat's herdr pane.
     Attach(agent_cmds::NameArg),
     /// Per-agent and fleet token/cost rollup.
@@ -1157,6 +1166,12 @@ async fn main() -> Result<()> {
         Command::Land(args) => agent_cmds::land(&layout, args, cli.json).await?,
         Command::Revert(args) => agent_cmds::revert(&layout, args, cli.json).await?,
         Command::Respawn(args) => agent_cmds::respawn(&layout, args, cli.json).await?,
+        Command::ContinueRecovery(args) => {
+            agent_cmds::continue_recovery(&layout, args, cli.json).await?
+        }
+        Command::AbandonRecovery(args) => {
+            agent_cmds::abandon_recovery(&layout, args, cli.json).await?
+        }
         Command::Attach(args) => agent_cmds::attach(&layout, args).await?,
         Command::Cost { fleet } => {
             if fleet {
