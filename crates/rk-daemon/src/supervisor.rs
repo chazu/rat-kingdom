@@ -8506,7 +8506,7 @@ mod respawn_tests {
             HarnessEvent::Completed {
                 result: "natural harness completion arrived late".into(),
                 is_error: false,
-                usage: usage.clone(),
+                usage,
                 cost_usd: Some(0.25),
                 session_id: None,
             },
