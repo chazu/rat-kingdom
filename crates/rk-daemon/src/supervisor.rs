@@ -8607,6 +8607,292 @@ mod respawn_tests {
         assert!(after.pid.is_none());
     }
 
+    /// A `Running` record with committed work (a branch with at least one
+    /// commit past its fork point) and live-verifier evidence in its
+    /// `liveness` snapshot, whose harness dies with transport-shaped
+    /// stderr — fault-injected through the SAME `handle_event` path a real
+    /// process death drives, not by calling the detector directly.
+    fn committed_work_record_with_live_verifier_evidence(
+        repo: &Path,
+        fork_point: String,
+        branch: &str,
+    ) -> AgentRecord {
+        let mut rec = record(repo, Some(branch));
+        rec.fork_point = Some(fork_point);
+        rec.state = AgentState::Running;
+        rec.session_id = Some("provider-sess-1".into());
+        // Live verifier evidence: a local check (`cargo test`/`rk verify`)
+        // was still advancing right up to the moment the harness died.
+        rec.liveness = crate::agents::LivenessObservation {
+            session: Some(rec.spawn_id()),
+            output_fingerprint: 777,
+            output_changed_at: Some(Utc::now()),
+            reconnect_events: 1,
+            ceiling_started_at: None,
+        };
+        rec.stderr_tail = Some("fatal: connection refused while contacting api\n".into());
+        rec
+    }
+
+    /// End-to-end fault injection for TKT-01M0HNDJ7AS9F1A3W22FRCC63N: proves
+    /// the durable recovery record survives a simulated daemon restart (two
+    /// `Supervisor`s over the same home directory) with its liveness
+    /// evidence intact, and that continuation is at-most-once — a replayed
+    /// `action_id` returns the SAME outcome instead of double-launching, and
+    /// a different `action_id` after acknowledgement is refused outright.
+    #[tokio::test]
+    async fn post_commit_transport_outage_recovers_across_a_daemon_restart_with_at_most_once_continuation(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let p = repo.path();
+        let fork_point = Repo::discover(p).unwrap().rev_parse("HEAD").unwrap();
+
+        git(p, &["checkout", "-b", "rat/nibble/tkt-1", "main"]);
+        std::fs::write(p.join("work"), "done\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "committed work"]);
+        git(p, &["checkout", "main"]);
+
+        let rec =
+            committed_work_record_with_live_verifier_evidence(p, fork_point, "rat/nibble/tkt-1");
+        let name = rec.name.clone();
+        let spawn = rec.spawn_id();
+        let generation = rec.created_at;
+
+        let sup1 = supervisor(home.path());
+        sup1.lock_registry().insert(rec).unwrap();
+
+        // A late `Exited` from a SUPERSEDED session must not write recovery
+        // state: the session tracked for `name` is a DIFFERENT token than
+        // the one this event names.
+        let superseding = rk_core::id::SpawnId::new();
+        let stale_session = rk_core::id::SpawnId::new();
+        sup1.lock_session_tokens().insert(name.clone(), superseding);
+        sup1.handle_event(
+            &name,
+            generation,
+            spawn,
+            stale_session,
+            HarnessEvent::Exited { code: Some(1) },
+        );
+        assert!(
+            sup1.status(&name).unwrap().recovery.is_none(),
+            "a late Exited from a superseded session must not overwrite the active \
+             generation's recovery state"
+        );
+
+        // The real fault: the CURRENT session's harness dies post-commit
+        // with transport-shaped stderr.
+        sup1.lock_registry()
+            .update(&name, |r| {
+                r.state = AgentState::Running; // undo the no-op stale attempt above
+                r.pid = Some(4242);
+            })
+            .unwrap();
+        let session = rk_core::id::SpawnId::new();
+        sup1.lock_session_tokens().insert(name.clone(), session);
+        sup1.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Exited { code: Some(1) },
+        );
+
+        let detected = sup1.status(&name).unwrap();
+        let recovery = detected
+            .recovery
+            .as_ref()
+            .expect("post-commit transport outage must be detected and recorded");
+        assert_eq!(recovery.branch, "rat/nibble/tkt-1");
+        assert_eq!(recovery.class, rk_harness::TransportClass::Unavailable);
+        assert_eq!(
+            recovery.liveness.output_fingerprint, 777,
+            "live-verifier liveness evidence must be preserved verbatim"
+        );
+        assert_eq!(recovery.liveness.reconnect_events, 1);
+        assert!(recovery.ack.is_none());
+        assert_eq!(detected.state, AgentState::Failed);
+        assert!(
+            detected.pid.is_none(),
+            "WIP must already be released at Exited"
+        );
+
+        // Simulated daemon restart: a FRESH Supervisor over the SAME home
+        // directory must see exactly what the dead process recorded.
+        drop(sup1);
+        let sup2 = supervisor(home.path());
+        let after_restart = sup2.status(&name).unwrap();
+        assert_eq!(
+            after_restart.recovery.as_ref().map(|r| &r.head),
+            Some(&recovery.head),
+            "the recovery record must survive a daemon restart intact"
+        );
+
+        // Continuation: same provider ("fake"), no target override.
+        let outcome = sup2
+            .continue_recovery(&name, "action-1", None)
+            .expect("continuation must succeed for a fresh, unacknowledged recovery");
+        assert!(
+            matches!(
+                outcome,
+                crate::agents::RecoveryOutcome::ResumedSameProvider { .. }
+            ),
+            "same-provider continuation must resume, not route to an alternate: {outcome:?}"
+        );
+        assert_eq!(sup2.status(&name).unwrap().state, AgentState::Running);
+
+        // Duplicate replay: the SAME action_id must return the SAME
+        // outcome without erroring (no second live owner is ever attempted).
+        let replayed = sup2
+            .continue_recovery(&name, "action-1", None)
+            .expect("a replayed action_id must be safe to retry");
+        assert_eq!(
+            replayed, outcome,
+            "a replay must return the identical recorded outcome"
+        );
+
+        // A DIFFERENT action_id after acknowledgement must be refused —
+        // acknowledgement makes continuation at-most-once.
+        let conflict = sup2.continue_recovery(&name, "action-2", None);
+        assert!(
+            conflict.is_err(),
+            "a different action_id after acknowledgement must be refused, not re-acted"
+        );
+    }
+
+    /// `target_harness` routes continuation to a configured alternate
+    /// harness in the SAME worktree rather than resuming the dead
+    /// provider's session — no session id is portable across providers, so
+    /// this must be a fresh turn, not a resume.
+    #[tokio::test]
+    async fn continue_recovery_routes_to_a_configured_alternate_harness() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let p = repo.path();
+        let fork_point = Repo::discover(p).unwrap().rev_parse("HEAD").unwrap();
+
+        git(p, &["checkout", "-b", "rat/nibble/tkt-2", "main"]);
+        std::fs::write(p.join("work"), "done\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "committed work"]);
+        git(p, &["checkout", "main"]);
+
+        // The dying provider is recorded as "claude" (never actually
+        // launched here); the configured alternate is "fake" — the only
+        // kind guaranteed to launch in a sandboxed test.
+        let mut rec =
+            committed_work_record_with_live_verifier_evidence(p, fork_point, "rat/nibble/tkt-2");
+        rec.harness = "claude".into();
+        let name = rec.name.clone();
+        let spawn = rec.spawn_id();
+        let generation = rec.created_at;
+
+        let sup = supervisor(home.path());
+        sup.lock_registry().insert(rec).unwrap();
+        let session = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert(name.clone(), session);
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Exited { code: Some(1) },
+        );
+        assert!(sup.status(&name).unwrap().recovery.is_some());
+
+        let outcome = sup
+            .continue_recovery(&name, "alt-action-1", Some("fake"))
+            .expect("alternate-provider continuation must succeed");
+        match &outcome {
+            crate::agents::RecoveryOutcome::ContinuedAlternateProvider { harness, .. } => {
+                assert_eq!(harness, "fake");
+            }
+            other => panic!("expected ContinuedAlternateProvider, got {other:?}"),
+        }
+        assert_eq!(
+            sup.status(&name).unwrap().harness,
+            "fake",
+            "the record's harness must reflect the alternate it actually continued under"
+        );
+    }
+
+    /// Terminal-failure path: an operator/policy decision to NOT continue a
+    /// parked recovery must release its WIP slot cleanly and permanently —
+    /// `respawn_sweep` must never resurrect it, even configured to fire on
+    /// its very first tick with no backoff (mirrors
+    /// `respawn_sweep_excludes_transport_outage_records`).
+    #[test]
+    fn abandoned_recovery_stays_excluded_from_respawn_sweep_forever() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let p = repo.path();
+        let fork_point = Repo::discover(p).unwrap().rev_parse("HEAD").unwrap();
+        git(p, &["checkout", "-b", "rat/nibble/tkt-3", "main"]);
+        std::fs::write(p.join("work"), "done\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "committed work"]);
+        git(p, &["checkout", "main"]);
+
+        let mut rec =
+            committed_work_record_with_live_verifier_evidence(p, fork_point, "rat/nibble/tkt-3");
+        rec.state = AgentState::Failed;
+        rec.pid = None;
+        rec.recovery = Some(crate::agents::RecoveryRecord {
+            ticket: rec.task.clone(),
+            branch: "rat/nibble/tkt-3".into(),
+            head: "deadbeef".repeat(5),
+            session_id: rec.session_id.clone(),
+            spawn: rec.spawn_id(),
+            liveness: rec.liveness.clone(),
+            budget_remaining_usd: None,
+            provider: "fake".into(),
+            class: rk_harness::TransportClass::Unavailable,
+            evidence: "connection refused".into(),
+            detected_at: Utc::now(),
+            ack: None,
+        });
+        let name = rec.name.clone();
+
+        let sup = supervisor(home.path());
+        sup.lock_registry().insert(rec).unwrap();
+
+        let outcome = sup
+            .abandon_recovery(&name, "give-up-1")
+            .expect("abandoning a fresh recovery must succeed");
+        assert_eq!(outcome, crate::agents::RecoveryOutcome::Abandoned);
+
+        // Duplicate replay of the SAME action_id must return the same
+        // terminal outcome, not error.
+        assert_eq!(
+            sup.abandon_recovery(&name, "give-up-1").unwrap(),
+            crate::agents::RecoveryOutcome::Abandoned
+        );
+        // A different action_id after acknowledgement must be refused.
+        assert!(sup.abandon_recovery(&name, "give-up-2").is_err());
+
+        let cfg = SupervisorConfig {
+            respawn_enabled: true,
+            respawn_max_attempts: 1,
+            respawn_backoff_secs: 0,
+            ..SupervisorConfig::default()
+        };
+        let sinks = rk_core::notify::SinkRegistry::default();
+        sup.respawn_sweep(&cfg, &sinks);
+
+        let after = sup.status(&name).unwrap();
+        assert_eq!(
+            after.state,
+            AgentState::Failed,
+            "an abandoned recovery must never be auto-respawned"
+        );
+        assert!(after.pid.is_none(), "WIP must stay released permanently");
+    }
+
     #[test]
     fn deliberate_stops_are_not_auto_respawn_candidates_but_crashes_are() {
         let repo = tempfile::tempdir().unwrap();
