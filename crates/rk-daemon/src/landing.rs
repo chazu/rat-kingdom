@@ -2998,6 +2998,11 @@ impl LandingPipeline {
                             gates.review_max_wait.as_secs()
                         ),
                         "inspect or stop the reviewer, then record a verdict or make the land decision",
+                        Some(format!(
+                            "to wait for a fresh review instead of forcing the land, rk \
+                             reenqueue-review {} --repo {} --target {} --task {} --attempt {}",
+                            entry.branch, entry.repo_path, entry.target, entry.task, instance_id
+                        )),
                     )?));
                 }
             }
@@ -3056,6 +3061,7 @@ impl LandingPipeline {
                 "reviewer-stop",
                 "the reviewer returned STOP".into(),
                 "decide whether to abandon the branch or explicitly override the STOP",
+                None,
             )?)),
             other => Ok(LandingOutcome::Escalated(self.review_human_gate(
                 entry,
@@ -3063,6 +3069,7 @@ impl LandingPipeline {
                 "unknown-verdict",
                 format!("the reviewer returned unrecognized verdict {other:?}"),
                 "correct the review artifact to APPROVE, REWORK, or STOP, then resubmit",
+                None,
             )?)),
         }
     }
@@ -3283,6 +3290,103 @@ impl LandingPipeline {
         Ok(new_attempt)
     }
 
+    /// Operator-facing wrapper around [`Self::reenqueue_after_ceiling`] for
+    /// the `repo.land.reenqueue` RPC (`rk reenqueue-review`). The RPC caller
+    /// only has the branch/target/task identifiers and the settled attempt
+    /// id an escalation text handed them — not a `LandingQueueEntry`, whose
+    /// `head_sha` is recovered from the ceiling-settlement marker itself
+    /// (mirroring [`Self::synthetic_conflict_entry`]) rather than requiring
+    /// the caller to know it.
+    pub(crate) async fn reenqueue_ceiling_settled_review(
+        &self,
+        repo_path: &Path,
+        branch: &str,
+        target: &str,
+        task: &str,
+        settled_attempt: &str,
+    ) -> rk_core::Result<String> {
+        let git_repo = rk_git::Repo::discover(repo_path)?;
+        let repo_name = git_repo.name();
+        let lookup = LandingQueueEntry {
+            repo_name: repo_name.clone(),
+            branch: branch.to_string(),
+            target: target.to_string(),
+            task: task.to_string(),
+            ..Default::default()
+        };
+        let settlement = self
+            .review_ceiling_settlement(&lookup, settled_attempt)?
+            .ok_or_else(|| {
+                rk_core::Error::other(format!(
+                    "cannot re-enqueue review for {branch} on {repo_name}: attempt \
+                     {settled_attempt} was never ceiling-settled"
+                ))
+            })?;
+        let head_sha = settlement
+            .payload
+            .get("head_sha")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let entry = LandingQueueEntry {
+            repo_name,
+            repo_path: repo_path.display().to_string(),
+            branch: branch.to_string(),
+            target: target.to_string(),
+            head_sha,
+            task: task.to_string(),
+            ..Default::default()
+        };
+        let gates = self.gate_config(&git_repo);
+        self.reenqueue_after_ceiling(&entry, &gates, settled_attempt)
+            .await
+    }
+
+    /// Live reconciliation: scan every durable `REVIEW_CEILING_SETTLED_IDENTITY`
+    /// marker across all repos and retain any late-arriving verdict for it as
+    /// durable evidence via [`Self::retain_late_review_evidence`]. Meant to
+    /// run on the same periodic tick as [`Self::run_cycle`] (see `Server`'s
+    /// landing background loop) — restart-safe and idempotent, since
+    /// `retain_late_review_evidence` itself is idempotent per `(attempt,
+    /// head_sha)`: re-scanning the same settled markers on every tick, or
+    /// after a daemon restart, only ever picks up evidence not already
+    /// retained. Never touches `LandingQueue` or re-decides a landing
+    /// outcome — settlement markers name attempts whose candidate is already
+    /// terminal.
+    pub(crate) fn reconcile_late_review_evidence(&self) -> rk_core::Result<usize> {
+        let markers = self
+            .space
+            .scan(&Pattern::category(Category::Event).identity(REVIEW_CEILING_SETTLED_IDENTITY))?;
+        let mut retained = 0;
+        for marker in markers {
+            let (Some(branch), Some(target), Some(task), Some(attempt)) = (
+                marker.payload.get("branch").and_then(Value::as_str),
+                marker.payload.get("target").and_then(Value::as_str),
+                marker.payload.get("task").and_then(Value::as_str),
+                marker.payload.get("attempt").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            let entry = LandingQueueEntry {
+                repo_name: marker.scope.clone(),
+                branch: branch.to_string(),
+                target: target.to_string(),
+                task: task.to_string(),
+                head_sha: marker
+                    .payload
+                    .get("head_sha")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                ..Default::default()
+            };
+            if self.retain_late_review_evidence(&entry, attempt)?.is_some() {
+                retained += 1;
+            }
+        }
+        Ok(retained)
+    }
+
     fn review_human_gate(
         &self,
         entry: &LandingQueueEntry,
@@ -3290,6 +3394,7 @@ impl LandingPipeline {
         code: &str,
         detail: String,
         decision: &str,
+        extra_resolve: Option<String>,
     ) -> rk_core::Result<Tuple> {
         let stat = git_repo.diff_stat(&entry.target, &entry.branch)?;
         let notes = self
@@ -3298,6 +3403,9 @@ impl LandingPipeline {
             .map(|artifact| landing_rework::notes(Some(artifact)))
             .filter(|notes| !notes.is_empty())
             .unwrap_or_else(|| "(none recorded)".to_string());
+        let extra_resolve = extra_resolve
+            .map(|line| format!("\nOR: {line}"))
+            .unwrap_or_default();
         self.escalate(
             entry,
             format!(
@@ -3306,7 +3414,7 @@ impl LandingPipeline {
                  DECISION NEEDED: {decision}\n\
                  BLAST RADIUS: {} file(s) / {} line(s) on {}, held back from {}. Nothing merged.\n\
                  RESOLVE WITH: rk land {} --repo {} --target {} --task {} --force --reason \
-                 'human resolved {code}'",
+                 'human resolved {code}'{extra_resolve}",
                 entry.branch,
                 entry.task,
                 entry.head_sha,

@@ -1247,6 +1247,16 @@ impl Daemon {
                         }
                         Err(e) => warn!(error = %e, "landing pipeline cycle failed"),
                     }
+                    // Same tick: retain any verdict that arrived late for an
+                    // already ceiling-settled review attempt as durable
+                    // evidence, without touching the (already terminal)
+                    // landing decision. Cheap and idempotent — see
+                    // `LandingPipeline::reconcile_late_review_evidence`.
+                    match landing.reconcile_late_review_evidence() {
+                        Ok(0) => {}
+                        Ok(n) => debug!(retained = n, "retained late review evidence"),
+                        Err(e) => warn!(error = %e, "late review evidence reconciliation failed"),
+                    }
                 }
             });
         }
@@ -1741,6 +1751,7 @@ impl Daemon {
                 | "agent.revert"
                 | "repo.add"
                 | "repo.land"
+                | "repo.land.reenqueue"
                 | "repo.remove"
                 | "repo.onboard.start"
                 | "repo.onboard.propose"
@@ -2865,6 +2876,28 @@ impl Daemon {
                 };
                 reply(match result {
                     Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
+                })
+            }
+            "repo.land.reenqueue" => {
+                let params: RepoLandReenqueueParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
+                    }
+                };
+                let result = self
+                    .landing()
+                    .reenqueue_ceiling_settled_review(
+                        std::path::Path::new(&params.repo),
+                        &params.branch,
+                        &params.target,
+                        &params.task,
+                        &params.attempt,
+                    )
+                    .await;
+                reply(match result {
+                    Ok(new_attempt) => Response::ok(id, json!({ "new_attempt": new_attempt })),
                     Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
                 })
             }
@@ -9178,6 +9211,21 @@ struct RepoLandParams {
 
 fn default_main_branch() -> String {
     "main".to_string()
+}
+
+/// `repo.land.reenqueue` — bounded, exactly-once dispatch of one fresh
+/// review attempt for a candidate whose prior attempt was ceiling-settled
+/// ([`crate::landing::LandingPipeline::settle_review_ceiling`]). `attempt`
+/// is the settled attempt id an escalation's `RESOLVE WITH:` text hands the
+/// operator — see [`crate::landing::LandingPipeline::reenqueue_after_ceiling`].
+#[derive(Deserialize)]
+struct RepoLandReenqueueParams {
+    repo: String,
+    branch: String,
+    #[serde(default = "default_main_branch")]
+    target: String,
+    task: String,
+    attempt: String,
 }
 
 #[derive(Deserialize)]
