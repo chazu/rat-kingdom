@@ -183,7 +183,10 @@ fn candidate_repo() -> (tempfile::TempDir, String) {
     )
     .unwrap();
     git(dir.path(), &["add", ".rk/checks.cue"]);
-    git(dir.path(), &["commit", "-m", "test: register landing checks"]);
+    git(
+        dir.path(),
+        &["commit", "-m", "test: register landing checks"],
+    );
 
     git(dir.path(), &["checkout", "-b", "feature"]);
     let body: String = (0..80)
@@ -191,7 +194,10 @@ fn candidate_repo() -> (tempfile::TempDir, String) {
         .collect();
     std::fs::write(dir.path().join("src_gen.rs"), body).unwrap();
     git(dir.path(), &["add", "src_gen.rs"]);
-    git(dir.path(), &["commit", "-m", "feat: add generated constants"]);
+    git(
+        dir.path(),
+        &["commit", "-m", "feat: add generated constants"],
+    );
     let head_sha = git(dir.path(), &["rev-parse", "HEAD"]);
     git(dir.path(), &["checkout", "main"]);
     (dir, head_sha)
@@ -279,10 +285,7 @@ fn live_agents_for(home: &Path, attempt: &str) -> Vec<Value> {
         .into_iter()
         .filter(|a| {
             a["workflow_instance"].as_str() == Some(attempt)
-                && matches!(
-                    a["state"].as_str(),
-                    Some("running" | "spawning" | "parked")
-                )
+                && matches!(a["state"].as_str(), Some("running" | "spawning" | "parked"))
         })
         .collect()
 }
@@ -587,34 +590,6 @@ fn crash_after_durable_marker_refuses_the_retry_rather_than_settling_twice() {
 fn assert_converged_properties(c: &Crashed) {
     let home = c.home.path();
 
-    // Bounded re-enqueue survives the restart: one fresh attempt, dispatched
-    // once.
-    let out = reenqueue(c);
-    assert!(
-        out.status.success(),
-        "re-enqueue must work against the restarted daemon: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let new_attempt = json_stdout(&out)["new_attempt"]
-        .as_str()
-        .expect("re-enqueue must report the fresh attempt id")
-        .to_string();
-    assert_ne!(new_attempt, c.attempt, "the replacement must be a new attempt");
-
-    // Idempotent: a second call for the same settled attempt returns the SAME
-    // replacement rather than dispatching another reviewer.
-    let repeat = reenqueue(c);
-    assert!(repeat.status.success());
-    assert_eq!(
-        json_stdout(&repeat)["new_attempt"].as_str(),
-        Some(new_attempt.as_str()),
-        "a repeat re-enqueue must return the same attempt, never dispatch a duplicate"
-    );
-    assert!(
-        live_agents_for(home, &c.attempt).is_empty(),
-        "re-enqueue must never revive the settled attempt"
-    );
-
     // A late APPROVE from the CANCELLED generation, written exactly as a
     // zombie reviewer finishing its in-flight turn after the kill would.
     let payload = serde_json::json!({
@@ -646,9 +621,14 @@ fn assert_converged_properties(c: &Crashed) {
 
     // It is retained as EVIDENCE by daemon B's own periodic reconciliation...
     until("the late verdict to be retained as evidence", || {
-        tuples(home, &c.repo_name, "artifact", "landing_late_review_evidence")
-            .into_iter()
-            .find(|t| t["payload"]["attempt"].as_str() == Some(c.attempt.as_str()))
+        tuples(
+            home,
+            &c.repo_name,
+            "artifact",
+            "landing_late_review_evidence",
+        )
+        .into_iter()
+        .find(|t| t["payload"]["attempt"].as_str() == Some(c.attempt.as_str()))
     });
 
     // ...and changes nothing: the decision stays terminal and the cancelled
@@ -662,5 +642,39 @@ fn assert_converged_properties(c: &Crashed) {
     assert_ne!(
         main_head, c.head_sha,
         "an APPROVE from a cancelled generation must never land the branch"
+    );
+
+    // Prove re-enqueue only after the late-evidence sweep has run. A fresh
+    // reviewer deliberately hangs in this fixture; dispatching it first would
+    // put the single landing loop back into `await_primary_verdict` and prevent
+    // that same loop from reaching its reconciliation step until the new wait
+    // ended. That would test scheduler ordering, not evidence durability.
+    let out = reenqueue(c);
+    assert!(
+        out.status.success(),
+        "re-enqueue must work against the restarted daemon: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let new_attempt = json_stdout(&out)["new_attempt"]
+        .as_str()
+        .expect("re-enqueue must report the fresh attempt id")
+        .to_string();
+    assert_ne!(
+        new_attempt, c.attempt,
+        "the replacement must be a new attempt"
+    );
+
+    // Idempotent: a second call for the same settled attempt returns the SAME
+    // replacement rather than dispatching another reviewer.
+    let repeat = reenqueue(c);
+    assert!(repeat.status.success());
+    assert_eq!(
+        json_stdout(&repeat)["new_attempt"].as_str(),
+        Some(new_attempt.as_str()),
+        "a repeat re-enqueue must return the same attempt, never dispatch a duplicate"
+    );
+    assert!(
+        live_agents_for(home, &c.attempt).is_empty(),
+        "re-enqueue must never revive the settled attempt"
     );
 }
