@@ -41,6 +41,27 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+/// Serializes the four `#[test]`s in this file (never any test in another
+/// binary — cargo already runs test binaries one at a time, only the tests
+/// *within* one binary run concurrently by default). Each test here starts
+/// one or more real daemon processes, each with its own reviewer/lander/
+/// canceller subprocesses; four of those fixtures competing for CPU and
+/// forks at once is enough self-inflicted contention to occasionally blow
+/// this file's deterministic 60-second `until` bounds (reproduced by running
+/// two copies of this binary concurrently, doubling that contention: the
+/// same properties this file proves eventually held, just past 60s).
+/// Serializing removes the contention these tests create for each other
+/// without weakening what any single one proves or touching any other
+/// binary's concurrency.
+static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`TEST_SERIAL`] for the calling test's whole body. Recovers from
+/// poisoning: one test panicking while holding the lock must not also fail
+/// every test after it.
+fn serialize_test() -> std::sync::MutexGuard<'static, ()> {
+    TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Must match `BARRIER_CEILING_PRE_MARKER` in `crates/rk-daemon/src/landing.rs`
 /// (the constant is private to that module; the barrier's contract is the
 /// name string, deliberately, so arming needs no API surface).
@@ -331,11 +352,50 @@ impl Drop for Crashed {
         // daemons into the host running the suite. Do not ask it to shut down
         // gracefully: this fixture deliberately leaves a replacement reviewer
         // waiting, so graceful stop can block behind the behavior under test.
-        if let Some(pid) = daemon_pid(self.home.path()) {
-            if pid != std::process::id() && pid != self.dead_daemon_pid {
-                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
-            }
-        }
+        kill_owning_daemon(self.home.path(), Some(self.dead_daemon_pid));
+    }
+}
+
+/// Kill whichever daemon currently owns `home`, unless it is this test
+/// process itself or `spare` (a pid this test already knows is dead and has
+/// no reason to signal again).
+///
+/// Reads `home`'s pid file directly rather than round-tripping through an
+/// `rk daemon status` RPC (as [`daemon_pid`] does for the assertions that are
+/// actually under test): teardown runs under exactly the load that can make
+/// a subprocess spawn or RPC connect flaky, and a dropped daemon-status call
+/// must never silently leave a live daemon behind — unlike every other
+/// process this file exercises, a daemon does not exit on its own, so a
+/// missed kill here is a permanent leak, not a bounded one. Best-effort: a
+/// stale or unreadable pid file (or a `kill` that itself fails to spawn) just
+/// means nothing gets signalled, same as today's fallback.
+fn kill_owning_daemon(home: &Path, spare: Option<u32>) {
+    let Some(pid) = std::fs::read_to_string(home.join("rk.pid"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+    if pid == std::process::id() || Some(pid) == spare {
+        return;
+    }
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+}
+
+/// RAII teardown for a test that starts a real detached daemon but — unlike
+/// the crash tests above — never crashes it itself, so nothing else in the
+/// test tears it down. Declared *after* the `TempDir` it guards so it drops
+/// *before* that `TempDir`'s own destructor removes the directory (Rust
+/// drops locals in reverse declaration order): the pid file must still exist
+/// when [`kill_owning_daemon`] reads it. Runs on both success and panic,
+/// same as [`Crashed`]'s own cleanup.
+struct DaemonGuard {
+    home: std::path::PathBuf,
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        kill_owning_daemon(&self.home, None);
     }
 }
 
@@ -606,6 +666,7 @@ fn reenqueue(c: &Crashed) -> std::process::Output {
 /// killed, but nothing durable recorded it.
 #[test]
 fn crash_between_dismissal_and_marker_converges_exactly_once() {
+    let _serial = serialize_test();
     let c = crash_at(BARRIER_PRE_MARKER);
     let home = c.home.path();
 
@@ -653,10 +714,17 @@ fn crash_between_dismissal_and_marker_converges_exactly_once() {
     assert_eq!(settled[0]["payload"]["head_sha"], c.head_sha);
 
     // No duplicate reviewer: settlement fenced the attempt, so nothing may be
-    // running under it.
-    assert!(
-        live_agents_for(home, &c.attempt).is_empty(),
-        "no agent may still be live under a settled attempt"
+    // running under it. Polled, not a single snapshot: the dismissed
+    // reviewer's `AgentRecord` converges to a terminal state via the
+    // daemon's own async reconciliation of the OS-process kill above, not
+    // synchronously with the RPC that requested it, so a snapshot taken
+    // immediately can catch it a beat before that reconciliation lands
+    // (worse, and more likely to actually flip the result, under the CPU
+    // contention `mise run verify`'s ordinary in-binary test concurrency
+    // creates).
+    until(
+        "no agent to still be live under the settled attempt",
+        || live_agents_for(home, &c.attempt).is_empty().then_some(()),
     );
 
     assert_converged_properties(&c);
@@ -667,6 +735,7 @@ fn crash_between_dismissal_and_marker_converges_exactly_once() {
 /// REFUSED rather than settling a second time.
 #[test]
 fn crash_after_durable_marker_refuses_the_retry_rather_than_settling_twice() {
+    let _serial = serialize_test();
     let c = crash_at(BARRIER_POST_MARKER);
     let home = c.home.path();
 
@@ -794,10 +863,11 @@ fn assert_converged_properties(c: &Crashed) {
         Some(new_attempt.as_str()),
         "a repeat re-enqueue must return the same attempt, never dispatch a duplicate"
     );
-    assert!(
-        live_agents_for(home, &c.attempt).is_empty(),
-        "re-enqueue must never revive the settled attempt"
-    );
+    // Same eventual-convergence property as the first `live_agents_for`
+    // check above (see its comment): polled rather than snapshotted once.
+    until("re-enqueue to never revive the settled attempt", || {
+        live_agents_for(home, &c.attempt).is_empty().then_some(())
+    });
 }
 
 /// The gap the other tests in this file never cover: every scenario above
@@ -835,6 +905,14 @@ fn assert_transport_outage_is_typed_and_fenced(harness: &str, bin_env: &str, bin
     // non-retryable episode's ceiling well inside the `until` bounds below.
     let home = daemon_home(&review_workflow_real_adapter(harness), Some(1));
     let home_path = home.path().to_path_buf();
+    // Unlike the crash tests above, nothing here ever kills this daemon —
+    // the whole point of this test is that it converges without a crash —
+    // so without this guard it (and its socket) would run forever after the
+    // test exits. See `DaemonGuard`'s doc for why it must be declared after
+    // `home`.
+    let _daemon_guard = DaemonGuard {
+        home: home_path.clone(),
+    };
     let bin = fake_transport_failure_binary(home.path(), bin_name);
 
     let (repo, head_sha) = candidate_repo(Some(NO_REVIEW_DEATH_RETRY_POLICY));
@@ -984,10 +1062,12 @@ fn assert_transport_outage_is_typed_and_fenced(harness: &str, bin_env: &str, bin
 
 #[test]
 fn transport_classified_claude_reviewer_death_is_a_typed_outage_not_a_plain_hang() {
+    let _serial = serialize_test();
     assert_transport_outage_is_typed_and_fenced("claude", "RK_CLAUDE_BIN", "claude-fake-outage");
 }
 
 #[test]
 fn transport_classified_codex_reviewer_death_is_a_typed_outage_not_a_plain_hang() {
+    let _serial = serialize_test();
     assert_transport_outage_is_typed_and_fenced("codex", "RK_CODEX_BIN", "codex-fake-outage");
 }
