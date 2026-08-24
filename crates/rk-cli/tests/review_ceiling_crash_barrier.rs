@@ -224,6 +224,11 @@ impl Drop for Crashed {
         // success and panic so a failed acceptance run cannot leak test
         // daemons into the host running the suite.
         let _ = rk(self.home.path()).args(["daemon", "stop"]).output();
+        if let Some(pid) = daemon_pid(self.home.path()) {
+            if pid != std::process::id() && pid != self.dead_daemon_pid {
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            }
+        }
     }
 }
 
