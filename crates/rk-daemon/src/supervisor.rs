@@ -123,6 +123,13 @@ const LATE_TASK_DONE_EVIDENCE_IDENTITY: &str = "late_task_done_evidence";
 const BARRIER_TASK_DONE_PRE_ROUTE: &str = "task-done-pre-route";
 const BARRIER_TASK_DONE_POST_ROUTE: &str = "task-done-post-route";
 
+/// Give the harness event pump a bounded chance to publish its authoritative
+/// final-turn result after `rk done` returns. The durable `task_done` already
+/// fences budget and liveness hard-stops during this window; this delay only
+/// decides which text becomes the one durable `harness_result`. A silent or
+/// orphaned harness falls back to the `rk done` summary after the grace.
+const TASK_DONE_HARNESS_GRACE: chrono::Duration = chrono::Duration::seconds(1);
+
 /// The completion-payload fields a reactive steward tiers its review on: the
 /// branch tip this generation produced, its size vs. the recorded target, and
 /// a precomputed bucket. See [`Supervisor::diff_summary`].
@@ -3213,6 +3220,18 @@ impl Supervisor {
                 if record.state == AgentState::Stopped {
                     return;
                 }
+                // `rk done` is durable before its RPC returns. If it won the
+                // race, leave the live process alone long enough for its
+                // authoritative final-turn `Completed` event to arrive;
+                // `reconcile_task_done` supplies the bounded fallback when it
+                // does not. Storage errors fail closed here: an unreadable
+                // completion signal must not disable a hard budget cap.
+                if matches!(
+                    self.find_task_done(&record.name, record.created_at, record.spawn),
+                    Ok(Some(_))
+                ) {
+                    return;
+                }
                 warn!(agent = %record.name, cost = record.cost_usd, tokens = record.usage.total(), "budget cap hit — stopping agent");
                 let detail = self.budget_stop_detail(record);
                 let mut newly_stopped = false;
@@ -3877,6 +3896,16 @@ impl Supervisor {
                     self.steer_flagged(record, kind);
                 }
                 SweepAction::Hard { kind, detail } => {
+                    // Same durable winner rule as the budget stop: once this
+                    // generation's `task_done` exists, reconciliation owns
+                    // terminalization and the sweep must not kill the harness
+                    // before it can flush its richer final result.
+                    if matches!(
+                        self.find_task_done(&record.name, record.created_at, record.spawn),
+                        Ok(Some(_))
+                    ) {
+                        continue;
+                    }
                     warn!(agent = %record.name, kind, %detail, "supervisor sweep killing agent after grace");
                     self.emit_sweep_obstacle(
                         record,
@@ -5180,24 +5209,20 @@ impl Supervisor {
     /// flush — a short generation that finishes on its first turn has none,
     /// so its already-accepted `task_done` was simply orphaned.
     ///
-    /// Scans every non-terminal-in-the-good-sense record (excludes
-    /// `Completed`, whose work here is already done, and `Dismissed`, whose
-    /// completion bookkeeping was deliberately forgotten by
-    /// [`Self::forget_completion`] and must not be resurrected) for a durable
-    /// `task_done`. When one is found:
+    /// Scans every record except `Dismissed` (whose completion bookkeeping was
+    /// deliberately forgotten by [`Self::forget_completion`] and must not be
+    /// resurrected) for a durable `task_done`. When one is found:
     ///
     ///  - **Still eligible** (`Spawning`/`Running`/`Paused`/`Orphaned` — the
     ///    last covers a daemon restart landing between the `task_done` write
     ///    and this reconcile pass, since [`crate::agents::Registry::orphan_live_agents`]
-    ///    converts every live record to `Orphaned` at startup): CASes the
-    ///    record to `Completed` under `lock_registry`'s mutex — the SAME lock
-    ///    [`Self::enforce_budget`]'s hard-stop CAS uses — so whichever of the
-    ///    two actually runs its `Registry::update` closure first durably
-    ///    decides the outcome; there is no timing window to race, only lock
-    ///    order. Routed exactly once via [`Self::claim_completion`]'s
-    ///    existing dedup, shared with the harness-event path, so a
-    ///    `HarnessEvent::Completed` racing this reconcile pass for the same
-    ///    generation still only ever publishes once.
+    ///    converts every live record to `Orphaned` at startup): a live record
+    ///    receives [`TASK_DONE_HARNESS_GRACE`] for its event pump to publish
+    ///    the authoritative final-turn text. During that grace budget and
+    ///    liveness hard-stops consult the same durable `task_done` and stand
+    ///    down. A silent live record, or an orphan with no event pump left,
+    ///    CASes to `Completed` and publishes the `rk done` summary instead.
+    ///    The CAS uses the same registry lock as hard-stop terminalization.
     ///  - **Already terminal for some other reason** (`Stopped`, `Failed`):
     ///    the stop (or crash) won durably first. Retained as evidence via
     ///    [`Self::retain_late_task_done_evidence`] instead of publishing —
@@ -5206,12 +5231,19 @@ impl Supervisor {
     ///    (`handle_event`'s `pre.state == AgentState::Stopped` check) that a
     ///    deliberate stop wins races with a final harness event.
     ///
+    ///  - **Already `Completed` but not published**: this is the durable seam
+    ///    left by a daemon crash after the state CAS and before the event
+    ///    write. It publishes on the successor. A durable generation-scoped
+    ///    `harness_result`, rather than only the process-local completion
+    ///    claim, is the dedup key across restart.
+    ///
     /// Restart-safe by construction: every check here re-derives its answer
-    /// from durable state (the registry snapshot on disk, the `task_done`
-    /// tuple in the space) rather than in-memory bookkeeping a crash could
-    /// lose, and every write (the `Completed` CAS, the evidence tuple) is
-    /// itself durable and idempotent — [`Self::claim_completion`] refuses a
-    /// second publish for the same generation, and
+    /// from durable state (the registry snapshot, `task_done`, and
+    /// `harness_result`) rather than in-memory bookkeeping a crash could lose,
+    /// and every write (the `Completed` CAS, the evidence tuple) is itself
+    /// durable and idempotent — [`Self::claim_completion`] refuses a second
+    /// publish within one daemon process, the durable result check refuses it
+    /// across processes, and
     /// [`Self::retain_late_task_done_evidence`] scans for its own prior
     /// artifact before writing another — so a daemon killed mid-pass and
     /// restarted just re-derives the same outcome on its next tick. Meant to
@@ -5223,7 +5255,7 @@ impl Supervisor {
     pub(crate) async fn reconcile_task_done(&self) -> rk_core::Result<usize> {
         let mut settled = 0;
         for record in self.list() {
-            if matches!(record.state, AgentState::Completed | AgentState::Dismissed) {
+            if record.state == AgentState::Dismissed {
                 continue;
             }
             let Some(task_done) =
@@ -5231,12 +5263,22 @@ impl Supervisor {
             else {
                 continue;
             };
-            let claim =
-                self.claim_completion(&record.name, record.created_at, record.spawn, false, false);
-            if !claim.publish {
-                // Already routed — either the harness's own `Completed`
-                // event won the race, or an earlier reconcile pass already
-                // settled (or fenced) this generation.
+
+            // A normal harness result is the canonical completion payload.
+            // Its durable presence is also the restart-safe dedup key: the
+            // in-memory `CompletionState` deliberately does not survive a
+            // daemon restart, so consulting it alone could republish after a
+            // crash between `route_completion` and this function returning.
+            if self.harness_result_exists(&record)? {
+                continue;
+            }
+
+            // A live harness commonly emits its final result immediately
+            // after `rk done`. Do not race that richer text with the terse
+            // summary. Orphaned generations have no event pump left and
+            // therefore bypass the grace on restart.
+            if record.state.is_live() && Utc::now() - task_done.created_at < TASK_DONE_HARNESS_GRACE
+            {
                 continue;
             }
             let diff = self.diff_summary_for(&record.name);
@@ -5245,11 +5287,9 @@ impl Supervisor {
                 .get("summary")
                 .and_then(Value::as_str)
                 .map(String::from);
-            // The claim is spent as of the call above: whatever this CAS
-            // decides, no other path will ever get to publish (or fence) a
-            // completion for this generation again. See `crate::fault` for
-            // why a barrier and not a sleep — a daemon killed here, before
-            // the CAS lands, must converge to the same outcome on restart.
+            // See `crate::fault` for why a barrier and not a sleep — a daemon
+            // killed here, before the CAS lands, must converge to the same
+            // outcome on restart.
             crate::fault::barrier(&self.layout, BARRIER_TASK_DONE_PRE_ROUTE).await;
             let updated = self.lock_registry().update(&record.name, |r| {
                 if r.state.is_live() || r.state == AgentState::Orphaned {
@@ -5261,6 +5301,10 @@ impl Supervisor {
             });
             match updated {
                 Ok(Some(r)) if r.state == AgentState::Completed => {
+                    let claim = self.claim_completion(&r.name, r.created_at, r.spawn, false, false);
+                    if !claim.publish {
+                        continue;
+                    }
                     info!(agent = %r.name, "task_done reconciled: generation completed");
                     self.route_completion(&r, false, claim.declared_done, diff);
                     crate::fault::barrier(&self.layout, BARRIER_TASK_DONE_POST_ROUTE).await;
@@ -5284,6 +5328,22 @@ impl Supervisor {
             }
         }
         Ok(settled)
+    }
+
+    /// Whether this exact generation already published its one durable
+    /// `harness_result`. Unlike the in-memory completion claim, this survives
+    /// a daemon restart and therefore closes the CAS-then-publish crash window.
+    fn harness_result_exists(&self, record: &AgentRecord) -> rk_core::Result<bool> {
+        let pattern = match record.spawn {
+            Some(spawn) => Pattern::for_spawn(Category::Event, "harness_result", spawn),
+            None => Pattern::for_agent_since(
+                Category::Event,
+                "harness_result",
+                &record.name,
+                record.created_at,
+            ),
+        };
+        Ok(!self.space.scan(&pattern)?.is_empty())
     }
 
     /// Whether a [`LATE_TASK_DONE_EVIDENCE_IDENTITY`] artifact already exists
