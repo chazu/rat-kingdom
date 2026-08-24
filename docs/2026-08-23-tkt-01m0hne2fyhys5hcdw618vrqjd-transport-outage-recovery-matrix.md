@@ -65,7 +65,23 @@ Types backing at-most-once acknowledgement and generation-fencing, both in
 (refuses continuation against a generation that has already moved on),
 `RecoveryAck { action_id, outcome, acknowledged_at }` (persisted, so the
 at-most-once guarantee survives a daemon restart), `RecoveryOutcome::{
-ResumedSameProvider, ContinuedAlternateProvider, Abandoned }`.
+ResumedSameProvider, ContinuedAlternateProvider, Abandoned }`. A CONTINUED
+recovery's `RecoveryRecord` (and its `ack`) is deleted by
+`Supervisor::handle_event`'s `Started` arm the moment the resumed generation
+proves liveness again (`AgentRecord::recovery` back to `None`, so the name is
+eligible for `detect_post_commit_outage`/`respawn_sweep` on its next,
+unrelated crash). The `ack` itself survives that deletion in
+`AgentRecord::recovery_receipt: Option<RecoveryReceipt>` — a durable,
+generation-scoped (`RecoveryReceipt::spawn`) tombstone written from the
+outgoing `ack` in the same `Started` handler right before `recovery` is
+cleared. `continue_recovery`/`abandon_recovery` consult it as a fallback
+whenever `recovery` is `None`, so the SAME `action_id` still replays and a
+DIFFERENT one is still refused after the resumed harness has already spoken
+— across a daemon restart too, since the tombstone is a plain field on the
+persisted `AgentRecord`. A later, unrelated post-commit outage on the same
+generation parks a fresh `RecoveryRecord` (`ack: None`), which always takes
+priority over the tombstone, so it can be freshly acknowledged without the
+old tombstone interfering (TKT-01M0S28V7XQ17F0C3SDNGC4PQA).
 
 ## Coverage matrix
 
@@ -88,17 +104,26 @@ properties the closure ticket asks the matrix to exercise.
    (Deyna-12); the same-provider resume plus exact `budget_remaining_usd`
    preservation across restart landed under
    TKT-01M0RZWDJQ6B49WCMSK3DC54T6 (Linguini-12), driven through the real `rk
-   continue-recovery` CLI rather than raw RPC. One implementation note this
-   pass surfaced: `Supervisor::handle_event`'s `Started` arm clears the whole
-   parked `recovery` record — ack included — the instant a continued
-   generation proves liveness again, so a caller replaying `action_id` is
-   only guaranteed the recorded outcome up until that point, not forever
-   after. The same-provider test's fixture blocks the resumed harness on a
-   release sentinel so the at-most-once/budget assertions run against the
-   still-parked record; this is a real, if narrow, edge on the documented
-   "the SAME key after acknowledgement replays the same recorded outcome"
-   contract and may be worth a follow-up ticket if an operator retry can
-   plausibly land after the resumed harness has already spoken.
+   continue-recovery` CLI rather than raw RPC. Linguini-12 flagged a real, if
+   narrow, edge this pass surfaced: `Supervisor::handle_event`'s `Started`
+   arm cleared the whole parked `recovery` record — ack included — the
+   instant a continued generation proved liveness again, so a caller
+   replaying `action_id` after the resumed harness had already spoken saw
+   "no pending recovery" instead of the recorded outcome. Closed under
+   TKT-01M0S28V7XQ17F0C3SDNGC4PQA (Pip-13): `AgentRecord::recovery_receipt`
+   is now a durable, generation-scoped tombstone written from the ack right
+   before `Started` clears `recovery`, and `continue_recovery`/
+   `abandon_recovery` fall back to it whenever `recovery` is `None`. Proven
+   in `supervisor.rs`:
+   `continue_recovery_replays_ack_after_started_clears_the_record_same_provider`,
+   `..._alternate_provider`,
+   `recovery_receipt_survives_started_clear_across_a_daemon_restart`, and
+   `later_recovery_on_same_generation_supersedes_the_receipt_and_can_be_freshly_acknowledged`
+   (the last proves a later, unrelated post-commit outage on the same
+   generation is unaffected — its fresh, unacknowledged `RecoveryRecord`
+   always takes priority over the tombstone). The documented "the SAME key
+   after acknowledgement replays the same recorded outcome" contract now
+   holds with no caveat.
 2. Reviewer-wait: a *transport-classified* outage during review is now
    distinguished from the plain hung/timeout case, proven against real
    claude/codex fixtures, under TKT-01M0RX7X8Y7J6Y56QTXGKFCSHX (Emile-12).

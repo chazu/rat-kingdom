@@ -374,6 +374,7 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
         liveness: crate::agents::LivenessObservation::default(),
         transport_outage: None,
         recovery: None,
+        recovery_receipt: None,
     }
 }
 
@@ -2694,7 +2695,24 @@ impl Supervisor {
                         })
                     });
                     if continued {
-                        r.recovery = None;
+                        // The record itself stops existing, but the
+                        // at-most-once contract on its `ack` must not: park
+                        // a durable, generation-scoped tombstone so a
+                        // continuation/abandonment call arriving AFTER this
+                        // resumed harness has already spoken can still
+                        // replay the same outcome (or be refused for a
+                        // different key) instead of seeing "no pending
+                        // recovery". Overwrites (never merges) any prior
+                        // tombstone, so a later continuation-then-Started
+                        // cycle on this same generation supersedes it.
+                        if let Some(rec) = r.recovery.take() {
+                            if let Some(ack) = rec.ack {
+                                r.recovery_receipt = Some(crate::agents::RecoveryReceipt {
+                                    spawn: rec.spawn,
+                                    ack,
+                                });
+                            }
+                        }
                     }
                 });
                 if had_outage {
@@ -4504,10 +4522,10 @@ impl Supervisor {
             .get(name)
             .cloned()
             .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
-        let recovery = record
-            .recovery
-            .clone()
-            .ok_or_else(|| rk_core::Error::other(format!("{name} has no pending recovery")))?;
+        let recovery = match record.recovery.clone() {
+            Some(recovery) => recovery,
+            None => return Self::replay_receipt_or_refuse(name, action_id, &record),
+        };
         if let Some(ack) = &recovery.ack {
             return Self::replay_or_refuse(name, action_id, ack);
         }
@@ -4670,9 +4688,10 @@ impl Supervisor {
             .get(name)
             .cloned()
             .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
-        let recovery = record
-            .recovery
-            .ok_or_else(|| rk_core::Error::other(format!("{name} has no pending recovery")))?;
+        let recovery = match record.recovery.clone() {
+            Some(recovery) => recovery,
+            None => return Self::replay_receipt_or_refuse(name, action_id, &record),
+        };
         if let Some(ack) = &recovery.ack {
             return Self::replay_or_refuse(name, action_id, ack);
         }
@@ -4706,6 +4725,29 @@ impl Supervisor {
                  {action_id})",
                 ack.action_id
             )))
+        }
+    }
+
+    /// Fallback for `continue_recovery`/`abandon_recovery` when `recovery`
+    /// has already been cleared by `Started` proof-of-life: consult the
+    /// durable [`crate::agents::RecoveryReceipt`] tombstone
+    /// (`AgentRecord::recovery_receipt`) left behind for this exact
+    /// generation instead of reporting "no pending recovery" outright. A
+    /// receipt from a DIFFERENT generation (fenced by `spawn`, same
+    /// discipline as `RecoveryRecord::stale`) is not this generation's to
+    /// replay — reported the same as no receipt at all.
+    fn replay_receipt_or_refuse(
+        name: &str,
+        action_id: &str,
+        record: &AgentRecord,
+    ) -> rk_core::Result<crate::agents::RecoveryOutcome> {
+        match &record.recovery_receipt {
+            Some(receipt) if receipt.spawn == record.spawn_id() => {
+                Self::replay_or_refuse(name, action_id, &receipt.ack)
+            }
+            _ => Err(rk_core::Error::other(format!(
+                "{name} has no pending recovery"
+            ))),
         }
     }
 
@@ -8224,6 +8266,7 @@ mod respawn_tests {
             liveness: Default::default(),
             transport_outage: None,
             recovery: None,
+            recovery_receipt: None,
         }
     }
 
@@ -9207,6 +9250,323 @@ mod respawn_tests {
             sup.lock_respawn_state().get(&name).is_some(),
             "a name that once continued a recovery must be an ordinary auto-respawn \
              candidate again after its next crash, not excluded forever"
+        );
+    }
+
+    /// TKT-01M0S28V7XQ17F0C3SDNGC4PQA: the at-most-once contract on a
+    /// recovery ack must outlive the `RecoveryRecord` it was made against.
+    /// Builds a record exactly as `continue_recovery` leaves one after a
+    /// same-provider resume (`recovery.ack = Some(ResumedSameProvider)`),
+    /// fires the `Started` handshake that clears it
+    /// (`continued_recovery_clears_on_proof_of_life_and_reenables_detection`
+    /// already proves the record disappears), then proves a caller replaying
+    /// the SAME `action_id` after that point still gets the recorded
+    /// outcome back, and a DIFFERENT `action_id` is still refused — not
+    /// silently treated as "no pending recovery, nothing to conflict with".
+    #[test]
+    fn continue_recovery_replays_ack_after_started_clears_the_record_same_provider() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+
+        let mut rec = record(repo.path(), Some("main"));
+        let name = rec.name.clone();
+        let spawn = rec.spawn_id();
+        let generation = rec.created_at;
+        let outcome = crate::agents::RecoveryOutcome::ResumedSameProvider { new_spawn: spawn };
+        rec.recovery = Some(crate::agents::RecoveryRecord {
+            ticket: rec.task.clone(),
+            branch: "rat/nibble/tkt-6".into(),
+            head: "deadbeef".repeat(5),
+            session_id: None,
+            spawn,
+            liveness: rec.liveness.clone(),
+            budget_remaining_usd: None,
+            provider: "fake".into(),
+            class: rk_harness::TransportClass::Unavailable,
+            evidence: "connection refused".into(),
+            detected_at: Utc::now(),
+            ack: Some(crate::agents::RecoveryAck {
+                action_id: "action-1".into(),
+                outcome: outcome.clone(),
+                acknowledged_at: Utc::now(),
+            }),
+        });
+
+        let sup = supervisor(home.path());
+        sup.lock_registry().insert(rec).unwrap();
+        let session = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert(name.clone(), session);
+
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Started {
+                session_id: Some("resumed-sess-6".into()),
+            },
+        );
+        assert!(
+            sup.status(&name).unwrap().recovery.is_none(),
+            "Started proof-of-life must still clear the active record"
+        );
+
+        let replayed = sup
+            .continue_recovery(&name, "action-1", None)
+            .expect("the SAME action_id must still replay after Started clears the record");
+        assert_eq!(
+            replayed, outcome,
+            "a post-clear replay must return the identical recorded outcome"
+        );
+
+        let conflict = sup.continue_recovery(&name, "action-2", None);
+        assert!(
+            conflict.is_err(),
+            "a DIFFERENT action_id after Started clears the record must still be refused, \
+             not treated as a fresh, unacknowledged recovery"
+        );
+    }
+
+    /// Companion to the same-provider case above for
+    /// `ContinuedAlternateProvider`: an alternate-harness continuation's ack
+    /// must survive the same `Started` clear the same way.
+    #[test]
+    fn continue_recovery_replays_ack_after_started_clears_the_record_alternate_provider() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+
+        let mut rec = record(repo.path(), Some("main"));
+        rec.harness = "codex".into();
+        let name = rec.name.clone();
+        let spawn = rec.spawn_id();
+        let generation = rec.created_at;
+        let outcome = crate::agents::RecoveryOutcome::ContinuedAlternateProvider {
+            harness: "fake".into(),
+            new_spawn: spawn,
+        };
+        rec.recovery = Some(crate::agents::RecoveryRecord {
+            ticket: rec.task.clone(),
+            branch: "rat/nibble/tkt-7".into(),
+            head: "deadbeef".repeat(5),
+            session_id: None,
+            spawn,
+            liveness: rec.liveness.clone(),
+            budget_remaining_usd: None,
+            provider: "codex".into(),
+            class: rk_harness::TransportClass::Unavailable,
+            evidence: "connection refused".into(),
+            detected_at: Utc::now(),
+            ack: Some(crate::agents::RecoveryAck {
+                action_id: "alt-action-1".into(),
+                outcome: outcome.clone(),
+                acknowledged_at: Utc::now(),
+            }),
+        });
+
+        let sup = supervisor(home.path());
+        sup.lock_registry().insert(rec).unwrap();
+        let session = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert(name.clone(), session);
+
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Started {
+                session_id: Some("resumed-sess-7".into()),
+            },
+        );
+        assert!(sup.status(&name).unwrap().recovery.is_none());
+
+        let replayed = sup
+            .continue_recovery(&name, "alt-action-1", Some("fake"))
+            .expect("the SAME action_id must still replay after Started clears the record");
+        assert_eq!(replayed, outcome);
+
+        let conflict = sup.continue_recovery(&name, "alt-action-2", Some("fake"));
+        assert!(
+            conflict.is_err(),
+            "a DIFFERENT action_id after Started clears the record must still be refused"
+        );
+    }
+
+    /// The `action_id`/refusal half of the contract must also survive a
+    /// daemon restart between the `Started` clear and the duplicate call —
+    /// same discipline `RecoveryRecord::ack` already had before it was
+    /// cleared, now proven for the tombstone that replaces it.
+    #[test]
+    fn recovery_receipt_survives_started_clear_across_a_daemon_restart() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+
+        let mut rec = record(repo.path(), Some("main"));
+        let name = rec.name.clone();
+        let spawn = rec.spawn_id();
+        let generation = rec.created_at;
+        let outcome = crate::agents::RecoveryOutcome::ResumedSameProvider { new_spawn: spawn };
+        rec.recovery = Some(crate::agents::RecoveryRecord {
+            ticket: rec.task.clone(),
+            branch: "rat/nibble/tkt-8".into(),
+            head: "deadbeef".repeat(5),
+            session_id: None,
+            spawn,
+            liveness: rec.liveness.clone(),
+            budget_remaining_usd: None,
+            provider: "fake".into(),
+            class: rk_harness::TransportClass::Unavailable,
+            evidence: "connection refused".into(),
+            detected_at: Utc::now(),
+            ack: Some(crate::agents::RecoveryAck {
+                action_id: "restart-action-1".into(),
+                outcome: outcome.clone(),
+                acknowledged_at: Utc::now(),
+            }),
+        });
+
+        let sup1 = supervisor(home.path());
+        sup1.lock_registry().insert(rec).unwrap();
+        let session = rk_core::id::SpawnId::new();
+        sup1.lock_session_tokens().insert(name.clone(), session);
+        sup1.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Started {
+                session_id: Some("resumed-sess-8".into()),
+            },
+        );
+        assert!(sup1.status(&name).unwrap().recovery.is_none());
+
+        // Simulated daemon restart: a FRESH Supervisor over the SAME home
+        // must see exactly what the dead process recorded — the tombstone
+        // included, since `recovery` itself is already gone.
+        drop(sup1);
+        let sup2 = supervisor(home.path());
+        assert!(sup2.status(&name).unwrap().recovery.is_none());
+
+        let replayed = sup2
+            .continue_recovery(&name, "restart-action-1", None)
+            .expect("the SAME action_id must replay after a restart too");
+        assert_eq!(replayed, outcome);
+
+        let conflict = sup2.continue_recovery(&name, "restart-action-2", None);
+        assert!(
+            conflict.is_err(),
+            "a DIFFERENT action_id must still be refused after a restart"
+        );
+    }
+
+    /// Extends `continued_recovery_clears_on_proof_of_life_and_reenables_detection`:
+    /// a later, unrelated post-commit outage on the SAME generation must be
+    /// not just *detected* fresh but genuinely *continuable* fresh — the
+    /// tombstone left by the FIRST episode's ack must not leak into the
+    /// second episode's own (freshly unacknowledged) `RecoveryRecord`, which
+    /// takes priority over the tombstone by construction (`continue_recovery`
+    /// only ever consults the receipt when `recovery` is `None`).
+    #[tokio::test]
+    async fn later_recovery_on_same_generation_supersedes_the_receipt_and_can_be_freshly_acknowledged(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let p = repo.path();
+        let fork_point = Repo::discover(p).unwrap().rev_parse("HEAD").unwrap();
+        git(p, &["checkout", "-b", "rat/nibble/tkt-9", "main"]);
+        std::fs::write(p.join("work"), "done\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "committed work"]);
+        git(p, &["checkout", "main"]);
+
+        let mut rec =
+            committed_work_record_with_live_verifier_evidence(p, fork_point, "rat/nibble/tkt-9");
+        let name = rec.name.clone();
+        let spawn = rec.spawn_id();
+        let generation = rec.created_at;
+        rec.recovery = Some(crate::agents::RecoveryRecord {
+            ticket: rec.task.clone(),
+            branch: "rat/nibble/tkt-9".into(),
+            head: "deadbeef".repeat(5),
+            session_id: rec.session_id.clone(),
+            spawn,
+            liveness: rec.liveness.clone(),
+            budget_remaining_usd: None,
+            provider: "fake".into(),
+            class: rk_harness::TransportClass::Unavailable,
+            evidence: "connection refused".into(),
+            detected_at: Utc::now(),
+            ack: Some(crate::agents::RecoveryAck {
+                action_id: "episode-1-action".into(),
+                outcome: crate::agents::RecoveryOutcome::ResumedSameProvider { new_spawn: spawn },
+                acknowledged_at: Utc::now(),
+            }),
+        });
+        rec.stderr_tail = None;
+
+        let sup = supervisor(home.path());
+        sup.lock_registry().insert(rec).unwrap();
+        let session = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert(name.clone(), session);
+
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Started {
+                session_id: Some("resumed-sess-9".into()),
+            },
+        );
+        assert!(sup.status(&name).unwrap().recovery.is_none());
+
+        // A second, later transport-shaped death on the SAME generation.
+        sup.lock_registry()
+            .update(&name, |r| {
+                r.state = AgentState::Running;
+                r.pid = Some(5252);
+                r.stderr_tail = Some("fatal: connection refused while contacting api\n".into());
+            })
+            .unwrap();
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Exited { code: Some(1) },
+        );
+        assert!(
+            sup.status(&name)
+                .unwrap()
+                .recovery
+                .as_ref()
+                .is_some_and(|r| r.ack.is_none()),
+            "the second episode must park fresh and unacknowledged"
+        );
+
+        // A fresh action_id, DIFFERENT from episode 1's, must be freely
+        // acknowledgeable — the stale tombstone must not refuse it.
+        let outcome = sup
+            .continue_recovery(&name, "episode-2-action", None)
+            .expect(
+                "a later, unrelated recovery on the same generation must supersede the old \
+                 receipt and be freshly acknowledgeable",
+            );
+        assert!(matches!(
+            outcome,
+            crate::agents::RecoveryOutcome::ResumedSameProvider { .. }
+        ));
+        assert_eq!(sup.status(&name).unwrap().state, AgentState::Running);
+
+        // The NEW ack now governs replay, not the stale one: episode 1's
+        // action_id must no longer replay episode 1's outcome.
+        let conflict = sup.continue_recovery(&name, "episode-1-action", None);
+        assert!(
+            conflict.is_err(),
+            "episode 1's action_id must not resurrect after episode 2 has its own ack"
         );
     }
 
@@ -10269,6 +10629,7 @@ mod stuck_liveness_tests {
             liveness: crate::agents::LivenessObservation::default(),
             transport_outage: None,
             recovery: None,
+            recovery_receipt: None,
         }
     }
 

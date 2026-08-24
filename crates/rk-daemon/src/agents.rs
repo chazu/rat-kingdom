@@ -216,6 +216,36 @@ pub struct AgentRecord {
     /// operator/policy continuation decision loses nothing.
     #[serde(default)]
     pub recovery: Option<RecoveryRecord>,
+    /// Durable tombstone of the last acknowledged [`RecoveryAck`] for this
+    /// generation, preserved after [`Supervisor::handle_event`]'s `Started`
+    /// arm clears `recovery` on proof-of-life
+    /// (docs/2026-08-23-tkt-01m0hne2fyhys5hcdw618vrqjd-transport-outage-recovery-matrix.md).
+    /// `recovery` itself stops existing at that point, but the at-most-once
+    /// contract on it does not: a continuation/abandonment call that arrives
+    /// AFTER the resumed harness has already spoken must still replay the
+    /// same recorded outcome for the SAME `action_id`, and refuse a
+    /// DIFFERENT one, exactly as it would have against the still-parked
+    /// record a moment earlier. `None` once no acknowledgement has ever
+    /// cleared for this generation. Superseded (overwritten, not merged) the
+    /// next time THIS field is written — which only happens when a later
+    /// continued recovery on the same generation is itself acknowledged and
+    /// then reaches its own `Started` — so a later, unrelated
+    /// `RecoveryRecord` parked fresh by `detect_post_commit_outage` is
+    /// unaffected: `continue_recovery`/`abandon_recovery` only ever consult
+    /// this tombstone when `recovery` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_receipt: Option<RecoveryReceipt>,
+}
+
+/// See the field doc on [`AgentRecord::recovery_receipt`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryReceipt {
+    /// The generation this receipt was acknowledged for — fenced the same
+    /// way [`RecoveryRecord::stale`] fences the live record, so a receipt
+    /// left over from some earlier generation of a recycled name can never
+    /// be replayed against a different one.
+    pub spawn: rk_core::id::SpawnId,
+    pub ack: RecoveryAck,
 }
 
 /// See the field doc on [`AgentRecord::recovery`].
@@ -1354,6 +1384,7 @@ mod tests {
             liveness: Default::default(),
             transport_outage: None,
             recovery: None,
+            recovery_receipt: None,
         }
     }
 
