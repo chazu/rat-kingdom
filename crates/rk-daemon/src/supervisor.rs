@@ -7708,6 +7708,7 @@ mod respawn_tests {
             updated_at: now,
             archived_at: None,
             liveness: Default::default(),
+            transport_outage: None,
         }
     }
 
@@ -9198,6 +9199,7 @@ mod stuck_liveness_tests {
             updated_at,
             archived_at: None,
             liveness: crate::agents::LivenessObservation::default(),
+            transport_outage: None,
         }
     }
 

@@ -1250,6 +1250,7 @@ mod tests {
             updated_at: Utc::now(),
             archived_at: None,
             liveness: Default::default(),
+            transport_outage: None,
         }
     }
 

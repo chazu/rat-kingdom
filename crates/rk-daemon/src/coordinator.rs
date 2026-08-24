@@ -764,6 +764,7 @@ mod tests {
             updated_at: now,
             archived_at: None,
             liveness: Default::default(),
+            transport_outage: None,
         }
     }
 
