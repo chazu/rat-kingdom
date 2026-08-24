@@ -214,7 +214,10 @@ async fn task_done_wins_and_a_later_budget_check_cannot_overwrite_it() {
         .await
         .unwrap();
     let ticket = client
-        .call("ticket.new", json!({"title": "race winner", "scope": &repo_name}))
+        .call(
+            "ticket.new",
+            json!({"title": "race winner", "scope": &repo_name}),
+        )
         .await
         .unwrap();
     let ticket_id = ticket["ticket"]["identity"].as_str().unwrap().to_string();
@@ -339,7 +342,10 @@ async fn budget_stop_wins_durably_first_and_a_late_task_done_is_fenced() {
         .await
         .unwrap();
     let ticket = client
-        .call("ticket.new", json!({"title": "race loser", "scope": &repo_name}))
+        .call(
+            "ticket.new",
+            json!({"title": "race loser", "scope": &repo_name}),
+        )
         .await
         .unwrap();
     let ticket_id = ticket["ticket"]["identity"].as_str().unwrap().to_string();
@@ -498,7 +504,10 @@ async fn restart_mid_reconcile_barrier_still_completes_the_generation() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(hit, "reconcile_task_done never reached the pre-route barrier");
+    assert!(
+        hit,
+        "reconcile_task_done never reached the pre-route barrier"
+    );
 
     // The record must still be live — the CAS has not landed yet.
     assert_eq!(

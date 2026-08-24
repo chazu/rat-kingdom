@@ -5199,13 +5199,8 @@ impl Supervisor {
             else {
                 continue;
             };
-            let claim = self.claim_completion(
-                &record.name,
-                record.created_at,
-                record.spawn,
-                false,
-                false,
-            );
+            let claim =
+                self.claim_completion(&record.name, record.created_at, record.spawn, false, false);
             if !claim.publish {
                 // Already routed — either the harness's own `Completed`
                 // event won the race, or an earlier reconcile pass already
@@ -5291,8 +5286,11 @@ impl Supervisor {
         record: &AgentRecord,
         task_done: &Tuple,
     ) -> rk_core::Result<Option<Tuple>> {
-        if self.late_task_done_evidence_exists(&record.repo_name, &record.name, record.created_at)?
-        {
+        if self.late_task_done_evidence_exists(
+            &record.repo_name,
+            &record.name,
+            record.created_at,
+        )? {
             return Ok(None);
         }
         let diff = self.diff_summary_for(&record.name);
