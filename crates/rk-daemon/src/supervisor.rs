@@ -4009,11 +4009,19 @@ impl Supervisor {
         let now = Utc::now();
         // Candidates: crashed but not dismissed and not cleanly completed. A
         // `Completed` rat ran `rk done` — a clean finish we must not relaunch.
+        // `transport_outage.is_none()` excludes a generation mid pre-work
+        // transport-outage episode: it is ALSO `is_auto_respawn_candidate`
+        // (Failed/Orphaned), but it is never a `RespawnState` entry, so
+        // `decide_respawn` would see `None` and fire an immediate
+        // `RespawnDecision::Respawn` — bypassing `transport_retry_sweep`'s
+        // backoff, jitter, and castle-wide circuit breaker entirely.
+        // `transport_retry_sweep` (which DOES gate on the breaker) owns these
+        // records exclusively.
         let candidates: Vec<AgentRecord> = self
             .lock_registry()
             .list()
             .into_iter()
-            .filter(|r| is_auto_respawn_candidate(r))
+            .filter(|r| is_auto_respawn_candidate(r) && r.transport_outage.is_none())
             .cloned()
             .collect();
 
@@ -8140,6 +8148,60 @@ mod respawn_tests {
             sup.decide_respawn(&rec, now + chrono::Duration::seconds(999), &cfg),
             RespawnDecision::Wait
         ));
+    }
+
+    /// Regression for the race the two sweeps used to have: a record mid
+    /// pre-work transport-outage episode is `Failed` (ordinary state) AND
+    /// `is_auto_respawn_candidate` (also ordinary), but it is deliberately
+    /// never a `RespawnState` entry — see `record_transport_outage`. Before
+    /// `respawn_sweep` excluded `transport_outage.is_some()` records,
+    /// `decide_respawn` saw `None` for that name and returned an immediate
+    /// `RespawnDecision::Respawn`, bypassing `transport_retry_sweep`'s
+    /// backoff, jitter, and castle-wide circuit breaker entirely. This test
+    /// configures `respawn_sweep` to fire on its very first tick (no
+    /// backoff, cap 1) and proves it still leaves the record untouched.
+    #[test]
+    fn respawn_sweep_excludes_transport_outage_records() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+
+        let mut rec = record(repo.path(), Some("main"));
+        rec.transport_outage = Some(crate::agents::TransportOutageState {
+            provider: "claude".into(),
+            class: rk_harness::TransportClass::Unavailable,
+            retryable: true,
+            attempts: 1,
+            last_failure_at: Utc::now(),
+            evidence: "503 Service Unavailable".into(),
+            ceiling_hit: false,
+            circuit_refused: false,
+        });
+        sup.lock_registry().insert(rec.clone()).unwrap();
+
+        let cfg = SupervisorConfig {
+            respawn_enabled: true,
+            respawn_max_attempts: 1,
+            respawn_backoff_secs: 0,
+            ..SupervisorConfig::default()
+        };
+        let sinks = rk_core::notify::SinkRegistry::default();
+        sup.respawn_sweep(&cfg, &sinks);
+
+        assert!(
+            sup.lock_respawn_state().get(&rec.name).is_none(),
+            "a transport-outage record must never become a RespawnState candidate \
+             for the generic crash-loop sweep"
+        );
+        let after = sup.status(&rec.name).unwrap();
+        assert_eq!(
+            after.state,
+            AgentState::Failed,
+            "respawn_sweep must not relaunch a transport-outage record — that is \
+             transport_retry_sweep's job, gated by the breaker"
+        );
+        assert!(after.pid.is_none());
     }
 
     #[test]
