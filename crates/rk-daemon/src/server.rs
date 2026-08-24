@@ -10466,6 +10466,7 @@ mod authorize_reasoned_tests {
             liveness: Default::default(),
             transport_outage: None,
             recovery: None,
+            recovery_receipt: None,
         };
         let mut records = HashMap::new();
         records.insert(record.name.clone(), record);
@@ -10992,6 +10993,7 @@ mod ticket_reopen_sweep_tests {
             liveness: Default::default(),
             transport_outage: None,
             recovery: None,
+            recovery_receipt: None,
         };
         let mut records = HashMap::new();
         records.insert(record.name.clone(), record);

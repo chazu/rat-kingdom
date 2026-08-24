@@ -374,6 +374,7 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
         liveness: crate::agents::LivenessObservation::default(),
         transport_outage: None,
         recovery: None,
+        recovery_receipt: None,
     }
 }
 
@@ -2694,7 +2695,24 @@ impl Supervisor {
                         })
                     });
                     if continued {
-                        r.recovery = None;
+                        // The record itself stops existing, but the
+                        // at-most-once contract on its `ack` must not: park
+                        // a durable, generation-scoped tombstone so a
+                        // continuation/abandonment call arriving AFTER this
+                        // resumed harness has already spoken can still
+                        // replay the same outcome (or be refused for a
+                        // different key) instead of seeing "no pending
+                        // recovery". Overwrites (never merges) any prior
+                        // tombstone, so a later continuation-then-Started
+                        // cycle on this same generation supersedes it.
+                        if let Some(rec) = r.recovery.take() {
+                            if let Some(ack) = rec.ack {
+                                r.recovery_receipt = Some(crate::agents::RecoveryReceipt {
+                                    spawn: rec.spawn,
+                                    ack,
+                                });
+                            }
+                        }
                     }
                 });
                 if had_outage {
@@ -4504,10 +4522,10 @@ impl Supervisor {
             .get(name)
             .cloned()
             .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
-        let recovery = record
-            .recovery
-            .clone()
-            .ok_or_else(|| rk_core::Error::other(format!("{name} has no pending recovery")))?;
+        let recovery = match record.recovery.clone() {
+            Some(recovery) => recovery,
+            None => return Self::replay_receipt_or_refuse(name, action_id, &record),
+        };
         if let Some(ack) = &recovery.ack {
             return Self::replay_or_refuse(name, action_id, ack);
         }
@@ -4670,9 +4688,10 @@ impl Supervisor {
             .get(name)
             .cloned()
             .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
-        let recovery = record
-            .recovery
-            .ok_or_else(|| rk_core::Error::other(format!("{name} has no pending recovery")))?;
+        let recovery = match record.recovery.clone() {
+            Some(recovery) => recovery,
+            None => return Self::replay_receipt_or_refuse(name, action_id, &record),
+        };
         if let Some(ack) = &recovery.ack {
             return Self::replay_or_refuse(name, action_id, ack);
         }
@@ -4706,6 +4725,29 @@ impl Supervisor {
                  {action_id})",
                 ack.action_id
             )))
+        }
+    }
+
+    /// Fallback for `continue_recovery`/`abandon_recovery` when `recovery`
+    /// has already been cleared by `Started` proof-of-life: consult the
+    /// durable [`crate::agents::RecoveryReceipt`] tombstone
+    /// (`AgentRecord::recovery_receipt`) left behind for this exact
+    /// generation instead of reporting "no pending recovery" outright. A
+    /// receipt from a DIFFERENT generation (fenced by `spawn`, same
+    /// discipline as `RecoveryRecord::stale`) is not this generation's to
+    /// replay — reported the same as no receipt at all.
+    fn replay_receipt_or_refuse(
+        name: &str,
+        action_id: &str,
+        record: &AgentRecord,
+    ) -> rk_core::Result<crate::agents::RecoveryOutcome> {
+        match &record.recovery_receipt {
+            Some(receipt) if receipt.spawn == record.spawn_id() => {
+                Self::replay_or_refuse(name, action_id, &receipt.ack)
+            }
+            _ => Err(rk_core::Error::other(format!(
+                "{name} has no pending recovery"
+            ))),
         }
     }
 
@@ -8224,6 +8266,7 @@ mod respawn_tests {
             liveness: Default::default(),
             transport_outage: None,
             recovery: None,
+            recovery_receipt: None,
         }
     }
 
@@ -10269,6 +10312,7 @@ mod stuck_liveness_tests {
             liveness: crate::agents::LivenessObservation::default(),
             transport_outage: None,
             recovery: None,
+            recovery_receipt: None,
         }
     }
 

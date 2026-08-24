@@ -7560,6 +7560,7 @@ test a::flaky ... FAILED
             liveness: Default::default(),
             transport_outage: None,
             recovery: None,
+            recovery_receipt: None,
         }
     }
 
@@ -8032,6 +8033,7 @@ test a::flaky ... FAILED
             liveness: Default::default(),
             transport_outage: None,
             recovery: None,
+            recovery_receipt: None,
         };
         // The workflow's own `spawn` step ran and its `wait` completed against
         // this generation.

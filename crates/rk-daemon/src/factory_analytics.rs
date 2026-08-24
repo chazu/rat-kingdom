@@ -789,6 +789,7 @@ mod tests {
             liveness: Default::default(),
             transport_outage: None,
             recovery: None,
+            recovery_receipt: None,
         }
     }
 
