@@ -160,6 +160,15 @@ const LANDING_EDGE_PLAN_IDENTITY: &str = "landing_edge_plan";
 /// ticket whose branch already landed — TKT-01M0C663BZ86SMA2PVMFP5QJ8D.
 pub(crate) const LANDING_PROCESSED_IDENTITY: &str = "landing_processed";
 
+/// Identity of the durable visibility event for an empty/no-op landing
+/// candidate — a source head already containing zero commits beyond its
+/// target when classified, either at admission
+/// ([`LandingPipeline::enqueue_disposition`]) or after sitting queued while
+/// the target caught up to it ([`LandingPipeline::process_entry`]). Written
+/// alongside (never instead of) the [`LANDING_PROCESSED_IDENTITY`] dedup
+/// marker so both "why" and "was this handled" are independently readable.
+const LANDING_EMPTY_IDENTITY: &str = "landing_empty_candidate";
+
 /// Task ids (ticket identities, by fleet convention) with a branch currently
 /// sitting anywhere in the landing pipeline — `Queued`, `RunningGates`, or
 /// `AwaitingReview`. No status check is needed: a `landing_queue_entry`
@@ -1305,6 +1314,15 @@ pub(crate) enum LandingOutcome {
     /// advanced through `Supervisor::land_prepared`. Carries its result JSON
     /// (`merged`, `delivered`, ...).
     Landed(Value),
+    /// The candidate's source head already carried zero commits beyond its
+    /// target when classified — an explicit no-op, never gated or reviewed
+    /// (module doc, [`LANDING_EMPTY_IDENTITY`]). Carries the same
+    /// `{branch, target, merged: false, delivered: false, status: "empty",
+    /// reason, ...}` JSON shape callers already expect from an outcome
+    /// value. Never advances the target, never creates a merge commit, and
+    /// never records a delivery — diagnostic/operator ticket closure stays a
+    /// separate explicit tracker action.
+    Empty(Value),
     /// A gate failed or timed out. `run_check_in` already recorded the
     /// durable `gate-failure` artifact, and a steward `need` row was written
     /// so the hold is visible in `rk inbox`; the branch is left unmerged.
@@ -1525,6 +1543,11 @@ impl LandingPipeline {
     fn enqueue_disposition(&self, entry: LandingQueueEntry) -> rk_core::Result<EnqueueDisposition> {
         let _guard = self.enqueue_lock.lock().unwrap_or_else(|p| p.into_inner());
         let Some(marker) = self.admission_marker(&entry)? else {
+            if let Some(target_head) = self.empty_candidate_at_admission(&entry) {
+                let outcome = self.record_empty(&entry, &target_head)?;
+                self.mark_processed(&entry, &outcome)?;
+                return Ok(EnqueueDisposition::Processed);
+            }
             if self.queue.contains_work_key(&entry)? {
                 return Ok(EnqueueDisposition::Pending);
             }
@@ -1653,6 +1676,24 @@ impl LandingPipeline {
         match self.enqueue_disposition(entry.clone())? {
             EnqueueDisposition::Queued(_) | EnqueueDisposition::Pending => {}
             EnqueueDisposition::Processed => {
+                // An empty/no-op candidate gets its own explicit status here
+                // rather than the generic already-processed detail below —
+                // acceptance requires a direct `rk land` on a branch with
+                // nothing to land (or a replay of one already classified
+                // that way) to report `status: "empty"`, `merged: false`,
+                // `delivered: false`, not a vague "already processed" that
+                // reads the same as a held or escalated branch.
+                if let Some(event) = self.empty_event(&entry)? {
+                    return Ok(json!({
+                        "branch": branch,
+                        "target": target,
+                        "merged": false,
+                        "delivered": false,
+                        "status": "empty",
+                        "reason": event.payload.get("reason").cloned().unwrap_or(Value::Null),
+                        "already_processed": true,
+                    }));
+                }
                 return Ok(json!({
                     "branch": branch,
                     "target": target,
@@ -1691,6 +1732,7 @@ impl LandingPipeline {
             }
             return Ok(match outcome {
                 LandingOutcome::Landed(result) => result,
+                LandingOutcome::Empty(result) => result,
                 LandingOutcome::GateHeld => json!({
                     "branch": branch, "target": target, "merged": false,
                     "delivered": false, "status": "gate-held",
@@ -1806,6 +1848,95 @@ impl LandingPipeline {
             .ok()
     }
 
+    /// `entry`'s source head already contained in `target`'s live tip — zero
+    /// commits for this exact candidate to contribute. `None` when the
+    /// target ref cannot be resolved, so an unresolvable target fails closed
+    /// into the normal gated path rather than a silent short-circuit.
+    fn empty_candidate_target_head(
+        &self,
+        entry: &LandingQueueEntry,
+        repo: &rk_git::Repo,
+    ) -> Option<String> {
+        let target_head = repo.rev_parse(&entry.target).ok()?;
+        repo.is_ancestor(&entry.head_sha, &target_head)
+            .then_some(target_head)
+    }
+
+    /// [`Self::empty_candidate_target_head`] for [`Self::enqueue_disposition`],
+    /// which has no [`rk_git::Repo`] handle yet — a fresh completion or
+    /// operator `rk land` is classified before any candidate is ever
+    /// prepared or queued.
+    fn empty_candidate_at_admission(&self, entry: &LandingQueueEntry) -> Option<String> {
+        let repo = rk_git::Repo::discover(Path::new(&entry.repo_path)).ok()?;
+        self.empty_candidate_target_head(entry, &repo)
+    }
+
+    /// The durable [`LANDING_EMPTY_IDENTITY`] visibility event for `entry`'s
+    /// exact work key, if one exists — read back by [`Self::submit_manual`]
+    /// so a `Processed` disposition (fresh classification OR a replayed
+    /// duplicate of one already classified this way) can report the
+    /// explicit `"empty"` status instead of the generic already-processed
+    /// detail. Same shape as [`Self::processed_marker`]: scan-then-filter on
+    /// `target` in Rust, `.rfind` for the newest match.
+    fn empty_event(&self, entry: &LandingQueueEntry) -> rk_core::Result<Option<Tuple>> {
+        let pattern = Pattern::for_commit(
+            Category::Event,
+            LANDING_EMPTY_IDENTITY,
+            &entry.branch,
+            &entry.head_sha,
+        )
+        .scope(&entry.repo_name);
+        Ok(self.space.scan(&pattern)?.into_iter().rfind(|t| {
+            t.payload.get("target").and_then(Value::as_str) == Some(entry.target.as_str())
+        }))
+    }
+
+    /// Durable, visible record of an empty/no-op landing candidate — the
+    /// [`LANDING_EMPTY_IDENTITY`] event `rk scan`/`rk inbox` can surface,
+    /// written alongside (not instead of) the [`Self::mark_processed`] dedup
+    /// marker. Never advances the target, never lands a merge commit, and
+    /// never records a delivery.
+    fn record_empty(
+        &self,
+        entry: &LandingQueueEntry,
+        target_head: &str,
+    ) -> rk_core::Result<LandingOutcome> {
+        let reason = format!(
+            "{} onto {} carries no commits beyond the current target tip ({target_head}) — \
+             nothing to land",
+            entry.branch, entry.target
+        );
+        self.space.out(
+            Tuple::new(
+                Category::Event,
+                entry.repo_name.clone(),
+                LANDING_EMPTY_IDENTITY,
+                "daemon",
+                json!({
+                    "repo": entry.repo_name,
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "target_head": target_head,
+                    "head_sha": entry.head_sha,
+                    "task": entry.task,
+                    "reason": reason,
+                    "state": "empty",
+                }),
+            )
+            .with_lifecycle(Lifecycle::Furniture),
+        )?;
+        Ok(LandingOutcome::Empty(json!({
+            "branch": entry.branch,
+            "target": entry.target,
+            "merged": false,
+            "delivered": false,
+            "status": "empty",
+            "reason": reason,
+            "head_sha": entry.head_sha,
+            "target_head": target_head,
+        })))
+    }
+
     /// The recorded terminal outcome string for `entry`'s work key, when a
     /// `landing_processed` marker exists — the read side `submit_manual`'s
     /// post-drain lookup uses to report what became of the caller's own
@@ -1849,6 +1980,7 @@ impl LandingPipeline {
     ) -> rk_core::Result<()> {
         let outcome_str = match outcome {
             LandingOutcome::Landed(_) => "landed",
+            LandingOutcome::Empty(_) => "empty",
             LandingOutcome::GateHeld => "gate-held",
             LandingOutcome::NoGate(_) => "no-gate",
             LandingOutcome::ReworkFiled(_) => "rework-filed",
@@ -1942,6 +2074,24 @@ impl LandingPipeline {
             blocking(move || rk_git::Repo::discover(&repo_path)).await?
         };
         if let Some(outcome) = self.recover_completed_land(&entry, &git_repo).await? {
+            return Ok(outcome);
+        }
+        // Re-checked fresh here (not just at admission): a candidate can sit
+        // `Queued` while the target catches up to its exact head through an
+        // unrelated landing, or an already-queued entry can be discovered
+        // for the first time after a restart — either way this must resolve
+        // to the same terminal no-op before ever touching gates or review.
+        // Placed after `recover_completed_land` deliberately: that call
+        // already consumed the one legitimate case where the target
+        // containing `entry.head_sha` means "my own prepared candidate just
+        // landed" rather than "nothing to land" — reaching here means that
+        // was ruled out (or entry.status is not `Landing` at all).
+        if let Some(target_head) = self.empty_candidate_target_head(&entry, &git_repo) {
+            if let Some(candidate_ref) = entry.candidate_ref.clone() {
+                let _ = git_repo.discard_candidate(&candidate_ref);
+            }
+            let outcome = self.record_empty(&entry, &target_head)?;
+            self.mark_processed(&entry, &outcome)?;
             return Ok(outcome);
         }
         let gates = self.gate_config(&git_repo);
@@ -13073,6 +13223,272 @@ checks: [
         );
     }
 
+    /// task_done admission (`Reactor::fire_land_action`'s call shape,
+    /// `LandingPipeline::enqueue`) of a candidate whose source head never
+    /// diverged from its target: classified as an explicit no-op before it
+    /// is ever queued — no `landing_queue_entry` tuple, no gate, no
+    /// checks.cue read at all (deliberately absent here: reaching
+    /// `gate_plan` would fail closed into `NoGate`, not `Empty`, so its
+    /// absence proves the short-circuit ran first).
+    #[tokio::test]
+    async fn task_done_admission_of_an_empty_candidate_is_classified_before_queueing() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        git(repo_dir.path(), &["checkout", "main"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        let main_before = rev_parse(repo_dir.path(), "main");
+        assert_eq!(
+            head_sha, main_before,
+            "feature must never have diverged from main"
+        );
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let entry = LandingQueueEntry {
+            repo_name: "empty-admission-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            diff_class: "doc-only".into(),
+            task: "empty-admission-task".into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            pipeline.enqueue(entry).unwrap(),
+            None,
+            "an empty candidate must never occupy a queue slot"
+        );
+        assert!(
+            space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                .unwrap()
+                .is_empty(),
+            "classifying as empty must never create a live queue entry"
+        );
+        let processed = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_PROCESSED_IDENTITY))
+            .unwrap();
+        assert_eq!(processed.len(), 1);
+        assert_eq!(
+            processed[0].payload.get("outcome").and_then(Value::as_str),
+            Some("empty")
+        );
+        let events = space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_EMPTY_IDENTITY))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let payload = &events[0].payload;
+        assert_eq!(
+            payload.get("repo").and_then(Value::as_str),
+            Some("empty-admission-repo")
+        );
+        assert_eq!(
+            payload.get("branch").and_then(Value::as_str),
+            Some("feature")
+        );
+        assert_eq!(payload.get("target").and_then(Value::as_str), Some("main"));
+        assert_eq!(
+            payload.get("head_sha").and_then(Value::as_str),
+            Some(head_sha.as_str())
+        );
+        assert_eq!(
+            payload.get("task").and_then(Value::as_str),
+            Some("empty-admission-task")
+        );
+        assert!(payload.get("reason").and_then(Value::as_str).is_some());
+        assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
+    }
+
+    /// The direct `rk land` path (`repo.land` RPC, `LandingPipeline::submit_manual`):
+    /// an empty candidate must report the SAME explicit `status: "empty"`,
+    /// `merged: false`, `delivered: false` shape a caller gets back from a
+    /// genuinely landed or held branch — not the generic
+    /// `already_processed` detail a same-key redelivery of an ordinary
+    /// outcome gets. A second call for the identical branch/head/target
+    /// must replay the same explicit status rather than a vague
+    /// already-processed marker with no distinguishing detail.
+    #[tokio::test]
+    async fn direct_land_of_an_empty_candidate_reports_an_explicit_empty_status() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        git(repo_dir.path(), &["checkout", "main"]);
+        let main_before = rev_parse(repo_dir.path(), "main");
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+
+        let result = pipeline
+            .submit_manual(
+                repo_dir.path(),
+                "feature",
+                "main",
+                false,
+                Some("direct-land-empty-task".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "empty");
+        assert_eq!(result["merged"], false);
+        assert_eq!(result["delivered"], false);
+        assert!(result.get("reason").and_then(Value::as_str).is_some());
+
+        // Replay: the same submission again must still report the explicit
+        // empty status, not a generic already-processed detail with no
+        // status field at all.
+        let replay = pipeline
+            .submit_manual(
+                repo_dir.path(),
+                "feature",
+                "main",
+                false,
+                Some("direct-land-empty-task".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay["status"], "empty");
+        assert_eq!(replay["merged"], false);
+        assert_eq!(replay["delivered"], false);
+
+        assert!(space
+            .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_EMPTY_IDENTITY))
+                .unwrap()
+                .len(),
+            1,
+            "the replay must dedup, not write a second empty event"
+        );
+        assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
+    }
+
+    /// An entry already sitting `Queued` — as it would after a restart, or
+    /// as an entry admitted by an older daemon build before this
+    /// short-circuit existed — must converge to the same terminal `Empty`
+    /// outcome without ever reaching a gate. Inserted with the low-level
+    /// `queue.enqueue` (bypassing `enqueue_disposition`'s own admission-time
+    /// check) so this exercises `process_entry`'s independent check, not the
+    /// admission one `task_done_admission_of_an_empty_candidate_is_classified_before_queueing`
+    /// already covers. No checks.cue: reaching `gate_plan` would fail closed
+    /// into `NoGate`, proving this outcome is `Empty` only because the gate
+    /// was never attempted.
+    #[tokio::test]
+    async fn restart_discovers_an_already_queued_empty_candidate_and_lands_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        git(repo_dir.path(), &["checkout", "main"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        let main_before = rev_parse(repo_dir.path(), "main");
+
+        let entry = LandingQueueEntry {
+            repo_name: "restart-empty-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha,
+            diff_class: "doc-only".into(),
+            task: "restart-empty-task".into(),
+            ..Default::default()
+        };
+
+        {
+            let space = Space::open(&layout.db_path()).unwrap();
+            let pipeline = test_pipeline(home.path(), space);
+            pipeline.queue.enqueue(entry).unwrap();
+        }
+
+        // "After restart": fresh Space handle over the same on-disk store.
+        let space = Space::open(&layout.db_path()).unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        let outcomes = pipeline.run_cycle().await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(&outcomes[0], LandingOutcome::Empty(_)),
+            "expected Empty, got {:?}",
+            outcomes[0]
+        );
+        assert!(
+            space
+                .scan(&Pattern::category(Category::Event).identity(LANDING_QUEUE_IDENTITY))
+                .unwrap()
+                .is_empty(),
+            "the restart-discovered entry must be removed from the live queue"
+        );
+        assert_eq!(rev_parse(repo_dir.path(), "main"), main_before);
+    }
+
+    /// A candidate genuinely non-empty at admission can become empty while
+    /// it sits `Queued` — the target catches all the way up to its exact
+    /// head through an unrelated path (an operator's manual merge, another
+    /// candidate carrying the identical commit). `process_entry` must
+    /// re-check freshly against the live target rather than trusting the
+    /// admission-time classification, and must converge to `Empty` without
+    /// ever reaching a gate (no checks.cue here either, for the same reason
+    /// as the restart test above).
+    #[tokio::test]
+    async fn target_advancing_to_the_source_head_while_queued_converges_to_empty() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("work.txt"), "v1\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "work"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let entry = LandingQueueEntry {
+            repo_name: "advance-while-queued-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha: head_sha.clone(),
+            diff_class: "doc-only".into(),
+            task: "advance-while-queued-task".into(),
+            ..Default::default()
+        };
+        // Genuinely non-empty at admission: main does not yet contain
+        // `feature`'s commit, so this is admitted onto the queue normally.
+        assert!(pipeline.enqueue(entry).unwrap().is_some());
+
+        // Advance main to include feature's exact head through an unrelated
+        // path — not through this pipeline at all.
+        git(
+            repo_dir.path(),
+            &["merge", "--no-ff", "feature", "-m", "external merge"],
+        );
+        let main_after_external_merge = rev_parse(repo_dir.path(), "main");
+        assert_ne!(main_after_external_merge, head_sha);
+
+        let outcomes = pipeline
+            .drain_key("advance-while-queued-repo", "main")
+            .await
+            .unwrap();
+        assert!(
+            matches!(&outcomes[0], LandingOutcome::Empty(_)),
+            "expected Empty once main already contains feature's head, got {:?}",
+            outcomes[0]
+        );
+        assert_eq!(
+            rev_parse(repo_dir.path(), "main"),
+            main_after_external_merge,
+            "no second merge: the pipeline must not touch main once it already contains the head"
+        );
+    }
+
     #[tokio::test]
     async fn missing_named_check_is_a_visible_no_gate_hold() {
         let home = tempfile::tempdir().unwrap();
@@ -15056,8 +15472,14 @@ checks: [
             (Utc::now() - chrono::Duration::days(30)).to_rfc3339(),
         )
         .unwrap();
-        // ...but a live queue entry for this exact key must still protect it.
-        pipeline.enqueue(entry).unwrap();
+        // ...but a live queue entry for this exact key must still protect
+        // it. Uses the low-level `queue.enqueue` rather than
+        // `pipeline.enqueue`: this fixture's `head_sha` is `main`'s own tip
+        // (a convenient stand-in, not a real divergent branch), which the
+        // admission-time empty-candidate check would now correctly classify
+        // as a no-op and refuse to queue — this test is about the sweep's
+        // queue-awareness, not admission, so it plants the tuple directly.
+        pipeline.queue.enqueue(entry).unwrap();
 
         let cfg = rk_core::config::GateWorktreeSweepConfig {
             max_age_days: 1,
