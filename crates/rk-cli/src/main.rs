@@ -187,6 +187,15 @@ enum Command {
         #[arg(long)]
         fleet: bool,
     },
+    /// Report primary-vs-shadow reviewer agreement over recorded comparisons.
+    ShadowReview {
+        /// Restrict the report to one repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Window to report on, e.g. 30m, 2h, 7d (bare number = minutes).
+        #[arg(long, default_value = "7d")]
+        since: String,
+    },
     /// Multiplayer sync via git notes.
     Sync {
         #[command(subcommand)]
@@ -1188,6 +1197,9 @@ async fn main() -> Result<()> {
             } else {
                 agent_cmds::cost(&layout, cli.json).await?
             }
+        }
+        Command::ShadowReview { repo, since } => {
+            observe::shadow_review_report(&layout, repo.as_deref(), &since, cli.json).await?
         }
         Command::Sync { command } => match command {
             SyncCommand::Now => {
