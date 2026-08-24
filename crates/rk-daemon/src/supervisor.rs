@@ -2678,6 +2678,24 @@ impl Supervisor {
                     // this generation is over, and the castle-wide breaker
                     // for its provider gets the same proof (see below).
                     r.transport_outage = None;
+                    // A post-commit recovery that was CONTINUED (not
+                    // abandoned) reaches proof-of-life here too: clear it so
+                    // this name goes back to behaving like an ordinary
+                    // generation — eligible for `detect_post_commit_outage`
+                    // and `respawn_sweep` again on a later, unrelated crash.
+                    // An abandoned recovery must stay stamped forever (that
+                    // exclusion is deliberate, see `abandon_recovery`), and a
+                    // still-unacknowledged one can only belong to some other,
+                    // stale generation's launch racing this handler — never
+                    // clear either of those.
+                    let continued = r.recovery.as_ref().is_some_and(|rec| {
+                        rec.ack.as_ref().is_some_and(|ack| {
+                            !matches!(ack.outcome, crate::agents::RecoveryOutcome::Abandoned)
+                        })
+                    });
+                    if continued {
+                        r.recovery = None;
+                    }
                 });
                 if had_outage {
                     if let Ok(Some(record)) = updated {
@@ -8970,6 +8988,185 @@ mod respawn_tests {
             "an abandoned recovery must never be auto-respawned"
         );
         assert!(after.pid.is_none(), "WIP must stay released permanently");
+    }
+
+    /// Regression for the gap Emmental-12 flagged in review (artifact
+    /// 01M0RRQA5CBNZ0BFQ88A56V8YZ): unlike `abandon_recovery`, a CONTINUED
+    /// recovery must not stay stamped on the record forever, or a name that
+    /// resumed once can never have its NEXT post-commit outage detected
+    /// again. Builds the record exactly as `continue_recovery` leaves it —
+    /// `recovery.ack` set to a non-`Abandoned` outcome — then fires the same
+    /// `Started` handshake `handle_event` would see from the relaunched
+    /// harness, and proves a SECOND, later transport-shaped death on the
+    /// same name is detected fresh rather than swallowed by the stale
+    /// record.
+    #[test]
+    fn continued_recovery_clears_on_proof_of_life_and_reenables_detection() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let p = repo.path();
+        let fork_point = Repo::discover(p).unwrap().rev_parse("HEAD").unwrap();
+        git(p, &["checkout", "-b", "rat/nibble/tkt-4", "main"]);
+        std::fs::write(p.join("work"), "done\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "committed work"]);
+        git(p, &["checkout", "main"]);
+
+        let mut rec =
+            committed_work_record_with_live_verifier_evidence(p, fork_point, "rat/nibble/tkt-4");
+        let name = rec.name.clone();
+        let spawn = rec.spawn_id();
+        let generation = rec.created_at;
+        rec.recovery = Some(crate::agents::RecoveryRecord {
+            ticket: rec.task.clone(),
+            branch: "rat/nibble/tkt-4".into(),
+            head: "deadbeef".repeat(5),
+            session_id: rec.session_id.clone(),
+            spawn,
+            liveness: rec.liveness.clone(),
+            budget_remaining_usd: None,
+            provider: "fake".into(),
+            class: rk_harness::TransportClass::Unavailable,
+            evidence: "connection refused".into(),
+            detected_at: Utc::now(),
+            ack: Some(crate::agents::RecoveryAck {
+                action_id: "action-1".into(),
+                outcome: crate::agents::RecoveryOutcome::ResumedSameProvider { new_spawn: spawn },
+                acknowledged_at: Utc::now(),
+            }),
+        });
+        // `continue_recovery` clears `stderr_tail` before relaunching; a
+        // fresh Started handshake must not see the outage evidence that
+        // parked the FIRST recovery.
+        rec.stderr_tail = None;
+
+        let sup = supervisor(home.path());
+        sup.lock_registry().insert(rec).unwrap();
+        let session = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert(name.clone(), session);
+
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Started {
+                session_id: Some("resumed-sess-1".into()),
+            },
+        );
+        assert!(
+            sup.status(&name).unwrap().recovery.is_none(),
+            "a CONTINUED recovery must clear on its next proof-of-life, or this name is \
+             stranded forever"
+        );
+
+        // A second, later transport-shaped death on the SAME name.
+        sup.lock_registry()
+            .update(&name, |r| {
+                r.state = AgentState::Running;
+                r.pid = Some(4343);
+                r.stderr_tail = Some("fatal: connection refused while contacting api\n".into());
+            })
+            .unwrap();
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Exited { code: Some(1) },
+        );
+        let redetected = sup.status(&name).unwrap();
+        assert!(
+            redetected.recovery.as_ref().is_some_and(|r| r.ack.is_none()),
+            "a second, unrelated post-commit outage on the same name must be detected \
+             fresh, not blocked by the first (already-continued) recovery: {:?}",
+            redetected.recovery
+        );
+    }
+
+    /// Companion to `continued_recovery_clears_on_proof_of_life_and_reenables_detection`:
+    /// the same proof-of-life clear must also restore ORDINARY auto-respawn
+    /// eligibility — `respawn_sweep`'s `recovery.is_none()` filter must not
+    /// exclude a name forever just because it once continued a recovery.
+    /// `#[tokio::test]` because a `Respawn` decision drives `self.respawn`,
+    /// which launches the fake harness for real.
+    #[tokio::test]
+    async fn continued_recovery_clears_on_proof_of_life_and_reenables_ordinary_respawn() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+
+        let mut rec = record(repo.path(), Some("main"));
+        rec.state = AgentState::Running;
+        rec.pid = Some(4343);
+        let name = rec.name.clone();
+        let spawn = rec.spawn_id();
+        let generation = rec.created_at;
+        rec.recovery = Some(crate::agents::RecoveryRecord {
+            ticket: rec.task.clone(),
+            branch: "rat/nibble/tkt-5".into(),
+            head: "deadbeef".repeat(5),
+            session_id: None,
+            spawn,
+            liveness: rec.liveness.clone(),
+            budget_remaining_usd: None,
+            provider: "fake".into(),
+            class: rk_harness::TransportClass::Unavailable,
+            evidence: "connection refused".into(),
+            detected_at: Utc::now(),
+            ack: Some(crate::agents::RecoveryAck {
+                action_id: "action-1".into(),
+                outcome: crate::agents::RecoveryOutcome::ResumedSameProvider { new_spawn: spawn },
+                acknowledged_at: Utc::now(),
+            }),
+        });
+
+        let sup = supervisor(home.path());
+        sup.lock_registry().insert(rec).unwrap();
+        let session = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert(name.clone(), session);
+
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Started {
+                session_id: Some("resumed-sess-2".into()),
+            },
+        );
+        assert!(sup.status(&name).unwrap().recovery.is_none());
+
+        // An ORDINARY crash later — no transport-shaped stderr — must be
+        // treated like any other crash: eligible for the auto-respawn
+        // sweep, not permanently excluded by the first (already-continued)
+        // recovery.
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Exited { code: Some(1) },
+        );
+        let after_crash = sup.status(&name).unwrap();
+        assert_eq!(after_crash.state, AgentState::Failed);
+        assert!(after_crash.recovery.is_none());
+
+        let cfg = SupervisorConfig {
+            respawn_enabled: true,
+            respawn_max_attempts: 1,
+            respawn_backoff_secs: 0,
+            ..SupervisorConfig::default()
+        };
+        let sinks = rk_core::notify::SinkRegistry::default();
+        sup.respawn_sweep(&cfg, &sinks);
+
+        assert!(
+            sup.lock_respawn_state().get(&name).is_some(),
+            "a name that once continued a recovery must be an ordinary auto-respawn \
+             candidate again after its next crash, not excluded forever"
+        );
     }
 
     #[test]
