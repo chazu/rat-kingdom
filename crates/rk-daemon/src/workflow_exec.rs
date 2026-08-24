@@ -7577,7 +7577,9 @@ test a::flaky ... FAILED
             ))
             .unwrap();
         let started_at = Utc::now() - chrono::Duration::hours(13);
-        engine.store_if_absent(wedged_instance(id, started_at)).unwrap();
+        engine
+            .store_if_absent(wedged_instance(id, started_at))
+            .unwrap();
 
         let (sinks, _recorder) = recording_sinks();
         let announcer = RecoveryAnnouncer::new();
@@ -7593,7 +7595,12 @@ test a::flaky ... FAILED
         assert_eq!(timed_out, 1);
         assert_eq!(engine.status(id).unwrap().status, InstanceStatus::Failed);
 
-        let released = engine.supervisor.lock_registry().get("Scurry").cloned().unwrap();
+        let released = engine
+            .supervisor
+            .lock_registry()
+            .get("Scurry")
+            .cloned()
+            .unwrap();
         assert_eq!(
             released.state,
             AgentState::Dismissed,
@@ -7642,14 +7649,37 @@ test a::flaky ... FAILED
             .unwrap();
 
         engine
-            .finalize(id, "/repo", "wf", Err(rk_core::Error::other("wait timed out")))
+            .finalize(
+                id,
+                "/repo",
+                "wf",
+                Err(rk_core::Error::other("wait timed out")),
+            )
             .await
             .unwrap();
 
-        let reviewer = engine.supervisor.lock_registry().get("Scurry").cloned().unwrap();
-        assert_eq!(reviewer.state, AgentState::Dismissed, "still-live agent must be released");
-        let crashed = engine.supervisor.lock_registry().get("Nibble").cloned().unwrap();
-        assert_eq!(crashed.state, AgentState::Dismissed, "already-terminal agent still reclaimed");
+        let reviewer = engine
+            .supervisor
+            .lock_registry()
+            .get("Scurry")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            reviewer.state,
+            AgentState::Dismissed,
+            "still-live agent must be released"
+        );
+        let crashed = engine
+            .supervisor
+            .lock_registry()
+            .get("Nibble")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            crashed.state,
+            AgentState::Dismissed,
+            "already-terminal agent still reclaimed"
+        );
     }
 
     /// T1: `run_check_in` was extracted from `run_command` precisely so a
