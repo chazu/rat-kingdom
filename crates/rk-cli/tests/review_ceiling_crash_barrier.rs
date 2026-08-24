@@ -218,6 +218,15 @@ struct Crashed {
     dead_daemon_pid: u32,
 }
 
+impl Drop for Crashed {
+    fn drop(&mut self) {
+        // The replacement daemon is a real detached process. Stop it on both
+        // success and panic so a failed acceptance run cannot leak test
+        // daemons into the host running the suite.
+        let _ = rk(self.home.path()).args(["daemon", "stop"]).output();
+    }
+}
+
 fn tuples(home: &Path, scope: &str, category: &str, identity: &str) -> Vec<Value> {
     let out = rk(home)
         .args(["--json", "scan", category, scope, identity])
