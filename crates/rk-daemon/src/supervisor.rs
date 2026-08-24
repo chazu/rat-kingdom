@@ -4379,6 +4379,85 @@ impl Supervisor {
             branch,
             "post-commit transport outage detected; durable recovery record written"
         );
+        self.announce_pending_recovery(name, record, &recovery);
+    }
+
+    /// Surface a freshly-parked [`RecoveryRecord`] the same way every other
+    /// automated recovery source in this file already does — through
+    /// [`crate::recovery::RecoveryAnnouncer`], which writes the durable
+    /// `recovery_action` event that `rk inbox` renders as a `recovery-action`
+    /// row and fans it out through the configured `[[notify.sinks]]`.
+    ///
+    /// Without this an operator could only discover a parked generation by
+    /// reading raw `agents.json`/`agent.status` JSON for every agent, which is
+    /// exactly the polling this seam exists to remove. The suggested action
+    /// names the two continuation commands, because the inbox row's own action
+    /// is always `rk inbox ack <id>` (see `inbox::recovery_action_rows`) — the
+    /// row body is the only place the real remedy can live.
+    ///
+    /// Announce-only: unlike the auto-respawn and transport-retry sites, a
+    /// rate-cap hold does NOT suppress anything here. Detection already
+    /// happened and the record is already persisted; there is no side effect
+    /// left to withhold, and dropping the record because the castle is noisy
+    /// would lose committed work. A held announce is logged and the parked
+    /// record still stands, ready for `continue_recovery`/`abandon_recovery`.
+    fn announce_pending_recovery(
+        &self,
+        name: &str,
+        record: &AgentRecord,
+        recovery: &crate::agents::RecoveryRecord,
+    ) {
+        let short_head: String = recovery.head.chars().take(12).collect();
+        let notice = EscalationNotice::new(
+            "placeholder",
+            "post_commit_recovery",
+            Severity::Warn,
+            record.repo_name.clone(),
+            name.to_string(),
+            format!(
+                "{name} lost its harness transport AFTER committing work on {} (head {}) — \
+                 the generation is parked awaiting a continuation decision and will NOT be \
+                 auto-respawned. Resume it with `rk continue-recovery {name}` (add \
+                 `--harness <kind>` to route to a configured alternate harness instead), or \
+                 `rk abandon-recovery {name}` to leave it terminal.",
+                recovery.branch, short_head,
+            ),
+        )
+        .with_action(format!("rk continue-recovery {name}"))
+        .with_ref("agent", name)
+        .with_ref("task", recovery.ticket.clone().unwrap_or_default())
+        .with_ref("branch", recovery.branch.clone())
+        .with_ref("head", recovery.head.clone())
+        .with_ref("provider", recovery.provider.clone())
+        .with_ref("class", format!("{:?}", recovery.class))
+        .with_ref("evidence", recovery.evidence.clone());
+        let announced = self.recovery_announcer.announce(
+            &self.space,
+            &self.sinks.lock().unwrap_or_else(|p| p.into_inner()),
+            crate::recovery::RecoveryAction {
+                kind: "post_commit_recovery".into(),
+                instance: "supervisor".into(),
+                notice,
+            },
+            // 20/hour, matching the kill-process-group site: generous enough
+            // that a genuine multi-agent outage episode is fully visible,
+            // tight enough that a castle-wide provider failure cannot turn
+            // this into a notification storm.
+            crate::recovery::RateCap::per_hour(20),
+        );
+        match announced {
+            Ok(outcome) if outcome.held() => warn!(
+                agent = name,
+                "post-commit recovery announce HELD by the rate cap; the durable recovery \
+                 record still stands — find it with `rk status` or the held escalation itself"
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(
+                agent = name,
+                error = %e,
+                "failed to announce a parked post-commit recovery; the durable record still stands"
+            ),
+        }
     }
 
     /// Resume (or route to a configured alternate harness for) a generation
