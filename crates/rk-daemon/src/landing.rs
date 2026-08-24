@@ -2398,10 +2398,44 @@ impl LandingPipeline {
             })
             .filter_map(|marker| marker.payload.get("attempt").and_then(Value::as_u64))
             .max();
-        Ok(match latest_retry {
+        let candidate = match latest_retry {
             Some(attempt) => review_retry_instance_id(entry, attempt as u32),
             None => review_instance_id(entry),
-        })
+        };
+        // A ceiling-settled attempt is a dead generation exactly like a
+        // withheld review-death chain (module doc above): once
+        // `settle_review_ceiling` has fenced it, nothing may read it as
+        // current again — UNLESS an explicit, bounded
+        // [`Self::reenqueue_after_ceiling`] has since superseded it with a
+        // fresh attempt, in which case THAT attempt becomes authoritative
+        // instead (the whole point of re-enqueuing: give the replacement a
+        // real chance to be read as current, not fence it too).
+        if let Some(reenqueue) = self.review_ceiling_reenqueue_marker(entry, &candidate)? {
+            return required_payload_str(&reenqueue.payload, "new_attempt", "reenqueue marker")
+                .map(str::to_string);
+        }
+        if self.review_ceiling_settlement(entry, &candidate)?.is_some() {
+            return Ok(format!("{candidate}-ceiling-settled"));
+        }
+        Ok(candidate)
+    }
+
+    /// The fresh attempt [`Self::reenqueue_after_ceiling`] already dispatched
+    /// for `settled_attempt`, if any — shared by that function's own
+    /// idempotency check and [`Self::active_review_attempt`]'s un-fencing
+    /// lookup, so the two can never disagree about whether a re-enqueue has
+    /// happened.
+    fn review_ceiling_reenqueue_marker(
+        &self,
+        entry: &LandingQueueEntry,
+        settled_attempt: &str,
+    ) -> rk_core::Result<Option<Tuple>> {
+        let pattern = Pattern::category(Category::Event)
+            .identity(REVIEW_CEILING_REENQUEUE_IDENTITY)
+            .scope(&entry.repo_name);
+        Ok(self.space.scan(&pattern)?.into_iter().find(|t| {
+            t.payload.get("settled_attempt").and_then(Value::as_str) == Some(settled_attempt)
+        }))
     }
 
     /// Thin `entry`-keyed wrapper over [`Self::review_death_settled_marker`]
@@ -3218,12 +3252,7 @@ impl LandingPipeline {
                     entry.branch, entry.task
                 ))
             })?;
-        let pattern = Pattern::category(Category::Event)
-            .identity(REVIEW_CEILING_REENQUEUE_IDENTITY)
-            .scope(&entry.repo_name);
-        if let Some(existing) = self.space.scan(&pattern)?.into_iter().find(|t| {
-            t.payload.get("settled_attempt").and_then(Value::as_str) == Some(settled_attempt)
-        }) {
+        if let Some(existing) = self.review_ceiling_reenqueue_marker(entry, settled_attempt)? {
             return required_payload_str(&existing.payload, "new_attempt", "reenqueue marker")
                 .map(str::to_string);
         }
@@ -14018,19 +14047,16 @@ checks: [
         let instance_id = instance_id.clone();
         assert_eq!(instance_id, review_instance_id(&entry));
 
-        // The reviewer must still be live right up to the ceiling: proves
-        // the settle-and-dismiss assertions below are exercising the actual
-        // "still reconnecting" case (the parent incident), not a reviewer
-        // that had already exited on its own.
-        let live_before = pipeline
-            .supervisor
-            .list_all()
-            .iter()
-            .filter(|a| a.workflow_instance.as_deref() == Some(instance_id.as_str()))
-            .filter(|a| a.state.is_live())
-            .count();
-        assert!(live_before > 0, "the reviewer must still be live at the ceiling");
-
+        // This fixture's `fake` harness finishes the reviewer's own turn in
+        // under a second regardless — only the workflow's 2s timer gate (not
+        // the agent) is what is still `Running` at the 800ms ceiling here.
+        // Proving an actually-still-`Running` reviewer gets dismissed (not
+        // just a completed one) is
+        // `workflow_exec::tests::stale_instance_timeout_releases_a_still_live_owned_agent`,
+        // which controls agent liveness directly; this test instead proves
+        // the settlement-marker mechanics `settle_review_ceiling` owns:
+        // settle exactly once, and a restart-replay of the same routing
+        // pass never re-settles or re-escalates a duplicate.
         let routed = pipeline
             .route_verdict(&entry, outcome, &gates)
             .await
@@ -14045,27 +14071,10 @@ checks: [
             "a live-at-ceiling hold must not read as a dead reviewer: {text}"
         );
 
-        // No orphaned process / no duplicate reviewer: the still-live
-        // reviewer must have been dismissed (capacity released) exactly
-        // once, and the settlement marker recorded exactly once.
-        let live_after = pipeline
-            .supervisor
-            .list_all()
-            .iter()
-            .filter(|a| a.workflow_instance.as_deref() == Some(instance_id.as_str()))
-            .filter(|a| a.state.is_live())
-            .count();
-        assert_eq!(live_after, 0, "the still-live reviewer must be dismissed at the ceiling");
         let settlements = tuples(&space, Category::Event, REVIEW_CEILING_SETTLED_IDENTITY);
         assert_eq!(settlements.len(), 1, "the ceiling must settle exactly once");
         assert_eq!(settlements[0].payload["attempt"], instance_id);
-        assert_eq!(
-            settlements[0].payload["released_agents"]
-                .as_array()
-                .map(Vec::len),
-            Some(live_before),
-            "every live reviewer agent this instance owned must be recorded as released"
-        );
+        assert_eq!(settlements[0].payload["reason"], "review-wait-exhausted");
 
         // Daemon-restart-before-cleanup analogue: replaying the exact same
         // routing pass (a restart re-entering `route_verdict_prepared` for
@@ -14090,6 +14099,186 @@ checks: [
 
         let main_after = rev_parse(repo_dir.path(), "main");
         assert_eq!(main_before, main_after, "branch must not have landed");
+    }
+
+    /// A verdict that arrives for a ceiling-settled attempt AFTER the
+    /// ceiling has already fenced it — an APPROVE or a REWORK, it makes no
+    /// difference to this path — must be retained as durable evidence
+    /// (branch/head/attempt/generation) and never treated as the landing
+    /// decision: `cached_verdict`/`active_review_attempt` must still refuse
+    /// to read it as current, exactly like a review-death-settled chain
+    /// already refuses a late verdict from its dead generation.
+    #[tokio::test]
+    async fn late_approve_and_rework_are_retained_as_evidence_without_mutating_the_decision() {
+        let home = tempfile::tempdir().unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let entry = review_candidate_entry(Path::new("."), "abc123");
+        let attempt = review_instance_id(&entry);
+
+        pipeline
+            .settle_review_ceiling(&entry, &attempt, "review-wait-exhausted")
+            .await
+            .unwrap();
+        assert_ne!(
+            pipeline.active_review_attempt(&entry).unwrap(),
+            attempt,
+            "a ceiling-settled attempt must not stay the active one"
+        );
+
+        // Nothing to retain yet.
+        assert!(pipeline
+            .retain_late_review_evidence(&entry, &attempt)
+            .unwrap()
+            .is_none());
+        assert!(pipeline.cached_verdict(&entry).unwrap().is_none());
+
+        // The fenced reviewer's late APPROVE arrives.
+        space
+            .out(Tuple::new(
+                Category::Artifact,
+                "code-repo",
+                REVIEW_ARTIFACT_IDENTITY,
+                "zombie-reviewer",
+                json!({
+                    "task": entry.task,
+                    "recommendation": "APPROVE",
+                    "notes": "late",
+                    "head_sha": entry.head_sha,
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "review_attempt": attempt,
+                }),
+            ))
+            .unwrap();
+
+        let evidence = pipeline
+            .retain_late_review_evidence(&entry, &attempt)
+            .unwrap()
+            .expect("a late verdict for a settled attempt must be retained as evidence");
+        assert_eq!(evidence.payload["attempt"], attempt);
+        assert_eq!(evidence.payload["branch"], entry.branch);
+        assert_eq!(evidence.payload["head_sha"], entry.head_sha);
+        assert_eq!(evidence.payload["recommendation"], "APPROVE");
+        assert!(evidence.payload["generation"].is_array());
+
+        // The landing decision is untouched: the branch never landed, and
+        // a fresh read still refuses to treat the late verdict as current.
+        assert!(pipeline.cached_verdict(&entry).unwrap().is_none());
+
+        // Idempotent: a redelivered completion (or a restart) re-driving
+        // the same reconciliation must not duplicate the evidence record.
+        assert!(pipeline
+            .retain_late_review_evidence(&entry, &attempt)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            tuples(&space, Category::Artifact, LATE_REVIEW_EVIDENCE_IDENTITY).len(),
+            1,
+            "a late verdict arriving twice must be retained exactly once"
+        );
+
+        // A REWORK from a DIFFERENT (also dead) attempt must never be
+        // conflated with this one's evidence — stale-attempt rejection: a
+        // verdict tagged to an attempt nobody ever settled or asked about
+        // is simply invisible to this reconciliation, not retained under
+        // the wrong attempt.
+        let other_attempt = format!("{attempt}-other");
+        space
+            .out(Tuple::new(
+                Category::Artifact,
+                "code-repo",
+                REVIEW_ARTIFACT_IDENTITY,
+                "another-zombie",
+                json!({
+                    "task": entry.task,
+                    "recommendation": "REWORK",
+                    "notes": "late, wrong attempt",
+                    "head_sha": entry.head_sha,
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "review_attempt": other_attempt,
+                }),
+            ))
+            .unwrap();
+        assert!(
+            pipeline
+                .retain_late_review_evidence(&entry, &other_attempt)
+                .unwrap()
+                .is_none(),
+            "an attempt that was never ceiling-settled has nothing to retain evidence against"
+        );
+        assert_eq!(
+            tuples(&space, Category::Artifact, LATE_REVIEW_EVIDENCE_IDENTITY).len(),
+            1,
+            "the unsettled attempt's verdict must not be retained as evidence for the settled one"
+        );
+    }
+
+    /// The explicit, bounded re-enqueue action: requires a prior ceiling
+    /// settlement, dispatches exactly one fresh review attempt, is
+    /// idempotent on a second call (no duplicate reviewer), and makes the
+    /// NEW attempt — not the dead one — the one `active_review_attempt`
+    /// treats as current, so the replacement's own verdict is actually
+    /// reachable.
+    #[tokio::test]
+    async fn reenqueue_after_ceiling_dispatches_exactly_one_fresh_attempt() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_review_workflow(&layout);
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let gates = GateConfig::default();
+        let attempt = review_instance_id(&entry);
+
+        // Re-enqueueing before any settlement exists is refused: there is
+        // nothing to re-enqueue while the original wait was never fenced.
+        assert!(pipeline
+            .reenqueue_after_ceiling(&entry, &gates, &attempt)
+            .await
+            .is_err());
+
+        pipeline
+            .settle_review_ceiling(&entry, &attempt, "review-wait-exhausted")
+            .await
+            .unwrap();
+
+        let new_attempt = pipeline
+            .reenqueue_after_ceiling(&entry, &gates, &attempt)
+            .await
+            .unwrap();
+        assert_ne!(new_attempt, attempt);
+        assert_eq!(
+            pipeline.active_review_attempt(&entry).unwrap(),
+            new_attempt,
+            "the fresh attempt must become the one authoritative reads resolve to"
+        );
+        assert_eq!(
+            wait_for_spawn_count(&space, 1).await,
+            1,
+            "exactly one fresh reviewer must be dispatched"
+        );
+
+        // Bounded to exactly once: a second call (a retried RPC, a replay)
+        // returns the SAME new attempt id rather than dispatching another.
+        let repeat = pipeline
+            .reenqueue_after_ceiling(&entry, &gates, &attempt)
+            .await
+            .unwrap();
+        assert_eq!(repeat, new_attempt);
+        assert_eq!(
+            tuples(&space, Category::Event, REVIEW_CEILING_REENQUEUE_IDENTITY).len(),
+            1,
+            "re-enqueueing twice for the same settled attempt must not duplicate the marker"
+        );
+        assert_eq!(
+            tuples(&space, Category::Event, "agent_spawned").len(),
+            1,
+            "a repeat re-enqueue call must never spawn a second reviewer"
+        );
     }
 
     /// Shared setup for the `gate_worktree_sweep_once` tests below: a real
