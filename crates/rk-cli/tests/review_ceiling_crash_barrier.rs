@@ -36,6 +36,7 @@
 //! degrading into a proof of ordinary restart.
 
 use serde_json::Value;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -80,6 +81,63 @@ workflow: {
 }
 "#;
 
+/// Same review workflow, but the reviewer role runs a REAL adapter
+/// (`crates/rk-harness/src/{claude,codex}.rs`) instead of `fake`. `fake`
+/// parses stdout with the same parser as `claude` but never wraps its
+/// session in `crate::watch_pre_work_transport_failure` (see
+/// `crates/rk-harness/src/fake.rs`), so a `fake` reviewer can hang or crash
+/// but can never produce a `HarnessEvent::TransportFailure` — only a real
+/// adapter can exercise the typed-outage path this file's other tests never
+/// touch. `harness` is `"claude"` or `"codex"`.
+fn review_workflow_real_adapter(harness: &str) -> String {
+    format!(
+        r#"
+package workflow
+
+workflow: {{
+	name: "steward-review"
+	params: {{
+		taskId:        {{type: "string", required: false, default: "unknown"}}
+		branch:        {{type: "string", required: true}}
+		repo:          {{type: "string", required: false, default: "rat-kingdom"}}
+		target:        {{type: "string", required: false, default: "main"}}
+		headSha:       {{type: "string", required: false, default: ""}}
+		reviewTimeout: {{type: "string", required: false, default: "30m"}}
+	}}
+	agents: {{
+		default: {{harness: "{harness}", model: "sonnet"}}
+	}}
+	steps: [
+		{{
+			type:   "spawn"
+			role:   "reviewer"
+			branch: _input.branch
+			task: {{title: "review", description: "review it"}}
+		}},
+		{{type: "wait", timeout: _input.reviewTimeout}},
+		{{type: "evaluate", expect: {{is_error: false}}}},
+	]
+}}
+"#
+    )
+}
+
+/// Repository policy disabling unattended review-death retry
+/// (`LandingPolicy::review_death_auto_retry`, `crates/rk-workflow/src/lib.rs`)
+/// so a dead reviewer is fenced by exactly ONE bounded human escalation
+/// instead of a 30s-backoff replacement chain — the fastest, most
+/// deterministic way to prove convergence without rebuilding the
+/// review-death retry matrix (a separate ticket's concern).
+const NO_REVIEW_DEATH_RETRY_POLICY: &str =
+    "repo: {\n\tlanding: {\n\t\treviewDeathAutoRetry: false\n\t}\n}\n";
+
+/// Fixed, non-retryable transport-classified stderr line — literally the
+/// same fixture `rk_harness::transport::classify` and
+/// `crates/rk-harness/src/claude.rs`'s own
+/// `pre_work_authentication_failure_is_classified_as_not_retryable` test use,
+/// reused here instead of inventing a new one.
+const TRANSPORT_AUTH_STDERR: &str = "401 Unauthorized: invalid api key";
+
 /// An `rk` invocation driven as the operator, with the fake harness pinned to
 /// a hang. The env set here reaches the daemon too: `connect_or_spawn`'s
 /// `spawn_detached_daemon` inherits this process's environment, so whichever
@@ -91,6 +149,38 @@ fn rk(home: &Path) -> Command {
     cmd.env_remove("RK_AGENT");
     cmd.env_remove("RK_AUTH_TOKEN");
     cmd
+}
+
+/// Same shape as [`rk`], but hands the auto-started daemon `bin_env`
+/// (`"RK_CLAUDE_BIN"` or `"RK_CODEX_BIN"`) instead —
+/// `ClaudeHarness`/`CodexHarness::launch` (`crates/rk-harness/src/{claude,codex}.rs`)
+/// each read their own var as a fallback binary path exactly like their own
+/// `run_fake` unit-test fixtures do.
+fn rk_with_bin(home: &Path, bin_env: &str, bin_path: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rk"));
+    cmd.env("RK_HOME", home);
+    cmd.env(bin_env, bin_path);
+    cmd.env_remove("RK_AGENT");
+    cmd.env_remove("RK_AUTH_TOKEN");
+    cmd
+}
+
+/// Write an executable fake adapter binary that fails before ever emitting a
+/// parseable started/init event (so it fails pre-`Started`, the only window
+/// `crate::watch_pre_work_transport_failure` classifies) with
+/// [`TRANSPORT_AUTH_STDERR`] on stderr, then exits non-zero. Mirrors
+/// `crates/rk-harness/src/{claude,codex}.rs`'s own `run_fake` test fixture
+/// shape — both adapters spawn the binary directly (no shell wrapping), and
+/// neither reads its args before failing, so one script body serves both.
+fn fake_transport_failure_binary(dir: &Path, name: &str) -> std::path::PathBuf {
+    let binary = dir.join(name);
+    std::fs::write(
+        &binary,
+        format!("#!/bin/sh\necho '{TRANSPORT_AUTH_STDERR}' >&2\nexit 1\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    binary
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -144,20 +234,28 @@ fn until<T>(what: &str, mut attempt: impl FnMut() -> Option<T>) -> T {
     panic!("timed out after 60s waiting for: {what}");
 }
 
-/// A daemon home with the review workflow installed and the disk-pressure
-/// floor disabled (a constrained CI temp filesystem would otherwise refuse
-/// every spawn before this test reaches anything it means to cover — same
-/// reasoning as `daemon_rollover.rs`).
-fn daemon_home() -> tempfile::TempDir {
+/// A daemon home with `workflow_cue` installed as the review workflow and
+/// the disk-pressure floor disabled (a constrained CI temp filesystem would
+/// otherwise refuse every spawn before this test reaches anything it means
+/// to cover — same reasoning as `daemon_rollover.rs`).
+///
+/// `supervisor_interval_secs`, when `Some`, overrides `[supervisor]
+/// interval_secs` (default 60s — `SupervisorConfig::default`,
+/// `crates/rk-core/src/config.rs`): the sweep loop consumes its immediate
+/// first tick on startup (`crates/rk-daemon/src/server.rs`) and only then
+/// starts ticking on this cadence, so at the default interval a transport-
+/// outage episode's own ceiling (`transport_retry_sweep`) can take up to two
+/// full intervals to escalate — 120s, well past any reasonable test bound.
+fn daemon_home(workflow_cue: &str, supervisor_interval_secs: Option<u64>) -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(
-        home.path().join("config.toml"),
-        "[disk]\nmin_free_gb = 0\n\n[harness]\ndefault = \"fake\"\n",
-    )
-    .unwrap();
+    let mut config = "[disk]\nmin_free_gb = 0\n\n[harness]\ndefault = \"fake\"\n".to_string();
+    if let Some(secs) = supervisor_interval_secs {
+        config.push_str(&format!("\n[supervisor]\ninterval_secs = {secs}\n"));
+    }
+    std::fs::write(home.path().join("config.toml"), config).unwrap();
     let workflows = home.path().join("workflows");
     std::fs::create_dir_all(&workflows).unwrap();
-    std::fs::write(workflows.join("steward-review.cue"), REVIEW_WORKFLOW).unwrap();
+    std::fs::write(workflows.join("steward-review.cue"), workflow_cue).unwrap();
     home
 }
 
@@ -165,7 +263,11 @@ fn daemon_home() -> tempfile::TempDir {
 /// `classify_diff` (`crates/rk-daemon/src/supervisor.rs`) only requires review
 /// past its trivial threshold, so a smaller diff would land straight through
 /// on a gate pass and never reach the review phase this test is about.
-fn candidate_repo() -> (tempfile::TempDir, String) {
+///
+/// `repo_policy_cue`, when `Some`, is committed as `.rk/repo.cue` alongside
+/// the checks — e.g. [`NO_REVIEW_DEATH_RETRY_POLICY`] to fence a dead
+/// reviewer with one bounded escalation instead of a retry chain.
+fn candidate_repo(repo_policy_cue: Option<&str>) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "-b", "main"]);
     git(dir.path(), &["config", "user.email", "r@x"]);
@@ -183,6 +285,10 @@ fn candidate_repo() -> (tempfile::TempDir, String) {
     )
     .unwrap();
     git(dir.path(), &["add", ".rk/checks.cue"]);
+    if let Some(policy) = repo_policy_cue {
+        std::fs::write(dir.path().join(".rk/repo.cue"), policy).unwrap();
+        git(dir.path(), &["add", ".rk/repo.cue"]);
+    }
     git(
         dir.path(),
         &["commit", "-m", "test: register landing checks"],
@@ -310,8 +416,8 @@ fn live_agents_for(home: &Path, attempt: &str) -> Vec<Value> {
 /// inside the barrier, then SIGKILL it. Returns once the daemon process is
 /// confirmed dead and the barrier is disarmed for its successor.
 fn crash_at(barrier: &str) -> Crashed {
-    let home = daemon_home();
-    let (repo, head_sha) = candidate_repo();
+    let home = daemon_home(REVIEW_WORKFLOW, None);
+    let (repo, head_sha) = candidate_repo(None);
     let repo_name = repo
         .path()
         .file_name()
@@ -692,4 +798,196 @@ fn assert_converged_properties(c: &Crashed) {
         live_agents_for(home, &c.attempt).is_empty(),
         "re-enqueue must never revive the settled attempt"
     );
+}
+
+/// The gap the other tests in this file never cover: every scenario above
+/// pins the reviewer to the `fake` harness's `sleep 120` — a genuinely LIVE,
+/// hung process, so nothing here ever exercises
+/// `rk_harness::transport::classify` at all (`fake` never wraps its session
+/// in `watch_pre_work_transport_failure` — see
+/// [`review_workflow_real_adapter`]'s doc). This proves the SAME
+/// review-workflow fixture, driven with a REAL adapter (`claude` or `codex`)
+/// against a reviewer whose stderr classifies as a non-retryable transport
+/// outage instead of hanging: the operator sees a TYPED `transport-outage`
+/// row rather than the undifferentiated `agent-failed` row a plain crash
+/// gets (`crates/rk-daemon/src/inbox.rs`'s `transport_outage_item` — "never
+/// BOTH", it replaces the generic row), and the landing decision still
+/// converges to exactly one bounded human escalation rather than hanging
+/// behind the dead reviewer — the same "never lands, never hangs forever"
+/// property `crash_between_dismissal_and_marker_converges_exactly_once`
+/// proves for a live-forever reviewer, just routed through
+/// `route_review_death` (a dead reviewer) instead of
+/// `settle_review_ceiling` (a still-live one at the wait ceiling).
+///
+/// `harness`/`bin_env`/`bin_name` select the real adapter under test
+/// (`"claude"`/`"RK_CLAUDE_BIN"`/`"claude-fake-outage"` or
+/// `"codex"`/`"RK_CODEX_BIN"`/`"codex-fake-outage"`); both wrap their session
+/// in `crate::watch_pre_work_transport_failure`
+/// (`crates/rk-harness/src/{claude,codex}.rs`) and read the same fixture
+/// literal ([`TRANSPORT_AUTH_STDERR`]) in their own crate's unit tests, so
+/// one assertion body proves the seam for both instead of trusting it
+/// generalizes from one adapter to the other.
+///
+/// No daemon crash, no restart: that machinery belongs to the tests above
+/// and is not this gap's concern.
+fn assert_transport_outage_is_typed_and_fenced(harness: &str, bin_env: &str, bin_name: &str) {
+    // Fast sweep cadence: the transport-outage retry sweep must reach this
+    // non-retryable episode's ceiling well inside the `until` bounds below.
+    let home = daemon_home(&review_workflow_real_adapter(harness), Some(1));
+    let home_path = home.path().to_path_buf();
+    let bin = fake_transport_failure_binary(home.path(), bin_name);
+
+    let (repo, head_sha) = candidate_repo(Some(NO_REVIEW_DEATH_RETRY_POLICY));
+    let repo_name = repo
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    json_stdout(
+        &rk_with_bin(&home_path, bin_env, &bin)
+            .args(["--json", "repo", "add", repo.path().to_str().unwrap()])
+            .output()
+            .unwrap(),
+    );
+    let task = json_stdout(
+        &rk_with_bin(&home_path, bin_env, &bin)
+            .args([
+                "--json",
+                "ticket",
+                "new",
+                "add generated constants",
+                "--repo",
+                &repo_name,
+            ])
+            .output()
+            .unwrap(),
+    )["identity"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // `rk land` does not return until the whole landing decision settles
+    // (module doc at the top of this file) — here that is fast (no retry
+    // chain to wait out), but run it detached anyway so a regression that
+    // DOES make it hang fails on the `until` bounds below rather than
+    // wedging the test process.
+    let mut lander = rk_with_bin(&home_path, bin_env, &bin)
+        .args([
+            "land",
+            "feature",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--target",
+            "main",
+            "--task",
+            &task,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // The reviewer's OS process dies almost immediately (pre-`Started`), but
+    // its `AgentRecord` and the typed classification persist for the
+    // operator to read. Polled to require BOTH the typed classification AND
+    // the terminal state: `TransportFailure` (which records
+    // `transport_outage`) and `Exited` (which drives the ordinary
+    // live->Failed transition) are two separate events, so a snapshot can
+    // briefly observe the classification on a still-`running` record.
+    let reviewer = until(
+        "the reviewer agent to record a transport outage and go terminal",
+        || {
+            let out = rk(&home_path).args(["--json", "list"]).output().ok()?;
+            json_stdout(&out)
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|a| {
+                    a["role"].as_str() == Some("reviewer")
+                        && !a["transport_outage"].is_null()
+                        && a["state"].as_str() == Some("failed")
+                })
+        },
+    );
+    assert_eq!(reviewer["transport_outage"]["provider"], harness);
+    assert_eq!(reviewer["transport_outage"]["class"], "authentication");
+    assert_eq!(
+        reviewer["transport_outage"]["retryable"], false,
+        "a rejected credential does not heal by reconnecting"
+    );
+    let reviewer_name = reviewer["name"]
+        .as_str()
+        .expect("agent record must carry its own name")
+        .to_string();
+
+    // Visible as a TYPED outage, never the undifferentiated stuck/failed row
+    // a plain crash or hang gets.
+    let inbox_item = until(
+        "the inbox to carry a typed transport-outage row for the reviewer",
+        || {
+            let out = rk(&home_path).args(["--json", "inbox"]).output().ok()?;
+            let items: Vec<Value> = serde_json::from_slice(&out.stdout).ok()?;
+            items
+                .into_iter()
+                .find(|it| it["subject"].as_str() == Some(reviewer_name.as_str()))
+        },
+    );
+    assert_eq!(
+        inbox_item["kind"], "transport-outage",
+        "a reviewer mid a typed transport-outage episode must not surface as the generic \
+         agent-failed row: {inbox_item:?}"
+    );
+
+    // Fenced: the landing decision does not hang behind the dead reviewer —
+    // with unattended review-death retry disabled by policy, it converges to
+    // exactly ONE bounded human escalation.
+    let need = until(
+        "the review-death escalation to land as a steward need",
+        || {
+            tuples(&home_path, &repo_name, "need", "steward")
+                .into_iter()
+                .find(|t| {
+                    t["payload"]["text"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("died before a verdict"))
+                })
+        },
+    );
+    assert!(
+        need["payload"]["text"]
+            .as_str()
+            .unwrap()
+            .contains(task.as_str()),
+        "the escalation must name the exact task it is holding: {need:?}"
+    );
+
+    // `rk land` itself returns — never hangs — once the decision is
+    // escalated.
+    let status = until("the detached `rk land` to exit", || {
+        lander.try_wait().ok().flatten()
+    });
+    assert!(
+        status.success(),
+        "an escalated-but-resolved landing decision is not a CLI failure"
+    );
+
+    // Never lands a candidate whose reviewer died before a verdict.
+    let main_head = git(repo.path(), &["rev-parse", "main"]);
+    assert_ne!(
+        main_head, head_sha,
+        "a candidate whose reviewer died before a verdict must never land"
+    );
+}
+
+#[test]
+fn transport_classified_claude_reviewer_death_is_a_typed_outage_not_a_plain_hang() {
+    assert_transport_outage_is_typed_and_fenced("claude", "RK_CLAUDE_BIN", "claude-fake-outage");
+}
+
+#[test]
+fn transport_classified_codex_reviewer_death_is_a_typed_outage_not_a_plain_hang() {
+    assert_transport_outage_is_typed_and_fenced("codex", "RK_CODEX_BIN", "codex-fake-outage");
 }
