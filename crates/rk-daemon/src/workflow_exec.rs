@@ -3215,12 +3215,28 @@ impl WorkflowEngine {
     /// step's timeout heals the run. A crashed (`Failed`) agent is likewise
     /// still revivable while the self-healing sweep is armed and has not yet
     /// hit its crash-loop cap.
+    ///
+    /// A pre-work transport-outage episode (`AgentRecord::transport_outage`)
+    /// is a THIRD, separate case: `is_auto_respawn_candidate`
+    /// (`crates/rk-daemon/src/supervisor.rs`) deliberately excludes it from
+    /// the ordinary `RespawnState` tracking the check below reads, so
+    /// `respawn_exhausted` never saw this generation and reads it as "not
+    /// exhausted" by default — which would keep this wait blocked for the
+    /// full step timeout even after the outage's own retry ceiling
+    /// (`TransportOutageState::ceiling_hit`) has already fired, on a
+    /// non-retryable class that was never going to be retried at all. Read
+    /// that ceiling directly instead of falling through to a check that was
+    /// never tracking this episode.
     fn abandoned(&self, agent: &str) -> Option<String> {
         let record = self.supervisor.status(agent)?;
         if record.state == AgentState::Orphaned || !record.crashed_without_reporting() {
             return None;
         }
-        if record.state == AgentState::Failed
+        if let Some(outage) = &record.transport_outage {
+            if !outage.ceiling_hit {
+                return None; // the transport-retry sweep may still bring it back
+            }
+        } else if record.state == AgentState::Failed
             && self.respawn_enabled
             && !self.supervisor.respawn_exhausted(agent)
         {
