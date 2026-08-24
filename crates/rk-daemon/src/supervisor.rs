@@ -2874,6 +2874,11 @@ impl Supervisor {
                     }
                 }
             }
+            // Retry-schedule/circuit-breaker handling lands in a follow-up
+            // increment (TKT-01M0HND8M25GYN1ZTRET3S5769); for now this is a
+            // deliberate no-op so the new event variant does not change any
+            // existing behavior.
+            HarnessEvent::TransportFailure { .. } => {}
         }
     }
 

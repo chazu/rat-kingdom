@@ -109,6 +109,7 @@ impl Harness for CodexHarness {
                 }),
             }),
         })?;
+        let session = crate::watch_pre_work_transport_failure("codex", session);
         Ok(post_process(session))
     }
 }
@@ -279,6 +280,120 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
+
+    /// Spawn a fake `codex` binary (via `RK_CODEX_BIN`) that behaves per
+    /// `script`, and drain its events with a bound so a hung fixture cannot
+    /// hang the test suite.
+    async fn run_fake(script: &str) -> Vec<HarnessEvent> {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("codex-fake");
+        fs::write(&binary, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = HashMap::new();
+        env.insert("RK_CODEX_BIN".into(), binary.to_string_lossy().into_owned());
+        let mut session = CodexHarness
+            .launch(&LaunchSpec {
+                prompt: "do the task".into(),
+                cwd: dir.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(event) =
+            tokio::time::timeout(Duration::from_secs(5), session.events.recv())
+                .await
+                .expect("fixture must not hang")
+        {
+            let exited = matches!(event, HarnessEvent::Exited { .. });
+            events.push(event);
+            if exited {
+                break;
+            }
+        }
+        events
+    }
+
+    fn transport_failure(events: &[HarnessEvent]) -> Option<&crate::TransportOutcome> {
+        events.iter().find_map(|e| match e {
+            HarnessEvent::TransportFailure { outcome } => Some(outcome),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn pre_work_certificate_failure_is_classified_before_exit() {
+        let events = run_fake("echo 'unable to get local issuer certificate' >&2; exit 1").await;
+        let outcome = transport_failure(&events).expect("must classify a transport failure");
+        assert_eq!(outcome.provider, "codex");
+        assert_eq!(outcome.class, crate::TransportClass::Certificate);
+        assert!(outcome.retryable);
+        let failure_idx = events
+            .iter()
+            .position(|e| matches!(e, HarnessEvent::TransportFailure { .. }))
+            .unwrap();
+        let exited_idx = events
+            .iter()
+            .position(|e| matches!(e, HarnessEvent::Exited { .. }))
+            .unwrap();
+        assert!(failure_idx < exited_idx);
+    }
+
+    #[tokio::test]
+    async fn pre_work_authentication_failure_is_classified_as_not_retryable() {
+        let events = run_fake("echo '401 Unauthorized: invalid api key' >&2; exit 1").await;
+        let outcome = transport_failure(&events).expect("must classify");
+        assert_eq!(outcome.class, crate::TransportClass::Authentication);
+        assert!(!outcome.retryable);
+    }
+
+    #[tokio::test]
+    async fn pre_work_unavailable_failure_is_classified() {
+        let events = run_fake("echo '503 Service Unavailable' >&2; exit 1").await;
+        let outcome = transport_failure(&events).expect("must classify");
+        assert_eq!(outcome.class, crate::TransportClass::Unavailable);
+        assert!(outcome.retryable);
+    }
+
+    #[tokio::test]
+    async fn pre_work_generic_transport_failure_is_classified() {
+        let events = run_fake("echo 'connect ECONNRESET 1.2.3.4:443' >&2; exit 1").await;
+        let outcome = transport_failure(&events).expect("must classify");
+        assert_eq!(outcome.class, crate::TransportClass::Generic);
+        assert!(outcome.retryable);
+    }
+
+    #[tokio::test]
+    async fn ordinary_pre_work_failure_is_not_classified_as_transport() {
+        let events = run_fake("echo 'error: unrecognized flag --bogus' >&2; exit 2").await;
+        assert!(
+            transport_failure(&events).is_none(),
+            "an unrelated CLI error must not be misclassified as a transport failure"
+        );
+    }
+
+    /// Once the harness has actually started, later transport-flavored
+    /// stderr chatter (Codex's own post-processor synthesizes `Completed` on
+    /// a clean exit) must not be reclassified as a pre-work failure.
+    #[tokio::test]
+    async fn transport_vocabulary_after_started_is_not_classified() {
+        let events = run_fake(
+            r#"echo '{"type":"thread.started","thread_id":"t-1"}'
+echo 'note: certificate rotation scheduled for next week' >&2
+echo '{"type":"item.completed","item":{"item_type":"agent_message","text":"done"}}'"#,
+        )
+        .await;
+        assert!(
+            transport_failure(&events).is_none(),
+            "a Started generation must never be reclassified as a pre-work transport failure"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, HarnessEvent::Started { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, HarnessEvent::Completed { is_error: false, .. })));
+    }
 
     #[test]
     fn env_policy_preserves_rat_credentials_for_sandboxed_shell_commands() {

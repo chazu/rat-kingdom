@@ -83,17 +83,24 @@ impl Harness for ClaudeHarness {
     }
 
     fn launch(&self, spec: &LaunchSpec) -> rk_core::Result<HarnessSession> {
-        let mut cmd = Command::new("claude");
+        let binary = spec
+            .env
+            .get("RK_CLAUDE_BIN")
+            .cloned()
+            .or_else(|| std::env::var("RK_CLAUDE_BIN").ok())
+            .unwrap_or_else(|| "claude".into());
+        let mut cmd = Command::new(binary);
         cmd.args(launch_args(spec));
         cmd.current_dir(&spec.cwd);
         cmd.envs(&spec.env);
 
-        let mut session = runner::launch(runner::Wiring {
+        let session = runner::launch(runner::Wiring {
             command: cmd,
             parse: parse_event_line,
             steer_line: Some(control_message_line),
             resume: None,
         })?;
+        let mut session = crate::watch_pre_work_transport_failure("claude", session);
 
         // The initial prompt is just the first steer message.
         let prompt = spec.prompt.clone();
@@ -191,6 +198,133 @@ pub(crate) fn parse_event_line(line: &str) -> Vec<HarnessEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TransportClass;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    /// Spawn a fake `claude` binary (via `RK_CLAUDE_BIN`) that behaves per
+    /// `script`, and drain its events with a bound so a hung fixture cannot
+    /// hang the test suite.
+    async fn run_fake(script: &str) -> Vec<HarnessEvent> {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("claude-fake");
+        fs::write(&binary, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = HashMap::new();
+        env.insert("RK_CLAUDE_BIN".into(), binary.to_string_lossy().into_owned());
+        let mut session = ClaudeHarness
+            .launch(&LaunchSpec {
+                prompt: "do the task".into(),
+                cwd: dir.path().to_path_buf(),
+                env,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(event) =
+            tokio::time::timeout(Duration::from_secs(5), session.events.recv())
+                .await
+                .expect("fixture must not hang")
+        {
+            let exited = matches!(event, HarnessEvent::Exited { .. });
+            events.push(event);
+            if exited {
+                break;
+            }
+        }
+        events
+    }
+
+    fn transport_failure(events: &[HarnessEvent]) -> Option<&crate::TransportOutcome> {
+        events.iter().find_map(|e| match e {
+            HarnessEvent::TransportFailure { outcome } => Some(outcome),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn pre_work_certificate_failure_is_classified_before_exit() {
+        let events = run_fake(
+            "echo 'unable to get local issuer certificate' >&2; exit 1",
+        )
+        .await;
+        let outcome = transport_failure(&events).expect("must classify a transport failure");
+        assert_eq!(outcome.provider, "claude");
+        assert_eq!(outcome.class, TransportClass::Certificate);
+        assert!(outcome.retryable);
+        // Order: the failure must be visible before Exited, never after.
+        let failure_idx = events
+            .iter()
+            .position(|e| matches!(e, HarnessEvent::TransportFailure { .. }))
+            .unwrap();
+        let exited_idx = events
+            .iter()
+            .position(|e| matches!(e, HarnessEvent::Exited { .. }))
+            .unwrap();
+        assert!(failure_idx < exited_idx);
+    }
+
+    #[tokio::test]
+    async fn pre_work_authentication_failure_is_classified_as_not_retryable() {
+        let events = run_fake("echo '401 Unauthorized: invalid api key' >&2; exit 1").await;
+        let outcome = transport_failure(&events).expect("must classify");
+        assert_eq!(outcome.class, TransportClass::Authentication);
+        assert!(!outcome.retryable);
+    }
+
+    #[tokio::test]
+    async fn pre_work_unavailable_failure_is_classified() {
+        let events = run_fake("echo '503 Service Unavailable' >&2; exit 1").await;
+        let outcome = transport_failure(&events).expect("must classify");
+        assert_eq!(outcome.class, TransportClass::Unavailable);
+        assert!(outcome.retryable);
+    }
+
+    #[tokio::test]
+    async fn pre_work_generic_transport_failure_is_classified() {
+        let events = run_fake("echo 'connect ECONNRESET 1.2.3.4:443' >&2; exit 1").await;
+        let outcome = transport_failure(&events).expect("must classify");
+        assert_eq!(outcome.class, TransportClass::Generic);
+        assert!(outcome.retryable);
+    }
+
+    /// An ordinary pre-`Started` launch failure (bad flag, misconfiguration)
+    /// that carries none of the known transport signals must NOT be
+    /// classified — it is left to ordinary failure handling, unchanged.
+    #[tokio::test]
+    async fn ordinary_pre_work_failure_is_not_classified_as_transport() {
+        let events = run_fake("echo 'error: unrecognized flag --bogus' >&2; exit 2").await;
+        assert!(
+            transport_failure(&events).is_none(),
+            "an unrelated CLI error must not be misclassified as a transport failure"
+        );
+    }
+
+    /// Once the harness has actually started (a real session, real work
+    /// under way), a later stderr line that happens to contain transport
+    /// vocabulary must not be classified — healthy success and ordinary
+    /// task-failure behavior after work has begun is unchanged.
+    #[tokio::test]
+    async fn transport_vocabulary_after_started_is_not_classified() {
+        let events = run_fake(
+            r#"echo '{"type":"system","subtype":"init","session_id":"s-1"}'
+echo 'note: certificate rotation scheduled for next week' >&2
+echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s-1","total_cost_usd":0.01,"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'"#,
+        )
+        .await;
+        assert!(
+            transport_failure(&events).is_none(),
+            "a Started generation must never be reclassified as a pre-work transport failure"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, HarnessEvent::Started { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, HarnessEvent::Completed { is_error: false, .. })));
+    }
 
     #[test]
     fn init_line_yields_started_with_session() {
