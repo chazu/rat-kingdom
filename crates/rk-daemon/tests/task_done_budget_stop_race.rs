@@ -11,17 +11,17 @@
 //!
 //! Three properties, three tests:
 //!
-//!  - [`task_done_wins_and_a_later_budget_check_cannot_overwrite_it`]: a
+//!  - [`task_done_wins_and_a_later_budget_check_cannot_overwrite_it`][]: a
 //!    `task_done` that lands while the record is still live completes it,
 //!    and a budget check that runs afterward is a no-op against the
 //!    already-`Completed` record (`enforce_budget`'s own `is_live()` guard).
-//!  - [`budget_stop_wins_durably_first_and_a_late_task_done_is_fenced`]: a
+//!  - [`budget_stop_wins_durably_first_and_a_late_task_done_is_fenced`][]: a
 //!    budget hard-stop that durably wins first leaves the record `Stopped`;
 //!    a `task_done` that arrives afterward is retained as evidence with an
 //!    explicit recovery action, never mutates the terminal state, and both
 //!    the evidence write and the (never-fired) completion are idempotent
 //!    under a repeat reconcile pass.
-//!  - [`restart_mid_reconcile_barrier_still_completes_the_generation`]: a
+//!  - [`restart_mid_reconcile_barrier_still_completes_the_generation`][]: a
 //!    genuinely two-`Daemon`-process restart (same shape as
 //!    `live_landing_restart.rs`), landing the kill exactly between the
 //!    reconcile pass claiming the publish right and the registry CAS itself
