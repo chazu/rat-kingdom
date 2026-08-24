@@ -722,9 +722,10 @@ fn crash_between_dismissal_and_marker_converges_exactly_once() {
     // (worse, and more likely to actually flip the result, under the CPU
     // contention `mise run verify`'s ordinary in-binary test concurrency
     // creates).
-    until("no agent to still be live under the settled attempt", || {
-        live_agents_for(home, &c.attempt).is_empty().then_some(())
-    });
+    until(
+        "no agent to still be live under the settled attempt",
+        || live_agents_for(home, &c.attempt).is_empty().then_some(()),
+    );
 
     assert_converged_properties(&c);
 }
