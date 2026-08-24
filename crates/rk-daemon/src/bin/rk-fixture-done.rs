@@ -24,15 +24,36 @@
 use rk_core::paths::Layout;
 use rk_daemon::Client;
 use serde_json::json;
+use std::time::Duration;
+
+const CONNECT_ATTEMPTS: usize = 50;
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(20);
 
 fn env(key: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| panic!("rk-fixture-done: {key} is not set"))
 }
 
+async fn connect_with_retry(layout: &Layout) -> rk_core::Result<Client> {
+    for attempt in 1..=CONNECT_ATTEMPTS {
+        match Client::connect(layout).await {
+            Ok(client) => return Ok(client),
+            Err(error) => {
+                if !matches!(error, rk_core::Error::DaemonNotRunning(_))
+                    || attempt == CONNECT_ATTEMPTS
+                {
+                    return Err(error);
+                }
+                tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+            }
+        }
+    }
+    unreachable!("CONNECT_ATTEMPTS is non-zero")
+}
+
 #[tokio::main]
 async fn main() {
     let layout = Layout::at(env("RK_HOME"));
-    let mut client = Client::connect(&layout)
+    let mut client = connect_with_retry(&layout)
         .await
         .expect("rk-fixture-done: no daemon on the socket");
     client
@@ -60,4 +81,40 @@ async fn main() {
         )
         .await
         .expect("rk-fixture-done: space.out failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn connect_retries_until_the_existing_daemon_socket_is_ready() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let socket = layout.socket_path();
+        let listener = tokio::spawn(async move {
+            tokio::time::sleep(CONNECT_RETRY_DELAY * 2).await;
+            let listener = UnixListener::bind(socket).unwrap();
+            listener.accept().await.unwrap();
+        });
+
+        let client = connect_with_retry(&layout).await.unwrap();
+
+        drop(client);
+        listener.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_retry_stays_bounded_when_the_socket_never_appears() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        let upper_bound = CONNECT_RETRY_DELAY * CONNECT_ATTEMPTS as u32 * 2;
+
+        let result = tokio::time::timeout(upper_bound, connect_with_retry(&layout))
+            .await
+            .expect("fixture connection retry exceeded its bounded policy");
+
+        assert!(result.is_err());
+    }
 }
