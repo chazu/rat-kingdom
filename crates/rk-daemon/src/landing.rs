@@ -372,6 +372,16 @@ const LATE_REVIEW_EVIDENCE_IDENTITY: &str = "landing_late_review_evidence";
 /// and returns the SAME new attempt id rather than dispatching again.
 const REVIEW_CEILING_REENQUEUE_IDENTITY: &str = "landing_review_ceiling_reenqueue";
 
+/// [`crate::fault`] barrier name for the window inside
+/// [`LandingPipeline::settle_review_ceiling`] after the live reviewer has
+/// been dismissed but before [`REVIEW_CEILING_SETTLED_IDENTITY`] is durable.
+/// Armed only by `tests/review_ceiling_crash_barrier.rs`.
+const BARRIER_CEILING_PRE_MARKER: &str = "review-ceiling-pre-marker";
+
+/// [`crate::fault`] barrier name for the mirror window: settlement durable,
+/// caller not yet told. Armed only by `tests/review_ceiling_crash_barrier.rs`.
+const BARRIER_CEILING_POST_MARKER: &str = "review-ceiling-post-marker";
+
 /// Identity of the steward's escalation `need` tuple. Matches
 /// `examples/workflows/steward.cue`'s `steward-report-stop`/
 /// `steward-report-unknown-verdict`/`steward-report-timeout` named checks,
@@ -3170,6 +3180,14 @@ impl LandingPipeline {
             return Ok(existing);
         }
         let dismissed = self.supervisor.dismiss_live_instance_agents(attempt).await;
+        // The one genuinely non-atomic window in this function: the reviewer
+        // is already dismissed (irreversible — its OS process is gone) but
+        // nothing durable records that the attempt was settled. A daemon
+        // that dies here leaves the candidate still `awaiting_review` with
+        // no reviewer behind it, which is exactly the state a successor must
+        // converge out of without orphaning or duplicating anything. See
+        // `crate::fault` for why this is a barrier and not a sleep.
+        crate::fault::barrier(&self.layout, BARRIER_CEILING_PRE_MARKER).await;
         let released: Vec<&str> = dismissed
             .iter()
             .filter(|(_, ok)| *ok)
@@ -3194,6 +3212,12 @@ impl LandingPipeline {
         )
         .with_lifecycle(Lifecycle::Furniture);
         self.space.out(marker.clone())?;
+        // The mirror window: the settlement is now durable, but the caller
+        // that asked for it (an operator's `repo.land.cancel_review`, or the
+        // ceiling path's own routing pass) has not yet seen it succeed. A
+        // daemon that dies here must leave a successor refusing the retry
+        // the operator will naturally make, not settling a second time.
+        crate::fault::barrier(&self.layout, BARRIER_CEILING_POST_MARKER).await;
         info!(
             repo = %entry.repo_name, branch = %entry.branch, attempt, reason,
             released = released.len(), failed,

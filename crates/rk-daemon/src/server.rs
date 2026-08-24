@@ -1247,12 +1247,32 @@ impl Daemon {
                         }
                         Err(e) => warn!(error = %e, "landing pipeline cycle failed"),
                     }
-                    // Same tick: retain any verdict that arrived late for an
-                    // already ceiling-settled review attempt as durable
-                    // evidence, without touching the (already terminal)
-                    // landing decision. Cheap and idempotent — see
-                    // `LandingPipeline::reconcile_late_review_evidence`.
-                    match landing.reconcile_late_review_evidence() {
+                }
+            });
+
+            // Late-review reconciliation must not share the drain task above.
+            // `run_cycle()` may legitimately spend the whole review ceiling in
+            // `await_primary_verdict`; putting reconciliation after that await
+            // starves late evidence for every other settled attempt (and for a
+            // restarted copy of the same awaiting entry). Keep its feed/timer
+            // independent so a verdict arriving from a fenced generation is
+            // retained promptly even while another review wait is live.
+            let landing_reconciler = Arc::clone(&daemon_landing);
+            let mut late_review_feed = daemon.space.subscribe();
+            let mut late_review_shutdown = daemon.shutdown_tx.subscribe();
+            background_tasks.spawn(async move {
+                let mut tick = tokio::time::interval(landing_interval);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        recv = late_review_feed.recv() => match recv {
+                            Ok(_) => while late_review_feed.try_recv().is_ok() {},
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                        _ = late_review_shutdown.changed() => break,
+                    }
+                    match landing_reconciler.reconcile_late_review_evidence() {
                         Ok(0) => {}
                         Ok(n) => debug!(retained = n, "retained late review evidence"),
                         Err(e) => warn!(error = %e, "late review evidence reconciliation failed"),
