@@ -240,7 +240,7 @@ exit 1
         agents_before, agents_after,
         "refusal must not allocate a row"
     );
-    client
+    let other_provider = client
         .call(
             "agent.spawn",
             json!({
@@ -251,13 +251,24 @@ exit 1
         )
         .await
         .expect("the Codex provider must remain independent");
+    let other_provider = other_provider["agent"]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    wait_for_status(
+        &mut client,
+        &other_provider,
+        |s| s["agent"]["state"] == "failed",
+        "the independent provider fixture to settle",
+    )
+    .await;
 
     assert_eq!(transport_rows(&mut client, &name).await.len(), 1);
 
     // Replace the daemon, then inject a due schedule using persisted state.
     // No elapsed-time margin decides whether the retry is eligible.
-    handle_a.abort();
-    let _ = handle_a.await;
+    client.call("stop", json!({})).await.unwrap();
+    handle_a.await.unwrap().unwrap();
     std::fs::remove_file(layout.pid_file()).ok();
     std::fs::remove_file(layout.socket_path()).ok();
     backdate_retry_state(&layout, &name);
@@ -312,7 +323,7 @@ exit 1
         "Started to clear the transport episode",
     )
     .await;
-    client
+    let fresh = client
         .call(
             "agent.spawn",
             json!({
@@ -323,9 +334,22 @@ exit 1
         )
         .await
         .expect("Started proof must close the Claude breaker");
+    let fresh = fresh["agent"]["name"].as_str().unwrap().to_string();
+    wait_for_status(
+        &mut client,
+        &fresh,
+        |s| {
+            !matches!(
+                s["agent"]["state"].as_str(),
+                Some("spawning" | "running" | "paused")
+            )
+        },
+        "the recovered provider fixture to settle",
+    )
+    .await;
 
-    handle_b.abort();
-    let _ = handle_b.await;
+    client.call("stop", json!({})).await.unwrap();
+    handle_b.await.unwrap().unwrap();
     std::env::remove_var("RK_CLAUDE_BIN");
     std::env::remove_var("RK_CODEX_BIN");
 }
