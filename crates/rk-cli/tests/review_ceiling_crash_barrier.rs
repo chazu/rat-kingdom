@@ -234,6 +234,39 @@ fn settlements(home: &Path, repo_name: &str, attempt: &str) -> Vec<Value> {
         .collect()
 }
 
+/// The pid of the daemon currently owning `home`, or `None` if none is up.
+///
+/// `rk daemon status` is a pure status read: it reports on a daemon, it does
+/// not start one. Bringing a daemon UP is what `Client::connect_or_spawn`
+/// does, on the ordinary RPC commands — hence [`start_daemon`].
+fn daemon_pid(home: &Path) -> Option<u32> {
+    let out = rk(home)
+        .args(["--json", "daemon", "status"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<Value>(&out.stdout).ok()?["pid"]
+        .as_u64()
+        .map(|p| p as u32)
+}
+
+/// Bring a daemon up over `home` the way the field does — by making an
+/// ordinary RPC call and letting `Client::connect_or_spawn` auto-start one —
+/// and return its pid. After a SIGKILL this is the path that exercises
+/// `Server::run`'s stale-socket reclamation.
+fn start_daemon(home: &Path) -> u32 {
+    until("a daemon to come up over the home", || {
+        // `rk list` is a plain `agent.list` RPC through `connect_or_spawn`.
+        let out = rk(home).args(["--json", "list"]).output().ok()?;
+        out.status.success().then_some(())
+    });
+    until("the freshly started daemon to report its pid", || {
+        daemon_pid(home)
+    })
+}
+
 /// Live (non-terminal) agents belonging to `attempt`'s workflow instance —
 /// the orphan check. `Dismissed`/`Failed`/`Completed` records legitimately
 /// persist; a *running* one after settlement is the leak.
@@ -342,14 +375,12 @@ fn crash_at(barrier: &str) -> Crashed {
         .to_string();
     let reviewer_pid = reviewer["pid"].as_u64().map(|p| p as u32);
 
-    let daemon_pid = json_stdout(
-        &rk(&home_path)
-            .args(["--json", "daemon", "status"])
-            .output()
-            .unwrap(),
-    )["pid"]
-        .as_u64()
-        .expect("daemon status must report a real pid") as u32;
+    let daemon_pid = daemon_pid(&home_path).expect("daemon A must report a real pid");
+    assert_ne!(
+        daemon_pid,
+        std::process::id(),
+        "refusing to SIGKILL this test process"
+    );
 
     // Fire the cancel and leave it in flight: the daemon parks inside
     // `settle_review_ceiling`, so this process will never return.
@@ -457,18 +488,7 @@ fn crash_between_dismissal_and_marker_converges_exactly_once() {
     // Daemon B: auto-started by this very call through
     // `Client::connect_or_spawn`, reclaiming the stale socket and pid file
     // SIGKILL left behind. Nothing in this test removed them.
-    let restarted_pid = until("daemon B to come up over the same home", || {
-        let out = rk(home)
-            .args(["--json", "daemon", "status"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        serde_json::from_slice::<Value>(&out.stdout).ok()?["pid"]
-            .as_u64()
-            .map(|p| p as u32)
-    });
+    let restarted_pid = start_daemon(home);
     assert_ne!(
         restarted_pid, c.dead_daemon_pid,
         "daemon B must be a genuinely new process, not the one we killed"
@@ -526,13 +546,11 @@ fn crash_after_durable_marker_refuses_the_retry_rather_than_settling_twice() {
     let c = crash_at(BARRIER_POST_MARKER);
     let home = c.home.path();
 
-    until("daemon B to come up over the same home", || {
-        let out = rk(home)
-            .args(["--json", "daemon", "status"])
-            .output()
-            .ok()?;
-        out.status.success().then_some(())
-    });
+    let restarted_pid = start_daemon(home);
+    assert_ne!(
+        restarted_pid, c.dead_daemon_pid,
+        "daemon B must be a genuinely new process, not the one we killed"
+    );
 
     // The write survived the SIGKILL — exactly once, with no second daemon
     // and no second call having added to it.
