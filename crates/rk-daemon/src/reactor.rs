@@ -3199,6 +3199,7 @@ mod tests {
             archived_at: None,
             liveness: Default::default(),
             transport_outage: None,
+            recovery: None,
         }
     }
 

@@ -8014,6 +8014,7 @@ test a::flaky ... FAILED
             archived_at: None,
             liveness: Default::default(),
             transport_outage: None,
+            recovery: None,
         };
         // The workflow's own `spawn` step ran and its `wait` completed against
         // this generation.
