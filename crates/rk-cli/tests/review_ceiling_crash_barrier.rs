@@ -41,6 +41,27 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+/// Serializes the four `#[test]`s in this file (never any test in another
+/// binary — cargo already runs test binaries one at a time, only the tests
+/// *within* one binary run concurrently by default). Each test here starts
+/// one or more real daemon processes, each with its own reviewer/lander/
+/// canceller subprocesses; four of those fixtures competing for CPU and
+/// forks at once is enough self-inflicted contention to occasionally blow
+/// this file's deterministic 60-second `until` bounds (reproduced by running
+/// two copies of this binary concurrently, doubling that contention: the
+/// same properties this file proves eventually held, just past 60s).
+/// Serializing removes the contention these tests create for each other
+/// without weakening what any single one proves or touching any other
+/// binary's concurrency.
+static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`TEST_SERIAL`] for the calling test's whole body. Recovers from
+/// poisoning: one test panicking while holding the lock must not also fail
+/// every test after it.
+fn serialize_test() -> std::sync::MutexGuard<'static, ()> {
+    TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Must match `BARRIER_CEILING_PRE_MARKER` in `crates/rk-daemon/src/landing.rs`
 /// (the constant is private to that module; the barrier's contract is the
 /// name string, deliberately, so arming needs no API surface).
@@ -645,6 +666,7 @@ fn reenqueue(c: &Crashed) -> std::process::Output {
 /// killed, but nothing durable recorded it.
 #[test]
 fn crash_between_dismissal_and_marker_converges_exactly_once() {
+    let _serial = serialize_test();
     let c = crash_at(BARRIER_PRE_MARKER);
     let home = c.home.path();
 
@@ -692,11 +714,17 @@ fn crash_between_dismissal_and_marker_converges_exactly_once() {
     assert_eq!(settled[0]["payload"]["head_sha"], c.head_sha);
 
     // No duplicate reviewer: settlement fenced the attempt, so nothing may be
-    // running under it.
-    assert!(
-        live_agents_for(home, &c.attempt).is_empty(),
-        "no agent may still be live under a settled attempt"
-    );
+    // running under it. Polled, not a single snapshot: the dismissed
+    // reviewer's `AgentRecord` converges to a terminal state via the
+    // daemon's own async reconciliation of the OS-process kill above, not
+    // synchronously with the RPC that requested it, so a snapshot taken
+    // immediately can catch it a beat before that reconciliation lands
+    // (worse, and more likely to actually flip the result, under the CPU
+    // contention `mise run verify`'s ordinary in-binary test concurrency
+    // creates).
+    until("no agent to still be live under the settled attempt", || {
+        live_agents_for(home, &c.attempt).is_empty().then_some(())
+    });
 
     assert_converged_properties(&c);
 }
@@ -706,6 +734,7 @@ fn crash_between_dismissal_and_marker_converges_exactly_once() {
 /// REFUSED rather than settling a second time.
 #[test]
 fn crash_after_durable_marker_refuses_the_retry_rather_than_settling_twice() {
+    let _serial = serialize_test();
     let c = crash_at(BARRIER_POST_MARKER);
     let home = c.home.path();
 
@@ -833,10 +862,11 @@ fn assert_converged_properties(c: &Crashed) {
         Some(new_attempt.as_str()),
         "a repeat re-enqueue must return the same attempt, never dispatch a duplicate"
     );
-    assert!(
-        live_agents_for(home, &c.attempt).is_empty(),
-        "re-enqueue must never revive the settled attempt"
-    );
+    // Same eventual-convergence property as the first `live_agents_for`
+    // check above (see its comment): polled rather than snapshotted once.
+    until("re-enqueue to never revive the settled attempt", || {
+        live_agents_for(home, &c.attempt).is_empty().then_some(())
+    });
 }
 
 /// The gap the other tests in this file never cover: every scenario above
@@ -1031,10 +1061,12 @@ fn assert_transport_outage_is_typed_and_fenced(harness: &str, bin_env: &str, bin
 
 #[test]
 fn transport_classified_claude_reviewer_death_is_a_typed_outage_not_a_plain_hang() {
+    let _serial = serialize_test();
     assert_transport_outage_is_typed_and_fenced("claude", "RK_CLAUDE_BIN", "claude-fake-outage");
 }
 
 #[test]
 fn transport_classified_codex_reviewer_death_is_a_typed_outage_not_a_plain_hang() {
+    let _serial = serialize_test();
     assert_transport_outage_is_typed_and_fenced("codex", "RK_CODEX_BIN", "codex-fake-outage");
 }
