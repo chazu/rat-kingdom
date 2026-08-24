@@ -1752,6 +1752,7 @@ impl Daemon {
                 | "repo.add"
                 | "repo.land"
                 | "repo.land.reenqueue"
+                | "repo.land.cancel_review"
                 | "repo.remove"
                 | "repo.onboard.start"
                 | "repo.onboard.propose"
@@ -2898,6 +2899,29 @@ impl Daemon {
                     .await;
                 reply(match result {
                     Ok(new_attempt) => Response::ok(id, json!({ "new_attempt": new_attempt })),
+                    Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
+                })
+            }
+            "repo.land.cancel_review" => {
+                let params: RepoLandCancelReviewParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
+                    }
+                };
+                let result = self
+                    .landing()
+                    .cancel_active_review(
+                        std::path::Path::new(&params.repo),
+                        &params.branch,
+                        &params.target,
+                        &params.task,
+                    )
+                    .await;
+                reply(match result {
+                    Ok(settlement) => {
+                        Response::ok(id, json!({ "attempt": settlement.payload.get("attempt") }))
+                    }
                     Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
                 })
             }
@@ -9228,6 +9252,21 @@ struct RepoLandReenqueueParams {
     attempt: String,
 }
 
+/// `repo.land.cancel_review` — operator-triggered cancellation of the
+/// CURRENTLY active review attempt for `(branch, target, task)`, routed
+/// through [`crate::landing::LandingPipeline::settle_review_ceiling`] via
+/// [`crate::landing::LandingPipeline::cancel_active_review`]. No `attempt`
+/// param, unlike reenqueue: cancel targets whichever attempt is live right
+/// now, which the pipeline resolves itself from the durable queue entry.
+#[derive(Deserialize)]
+struct RepoLandCancelReviewParams {
+    repo: String,
+    branch: String,
+    #[serde(default = "default_main_branch")]
+    target: String,
+    task: String,
+}
+
 #[derive(Deserialize)]
 struct RevertParams {
     name: String,
@@ -10527,6 +10566,36 @@ mod authorize_reasoned_tests {
     fn repo_land_reenqueue_allows_the_operator() {
         let (_dir, daemon) = test_daemon();
         let request = req("operator", "repo.land.reenqueue", "");
+        let origin = PeerOrigin {
+            pid_observed: true,
+            supervised_agents: Default::default(),
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &origin);
+        assert!(allowed);
+        assert_eq!(reason, "");
+    }
+
+    #[test]
+    fn repo_land_cancel_review_refuses_an_ordinary_rat() {
+        let (_dir, daemon) = test_daemon_with_role("rat");
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "invalid-rat");
+        let request = Request {
+            id: "1".into(),
+            method: "repo.land.cancel_review".into(),
+            auth: token,
+            caller: "invalid-rat".into(),
+            client_version: None,
+            params: json!({"repo": ".", "branch": "b", "task": "t"}),
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
+        assert!(!allowed);
+        assert_eq!(reason, "operator_only_method");
+    }
+
+    #[test]
+    fn repo_land_cancel_review_allows_the_operator() {
+        let (_dir, daemon) = test_daemon();
+        let request = req("operator", "repo.land.cancel_review", "");
         let origin = PeerOrigin {
             pid_observed: true,
             supervised_agents: Default::default(),
