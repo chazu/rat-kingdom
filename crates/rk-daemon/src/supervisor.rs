@@ -72,6 +72,23 @@ pub(crate) const IMPLEMENTATION_LANE_REFUSED: &str =
 pub(crate) const REVIEW_LANE_REFUSED: &str =
     "review lane at capacity for this repository: no free slot to admit this spawn";
 
+/// Fixed prefix of the error [`Supervisor::spawn`] returns when the
+/// castle-wide circuit breaker for the requested harness provider is
+/// currently open (TKT-01M0HND8M25GYN1ZTRET3S5769) — a distinct string
+/// (not [`FLEET_WIP_CAP_REFUSED`] or a lane-capacity refusal) so a caller
+/// can tell an outage refusal apart from ordinary admission pressure. The
+/// provider name is appended by [`transport_breaker_open_refused`] for
+/// observability; match on this prefix rather than the full message.
+pub(crate) const TRANSPORT_BREAKER_OPEN_REFUSED_PREFIX: &str =
+    "transport circuit breaker open for provider";
+
+pub(crate) fn transport_breaker_open_refused(provider: &str) -> String {
+    format!(
+        "{TRANSPORT_BREAKER_OPEN_REFUSED_PREFIX} {provider}: refusing new launches until it \
+         recovers (see `rk inbox` for the open episode)"
+    )
+}
+
 // Review-tiering diff_class thresholds (Phase 0 of the steward remediation).
 // The steward trigger reads `diff_class` off the completion payload to decide
 // whether a diff is worth an LLM reviewer's judgment at all; these bounds are
@@ -709,6 +726,12 @@ pub struct Supervisor {
     /// event-handling path, not just on the periodic sweep tick that
     /// otherwise carries a fresh `SupervisorConfig` on every call.
     transport_breaker_trip_threshold: AtomicU64,
+    /// `[supervisor] transport_breaker_cooldown_secs`: same reasoning as
+    /// `transport_breaker_trip_threshold` immediately above, but for
+    /// [`spawn`](Self::spawn)'s admission check — a NEW launch for a
+    /// tripped provider must be refused on the hot spawn path in real time,
+    /// not just retried on `transport_retry_sweep`'s periodic tick.
+    transport_breaker_cooldown_secs: AtomicU64,
     /// Push channels for automated recovery actions this supervisor
     /// announces (kill-at-`rk done` today). Set once by `Daemon::new`'s
     /// config-loading path via [`set_sinks`](Supervisor::set_sinks) —
@@ -1352,6 +1375,9 @@ impl Supervisor {
                 rk_core::config::SupervisorConfig::default().transport_breaker_trip_threshold
                     as u64,
             ),
+            transport_breaker_cooldown_secs: AtomicU64::new(
+                rk_core::config::SupervisorConfig::default().transport_breaker_cooldown_secs,
+            ),
             sinks: Mutex::new(rk_core::notify::SinkRegistry::default()),
             announcer: crate::recovery::RecoveryAnnouncer::new(),
             transport_breakers: Mutex::new(transport_breakers),
@@ -1704,6 +1730,13 @@ impl Supervisor {
             .store(threshold as u64, Ordering::Relaxed);
     }
 
+    /// `[supervisor] transport_breaker_cooldown_secs`, applied by
+    /// `Daemon::new`/`set_sweep_config` from config — see the field doc.
+    pub fn set_transport_breaker_cooldown_secs(&self, secs: u64) {
+        self.transport_breaker_cooldown_secs
+            .store(secs, Ordering::Relaxed);
+    }
+
     /// The per-agent transcript store (for `agent.log` reads and `--follow`).
     pub fn log(&self) -> &crate::agent_log::AgentLog {
         &self.log
@@ -1895,6 +1928,24 @@ impl Supervisor {
                  `rk done`, so Rat Kingdom completes the assessment from jcode's one-shot \
                  terminal event",
             ));
+        }
+
+        // Castle-wide circuit-breaker admission: a NEW launch for a provider
+        // whose breaker is currently open is refused here, before any
+        // WIP/lane slot or budget is touched — `transport_retry_sweep` is
+        // the only path that may relaunch THIS provider's own crashed
+        // generations while it recovers, but an unrelated fresh spawn must
+        // not queue up behind (or worse, race past) that recovery either.
+        // Checked purely in memory (no registry lock), matching the other
+        // early preflight gates above it.
+        if self.lock_transport_breakers().is_open(
+            &effective.harness,
+            Utc::now(),
+            self.transport_breaker_cooldown_secs.load(Ordering::Relaxed),
+        ) {
+            return Err(rk_core::Error::other(transport_breaker_open_refused(
+                &effective.harness,
+            )));
         }
 
         // Atomically admit one fleet-WIP slot and reserve the name in the
@@ -8148,6 +8199,37 @@ mod respawn_tests {
             sup.decide_respawn(&rec, now + chrono::Duration::seconds(999), &cfg),
             RespawnDecision::Wait
         ));
+    }
+
+    /// `TransportBreakers::is_open` used to be consulted only by
+    /// `transport_retry_sweep` — an ordinary NEW spawn for a provider whose
+    /// castle-wide breaker is open sailed straight through admission. This
+    /// proves `spawn` now refuses it up front, before any WIP/lane slot or
+    /// registry row is created (so nothing needs releasing on the refusal
+    /// path — no reservation was ever made).
+    #[test]
+    fn spawn_refuses_admission_while_the_providers_breaker_is_open() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let sup = supervisor(home.path());
+
+        sup.lock_transport_breakers()
+            .record_failure("fake", 1, Utc::now());
+
+        let err = sup
+            .spawn(spawn_params(repo.path(), "TKT-breaker"), 0)
+            .expect_err("a tripped provider breaker must refuse the spawn");
+        assert!(
+            err.to_string()
+                .contains(TRANSPORT_BREAKER_OPEN_REFUSED_PREFIX),
+            "unexpected refusal message: {err}"
+        );
+        assert!(err.to_string().contains("fake"));
+        assert!(
+            sup.lock_registry().list().is_empty(),
+            "a refused spawn must not create any registry row (no WIP/budget consumed)"
+        );
     }
 
     /// Regression for the race the two sweeps used to have: a record mid
