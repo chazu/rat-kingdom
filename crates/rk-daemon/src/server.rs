@@ -376,9 +376,9 @@ impl Daemon {
         daemon.supervisor.set_transport_breaker_trip_threshold(
             config.supervisor.transport_breaker_trip_threshold,
         );
-        daemon.supervisor.set_transport_breaker_cooldown_secs(
-            config.supervisor.transport_breaker_cooldown_secs,
-        );
+        daemon
+            .supervisor
+            .set_transport_breaker_cooldown_secs(config.supervisor.transport_breaker_cooldown_secs);
         daemon.supervisor.set_sinks(
             crate::reactor::sink_factory()
                 .registry(config.notify.resolved(config.reactor.notify_escalations)),

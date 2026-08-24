@@ -164,8 +164,8 @@ mod tests {
 
     #[test]
     fn classifies_generic_transport_failure() {
-        let outcome = classify("claude", &lines(&["connect ECONNRESET 1.2.3.4:443"]))
-            .expect("must classify");
+        let outcome =
+            classify("claude", &lines(&["connect ECONNRESET 1.2.3.4:443"])).expect("must classify");
         assert_eq!(outcome.class, TransportClass::Generic);
         assert!(outcome.retryable);
     }

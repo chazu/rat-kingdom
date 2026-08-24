@@ -213,7 +213,10 @@ mod tests {
         fs::write(&binary, format!("#!/bin/sh\n{script}\n")).unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
         let mut env = HashMap::new();
-        env.insert("RK_CLAUDE_BIN".into(), binary.to_string_lossy().into_owned());
+        env.insert(
+            "RK_CLAUDE_BIN".into(),
+            binary.to_string_lossy().into_owned(),
+        );
         let mut session = ClaudeHarness
             .launch(&LaunchSpec {
                 prompt: "do the task".into(),
@@ -223,10 +226,9 @@ mod tests {
             })
             .unwrap();
         let mut events = Vec::new();
-        while let Some(event) =
-            tokio::time::timeout(Duration::from_secs(5), session.events.recv())
-                .await
-                .expect("fixture must not hang")
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(5), session.events.recv())
+            .await
+            .expect("fixture must not hang")
         {
             let exited = matches!(event, HarnessEvent::Exited { .. });
             events.push(event);
@@ -246,10 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn pre_work_certificate_failure_is_classified_before_exit() {
-        let events = run_fake(
-            "echo 'unable to get local issuer certificate' >&2; exit 1",
-        )
-        .await;
+        let events = run_fake("echo 'unable to get local issuer certificate' >&2; exit 1").await;
         let outcome = transport_failure(&events).expect("must classify a transport failure");
         assert_eq!(outcome.provider, "claude");
         assert_eq!(outcome.class, TransportClass::Certificate);
@@ -321,9 +320,13 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","ses
         assert!(events
             .iter()
             .any(|e| matches!(e, HarnessEvent::Started { .. })));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, HarnessEvent::Completed { is_error: false, .. })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            HarnessEvent::Completed {
+                is_error: false,
+                ..
+            }
+        )));
     }
 
     #[test]
