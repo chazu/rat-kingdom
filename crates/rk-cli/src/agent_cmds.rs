@@ -904,6 +904,110 @@ pub async fn respawn(layout: &Layout, args: NameArg, as_json: bool) -> Result<()
     Ok(())
 }
 
+#[derive(Args)]
+pub struct RecoveryActionArgs {
+    /// Agent name.
+    pub name: String,
+    /// Route the continuation to a configured alternate harness (e.g. `codex`)
+    /// in the same worktree, against the same preserved head, instead of
+    /// resuming the original provider's session. Ignored by
+    /// `abandon-recovery`.
+    #[arg(long)]
+    pub harness: Option<String>,
+    /// Idempotency key for the at-most-once continuation contract. Omit to
+    /// mint a fresh one. Pass the SAME key to retry a call whose reply you did
+    /// not see: replaying a key returns the original outcome instead of acting
+    /// twice, while a different key after acknowledgement is refused.
+    #[arg(long)]
+    pub action_id: Option<String>,
+}
+
+impl RecoveryActionArgs {
+    /// A caller-supplied key is the whole point of the contract, but an
+    /// operator typing the command by hand has no key to supply and should not
+    /// have to invent one — mint a fresh id, and print it so the exact call can
+    /// be replayed verbatim if the reply is lost.
+    fn action_id(&self) -> String {
+        self.action_id
+            .clone()
+            .unwrap_or_else(|| rk_core::id::RecordId::new().to_string())
+    }
+}
+
+/// Render `RecoveryOutcome`'s externally-tagged JSON as one operator-facing
+/// line. Unknown variants degrade to the raw JSON rather than being swallowed,
+/// so a future outcome added daemon-side is never reported as nothing happened.
+fn describe_recovery_outcome(outcome: &serde_json::Value) -> String {
+    if outcome == "Abandoned" {
+        return "abandoned — the generation stays terminal and will not be auto-respawned".into();
+    }
+    if let Some(new_spawn) = outcome
+        .get("ResumedSameProvider")
+        .and_then(|v| v.get("new_spawn"))
+        .and_then(|v| v.as_str())
+    {
+        return format!("resumed the same harness/session (generation {new_spawn})");
+    }
+    if let Some(alt) = outcome.get("ContinuedAlternateProvider") {
+        return format!(
+            "continued under alternate harness {} (generation {})",
+            alt.get("harness").and_then(|v| v.as_str()).unwrap_or("?"),
+            alt.get("new_spawn").and_then(|v| v.as_str()).unwrap_or("?"),
+        );
+    }
+    outcome.to_string()
+}
+
+pub async fn continue_recovery(
+    layout: &Layout,
+    args: RecoveryActionArgs,
+    as_json: bool,
+) -> Result<()> {
+    let action_id = args.action_id();
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call(
+            "agent.continue_recovery",
+            json!({"name": args.name, "action_id": action_id, "harness": args.harness}),
+        )
+        .await?;
+    if as_json {
+        println!("{}", result["outcome"]);
+    } else {
+        println!(
+            "{}: {} [action-id {action_id}]",
+            args.name,
+            describe_recovery_outcome(&result["outcome"])
+        );
+    }
+    Ok(())
+}
+
+pub async fn abandon_recovery(
+    layout: &Layout,
+    args: RecoveryActionArgs,
+    as_json: bool,
+) -> Result<()> {
+    let action_id = args.action_id();
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call(
+            "agent.abandon_recovery",
+            json!({"name": args.name, "action_id": action_id}),
+        )
+        .await?;
+    if as_json {
+        println!("{}", result["outcome"]);
+    } else {
+        println!(
+            "{}: {} [action-id {action_id}]",
+            args.name,
+            describe_recovery_outcome(&result["outcome"])
+        );
+    }
+    Ok(())
+}
+
 /// Exec into the herdr attach for a running attach-mode rat.
 pub async fn attach(layout: &Layout, args: NameArg) -> Result<()> {
     let mut client = Client::connect_or_spawn(layout).await?;

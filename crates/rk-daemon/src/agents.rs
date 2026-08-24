@@ -204,6 +204,108 @@ pub struct AgentRecord {
     /// instead of granting a fresh retry budget or relaunching a duplicate.
     #[serde(default)]
     pub transport_outage: Option<TransportOutageState>,
+    /// Durable recovery record for a transport outage discovered AFTER this
+    /// generation had already committed work and possibly while a local
+    /// verification child was still running (TKT-01M0HNDJ7AS9F1A3W22FRCC63N).
+    /// `None` = no committed-work outage pending. Distinct from
+    /// `transport_outage`, which is scoped to a launch failure BEFORE the
+    /// harness ever reached `Started`: this generation reached `Started`,
+    /// produced a commit, and only then lost its transport — the goal is
+    /// continuation of that work, not a bare relaunch. Persisted with the
+    /// rest of this generation so a daemon restart between the outage and an
+    /// operator/policy continuation decision loses nothing.
+    #[serde(default)]
+    pub recovery: Option<RecoveryRecord>,
+}
+
+/// See the field doc on [`AgentRecord::recovery`].
+///
+/// Everything an operator or policy action needs to resume this generation's
+/// work is captured here at the moment the outage is detected, so the
+/// continuation decision can be made — and safely retried — arbitrarily long
+/// after the detecting daemon process is gone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryRecord {
+    /// Ticket this generation was working, if any.
+    pub ticket: Option<String>,
+    /// Branch carrying the committed work.
+    pub branch: String,
+    /// Exact commit the branch was at when the outage was detected — the
+    /// continuation resumes (or an alternate harness picks up) from exactly
+    /// this head, never a re-read of a possibly-since-moved branch tip.
+    pub head: String,
+    /// Harness session id for same-provider resume (`--resume <session>` /
+    /// `codex resume <session>`). `None` when the harness never reported one
+    /// (e.g. died before its `Started` handshake, which the pre-work
+    /// transport-outage path already owns) or when a same-provider resume
+    /// is not applicable.
+    pub session_id: Option<String>,
+    /// This generation's identity — the join key
+    /// (`docs/2026-08-17-tkt-c1-generation-identity.md`). A continuation
+    /// action is fenced to this: see [`RecoveryRecord::stale`].
+    pub spawn: rk_core::id::SpawnId,
+    /// Child-process liveness evidence captured at the moment of outage —
+    /// e.g. proof a local verification child (`cargo test`, an `rk verify`
+    /// CLI call) was still running. Lets a continuation decision tell "died
+    /// mid-check" from "died idle" without re-deriving it from raw events.
+    pub liveness: LivenessObservation,
+    /// Remaining budget (USD) for this agent at the moment of outage, if a
+    /// cap is configured. Preserved so a continuation does not silently
+    /// grant a fresh budget window.
+    pub budget_remaining_usd: Option<f64>,
+    /// Harness kind ("claude" | "codex") that was running.
+    pub provider: String,
+    pub class: rk_harness::TransportClass,
+    pub evidence: String,
+    pub detected_at: DateTime<Utc>,
+    /// Set once a continuation (or an explicit abandonment) has been
+    /// acknowledged. `None` = replay-safe: a repeated continuation attempt
+    /// before this is set may retry freely. Once set, the SAME `action_id`
+    /// replays the same recorded outcome instead of acting twice; a
+    /// DIFFERENT `action_id` is refused — this is what makes acknowledgement
+    /// at-most-once.
+    #[serde(default)]
+    pub ack: Option<RecoveryAck>,
+}
+
+impl RecoveryRecord {
+    /// A continuation action is fenced to the generation it was minted for:
+    /// this is `true` when `spawn` no longer names the generation currently
+    /// live under the record's name (e.g. a later, unrelated respawn already
+    /// gave the name a fresh generation). A stale/late continuation must
+    /// never overwrite whatever the active generation is doing.
+    pub fn stale(&self, current: rk_core::id::SpawnId) -> bool {
+        self.spawn != current
+    }
+}
+
+/// Outcome of a continuation (or abandonment) acknowledged against a
+/// [`RecoveryRecord`]. Persisted so the acknowledgement itself survives a
+/// daemon restart — a duplicate continuation call after restart must still
+/// see the same outcome rather than re-acting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryAck {
+    /// Opaque idempotency key supplied by the caller. Replaying the SAME key
+    /// returns the same outcome; a DIFFERENT key is refused once this is set.
+    pub action_id: String,
+    pub outcome: RecoveryOutcome,
+    pub acknowledged_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoveryOutcome {
+    /// Continuation resumed the same harness/session in the same worktree.
+    ResumedSameProvider { new_spawn: rk_core::id::SpawnId },
+    /// Continuation routed to a configured alternate harness in the same
+    /// worktree (no session to resume — a fresh turn against the same head).
+    ContinuedAlternateProvider {
+        harness: String,
+        new_spawn: rk_core::id::SpawnId,
+    },
+    /// Explicitly abandoned rather than continued (e.g. non-retryable class,
+    /// ceiling hit, operator declined) — the generation stays terminal and
+    /// its WIP slot is never reclaimed by a later auto-respawn.
+    Abandoned,
 }
 
 /// See the field doc on [`AgentRecord::transport_outage`].
@@ -1251,6 +1353,7 @@ mod tests {
             archived_at: None,
             liveness: Default::default(),
             transport_outage: None,
+            recovery: None,
         }
     }
 
@@ -1685,5 +1788,111 @@ mod tests {
         assert!(cutoff_from_spec("-3d", now).is_err());
         assert!(cutoff_from_spec("5m²", now).is_err());
         assert!(cutoff_from_spec("", now).is_err());
+    }
+
+    fn sample_recovery(spawn: rk_core::id::SpawnId) -> RecoveryRecord {
+        RecoveryRecord {
+            ticket: Some("TKT-01M0HNDJ7AS9F1A3W22FRCC63N".to_string()),
+            branch: "rat/roquefort-12/tkt-01m0hndj7as9f1a3w22frcc63n".to_string(),
+            head: "deadbeef".repeat(5),
+            session_id: Some("sess-1".to_string()),
+            spawn,
+            liveness: LivenessObservation {
+                session: Some(spawn),
+                output_fingerprint: 42,
+                output_changed_at: Some(Utc::now()),
+                reconnect_events: 0,
+                ceiling_started_at: None,
+            },
+            budget_remaining_usd: Some(3.5),
+            provider: "claude".to_string(),
+            class: rk_harness::TransportClass::Unavailable,
+            evidence: "connection refused".to_string(),
+            detected_at: Utc::now(),
+            ack: None,
+        }
+    }
+
+    /// The whole point of persisting this alongside the rest of the
+    /// generation: a daemon restart between the outage and a continuation
+    /// decision must lose nothing needed to resume — ticket, branch, exact
+    /// head, session, generation identity, liveness evidence, and budget all
+    /// round-trip through the same JSON path `agents.json` uses.
+    #[test]
+    fn recovery_record_round_trips_every_field_a_continuation_needs() {
+        let spawn = rk_core::id::SpawnId::new();
+        let record = sample_recovery(spawn);
+        let json = serde_json::to_string(&record).unwrap();
+        let restored: RecoveryRecord = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.ticket, record.ticket);
+        assert_eq!(restored.branch, record.branch);
+        assert_eq!(restored.head, record.head);
+        assert_eq!(restored.session_id, record.session_id);
+        assert_eq!(restored.spawn, record.spawn);
+        assert_eq!(
+            restored.liveness.output_fingerprint,
+            record.liveness.output_fingerprint
+        );
+        assert_eq!(restored.budget_remaining_usd, record.budget_remaining_usd);
+        assert!(restored.ack.is_none());
+    }
+
+    /// A record predating this field (no `recovery` key at all in an old
+    /// `agents.json`) must still deserialize — same `#[serde(default)]`
+    /// discipline every other optional generation field here follows.
+    #[test]
+    fn agent_record_without_recovery_key_deserializes_as_none() {
+        let mut rec = record("Gouda", AgentState::Failed);
+        rec.recovery = Some(sample_recovery(rk_core::id::SpawnId::new()));
+        let mut value = serde_json::to_value(&rec).unwrap();
+        value.as_object_mut().unwrap().remove("recovery");
+
+        let restored: AgentRecord = serde_json::from_value(value).unwrap();
+        assert!(restored.recovery.is_none());
+    }
+
+    /// A continuation is minted for one specific generation. If, by the time
+    /// it is acted on, the record's live generation has already moved on
+    /// (e.g. an unrelated respawn), the record must read as stale — the
+    /// guard a late/duplicate continuation is fenced against.
+    #[test]
+    fn recovery_record_reports_stale_against_a_different_generation() {
+        let original = rk_core::id::SpawnId::new();
+        let record = sample_recovery(original);
+        assert!(!record.stale(original));
+
+        let later = rk_core::id::SpawnId::new();
+        assert!(record.stale(later));
+    }
+
+    /// Acknowledgement semantics live in `RecoveryAck`/`RecoveryOutcome`
+    /// (persisted state); this pins the data-level contract a continuation
+    /// action reads before deciding whether to act or replay: no ack yet =
+    /// free to act, matching action_id = replay the same outcome, mismatched
+    /// action_id = must be refused by the caller.
+    #[test]
+    fn recovery_ack_distinguishes_replay_from_a_conflicting_action() {
+        let spawn = rk_core::id::SpawnId::new();
+        let mut record = sample_recovery(spawn);
+        assert!(record.ack.is_none(), "unacknowledged: free to act");
+
+        let new_spawn = rk_core::id::SpawnId::new();
+        record.ack = Some(RecoveryAck {
+            action_id: "action-1".to_string(),
+            outcome: RecoveryOutcome::ResumedSameProvider { new_spawn },
+            acknowledged_at: Utc::now(),
+        });
+
+        let ack = record.ack.as_ref().unwrap();
+        assert_eq!(ack.action_id, "action-1", "same key replays this outcome");
+        assert_ne!(
+            ack.action_id, "action-2",
+            "a different key must be refused by the caller, not silently re-acted"
+        );
+        assert_eq!(
+            ack.outcome,
+            RecoveryOutcome::ResumedSameProvider { new_spawn }
+        );
     }
 }

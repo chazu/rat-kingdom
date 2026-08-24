@@ -373,6 +373,7 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
         archived_at: None,
         liveness: crate::agents::LivenessObservation::default(),
         transport_outage: None,
+        recovery: None,
     }
 }
 
@@ -2677,6 +2678,24 @@ impl Supervisor {
                     // this generation is over, and the castle-wide breaker
                     // for its provider gets the same proof (see below).
                     r.transport_outage = None;
+                    // A post-commit recovery that was CONTINUED (not
+                    // abandoned) reaches proof-of-life here too: clear it so
+                    // this name goes back to behaving like an ordinary
+                    // generation — eligible for `detect_post_commit_outage`
+                    // and `respawn_sweep` again on a later, unrelated crash.
+                    // An abandoned recovery must stay stamped forever (that
+                    // exclusion is deliberate, see `abandon_recovery`), and a
+                    // still-unacknowledged one can only belong to some other,
+                    // stale generation's launch racing this handler — never
+                    // clear either of those.
+                    let continued = r.recovery.as_ref().is_some_and(|rec| {
+                        rec.ack.as_ref().is_some_and(|ack| {
+                            !matches!(ack.outcome, crate::agents::RecoveryOutcome::Abandoned)
+                        })
+                    });
+                    if continued {
+                        r.recovery = None;
+                    }
                 });
                 if had_outage {
                     if let Ok(Some(record)) = updated {
@@ -2862,6 +2881,18 @@ impl Supervisor {
                     // true cost/usage on the terminal record.
                     self.apply_budget_stop_floor(&r.name, &mut r.cost_usd, &mut r.usage);
                 });
+                // Fenced to the session that actually died: a late `Exited`
+                // from a SUPERSEDED session (e.g. a continuation already
+                // resumed this name under a fresh session token before this
+                // event was processed) must never write recovery state over
+                // whatever the active session already established
+                // (TKT-01M0HNDJ7AS9F1A3W22FRCC63N — "a stale or late
+                // generation cannot overwrite the active generation").
+                if self.lock_session_tokens().get(name) == Some(&session) {
+                    if let Ok(Some(record)) = &updated {
+                        self.detect_post_commit_outage(name, record);
+                    }
+                }
                 // The process is gone, so no further turn can follow: a turn
                 // result held back for want of a `rk done` is now provably this
                 // generation's last word, and must be published. Harnesses that
@@ -4067,12 +4098,19 @@ impl Supervisor {
         // `RespawnDecision::Respawn` — bypassing `transport_retry_sweep`'s
         // backoff, jitter, and castle-wide circuit breaker entirely.
         // `transport_retry_sweep` (which DOES gate on the breaker) owns these
-        // records exclusively.
+        // records exclusively. `recovery.is_some()` excludes a generation
+        // parked with a post-commit `RecoveryRecord` the same way: it is a
+        // deliberate continuation decision (`continue_recovery`/
+        // `abandon_recovery`), never a bare relaunch, and an abandoned one
+        // must stay excluded forever so its WIP slot is never silently
+        // reclaimed (TKT-01M0HNDJ7AS9F1A3W22FRCC63N).
         let candidates: Vec<AgentRecord> = self
             .lock_registry()
             .list()
             .into_iter()
-            .filter(|r| is_auto_respawn_candidate(r) && r.transport_outage.is_none())
+            .filter(|r| {
+                is_auto_respawn_candidate(r) && r.transport_outage.is_none() && r.recovery.is_none()
+            })
             .cloned()
             .collect();
 
@@ -4289,6 +4327,385 @@ impl Supervisor {
         );
         if let Err(e) = self.space.out(tuple.into_trail(DEFAULT_TRAIL_TTL)) {
             warn!(error = %e, "failed to emit respawn-exhausted need");
+        }
+    }
+
+    /// Detect a transport outage discovered AFTER a generation had already
+    /// committed work (TKT-01M0HNDJ7AS9F1A3W22FRCC63N) — as opposed to
+    /// `record_transport_outage`, which only ever fires before a harness's
+    /// `Started` handshake. Builds and persists a `RecoveryRecord` so an
+    /// operator/policy continuation decision (`continue_recovery`/
+    /// `abandon_recovery`) can be made — and safely retried — arbitrarily
+    /// long after this detecting daemon process is gone.
+    ///
+    /// A no-op unless ALL of: no pre-work outage is already in progress (that
+    /// path owns the record instead), the generation has a branch with at
+    /// least one commit past its fork point (this is what makes it
+    /// "post-commit" rather than an ordinary crashed launch), and the
+    /// generation's stderr classifies as a known transport signal. Anything
+    /// else falls through to the ordinary crash/respawn handling the `Exited`
+    /// arm already does, unchanged.
+    fn detect_post_commit_outage(self: &Arc<Self>, name: &str, record: &AgentRecord) {
+        if record.transport_outage.is_some() || record.recovery.is_some() {
+            return;
+        }
+        let (Some(branch), Some(worktree), Some(fork_point)) = (
+            record.branch.as_deref(),
+            record.worktree.as_deref(),
+            record.fork_point.as_deref(),
+        ) else {
+            return;
+        };
+        let Some(outcome) = record.stderr_tail.as_deref().and_then(|tail| {
+            let lines: Vec<String> = tail.lines().map(str::to_string).collect();
+            rk_harness::transport::classify(&record.harness, &lines)
+        }) else {
+            return;
+        };
+        let Ok(repo) = Repo::discover(worktree) else {
+            return;
+        };
+        if !repo.branch_has_commits_since(branch, fork_point) {
+            return; // no committed work yet — ordinary crash handling applies
+        }
+        let Ok(head) = repo.rev_parse("HEAD") else {
+            return;
+        };
+        let budget = self.budget_for(record);
+        let budget_remaining_usd =
+            (budget.max_usd > 0.0).then(|| (budget.max_usd - record.cost_usd).max(0.0));
+        let recovery = crate::agents::RecoveryRecord {
+            ticket: record.task.clone(),
+            branch: branch.to_string(),
+            head,
+            session_id: record.session_id.clone(),
+            spawn: record.spawn_id(),
+            liveness: record.liveness.clone(),
+            budget_remaining_usd,
+            provider: record.harness.clone(),
+            class: outcome.class,
+            evidence: outcome.evidence.clone(),
+            detected_at: Utc::now(),
+            ack: None,
+        };
+        let _ = self.lock_registry().update(name, |r| {
+            r.recovery = Some(recovery.clone());
+        });
+        info!(
+            agent = name,
+            class = ?outcome.class,
+            branch,
+            "post-commit transport outage detected; durable recovery record written"
+        );
+        self.announce_pending_recovery(name, record, &recovery);
+    }
+
+    /// Surface a freshly-parked [`RecoveryRecord`] the same way every other
+    /// automated recovery source in this file already does — through
+    /// [`crate::recovery::RecoveryAnnouncer`], which writes the durable
+    /// `recovery_action` event that `rk inbox` renders as a `recovery-action`
+    /// row and fans it out through the configured `[[notify.sinks]]`.
+    ///
+    /// Without this an operator could only discover a parked generation by
+    /// reading raw `agents.json`/`agent.status` JSON for every agent, which is
+    /// exactly the polling this seam exists to remove. The suggested action
+    /// names the two continuation commands, because the inbox row's own action
+    /// is always `rk inbox ack <id>` (see `inbox::recovery_action_rows`) — the
+    /// row body is the only place the real remedy can live.
+    ///
+    /// Announce-only: unlike the auto-respawn and transport-retry sites, a
+    /// rate-cap hold does NOT suppress anything here. Detection already
+    /// happened and the record is already persisted; there is no side effect
+    /// left to withhold, and dropping the record because the castle is noisy
+    /// would lose committed work. A held announce is logged and the parked
+    /// record still stands, ready for `continue_recovery`/`abandon_recovery`.
+    fn announce_pending_recovery(
+        &self,
+        name: &str,
+        record: &AgentRecord,
+        recovery: &crate::agents::RecoveryRecord,
+    ) {
+        let short_head: String = recovery.head.chars().take(12).collect();
+        let notice = EscalationNotice::new(
+            "placeholder",
+            "post_commit_recovery",
+            Severity::Warn,
+            record.repo_name.clone(),
+            name.to_string(),
+            format!(
+                "{name} lost its harness transport AFTER committing work on {} (head {}) — \
+                 the generation is parked awaiting a continuation decision and will NOT be \
+                 auto-respawned. Resume it with `rk continue-recovery {name}` (add \
+                 `--harness <kind>` to route to a configured alternate harness instead), or \
+                 `rk abandon-recovery {name}` to leave it terminal.",
+                recovery.branch, short_head,
+            ),
+        )
+        .with_action(format!("rk continue-recovery {name}"))
+        .with_ref("agent", name)
+        .with_ref("task", recovery.ticket.clone().unwrap_or_default())
+        .with_ref("branch", recovery.branch.clone())
+        .with_ref("head", recovery.head.clone())
+        .with_ref("provider", recovery.provider.clone())
+        .with_ref("class", format!("{:?}", recovery.class))
+        .with_ref("evidence", recovery.evidence.clone());
+        let announced = self.recovery_announcer.announce(
+            &self.space,
+            &self.sinks.lock().unwrap_or_else(|p| p.into_inner()),
+            crate::recovery::RecoveryAction {
+                kind: "post_commit_recovery".into(),
+                instance: "supervisor".into(),
+                notice,
+            },
+            // 20/hour, matching the kill-process-group site: generous enough
+            // that a genuine multi-agent outage episode is fully visible,
+            // tight enough that a castle-wide provider failure cannot turn
+            // this into a notification storm.
+            crate::recovery::RateCap::per_hour(20),
+        );
+        match announced {
+            Ok(outcome) if outcome.held() => warn!(
+                agent = name,
+                "post-commit recovery announce HELD by the rate cap; the durable recovery \
+                 record still stands — find it with `rk status` or the held escalation itself"
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(
+                agent = name,
+                error = %e,
+                "failed to announce a parked post-commit recovery; the durable record still stands"
+            ),
+        }
+    }
+
+    /// Resume (or route to a configured alternate harness for) a generation
+    /// parked with a post-commit `RecoveryRecord`. `action_id` is an opaque
+    /// idempotency key: calling this again before the FIRST call's effects
+    /// are acknowledged is safe to retry (replay before acknowledgement);
+    /// the SAME key after acknowledgement replays the same recorded outcome
+    /// instead of acting twice; a DIFFERENT key after acknowledgement is
+    /// refused — acknowledgement makes continuation at-most-once.
+    ///
+    /// `target_harness = None` resumes the SAME provider/session in the same
+    /// worktree; `Some(harness)` routes to a configured alternate harness in
+    /// the same worktree instead (no session to resume — a fresh turn
+    /// against the same preserved head). Either way this refuses to launch
+    /// a second live owner: a record that is already live, or whose
+    /// generation has moved on since the recovery record was minted, errors
+    /// instead of double-spawning.
+    pub fn continue_recovery(
+        self: &Arc<Self>,
+        name: &str,
+        action_id: &str,
+        target_harness: Option<&str>,
+    ) -> rk_core::Result<crate::agents::RecoveryOutcome> {
+        let record = self
+            .lock_registry()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
+        let recovery = record
+            .recovery
+            .clone()
+            .ok_or_else(|| rk_core::Error::other(format!("{name} has no pending recovery")))?;
+        if let Some(ack) = &recovery.ack {
+            return Self::replay_or_refuse(name, action_id, ack);
+        }
+        if recovery.stale(record.spawn_id()) {
+            return Err(rk_core::Error::other(format!(
+                "{name}'s recovery record is stale: a newer generation is active"
+            )));
+        }
+        // No second live owner: a process that already resumed (or never
+        // left) this name must refuse a concurrent continuation instead of
+        // double-launching.
+        if record.state.is_live() || record.pid.is_some() {
+            return Err(rk_core::Error::other(format!(
+                "{name} already has a live owner — refusing to continue"
+            )));
+        }
+        validate_role(&record.role)?;
+        let (Some(worktree), Some(task)) = (record.worktree.clone(), record.task.clone()) else {
+            return Err(rk_core::Error::other(format!("{name} lacks worktree/task")));
+        };
+
+        let harness_kind = target_harness.unwrap_or(record.harness.as_str());
+        let same_provider = harness_kind == record.harness;
+        let harness = make_harness(harness_kind)?;
+        // A session from one provider can never resume under a different
+        // one — continuing under an alternate harness is always a fresh
+        // turn against the preserved head, never a resume.
+        let resume = if same_provider && harness.caps().resume {
+            recovery.session_id.clone()
+        } else {
+            None
+        };
+        let repo = Repo::discover(&record.repo_root)?;
+        let instruction_base = self.instruction_base(&record.role, &record.target_branch, &repo);
+        let env = self.agent_env(
+            &record.name,
+            &record.role,
+            &record.repo_name,
+            &task,
+            record.branch.as_deref(),
+            &instruction_base,
+            &worktree,
+            record.workflow_instance.as_deref(),
+            record.review.as_ref(),
+        );
+        let prime_ctx = PrimeContext {
+            agent: record.name.clone(),
+            repo: record.repo_name.clone(),
+            task: record.task.clone(),
+            branch: record.branch.clone(),
+            base: Some(instruction_base),
+            review: record.review.clone(),
+            parent: record.parent.clone(),
+            facts: self.scan_facts(&record.repo_name),
+            conventions: self.scan_conventions(&record.repo_name),
+            verification_checks: self.scan_verification_checks(&worktree),
+            harness_terminal_completion: uses_harness_terminal_completion(
+                &record.role,
+                harness_kind,
+            ),
+        };
+        let resume_prompt = if same_provider {
+            format!(
+                "Resuming task {task} after a transport outage that interrupted you AFTER \
+                 work was committed (branch {}, head {}). Check `git log` and `git status` in \
+                 your worktree to see exactly what landed, re-run any check that was \
+                 interrupted mid-flight, then continue. Finish with `rk done` as usual.",
+                recovery.branch, recovery.head,
+            )
+        } else {
+            format!(
+                "You are continuing task {task} in the same worktree after a transport \
+                 outage took down a prior harness AFTER work was committed (branch {}, head \
+                 {}). That prior session cannot be resumed from here — treat this as a fresh \
+                 turn: check `git log` and `git status` to see exactly what already landed, \
+                 re-run any check that was interrupted mid-flight, then continue. Finish with \
+                 `rk done` as usual.",
+                recovery.branch, recovery.head,
+            )
+        };
+        let spec = LaunchSpec {
+            prompt: resume_prompt,
+            system_prompt: Some(render(&record.role, &prime_ctx)),
+            cwd: worktree.clone(),
+            env,
+            permission_mode: Some(respawn_permission_mode(&record)?),
+            model: record.model.clone(),
+            resume_session: resume,
+        };
+        let session = harness.launch(&spec)?;
+
+        // The continuation reuses this generation's identity — same
+        // convention an ordinary respawn already follows (the record, and
+        // its `created_at`/`spawn`, are reused rather than reallocated) —
+        // which is exactly the "preserve retry generation" continuity the
+        // ticket asks for.
+        let new_spawn = record.spawn_id();
+        let outcome = if same_provider {
+            crate::agents::RecoveryOutcome::ResumedSameProvider { new_spawn }
+        } else {
+            crate::agents::RecoveryOutcome::ContinuedAlternateProvider {
+                harness: harness_kind.to_string(),
+                new_spawn,
+            }
+        };
+        let action_id_owned = action_id.to_string();
+        let outcome_for_ack = outcome.clone();
+        let updated = self
+            .lock_registry()
+            .update(name, |r| {
+                r.harness = harness_kind.to_string();
+                r.state = AgentState::Running;
+                r.pid = session.pid;
+                r.result = None;
+                r.crashed = false;
+                r.stderr_tail = None;
+                if let Some(rec) = r.recovery.as_mut() {
+                    rec.ack = Some(crate::agents::RecoveryAck {
+                        action_id: action_id_owned,
+                        outcome: outcome_for_ack,
+                        acknowledged_at: Utc::now(),
+                    });
+                }
+            })?
+            .ok_or_else(|| rk_core::Error::other("record vanished"))?;
+
+        let session_token = self.track_session(name, session.control.clone());
+        self.forget_completion(name);
+
+        let supervisor = Arc::clone(self);
+        let owned = name.to_string();
+        let mut events = session.events;
+        let generation = updated.created_at;
+        let spawn = updated.spawn_id();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                supervisor.handle_event(&owned, generation, spawn, session_token, event);
+            }
+        });
+
+        Ok(outcome)
+    }
+
+    /// Explicitly decline to continue a parked post-commit recovery — a
+    /// non-retryable class, an exhausted ceiling, or an operator's own
+    /// choice. Same `action_id` at-most-once contract as
+    /// [`continue_recovery`](Self::continue_recovery). The generation stays
+    /// terminal (`Failed`, no live process): `respawn_sweep` excludes any
+    /// record with `recovery.is_some()` (same exclusion pattern as
+    /// `transport_outage`), so its WIP slot — already released the moment
+    /// `Exited` cleared `pid` — is never silently reclaimed by a later
+    /// auto-respawn.
+    pub fn abandon_recovery(
+        self: &Arc<Self>,
+        name: &str,
+        action_id: &str,
+    ) -> rk_core::Result<crate::agents::RecoveryOutcome> {
+        let record = self
+            .lock_registry()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
+        let recovery = record
+            .recovery
+            .ok_or_else(|| rk_core::Error::other(format!("{name} has no pending recovery")))?;
+        if let Some(ack) = &recovery.ack {
+            return Self::replay_or_refuse(name, action_id, ack);
+        }
+        let action_id_owned = action_id.to_string();
+        self.lock_registry().update(name, |r| {
+            if let Some(rec) = r.recovery.as_mut() {
+                rec.ack = Some(crate::agents::RecoveryAck {
+                    action_id: action_id_owned,
+                    outcome: crate::agents::RecoveryOutcome::Abandoned,
+                    acknowledged_at: Utc::now(),
+                });
+            }
+        })?;
+        Ok(crate::agents::RecoveryOutcome::Abandoned)
+    }
+
+    /// Shared acknowledged-ack handling for `continue_recovery`/
+    /// `abandon_recovery`: the same `action_id` replays the recorded
+    /// outcome (duplicate-call safety), a different one is refused (the
+    /// at-most-once half of the contract).
+    fn replay_or_refuse(
+        name: &str,
+        action_id: &str,
+        ack: &crate::agents::RecoveryAck,
+    ) -> rk_core::Result<crate::agents::RecoveryOutcome> {
+        if ack.action_id == action_id {
+            Ok(ack.outcome.clone())
+        } else {
+            Err(rk_core::Error::other(format!(
+                "{name}'s recovery was already acknowledged by a different action ({} != \
+                 {action_id})",
+                ack.action_id
+            )))
         }
     }
 
@@ -7768,6 +8185,7 @@ mod respawn_tests {
             archived_at: None,
             liveness: Default::default(),
             transport_outage: None,
+            recovery: None,
         }
     }
 
@@ -8284,6 +8702,474 @@ mod respawn_tests {
              transport_retry_sweep's job, gated by the breaker"
         );
         assert!(after.pid.is_none());
+    }
+
+    /// A `Running` record with committed work (a branch with at least one
+    /// commit past its fork point) and live-verifier evidence in its
+    /// `liveness` snapshot, whose harness dies with transport-shaped
+    /// stderr — fault-injected through the SAME `handle_event` path a real
+    /// process death drives, not by calling the detector directly.
+    fn committed_work_record_with_live_verifier_evidence(
+        repo: &Path,
+        fork_point: String,
+        branch: &str,
+    ) -> AgentRecord {
+        let mut rec = record(repo, Some(branch));
+        rec.fork_point = Some(fork_point);
+        rec.state = AgentState::Running;
+        rec.session_id = Some("provider-sess-1".into());
+        // Live verifier evidence: a local check (`cargo test`/`rk verify`)
+        // was still advancing right up to the moment the harness died.
+        rec.liveness = crate::agents::LivenessObservation {
+            session: Some(rec.spawn_id()),
+            output_fingerprint: 777,
+            output_changed_at: Some(Utc::now()),
+            reconnect_events: 1,
+            ceiling_started_at: None,
+        };
+        rec.stderr_tail = Some("fatal: connection refused while contacting api\n".into());
+        rec
+    }
+
+    /// End-to-end fault injection for TKT-01M0HNDJ7AS9F1A3W22FRCC63N: proves
+    /// the durable recovery record survives a simulated daemon restart (two
+    /// `Supervisor`s over the same home directory) with its liveness
+    /// evidence intact, and that continuation is at-most-once — a replayed
+    /// `action_id` returns the SAME outcome instead of double-launching, and
+    /// a different `action_id` after acknowledgement is refused outright.
+    #[tokio::test]
+    async fn post_commit_transport_outage_recovers_across_a_daemon_restart_with_at_most_once_continuation(
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let p = repo.path();
+        let fork_point = Repo::discover(p).unwrap().rev_parse("HEAD").unwrap();
+
+        git(p, &["checkout", "-b", "rat/nibble/tkt-1", "main"]);
+        std::fs::write(p.join("work"), "done\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "committed work"]);
+        git(p, &["checkout", "main"]);
+
+        let rec =
+            committed_work_record_with_live_verifier_evidence(p, fork_point, "rat/nibble/tkt-1");
+        let name = rec.name.clone();
+        let spawn = rec.spawn_id();
+        let generation = rec.created_at;
+
+        let sup1 = supervisor(home.path());
+        sup1.lock_registry().insert(rec).unwrap();
+
+        // A late `Exited` from a SUPERSEDED session must not write recovery
+        // state: the session tracked for `name` is a DIFFERENT token than
+        // the one this event names.
+        let superseding = rk_core::id::SpawnId::new();
+        let stale_session = rk_core::id::SpawnId::new();
+        sup1.lock_session_tokens().insert(name.clone(), superseding);
+        sup1.handle_event(
+            &name,
+            generation,
+            spawn,
+            stale_session,
+            HarnessEvent::Exited { code: Some(1) },
+        );
+        assert!(
+            sup1.status(&name).unwrap().recovery.is_none(),
+            "a late Exited from a superseded session must not overwrite the active \
+             generation's recovery state"
+        );
+
+        // The real fault: the CURRENT session's harness dies post-commit
+        // with transport-shaped stderr.
+        sup1.lock_registry()
+            .update(&name, |r| {
+                r.state = AgentState::Running; // undo the no-op stale attempt above
+                r.pid = Some(4242);
+            })
+            .unwrap();
+        let session = rk_core::id::SpawnId::new();
+        sup1.lock_session_tokens().insert(name.clone(), session);
+        sup1.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Exited { code: Some(1) },
+        );
+
+        let detected = sup1.status(&name).unwrap();
+        let recovery = detected
+            .recovery
+            .as_ref()
+            .expect("post-commit transport outage must be detected and recorded");
+        assert_eq!(recovery.branch, "rat/nibble/tkt-1");
+        assert_eq!(recovery.class, rk_harness::TransportClass::Unavailable);
+        assert_eq!(
+            recovery.liveness.output_fingerprint, 777,
+            "live-verifier liveness evidence must be preserved verbatim"
+        );
+        assert_eq!(recovery.liveness.reconnect_events, 1);
+        assert!(recovery.ack.is_none());
+        assert_eq!(detected.state, AgentState::Failed);
+        assert!(
+            detected.pid.is_none(),
+            "WIP must already be released at Exited"
+        );
+
+        // Simulated daemon restart: a FRESH Supervisor over the SAME home
+        // directory must see exactly what the dead process recorded.
+        drop(sup1);
+        let sup2 = supervisor(home.path());
+        let after_restart = sup2.status(&name).unwrap();
+        assert_eq!(
+            after_restart.recovery.as_ref().map(|r| &r.head),
+            Some(&recovery.head),
+            "the recovery record must survive a daemon restart intact"
+        );
+
+        // Continuation: same provider ("fake"), no target override.
+        let outcome = sup2
+            .continue_recovery(&name, "action-1", None)
+            .expect("continuation must succeed for a fresh, unacknowledged recovery");
+        assert!(
+            matches!(
+                outcome,
+                crate::agents::RecoveryOutcome::ResumedSameProvider { .. }
+            ),
+            "same-provider continuation must resume, not route to an alternate: {outcome:?}"
+        );
+        assert_eq!(sup2.status(&name).unwrap().state, AgentState::Running);
+
+        // Duplicate replay: the SAME action_id must return the SAME
+        // outcome without erroring (no second live owner is ever attempted).
+        let replayed = sup2
+            .continue_recovery(&name, "action-1", None)
+            .expect("a replayed action_id must be safe to retry");
+        assert_eq!(
+            replayed, outcome,
+            "a replay must return the identical recorded outcome"
+        );
+
+        // A DIFFERENT action_id after acknowledgement must be refused —
+        // acknowledgement makes continuation at-most-once.
+        let conflict = sup2.continue_recovery(&name, "action-2", None);
+        assert!(
+            conflict.is_err(),
+            "a different action_id after acknowledgement must be refused, not re-acted"
+        );
+    }
+
+    /// `target_harness` routes continuation to a configured alternate
+    /// harness in the SAME worktree rather than resuming the dead
+    /// provider's session — no session id is portable across providers, so
+    /// this must be a fresh turn, not a resume.
+    #[tokio::test]
+    async fn continue_recovery_routes_to_a_configured_alternate_harness() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let p = repo.path();
+        let fork_point = Repo::discover(p).unwrap().rev_parse("HEAD").unwrap();
+
+        git(p, &["checkout", "-b", "rat/nibble/tkt-2", "main"]);
+        std::fs::write(p.join("work"), "done\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "committed work"]);
+        git(p, &["checkout", "main"]);
+
+        // The dying provider is recorded as "claude" (never actually
+        // launched here); the configured alternate is "fake" — the only
+        // kind guaranteed to launch in a sandboxed test.
+        let mut rec =
+            committed_work_record_with_live_verifier_evidence(p, fork_point, "rat/nibble/tkt-2");
+        rec.harness = "claude".into();
+        let name = rec.name.clone();
+        let spawn = rec.spawn_id();
+        let generation = rec.created_at;
+
+        let sup = supervisor(home.path());
+        sup.lock_registry().insert(rec).unwrap();
+        let session = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert(name.clone(), session);
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Exited { code: Some(1) },
+        );
+        assert!(sup.status(&name).unwrap().recovery.is_some());
+
+        let outcome = sup
+            .continue_recovery(&name, "alt-action-1", Some("fake"))
+            .expect("alternate-provider continuation must succeed");
+        match &outcome {
+            crate::agents::RecoveryOutcome::ContinuedAlternateProvider { harness, .. } => {
+                assert_eq!(harness, "fake");
+            }
+            other => panic!("expected ContinuedAlternateProvider, got {other:?}"),
+        }
+        assert_eq!(
+            sup.status(&name).unwrap().harness,
+            "fake",
+            "the record's harness must reflect the alternate it actually continued under"
+        );
+    }
+
+    /// Terminal-failure path: an operator/policy decision to NOT continue a
+    /// parked recovery must release its WIP slot cleanly and permanently —
+    /// `respawn_sweep` must never resurrect it, even configured to fire on
+    /// its very first tick with no backoff (mirrors
+    /// `respawn_sweep_excludes_transport_outage_records`).
+    #[test]
+    fn abandoned_recovery_stays_excluded_from_respawn_sweep_forever() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let p = repo.path();
+        let fork_point = Repo::discover(p).unwrap().rev_parse("HEAD").unwrap();
+        git(p, &["checkout", "-b", "rat/nibble/tkt-3", "main"]);
+        std::fs::write(p.join("work"), "done\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "committed work"]);
+        git(p, &["checkout", "main"]);
+
+        let mut rec =
+            committed_work_record_with_live_verifier_evidence(p, fork_point, "rat/nibble/tkt-3");
+        rec.state = AgentState::Failed;
+        rec.pid = None;
+        rec.recovery = Some(crate::agents::RecoveryRecord {
+            ticket: rec.task.clone(),
+            branch: "rat/nibble/tkt-3".into(),
+            head: "deadbeef".repeat(5),
+            session_id: rec.session_id.clone(),
+            spawn: rec.spawn_id(),
+            liveness: rec.liveness.clone(),
+            budget_remaining_usd: None,
+            provider: "fake".into(),
+            class: rk_harness::TransportClass::Unavailable,
+            evidence: "connection refused".into(),
+            detected_at: Utc::now(),
+            ack: None,
+        });
+        let name = rec.name.clone();
+
+        let sup = supervisor(home.path());
+        sup.lock_registry().insert(rec).unwrap();
+
+        let outcome = sup
+            .abandon_recovery(&name, "give-up-1")
+            .expect("abandoning a fresh recovery must succeed");
+        assert_eq!(outcome, crate::agents::RecoveryOutcome::Abandoned);
+
+        // Duplicate replay of the SAME action_id must return the same
+        // terminal outcome, not error.
+        assert_eq!(
+            sup.abandon_recovery(&name, "give-up-1").unwrap(),
+            crate::agents::RecoveryOutcome::Abandoned
+        );
+        // A different action_id after acknowledgement must be refused.
+        assert!(sup.abandon_recovery(&name, "give-up-2").is_err());
+
+        let cfg = SupervisorConfig {
+            respawn_enabled: true,
+            respawn_max_attempts: 1,
+            respawn_backoff_secs: 0,
+            ..SupervisorConfig::default()
+        };
+        let sinks = rk_core::notify::SinkRegistry::default();
+        sup.respawn_sweep(&cfg, &sinks);
+
+        let after = sup.status(&name).unwrap();
+        assert_eq!(
+            after.state,
+            AgentState::Failed,
+            "an abandoned recovery must never be auto-respawned"
+        );
+        assert!(after.pid.is_none(), "WIP must stay released permanently");
+    }
+
+    /// Regression for the gap Emmental-12 flagged in review (artifact
+    /// 01M0RRQA5CBNZ0BFQ88A56V8YZ): unlike `abandon_recovery`, a CONTINUED
+    /// recovery must not stay stamped on the record forever, or a name that
+    /// resumed once can never have its NEXT post-commit outage detected
+    /// again. Builds the record exactly as `continue_recovery` leaves it —
+    /// `recovery.ack` set to a non-`Abandoned` outcome — then fires the same
+    /// `Started` handshake `handle_event` would see from the relaunched
+    /// harness, and proves a SECOND, later transport-shaped death on the
+    /// same name is detected fresh rather than swallowed by the stale
+    /// record.
+    #[test]
+    fn continued_recovery_clears_on_proof_of_life_and_reenables_detection() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let p = repo.path();
+        let fork_point = Repo::discover(p).unwrap().rev_parse("HEAD").unwrap();
+        git(p, &["checkout", "-b", "rat/nibble/tkt-4", "main"]);
+        std::fs::write(p.join("work"), "done\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "committed work"]);
+        git(p, &["checkout", "main"]);
+
+        let mut rec =
+            committed_work_record_with_live_verifier_evidence(p, fork_point, "rat/nibble/tkt-4");
+        let name = rec.name.clone();
+        let spawn = rec.spawn_id();
+        let generation = rec.created_at;
+        rec.recovery = Some(crate::agents::RecoveryRecord {
+            ticket: rec.task.clone(),
+            branch: "rat/nibble/tkt-4".into(),
+            head: "deadbeef".repeat(5),
+            session_id: rec.session_id.clone(),
+            spawn,
+            liveness: rec.liveness.clone(),
+            budget_remaining_usd: None,
+            provider: "fake".into(),
+            class: rk_harness::TransportClass::Unavailable,
+            evidence: "connection refused".into(),
+            detected_at: Utc::now(),
+            ack: Some(crate::agents::RecoveryAck {
+                action_id: "action-1".into(),
+                outcome: crate::agents::RecoveryOutcome::ResumedSameProvider { new_spawn: spawn },
+                acknowledged_at: Utc::now(),
+            }),
+        });
+        // `continue_recovery` clears `stderr_tail` before relaunching; a
+        // fresh Started handshake must not see the outage evidence that
+        // parked the FIRST recovery.
+        rec.stderr_tail = None;
+
+        let sup = supervisor(home.path());
+        sup.lock_registry().insert(rec).unwrap();
+        let session = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert(name.clone(), session);
+
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Started {
+                session_id: Some("resumed-sess-1".into()),
+            },
+        );
+        assert!(
+            sup.status(&name).unwrap().recovery.is_none(),
+            "a CONTINUED recovery must clear on its next proof-of-life, or this name is \
+             stranded forever"
+        );
+
+        // A second, later transport-shaped death on the SAME name.
+        sup.lock_registry()
+            .update(&name, |r| {
+                r.state = AgentState::Running;
+                r.pid = Some(4343);
+                r.stderr_tail = Some("fatal: connection refused while contacting api\n".into());
+            })
+            .unwrap();
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Exited { code: Some(1) },
+        );
+        let redetected = sup.status(&name).unwrap();
+        assert!(
+            redetected
+                .recovery
+                .as_ref()
+                .is_some_and(|r| r.ack.is_none()),
+            "a second, unrelated post-commit outage on the same name must be detected \
+             fresh, not blocked by the first (already-continued) recovery: {:?}",
+            redetected.recovery
+        );
+    }
+
+    /// Companion to `continued_recovery_clears_on_proof_of_life_and_reenables_detection`:
+    /// the same proof-of-life clear must also restore ORDINARY auto-respawn
+    /// eligibility — `respawn_sweep`'s `recovery.is_none()` filter must not
+    /// exclude a name forever just because it once continued a recovery.
+    /// `#[tokio::test]` because a `Respawn` decision drives `self.respawn`,
+    /// which launches the fake harness for real.
+    #[tokio::test]
+    async fn continued_recovery_clears_on_proof_of_life_and_reenables_ordinary_respawn() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+
+        let mut rec = record(repo.path(), Some("main"));
+        rec.state = AgentState::Running;
+        rec.pid = Some(4343);
+        let name = rec.name.clone();
+        let spawn = rec.spawn_id();
+        let generation = rec.created_at;
+        rec.recovery = Some(crate::agents::RecoveryRecord {
+            ticket: rec.task.clone(),
+            branch: "rat/nibble/tkt-5".into(),
+            head: "deadbeef".repeat(5),
+            session_id: None,
+            spawn,
+            liveness: rec.liveness.clone(),
+            budget_remaining_usd: None,
+            provider: "fake".into(),
+            class: rk_harness::TransportClass::Unavailable,
+            evidence: "connection refused".into(),
+            detected_at: Utc::now(),
+            ack: Some(crate::agents::RecoveryAck {
+                action_id: "action-1".into(),
+                outcome: crate::agents::RecoveryOutcome::ResumedSameProvider { new_spawn: spawn },
+                acknowledged_at: Utc::now(),
+            }),
+        });
+
+        let sup = supervisor(home.path());
+        sup.lock_registry().insert(rec).unwrap();
+        let session = rk_core::id::SpawnId::new();
+        sup.lock_session_tokens().insert(name.clone(), session);
+
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Started {
+                session_id: Some("resumed-sess-2".into()),
+            },
+        );
+        assert!(sup.status(&name).unwrap().recovery.is_none());
+
+        // An ORDINARY crash later — no transport-shaped stderr — must be
+        // treated like any other crash: eligible for the auto-respawn
+        // sweep, not permanently excluded by the first (already-continued)
+        // recovery.
+        sup.handle_event(
+            &name,
+            generation,
+            spawn,
+            session,
+            HarnessEvent::Exited { code: Some(1) },
+        );
+        let after_crash = sup.status(&name).unwrap();
+        assert_eq!(after_crash.state, AgentState::Failed);
+        assert!(after_crash.recovery.is_none());
+
+        let cfg = SupervisorConfig {
+            respawn_enabled: true,
+            respawn_max_attempts: 1,
+            respawn_backoff_secs: 0,
+            ..SupervisorConfig::default()
+        };
+        let sinks = rk_core::notify::SinkRegistry::default();
+        sup.respawn_sweep(&cfg, &sinks);
+
+        assert!(
+            sup.lock_respawn_state().get(&name).is_some(),
+            "a name that once continued a recovery must be an ordinary auto-respawn \
+             candidate again after its next crash, not excluded forever"
+        );
     }
 
     #[test]
@@ -9344,6 +10230,7 @@ mod stuck_liveness_tests {
             archived_at: None,
             liveness: crate::agents::LivenessObservation::default(),
             transport_outage: None,
+            recovery: None,
         }
     }
 

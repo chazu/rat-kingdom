@@ -1733,6 +1733,15 @@ impl Daemon {
                 | "daemon.resume_dispatch"
                 | "agent.spawn"
                 | "agent.respawn"
+                // Continuation of a parked post-commit recovery relaunches a
+                // harness against committed work, so it sits with spawn /
+                // respawn on the operator-only list. Deliberately NOT added to
+                // the foreman subset below: a foreman manages its own children's
+                // lifecycle, but deciding whether committed work is resumed,
+                // rerouted to another harness, or written off is an operator or
+                // policy call.
+                | "agent.continue_recovery"
+                | "agent.abandon_recovery"
                 | "agent.dismiss"
                 | "agent.interrupt"
                 | "agent.steer"
@@ -2476,6 +2485,8 @@ impl Daemon {
             "agent.spawn" => reply(self.handle_spawn(req).await),
             "agent.progress" => reply(self.handle_progress(req)),
             "agent.respawn" => reply(self.handle_respawn(req).await),
+            "agent.continue_recovery" => reply(self.handle_continue_recovery(req).await),
+            "agent.abandon_recovery" => reply(self.handle_abandon_recovery(req)),
             "agent.list" => reply(match parse_params::<AgentListParams>(&req.params) {
                 Ok(p) => {
                     let agents = if p.archived_only {
@@ -6702,6 +6713,63 @@ impl Daemon {
         }
     }
 
+    /// Resume — or route to a configured alternate harness — a generation
+    /// parked with a post-commit [`crate::agents::RecoveryRecord`]
+    /// (TKT-01M0HNDJ7AS9F1A3W22FRCC63N). This is the "one operator or policy
+    /// action must resume the same harness ... without creating a second live
+    /// owner" half of the ticket: the no-second-owner fencing (live-owner
+    /// refusal, stale-generation refusal, at-most-once `action_id`
+    /// acknowledgement) all lives in `Supervisor::continue_recovery`; this is
+    /// only the wire seam onto it.
+    ///
+    /// `spawn_blocking` for the same reason `handle_respawn` uses it:
+    /// `continue_recovery` launches a harness synchronously and would
+    /// otherwise stall the reactor thread.
+    async fn handle_continue_recovery(&self, req: Request) -> Response {
+        let params: RecoveryActionParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        let supervisor = Arc::clone(&self.supervisor);
+        let handle = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
+            let _entered = handle.enter();
+            supervisor
+                .continue_recovery(&params.name, &params.action_id, params.harness.as_deref())
+                .map(|outcome| json!({"outcome": outcome}))
+        })
+        .await;
+        match result {
+            Ok(Ok(value)) => Response::ok(req.id, value),
+            Ok(Err(e)) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+            Err(e) => Response::err(
+                req.id,
+                codes::INTERNAL,
+                format!("continue-recovery task failed: {e}"),
+            ),
+        }
+    }
+
+    /// Explicitly decline to continue a parked post-commit recovery. Same
+    /// at-most-once `action_id` contract as
+    /// [`handle_continue_recovery`](Self::handle_continue_recovery); the
+    /// generation stays terminal and `respawn_sweep` keeps excluding it, so
+    /// its WIP slot is never silently reclaimed. Synchronous — unlike
+    /// continuation this launches nothing, it only writes the acknowledgement.
+    fn handle_abandon_recovery(&self, req: Request) -> Response {
+        let params: RecoveryActionParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        match self
+            .supervisor
+            .abandon_recovery(&params.name, &params.action_id)
+        {
+            Ok(outcome) => Response::ok(req.id, json!({"outcome": outcome})),
+            Err(e) => Response::err(req.id, codes::INTERNAL, e.to_string()),
+        }
+    }
+
     fn handle_factory_propose_action(&self, req: Request) -> Response {
         let params: FactoryProposeParams = match parse_params(&req.params) {
             Ok(p) => p,
@@ -9157,6 +9225,26 @@ struct DismissParams {
     no_merge: bool,
 }
 
+/// Wire shape for `agent.continue_recovery` / `agent.abandon_recovery`.
+///
+/// `action_id` is REQUIRED and deliberately caller-supplied rather than
+/// minted here: it is the idempotency key behind the at-most-once
+/// acknowledgement contract on [`crate::agents::RecoveryRecord::ack`]. A
+/// server-side key would be fresh on every retry, so a client that retried a
+/// timed-out call would present a DIFFERENT key and be refused (or, before
+/// acknowledgement, launch twice). The CLI mints one per invocation and
+/// prints it, so an operator can replay the exact same call safely.
+#[derive(Deserialize)]
+struct RecoveryActionParams {
+    name: String,
+    action_id: String,
+    /// `None` resumes the same provider/session; `Some(kind)` routes to a
+    /// configured alternate harness in the same worktree. Ignored by
+    /// `agent.abandon_recovery`.
+    #[serde(default)]
+    harness: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct RepoLandParams {
     repo: String,
@@ -10270,6 +10358,7 @@ mod authorize_reasoned_tests {
             archived_at: None,
             liveness: Default::default(),
             transport_outage: None,
+            recovery: None,
         };
         let mut records = HashMap::new();
         records.insert(record.name.clone(), record);
@@ -10735,6 +10824,7 @@ mod ticket_reopen_sweep_tests {
             archived_at: None,
             liveness: Default::default(),
             transport_outage: None,
+            recovery: None,
         };
         let mut records = HashMap::new();
         records.insert(record.name.clone(), record);
