@@ -707,9 +707,18 @@ pub async fn shadow_review_report(
 ) -> Result<()> {
     let cutoff = Utc::now() - parse_since(since)?;
     let mut client = Client::connect_or_spawn(layout).await?;
+    // Same cap hazard as `digest`'s `scan_category` (TKT-01M0QZFTYQW4WV200TYGCN46XA):
+    // the daemon's default `space.scan` is oldest-first bounded by
+    // `MAX_SCAN_TUPLES`, so once comparison artifacts exceed that cap — easily,
+    // fleet-wide when `--repo` is omitted — an unqualified scan returns the
+    // OLDEST comparisons and the `--since` window silently comes back empty.
+    // `newest: true` spends the cap on the tail instead, which is the only
+    // ordering a recency report can be built from. It rides alongside the
+    // flattened match pattern in `ScanParams`, hence the same object.
     let mut pattern = json!({
         "category": "artifact",
         "identity": SHADOW_COMPARISON_IDENTITY,
+        "newest": true,
     });
     if let Some(repo) = repo {
         pattern["scope"] = json!(repo);
