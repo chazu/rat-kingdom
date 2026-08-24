@@ -10505,6 +10505,36 @@ mod authorize_reasoned_tests {
         assert!(!allowed);
         assert_eq!(reason, "operator_only_method");
     }
+
+    #[test]
+    fn repo_land_reenqueue_refuses_an_ordinary_rat() {
+        let (_dir, daemon) = test_daemon_with_role("rat");
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "invalid-rat");
+        let request = Request {
+            id: "1".into(),
+            method: "repo.land.reenqueue".into(),
+            auth: token,
+            caller: "invalid-rat".into(),
+            client_version: None,
+            params: json!({"repo": ".", "branch": "b", "task": "t", "attempt": "a"}),
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
+        assert!(!allowed);
+        assert_eq!(reason, "operator_only_method");
+    }
+
+    #[test]
+    fn repo_land_reenqueue_allows_the_operator() {
+        let (_dir, daemon) = test_daemon();
+        let request = req("operator", "repo.land.reenqueue", "");
+        let origin = PeerOrigin {
+            pid_observed: true,
+            supervised_agents: Default::default(),
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &origin);
+        assert!(allowed);
+        assert_eq!(reason, "");
+    }
 }
 
 #[cfg(test)]

@@ -14389,6 +14389,163 @@ checks: [
         );
     }
 
+    /// The `repo.land.reenqueue` RPC's actual entry point:
+    /// `reenqueue_ceiling_settled_review` must resolve a `LandingQueueEntry`
+    /// and `GateConfig` from just a repo path plus branch/target/task/attempt
+    /// — the caller-facing identifiers an escalation's `RESOLVE WITH:` text
+    /// hands an operator — refuse before any settlement exists, and be
+    /// idempotent per settled attempt exactly like the underlying
+    /// `reenqueue_after_ceiling` it wraps.
+    #[tokio::test]
+    async fn reenqueue_ceiling_settled_review_resolves_entry_and_is_idempotent() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_review_workflow(&layout);
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+        // `reenqueue_ceiling_settled_review` derives `repo_name` from the
+        // real repo path the same way `submit_manual` does (`rk_git::Repo::
+        // name`, the tempdir's own leaf name) — override the fixture's
+        // hardcoded "code-repo" so the lookup it performs actually matches.
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let entry = LandingQueueEntry {
+            repo_name: git_repo.name(),
+            ..review_candidate_entry(repo_dir.path(), &head_sha)
+        };
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let attempt = review_instance_id(&entry);
+
+        // No settlement yet: nothing to re-enqueue.
+        assert!(pipeline
+            .reenqueue_ceiling_settled_review(
+                repo_dir.path(),
+                &entry.branch,
+                &entry.target,
+                &entry.task,
+                &attempt,
+            )
+            .await
+            .is_err());
+
+        pipeline
+            .settle_review_ceiling(&entry, &attempt, "review-wait-exhausted")
+            .await
+            .unwrap();
+
+        let new_attempt = pipeline
+            .reenqueue_ceiling_settled_review(
+                repo_dir.path(),
+                &entry.branch,
+                &entry.target,
+                &entry.task,
+                &attempt,
+            )
+            .await
+            .unwrap();
+        assert_ne!(new_attempt, attempt);
+        assert_eq!(
+            pipeline.active_review_attempt(&entry).unwrap(),
+            new_attempt,
+            "the fresh attempt dispatched via the RPC entry point must become authoritative"
+        );
+        assert_eq!(wait_for_spawn_count(&space, 1).await, 1);
+
+        // Idempotent: a retried RPC call (or a duplicate CLI invocation)
+        // returns the same fresh attempt id and never dispatches twice.
+        let repeat = pipeline
+            .reenqueue_ceiling_settled_review(
+                repo_dir.path(),
+                &entry.branch,
+                &entry.target,
+                &entry.task,
+                &attempt,
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeat, new_attempt);
+        assert_eq!(tuples(&space, Category::Event, "agent_spawned").len(), 1);
+    }
+
+    /// The live reconciliation sweep (`Server`'s landing background loop,
+    /// alongside `run_cycle`): a late verdict for a ceiling-settled attempt
+    /// must be retained as durable evidence, the sweep must be idempotent
+    /// (a second tick over the same marker retains nothing new), a fresh
+    /// `LandingPipeline` instance re-scanning the SAME durable space (the
+    /// daemon-restart case — nothing survives in memory) must not duplicate
+    /// evidence either, and none of this may mutate the landing decision:
+    /// the candidate stays exactly as terminal as `late_approve_and_rework_
+    /// are_retained_as_evidence_without_mutating_the_decision` already
+    /// proves for the underlying `retain_late_review_evidence`.
+    #[tokio::test]
+    async fn reconcile_late_review_evidence_sweep_is_idempotent_and_restart_safe() {
+        let home = tempfile::tempdir().unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let entry = review_candidate_entry(Path::new("."), "abc123");
+        let attempt = review_instance_id(&entry);
+
+        pipeline
+            .settle_review_ceiling(&entry, &attempt, "review-wait-exhausted")
+            .await
+            .unwrap();
+
+        // Nothing to retain yet: the sweep is a no-op, and the decision is
+        // still open (never landed, never cached).
+        assert_eq!(pipeline.reconcile_late_review_evidence().unwrap(), 0);
+        assert!(pipeline.cached_verdict(&entry).unwrap().is_none());
+
+        space
+            .out(Tuple::new(
+                Category::Artifact,
+                "code-repo",
+                REVIEW_ARTIFACT_IDENTITY,
+                "zombie-reviewer",
+                json!({
+                    "task": entry.task,
+                    "recommendation": "APPROVE",
+                    "notes": "late",
+                    "head_sha": entry.head_sha,
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "review_attempt": attempt,
+                }),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            pipeline.reconcile_late_review_evidence().unwrap(),
+            1,
+            "the sweep must retain exactly the one late verdict it just found"
+        );
+        assert_eq!(
+            tuples(&space, Category::Artifact, LATE_REVIEW_EVIDENCE_IDENTITY).len(),
+            1
+        );
+        // The decision itself is untouched by the sweep.
+        assert!(pipeline.cached_verdict(&entry).unwrap().is_none());
+
+        // Idempotent: the next tick over the same marker retains nothing new.
+        assert_eq!(pipeline.reconcile_late_review_evidence().unwrap(), 0);
+        assert_eq!(
+            tuples(&space, Category::Artifact, LATE_REVIEW_EVIDENCE_IDENTITY).len(),
+            1
+        );
+
+        // Restart-safe: a brand new `LandingPipeline` sharing only the
+        // durable space (no in-memory state carried over) re-scanning the
+        // same markers must find the evidence already recorded, not
+        // duplicate it.
+        let restarted = test_pipeline(home.path(), space.clone());
+        assert_eq!(restarted.reconcile_late_review_evidence().unwrap(), 0);
+        assert_eq!(
+            tuples(&space, Category::Artifact, LATE_REVIEW_EVIDENCE_IDENTITY).len(),
+            1,
+            "a restart replaying the same durable markers must not duplicate evidence"
+        );
+        assert!(restarted.cached_verdict(&entry).unwrap().is_none());
+    }
+
     /// Shared setup for the `gate_worktree_sweep_once` tests below: a real
     /// repo plus a pipeline, with `run_gates` used directly (not the full
     /// `drain_key`/land path) to create one or more real, git-registered
