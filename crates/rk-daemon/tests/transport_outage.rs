@@ -111,12 +111,12 @@ fn marker_count(path: &Path) -> usize {
 }
 
 fn backdate_retry_state(layout: &Layout, name: &str) {
+    backdate_retry_state_for_provider(layout, name, "claude");
     let agents_path = layout.home().join("agents.json");
     let mut agents: Value = serde_json::from_slice(&std::fs::read(&agents_path).unwrap()).unwrap();
     let agent = agents
         .get_mut(name)
         .unwrap_or_else(|| panic!("missing persisted agent {name}"));
-    agent["transport_outage"]["last_failure_at"] = json!("2000-01-01T00:00:00Z");
     // Non-zero ledger values make the restart/respawn preservation assertion
     // meaningful even though a pre-work failure naturally reports no usage.
     agent["cost_usd"] = json!(7.25);
@@ -127,11 +127,21 @@ fn backdate_retry_state(layout: &Layout, name: &str) {
         "cache_creation": 5
     });
     std::fs::write(&agents_path, serde_json::to_vec_pretty(&agents).unwrap()).unwrap();
+}
+
+fn backdate_retry_state_for_provider(layout: &Layout, name: &str, provider: &str) {
+    let agents_path = layout.home().join("agents.json");
+    let mut agents: Value = serde_json::from_slice(&std::fs::read(&agents_path).unwrap()).unwrap();
+    let agent = agents
+        .get_mut(name)
+        .unwrap_or_else(|| panic!("missing persisted agent {name}"));
+    agent["transport_outage"]["last_failure_at"] = json!("2000-01-01T00:00:00Z");
+    std::fs::write(&agents_path, serde_json::to_vec_pretty(&agents).unwrap()).unwrap();
 
     let breaker_path = layout.home().join("transport_breaker.json");
     let mut breakers: Value =
         serde_json::from_slice(&std::fs::read(&breaker_path).unwrap()).unwrap();
-    breakers["providers"]["claude"]["opened_at"] = json!("2000-01-01T00:00:00Z");
+    breakers["providers"][provider]["opened_at"] = json!("2000-01-01T00:00:00Z");
     std::fs::write(breaker_path, serde_json::to_vec_pretty(&breakers).unwrap()).unwrap();
 }
 
@@ -352,4 +362,211 @@ exit 1
     handle_b.await.unwrap().unwrap();
     std::env::remove_var("RK_CLAUDE_BIN");
     std::env::remove_var("RK_CODEX_BIN");
+}
+
+/// Mirrors `outage_retry_survives_restart_without_duplicate_launch_or_ledger_reset`
+/// with the failing and bystander providers swapped, so the same typed
+/// failure -> breaker trip -> restart -> ceiling -> recovery lifecycle is
+/// proven provider-neutral rather than Claude-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outage_retry_survives_restart_without_duplicate_launch_or_ledger_reset_codex() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    init_repo(repo_dir.path());
+
+    let marker = home.path().join("codex-attempts");
+    let recovered = home.path().join("provider-recovered");
+    let codex = home.path().join("codex-fixture");
+    executable(
+        &codex,
+        &format!(
+            r#"#!/bin/sh
+printf 'attempt\n' >> '{}'
+if [ -f '{}' ]; then
+  printf '%s\n' '{{"type":"thread.started","thread_id":"transport-recovered"}}'
+  exit 0
+fi
+printf '%s\n' 'TLS handshake failed: unable to get local issuer certificate' >&2
+exit 1
+"#,
+            marker.display(),
+            recovered.display()
+        ),
+    );
+    let claude = home.path().join("claude-fixture");
+    executable(
+        &claude,
+        "#!/bin/sh\nprintf '%s\\n' 'ordinary local fixture exit' >&2\nexit 1\n",
+    );
+    std::env::set_var("RK_CODEX_BIN", &codex);
+    std::env::set_var("RK_CLAUDE_BIN", &claude);
+
+    let layout = Layout::at(home.path());
+    layout.ensure().unwrap();
+    let handle_a = tokio::spawn(daemon(&layout).run());
+    let mut client = connect(&layout).await;
+
+    let spawned = client
+        .call(
+            "agent.spawn",
+            json!({
+                "repo": repo_dir.path().to_string_lossy(),
+                "task": "transport-restart-codex",
+                "harness": "codex"
+            }),
+        )
+        .await
+        .unwrap();
+    let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+    let generation = spawned["agent"]["spawn"].clone();
+    let created_at = spawned["agent"]["created_at"].clone();
+
+    let first = wait_for_status(
+        &mut client,
+        &name,
+        |s| s["agent"]["state"] == "failed" && s["agent"]["transport_outage"]["attempts"] == 1,
+        "the first typed transport failure",
+    )
+    .await;
+    assert_eq!(first["agent"]["transport_outage"]["provider"], "codex");
+    assert_eq!(first["agent"]["transport_outage"]["class"], "certificate");
+    assert_eq!(marker_count(&marker), 1);
+
+    // Threshold 1 opens the Codex breaker immediately. Admission refusal is
+    // before name/WIP/worktree allocation, while Claude remains independent
+    // and is still admitted.
+    let agents_before = client.call("agent.list", json!({})).await.unwrap()["agents"]
+        .as_array()
+        .unwrap()
+        .len();
+    let refused = client
+        .call(
+            "agent.spawn",
+            json!({
+                "repo": repo_dir.path().to_string_lossy(),
+                "task": "must-not-allocate",
+                "harness": "codex"
+            }),
+        )
+        .await
+        .expect_err("an open Codex breaker must refuse a new Codex launch");
+    assert!(refused
+        .to_string()
+        .contains("transport circuit breaker open"));
+    let agents_after = client.call("agent.list", json!({})).await.unwrap()["agents"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(
+        agents_before, agents_after,
+        "refusal must not allocate a row"
+    );
+    let other_provider = client
+        .call(
+            "agent.spawn",
+            json!({
+                "repo": repo_dir.path().to_string_lossy(),
+                "task": "other-provider",
+                "harness": "claude"
+            }),
+        )
+        .await
+        .expect("the Claude provider must remain independent");
+    let other_provider = other_provider["agent"]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    wait_for_status(
+        &mut client,
+        &other_provider,
+        |s| s["agent"]["state"] == "failed",
+        "the independent provider fixture to settle",
+    )
+    .await;
+
+    assert_eq!(transport_rows(&mut client, &name).await.len(), 1);
+
+    // Replace the daemon, then inject a due schedule using persisted state.
+    // No elapsed-time margin decides whether the retry is eligible.
+    client.call("stop", json!({})).await.unwrap();
+    handle_a.await.unwrap().unwrap();
+    std::fs::remove_file(layout.pid_file()).ok();
+    std::fs::remove_file(layout.socket_path()).ok();
+    backdate_retry_state_for_provider(&layout, &name, "codex");
+    assert_eq!(marker_count(&marker), 1, "restart itself must not launch");
+
+    let handle_b = tokio::spawn(daemon(&layout).run());
+    let mut client = connect(&layout).await;
+    let exhausted = wait_for_status(
+        &mut client,
+        &name,
+        |s| {
+            s["agent"]["state"] == "failed"
+                && s["agent"]["transport_outage"]["attempts"] == 2
+                && s["agent"]["transport_outage"]["ceiling_hit"] == true
+        },
+        "the resumed retry to exhaust its ceiling",
+    )
+    .await;
+
+    assert_eq!(marker_count(&marker), 2, "exactly one retry must launch");
+    assert_eq!(exhausted["agent"]["spawn"], generation);
+    assert_eq!(exhausted["agent"]["created_at"], created_at);
+    assert_eq!(transport_rows(&mut client, &name).await.len(), 1);
+
+    // Cross another sweep tick and prove a settled ceiling neither retries
+    // nor emits a duplicate typed inbox row.
+    tokio::time::sleep(Duration::from_millis(1_250)).await;
+    assert_eq!(
+        marker_count(&marker),
+        2,
+        "ceiling must stop further launches"
+    );
+    assert_eq!(transport_rows(&mut client, &name).await.len(), 1);
+
+    // An operator-directed recovery trial that reaches Started clears both
+    // the per-generation episode and the castle-wide breaker. A subsequent
+    // fresh Codex spawn is admitted again.
+    std::fs::write(&recovered, "ready\n").unwrap();
+    client
+        .call("agent.respawn", json!({"name": name}))
+        .await
+        .unwrap();
+    wait_for_status(
+        &mut client,
+        &name,
+        |s| s["agent"]["transport_outage"].is_null(),
+        "Started to clear the transport episode",
+    )
+    .await;
+    let fresh = client
+        .call(
+            "agent.spawn",
+            json!({
+                "repo": repo_dir.path().to_string_lossy(),
+                "task": "provider-recovered",
+                "harness": "codex"
+            }),
+        )
+        .await
+        .expect("Started proof must close the Codex breaker");
+    let fresh = fresh["agent"]["name"].as_str().unwrap().to_string();
+    wait_for_status(
+        &mut client,
+        &fresh,
+        |s| {
+            !matches!(
+                s["agent"]["state"].as_str(),
+                Some("spawning" | "running" | "paused")
+            )
+        },
+        "the recovered provider fixture to settle",
+    )
+    .await;
+
+    client.call("stop", json!({})).await.unwrap();
+    handle_b.await.unwrap().unwrap();
+    std::env::remove_var("RK_CODEX_BIN");
+    std::env::remove_var("RK_CLAUDE_BIN");
 }
