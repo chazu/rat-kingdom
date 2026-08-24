@@ -11,7 +11,7 @@ use rk_core::config::SupervisorConfig;
 use rk_core::notify::{EscalationNotice, Severity, SinkRegistry};
 use rk_core::paths::Layout;
 use rk_core::prime::{render, PrimeContext, VerificationCheck, MAX_INJECTED_FACTS};
-use rk_core::tuple::{Category, Pattern, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
+use rk_core::tuple::{Category, Lifecycle, Pattern, Tuple, DEFAULT_TRAIL_TTL, SYSTEM_SCOPE};
 use rk_git::Repo;
 use rk_harness::{
     make_harness, ControlEnvelope, HarnessEvent, LaunchSpec, SessionControl, TokenUsage,
@@ -21,7 +21,7 @@ use rk_ledger::{Budget, BudgetAction, BudgetScope, DispatchCheck, FleetBudget};
 use rk_space::Space;
 use rk_workflow::{AgentProfile, Coordination, DeliveryMode};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -104,6 +104,31 @@ const DIFF_SMALL_MAX_LINES: u64 = 400;
 /// mirrors this): above the observed cost of a legitimate deep review, but a
 /// hard ceiling on the $27+ uncapped outliers production surfaced.
 const DEFAULT_REVIEWER_MAX_USD: f64 = 30.0;
+
+/// Durable evidence that a `task_done` arrived for a generation the budget,
+/// stuck, or runaway machinery had already terminalized (`Stopped`/`Failed`)
+/// before the completion could be applied — the loser of a same-tick race
+/// between a hard-stop's CAS and [`Supervisor::reconcile_task_done`]'s own
+/// CAS to `Completed`. Recorded instead of silently dropped so an operator
+/// has an explicit recovery action rather than discovering a stranded,
+/// already-verified branch by hand (2026-08-21 Cinder-11 incident,
+/// TKT-01M0J5KT4TCH03W48MR9T7EJ27).
+const LATE_TASK_DONE_EVIDENCE_IDENTITY: &str = "late_task_done_evidence";
+
+/// Barrier names for [`Supervisor::reconcile_task_done`]'s CAS-then-publish
+/// sequence. See `crate::fault` for why a barrier and not a sleep, and
+/// `landing.rs`'s `BARRIER_CEILING_PRE/POST_MARKER` for the sibling pattern
+/// this mirrors — there a late review verdict races a ceiling settlement;
+/// here a late `task_done` races a budget/stuck/runaway hard stop.
+const BARRIER_TASK_DONE_PRE_ROUTE: &str = "task-done-pre-route";
+const BARRIER_TASK_DONE_POST_ROUTE: &str = "task-done-post-route";
+
+/// Give the harness event pump a bounded chance to publish its authoritative
+/// final-turn result after `rk done` returns. The durable `task_done` already
+/// fences budget and liveness hard-stops during this window; this delay only
+/// decides which text becomes the one durable `harness_result`. A silent or
+/// orphaned harness falls back to the `rk done` summary after the grace.
+const TASK_DONE_HARNESS_GRACE: chrono::Duration = chrono::Duration::seconds(1);
 
 /// The completion-payload fields a reactive steward tiers its review on: the
 /// branch tip this generation produced, its size vs. the recorded target, and
@@ -2762,13 +2787,45 @@ impl Supervisor {
                     warn!(agent = name, "completion event for an unknown agent");
                     return;
                 };
-                // A deliberate stop wins races with a final harness event.
+                // A deliberate stop, or a completion already settled by
+                // `reconcile_task_done` reacting to the durable `task_done`
+                // tuple directly, wins races with a final harness event.
                 // SIGINT/SIGTERM can prompt an adapter to flush a `Completed`
                 // event before its process exits; accepting that event as a
                 // normal completion would erase the terminal cause and could
-                // make an unfinished run look successful.
-                if pre.state == AgentState::Stopped {
+                // make an unfinished run look successful. And once
+                // `reconcile_task_done` has already CASed this generation to
+                // `Completed`, `claim_completion` below refuses the claim
+                // (`claim.publish = false`) for the harness's own event — the
+                // `else` arm of the state assignment reads that as "no proof
+                // this is the last turn" and downgrades to `Paused`, which
+                // would silently un-complete an already-published generation.
+                // Both cases are "this generation's disposition is already
+                // decided by something other than this event" — merge
+                // usage/cost only, never touch state.
+                if matches!(pre.state, AgentState::Stopped | AgentState::Completed) {
+                    // `result` is handled differently per branch: a `Stopped`
+                    // record's `result` is the budget-stop detail message
+                    // (`enforce_budget::budget_stop_detail`) and must stand —
+                    // a harness's post-kill text is exactly what TKT-173/175
+                    // distrust. A `Completed`-via-`reconcile_task_done` record
+                    // has no such authoritative detail: its `result` is
+                    // whatever summary the generation's own `rk done` call
+                    // happened to carry (often terser than the harness's own
+                    // final turn text — see `agent_lifecycle.rs`'s
+                    // `WORKING_FAKE`, `rk_done "work done"` immediately
+                    // followed by `"result":"committed gnawed.txt"`), so this
+                    // naturally-arriving event's richer text is allowed to
+                    // upgrade it in place. Neither branch re-publishes: the
+                    // durable `harness_result` this generation already
+                    // produced (via `reconcile_task_done`'s `route_completion`
+                    // call, exactly once) is untouched — this only updates the
+                    // live `agent.status` view.
+                    let completed_via_reconcile = pre.state == AgentState::Completed;
                     let _ = self.lock_registry().update(name, |r| {
+                        if completed_via_reconcile {
+                            r.result = Some(result.clone());
+                        }
                         if usage.total() > 0 {
                             r.usage = usage;
                         }
@@ -3161,6 +3218,18 @@ impl Supervisor {
                 // The durable state is the idempotency guard: one transition,
                 // one escalation, one kill.
                 if record.state == AgentState::Stopped {
+                    return;
+                }
+                // `rk done` is durable before its RPC returns. If it won the
+                // race, leave the live process alone long enough for its
+                // authoritative final-turn `Completed` event to arrive;
+                // `reconcile_task_done` supplies the bounded fallback when it
+                // does not. Storage errors fail closed here: an unreadable
+                // completion signal must not disable a hard budget cap.
+                if matches!(
+                    self.find_task_done(&record.name, record.created_at, record.spawn),
+                    Ok(Some(_))
+                ) {
                     return;
                 }
                 warn!(agent = %record.name, cost = record.cost_usd, tokens = record.usage.total(), "budget cap hit — stopping agent");
@@ -3827,6 +3896,16 @@ impl Supervisor {
                     self.steer_flagged(record, kind);
                 }
                 SweepAction::Hard { kind, detail } => {
+                    // Same durable winner rule as the budget stop: once this
+                    // generation's `task_done` exists, reconciliation owns
+                    // terminalization and the sweep must not kill the harness
+                    // before it can flush its richer final result.
+                    if matches!(
+                        self.find_task_done(&record.name, record.created_at, record.spawn),
+                        Ok(Some(_))
+                    ) {
+                        continue;
+                    }
                     warn!(agent = %record.name, kind, %detail, "supervisor sweep killing agent after grace");
                     self.emit_sweep_obstacle(
                         record,
@@ -5062,6 +5141,24 @@ impl Supervisor {
     /// name+floor predicate for a record with no minted id (unreachable, or
     /// written before this migration).
     ///
+    /// The durable `task_done` tuple this generation wrote via `rk done`, if
+    /// any — the shared lookup behind [`Self::declared_done`] (bool) and
+    /// [`Self::reconcile_task_done`] (needs the tuple itself, for its
+    /// `summary` payload). Same generation-scoping as `declared_done`: keyed
+    /// on `spawn` when minted, else the name+floor fallback.
+    fn find_task_done(
+        &self,
+        name: &str,
+        generation: DateTime<Utc>,
+        spawn: Option<rk_core::id::SpawnId>,
+    ) -> rk_core::Result<Option<Tuple>> {
+        let pattern = match spawn {
+            Some(spawn) => Pattern::for_spawn(Category::Event, "task_done", spawn),
+            None => Pattern::for_agent_since(Category::Event, "task_done", name, generation),
+        };
+        Ok(self.space.scan(&pattern)?.into_iter().next())
+    }
+
     /// Fails OPEN — an unreadable space means "publish", which is the behaviour
     /// that predates this gate. Withholding on a storage error would strand
     /// every workflow waiting on the agent until its step timeout.
@@ -5071,13 +5168,9 @@ impl Supervisor {
         generation: DateTime<Utc>,
         spawn: Option<rk_core::id::SpawnId>,
     ) -> bool {
-        let pattern = match spawn {
-            Some(spawn) => Pattern::for_spawn(Category::Event, "task_done", spawn),
-            None => Pattern::for_agent_since(Category::Event, "task_done", name, generation),
-        };
-        match self.space.scan(&pattern) {
-            Ok(tuples) => {
-                let found = !tuples.is_empty();
+        match self.find_task_done(name, generation, spawn) {
+            Ok(found) => {
+                let found = found.is_some();
                 // Deliberately logged on every call, not just the negative
                 // case: TKT-01M0BWWY15SH2KCQ99WKPGN9N7 saw this scan come back
                 // empty for a generation whose `rk_done` had, by construction,
@@ -5101,6 +5194,235 @@ impl Supervisor {
                 true
             }
         }
+    }
+
+    /// Live + restart-safe reconciliation of `task_done` against terminal
+    /// state — the fix for the 2026-08-21 Cinder-11 incident
+    /// (TKT-01M0J5KT4TCH03W48MR9T7EJ27): a harness reports its own turn
+    /// completion asynchronously (`HarnessEvent::Completed`), and if a
+    /// concurrent budget/stuck/runaway sweep kills the process first, that
+    /// event can simply never arrive — the generation's `rk done` still
+    /// durably wrote its `task_done` tuple, but for a headless (non-attach)
+    /// generation nothing was ever independently listening for it. Before
+    /// this, only [`Self::flush_withheld_completion`] reacted to a process
+    /// death, and only for a generation that had an EARLIER withheld turn to
+    /// flush — a short generation that finishes on its first turn has none,
+    /// so its already-accepted `task_done` was simply orphaned.
+    ///
+    /// Scans every record except `Dismissed` (whose completion bookkeeping was
+    /// deliberately forgotten by [`Self::forget_completion`] and must not be
+    /// resurrected) for a durable `task_done`. When one is found:
+    ///
+    ///  - **Still eligible** (`Spawning`/`Running`/`Paused`/`Orphaned` — the
+    ///    last covers a daemon restart landing between the `task_done` write
+    ///    and this reconcile pass, since [`crate::agents::Registry::orphan_live_agents`]
+    ///    converts every live record to `Orphaned` at startup): a live record
+    ///    receives [`TASK_DONE_HARNESS_GRACE`] for its event pump to publish
+    ///    the authoritative final-turn text. During that grace budget and
+    ///    liveness hard-stops consult the same durable `task_done` and stand
+    ///    down. A silent live record, or an orphan with no event pump left,
+    ///    CASes to `Completed` and publishes the `rk done` summary instead.
+    ///    The CAS uses the same registry lock as hard-stop terminalization.
+    ///  - **Already terminal for some other reason** (`Stopped`, `Failed`):
+    ///    the stop (or crash) won durably first. Retained as evidence via
+    ///    [`Self::retain_late_task_done_evidence`] instead of publishing —
+    ///    the terminal state itself is never mutated, matching the
+    ///    already-shipped early return in the harness-event path
+    ///    (`handle_event`'s `pre.state == AgentState::Stopped` check) that a
+    ///    deliberate stop wins races with a final harness event.
+    ///
+    ///  - **Already `Completed` but not published**: this is the durable seam
+    ///    left by a daemon crash after the state CAS and before the event
+    ///    write. It publishes on the successor. A durable generation-scoped
+    ///    `harness_result`, rather than only the process-local completion
+    ///    claim, is the dedup key across restart.
+    ///
+    /// Restart-safe by construction: every check here re-derives its answer
+    /// from durable state (the registry snapshot, `task_done`, and
+    /// `harness_result`) rather than in-memory bookkeeping a crash could lose,
+    /// and every write (the `Completed` CAS, the evidence tuple) is itself
+    /// durable and idempotent — [`Self::claim_completion`] refuses a second
+    /// publish within one daemon process, the durable result check refuses it
+    /// across processes, and
+    /// [`Self::retain_late_task_done_evidence`] scans for its own prior
+    /// artifact before writing another — so a daemon killed mid-pass and
+    /// restarted just re-derives the same outcome on its next tick. Meant to
+    /// run on the same event-feed + interval cadence as
+    /// [`crate::landing::Landing::reconcile_late_review_evidence`] — see that
+    /// sibling's doc comment for why (the same restart-safety argument for
+    /// the same class of race: a late verdict there, a late `task_done`
+    /// here).
+    pub(crate) async fn reconcile_task_done(&self) -> rk_core::Result<usize> {
+        let mut settled = 0;
+        for record in self.list() {
+            if record.state == AgentState::Dismissed {
+                continue;
+            }
+            let Some(task_done) =
+                self.find_task_done(&record.name, record.created_at, record.spawn)?
+            else {
+                continue;
+            };
+
+            // A normal harness result is the canonical completion payload.
+            // Its durable presence is also the restart-safe dedup key: the
+            // in-memory `CompletionState` deliberately does not survive a
+            // daemon restart, so consulting it alone could republish after a
+            // crash between `route_completion` and this function returning.
+            if self.harness_result_exists(&record)? {
+                continue;
+            }
+
+            // A live harness commonly emits its final result immediately
+            // after `rk done`. Do not race that richer text with the terse
+            // summary. Orphaned generations have no event pump left and
+            // therefore bypass the grace on restart.
+            if record.state.is_live() && Utc::now() - task_done.created_at < TASK_DONE_HARNESS_GRACE
+            {
+                continue;
+            }
+            let diff = self.diff_summary_for(&record.name);
+            let summary = task_done
+                .payload
+                .get("summary")
+                .and_then(Value::as_str)
+                .map(String::from);
+            // See `crate::fault` for why a barrier and not a sleep — a daemon
+            // killed here, before the CAS lands, must converge to the same
+            // outcome on restart.
+            crate::fault::barrier(&self.layout, BARRIER_TASK_DONE_PRE_ROUTE).await;
+            let updated = self.lock_registry().update(&record.name, |r| {
+                if r.state.is_live() || r.state == AgentState::Orphaned {
+                    r.state = AgentState::Completed;
+                    if let Some(s) = &summary {
+                        r.result = Some(s.clone());
+                    }
+                }
+            });
+            match updated {
+                Ok(Some(r)) if r.state == AgentState::Completed => {
+                    let claim = self.claim_completion(&r.name, r.created_at, r.spawn, false, false);
+                    if !claim.publish {
+                        continue;
+                    }
+                    info!(agent = %r.name, "task_done reconciled: generation completed");
+                    self.route_completion(&r, false, claim.declared_done, diff);
+                    crate::fault::barrier(&self.layout, BARRIER_TASK_DONE_POST_ROUTE).await;
+                    settled += 1;
+                }
+                Ok(Some(r)) => {
+                    // Lost the CAS: something else (a budget/stuck/runaway
+                    // hard stop, or a plain crash) durably terminalized this
+                    // generation first. The claim above is already spent, so
+                    // this is the ONLY chance to record that the agent did,
+                    // in fact, finish — retain it as evidence rather than
+                    // silently dropping it.
+                    if self
+                        .retain_late_task_done_evidence(&r, &task_done)?
+                        .is_some()
+                    {
+                        settled += 1;
+                    }
+                }
+                Ok(None) | Err(_) => {}
+            }
+        }
+        Ok(settled)
+    }
+
+    /// Whether this exact generation already published its one durable
+    /// `harness_result`. Unlike the in-memory completion claim, this survives
+    /// a daemon restart and therefore closes the CAS-then-publish crash window.
+    fn harness_result_exists(&self, record: &AgentRecord) -> rk_core::Result<bool> {
+        let pattern = match record.spawn {
+            Some(spawn) => Pattern::for_spawn(Category::Event, "harness_result", spawn),
+            None => Pattern::for_agent_since(
+                Category::Event,
+                "harness_result",
+                &record.name,
+                record.created_at,
+            ),
+        };
+        Ok(!self.space.scan(&pattern)?.is_empty())
+    }
+
+    /// Whether a [`LATE_TASK_DONE_EVIDENCE_IDENTITY`] artifact already exists
+    /// for this exact generation, so a repeat reconcile pass (the periodic
+    /// tick, a restart) never duplicates it.
+    fn late_task_done_evidence_exists(
+        &self,
+        repo_name: &str,
+        name: &str,
+        generation: DateTime<Utc>,
+    ) -> rk_core::Result<bool> {
+        let pattern = Pattern::category(Category::Artifact)
+            .identity(LATE_TASK_DONE_EVIDENCE_IDENTITY)
+            .scope(repo_name);
+        let generation = generation.to_rfc3339();
+        Ok(self.space.scan(&pattern)?.into_iter().any(|t| {
+            t.payload.get("agent").and_then(Value::as_str) == Some(name)
+                && t.payload.get("generation").and_then(Value::as_str) == Some(generation.as_str())
+        }))
+    }
+
+    /// Retain a `task_done` that arrived for `record` after it was already
+    /// terminalized for some reason other than a clean completion (a budget
+    /// hard stop, a stuck/runaway kill, a plain crash) as durable evidence
+    /// with an explicit recovery action — never by mutating `record`'s
+    /// terminal state, which by construction has already been decided, and
+    /// for a `Stopped` record has already been announced and its process
+    /// already killed. Idempotent per generation via
+    /// [`Self::late_task_done_evidence_exists`].
+    fn retain_late_task_done_evidence(
+        &self,
+        record: &AgentRecord,
+        task_done: &Tuple,
+    ) -> rk_core::Result<Option<Tuple>> {
+        if self.late_task_done_evidence_exists(
+            &record.repo_name,
+            &record.name,
+            record.created_at,
+        )? {
+            return Ok(None);
+        }
+        let diff = self.diff_summary_for(&record.name);
+        let recovery_action = match &record.branch {
+            Some(branch) => format!(
+                "rk land {branch} --repo {} --target {}  (verify the branch first; or `rk respawn {}` to resume the generation)",
+                record.repo_name, record.target_branch, record.name
+            ),
+            None => format!(
+                "rk respawn {} to resume the generation (no branch was recorded to land directly)",
+                record.name
+            ),
+        };
+        let evidence = Tuple::new(
+            Category::Artifact,
+            record.repo_name.clone(),
+            LATE_TASK_DONE_EVIDENCE_IDENTITY,
+            "daemon",
+            json!({
+                "agent": record.name,
+                "generation": record.created_at.to_rfc3339(),
+                "task": record.task,
+                "branch": record.branch,
+                "target": record.target_branch,
+                "head_sha": diff.head_sha,
+                "terminal_state": format!("{:?}", record.state),
+                "terminal_reason": record.result,
+                "declared_summary": task_done.payload.get("summary"),
+                "recovery_action": recovery_action,
+                "retained_at": Utc::now().to_rfc3339(),
+            }),
+        )
+        .with_lifecycle(Lifecycle::Furniture);
+        self.space.out(evidence.clone())?;
+        warn!(
+            agent = %record.name, state = ?record.state,
+            "a task_done arrived after this generation was already terminalized; \
+             retained as evidence, terminal state left unchanged"
+        );
+        Ok(Some(evidence))
     }
 
     /// Claim the right to publish a turn result that was held back, now that the
@@ -8153,6 +8475,46 @@ mod respawn_tests {
             },
         );
         assert_eq!(sup.status("Nibble").unwrap().state, AgentState::Running);
+    }
+
+    /// TKT-01M0J5KT4TCH03W48MR9T7EJ27: the durable `task_done`
+    /// reconciler can settle a generation before the harness emits its own
+    /// natural completion event. That later event must merge final usage but
+    /// must never downgrade the already-published `Completed` state to
+    /// `Paused` merely because the completion claim was already consumed.
+    #[test]
+    fn a_late_harness_completion_cannot_uncomplete_a_reconciled_generation() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let sup = supervisor(home.path());
+        let mut rec = record(repo.path(), None);
+        rec.state = AgentState::Completed;
+        let generation = rec.created_at;
+        let spawn = rec.spawn_id();
+        sup.lock_registry().insert(rec).unwrap();
+
+        let usage = TokenUsage {
+            input: 11,
+            output: 7,
+            ..Default::default()
+        };
+        sup.handle_event(
+            "Nibble",
+            generation,
+            spawn,
+            spawn,
+            HarnessEvent::Completed {
+                result: "natural harness completion arrived late".into(),
+                is_error: false,
+                usage,
+                cost_usd: Some(0.25),
+                session_id: None,
+            },
+        );
+
+        let settled = sup.status("Nibble").unwrap();
+        assert_eq!(settled.state, AgentState::Completed);
+        assert_eq!(settled.usage, usage);
     }
 
     /// Probe O6/O8, REVIEWER path: a reviewer that pauses must not fail its

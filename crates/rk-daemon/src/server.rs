@@ -899,6 +899,42 @@ impl Daemon {
             });
         }
 
+        // `task_done` vs budget/stuck/stop reconciliation
+        // (TKT-01M0J5KT4TCH03W48MR9T7EJ27, 2026-08-21 Cinder-11 incident):
+        // event-feed + interval loop, same shape as the late-review
+        // reconciler below and for the same reason — a harness's own
+        // `Completed` event can be lost to a concurrent hard stop, so
+        // something has to react to the durable `task_done` tuple
+        // independently. Unconditional (not gated on `sweep_config.enabled`):
+        // the race it closes is between `rk done` and `enforce_budget`, which
+        // runs on every `Usage` event regardless of whether the liveness/
+        // burn-rate sweep is turned on.
+        {
+            let task_done_supervisor = Arc::clone(&daemon.supervisor);
+            let mut task_done_feed = daemon.space.subscribe();
+            let mut task_done_shutdown = daemon.shutdown_tx.subscribe();
+            let task_done_interval = Duration::from_secs(daemon.sweep_config.interval_secs.max(1));
+            background_tasks.spawn(async move {
+                let mut tick = tokio::time::interval(task_done_interval);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        recv = task_done_feed.recv() => match recv {
+                            Ok(_) => while task_done_feed.try_recv().is_ok() {},
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                        _ = task_done_shutdown.changed() => break,
+                    }
+                    match task_done_supervisor.reconcile_task_done().await {
+                        Ok(0) => {}
+                        Ok(n) => debug!(settled = n, "reconciled task_done vs terminal state"),
+                        Err(e) => warn!(error = %e, "task_done reconciliation failed"),
+                    }
+                }
+            });
+        }
+
         // Fetch-driven awaiting-review clear (TKT-70). Periodically fetch+prune
         // each repo with an open PR and check whether the forge merged/deleted
         // the branch upstream — clearing the inbox row for a merge the operator
