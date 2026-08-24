@@ -479,16 +479,31 @@ async fn live_verifier_descendant_survives_the_sweep_while_a_silent_dead_generat
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
-fn install_single_sleep_check(dir: &Path, sleep_secs: f64) {
+/// A check body that proves genuine overlap with a *sibling* check running
+/// in another repo, without relying on wall-clock margins: it drops its own
+/// marker into a directory shared across both repos, waits just long enough
+/// for the sibling to have started, then records whether the sibling's
+/// marker is *still present* into `overlap.log` before removing its own.
+/// If the two checks ran serially (one queued behind the other), the first
+/// one's marker would already be gone by the time the second checks for it
+/// — same marker-file technique as `marker_check_body` above, adapted for
+/// two distinct repos sharing one directory instead of `N` checks sharing
+/// one repo's admission lane.
+fn cross_repo_marker_body(shared: &Path, own: &str, other: &str) -> String {
+    let shared = shared.display();
+    format!(
+        r#"touch "{shared}/{own}.marker"; sleep 0.1; if [ -f "{shared}/{other}.marker" ]; then echo "saw-{other}" >> "{shared}/overlap.log"; else echo "no-{other}" >> "{shared}/overlap.log"; fi; sleep 0.2; rm -f "{shared}/{own}.marker""#
+    )
+}
+
+fn install_marker_check(dir: &Path, shared: &Path, own: &str, other: &str) {
     let rk_dir = dir.join(".rk");
     std::fs::create_dir_all(&rk_dir).unwrap();
     std::fs::write(
         rk_dir.join("checks.cue"),
         format!(
-            r#"checks: [
-    {{name: "verify", command: "sleep {sleep_secs}", timeout: "10s", environmentPolicy: "strip_rk_spawn", sharedCargoTarget: true}},
-]
-"#
+            "checks: [\n    {{name: \"verify\", command: \"{}\", timeout: \"10s\", environmentPolicy: \"strip_rk_spawn\", sharedCargoTarget: true}},\n]\n",
+            cue_command(&cross_repo_marker_body(shared, own, other))
         ),
     )
     .unwrap();
@@ -497,10 +512,13 @@ fn install_single_sleep_check(dir: &Path, sleep_secs: f64) {
 /// "work in separate repositories can proceed concurrently": two distinct
 /// repos, each with its own tight `verification_admission_limit_by_repo` of
 /// 1, must NOT contend against each other for that permit — the admission
-/// lane is keyed per repo, not a single cross-repo lock. Proven by wall
-/// clock: two 300ms checks running truly concurrently finish in well under
-/// 2x300ms; if they secretly shared one lock, the second would queue behind
-/// the first and the pair would take >=600ms.
+/// lane is keyed per repo, not a single cross-repo lock. Proven by marker
+/// files rather than wall clock (matching this file's other saturation
+/// tests, per TKT-01M0D2APS09AXKB4AHAYHCPSPX's wall-clock-flake history):
+/// each repo's check drops a marker, waits, then checks whether its
+/// sibling's marker is *still present* — if the two secretly shared one
+/// lock, the second check would only start after the first had already
+/// removed its marker, and neither side would ever observe the other's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cross_repo_verification_admission_is_independent_and_proceeds_concurrently() {
     let home = tempfile::tempdir().unwrap();
@@ -508,8 +526,9 @@ async fn cross_repo_verification_admission_is_independent_and_proceeds_concurren
     let repo_b_dir = tempfile::tempdir().unwrap();
     let repo_a_name = init_repo(repo_a_dir.path());
     let repo_b_name = init_repo(repo_b_dir.path());
-    install_single_sleep_check(repo_a_dir.path(), 0.3);
-    install_single_sleep_check(repo_b_dir.path(), 0.3);
+    let shared = tempfile::tempdir().unwrap();
+    install_marker_check(repo_a_dir.path(), shared.path(), "a", "b");
+    install_marker_check(repo_b_dir.path(), shared.path(), "b", "a");
 
     let layout = Layout::at(home.path());
     let space = Space::open_in_memory().unwrap();
@@ -543,20 +562,28 @@ async fn cross_repo_verification_admission_is_independent_and_proceeds_concurren
         .await
         .unwrap();
 
-    let started = tokio::time::Instant::now();
     let (ra, rb) = tokio::join!(
         run_verify(&layout, &repo_a_name, "verify"),
         run_verify(&layout, &repo_b_name, "verify"),
     );
-    let elapsed = started.elapsed();
 
     assert_eq!(ra["exit"], json!(0), "{ra:#?}");
     assert_eq!(rb["exit"], json!(0), "{rb:#?}");
+
+    let overlap_log =
+        std::fs::read_to_string(shared.path().join("overlap.log")).unwrap_or_default();
+    let lines: Vec<&str> = overlap_log.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "both checks must have run and recorded an overlap observation: {overlap_log:?}"
+    );
     assert!(
-        elapsed < Duration::from_millis(550),
+        lines.contains(&"saw-b") && lines.contains(&"saw-a"),
         "two independent repos' verification admission lanes must run concurrently, not \
-         contend for one shared lock: took {elapsed:?} for two 300ms checks (a shared lock \
-         would take >=600ms)"
+         contend for one shared lock: each check must have observed its sibling's marker \
+         still present while it was running — if the lane were shared, the second check \
+         would only start after the first had already removed its marker: {overlap_log:?}"
     );
 }
 
