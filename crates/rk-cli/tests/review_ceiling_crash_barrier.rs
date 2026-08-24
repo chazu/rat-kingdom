@@ -331,11 +331,50 @@ impl Drop for Crashed {
         // daemons into the host running the suite. Do not ask it to shut down
         // gracefully: this fixture deliberately leaves a replacement reviewer
         // waiting, so graceful stop can block behind the behavior under test.
-        if let Some(pid) = daemon_pid(self.home.path()) {
-            if pid != std::process::id() && pid != self.dead_daemon_pid {
-                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
-            }
-        }
+        kill_owning_daemon(self.home.path(), Some(self.dead_daemon_pid));
+    }
+}
+
+/// Kill whichever daemon currently owns `home`, unless it is this test
+/// process itself or `spare` (a pid this test already knows is dead and has
+/// no reason to signal again).
+///
+/// Reads `home`'s pid file directly rather than round-tripping through an
+/// `rk daemon status` RPC (as [`daemon_pid`] does for the assertions that are
+/// actually under test): teardown runs under exactly the load that can make
+/// a subprocess spawn or RPC connect flaky, and a dropped daemon-status call
+/// must never silently leave a live daemon behind — unlike every other
+/// process this file exercises, a daemon does not exit on its own, so a
+/// missed kill here is a permanent leak, not a bounded one. Best-effort: a
+/// stale or unreadable pid file (or a `kill` that itself fails to spawn) just
+/// means nothing gets signalled, same as today's fallback.
+fn kill_owning_daemon(home: &Path, spare: Option<u32>) {
+    let Some(pid) = std::fs::read_to_string(home.join("rk.pid"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+    if pid == std::process::id() || Some(pid) == spare {
+        return;
+    }
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+}
+
+/// RAII teardown for a test that starts a real detached daemon but — unlike
+/// the crash tests above — never crashes it itself, so nothing else in the
+/// test tears it down. Declared *after* the `TempDir` it guards so it drops
+/// *before* that `TempDir`'s own destructor removes the directory (Rust
+/// drops locals in reverse declaration order): the pid file must still exist
+/// when [`kill_owning_daemon`] reads it. Runs on both success and panic,
+/// same as [`Crashed`]'s own cleanup.
+struct DaemonGuard {
+    home: std::path::PathBuf,
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        kill_owning_daemon(&self.home, None);
     }
 }
 
@@ -835,6 +874,14 @@ fn assert_transport_outage_is_typed_and_fenced(harness: &str, bin_env: &str, bin
     // non-retryable episode's ceiling well inside the `until` bounds below.
     let home = daemon_home(&review_workflow_real_adapter(harness), Some(1));
     let home_path = home.path().to_path_buf();
+    // Unlike the crash tests above, nothing here ever kills this daemon —
+    // the whole point of this test is that it converges without a crash —
+    // so without this guard it (and its socket) would run forever after the
+    // test exits. See `DaemonGuard`'s doc for why it must be declared after
+    // `home`.
+    let _daemon_guard = DaemonGuard {
+        home: home_path.clone(),
+    };
     let bin = fake_transport_failure_binary(home.path(), bin_name);
 
     let (repo, head_sha) = candidate_repo(Some(NO_REVIEW_DEATH_RETRY_POLICY));
