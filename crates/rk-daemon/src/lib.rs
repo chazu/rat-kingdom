@@ -40,6 +40,7 @@ pub mod steer;
 pub mod supervisor;
 pub mod sync;
 pub mod tickets;
+pub mod transport_breaker;
 pub mod workflow_exec;
 
 pub use client::{Client, ClientRpcError, WatchStream};

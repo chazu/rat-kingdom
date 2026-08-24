@@ -355,6 +355,7 @@ fn spawning_record(journal: SpawnJournal<'_>) -> AgentRecord {
         updated_at: now,
         archived_at: None,
         liveness: crate::agents::LivenessObservation::default(),
+        transport_outage: None,
     }
 }
 
@@ -701,6 +702,13 @@ pub struct Supervisor {
     /// must be read in real time from the event-handling path (mirrors
     /// `min_free_disk_gb` above) rather than only on a periodic sweep tick.
     done_kill_grace_secs: AtomicU64,
+    /// `[supervisor] transport_breaker_trip_threshold`: consecutive
+    /// castle-wide pre-work transport failures for one provider that trip
+    /// the circuit breaker. Same reasoning as `done_kill_grace_secs` —
+    /// `record_transport_outage` needs it in real time from the
+    /// event-handling path, not just on the periodic sweep tick that
+    /// otherwise carries a fresh `SupervisorConfig` on every call.
+    transport_breaker_trip_threshold: AtomicU64,
     /// Push channels for automated recovery actions this supervisor
     /// announces (kill-at-`rk done` today). Set once by `Daemon::new`'s
     /// config-loading path via [`set_sinks`](Supervisor::set_sinks) —
@@ -711,6 +719,12 @@ pub struct Supervisor {
     /// announcements (`RecoveryAnnouncer` state must persist across calls to
     /// cap correctly — see `recovery.rs`).
     announcer: crate::recovery::RecoveryAnnouncer,
+    /// Castle-wide, per-provider circuit breaker for pre-work harness
+    /// transport outages (TKT-01M0HND8M25GYN1ZTRET3S5769). Durable — see
+    /// [`crate::transport_breaker::TransportBreakers`] — unlike
+    /// `respawn_state`: a daemon restart must not silently re-open a breaker
+    /// that was protecting a genuinely down provider.
+    transport_breakers: Mutex<crate::transport_breaker::TransportBreakers>,
 }
 
 /// How far one agent generation has got through reporting its completion.
@@ -839,6 +853,24 @@ enum RespawnDecision {
 
 fn is_auto_respawn_candidate(record: &AgentRecord) -> bool {
     matches!(record.state, AgentState::Orphaned | AgentState::Failed)
+}
+
+/// Deterministic per-attempt jitter (seconds, in `[0, jitter_window_secs)`)
+/// added to a pre-work transport-outage retry's backoff. Derived from the
+/// agent name and attempt number rather than true randomness so the
+/// schedule is stable and restart-safe without persisting a seed: the same
+/// generation retrying the same attempt always waits the same jittered
+/// window, but different agents (or different attempts) spread out instead
+/// of all retrying in lockstep on a provider-wide outage.
+fn transport_retry_jitter_secs(name: &str, attempts: u32, jitter_window_secs: u64) -> u64 {
+    if jitter_window_secs == 0 {
+        return 0;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    attempts.hash(&mut hasher);
+    hasher.finish() % jitter_window_secs
 }
 
 /// Serializes merges to the same target branch — the land / merge queue.
@@ -1277,6 +1309,9 @@ impl Supervisor {
             }
         }
         let log = crate::agent_log::AgentLog::new(&layout);
+        let transport_breakers = crate::transport_breaker::TransportBreakers::load(
+            &layout.home().join("transport_breaker.json"),
+        )?;
         Ok(Self {
             layout,
             castle,
@@ -1313,8 +1348,13 @@ impl Supervisor {
             done_kill_grace_secs: AtomicU64::new(
                 rk_core::config::SupervisorConfig::default().done_kill_grace_secs,
             ),
+            transport_breaker_trip_threshold: AtomicU64::new(
+                rk_core::config::SupervisorConfig::default().transport_breaker_trip_threshold
+                    as u64,
+            ),
             sinks: Mutex::new(rk_core::notify::SinkRegistry::default()),
             announcer: crate::recovery::RecoveryAnnouncer::new(),
+            transport_breakers: Mutex::new(transport_breakers),
         })
     }
 
@@ -1655,6 +1695,13 @@ impl Supervisor {
     /// [`set_min_free_disk_gb`](Supervisor::set_min_free_disk_gb).
     pub fn set_done_kill_grace_secs(&self, secs: u64) {
         self.done_kill_grace_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// `[supervisor] transport_breaker_trip_threshold`, applied by
+    /// `Daemon::new`/`set_sweep_config` from config — see the field doc.
+    pub fn set_transport_breaker_trip_threshold(&self, threshold: u32) {
+        self.transport_breaker_trip_threshold
+            .store(threshold as u64, Ordering::Relaxed);
     }
 
     /// The per-agent transcript store (for `agent.log` reads and `--follow`).
@@ -2568,9 +2615,24 @@ impl Supervisor {
         }
         match event {
             HarnessEvent::Started { session_id } => {
-                let _ = self.lock_registry().update(name, |r| {
+                let had_outage = self
+                    .lock_registry()
+                    .get(name)
+                    .is_some_and(|r| r.transport_outage.is_some());
+                let updated = self.lock_registry().update(name, |r| {
                     r.session_id = session_id.clone();
+                    // A `Started` handshake is proof of life: whatever
+                    // pre-work transport-outage episode was in progress for
+                    // this generation is over, and the castle-wide breaker
+                    // for its provider gets the same proof (see below).
+                    r.transport_outage = None;
                 });
+                if had_outage {
+                    if let Ok(Some(record)) = updated {
+                        self.lock_transport_breakers()
+                            .record_success(&record.harness);
+                    }
+                }
             }
             HarnessEvent::Usage { usage } => {
                 let real_usage = usage.total() > 0;
@@ -2874,11 +2936,9 @@ impl Supervisor {
                     }
                 }
             }
-            // Retry-schedule/circuit-breaker handling lands in a follow-up
-            // increment (TKT-01M0HND8M25GYN1ZTRET3S5769); for now this is a
-            // deliberate no-op so the new event variant does not change any
-            // existing behavior.
-            HarnessEvent::TransportFailure { .. } => {}
+            HarnessEvent::TransportFailure { outcome } => {
+                self.record_transport_outage(name, &outcome);
+            }
         }
     }
 
@@ -4170,6 +4230,217 @@ impl Supervisor {
         );
         if let Err(e) = self.space.out(tuple.into_trail(DEFAULT_TRAIL_TTL)) {
             warn!(error = %e, "failed to emit respawn-exhausted need");
+        }
+    }
+
+    /// Record one pre-work harness transport failure: bump (or start) this
+    /// generation's durable retry-schedule episode on its `AgentRecord`, and
+    /// feed the castle-wide per-provider circuit breaker. Called from
+    /// `handle_event` the moment a `TransportFailure` event arrives — the
+    /// `Exited` event that always follows it drives the ordinary
+    /// live->Failed state transition (and so the ordinary WIP release)
+    /// exactly as any other crashed launch does; this only adds the typed,
+    /// durable retry bookkeeping on top.
+    fn record_transport_outage(&self, name: &str, outcome: &rk_harness::TransportOutcome) {
+        let now = Utc::now();
+        let _ = self.lock_registry().update(name, |r| {
+            let attempts = r
+                .transport_outage
+                .as_ref()
+                .map(|o| o.attempts + 1)
+                .unwrap_or(1);
+            r.transport_outage = Some(crate::agents::TransportOutageState {
+                provider: outcome.provider.clone(),
+                class: outcome.class,
+                retryable: outcome.retryable,
+                attempts,
+                last_failure_at: now,
+                evidence: outcome.evidence.clone(),
+                ceiling_hit: false,
+                circuit_refused: false,
+            });
+        });
+        // Cheap, safe default: a breaker that never received the threshold
+        // config yet (bare/test supervisor) still counts failures — it just
+        // never trips, since `record_failure`'s own zero-threshold guard
+        // matches `TransportBreakers::is_open`'s zero-cooldown guard. Real
+        // config is applied by `Daemon::new` before any traffic flows.
+        self.lock_transport_breakers().record_failure(
+            &outcome.provider,
+            self.transport_breaker_trip_threshold
+                .load(Ordering::Relaxed) as u32,
+            now,
+        );
+    }
+
+    /// What the pre-work transport-outage retry sweep decided to do about
+    /// one agent whose generation is mid-episode. Mirrors
+    /// [`RespawnDecision`], with the addition of the castle-wide breaker.
+    fn decide_transport_retry(
+        &self,
+        record: &AgentRecord,
+        now: DateTime<Utc>,
+        cfg: &SupervisorConfig,
+    ) -> RespawnDecision {
+        let Some(outage) = &record.transport_outage else {
+            return RespawnDecision::Wait;
+        };
+        if outage.ceiling_hit {
+            return RespawnDecision::Wait;
+        }
+        if !outage.retryable || outage.attempts >= cfg.transport_retry_max_attempts {
+            return RespawnDecision::Escalate;
+        }
+        if self.lock_transport_breakers().is_open(
+            &outage.provider,
+            now,
+            cfg.transport_breaker_cooldown_secs,
+        ) {
+            return RespawnDecision::Wait;
+        }
+        let backoff = cfg
+            .transport_retry_backoff_secs
+            .saturating_mul(1u64 << (outage.attempts.saturating_sub(1)).min(16));
+        let jitter = transport_retry_jitter_secs(
+            &record.name,
+            outage.attempts,
+            cfg.transport_retry_jitter_secs,
+        );
+        let waited = (now - outage.last_failure_at).num_seconds().max(0) as u64;
+        if waited >= backoff.saturating_add(jitter) {
+            RespawnDecision::Respawn
+        } else {
+            RespawnDecision::Wait
+        }
+    }
+
+    /// Periodic pass over agents mid pre-work-transport-outage episode:
+    /// bounded, jittered retry; castle-wide circuit-breaker refusal; ceiling
+    /// escalation. Rides the same tick as [`Self::respawn_sweep`] but is
+    /// entirely independent of it — a `transport_outage` record is never a
+    /// `RespawnState` entry, so the two sweeps never double-count or
+    /// double-launch the same generation.
+    ///
+    /// Restart-safe by construction: every input this reads (`transport_outage`
+    /// on the record, the durable breaker file) survives a daemon restart, so
+    /// resuming after one continues the exact same schedule — same attempt
+    /// count, same backoff clock — rather than granting a fresh budget or
+    /// relaunching a generation that already exhausted its ceiling.
+    pub fn transport_retry_sweep(self: &Arc<Self>, cfg: &SupervisorConfig, sinks: &SinkRegistry) {
+        if cfg.transport_retry_max_attempts == 0 {
+            return;
+        }
+        let now = Utc::now();
+        let candidates: Vec<AgentRecord> = self
+            .lock_registry()
+            .list()
+            .into_iter()
+            .filter(|r| r.transport_outage.is_some() && is_auto_respawn_candidate(r))
+            .cloned()
+            .collect();
+
+        for record in &candidates {
+            if self.branch_already_merged(record) {
+                continue;
+            }
+            match self.decide_transport_retry(record, now, cfg) {
+                RespawnDecision::Wait => {}
+                RespawnDecision::Respawn => {
+                    if self.would_exceed_budget(&record.repo_name) {
+                        warn!(agent = %record.name, "skipping transport-outage retry: over budget cap");
+                        continue;
+                    }
+                    let notice = EscalationNotice::new(
+                        "placeholder",
+                        "transport_retry",
+                        Severity::Warn,
+                        record.repo_name.clone(),
+                        record.name.clone(),
+                        format!(
+                            "pre-work transport-outage sweep retrying {} (task: {})",
+                            record.name,
+                            record.task.as_deref().unwrap_or("-")
+                        ),
+                    );
+                    let outcome = self.recovery_announcer.announce(
+                        &self.space,
+                        sinks,
+                        crate::recovery::RecoveryAction {
+                            kind: "transport_retry".into(),
+                            instance: "supervisor".into(),
+                            notice,
+                        },
+                        crate::recovery::RateCap::per_hour(cfg.respawn_rate_cap_per_hour),
+                    );
+                    match outcome {
+                        Ok(outcome) if outcome.held() => {
+                            warn!(
+                                agent = %record.name,
+                                "transport-outage retry HELD: castle-wide respawn rate cap hit"
+                            );
+                        }
+                        Ok(_) => {
+                            if let Err(e) = self.respawn(&record.name) {
+                                warn!(agent = %record.name, error = %e, "transport-outage retry failed");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(agent = %record.name, error = %e, "failed to announce transport-outage retry; skipping this tick");
+                        }
+                    }
+                }
+                RespawnDecision::Escalate => {
+                    self.escalate_transport_outage(record, cfg);
+                }
+            }
+        }
+    }
+
+    /// Escalate an exhausted (or non-retryable) transport-outage episode to
+    /// a human: emit a `need` and mark it escalated so this fires exactly
+    /// once. The record stays `Failed` (or `Orphaned`) — never respawned
+    /// again — which is what releases its WIP slot for good; nothing further
+    /// is needed here for that.
+    fn escalate_transport_outage(&self, record: &AgentRecord, cfg: &SupervisorConfig) {
+        let _ = self.lock_registry().update(&record.name, |r| {
+            if let Some(outage) = &mut r.transport_outage {
+                outage.ceiling_hit = true;
+            }
+        });
+        let Some(outage) = &record.transport_outage else {
+            return;
+        };
+        warn!(
+            agent = %record.name,
+            provider = %outage.provider,
+            class = ?outage.class,
+            attempts = outage.attempts,
+            "pre-work transport outage exhausted its retry ceiling — escalating a need for a human"
+        );
+        let tuple = Tuple::new(
+            Category::Need,
+            record.repo_name.clone(),
+            record.name.clone(),
+            self.castle.clone(),
+            json!({
+                "type": "transport_outage_exhausted",
+                "agent": record.name,
+                "task": record.task,
+                "provider": outage.provider,
+                "class": outage.class,
+                "retryable": outage.retryable,
+                "attempts": outage.attempts,
+                "max_attempts": cfg.transport_retry_max_attempts,
+                "evidence": outage.evidence,
+                "text": format!(
+                    "agent {} could not reach its {} harness ({:?} transport failure) after {} attempt(s); \
+                     needs a human — investigate then `rk respawn {}`",
+                    record.name, outage.provider, outage.class, outage.attempts, record.name
+                ),
+            }),
+        );
+        if let Err(e) = self.space.out(tuple.into_trail(DEFAULT_TRAIL_TTL)) {
+            warn!(error = %e, "failed to emit transport-outage-exhausted need");
         }
     }
 
@@ -6744,6 +7015,15 @@ impl Supervisor {
 
     fn lock_respawn_state(&self) -> std::sync::MutexGuard<'_, HashMap<String, RespawnState>> {
         match self.respawn_state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    fn lock_transport_breakers(
+        &self,
+    ) -> std::sync::MutexGuard<'_, crate::transport_breaker::TransportBreakers> {
+        match self.transport_breakers.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }

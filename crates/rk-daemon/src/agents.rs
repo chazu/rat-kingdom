@@ -196,6 +196,43 @@ pub struct AgentRecord {
     /// See [`LivenessObservation`].
     #[serde(default)]
     pub liveness: LivenessObservation,
+    /// Bounded, durable retry-schedule state for a pre-work harness
+    /// transport outage (TKT-01M0HND8M25GYN1ZTRET3S5769). `None` = no
+    /// outage in progress. Persisted with the rest of this generation
+    /// (unlike the in-memory crash-loop `RespawnState`) so a daemon restart
+    /// resumes the same schedule — same attempt count, same backoff clock —
+    /// instead of granting a fresh retry budget or relaunching a duplicate.
+    #[serde(default)]
+    pub transport_outage: Option<TransportOutageState>,
+}
+
+/// See the field doc on [`AgentRecord::transport_outage`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransportOutageState {
+    /// Harness kind ("claude" | "codex").
+    pub provider: String,
+    pub class: rk_harness::TransportClass,
+    /// Whether retrying can plausibly help (see
+    /// `rk_harness::TransportOutcome::retryable`) — `false` (e.g. a
+    /// rejected credential) escalates after one failure instead of
+    /// spending the retry ceiling on a certain repeat.
+    pub retryable: bool,
+    /// Failures observed for the CURRENT outage episode. Reset by clearing
+    /// this whole field the moment the generation reaches `Started` again.
+    pub attempts: u32,
+    pub last_failure_at: DateTime<Utc>,
+    /// Redacted evidence from the most recent failure.
+    pub evidence: String,
+    /// Set once the retry ceiling (or a non-retryable class) has been
+    /// escalated to a human — the retry sweep then leaves this generation
+    /// alone forever instead of re-escalating every tick.
+    #[serde(default)]
+    pub ceiling_hit: bool,
+    /// Set by the most recent sweep tick purely for status/inbox rendering:
+    /// whether that attempt was refused by an open castle-wide circuit
+    /// breaker rather than genuinely retried.
+    #[serde(default)]
+    pub circuit_refused: bool,
 }
 
 /// Evidence a stuck sweep uses to tell a genuinely wedged/dead generation
