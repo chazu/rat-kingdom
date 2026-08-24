@@ -688,6 +688,153 @@ pub fn render_digest(digest: &Value) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Shadow-review comparison report
+// ---------------------------------------------------------------------------
+
+/// Durable artifact identity written by the landing pipeline after a shadow
+/// reviewer finishes or exhausts its bounded wait.
+const SHADOW_COMPARISON_IDENTITY: &str = "review-shadow-comparison";
+
+/// Aggregate recorded primary-vs-shadow reviewer outcomes over a bounded
+/// window. The primary verdict remains authoritative; this is a read-only
+/// operator report for deciding whether a future policy change is warranted.
+pub async fn shadow_review_report(
+    layout: &Layout,
+    repo: Option<&str>,
+    since: &str,
+    as_json: bool,
+) -> Result<()> {
+    let cutoff = Utc::now() - parse_since(since)?;
+    let mut client = Client::connect_or_spawn(layout).await?;
+    // Same cap hazard as `digest`'s `scan_category` (TKT-01M0QZFTYQW4WV200TYGCN46XA):
+    // the daemon's default `space.scan` is oldest-first bounded by
+    // `MAX_SCAN_TUPLES`, so once comparison artifacts exceed that cap — easily,
+    // fleet-wide when `--repo` is omitted — an unqualified scan returns the
+    // OLDEST comparisons and the `--since` window silently comes back empty.
+    // `newest: true` spends the cap on the tail instead, which is the only
+    // ordering a recency report can be built from. It rides alongside the
+    // flattened match pattern in `ScanParams`, hence the same object.
+    let mut pattern = json!({
+        "category": "artifact",
+        "identity": SHADOW_COMPARISON_IDENTITY,
+        "newest": true,
+    });
+    if let Some(repo) = repo {
+        pattern["scope"] = json!(repo);
+    }
+
+    let tuples = client.call("space.scan", pattern).await?["tuples"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let report = build_shadow_review_report(since, cutoff, &tuples);
+
+    if as_json {
+        println!("{report}");
+    } else {
+        println!("{}", render_shadow_review_report(&report));
+    }
+    Ok(())
+}
+
+/// Build per-repository and overall agreement counts from comparison
+/// artifacts. `no-verdict` is excluded from the disagreement-rate denominator
+/// because a missing shadow verdict is a liveness signal, not model disagreement.
+pub fn build_shadow_review_report(since: &str, cutoff: DateTime<Utc>, tuples: &[Value]) -> Value {
+    let fresh: Vec<&Value> = tuples
+        .iter()
+        .filter(|tuple| parse_time(&tuple["payload"]["recorded_at"]).is_some_and(|at| at >= cutoff))
+        .collect();
+
+    let summarize = |rows: &[&Value]| {
+        let mut agree = 0u64;
+        let mut disagree = 0u64;
+        let mut no_verdict = 0u64;
+        for tuple in rows {
+            match tuple["payload"]["agreement"].as_str() {
+                Some("agree") => agree += 1,
+                Some("disagree") => disagree += 1,
+                _ => no_verdict += 1,
+            }
+        }
+        let decided = agree + disagree;
+        json!({
+            "total": rows.len(),
+            "agree": agree,
+            "disagree": disagree,
+            "no_verdict": no_verdict,
+            "disagreement_rate": if decided == 0 {
+                Value::Null
+            } else {
+                json!(disagree as f64 / decided as f64)
+            },
+        })
+    };
+
+    let mut by_repo: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
+    for tuple in &fresh {
+        by_repo
+            .entry(tuple["scope"].as_str().unwrap_or("?").to_string())
+            .or_default()
+            .push(tuple);
+    }
+    let repos: Map<String, Value> = by_repo
+        .iter()
+        .map(|(repo, rows)| (repo.clone(), summarize(rows)))
+        .collect();
+
+    json!({
+        "since": since,
+        "cutoff": cutoff.to_rfc3339(),
+        "overall": summarize(&fresh),
+        "repos": repos,
+    })
+}
+
+/// Render the structured shadow-review report for an operator terminal.
+pub fn render_shadow_review_report(report: &Value) -> String {
+    let mut out = format!(
+        "shadow review report — last {}\n",
+        report["since"].as_str().unwrap_or("?")
+    );
+    let overall = &report["overall"];
+    let total = overall["total"].as_u64().unwrap_or(0);
+    if total == 0 {
+        out.push_str("\nno shadow-review comparisons recorded in this window");
+        return out;
+    }
+
+    let rate_suffix = |summary: &Value| match summary["disagreement_rate"].as_f64() {
+        Some(rate) => format!(" (disagreement rate: {:.1}%)", rate * 100.0),
+        None => String::new(),
+    };
+    out.push_str(&format!(
+        "\noverall: {total} comparisons — {} agree, {} disagree, {} no-verdict{}\n",
+        overall["agree"],
+        overall["disagree"],
+        overall["no_verdict"],
+        rate_suffix(overall),
+    ));
+
+    if let Some(repos) = report["repos"].as_object() {
+        if repos.len() > 1 {
+            out.push_str("\nby repo:\n");
+            for (repo, summary) in repos {
+                out.push_str(&format!(
+                    "  {repo}: {} comparisons — {} agree, {} disagree, {} no-verdict{}\n",
+                    summary["total"],
+                    summary["agree"],
+                    summary["disagree"],
+                    summary["no_verdict"],
+                    rate_suffix(summary),
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// Summarize the report with a one-shot `claude -p` call, feeding the report
 /// on stdin. Any failure (missing binary, non-zero exit) is an `Err` the
 /// caller degrades from — the deterministic report is always available.
@@ -1231,6 +1378,83 @@ mod tests {
             timeline_line(&row(1, 2, "dismiss + land"), 1, "running"),
             " ▶         dismiss + land"
         );
+    }
+
+    fn shadow_comparison(scope: &str, recorded_at: &str, agreement: &str) -> Value {
+        json!({
+            "category": "artifact",
+            "scope": scope,
+            "identity": SHADOW_COMPARISON_IDENTITY,
+            "author": "daemon",
+            "payload": {
+                "agreement": agreement,
+                "recorded_at": recorded_at,
+            },
+        })
+    }
+
+    #[test]
+    fn shadow_review_report_filters_window_and_aggregates_by_repo() {
+        let cutoff = DateTime::parse_from_rfc3339("2026-08-15T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let tuples = vec![
+            shadow_comparison("rat-kingdom", "2026-08-16T00:00:00Z", "agree"),
+            shadow_comparison("rat-kingdom", "2026-08-16T01:00:00Z", "agree"),
+            shadow_comparison("rat-kingdom", "2026-08-16T02:00:00Z", "disagree"),
+            shadow_comparison("rat-kingdom", "2026-08-16T03:00:00Z", "no-verdict"),
+            shadow_comparison("other-repo", "2026-08-16T04:00:00Z", "disagree"),
+            shadow_comparison("rat-kingdom", "2026-08-14T23:59:59Z", "disagree"),
+        ];
+
+        let report = build_shadow_review_report("7d", cutoff, &tuples);
+
+        assert_eq!(report["overall"]["total"], 5);
+        assert_eq!(report["overall"]["agree"], 2);
+        assert_eq!(report["overall"]["disagree"], 2);
+        assert_eq!(report["overall"]["no_verdict"], 1);
+        assert_eq!(report["overall"]["disagreement_rate"], 0.5);
+        assert_eq!(report["repos"]["rat-kingdom"]["total"], 4);
+        assert_eq!(
+            report["repos"]["rat-kingdom"]["disagreement_rate"],
+            1.0 / 3.0
+        );
+        assert_eq!(report["repos"]["other-repo"]["disagreement_rate"], 1.0);
+
+        let rendered = render_shadow_review_report(&report);
+        assert!(rendered.contains("5 comparisons"));
+        assert!(rendered.contains("disagreement rate: 50.0%"));
+        assert!(rendered.contains("by repo:"));
+        assert!(rendered.contains("rat-kingdom: 4 comparisons"));
+    }
+
+    #[test]
+    fn shadow_review_report_excludes_no_verdict_from_rate() {
+        let cutoff = DateTime::parse_from_rfc3339("2026-08-15T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let tuples = vec![shadow_comparison(
+            "rat-kingdom",
+            "2026-08-16T00:00:00Z",
+            "no-verdict",
+        )];
+
+        let report = build_shadow_review_report("7d", cutoff, &tuples);
+
+        assert_eq!(report["overall"]["total"], 1);
+        assert_eq!(report["overall"]["no_verdict"], 1);
+        assert!(report["overall"]["disagreement_rate"].is_null());
+        let rendered = render_shadow_review_report(&report);
+        assert!(rendered.contains("1 no-verdict"));
+        assert!(!rendered.contains("disagreement rate"));
+    }
+
+    #[test]
+    fn shadow_review_report_renders_empty_window() {
+        let report = build_shadow_review_report("7d", Utc::now(), &[]);
+        let rendered = render_shadow_review_report(&report);
+
+        assert!(rendered.contains("no shadow-review comparisons recorded"));
     }
 
     fn span(phase: &str, attempt: u64, created_at: &str, payload: Value) -> Value {
