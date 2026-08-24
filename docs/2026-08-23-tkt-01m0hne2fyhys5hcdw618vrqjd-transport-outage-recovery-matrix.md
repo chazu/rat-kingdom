@@ -75,29 +75,38 @@ properties the closure ticket asks the matrix to exercise.
 | Outage point | Claude | Codex | Restart at durable transition | Breaker open/cooldown | Same/alternate harness | Ceiling/late evidence | Budgets+generation preserved |
 |---|---|---|---|---|---|---|---|
 | Before work | `transport_outage.rs::outage_retry_survives_restart_without_duplicate_launch_or_ledger_reset` | `transport_outage.rs::..._codex` (this ticket) | yes (daemon killed/replaced mid-episode) | yes (trip + refusal; auto-close proven via operator `respawn`→`Started`) | same-harness only (operator respawn) | ceiling exhaustion + no-duplicate-row proven | yes (`spawn`, `created_at`, `cost_usd`, `usage` asserted equal across restart) |
-| After commit / during local verify | `post_commit_recovery_rpc.rs` (generic `FakeHarness`, not real claude/codex adapters) | same fixture, provider-agnostic | not yet — daemon-restart-mid-recovery is unit-level only (`supervisor.rs`), not proven over RPC | n/a (breaker is a pre-work concept only) | same-harness continuation unit-tested only; **alternate-harness continuation and WIP release not proven over RPC** | n/a | not asserted at the RPC level (only at-most-once ack is) |
-| During reviewer wait | `review_ceiling_crash_barrier.rs` | same harness fixture is provider-agnostic (`fake` kind); not exercised against real claude/codex adapters | yes (`fault.rs` barriers pre/post durable marker + SIGKILL) | n/a | n/a (single reviewer identity per attempt) | yes — exactly-once convergence, late APPROVE retained as evidence without landing, idempotent reenqueue | not directly asserted (scope is settlement identity, not ledger) |
+| After commit / during local verify | `post_commit_recovery_rpc.rs` (generic `FakeHarness`, wire ack path) + `post_commit_recovery_continuation_rpc.rs::continue_recovery_resumes_the_same_provider_across_a_restart_with_budget_preserved` (real Claude adapter, TKT-01M0RZWDJQ6B49WCMSK3DC54T6) | `post_commit_recovery_continuation_rpc.rs::continue_recovery_routes_to_a_real_alternate_harness_across_a_daemon_restart` (real Claude→Codex, TKT-01M0RX7X896HF6WWYVX3BNFKEG) | yes — both continuation tests and `abandoned_recovery_stays_terminal_across_a_restart_under_a_live_respawn_sweep` kill/replace the daemon between detection and the operator action, over a real socket | n/a (breaker is a pre-work concept only) | both proven over RPC/CLI with real adapters: same-provider resume via the real `rk continue-recovery` CLI (no `--harness`), alternate-provider via `agent.continue_recovery {"harness":"codex"}`; abandonment/WIP release proven under a LIVE restarted respawn-sweep loop | n/a | yes, byte-for-byte: same-provider test asserts `cost_usd`/`recovery.budget_remaining_usd` equal across detection, restart, continuation, and replay under a nonzero agent budget; alternate-provider test asserts `spawn` identity preserved across restart+continuation+replay |
+| During reviewer wait | `review_ceiling_crash_barrier.rs` (plain hang) + reviewer-death fixture (real claude/codex, non-retryable auth failure, TKT-01M0RX7X8Y7J6Y56QTXGKFCSHX) | same fixture, parameterized over both providers | yes (`fault.rs` barriers pre/post durable marker + SIGKILL) | n/a | n/a (single reviewer identity per attempt) | yes — exactly-once convergence, late APPROVE retained as evidence without landing, idempotent reenqueue; typed transport-outage reviewer death now surfaces its own inbox row distinct from a plain hang | not directly asserted (scope is settlement identity, not ledger) |
 
-**Open gaps, not attempted in this closure pass** (filed as follow-up
-tickets rather than left as an uncommitted attempt in this budget):
+**Resolved in this closure pass** (formerly the three open gaps below):
 
-1. Post-commit recovery: prove same-harness resume, alternate-harness
-   continuation, daemon-restart-mid-recovery, and WIP release over RPC/CLI
-   (today only unit-tested in `supervisor.rs`), and against real claude/codex
-   adapter fixtures rather than the generic `FakeHarness`. Filed as
-   TKT-01M0RX7X896HF6WWYVX3BNFKEG.
-2. Reviewer-wait: distinguish a *transport-classified* outage during review
-   (adapter reports certificate/auth/unavailable) from the plain hung/timeout
-   case `review_ceiling_crash_barrier.rs` already covers, and prove it against
-   real claude/codex fixtures. Filed as TKT-01M0RX7X8Y7J6Y56QTXGKFCSHX.
-3. `RecoveryAnnouncer`'s hardcoded post-commit rate cap: decide whether it
-   should become an operator-tunable `SupervisorConfig` field for parity with
-   `respawn_rate_cap_per_hour`. Not filed as a separate ticket — noted here
-   for whoever picks up gap 1.
+1. Post-commit recovery: same-harness resume, alternate-harness continuation,
+   daemon-restart-mid-recovery, and WIP release are now all proven over
+   RPC/CLI against real claude/codex adapter fixtures rather than the generic
+   `FakeHarness`. Alternate-harness continuation, restart-mid-recovery, and
+   abandon-under-live-sweep landed under TKT-01M0RX7X896HF6WWYVX3BNFKEG
+   (Deyna-12); the same-provider resume plus exact `budget_remaining_usd`
+   preservation across restart landed under
+   TKT-01M0RZWDJQ6B49WCMSK3DC54T6 (Linguini-12), driven through the real `rk
+   continue-recovery` CLI rather than raw RPC. One implementation note this
+   pass surfaced: `Supervisor::handle_event`'s `Started` arm clears the whole
+   parked `recovery` record — ack included — the instant a continued
+   generation proves liveness again, so a caller replaying `action_id` is
+   only guaranteed the recorded outcome up until that point, not forever
+   after. The same-provider test's fixture blocks the resumed harness on a
+   release sentinel so the at-most-once/budget assertions run against the
+   still-parked record; this is a real, if narrow, edge on the documented
+   "the SAME key after acknowledgement replays the same recorded outcome"
+   contract and may be worth a follow-up ticket if an operator retry can
+   plausibly land after the resumed harness has already spoken.
+2. Reviewer-wait: a *transport-classified* outage during review is now
+   distinguished from the plain hung/timeout case, proven against real
+   claude/codex fixtures, under TKT-01M0RX7X8Y7J6Y56QTXGKFCSHX (Emile-12).
+3. `RecoveryAnnouncer`'s hardcoded post-commit rate cap: still open — decide
+   whether it should become an operator-tunable `SupervisorConfig` field for
+   parity with `respawn_rate_cap_per_hour`. Not filed as a separate ticket.
 
-The parent ticket's closure gate ("close the parent only when this matrix
-passes under full workspace verification") is **not** met by this pass alone
-— items 1 and 2 above are load-bearing cells the parent's acceptance criteria
-name explicitly (alternate-harness continuation, WIP release, at-most-once
-continuation for the post-commit path). The parent is left open with these
-gaps tracked as sub-tickets.
+All three sub-tickets under TKT-01M0HNE2FYHYS5HCDW618VRQJD are now closed or
+complete; the parent's closure gate ("close the parent only when this matrix
+passes under full workspace verification") depends only on that full
+workspace run, not on any further test authoring.
