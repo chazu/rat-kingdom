@@ -1249,6 +1249,36 @@ impl Daemon {
                     }
                 }
             });
+
+            // Late-review reconciliation must not share the drain task above.
+            // `run_cycle()` may legitimately spend the whole review ceiling in
+            // `await_primary_verdict`; putting reconciliation after that await
+            // starves late evidence for every other settled attempt (and for a
+            // restarted copy of the same awaiting entry). Keep its feed/timer
+            // independent so a verdict arriving from a fenced generation is
+            // retained promptly even while another review wait is live.
+            let landing_reconciler = Arc::clone(&daemon_landing);
+            let mut late_review_feed = daemon.space.subscribe();
+            let mut late_review_shutdown = daemon.shutdown_tx.subscribe();
+            background_tasks.spawn(async move {
+                let mut tick = tokio::time::interval(landing_interval);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        recv = late_review_feed.recv() => match recv {
+                            Ok(_) => while late_review_feed.try_recv().is_ok() {},
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                        _ = late_review_shutdown.changed() => break,
+                    }
+                    match landing_reconciler.reconcile_late_review_evidence() {
+                        Ok(0) => {}
+                        Ok(n) => debug!(retained = n, "retained late review evidence"),
+                        Err(e) => warn!(error = %e, "late review evidence reconciliation failed"),
+                    }
+                }
+            });
         }
 
         // Scheduler loop: fire registered #Schedule workflows on a cron cadence.
@@ -1750,6 +1780,8 @@ impl Daemon {
                 | "agent.revert"
                 | "repo.add"
                 | "repo.land"
+                | "repo.land.reenqueue"
+                | "repo.land.cancel_review"
                 | "repo.remove"
                 | "repo.onboard.start"
                 | "repo.onboard.propose"
@@ -2876,6 +2908,51 @@ impl Daemon {
                 };
                 reply(match result {
                     Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
+                })
+            }
+            "repo.land.reenqueue" => {
+                let params: RepoLandReenqueueParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
+                    }
+                };
+                let result = self
+                    .landing()
+                    .reenqueue_ceiling_settled_review(
+                        std::path::Path::new(&params.repo),
+                        &params.branch,
+                        &params.target,
+                        &params.task,
+                        &params.attempt,
+                    )
+                    .await;
+                reply(match result {
+                    Ok(new_attempt) => Response::ok(id, json!({ "new_attempt": new_attempt })),
+                    Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
+                })
+            }
+            "repo.land.cancel_review" => {
+                let params: RepoLandCancelReviewParams = match parse_params(&req.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Outcome::Reply(Response::err(id, codes::BAD_PARAMS, error));
+                    }
+                };
+                let result = self
+                    .landing()
+                    .cancel_active_review(
+                        std::path::Path::new(&params.repo),
+                        &params.branch,
+                        &params.target,
+                        &params.task,
+                    )
+                    .await;
+                reply(match result {
+                    Ok(settlement) => {
+                        Response::ok(id, json!({ "attempt": settlement.payload.get("attempt") }))
+                    }
                     Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
                 })
             }
@@ -9268,6 +9345,36 @@ fn default_main_branch() -> String {
     "main".to_string()
 }
 
+/// `repo.land.reenqueue` — bounded, exactly-once dispatch of one fresh
+/// review attempt for a candidate whose prior attempt was ceiling-settled
+/// ([`crate::landing::LandingPipeline::settle_review_ceiling`]). `attempt`
+/// is the settled attempt id an escalation's `RESOLVE WITH:` text hands the
+/// operator — see [`crate::landing::LandingPipeline::reenqueue_after_ceiling`].
+#[derive(Deserialize)]
+struct RepoLandReenqueueParams {
+    repo: String,
+    branch: String,
+    #[serde(default = "default_main_branch")]
+    target: String,
+    task: String,
+    attempt: String,
+}
+
+/// `repo.land.cancel_review` — operator-triggered cancellation of the
+/// CURRENTLY active review attempt for `(branch, target, task)`, routed
+/// through [`crate::landing::LandingPipeline::settle_review_ceiling`] via
+/// [`crate::landing::LandingPipeline::cancel_active_review`]. No `attempt`
+/// param, unlike reenqueue: cancel targets whichever attempt is live right
+/// now, which the pipeline resolves itself from the durable queue entry.
+#[derive(Deserialize)]
+struct RepoLandCancelReviewParams {
+    repo: String,
+    branch: String,
+    #[serde(default = "default_main_branch")]
+    target: String,
+    task: String,
+}
+
 #[derive(Deserialize)]
 struct RevertParams {
     name: String,
@@ -10545,6 +10652,66 @@ mod authorize_reasoned_tests {
         let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
         assert!(!allowed);
         assert_eq!(reason, "operator_only_method");
+    }
+
+    #[test]
+    fn repo_land_reenqueue_refuses_an_ordinary_rat() {
+        let (_dir, daemon) = test_daemon_with_role("rat");
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "invalid-rat");
+        let request = Request {
+            id: "1".into(),
+            method: "repo.land.reenqueue".into(),
+            auth: token,
+            caller: "invalid-rat".into(),
+            client_version: None,
+            params: json!({"repo": ".", "branch": "b", "task": "t", "attempt": "a"}),
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
+        assert!(!allowed);
+        assert_eq!(reason, "operator_only_method");
+    }
+
+    #[test]
+    fn repo_land_reenqueue_allows_the_operator() {
+        let (_dir, daemon) = test_daemon();
+        let request = req("operator", "repo.land.reenqueue", "");
+        let origin = PeerOrigin {
+            pid_observed: true,
+            supervised_agents: Default::default(),
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &origin);
+        assert!(allowed);
+        assert_eq!(reason, "");
+    }
+
+    #[test]
+    fn repo_land_cancel_review_refuses_an_ordinary_rat() {
+        let (_dir, daemon) = test_daemon_with_role("rat");
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "invalid-rat");
+        let request = Request {
+            id: "1".into(),
+            method: "repo.land.cancel_review".into(),
+            auth: token,
+            caller: "invalid-rat".into(),
+            client_version: None,
+            params: json!({"repo": ".", "branch": "b", "task": "t"}),
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
+        assert!(!allowed);
+        assert_eq!(reason, "operator_only_method");
+    }
+
+    #[test]
+    fn repo_land_cancel_review_allows_the_operator() {
+        let (_dir, daemon) = test_daemon();
+        let request = req("operator", "repo.land.cancel_review", "");
+        let origin = PeerOrigin {
+            pid_observed: true,
+            supervised_agents: Default::default(),
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &origin);
+        assert!(allowed);
+        assert_eq!(reason, "");
     }
 }
 

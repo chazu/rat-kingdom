@@ -6138,6 +6138,44 @@ impl Supervisor {
         results
     }
 
+    /// Companion to [`dismiss_orphaned_instance_agents`](Self::dismiss_orphaned_instance_agents)
+    /// for the case that one deliberately excludes: a workflow instance
+    /// whose owning wait already gave up (a ceiling, or an explicit
+    /// cancellation) while the agent it was waiting on is STILL live
+    /// (`AgentState::is_live`) — e.g. a reviewer stuck reconnecting through a
+    /// transport outage (the 2026-08-21 incident: Codex reviewer Scurry-11
+    /// stayed `Running` and reconnecting well after its owning
+    /// steward-review workflow had already timed out). Leaving it running
+    /// holds fleet capacity indefinitely for a wait nothing is listening to
+    /// any more, so this tears the process down the same way an explicit
+    /// `dismiss` would (`dismiss_inner` with `park_if_dirty: true`, same
+    /// dirty-worktree guard the terminal-only sweep above applies) rather
+    /// than leaving it to reconnect forever.
+    ///
+    /// Best-effort, same contract as the terminal-only sweep: a single
+    /// agent's dismissal failing is logged and does not stop the others.
+    pub async fn dismiss_live_instance_agents(&self, instance: &str) -> Vec<(String, bool)> {
+        let names: Vec<(String, rk_core::id::SpawnId)> = {
+            let reg = self.lock_registry();
+            reg.list()
+                .into_iter()
+                .filter(|a| a.workflow_instance.as_deref() == Some(instance) && a.state.is_live())
+                .map(|a| (a.name.clone(), a.spawn_id()))
+                .collect()
+        };
+        let mut results = Vec::with_capacity(names.len());
+        for (name, spawn) in names {
+            match self.dismiss_inner(&name, true, true, Some(spawn)).await {
+                Ok(_) => results.push((name, true)),
+                Err(error) => {
+                    warn!(agent = %name, instance, %error, "review-ceiling sweep could not dismiss a still-live agent");
+                    results.push((name, false));
+                }
+            }
+        }
+        results
+    }
+
     /// Revert an agent branch's recorded landing — the undo for an unattended
     /// delivery that turned out bad (steward/drain landed it, then main
     /// broke). Revert-merges the merge commit recorded on the agent's record

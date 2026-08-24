@@ -159,6 +159,11 @@ enum Command {
     Dismiss(agent_cmds::DismissArgs),
     /// Submit a branch to the gated landing queue (or explicitly force an audited bypass).
     Land(agent_cmds::LandArgs),
+    /// Dispatch one fresh review attempt for a candidate whose prior review
+    /// was fenced at the landing pipeline's wait ceiling.
+    ReenqueueReview(agent_cmds::ReenqueueReviewArgs),
+    /// Explicitly cancel a candidate's currently active review attempt.
+    CancelReview(agent_cmds::CancelReviewArgs),
     /// Undo a bad landing: revert an agent's recorded merge commit and reopen
     /// its ticket.
     Revert(agent_cmds::RevertArgs),
@@ -1164,6 +1169,10 @@ async fn main() -> Result<()> {
         Command::Interrupt(args) => agent_cmds::interrupt(&layout, args, cli.json).await?,
         Command::Dismiss(args) => agent_cmds::dismiss(&layout, args, cli.json).await?,
         Command::Land(args) => agent_cmds::land(&layout, args, cli.json).await?,
+        Command::ReenqueueReview(args) => {
+            agent_cmds::reenqueue_review(&layout, args, cli.json).await?
+        }
+        Command::CancelReview(args) => agent_cmds::cancel_review(&layout, args, cli.json).await?,
         Command::Revert(args) => agent_cmds::revert(&layout, args, cli.json).await?,
         Command::Respawn(args) => agent_cmds::respawn(&layout, args, cli.json).await?,
         Command::ContinueRecovery(args) => {

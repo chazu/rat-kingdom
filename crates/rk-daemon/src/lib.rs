@@ -12,6 +12,7 @@ pub mod cron;
 pub mod drain;
 pub mod factory_analytics;
 pub mod factory_events;
+mod fault;
 pub mod inbox;
 pub mod ingest_auth;
 mod landing;

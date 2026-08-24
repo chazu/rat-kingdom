@@ -1721,7 +1721,7 @@ impl WorkflowEngine {
         // by `finalize_cleanup_enabled` (defaults off for bare/test daemons):
         // see the field doc for why this must not run unconditionally.
         if self.finalize_cleanup_enabled {
-            let swept = self.supervisor.dismiss_orphaned_instance_agents(id).await;
+            let swept = self.sweep_instance_agents(id).await;
             if !swept.is_empty() {
                 let failed = swept.iter().filter(|(_, ok)| !ok).count();
                 info!(
@@ -1733,6 +1733,29 @@ impl WorkflowEngine {
             }
         }
         Ok(())
+    }
+
+    /// Every agent this instance owns, terminal or still live, released in
+    /// one pass: [`Supervisor::dismiss_orphaned_instance_agents`] only ever
+    /// touches an already-terminal (`Completed`/`Failed`) record — by
+    /// design, so an ordinary completion never races a still-working agent
+    /// — but that means it structurally cannot release an agent that is
+    /// STILL `Running`/`Paused`/`Spawning` when its owning instance goes
+    /// terminal, e.g. a reviewer stuck reconnecting through a transport
+    /// outage (the 2026-08-21 incident this closes: a Codex reviewer stayed
+    /// `Running` and reconnecting well after its owning steward-review
+    /// workflow had already timed out, holding fleet capacity
+    /// indefinitely). [`Supervisor::dismiss_live_instance_agents`] is the
+    /// live-state counterpart; running both here means a workflow's own
+    /// terminal transition (ordinary completion, the B8 stale-timeout
+    /// sweep, or this module's error path) always durably releases every
+    /// agent it owns, regardless of that agent's own liveness state at the
+    /// moment — "transport-unhealthy does not count as healthy liveness
+    /// past the workflow ceiling".
+    async fn sweep_instance_agents(&self, id: &str) -> Vec<(String, bool)> {
+        let mut swept = self.supervisor.dismiss_orphaned_instance_agents(id).await;
+        swept.extend(self.supervisor.dismiss_live_instance_agents(id).await);
+        swept
     }
 
     /// Guarded terminal transition for [`stale_timeout_sweep_once`](Self::stale_timeout_sweep_once):
@@ -1786,7 +1809,7 @@ impl WorkflowEngine {
             json!({"instance": id, "workflow": instance.workflow, "error": error_text}),
         ));
         if self.finalize_cleanup_enabled {
-            let swept = self.supervisor.dismiss_orphaned_instance_agents(id).await;
+            let swept = self.sweep_instance_agents(id).await;
             if !swept.is_empty() {
                 let failed = swept.iter().filter(|(_, ok)| !ok).count();
                 info!(
@@ -7407,6 +7430,257 @@ test a::flaky ... FAILED
             0,
             false,
         )
+    }
+
+    /// [`test_engine`] with `finalize_cleanup_enabled: true` — needed by any
+    /// test asserting on the guaranteed-cleanup sweep itself
+    /// ([`WorkflowEngine::sweep_instance_agents`]), which `test_engine`
+    /// deliberately leaves off so its other (unrelated) tests never race a
+    /// background dismiss.
+    fn test_engine_with_cleanup(home: &Path) -> WorkflowEngine {
+        let layout = Layout::at(home);
+        let space = Space::open_in_memory().unwrap();
+        let tickets = Arc::new(Tickets::new(space.clone(), "castle".into()));
+        let supervisor = Arc::new(
+            Supervisor::new(
+                layout.clone(),
+                "castle".into(),
+                "fake".into(),
+                rk_ledger::Budget::default(),
+                rk_ledger::FleetBudget::default(),
+                space.clone(),
+                tickets.clone(),
+            )
+            .unwrap(),
+        );
+        WorkflowEngine::new(
+            layout,
+            supervisor,
+            space,
+            tickets,
+            HashMap::new(),
+            TierRouting::default(),
+            "fake".into(),
+            false,
+            true,
+            false,
+            Vec::new(),
+            Vec::new(),
+            0,
+            true,
+        )
+    }
+
+    /// A minimal `AgentRecord` owned by `instance`, in `state` — shared by
+    /// the still-live-at-ceiling cleanup tests below so each only has to
+    /// vary the one field it is testing.
+    /// A bare, real, discoverable git repo — [`Supervisor::dismiss_inner`]
+    /// (behind `dismiss_live_instance_agents`/`dismiss_orphaned_instance_agents`)
+    /// unconditionally calls `Repo::discover` on the agent record's
+    /// `repo_root`, so a still-live-agent dismiss test needs a real repo, not
+    /// the placeholder `/repo` path other tests in this file use for records
+    /// that are never actually dismissed.
+    fn init_bare_repo(dir: &Path) {
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "r@x"]);
+        git(&["config", "user.name", "R"]);
+        std::fs::write(dir.join("f"), "0\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+    }
+
+    /// A minimal `AgentRecord` owned by `instance`, in `state`, rooted at
+    /// `repo_root` (a real repo — see [`init_bare_repo`]) with no worktree
+    /// to reclaim, so a dismiss exercises only the state transition these
+    /// tests check, not worktree removal.
+    fn owned_agent_record(
+        name: &str,
+        instance: &str,
+        state: AgentState,
+        repo_root: &Path,
+    ) -> crate::agents::AgentRecord {
+        let now = Utc::now();
+        crate::agents::AgentRecord {
+            name: name.into(),
+            spawn: Some(rk_core::id::SpawnId::new()),
+            role: "reviewer".into(),
+            coordination: None,
+            harness: "fake".into(),
+            permission_mode: None,
+            model: None,
+            repo_root: repo_root.to_path_buf(),
+            repo_name: "repo".into(),
+            task: Some("t".into()),
+            branch: Some(format!("rat/{name}/t")),
+            fork_point: None,
+            worktree: None,
+            target_branch: "main".into(),
+            parent: None,
+            workflow_instance: Some(instance.into()),
+            review: None,
+            coordinator: None,
+            session_id: None,
+            attach_target: None,
+            pid: None,
+            merge_commit: None,
+            state,
+            crashed: false,
+            stderr_tail: None,
+            result: None,
+            progress: None,
+            usage: rk_harness::TokenUsage::default(),
+            cost_usd: 0.0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            liveness: Default::default(),
+            transport_outage: None,
+            recovery: None,
+        }
+    }
+
+    /// Root-cause regression for the parent transport-outage incident
+    /// (2026-08-21, TKT-01M0HDFZNVPHE0JV382VSBCQD0): a Codex reviewer stayed
+    /// `Running` and reconnecting well after its owning steward-review
+    /// workflow had already timed out, holding fleet capacity indefinitely.
+    /// Before [`WorkflowEngine::sweep_instance_agents`] existed, the
+    /// finalize-time/stale-timeout cleanup sweep called ONLY
+    /// `dismiss_orphaned_instance_agents`, which filters to
+    /// `Completed`/`Failed` by design and therefore could never touch a
+    /// still-`Running` (transport-reconnecting) agent — the instance would
+    /// go `Failed` and the agent would simply be left running forever.
+    /// Proves the B8 stale-instance-timeout path (a workflow ceiling) now
+    /// releases such an agent instead of orphaning it.
+    #[tokio::test]
+    async fn stale_instance_timeout_releases_a_still_live_owned_agent() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_bare_repo(repo_dir.path());
+        let engine = test_engine_with_cleanup(home.path());
+        let id = "inst-ceiling-timeout";
+
+        engine
+            .supervisor
+            .lock_registry()
+            .insert(owned_agent_record(
+                "Scurry",
+                id,
+                AgentState::Running,
+                repo_dir.path(),
+            ))
+            .unwrap();
+        let started_at = Utc::now() - chrono::Duration::hours(13);
+        engine
+            .store_if_absent(wedged_instance(id, started_at))
+            .unwrap();
+
+        let (sinks, _recorder) = recording_sinks();
+        let announcer = RecoveryAnnouncer::new();
+        let timed_out = engine
+            .stale_timeout_sweep_once(
+                Utc::now(),
+                Duration::from_secs(12 * 3600),
+                &announcer,
+                &sinks,
+                RateCap::unlimited(),
+            )
+            .await;
+        assert_eq!(timed_out, 1);
+        assert_eq!(engine.status(id).unwrap().status, InstanceStatus::Failed);
+
+        let released = engine
+            .supervisor
+            .lock_registry()
+            .get("Scurry")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            released.state,
+            AgentState::Dismissed,
+            "a still-live reviewer must be released when its owning workflow times out, not \
+             left reconnecting forever"
+        );
+    }
+
+    /// Companion to the timeout case above: the SAME still-live release must
+    /// happen on the ordinary `finalize()` path (an instance whose
+    /// `execute()` future returns an error — a `wait` step timing out
+    /// because the agent's own liveness never resolves — not just the B8
+    /// stale-Running sweep), and it must never double-dismiss an agent that
+    /// [`dismiss_orphaned_instance_agents`] already reclaimed because it was
+    /// already terminal.
+    #[tokio::test]
+    async fn finalize_releases_a_still_live_owned_agent_without_double_dismissing_a_terminal_one() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_bare_repo(repo_dir.path());
+        let engine = test_engine_with_cleanup(home.path());
+        let id = "inst-finalize-cleanup";
+
+        engine
+            .supervisor
+            .lock_registry()
+            .insert(owned_agent_record(
+                "Scurry",
+                id,
+                AgentState::Running,
+                repo_dir.path(),
+            ))
+            .unwrap();
+        engine
+            .supervisor
+            .lock_registry()
+            .insert(owned_agent_record(
+                "Nibble",
+                id,
+                AgentState::Failed,
+                repo_dir.path(),
+            ))
+            .unwrap();
+        engine
+            .store_if_absent(wedged_instance(id, Utc::now()))
+            .unwrap();
+
+        engine
+            .finalize(
+                id,
+                "/repo",
+                "wf",
+                Err(rk_core::Error::other("wait timed out")),
+            )
+            .await
+            .unwrap();
+
+        let reviewer = engine
+            .supervisor
+            .lock_registry()
+            .get("Scurry")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            reviewer.state,
+            AgentState::Dismissed,
+            "still-live agent must be released"
+        );
+        let crashed = engine
+            .supervisor
+            .lock_registry()
+            .get("Nibble")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            crashed.state,
+            AgentState::Dismissed,
+            "already-terminal agent still reclaimed"
+        );
     }
 
     /// T1: `run_check_in` was extracted from `run_command` precisely so a
