@@ -196,6 +196,21 @@ pub struct ReenqueueReviewArgs {
 }
 
 #[derive(Args)]
+pub struct CancelReviewArgs {
+    /// Branch whose review attempt is currently in progress.
+    pub branch: String,
+    /// Repository checkout (defaults to the current directory).
+    #[arg(long, default_value = ".")]
+    pub repo: String,
+    /// Target branch.
+    #[arg(long, default_value = "main")]
+    pub target: String,
+    /// Ticket this candidate delivers.
+    #[arg(long)]
+    pub task: String,
+}
+
+#[derive(Args)]
 pub struct RevertArgs {
     /// Dismissed agent whose landed merge to undo.
     pub name: String,
@@ -909,6 +924,39 @@ pub async fn reenqueue_review(
             args.branch,
             args.target,
             result["new_attempt"].as_str().unwrap_or("?")
+        );
+    }
+    Ok(())
+}
+
+/// Explicitly cancel the currently active review attempt for a candidate —
+/// durably terminates or parks its owned reviewer harness, releases fleet
+/// capacity, and settles the attempt exactly once through the same
+/// `settle_review_ceiling` fencing a ceiling timeout gets. A verdict that
+/// still arrives afterward is retained as evidence, never treated as the
+/// landing decision.
+pub async fn cancel_review(layout: &Layout, args: CancelReviewArgs, as_json: bool) -> Result<()> {
+    let repo = std::fs::canonicalize(&args.repo)?;
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call(
+            "repo.land.cancel_review",
+            json!({
+                "repo": repo,
+                "branch": args.branch,
+                "target": args.target,
+                "task": args.task,
+            }),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else {
+        println!(
+            "cancelled review of {} -> {} — settled attempt {}",
+            args.branch,
+            args.target,
+            result["attempt"].as_str().unwrap_or("?")
         );
     }
     Ok(())

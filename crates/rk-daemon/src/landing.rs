@@ -372,6 +372,16 @@ const LATE_REVIEW_EVIDENCE_IDENTITY: &str = "landing_late_review_evidence";
 /// and returns the SAME new attempt id rather than dispatching again.
 const REVIEW_CEILING_REENQUEUE_IDENTITY: &str = "landing_review_ceiling_reenqueue";
 
+/// [`crate::fault`] barrier name for the window inside
+/// [`LandingPipeline::settle_review_ceiling`] after the live reviewer has
+/// been dismissed but before [`REVIEW_CEILING_SETTLED_IDENTITY`] is durable.
+/// Armed only by `tests/review_ceiling_crash_barrier.rs`.
+const BARRIER_CEILING_PRE_MARKER: &str = "review-ceiling-pre-marker";
+
+/// [`crate::fault`] barrier name for the mirror window: settlement durable,
+/// caller not yet told. Armed only by `tests/review_ceiling_crash_barrier.rs`.
+const BARRIER_CEILING_POST_MARKER: &str = "review-ceiling-post-marker";
+
 /// Identity of the steward's escalation `need` tuple. Matches
 /// `examples/workflows/steward.cue`'s `steward-report-stop`/
 /// `steward-report-unknown-verdict`/`steward-report-timeout` named checks,
@@ -1343,6 +1353,16 @@ enum ReviewWaitOutcome {
     /// ceiling so the router can fence it (settle + release the still-live
     /// reviewer's capacity) — see [`LandingPipeline::settle_review_ceiling`].
     CeilingReached { instance_id: String },
+    /// An operator explicitly cancelled this attempt out-of-band, via
+    /// [`LandingPipeline::cancel_active_review`] (the `repo.land.cancel_review`
+    /// RPC / `rk cancel-review`) — discovered by
+    /// [`LandingPipeline::await_primary_verdict`]'s poll loop finding a
+    /// ceiling-settlement marker for its own `instance_id` that it did not
+    /// itself just write. `settle_review_ceiling` already ran by the time
+    /// this is observed (the RPC calls it directly, synchronously, before
+    /// this loop ever notices); the router's handling is idempotent so it
+    /// is safe to call again.
+    Cancelled { instance_id: String },
 }
 
 /// How [`LandingPipeline::route_review_death`] resolved one `ReviewerDied`
@@ -2931,6 +2951,21 @@ impl LandingPipeline {
                     .to_string();
                 return Ok(ReviewWaitOutcome::Verdict(recommendation));
             }
+            // An operator's `cancel_active_review` settles out-of-band, from
+            // a completely different call stack (an RPC handler, not this
+            // loop) — the only way this loop can learn about it is by
+            // polling for the settlement marker it left behind. Checked
+            // before the liveness probe below so a cancellation that has
+            // already dismissed the reviewer is reported as `Cancelled`,
+            // never misread as an ordinary `ReviewerDied`.
+            if self
+                .review_ceiling_settlement(entry, instance_id)?
+                .is_some()
+            {
+                return Ok(ReviewWaitOutcome::Cancelled {
+                    instance_id: instance_id.to_string(),
+                });
+            }
             if let Some(instance) = self.engine.status_any(instance_id) {
                 if instance.status != InstanceStatus::Running {
                     // Same race as above: probe once more before declaring
@@ -2998,6 +3033,25 @@ impl LandingPipeline {
                             gates.review_max_wait.as_secs()
                         ),
                         "inspect or stop the reviewer, then record a verdict or make the land decision",
+                        Some(format!(
+                            "to wait for a fresh review instead of forcing the land, rk \
+                             reenqueue-review {} --repo {} --target {} --task {} --attempt {}",
+                            entry.branch, entry.repo_path, entry.target, entry.task, instance_id
+                        )),
+                    )?));
+                }
+                ReviewWaitOutcome::Cancelled { instance_id } => {
+                    // Idempotent: `cancel_active_review` already called this
+                    // (that write is what the poll loop just discovered), so
+                    // this is a no-op that returns the same marker.
+                    self.settle_review_ceiling(entry, &instance_id, "operator-cancelled")
+                        .await?;
+                    return Ok(LandingOutcome::Escalated(self.review_human_gate(
+                        entry,
+                        git_repo,
+                        "operator-cancelled",
+                        "the review was explicitly cancelled by an operator".to_string(),
+                        "decide whether to land as-is, reenqueue a fresh review, or abandon the branch",
                         Some(format!(
                             "to wait for a fresh review instead of forcing the land, rk \
                              reenqueue-review {} --repo {} --target {} --task {} --attempt {}",
@@ -3126,6 +3180,14 @@ impl LandingPipeline {
             return Ok(existing);
         }
         let dismissed = self.supervisor.dismiss_live_instance_agents(attempt).await;
+        // The one genuinely non-atomic window in this function: the reviewer
+        // is already dismissed (irreversible — its OS process is gone) but
+        // nothing durable records that the attempt was settled. A daemon
+        // that dies here leaves the candidate still `awaiting_review` with
+        // no reviewer behind it, which is exactly the state a successor must
+        // converge out of without orphaning or duplicating anything. See
+        // `crate::fault` for why this is a barrier and not a sleep.
+        crate::fault::barrier(&self.layout, BARRIER_CEILING_PRE_MARKER).await;
         let released: Vec<&str> = dismissed
             .iter()
             .filter(|(_, ok)| *ok)
@@ -3150,6 +3212,12 @@ impl LandingPipeline {
         )
         .with_lifecycle(Lifecycle::Furniture);
         self.space.out(marker.clone())?;
+        // The mirror window: the settlement is now durable, but the caller
+        // that asked for it (an operator's `repo.land.cancel_review`, or the
+        // ceiling path's own routing pass) has not yet seen it succeed. A
+        // daemon that dies here must leave a successor refusing the retry
+        // the operator will naturally make, not settling a second time.
+        crate::fault::barrier(&self.layout, BARRIER_CEILING_POST_MARKER).await;
         info!(
             repo = %entry.repo_name, branch = %entry.branch, attempt, reason,
             released = released.len(), failed,
@@ -3339,6 +3407,92 @@ impl LandingPipeline {
         };
         let gates = self.gate_config(&git_repo);
         self.reenqueue_after_ceiling(&entry, &gates, settled_attempt)
+            .await
+    }
+
+    /// Find the durably-queued entry for `(branch, target, task)`, if the
+    /// candidate is still in the queue in any status — used by
+    /// [`Self::cancel_active_review`] to recover the real `head_sha` an
+    /// operator RPC caller cannot know (they only have the identifiers a
+    /// human can type). Unlike [`Self::reenqueue_ceiling_settled_review`],
+    /// which recovers `head_sha` from an existing settlement marker, cancel
+    /// runs BEFORE any settlement exists for this attempt, so the live
+    /// queue entry is the only durable source left.
+    fn queued_entry_for(
+        &self,
+        repo_name: &str,
+        branch: &str,
+        target: &str,
+        task: &str,
+    ) -> rk_core::Result<Option<LandingQueueEntry>> {
+        for tuple in self.queue.scan_current(repo_name, Some(target))? {
+            if tuple.payload.get("branch").and_then(Value::as_str) == Some(branch)
+                && tuple.payload.get("task").and_then(Value::as_str) == Some(task)
+            {
+                let entry: LandingQueueEntry = serde_json::from_value(tuple.payload.clone())
+                    .map_err(|e| rk_core::Error::other(format!("landing queue entry: {e}")))?;
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Operator-facing cancellation for the `repo.land.cancel_review` RPC
+    /// (`rk cancel-review`): fence the CURRENTLY active review attempt for
+    /// `(branch, target, task)` through [`Self::settle_review_ceiling`] —
+    /// the exact same durable settlement, live-capacity release, and
+    /// exactly-once guarantee a ceiling timeout gets, just triggered
+    /// explicitly instead of by the wall-clock deadline. A still-in-flight
+    /// [`Self::await_primary_verdict`] poll loop for this same attempt
+    /// discovers the settlement this call just wrote on its next slice and
+    /// exits with `ReviewWaitOutcome::Cancelled`; its own call back into
+    /// `settle_review_ceiling` is then a no-op that returns the SAME
+    /// marker, never a second dismissal or a second write. A late verdict
+    /// that still arrives afterward is retained as evidence
+    /// ([`Self::retain_late_review_evidence`]), never treated as the
+    /// landing decision.
+    ///
+    /// Refuses (rather than silently no-op or guess) in two cases:
+    ///
+    ///  - no candidate for `(branch, target, task)` is currently in the
+    ///    durable queue at all — unlike [`Self::reenqueue_ceiling_settled_review`],
+    ///    which can recover `head_sha` from an existing settlement marker,
+    ///    cancel runs BEFORE any settlement exists, so the live queue entry
+    ///    is the only durable source of the real `head_sha`. Guessing it
+    ///    (e.g. defaulting to empty) would compute the WRONG attempt id —
+    ///    [`review_instance_id`] hashes `head_sha` in — and silently settle
+    ///    a phantom attempt that matches no live reviewer, returning success
+    ///    while cancelling nothing;
+    ///  - [`Self::active_review_attempt`] returns a `*-settled` sentinel
+    ///    once the attempt is already fenced by either settlement path
+    ///    (ceiling or review-death), which this rejects up front so a
+    ///    repeat or late cancel call is never mistaken for having cancelled
+    ///    anything.
+    pub(crate) async fn cancel_active_review(
+        &self,
+        repo_path: &Path,
+        branch: &str,
+        target: &str,
+        task: &str,
+    ) -> rk_core::Result<Tuple> {
+        let git_repo = rk_git::Repo::discover(repo_path)?;
+        let repo_name = git_repo.name();
+        let entry = self
+            .queued_entry_for(&repo_name, branch, target, task)?
+            .ok_or_else(|| {
+                rk_core::Error::other(format!(
+                    "cannot cancel review for {branch} on {repo_name}: no candidate currently \
+                     in the landing queue for task {task}"
+                ))
+            })?;
+        let attempt = self.active_review_attempt(&entry)?;
+        if attempt.ends_with("-settled") {
+            return Err(rk_core::Error::other(format!(
+                "cannot cancel review for {branch} on {repo_name}: no active review attempt \
+                 (already settled)"
+            )));
+        }
+        self.settle_review_ceiling(&entry, &attempt, "operator-cancelled")
             .await
     }
 
@@ -14321,6 +14475,181 @@ checks: [
             1,
             "the unsettled attempt's verdict must not be retained as evidence for the settled one"
         );
+    }
+
+    /// Explicit operator cancellation of a review that is genuinely still
+    /// in flight (mid-wait, well before the ceiling): `cancel_active_review`
+    /// must settle through `settle_review_ceiling` (releasing the still-live
+    /// reviewer's capacity), the concurrently-running `await_primary_verdict`
+    /// poll loop must notice and resolve as `Cancelled` — not stall out to
+    /// `CeilingReached` — and the router's own idempotent re-settle must not
+    /// duplicate the marker. A late verdict that still arrives afterward is
+    /// retained as evidence, never the landing decision, and a second
+    /// cancel call is refused once the attempt is already settled.
+    #[tokio::test]
+    async fn cancel_active_review_settles_mid_wait_releases_capacity_and_fences_late_verdict() {
+        let home = tempfile::tempdir().unwrap();
+        let layout = Layout::at(home.path());
+        write_review_workflow(&layout); // 2s timer gate keeps the reviewer Running
+        let (repo_dir, head_sha, main_before) = review_candidate_repo();
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let entry = LandingQueueEntry {
+            repo_name: git_repo.name(),
+            ..review_candidate_entry(repo_dir.path(), &head_sha)
+        };
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = Arc::new(test_pipeline(home.path(), space.clone()));
+        // `cancel_active_review` recovers `head_sha` from the durable queue
+        // entry, exactly like a real candidate awaiting review would leave
+        // behind (`dispatch_review`'s `set_status(AwaitingReview)`).
+        pipeline.queue.enqueue(entry.clone()).unwrap();
+
+        // A ceiling long enough that only an explicit cancel — not the
+        // deadline — could plausibly resolve the wait within this test.
+        let gates = GateConfig {
+            review_timeout: Duration::from_millis(100),
+            review_max_wait: Duration::from_secs(5),
+            ..GateConfig::default()
+        };
+
+        let started = tokio::time::Instant::now();
+        let request = tokio::spawn({
+            let pipeline = Arc::clone(&pipeline);
+            let entry = entry.clone();
+            let gates = gates.clone();
+            async move { pipeline.request_review(&entry, &gates).await }
+        });
+
+        // Let the reviewer actually launch and be observably `Running`
+        // (inside the workflow's 2s timer gate) before cancelling it.
+        wait_for_spawn_count(&space, 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let settlement = pipeline
+            .cancel_active_review(repo_dir.path(), &entry.branch, &entry.target, &entry.task)
+            .await
+            .unwrap();
+        assert_eq!(settlement.payload["reason"], "operator-cancelled");
+        // `released_agents` reports whatever `dismiss_live_instance_agents`
+        // found still live at the moment of settlement — proving it is
+        // actually invoked (not just that a marker is written) is this
+        // test's job; proving a genuinely still-running agent is torn down
+        // is `workflow_exec::tests::stale_instance_timeout_releases_a_still_
+        // live_owned_agent`'s (this fixture's own reviewer harness finishes
+        // its turn in under a second regardless, per `write_review_workflow`'s
+        // doc, so by 200ms there may be nothing live left to release).
+        assert!(settlement.payload["released_agents"].is_array());
+
+        let outcome = tokio::time::timeout(Duration::from_secs(3), request)
+            .await
+            .expect("cancel must interrupt the wait long before the 5s ceiling")
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "cancellation must be observed well inside the 5s ceiling"
+        );
+        let ReviewWaitOutcome::Cancelled { instance_id } = &outcome else {
+            panic!("expected Cancelled, got {outcome:?}");
+        };
+        let instance_id = instance_id.clone();
+        assert_eq!(instance_id, review_instance_id(&entry));
+
+        let settlements = tuples(&space, Category::Event, REVIEW_CEILING_SETTLED_IDENTITY);
+        assert_eq!(settlements.len(), 1, "cancel must settle exactly once");
+        assert_eq!(settlements[0].payload["attempt"], instance_id);
+        assert_eq!(settlements[0].payload["reason"], "operator-cancelled");
+
+        // Route the discovered outcome the way `route_verdict_prepared`
+        // would in production: its own call back into
+        // `settle_review_ceiling` must be a no-op, never a second dismissal
+        // or a duplicate marker.
+        let routed = pipeline
+            .route_verdict(&entry, outcome, &gates)
+            .await
+            .unwrap();
+        let LandingOutcome::Escalated(need) = &routed else {
+            panic!("expected Escalated, got {routed:?}");
+        };
+        let text = need.payload["text"].as_str().unwrap();
+        assert!(text.contains("cancelled"), "text: {text}");
+        assert_eq!(
+            tuples(&space, Category::Event, REVIEW_CEILING_SETTLED_IDENTITY).len(),
+            1,
+            "the router's own settle call must not duplicate the marker"
+        );
+
+        // A late verdict from the cancelled generation is retained as
+        // evidence, never treated as the landing decision.
+        space
+            .out(Tuple::new(
+                Category::Artifact,
+                entry.repo_name.clone(),
+                REVIEW_ARTIFACT_IDENTITY,
+                "cancelled-reviewer",
+                json!({
+                    "task": entry.task,
+                    "recommendation": "APPROVE",
+                    "notes": "arrived after cancellation",
+                    "head_sha": entry.head_sha,
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "review_attempt": instance_id,
+                }),
+            ))
+            .unwrap();
+        let evidence = pipeline
+            .retain_late_review_evidence(&entry, &instance_id)
+            .unwrap()
+            .expect("a late verdict for a cancelled attempt must be retained as evidence");
+        assert_eq!(evidence.payload["recommendation"], "APPROVE");
+        assert!(
+            pipeline.cached_verdict(&entry).unwrap().is_none(),
+            "the late APPROVE must never be read back as the landing decision"
+        );
+        let main_after = rev_parse(repo_dir.path(), "main");
+        assert_eq!(main_before, main_after, "branch must not have landed");
+
+        // Stale-attempt rejection: a second cancel call for the same
+        // candidate finds the attempt already settled and refuses, rather
+        // than re-dismissing or re-settling.
+        let repeat = pipeline
+            .cancel_active_review(repo_dir.path(), &entry.branch, &entry.target, &entry.task)
+            .await;
+        assert!(
+            repeat.is_err(),
+            "cancelling an already-settled attempt must be refused"
+        );
+        assert_eq!(
+            tuples(&space, Category::Event, REVIEW_CEILING_SETTLED_IDENTITY).len(),
+            1,
+            "a refused repeat cancel must not touch the settlement marker"
+        );
+    }
+
+    /// `cancel_active_review` must refuse rather than guess when no
+    /// candidate for `(branch, target, task)` is currently in the durable
+    /// queue: without the real `head_sha` a fabricated entry would compute
+    /// the wrong attempt id and silently settle a phantom that matches no
+    /// live reviewer, returning success while cancelling nothing.
+    #[tokio::test]
+    async fn cancel_active_review_refuses_when_nothing_is_queued() {
+        let home = tempfile::tempdir().unwrap();
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space.clone());
+        let (repo_dir, head_sha, _main_before) = review_candidate_repo();
+        let entry = review_candidate_entry(repo_dir.path(), &head_sha);
+
+        let error = pipeline
+            .cancel_active_review(repo_dir.path(), &entry.branch, &entry.target, &entry.task)
+            .await
+            .expect_err("nothing queued means nothing to cancel");
+        assert!(
+            error.to_string().contains("no candidate currently"),
+            "error: {error}"
+        );
+        assert!(tuples(&space, Category::Event, REVIEW_CEILING_SETTLED_IDENTITY).is_empty());
     }
 
     /// The explicit, bounded re-enqueue action: requires a prior ceiling
