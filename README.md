@@ -702,16 +702,78 @@ and expects the King to pull current state over authenticated RPC. Delivery is
 at least once, so repeated terminal prompts are harmless when the same wake is
 claimed again.
 
-Register the exact Herdr terminal/agent generation, then enable the loop and
-restart the daemon:
+Bootstrap the King from the Rat Kingdom checkout. Install the current binary
+first; registering against an older installed `rk` will fail because that
+binary and its daemon do not expose the King RPCs yet.
 
 ```bash
-herdr agent list                         # choose a terminal_id or pane_id
-rk king register term_... --holder king
-# edit ~/.rat-kingdom/config.toml: [king] enabled = true
+cd /path/to/rat-kingdom
+MISE_TRUSTED_CONFIG_PATHS="$PWD" mise run install
+
+king_workspace="$(
+  herdr workspace create \
+    --cwd "$PWD" \
+    --label King \
+    --no-focus |
+  jq -r '.result.workspace_id'
+)"
+
+king_pane="$(
+  herdr pane list |
+  jq -r --arg workspace "$king_workspace" \
+    '.result.panes[] | select(.workspace_id == $workspace) | .pane_id'
+)"
+
+herdr agent start King \
+  --kind codex \
+  --pane "$king_pane" \
+  --timeout 300000 \
+  -- \
+  --dangerously-bypass-approvals-and-sandbox
+```
+
+Prime the session before enabling automatic wakes. `rk prime --role operator`
+is the authoritative general operator instruction set; the short addendum
+below establishes the King's wake-settlement responsibility.
+
+```bash
+herdr agent prompt "$king_pane" \
+  'You are the King: the human operator delegate for Rat Kingdom, not a worker rat. Run `rk prime --role operator` now and adopt those instructions. When you receive an `RK_WAKE`, execute its exact `rk king pull` command, inspect authoritative RK state, and intervene within existing policy. Resolve the wake when handled. Defer it only when human authority, judgment, credentials, or an irreversible decision is genuinely required. Then remain idle awaiting the next wake.' \
+  --wait \
+  --timeout 300000
+```
+
+Attach to watch or converse with the King. Add `--takeover` when explicit
+keyboard control is required.
+
+```bash
+herdr agent attach "$king_pane"
+herdr agent attach "$king_pane" --takeover
+```
+
+Enable the loop in `~/.rat-kingdom/config.toml` (or `$RK_HOME/config.toml`):
+
+```toml
+[king]
+enabled = true
+harness = "codex"
+permission_mode = "danger-full-access"
+```
+
+Configuration is loaded at daemon startup. Roll the daemon onto the installed
+binary, register the exact Herdr generation, and force one diagnostic cycle:
+
+```bash
 rk daemon rollover
+rk king register "$king_pane" --holder king --name King
+rk king tick
 rk king status
 ```
+
+If setup continues in another shell, recover the pane or terminal id with
+`herdr agent list` and pass that value to `rk king register`. Registration is
+generation-fenced: replacing the agent in the pane requires registration of
+the replacement unless RK itself performed the checkpointed hibernation.
 
 When woken, the delegate claims and pulls, acts only within the existing
 authority policy, then settles the envelope:
@@ -736,6 +798,11 @@ idle threshold writes a bounded checkpoint, exits that exact generation, and
 starts a fresh harness in the same pane. The fresh session receives only a
 checkpoint id and restores via `rk king restore KCP-...`; it never resumes the
 old model thread, preventing a cold reload of its large context.
+
+Initial operator priming is currently explicit. A fresh post-hibernation
+session automatically receives the checkpoint restore command and current RK
+state, but does not rerun the full `rk prime --role operator` text. Re-prime it
+manually after replacement when the complete operator reference is needed.
 
 `rk king tick` runs one cycle immediately for diagnostics. The feature stays
 inert by default, and a stale terminal or changed Herdr agent-session id fails
