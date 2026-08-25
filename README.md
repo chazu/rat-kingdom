@@ -582,6 +582,18 @@ interval_secs = 30               # fallback refill cadence; a freed slot also wa
 aging_secs = 3600               # seconds of waiting that buy one priority level,
                                  # so low-priority tickets can't starve (0 = strict)
 
+[king]                          # dedicated LLM operator-delegate control loop
+enabled = false                 # requires both this opt-in and `rk king register`
+poll_secs = 15                  # authoritative RK-state scan cadence
+wake_retry_secs = 60            # retry an injected-but-unclaimed durable wake
+compact_after_idle_secs = 300   # request `/compact` after five idle minutes
+compact_min_wake_batches = 3    # and at least this many claimed batches
+compact_timeout_secs = 180      # failed/stuck compaction falls into hibernation
+hibernate_after_idle_secs = 3600 # checkpoint, exit, and start a fresh session
+harness = "codex"                # fresh-session harness after hibernation
+# model = "gpt-5.6"
+permission_mode = "danger-full-access"
+
 # Cross-repo WIP partitioning: subdivide the fleet-wide max_wip per repo so one
 # busy repo cannot monopolize the fleet. When any [drain.repos.*] table exists it
 # becomes an ALLOWLIST — only listed, enabled repos drain (repo pin above is
@@ -680,6 +692,54 @@ fleet-wide wallet kill-switch that refuses new spawns once total spend hits the
 cap) and `[supervisor].burn_usd_per_min` (flags a runaway rat by sustained
 spend) so a stuck or looping fleet stops itself rather than draining the wallet
 overnight.
+
+### `[king]` — operator-delegate control loop
+
+The King is a dedicated LLM session with operator authority, not an ordinary
+supervised rat. RK uses Herdr only as a wake transport: it persists a wake
+first, injects an opaque `KWK-...` id plus a fixed built-in pull instruction,
+and expects the King to pull current state over authenticated RPC. Delivery is
+at least once, so repeated terminal prompts are harmless when the same wake is
+claimed again.
+
+Register the exact Herdr terminal/agent generation, then enable the loop and
+restart the daemon:
+
+```bash
+herdr agent list                         # choose a terminal_id or pane_id
+rk king register term_... --holder king
+# edit ~/.rat-kingdom/config.toml: [king] enabled = true
+rk daemon rollover
+rk king status
+```
+
+When woken, the delegate claims and pulls, acts only within the existing
+authority policy, then settles the envelope:
+
+```bash
+rk --json king pull KWK-... --holder king
+rk king resolve KWK-... --holder king    # handled
+rk king defer KWK-... --holder king      # explicit human gate
+```
+
+The pull payload is bounded to current attention items, the first 20 inbox
+rows, the first 20 ready tickets, and 50 live agents. Repo-authored text never
+enters the injected wake. The lease acquired by `king pull` is still fenced by
+`[policy] orchestrator_lease_ttl_secs`, and `attention.decide` remains bounded
+by the authority allowlist and rate cap.
+
+Idle lifecycle state is durable in `~/.rat-kingdom/king-state.json`. Compaction
+runs only when Herdr reports the exact registered generation idle, unfocused,
+and with no unsettled wake. RK submits `/compact` atomically through `herdr
+agent prompt`; it never separately types text and Enter. A timeout or the hard
+idle threshold writes a bounded checkpoint, exits that exact generation, and
+starts a fresh harness in the same pane. The fresh session receives only a
+checkpoint id and restores via `rk king restore KCP-...`; it never resumes the
+old model thread, preventing a cold reload of its large context.
+
+`rk king tick` runs one cycle immediately for diagnostics. The feature stays
+inert by default, and a stale terminal or changed Herdr agent-session id fails
+closed until explicitly re-registered.
 
 ## Workflows
 

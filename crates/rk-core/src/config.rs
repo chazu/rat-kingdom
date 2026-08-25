@@ -36,6 +36,9 @@ pub struct Config {
     pub evaporation: EvaporationConfig,
     pub ingest: IngestConfig,
     pub policy: PolicyConfig,
+    /// Dedicated operator-delegate control loop. Disabled until a King is
+    /// explicitly registered with `rk king register` and this switch is set.
+    pub king: KingConfig,
     /// Named agent profiles: [agents.<name>] harness/model/permission_mode.
     /// The "default" profile applies centrally to every ordinary spawn that
     /// does not override a field, including direct, nested, workflow, and drain
@@ -47,6 +50,51 @@ pub struct Config {
     pub tiers: TierRoutingConfig,
     /// Where escalations get pushed. See [`NotifyConfig`].
     pub notify: NotifyConfig,
+}
+
+/// The dedicated King session: a privileged, long-lived LLM operator delegate
+/// woken through Herdr. The injected text is only an opaque wake id; all
+/// repository-authored data is pulled back over authenticated RK RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct KingConfig {
+    /// Run the daemon's wake/idle lifecycle loop. Registration alone never
+    /// turns automation on.
+    pub enabled: bool,
+    /// Durable-state scan cadence.
+    pub poll_secs: u64,
+    /// Re-inject an unclaimed at-least-once wake after this interval.
+    pub wake_retry_secs: i64,
+    /// First idle threshold at which context compaction may be requested.
+    pub compact_after_idle_secs: i64,
+    /// Require this many claimed wake batches since the previous compaction.
+    pub compact_min_wake_batches: u32,
+    /// Maximum time `/compact` may remain unsettled before hard hibernation.
+    pub compact_timeout_secs: i64,
+    /// Replace an idle session with a checkpoint-primed fresh session after
+    /// this interval, guaranteeing the old context is not cold-loaded later.
+    pub hibernate_after_idle_secs: i64,
+    /// Harness used when starting the fresh post-hibernation session.
+    pub harness: String,
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
+}
+
+impl Default for KingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_secs: 15,
+            wake_retry_secs: 60,
+            compact_after_idle_secs: 5 * 60,
+            compact_min_wake_batches: 3,
+            compact_timeout_secs: 3 * 60,
+            hibernate_after_idle_secs: 60 * 60,
+            harness: "codex".into(),
+            model: None,
+            permission_mode: Some("danger-full-access".into()),
+        }
+    }
 }
 
 /// Operator push channels for escalations (`[[notify.sinks]]`).
@@ -1375,6 +1423,37 @@ mod tests {
         assert_eq!(cfg, Config::default());
         assert_eq!(cfg.harness.default, "claude");
         assert_eq!(cfg.policy.automated_landing_workflows, ["steward"]);
+        assert!(!cfg.king.enabled);
+        assert_eq!(cfg.king.compact_after_idle_secs, 300);
+        assert_eq!(cfg.king.hibernate_after_idle_secs, 3600);
+    }
+
+    #[test]
+    fn king_lifecycle_loads_from_operator_owned_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[king]
+enabled = true
+poll_secs = 7
+wake_retry_secs = 20
+compact_after_idle_secs = 240
+compact_min_wake_batches = 4
+compact_timeout_secs = 90
+hibernate_after_idle_secs = 1800
+harness = "codex"
+model = "gpt-5.6"
+permission_mode = "workspace-write"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.king.enabled);
+        assert_eq!(cfg.king.poll_secs, 7);
+        assert_eq!(cfg.king.compact_min_wake_batches, 4);
+        assert_eq!(cfg.king.model.as_deref(), Some("gpt-5.6"));
+        assert_eq!(cfg.king.permission_mode.as_deref(), Some("workspace-write"));
     }
 
     /// TKT-01M0EXYHV1GR9Z75QSS42HXBVK: a shared `CARGO_TARGET_DIR` corrupts

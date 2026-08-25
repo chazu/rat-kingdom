@@ -15,6 +15,7 @@ pub mod factory_events;
 mod fault;
 pub mod inbox;
 pub mod ingest_auth;
+pub mod king;
 mod landing;
 mod landing_conflict;
 mod landing_review_retry;

@@ -7,6 +7,7 @@ mod factory_cmds;
 mod factory_dashboard;
 mod factory_skill;
 mod ingest_cmds;
+mod king_cmds;
 mod observe;
 mod product_to_code_cmds;
 mod reconcile_cmds;
@@ -123,6 +124,11 @@ enum Command {
     Attention {
         #[command(subcommand)]
         command: attention_cmds::AttentionCommand,
+    },
+    /// Operate the dedicated Herdr-backed LLM operator delegate.
+    King {
+        #[command(subcommand)]
+        command: king_cmds::KingCommand,
     },
     /// Live fleet dashboard: agents, workflows, budget, inbox (q to quit).
     Top {
@@ -1170,6 +1176,7 @@ async fn main() -> Result<()> {
                 attention_cmds::attention_decide(&layout, *args, cli.json).await?
             }
         },
+        Command::King { command } => king_cmds::run(&layout, command, cli.json).await?,
         Command::Top { interval, all } => top::top(&layout, interval, all).await?,
         Command::Digest { since, llm } => observe::digest(&layout, &since, llm, cli.json).await?,
         Command::Status(args) => agent_cmds::status(&layout, args, cli.json).await?,

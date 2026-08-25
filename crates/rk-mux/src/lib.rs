@@ -7,6 +7,7 @@
 //! attach surface, headless spawns unaffected.
 
 use rk_core::notify::{EscalationNotice, NotificationSink};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,6 +15,24 @@ use std::process::Command;
 use tracing::debug;
 
 pub struct HerdrMux;
+
+/// Stable identity of one detected agent generation. `terminal_id` anchors the
+/// pane while `session_id` fences a restarted agent in that same terminal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentIdentity {
+    pub terminal_id: String,
+    pub pane_id: String,
+    pub session_id: String,
+    pub agent: String,
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentState {
+    pub identity: AgentIdentity,
+    pub status: String,
+    pub focused: bool,
+}
 
 impl HerdrMux {
     /// Is a herdr server reachable?
@@ -33,37 +52,187 @@ impl HerdrMux {
         env: &HashMap<String, String>,
         argv: &[String],
     ) -> rk_core::Result<String> {
-        let mut cmd = Command::new("herdr");
-        cmd.args(["agent", "start", name]);
-        cmd.args(["--cwd", &cwd.to_string_lossy()]);
-        for (key, value) in env {
-            cmd.args(["--env", &format!("{key}={value}")]);
+        if argv.is_empty() {
+            return Err(rk_core::Error::other("cannot start an empty agent argv"));
         }
-        cmd.arg("--no-focus");
-        cmd.arg("--");
-        cmd.args(argv);
-        let out = cmd
-            .output()
-            .map_err(|e| rk_core::Error::other(format!("herdr not runnable: {e}")))?;
-        if !out.status.success() {
-            return Err(rk_core::Error::other(format!(
-                "herdr agent start failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
+        let mut create = vec![
+            "workspace".to_string(),
+            "create".to_string(),
+            "--cwd".to_string(),
+            cwd.to_string_lossy().to_string(),
+            "--label".to_string(),
+            name.to_string(),
+            "--no-focus".to_string(),
+        ];
+        for (key, value) in env {
+            create.push("--env".into());
+            create.push(format!("{key}={value}"));
+        }
+        let created = match run_herdr_owned(&create) {
+            Ok(created) => created,
+            // Herdr <0.8 exposed `agent start NAME --cwd ... -- ARGV`
+            // directly. Keep that compatibility path after the current API
+            // fails so older installations and deterministic fake-Herdr test
+            // harnesses remain usable.
+            Err(current_api_error) => {
+                return Self::start_agent_legacy(name, cwd, env, argv).map_err(|legacy_error| {
+                    rk_core::Error::other(format!(
+                        "current Herdr start failed ({current_api_error}); legacy start failed ({legacy_error})"
+                    ))
+                });
+            }
+        };
+        let value: Value = serde_json::from_str(&created)
+            .map_err(|e| rk_core::Error::other(format!("invalid herdr workspace response: {e}")))?;
+        let workspace = find_string_key(&value, "workspace_id").ok_or_else(|| {
+            rk_core::Error::other("herdr workspace response omitted workspace_id")
+        })?;
+        let pane = Self::snapshot()
+            .and_then(|snapshot| {
+                snapshot["result"]["snapshot"]["panes"]
+                    .as_array()?
+                    .iter()
+                    .find(|p| p["workspace_id"].as_str() == Some(&workspace))
+                    .and_then(|p| p["pane_id"].as_str().map(String::from))
+            })
+            .ok_or_else(|| rk_core::Error::other("new herdr workspace has no pane"))?;
+        if let Err(error) = Self::start_in_pane(name, &argv[0], &pane, &argv[1..]) {
+            let _ = run_herdr(&["workspace", "close", &workspace]);
+            return Err(error);
         }
         debug!(name, "started herdr pane");
+        Ok(pane)
+    }
+
+    /// Submit one complete prompt atomically. Herdr owns readiness and Enter;
+    /// splitting those operations reintroduces the timing race this API exists
+    /// to avoid.
+    pub fn send(target: &str, text: &str) -> rk_core::Result<()> {
+        if run_herdr(&["agent", "prompt", target, text]).is_err() {
+            run_herdr(&["agent", "send", target, text])?;
+            let pane = Self::find_pane(target)
+                .ok_or_else(|| rk_core::Error::other(format!("no herdr pane for {target}")))?;
+            run_herdr(&["pane", "send-keys", &pane, "enter"])?;
+        }
+        Ok(())
+    }
+
+    fn start_agent_legacy(
+        name: &str,
+        cwd: &Path,
+        env: &HashMap<String, String>,
+        argv: &[String],
+    ) -> rk_core::Result<String> {
+        let mut command = vec!["agent".into(), "start".into(), name.into()];
+        command.push("--cwd".into());
+        command.push(cwd.to_string_lossy().to_string());
+        for (key, value) in env {
+            command.push("--env".into());
+            command.push(format!("{key}={value}"));
+        }
+        command.push("--no-focus".into());
+        command.push("--".into());
+        command.extend(argv.iter().cloned());
+        run_herdr_owned(&command)?;
         Ok(name.to_string())
     }
 
-    /// Type a message into the agent's pane (herdr owns timing — no sleeps
-    /// here) followed by Enter via `pane run` semantics: `agent send` writes
-    /// literal text, so we send text then the Enter key.
-    pub fn send(target: &str, text: &str) -> rk_core::Result<()> {
-        run_herdr(&["agent", "send", target, text])?;
-        let pane = Self::find_pane(target)
-            .ok_or_else(|| rk_core::Error::other(format!("no herdr pane for {target}")))?;
-        run_herdr(&["pane", "send-keys", &pane, "enter"])?;
+    /// Submit and wait for a settled semantic state. Used for lifecycle
+    /// commands where "text reached the pane" is not enough evidence.
+    pub fn send_wait(target: &str, text: &str, timeout_ms: u64) -> rk_core::Result<()> {
+        let timeout = timeout_ms.clamp(1_000, 300_000).to_string();
+        run_herdr(&[
+            "agent",
+            "prompt",
+            target,
+            text,
+            "--wait",
+            "--until",
+            "idle",
+            "--until",
+            "done",
+            "--timeout",
+            &timeout,
+        ])?;
         Ok(())
+    }
+
+    /// Resolve an operator-supplied label/pane/terminal/session to the exact
+    /// terminal + agent-generation identity persisted by the King loop.
+    pub fn identify(target: &str) -> rk_core::Result<AgentIdentity> {
+        let snapshot =
+            Self::snapshot().ok_or_else(|| rk_core::Error::other("cannot read herdr snapshot"))?;
+        let entry = Self::agent_entry(&snapshot, target)
+            .ok_or_else(|| rk_core::Error::other(format!("no herdr agent for {target}")))?;
+        identity_from_entry(entry)
+    }
+
+    /// State for an exact registered generation. A new agent in the old pane
+    /// is not silently treated as the same King.
+    pub fn exact_state(identity: &AgentIdentity) -> Option<AgentState> {
+        let snapshot = Self::snapshot()?;
+        let entry = Self::agent_entry(&snapshot, &identity.terminal_id)?;
+        let current = identity_from_entry(entry).ok()?;
+        if current.session_id != identity.session_id {
+            return None;
+        }
+        Some(AgentState {
+            identity: current,
+            status: entry["agent_status"].as_str().unwrap_or("unknown").into(),
+            focused: entry["focused"].as_bool().unwrap_or(false),
+        })
+    }
+
+    /// Start a fresh harness generation in an existing shell pane.
+    pub fn start_in_pane(
+        name: &str,
+        harness: &str,
+        pane: &str,
+        args: &[String],
+    ) -> rk_core::Result<AgentIdentity> {
+        let mut command = vec![
+            "agent".to_string(),
+            "start".to_string(),
+            name.to_string(),
+            "--kind".to_string(),
+            harness.to_string(),
+            "--pane".to_string(),
+            pane.to_string(),
+        ];
+        if !args.is_empty() {
+            command.push("--".into());
+            command.extend(args.iter().cloned());
+        }
+        run_herdr_owned(&command)?;
+        Self::identify(pane)
+    }
+
+    /// Exit one exact agent generation and start a new one in its pane.
+    pub fn replace_agent(
+        identity: &AgentIdentity,
+        name: &str,
+        harness: &str,
+        args: &[String],
+        timeout_ms: u64,
+    ) -> rk_core::Result<AgentIdentity> {
+        if Self::exact_state(identity).is_none() {
+            return Err(rk_core::Error::other(
+                "registered King generation is no longer present",
+            ));
+        }
+        let timeout = timeout_ms.clamp(1_000, 300_000).to_string();
+        run_herdr(&[
+            "agent",
+            "prompt",
+            &identity.terminal_id,
+            "/exit",
+            "--wait",
+            "--until",
+            "done",
+            "--timeout",
+            &timeout,
+        ])?;
+        Self::start_in_pane(name, harness, &identity.pane_id, args)
     }
 
     /// Herdr's semantic state for the pane: idle|working|blocked|done|unknown.
@@ -118,10 +287,47 @@ impl HerdrMux {
             .as_array()?
             .iter()
             .find(|a| {
-                [&a["name"], &a["label"], &a["terminal_id"], &a["agent"]]
-                    .iter()
-                    .any(|f| f.as_str() == Some(target))
+                [
+                    &a["name"],
+                    &a["label"],
+                    &a["terminal_id"],
+                    &a["pane_id"],
+                    &a["agent_session"]["value"],
+                ]
+                .iter()
+                .any(|f| f.as_str() == Some(target))
             })
+    }
+}
+
+fn identity_from_entry(entry: &Value) -> rk_core::Result<AgentIdentity> {
+    let required = |key: &str| {
+        entry[key]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| rk_core::Error::other(format!("herdr agent omitted {key}")))
+    };
+    Ok(AgentIdentity {
+        terminal_id: required("terminal_id")?,
+        pane_id: required("pane_id")?,
+        session_id: entry["agent_session"]["value"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| rk_core::Error::other("herdr agent omitted agent_session.value"))?,
+        agent: required("agent")?,
+        cwd: required("cwd")?,
+    })
+}
+
+fn find_string_key(value: &Value, key: &str) -> Option<String> {
+    match value {
+        Value::Object(map) => map
+            .get(key)
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| map.values().find_map(|v| find_string_key(v, key))),
+        Value::Array(values) => values.iter().find_map(|v| find_string_key(v, key)),
+        _ => None,
     }
 }
 
@@ -164,6 +370,11 @@ fn run_herdr(args: &[&str]) -> rk_core::Result<String> {
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn run_herdr_owned(args: &[String]) -> rk_core::Result<String> {
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_herdr(&refs)
 }
 
 /// Interactive (TUI) argv for a harness kind — used for attach-mode spawns,
@@ -268,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_entry_matches_by_name_or_terminal() {
+    fn agent_entry_matches_by_name_terminal_pane_or_generation_not_agent_kind() {
         let snapshot: Value = serde_json::from_str(
             r#"{"result":{"snapshot":{"agents":[
                 {"name":"Whisker","agent":"claude","agent_status":"working","pane_id":"w1:p2","terminal_id":"term_1"},
@@ -280,6 +491,7 @@ mod tests {
         assert_eq!(by_name["pane_id"], "w1:p2");
         let by_term = HerdrMux::agent_entry(&snapshot, "term_2").unwrap();
         assert_eq!(by_term["agent_status"], "idle");
+        assert!(HerdrMux::agent_entry(&snapshot, "codex").is_none());
         assert!(HerdrMux::agent_entry(&snapshot, "Nibbles").is_none());
     }
 }

@@ -161,6 +161,12 @@ impl Layout {
         self.home.join("workflows")
     }
 
+    /// Durable King registration, wake queue, compaction lifecycle, and
+    /// hibernation checkpoints.
+    pub fn king_state_path(&self) -> PathBuf {
+        self.home.join("king-state.json")
+    }
+
     /// Global `#Trigger` definitions dir (`<home>/triggers/*.cue`). Repo-local
     /// triggers live at `<repo>/.rk/triggers.cue` instead.
     pub fn triggers_dir(&self) -> PathBuf {

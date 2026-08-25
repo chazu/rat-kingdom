@@ -63,6 +63,39 @@ const MAX_INBOX_ITEMS: usize = 2_048;
 /// whenever `RK_AGENT` is unset, and an empty caller means the same thing.
 const OPERATOR_ACTOR: &str = "operator";
 
+/// Bound every leaf in a King pull/checkpoint. Counts alone are insufficient:
+/// one operator-authored tuple field may itself approach the request frame
+/// ceiling. The full resource remains available through its native RPC.
+fn bound_json(value: &mut Value, max_string_chars: usize, max_array_items: usize) {
+    match value {
+        Value::String(text) => {
+            if text.chars().count() > max_string_chars {
+                *text = text.chars().take(max_string_chars).collect();
+            }
+        }
+        Value::Array(items) => {
+            items.truncate(max_array_items);
+            for item in items {
+                bound_json(item, max_string_chars, max_array_items);
+            }
+        }
+        Value::Object(fields) => {
+            for field in fields.values_mut() {
+                bound_json(field, max_string_chars, max_array_items);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn king_snapshot_bound_truncates_nested_strings_and_arrays() {
+    let mut value = json!({"items": [{"text": "abcdefgh"}, {"text": "ijklmnop"}]});
+    bound_json(&mut value, 4, 1);
+    assert_eq!(value, json!({"items": [{"text": "abcd"}]}));
+}
+
 type FactVoteKey = (String, String, String);
 type FactVoteState = (DateTime<Utc>, RecordId, String);
 type RequestClock = fn() -> DateTime<Utc>;
@@ -189,6 +222,7 @@ pub struct Daemon {
     drain_config: rk_core::config::DrainConfig,
     evaporation_decay: f64,
     ingest_config: rk_core::config::IngestConfig,
+    king_config: rk_core::config::KingConfig,
     global_agents: std::collections::HashMap<String, rk_workflow::AgentProfile>,
     tier_routing: rk_workflow::TierRouting,
     default_harness: String,
@@ -219,6 +253,12 @@ pub struct Daemon {
     /// (one lease per repo scope) an `attention.decide` orchestrator-authority
     /// call must hold before it may act.
     orchestrator_lease: crate::orchestrator_lease::LeaseStore,
+    /// Dedicated operator-delegate session and at-least-once wake queue.
+    king: crate::king::KingStore,
+    /// Prevent a diagnostic `king.tick` from racing the periodic loop through
+    /// compaction or pane replacement. Wake injection itself tolerates replay;
+    /// hibernation is intentionally single-flight.
+    king_cycle_lock: tokio::sync::Mutex<()>,
     /// The authority-ladder policy (`[policy]` in `config.toml`), built once
     /// at startup — see `crate::authority::AuthorityPolicy` for why nothing
     /// mutates this at runtime.
@@ -386,6 +426,7 @@ impl Daemon {
         daemon.drain_config = config.drain.clone();
         daemon.evaporation_decay = config.evaporation.decay;
         daemon.ingest_config = config.ingest.clone();
+        daemon.king_config = config.king.clone();
         daemon.require_named_checks = config.policy.require_named_checks;
         daemon.require_approval_for_landing = config.policy.require_approval_for_landing;
         daemon.automated_landing_workflows = config.policy.automated_landing_workflows.clone();
@@ -633,6 +674,7 @@ impl Daemon {
         let orchestrator_lease = crate::orchestrator_lease::LeaseStore::load(
             layout.home().join("orchestrator-lease.json"),
         )?;
+        let king = crate::king::KingStore::load(layout.king_state_path())?;
         Ok(Self {
             layout,
             space,
@@ -704,6 +746,7 @@ impl Daemon {
             drain_config: rk_core::config::DrainConfig::default(),
             evaporation_decay: rk_core::config::EvaporationConfig::default().decay,
             ingest_config: rk_core::config::IngestConfig::default(),
+            king_config: rk_core::config::KingConfig::default(),
             global_agents: Default::default(),
             tier_routing: Default::default(),
             default_harness,
@@ -723,6 +766,8 @@ impl Daemon {
             ticket_graph_apply_lock: tokio::sync::Mutex::new(()),
             action_approvals,
             orchestrator_lease,
+            king,
+            king_cycle_lock: tokio::sync::Mutex::new(()),
             authority_policy: crate::authority::AuthorityPolicy::default(),
             tickets,
             coordinator_sessions,
@@ -1410,6 +1455,28 @@ impl Daemon {
             });
         }
 
+        // Dedicated King control loop. This is intentionally config-gated AND
+        // registration-gated: enabling it without `rk king register` has no
+        // terminal side effect. Every cycle rebuilds authoritative RK state;
+        // Herdr receives only an opaque durable wake/checkpoint id.
+        if daemon.king_config.enabled {
+            let king_daemon = Arc::clone(&daemon);
+            let mut king_shutdown = daemon.shutdown_tx.subscribe();
+            let interval = Duration::from_secs(daemon.king_config.poll_secs.max(1));
+            background_tasks.spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        _ = king_shutdown.changed() => break,
+                    }
+                    if let Err(error) = king_daemon.king_cycle().await {
+                        warn!(%error, "King control-loop cycle failed");
+                    }
+                }
+            });
+        }
+
         // The maps were rehydrated before dispatch loops started. Now that
         // reactor/scheduler consumers are listening, resume in-flight instances.
         daemon.engine().resume_rehydrated(resumable_workflows);
@@ -1848,6 +1915,13 @@ impl Daemon {
                 | "ticket.dep"
                 | "ticket.reopen"
                 | "reconcile.repair"
+                | "king.register"
+                | "king.status"
+                | "king.pull"
+                | "king.settle"
+                | "king.checkpoint"
+                | "king.restore"
+                | "king.tick"
         ) {
             return (true, "");
         }
@@ -2581,6 +2655,16 @@ impl Daemon {
             "lease.renew" => reply(self.handle_lease_renew(req).await),
             "attention.next" => reply(self.handle_attention_next(req).await),
             "attention.decide" => reply(self.handle_attention_decide(req).await),
+            "king.register" => reply(self.handle_king_register(req).await),
+            "king.status" => reply(self.handle_king_status(req)),
+            "king.pull" => reply(self.handle_king_pull(req).await),
+            "king.settle" => reply(self.handle_king_settle(req)),
+            "king.checkpoint" => reply(self.handle_king_checkpoint(req)),
+            "king.restore" => reply(self.handle_king_restore(req).await),
+            "king.tick" => reply(match self.king_cycle().await {
+                Ok(value) => Response::ok(id, value),
+                Err(error) => Response::err(id, codes::INTERNAL, error.to_string()),
+            }),
             "agent.status" => reply(self.handle_named(req, |sup, name| {
                 sup.status(&name)
                     .map(|r| json!({"agent": r}))
@@ -3711,6 +3795,420 @@ impl Daemon {
         {
             Ok(lease) => Response::ok(req.id, json!(lease)),
             Err(e) => Response::err(req.id, codes::FORBIDDEN, e.to_string()),
+        }
+    }
+
+    async fn handle_king_register(&self, req: Request) -> Response {
+        let params: KingRegisterParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let target = params.target.clone();
+        let identity =
+            match tokio::task::spawn_blocking(move || rk_mux::HerdrMux::identify(&target)).await {
+                Ok(Ok(identity)) => identity,
+                Ok(Err(error)) => {
+                    return Response::err(req.id, codes::BAD_PARAMS, error.to_string())
+                }
+                Err(error) => {
+                    return Response::err(
+                        req.id,
+                        codes::INTERNAL,
+                        format!("Herdr identity lookup failed: {error}"),
+                    )
+                }
+            };
+        match self.king.register(
+            params.holder,
+            params.name.unwrap_or_else(|| "King".into()),
+            identity,
+            self.king_config.compact_min_wake_batches,
+            (self.request_clock)(),
+        ) {
+            Ok(registration) => Response::ok(
+                req.id,
+                json!({"registration": registration, "enabled": self.king_config.enabled}),
+            ),
+            Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
+        }
+    }
+
+    fn handle_king_status(&self, req: Request) -> Response {
+        match self.king.snapshot() {
+            Ok(state) => Response::ok(
+                req.id,
+                json!({"enabled": self.king_config.enabled, "state": state}),
+            ),
+            Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
+        }
+    }
+
+    async fn handle_king_pull(&self, req: Request) -> Response {
+        let params: KingPullParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let wake = match self
+            .king
+            .claim(&params.wake, &params.holder, (self.request_clock)())
+        {
+            Ok(wake) => wake,
+            Err(error) => return Response::err(req.id, codes::FORBIDDEN, error.to_string()),
+        };
+        let (snapshot, _, _) = match self.king_authoritative_snapshot().await {
+            Ok(value) => value,
+            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+        };
+        let mut leases = Vec::new();
+        for repo in snapshot["attention"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item["repo"].as_str())
+        {
+            match self.orchestrator_lease.acquire(
+                repo,
+                &params.holder,
+                self.authority_policy.lease_ttl_secs,
+                (self.request_clock)(),
+            ) {
+                Ok(lease) => leases.push(lease),
+                Err(error) => {
+                    return Response::err(req.id, codes::FORBIDDEN, error.to_string());
+                }
+            }
+        }
+        Response::ok(
+            req.id,
+            json!({"wake": wake, "leases": leases, "snapshot": snapshot}),
+        )
+    }
+
+    fn handle_king_settle(&self, req: Request) -> Response {
+        let params: KingSettleParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let deferred = match params.disposition.as_deref().unwrap_or("resolved") {
+            "resolved" => false,
+            "deferred" => true,
+            other => {
+                return Response::err(
+                    req.id,
+                    codes::BAD_PARAMS,
+                    format!("invalid King wake disposition: {other}"),
+                )
+            }
+        };
+        match self.king.settle(
+            &params.wake,
+            &params.holder,
+            deferred,
+            (self.request_clock)(),
+        ) {
+            Ok(wake) => Response::ok(req.id, json!({"wake": wake})),
+            Err(error) => Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+        }
+    }
+
+    fn handle_king_checkpoint(&self, req: Request) -> Response {
+        let params: KingCheckpointParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        match self.king.checkpoint(params.notes, (self.request_clock)()) {
+            Ok(checkpoint) => Response::ok(req.id, json!({"checkpoint": checkpoint})),
+            Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
+        }
+    }
+
+    async fn handle_king_restore(&self, req: Request) -> Response {
+        let params: KingRestoreParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let checkpoint = match self.king.checkpoint_by_id(&params.checkpoint) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+        };
+        let current = match self.king_authoritative_snapshot().await {
+            Ok((snapshot, _, _)) => snapshot,
+            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+        };
+        if let Err(error) = self.king.acknowledge_restore(&params.checkpoint) {
+            return Response::err(req.id, codes::INTERNAL, error.to_string());
+        }
+        Response::ok(
+            req.id,
+            json!({"checkpoint": checkpoint, "current": current}),
+        )
+    }
+
+    /// Build the bounded pull payload. It deliberately contains current
+    /// derived state rather than trusting the snapshot captured when terminal
+    /// delivery happened.
+    async fn king_authoritative_snapshot(&self) -> rk_core::Result<(Value, String, bool)> {
+        let repos = self
+            .repos
+            .lock()
+            .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?
+            .list();
+        let mut attention = Vec::new();
+        for repo in &repos {
+            let report = self.reconcile_report(repo.name.clone()).await?;
+            let cursor = self
+                .orchestrator_lease
+                .current(&report.scope)?
+                .and_then(|lease| lease.cursor);
+            if let Some(item) =
+                crate::attention::next_attention(&report, &self.authority_policy, cursor.as_deref())
+            {
+                attention.push(json!({"repo": report.scope, "item": item}));
+            }
+        }
+        let mut inbox = self.inbox_value(None).await?;
+        if let Some(items) = inbox["items"].as_array_mut() {
+            items.truncate(20);
+        }
+        let ready = self
+            .tickets
+            .ready(None)?
+            .into_iter()
+            .take(20)
+            .map(|ticket| {
+                json!({
+                    "id": ticket.identity,
+                    "repo": ticket.scope,
+                    "title": ticket.payload["title"],
+                    "priority": ticket.payload["priority"],
+                    "labels": ticket.payload["labels"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let live_agents = self
+            .supervisor
+            .list()
+            .into_iter()
+            .filter(|agent| agent.state.is_live())
+            .take(50)
+            .map(|agent| {
+                json!({
+                    "name": agent.name,
+                    "generation": agent.spawn_id(),
+                    "repo": agent.repo_name,
+                    "role": agent.role,
+                    "state": agent.state,
+                    "task": agent.task.map(|task| task.chars().take(1_000).collect::<String>()),
+                    "workflow": agent.workflow_instance,
+                    "updated_at": agent.updated_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        let has_work = !attention.is_empty()
+            || inbox["items"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+            || !ready.is_empty();
+        let summary = format!(
+            "{} attention, {} inbox, {} ready, {} live",
+            attention.len(),
+            inbox["items"].as_array().map_or(0, Vec::len),
+            ready.len(),
+            live_agents.len()
+        );
+        let mut snapshot = json!({
+            "generated_at": (self.request_clock)(),
+            "attention": attention,
+            "inbox": inbox,
+            "ready_tickets": ready,
+            "live_agents": live_agents,
+            "drain": {
+                "enabled": self.drain_config.enabled,
+                "max_wip": self.drain_config.max_wip,
+            },
+        });
+        bound_json(&mut snapshot, 2_000, 100);
+        Ok((snapshot, summary, has_work))
+    }
+
+    async fn king_cycle(&self) -> rk_core::Result<Value> {
+        use sha2::Digest as _;
+
+        let _cycle = self.king_cycle_lock.lock().await;
+        let state = self.king.snapshot()?;
+        let Some(registration) = state.registration else {
+            return Ok(json!({"registered": false, "action": "none"}));
+        };
+        let identity = registration.identity.clone();
+        let herdr_state =
+            tokio::task::spawn_blocking(move || rk_mux::HerdrMux::exact_state(&identity))
+                .await
+                .map_err(|error| {
+                    rk_core::Error::other(format!("Herdr status task failed: {error}"))
+                })?;
+        let Some(herdr_state) = herdr_state else {
+            return Err(rk_core::Error::other(
+                "registered King generation is absent; run `rk king register` against the replacement",
+            ));
+        };
+
+        let now = (self.request_clock)();
+        if herdr_state.status == "idle" {
+            if let Some(checkpoint) = self
+                .king
+                .pending_restore_due(self.king_config.wake_retry_secs, now)?
+            {
+                let target = registration.identity.terminal_id.clone();
+                let text = format!(
+                    "RK_KING_RESTORE {checkpoint}. Run `rk --json king restore {checkpoint}`; treat current RK state as authoritative."
+                );
+                tokio::task::spawn_blocking(move || rk_mux::HerdrMux::send(&target, &text))
+                    .await
+                    .map_err(|error| {
+                        rk_core::Error::other(format!("King restore prompt failed: {error}"))
+                    })??;
+                self.king.mark_restore_injected(&checkpoint, now)?;
+                return Ok(json!({
+                    "registered": true,
+                    "action": "restore",
+                    "checkpoint": checkpoint,
+                }));
+            }
+        }
+
+        let (snapshot, summary, has_work) = self.king_authoritative_snapshot().await?;
+        // Observation time is useful to the King but is not work identity: if
+        // it entered the digest, an unchanged settled queue would wake again
+        // on every poll solely because the clock moved.
+        let mut digest_value = snapshot.clone();
+        if let Some(object) = digest_value.as_object_mut() {
+            object.remove("generated_at");
+        }
+        let bytes = serde_json::to_vec(&digest_value)?;
+        let digest = hex::encode(sha2::Sha256::digest(bytes));
+        let wake = self.king.observe(
+            digest,
+            summary,
+            snapshot,
+            has_work,
+            self.king_config.wake_retry_secs,
+            now,
+        )?;
+        if let Some(wake) = wake {
+            if herdr_state.status == "idle" {
+                let target = registration.identity.terminal_id.clone();
+                let text = format!(
+                    "RK_WAKE {id}. Run `rk --json king pull {id} --holder {holder}`; after handling it run `rk king resolve {id} --holder {holder}`, or `rk king defer {id} --holder {holder}` only for an explicit human gate.",
+                    id = wake.id,
+                    holder = registration.holder,
+                );
+                tokio::task::spawn_blocking(move || rk_mux::HerdrMux::send(&target, &text))
+                    .await
+                    .map_err(|error| {
+                        rk_core::Error::other(format!("King wake task failed: {error}"))
+                    })??;
+                self.king.mark_injected(&wake.id, now)?;
+                return Ok(json!({"registered": true, "action": "wake", "wake": wake.id}));
+            }
+            return Ok(json!({
+                "registered": true,
+                "action": "wake_pending",
+                "wake": wake.id,
+                "agent_status": herdr_state.status,
+            }));
+        }
+
+        match self.king.context_action(
+            &herdr_state.status,
+            herdr_state.focused,
+            &self.king_config,
+            now,
+        )? {
+            Some(crate::king::ContextAction::Compact) => {
+                let target = registration.identity.terminal_id.clone();
+                let timeout_ms = self
+                    .king_config
+                    .compact_timeout_secs
+                    .max(1)
+                    .saturating_mul(1_000) as u64;
+                self.king.mark_compacting(now)?;
+                let result = tokio::task::spawn_blocking(move || {
+                    rk_mux::HerdrMux::send_wait(&target, "/compact", timeout_ms)
+                })
+                .await
+                .map_err(|error| {
+                    rk_core::Error::other(format!("King compact task failed: {error}"))
+                })?;
+                match result {
+                    Ok(()) => Ok(json!({"registered": true, "action": "compact"})),
+                    Err(error) => {
+                        self.king.compaction_failed(now)?;
+                        Err(error)
+                    }
+                }
+            }
+            Some(crate::king::ContextAction::Hibernate) => {
+                let checkpoint = self.king.checkpoint(None, now)?;
+                let argv = rk_mux::interactive_argv(
+                    &self.king_config.harness,
+                    None,
+                    self.king_config.model.as_deref(),
+                    self.king_config.permission_mode.as_deref(),
+                )?;
+                let old = registration.identity.clone();
+                let name = registration.name.clone();
+                let harness = self.king_config.harness.clone();
+                let args = argv.into_iter().skip(1).collect::<Vec<_>>();
+                let timeout_ms = self
+                    .king_config
+                    .compact_timeout_secs
+                    .max(1)
+                    .saturating_mul(1_000) as u64;
+                let replaced = tokio::task::spawn_blocking(move || {
+                    rk_mux::HerdrMux::replace_agent(&old, &name, &harness, &args, timeout_ms)
+                })
+                .await
+                .map_err(|error| {
+                    rk_core::Error::other(format!("King replacement task failed: {error}"))
+                })?;
+                match replaced {
+                    Ok(identity) => {
+                        let registration = self.king.complete_hibernation(
+                            identity.clone(),
+                            checkpoint.id.clone(),
+                            now,
+                        )?;
+                        let target = identity.terminal_id;
+                        let text = format!(
+                            "RK_KING_RESTORE {id}. Run `rk --json king restore {id}`; treat current RK state as authoritative.",
+                            id = checkpoint.id,
+                        );
+                        tokio::task::spawn_blocking(move || rk_mux::HerdrMux::send(&target, &text))
+                            .await
+                            .map_err(|error| {
+                                rk_core::Error::other(format!(
+                                    "King restore prompt failed: {error}"
+                                ))
+                            })??;
+                        self.king.mark_restore_injected(&checkpoint.id, now)?;
+                        Ok(json!({
+                            "registered": true,
+                            "action": "hibernate",
+                            "checkpoint": checkpoint.id,
+                            "generation": registration.generation,
+                        }))
+                    }
+                    Err(error) => {
+                        self.king.hibernation_failed()?;
+                        Err(error)
+                    }
+                }
+            }
+            None => Ok(json!({
+                "registered": true,
+                "action": "none",
+                "agent_status": herdr_state.status,
+            })),
         }
     }
 
@@ -9207,6 +9705,36 @@ struct LeaseRenewParams {
     holder: String,
     generation: u64,
     ttl_secs: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct KingRegisterParams {
+    target: String,
+    holder: String,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KingPullParams {
+    wake: String,
+    holder: String,
+}
+
+#[derive(Deserialize)]
+struct KingSettleParams {
+    wake: String,
+    holder: String,
+    disposition: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KingCheckpointParams {
+    notes: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KingRestoreParams {
+    checkpoint: String,
 }
 
 #[derive(Deserialize)]
