@@ -18,6 +18,12 @@ pub struct HerdrMux;
 
 /// Stable identity of one detected agent generation. `terminal_id` anchors the
 /// pane while `session_id` fences a restarted agent in that same terminal.
+///
+/// `agent_session` is nullable in the Herdr API schema: it is populated only
+/// when the harness itself reports a session (`herdr pane
+/// report-agent-session`), which Claude Code does not do. When it is absent we
+/// fence on the pane's `revision` counter instead — a required field that
+/// Herdr increments when a new agent generation takes over the pane.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentIdentity {
     pub terminal_id: String,
@@ -107,14 +113,41 @@ impl HerdrMux {
     /// Submit one complete prompt atomically. Herdr owns readiness and Enter;
     /// splitting those operations reintroduces the timing race this API exists
     /// to avoid.
+    ///
+    /// Herdr 0.8 dropped `agent send`, so the split send-then-Enter path is
+    /// only reachable on older servers. Report the original `agent prompt`
+    /// failure when the fallback is unavailable too: the fallback's own usage
+    /// error says nothing about why the prompt did not land.
     pub fn send(target: &str, text: &str) -> rk_core::Result<()> {
-        if run_herdr(&["agent", "prompt", target, text]).is_err() {
-            run_herdr(&["agent", "send", target, text])?;
-            let pane = Self::find_pane(target)
-                .ok_or_else(|| rk_core::Error::other(format!("no herdr pane for {target}")))?;
-            run_herdr(&["pane", "send-keys", &pane, "enter"])?;
+        let target = &Self::agent_target(target);
+        let prompt_error = match run_herdr(&["agent", "prompt", target, text]) {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        };
+        if run_herdr(&["agent", "send", target, text]).is_err() {
+            return Err(prompt_error);
         }
+        let pane = Self::find_pane(target)
+            .ok_or_else(|| rk_core::Error::other(format!("no herdr pane for {target}")))?;
+        run_herdr(&["pane", "send-keys", &pane, "enter"])?;
         Ok(())
+    }
+
+    /// Resolve a stored identity field to a target Herdr accepts today.
+    ///
+    /// Herdr 0.8 stopped resolving `terminal_id` for `agent` subcommands
+    /// (`agent_not_found`), while `pane_id` and the agent name still resolve.
+    /// Registrations persist `terminal_id`, so map it back through the
+    /// snapshot; pass anything already resolvable straight through.
+    fn agent_target(target: &str) -> String {
+        match Self::snapshot()
+            .as_ref()
+            .and_then(|snapshot| Self::agent_entry(snapshot, target))
+            .and_then(|entry| entry["pane_id"].as_str().map(String::from))
+        {
+            Some(pane) => pane,
+            None => target.to_string(),
+        }
     }
 
     fn start_agent_legacy(
@@ -144,7 +177,7 @@ impl HerdrMux {
         run_herdr(&[
             "agent",
             "prompt",
-            target,
+            &Self::agent_target(target),
             text,
             "--wait",
             "--until",
@@ -221,10 +254,11 @@ impl HerdrMux {
             ));
         }
         let timeout = timeout_ms.clamp(1_000, 300_000).to_string();
+        // Target the pane: Herdr 0.8 no longer resolves `terminal_id` here.
         run_herdr(&[
             "agent",
             "prompt",
-            &identity.terminal_id,
+            &identity.pane_id,
             "/exit",
             "--wait",
             "--until",
@@ -310,13 +344,29 @@ fn identity_from_entry(entry: &Value) -> rk_core::Result<AgentIdentity> {
     Ok(AgentIdentity {
         terminal_id: required("terminal_id")?,
         pane_id: required("pane_id")?,
-        session_id: entry["agent_session"]["value"]
-            .as_str()
-            .map(String::from)
-            .ok_or_else(|| rk_core::Error::other("herdr agent omitted agent_session.value"))?,
+        session_id: generation_fence(entry)?,
         agent: required("agent")?,
         cwd: required("cwd")?,
     })
+}
+
+/// Fence one agent generation within a pane.
+///
+/// Prefer the harness-reported `agent_session.value`: it survives Herdr server
+/// restarts and identifies the harness session itself. Herdr leaves it null
+/// for harnesses that do not report one, so fall back to the pane's required
+/// `revision` counter, which Herdr increments when a new generation takes over
+/// the pane. Either way a replacement agent in the same pane fences out.
+fn generation_fence(entry: &Value) -> rk_core::Result<String> {
+    if let Some(session) = entry["agent_session"]["value"].as_str() {
+        return Ok(session.to_string());
+    }
+    entry["revision"]
+        .as_u64()
+        .map(|revision| format!("revision:{revision}"))
+        .ok_or_else(|| {
+            rk_core::Error::other("herdr agent omitted both agent_session.value and revision")
+        })
 }
 
 fn find_string_key(value: &Value, key: &str) -> Option<String> {
@@ -493,5 +543,46 @@ mod tests {
         assert_eq!(by_term["agent_status"], "idle");
         assert!(HerdrMux::agent_entry(&snapshot, "codex").is_none());
         assert!(HerdrMux::agent_entry(&snapshot, "Nibbles").is_none());
+    }
+
+    /// A harness-reported session is the preferred fence, but Herdr's schema
+    /// declares `agent_session` nullable and Claude Code never reports one.
+    /// Requiring it made `rk king spawn` fail outright against a healthy
+    /// agent, so an omitted session falls back to the pane `revision`.
+    #[test]
+    fn generation_fence_prefers_agent_session_then_falls_back_to_revision() {
+        let reported: Value = serde_json::from_str(
+            r#"{"terminal_id":"term_1","pane_id":"w1:p1","revision":7,
+                "agent":"codex","cwd":"/repo","agent_session":{"value":"sess_abc"}}"#,
+        )
+        .unwrap();
+        assert_eq!(generation_fence(&reported).unwrap(), "sess_abc");
+
+        // Verbatim shape of a live `claude` agent under herdr 0.8.2: healthy,
+        // interactive, and carrying no `agent_session` key at all.
+        let unreported: Value = serde_json::from_str(
+            r#"{"agent":"claude","agent_status":"idle","cwd":"/repo","focused":false,
+                "interactive_ready":true,"name":"king","pane_id":"w8:p1","revision":1,
+                "state_change_seq":3,"tab_id":"w8:t1","terminal_id":"term_2",
+                "workspace_id":"w8"}"#,
+        )
+        .unwrap();
+        let identity = identity_from_entry(&unreported).unwrap();
+        assert_eq!(identity.session_id, "revision:1");
+        assert_eq!(identity.terminal_id, "term_2");
+        assert_eq!(identity.agent, "claude");
+
+        // A replacement generation in the same pane must not read as the same
+        // King: Herdr bumps `revision` when a new agent takes the pane over.
+        let mut replaced = unreported.clone();
+        replaced["revision"] = serde_json::json!(3);
+        assert_ne!(
+            identity_from_entry(&replaced).unwrap().session_id,
+            identity.session_id
+        );
+
+        let neither: Value =
+            serde_json::from_str(r#"{"terminal_id":"term_3","pane_id":"w1:p1"}"#).unwrap();
+        assert!(generation_fence(&neither).is_err());
     }
 }

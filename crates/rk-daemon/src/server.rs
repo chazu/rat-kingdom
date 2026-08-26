@@ -3939,7 +3939,9 @@ impl Daemon {
                 }),
             ),
             Err(error) => {
-                let target = identity.session_id;
+                // `session_id` may be a synthetic revision fence, which is not
+                // a resolvable Herdr target. `terminal_id` always is.
+                let target = identity.terminal_id;
                 let _ = tokio::task::spawn_blocking(move || rk_mux::HerdrMux::close(&target)).await;
                 Response::err(req.id, codes::INTERNAL, error.to_string())
             }

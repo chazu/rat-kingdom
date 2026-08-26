@@ -191,10 +191,17 @@ async fn attach(client: &mut Client) -> Result<()> {
         anyhow::bail!("registered King generation is absent; use `rk king spawn`");
     }
     use std::os::unix::process::CommandExt;
-    // Attach by generation id, not terminal id: if Herdr replaces the process
-    // after the exact-state check, it must fail closed instead of attaching the
-    // human to an unregistered successor in the same pane.
-    let argv = rk_mux::HerdrMux::attach_argv(&identity.session_id);
+    // Prefer the harness-reported generation id over the pane: if Herdr
+    // replaces the process after the exact-state check above, attaching by
+    // generation fails closed rather than handing the human an unregistered
+    // successor in the same pane. A synthetic `revision:` fence is not a
+    // Herdr target, so fall back to the pane and accept that narrow race.
+    let target = if identity.session_id.starts_with("revision:") {
+        &identity.pane_id
+    } else {
+        &identity.session_id
+    };
+    let argv = rk_mux::HerdrMux::attach_argv(target);
     let error = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
     Err(anyhow::anyhow!("failed to exec herdr attach: {error}"))
 }
