@@ -41,7 +41,7 @@ pub struct SpawnArgs {
     #[arg(long, default_value = "king")]
     pub holder: String,
     /// Display name for the dedicated Herdr workspace and agent.
-    #[arg(long, default_value = "King")]
+    #[arg(long, default_value = "king")]
     pub name: String,
 }
 
@@ -53,7 +53,7 @@ pub struct RegisterArgs {
     #[arg(long, default_value = "king")]
     pub holder: String,
     /// Display name used when RK starts a fresh post-hibernation session.
-    #[arg(long, default_value = "King")]
+    #[arg(long, default_value = "king")]
     pub name: String,
 }
 
@@ -151,7 +151,7 @@ pub async fn run(layout: &Layout, command: KingCommand, as_json: bool) -> Result
             let registration = &result["registration"];
             println!(
                 "spawned {} with {} in {}",
-                registration["name"].as_str().unwrap_or("King"),
+                registration["name"].as_str().unwrap_or("king"),
                 result["harness"].as_str().unwrap_or("configured harness"),
                 registration["identity"]["terminal_id"]
                     .as_str()
@@ -222,5 +222,20 @@ mod tests {
                 .command,
             KingCommand::Attach
         ));
+    }
+
+    #[test]
+    fn lifecycle_names_default_to_lowercase_king() {
+        let spawn = TestCli::try_parse_from(["rk-king", "spawn"]).unwrap();
+        let KingCommand::Spawn(spawn) = spawn.command else {
+            panic!("expected spawn command");
+        };
+        assert_eq!(spawn.name, "king");
+
+        let register = TestCli::try_parse_from(["rk-king", "register", "term-1"]).unwrap();
+        let KingCommand::Register(register) = register.command else {
+            panic!("expected register command");
+        };
+        assert_eq!(register.name, "king");
     }
 }

@@ -602,7 +602,7 @@ mod tests {
         store
             .register(
                 "king-a".into(),
-                "King".into(),
+                "king".into(),
                 identity("one"),
                 0,
                 Utc::now(),

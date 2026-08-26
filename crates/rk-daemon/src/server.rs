@@ -3826,7 +3826,7 @@ impl Daemon {
             };
         match self.king.register(
             params.holder,
-            params.name.unwrap_or_else(|| "King".into()),
+            params.name.unwrap_or_else(|| "king".into()),
             identity,
             self.king_config.compact_min_wake_batches,
             (self.request_clock)(),
@@ -3886,7 +3886,7 @@ impl Daemon {
             Ok(argv) => argv,
             Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
         };
-        let name = params.name.unwrap_or_else(|| "King".into());
+        let name = params.name.unwrap_or_else(|| "king".into());
         let holder = params.holder.unwrap_or_else(|| "king".into());
         let spawn_name = name.clone();
         let mut env = HashMap::new();

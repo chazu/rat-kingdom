@@ -33,7 +33,7 @@ case "$1 $2" in
     cwd="$(cat "$RK_TEST_HERDR_CWD" 2>/dev/null || printf /tmp)"
     if [ -f "$RK_TEST_HERDR_AGENT" ]; then
       session="$(cat "$RK_TEST_HERDR_AGENT")"
-      printf '{"result":{"snapshot":{"panes":[{"workspace_id":"ws_king","pane_id":"pane_king"}],"agents":[{"name":"King","label":"King","terminal_id":"term_king","pane_id":"pane_king","agent_session":{"value":"session_%s"},"agent":"codex","cwd":"%s","agent_status":"idle","focused":false}]}}}\n' "$session" "$cwd"
+      printf '{"result":{"snapshot":{"panes":[{"workspace_id":"ws_king","pane_id":"pane_king"}],"agents":[{"name":"king","label":"king","terminal_id":"term_king","pane_id":"pane_king","agent_session":{"value":"session_%s"},"agent":"codex","cwd":"%s","agent_status":"idle","focused":false}]}}}\n' "$session" "$cwd"
     elif [ -f "$RK_TEST_HERDR_WORKSPACE" ]; then
       printf '%s\n' '{"result":{"snapshot":{"panes":[{"workspace_id":"ws_king","pane_id":"pane_king"}],"agents":[]}}}'
     else
@@ -41,6 +41,14 @@ case "$1 $2" in
     fi
     ;;
   "agent start")
+    case "$3" in
+      [a-z]*)
+        case "$3" in
+          *[!a-z0-9_-]*) exit 64 ;;
+        esac
+        ;;
+      *) exit 64 ;;
+    esac
     session=1
     if [ -f "$RK_TEST_HERDR_AGENT" ]; then
       session=$(( $(cat "$RK_TEST_HERDR_AGENT") + 1 ))
@@ -103,10 +111,7 @@ async fn spawn_restart_and_dismiss_manage_one_registered_king_generation() {
     std::env::set_var("RK_TEST_HERDR_AGENT", root.path().join("herdr.agent"));
 
     let spawned = client
-        .call(
-            "king.spawn",
-            json!({"cwd": root.path(), "holder": "king", "name": "King"}),
-        )
+        .call("king.spawn", json!({"cwd": root.path(), "holder": "king"}))
         .await
         .unwrap();
     assert_eq!(
@@ -131,7 +136,7 @@ async fn spawn_restart_and_dismiss_manage_one_registered_king_generation() {
     assert!(status["state"]["registration"].is_null());
 
     let herdr_log = std::fs::read_to_string(&log).unwrap();
-    assert_eq!(herdr_log.matches("agent start King").count(), 2);
+    assert_eq!(herdr_log.matches("agent start king").count(), 2);
     assert!(herdr_log.contains("workspace create"));
     assert!(herdr_log.contains("pane close pane_king"));
 
