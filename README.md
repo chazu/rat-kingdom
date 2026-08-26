@@ -583,7 +583,7 @@ aging_secs = 3600               # seconds of waiting that buy one priority level
                                  # so low-priority tickets can't starve (0 = strict)
 
 [king]                          # dedicated LLM operator-delegate control loop
-enabled = false                 # requires both this opt-in and `rk king register`
+enabled = false                 # requires this opt-in and a spawned/registered King
 poll_secs = 15                  # authoritative RK-state scan cadence
 wake_retry_secs = 60            # retry an injected-but-unclaimed durable wake
 compact_after_idle_secs = 300   # request `/compact` after five idle minutes
@@ -703,52 +703,12 @@ at least once, so repeated terminal prompts are harmless when the same wake is
 claimed again.
 
 Bootstrap the King from the Rat Kingdom checkout. Install the current binary
-first; registering against an older installed `rk` will fail because that
-binary and its daemon do not expose the King RPCs yet.
+first; an older installed `rk` and daemon do not expose the King lifecycle
+RPCs.
 
 ```bash
 cd /path/to/rat-kingdom
 MISE_TRUSTED_CONFIG_PATHS="$PWD" mise run install
-
-king_workspace="$(
-  herdr workspace create \
-    --cwd "$PWD" \
-    --label King \
-    --no-focus |
-  jq -r '.result.workspace_id'
-)"
-
-king_pane="$(
-  herdr pane list |
-  jq -r --arg workspace "$king_workspace" \
-    '.result.panes[] | select(.workspace_id == $workspace) | .pane_id'
-)"
-
-herdr agent start King \
-  --kind codex \
-  --pane "$king_pane" \
-  --timeout 300000 \
-  -- \
-  --dangerously-bypass-approvals-and-sandbox
-```
-
-Prime the session before enabling automatic wakes. `rk prime --role operator`
-is the authoritative general operator instruction set; the short addendum
-below establishes the King's wake-settlement responsibility.
-
-```bash
-herdr agent prompt "$king_pane" \
-  'You are the King: the human operator delegate for Rat Kingdom, not a worker rat. Run `rk prime --role operator` now and adopt those instructions. When you receive an `RK_WAKE`, execute its exact `rk king pull` command, inspect authoritative RK state, and intervene within existing policy. Resolve the wake when handled. Defer it only when human authority, judgment, credentials, or an irreversible decision is genuinely required. Then remain idle awaiting the next wake.' \
-  --wait \
-  --timeout 300000
-```
-
-Attach to watch or converse with the King. Add `--takeover` when explicit
-keyboard control is required.
-
-```bash
-herdr agent attach "$king_pane"
-herdr agent attach "$king_pane" --takeover
 ```
 
 Enable the loop in `~/.rat-kingdom/config.toml` (or `$RK_HOME/config.toml`):
@@ -761,19 +721,30 @@ permission_mode = "danger-full-access"
 ```
 
 Configuration is loaded at daemon startup. Roll the daemon onto the installed
-binary, register the exact Herdr generation, and force one diagnostic cycle:
+binary, then start the configured harness in a dedicated, primed Herdr
+workspace:
 
 ```bash
 rk daemon rollover
-rk king register "$king_pane" --holder king --name King
+rk king spawn
+rk king at                 # alias for: rk king attach
+rk king restart            # checkpoint, replace, and restore
+rk king dismiss            # stop and close the dedicated workspace
 rk king tick
 rk king status
 ```
 
-If setup continues in another shell, recover the pane or terminal id with
-`herdr agent list` and pass that value to `rk king register`. Registration is
-generation-fenced: replacing the agent in the pane requires registration of
-the replacement unless RK itself performed the checkpointed hibernation.
+`rk king spawn` passes the configured harness, model, permission mode, RK home,
+and current working directory to Herdr, registers the exact generation, and
+submits the built-in operator priming prompt. `restart` preserves a bounded RK
+checkpoint; `dismiss` deliberately ends the session and makes any interrupted
+wake replayable to the next spawn.
+
+For an existing manually-created King, recover the pane or terminal id with
+`herdr agent list` and pass that value to `rk king register`. Registration
+remains generation-fenced: replacing the agent in the pane requires
+registration of the replacement unless RK itself performed a checkpointed
+restart or hibernation.
 
 When woken, the delegate claims and pulls, acts only within the existing
 authority policy, then settles the envelope:
@@ -799,9 +770,9 @@ starts a fresh harness in the same pane. The fresh session receives only a
 checkpoint id and restores via `rk king restore KCP-...`; it never resumes the
 old model thread, preventing a cold reload of its large context.
 
-Initial operator priming is currently explicit. A fresh post-hibernation
-session automatically receives the checkpoint restore command and current RK
-state, but does not rerun the full `rk prime --role operator` text. Re-prime it
+`rk king spawn` performs initial operator priming. A fresh post-hibernation or
+restarted session receives the checkpoint restore command and current RK state,
+but does not rerun the full `rk prime --role operator` text. Re-prime it
 manually after replacement when the complete operator reference is needed.
 
 `rk king tick` runs one cycle immediately for diagnostics. The feature stays

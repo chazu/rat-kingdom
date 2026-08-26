@@ -1915,7 +1915,10 @@ impl Daemon {
                 | "ticket.dep"
                 | "ticket.reopen"
                 | "reconcile.repair"
+                | "king.spawn"
                 | "king.register"
+                | "king.dismiss"
+                | "king.restart"
                 | "king.status"
                 | "king.pull"
                 | "king.settle"
@@ -2655,7 +2658,10 @@ impl Daemon {
             "lease.renew" => reply(self.handle_lease_renew(req).await),
             "attention.next" => reply(self.handle_attention_next(req).await),
             "attention.decide" => reply(self.handle_attention_decide(req).await),
+            "king.spawn" => reply(self.handle_king_spawn(req).await),
             "king.register" => reply(self.handle_king_register(req).await),
+            "king.dismiss" => reply(self.handle_king_dismiss(req).await),
+            "king.restart" => reply(self.handle_king_restart(req).await),
             "king.status" => reply(self.handle_king_status(req)),
             "king.pull" => reply(self.handle_king_pull(req).await),
             "king.settle" => reply(self.handle_king_settle(req)),
@@ -3831,6 +3837,249 @@ impl Daemon {
             ),
             Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
         }
+    }
+
+    async fn handle_king_spawn(&self, req: Request) -> Response {
+        let params: KingSpawnParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        let _cycle = self.king_cycle_lock.lock().await;
+        let now = (self.request_clock)();
+        let state = match self.king.snapshot() {
+            Ok(state) => state,
+            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+        };
+        if let Some(registration) = state.registration {
+            let identity = registration.identity.clone();
+            let live = tokio::task::spawn_blocking(move || {
+                rk_mux::HerdrMux::exact_state(&identity).is_some()
+            })
+            .await
+            .unwrap_or(false);
+            if live {
+                return Response::err(
+                    req.id,
+                    codes::BAD_PARAMS,
+                    "the King is already running; use `rk king at` or `rk king restart`",
+                );
+            }
+            if let Err(error) = self.king.unregister(now) {
+                return Response::err(req.id, codes::INTERNAL, error.to_string());
+            }
+        }
+
+        let cwd = std::path::PathBuf::from(&params.cwd);
+        if !cwd.is_dir() {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                format!("King working directory does not exist: {}", cwd.display()),
+            );
+        }
+        let argv = match rk_mux::interactive_argv(
+            &self.king_config.harness,
+            None,
+            self.king_config.model.as_deref(),
+            self.king_config.permission_mode.as_deref(),
+        ) {
+            Ok(argv) => argv,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+        };
+        let name = params.name.unwrap_or_else(|| "King".into());
+        let holder = params.holder.unwrap_or_else(|| "king".into());
+        let spawn_name = name.clone();
+        let mut env = HashMap::new();
+        env.insert(
+            "RK_HOME".to_string(),
+            self.layout.home().to_string_lossy().to_string(),
+        );
+        let identity = match tokio::task::spawn_blocking(move || {
+            let target = rk_mux::HerdrMux::start_agent(&spawn_name, &cwd, &env, &argv)?;
+            let identity = match rk_mux::HerdrMux::identify(&target) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    let _ = rk_mux::HerdrMux::close(&target);
+                    return Err(error);
+                }
+            };
+            let prime = "You are the King: the human operator delegate for Rat Kingdom, not a worker rat. Run `rk prime --role operator` now and adopt those instructions. When you receive an `RK_WAKE`, execute its exact `rk king pull` command, inspect authoritative RK state, and intervene within existing policy. Resolve the wake when handled. Defer it only when human authority, judgment, credentials, or an irreversible decision is genuinely required. Then remain idle awaiting the next wake.";
+            if let Err(error) = rk_mux::HerdrMux::send(&identity.terminal_id, prime) {
+                let _ = rk_mux::HerdrMux::close(&identity.terminal_id);
+                return Err(error);
+            }
+            Ok(identity)
+        })
+        .await
+        {
+            Ok(Ok(identity)) => identity,
+            Ok(Err(error)) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+            Err(error) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    format!("King spawn task failed: {error}"),
+                )
+            }
+        };
+        match self.king.register(
+            holder,
+            name,
+            identity.clone(),
+            self.king_config.compact_min_wake_batches,
+            now,
+        ) {
+            Ok(registration) => Response::ok(
+                req.id,
+                json!({
+                    "spawned": true,
+                    "enabled": self.king_config.enabled,
+                    "harness": self.king_config.harness,
+                    "registration": registration,
+                }),
+            ),
+            Err(error) => {
+                let target = identity.session_id;
+                let _ = tokio::task::spawn_blocking(move || rk_mux::HerdrMux::close(&target)).await;
+                Response::err(req.id, codes::INTERNAL, error.to_string())
+            }
+        }
+    }
+
+    async fn handle_king_dismiss(&self, req: Request) -> Response {
+        let _cycle = self.king_cycle_lock.lock().await;
+        let now = (self.request_clock)();
+        let registration = match self.king.snapshot() {
+            Ok(state) => state.registration,
+            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+        };
+        let Some(registration) = registration else {
+            return Response::err(req.id, codes::BAD_PARAMS, "no King is registered");
+        };
+        let identity = registration.identity.clone();
+        let closed = match tokio::task::spawn_blocking(move || {
+            if rk_mux::HerdrMux::exact_state(&identity).is_none() {
+                return Ok::<bool, rk_core::Error>(false);
+            }
+            rk_mux::HerdrMux::close(&identity.terminal_id)?;
+            Ok(true)
+        })
+        .await
+        {
+            Ok(Ok(closed)) => closed,
+            Ok(Err(error)) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+            Err(error) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    format!("King dismiss task failed: {error}"),
+                )
+            }
+        };
+        match self.king.unregister(now) {
+            Ok(_) => Response::ok(req.id, json!({"dismissed": true, "closed": closed})),
+            Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
+        }
+    }
+
+    async fn handle_king_restart(&self, req: Request) -> Response {
+        let _cycle = self.king_cycle_lock.lock().await;
+        let now = (self.request_clock)();
+        let registration = match self.king.snapshot() {
+            Ok(state) => state.registration,
+            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+        };
+        let Some(registration) = registration else {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                "no King is registered; use `rk king spawn`",
+            );
+        };
+        let identity = registration.identity.clone();
+        let present =
+            tokio::task::spawn_blocking(move || rk_mux::HerdrMux::exact_state(&identity).is_some())
+                .await
+                .unwrap_or(false);
+        if !present {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                "registered King generation is absent; use `rk king spawn`",
+            );
+        }
+        let argv = match rk_mux::interactive_argv(
+            &self.king_config.harness,
+            None,
+            self.king_config.model.as_deref(),
+            self.king_config.permission_mode.as_deref(),
+        ) {
+            Ok(argv) => argv,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+        };
+        let checkpoint = match self.king.checkpoint(None, now) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+        };
+        let old = registration.identity;
+        let name = registration.name;
+        let harness = self.king_config.harness.clone();
+        let args = argv.into_iter().skip(1).collect::<Vec<_>>();
+        let timeout_ms = self
+            .king_config
+            .compact_timeout_secs
+            .max(1)
+            .saturating_mul(1_000) as u64;
+        let identity = match tokio::task::spawn_blocking(move || {
+            rk_mux::HerdrMux::replace_agent(&old, &name, &harness, &args, timeout_ms)
+        })
+        .await
+        {
+            Ok(Ok(identity)) => identity,
+            Ok(Err(error)) => {
+                let _ = self.king.hibernation_failed();
+                return Response::err(req.id, codes::INTERNAL, error.to_string());
+            }
+            Err(error) => {
+                let _ = self.king.hibernation_failed();
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    format!("King restart task failed: {error}"),
+                );
+            }
+        };
+        let registration =
+            match self
+                .king
+                .complete_hibernation(identity.clone(), checkpoint.id.clone(), now)
+            {
+                Ok(registration) => registration,
+                Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+            };
+        let checkpoint_id = checkpoint.id.clone();
+        let target = identity.terminal_id;
+        let restore = format!(
+            "RK_KING_RESTORE {checkpoint_id}. Run `rk --json king restore {checkpoint_id}`; treat current RK state as authoritative."
+        );
+        let restore_injected =
+            tokio::task::spawn_blocking(move || rk_mux::HerdrMux::send(&target, &restore))
+                .await
+                .is_ok_and(|result| result.is_ok());
+        if restore_injected {
+            if let Err(error) = self.king.mark_restore_injected(&checkpoint.id, now) {
+                return Response::err(req.id, codes::INTERNAL, error.to_string());
+            }
+        }
+        Response::ok(
+            req.id,
+            json!({
+                "restarted": true,
+                "checkpoint": checkpoint.id,
+                "restore_injected": restore_injected,
+                "registration": registration,
+            }),
+        )
     }
 
     fn handle_king_status(&self, req: Request) -> Response {
@@ -9711,6 +9960,13 @@ struct LeaseRenewParams {
 struct KingRegisterParams {
     target: String,
     holder: String,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KingSpawnParams {
+    cwd: String,
+    holder: Option<String>,
     name: Option<String>,
 }
 

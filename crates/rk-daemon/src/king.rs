@@ -197,6 +197,30 @@ impl KingStore {
         Ok(registration)
     }
 
+    /// Remove the terminal binding while retaining durable King history.
+    ///
+    /// Any unsettled envelope may have been interrupted in the dismissed
+    /// generation, so make it pending again for at-least-once delivery to the
+    /// next explicitly registered generation.
+    pub fn unregister(&self, now: DateTime<Utc>) -> rk_core::Result<Option<KingRegistration>> {
+        let mut state = self.lock()?;
+        let registration = state.registration.take();
+        for wake in state.wakes.iter_mut().filter(|wake| wake.active()) {
+            wake.state = WakeState::Pending;
+            wake.updated_at = now;
+            wake.last_injected_at = None;
+            wake.claimed_at = None;
+        }
+        state.context = ContextLifecycle::Clean;
+        state.idle_since = None;
+        state.last_activity_at = None;
+        state.compact_started_at = None;
+        state.pending_restore = None;
+        state.restore_last_injected_at = None;
+        self.persist(&state)?;
+        Ok(registration)
+    }
+
     /// Observe a fresh authoritative snapshot and return a wake that should be
     /// injected now. One active wake coalesces all changes until it is settled.
     pub fn observe(
@@ -746,5 +770,23 @@ mod tests {
             .pending_restore_due(60, now + Duration::seconds(120))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn unregister_replays_unsettled_work_to_the_next_generation() {
+        let (_dir, store) = store();
+        let now = Utc::now();
+        let wake = store
+            .observe("a".into(), "one".into(), Value::Null, true, 10, now)
+            .unwrap()
+            .unwrap();
+        store.claim(&wake.id, "king-a", now).unwrap();
+
+        let removed = store.unregister(now).unwrap().unwrap();
+        assert_eq!(removed.identity.session_id, "one");
+        let state = store.snapshot().unwrap();
+        assert!(state.registration.is_none());
+        assert_eq!(state.wakes.back().unwrap().state, WakeState::Pending);
+        assert_eq!(state.context, ContextLifecycle::Clean);
     }
 }

@@ -17,7 +17,15 @@ terminal prompt itself.
 
 ## Protocol
 
-1. `rk king register <herdr-target> --holder <stable-id>` resolves a name, pane,
+The ordinary operator lifecycle is `rk king spawn`, `rk king at` (or
+`attach`), `rk king restart`, and `rk king dismiss`. Spawn creates a dedicated
+Herdr workspace from `[king]` harness configuration, primes it as the operator
+delegate, and performs the registration step below. Restart uses the same
+checkpoint/restore boundary as hard hibernation. Dismiss closes the exact
+registered generation and makes interrupted work replayable to a later spawn.
+
+1. `rk king register <herdr-target> --holder <stable-id>` (normally performed
+   by `rk king spawn`) resolves a name, pane,
    terminal, or agent-session id to `{terminal_id, pane_id, session_id}` and
    persists that exact generation.
 2. The daemon scans current reconciliation attention, operator inbox, ready
