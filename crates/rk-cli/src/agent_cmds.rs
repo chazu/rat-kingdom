@@ -286,7 +286,17 @@ pub async fn spawn(layout: &Layout, args: SpawnArgs, as_json: bool) -> Result<()
         } else {
             args.repo.clone()
         };
-        (ticket_id.clone(), Some(prompt), repo_arg)
+        // Canonicalize to the ticket's durable identity (never the raw
+        // `--ticket` spelling) so `record.task` — persisted verbatim into
+        // the agent record and worktree/branch names, and later compared by
+        // raw string equality in the delivery guard and the live-agent
+        // rescue sweep — matches regardless of whether the caller dispatched
+        // by a legacy ULID or its proquint alias.
+        let canonical_task = ticket["identity"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| ticket_id.clone());
+        (canonical_task, Some(prompt), repo_arg)
     } else {
         let task = args
             .task
