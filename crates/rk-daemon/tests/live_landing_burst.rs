@@ -100,6 +100,7 @@ async fn many_concurrent_completions_on_one_key_serialize_through_the_live_daemo
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     init_repo(repo_dir.path());
+    support::install_default_repository_policy(repo_dir.path());
 
     // Lives outside the repo/gate worktree entirely, so `reset_gate_worktree`'s
     // `git clean -fd` between candidates never touches it (mirrors
@@ -123,6 +124,14 @@ checks: [
     std::fs::create_dir_all(&rk_dir).unwrap();
     std::fs::write(rk_dir.join("checks.cue"), &checks).unwrap();
     std::fs::write(rk_dir.join("triggers.cue"), LANDING_TRIGGER).unwrap();
+    git(
+        repo_dir.path(),
+        &["add", ".rk/checks.cue", ".rk/triggers.cue"],
+    );
+    git(
+        repo_dir.path(),
+        &["commit", "-m", "test: register landing checks and trigger"],
+    );
 
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "burst-castle".into()).unwrap();

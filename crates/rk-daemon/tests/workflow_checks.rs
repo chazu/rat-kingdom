@@ -113,6 +113,7 @@ fn init_repo(repo: &Path) {
     std::fs::write(repo.join("README.md"), "# x\n").unwrap();
     git(repo, &["add", "."]);
     git(repo, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo);
     support::install_passing_landing_checks(repo);
 }
 
@@ -180,6 +181,7 @@ async fn named_check_resolves_and_merges_under_policy() {
     daemon.set_require_named_checks(true);
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -222,6 +224,7 @@ async fn named_check_receives_namespaced_data_inputs_under_policy() {
     daemon.set_require_named_checks(true);
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -260,6 +263,7 @@ async fn raw_command_refused_under_policy_fails_closed() {
     daemon.set_require_named_checks(true);
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -306,6 +310,7 @@ async fn raw_command_runs_when_policy_off() {
     // Policy OFF by default.
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -411,6 +416,7 @@ async fn strip_rk_spawn_removes_review_binding_but_inherit_still_sees_it() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -457,6 +463,7 @@ async fn unknown_check_fails_closed() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(

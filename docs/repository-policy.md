@@ -95,51 +95,56 @@ for forge review.
 
 ## Steward and trust
 
-Every completed rat's branch is triaged by a daemon-managed landing algorithm,
-the **steward**: a reviewer verdict (or, for a doc-only/trivial diff or a
-cache hit, no review at all) flows directly into delivery without a separate
-human gate, gated by the `landing` policy above plus the repo's real `verify`
-check. As of the steward remediation's Phase 3/4 cutover
-(`docs/reactor.md`, "Shipped reaction: the steward and the landing pipeline"),
-this triage runs two ways, and they are authorized differently:
+Every completed rat's branch may be triaged by the daemon-native landing
+pipeline when the repository's activated CUE triggers include an
+`action: "land"` match. That activated trigger is the unattended-landing
+authorization. The same activated policy supplies protected paths, diff
+budgets, timeouts, delivery mode, target, and the repository's named `verify`
+check. These checks are evaluated mechanically; they do not require an agent.
+A protected-path hit, an over-budget diff, or a failed/timed-out check holds
+the branch and surfaces attention instead of weakening the policy.
 
-- **Daemon-native landing pipeline (`action: "land"` trigger, live).**
-  `LandingPipeline` (`crates/rk-daemon/src/landing.rs`) calls
-  `Supervisor::land` directly — never through the workflow engine — so the
-  automated-landing exception described below (`automated_landing_workflows`,
-  `require_approval_for_landing`) **does not apply to it at all**. For a repo
-  whose installed triggers include an `action: "land"` entry, that trigger's
-  own existence and match predicate is the sole unattended-landing
-  authorization; the activated `landing` policy (protected paths, diff
-  budget, timeouts) is the only per-repo tuning available. This is the
-  intended end state, but narrowing/removing the two config fields below
-  (steward remediation Phase 4, item 4) is not yet done
-  (TKT-01M048ASY8MDB5DVV5VG3WRM47) — until then the fields keep working, but
-  only for the workflow-driven path.
-- **Workflow-driven mega-workflow (`run: "steward"` trigger, pre-cutover
-  reference).** The `land` workflow step this trigger's spawned instance
-  reaches is subject to the exception below, unchanged. This is the original
-  design; nothing installs it by default anymore, but it remains valid to run
-  instead of the daemon-native path (never both at once — see
-  `docs/reactor.md`).
+Workflow `land` and `open_pr` steps are a separate path, and they are still
+governed by the daemon's own config rather than by the activated repository
+policy alone. When `policy.require_approval_for_landing` is true a `land` or
+`open_pr` step requires a prior approved human gate, and its target must be in
+`policy.allowed_target_branches`.
 
-### The `automated_landing_workflows` / `require_approval_for_landing` exception (workflow-driven path only)
+### The `automated_landing_workflows` exception (workflow `land` steps only)
 
-Only the installed global workflow receives the configured automated-landing
-exception (`policy.automated_landing_workflows`, default `["steward"]`). A
-repository-local workflow with the same name cannot inherit that authority. A
-`land` step also checks `policy.require_approval_for_landing`, unless the
-workflow is in the exception list. `agent-base` authorizes the daemon-authored
-base for a managed steward run; a fixed target authorizes only that exact
-target. Manual workflows and explicit `open_pr` steps retain the normal
-approval and target-allowlist checks. Both fields are read only in
-`crates/rk-daemon/src/workflow_exec.rs`, so they have no effect on the
-daemon-native landing pipeline (see above).
+`policy.automated_landing_workflows` (default `["steward"]`) is a narrow
+`land`-only exception to that approval requirement: a workflow whose name is
+in the list may `land` unattended. `open_pr` is never excepted. The authority
+is bound to the *file*, not the name — `WorkflowEngine::is_automated_landing_definition`
+(`crates/rk-daemon/src/workflow_exec.rs`) additionally requires the resolved
+definition to live directly in the operator-owned global workflow directory,
+so a repo-local file of the same name cannot inherit it.
 
-## Legacy registrations
+**Its scope has narrowed, but it has not been removed.** Since the
+daemon-native landing pipeline (Phase 3/4 of the steward remediation) the
+primary unattended-landing path no longer goes through a workflow `land` step
+at all: `LandingPipeline` calls `Supervisor::land` directly and never consults
+this list. The shipped `steward` mega-workflow that used to rely on it is gone
+from the tree, so the default value is now inert in a stock installation. The
+field and its enforcement remain fully live in `rk-core`'s `PolicyConfig`
+(`crates/rk-core/src/config.rs`) for an operator-authored *custom* workflow
+that still uses an explicit `land` step — a bespoke `curator`, say. Actually
+narrowing or removing the field is tracked separately and is not yet done
+(TKT-01M048ASY8MDB5DVV5VG3WRM47).
 
-Repositories without `.rk/repo.cue` keep the previous registry behavior:
-`--merge-mode direct|pr`, `--remote`, and the daemon's
-`default_merge_mode`. Those flags are rejected when `.rk/repo.cue` exists so
-there cannot be two competing per-repository policies. Add the file through
-onboarding to migrate a legacy registration.
+## Activation and legacy registrations
+
+Activating `.rk/repo.cue` is how a repository gets a versioned policy: run
+`rk repo onboard start <path-or-name>` (or `rk repo add <path>` once the file
+is committed) to validate and activate the exact digest. An activated policy
+is the sole source of delivery mode, remote, protected paths, diff budgets,
+and timeouts, and `rk repo add --merge-mode/--remote` is *rejected* when
+`.rk/repo.cue` exists, so there cannot be two competing per-repository
+policies.
+
+A repository registered **without** an activated `.rk/repo.cue` keeps the
+previous registry behavior rather than failing closed: `rk repo add
+--merge-mode direct|pr` and `--remote` still apply, and when neither is given
+the daemon falls back to `policy.default_merge_mode` from
+`~/.rat-kingdom/config.toml` (default `direct`). Add the file through
+onboarding to migrate a legacy registration onto versioned policy.

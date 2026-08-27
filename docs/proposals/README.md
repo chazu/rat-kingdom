@@ -11,19 +11,18 @@ export -e workflow` path `rk_workflow::load` uses).
 
 ## Findings acted on
 
-1. **`land` result is ungated** in `steward` and `land-on-approve` (real defect).
+1. **`land` result was ungated** in the retired mega-workflow and
+   `land-on-approve` (real defect).
    A `land` merge conflict / moved target is a clean `{merged: false}` in
    `ctx.previousResult`, **not** an error — so the shipped APPROVE paths complete
    the instance as if the work merged, silently leaving the branch unmerged with
    no operator signal. `schema.cue` #LandStep explicitly prescribes gating with a
    following `evaluate {expect: {merged: true}}`. Both proposals add it (fail
    closed → surfaces the stuck auto-merge in `rk inbox`).
-   **Landed:** `examples/workflows/steward.cue` and
-   `examples/workflows/land-on-approve.cue`. The proposal copies are kept in
-   sync with those shipped definitions so they do not regress later workflow
-   evolution (named checks, diff scope, timeout routing, reviewer/instance
-   bindings, and PR delivery).
-   → `docs/proposals/steward.cue`, `docs/proposals/land-on-approve.cue`
+   **Landed:** `examples/workflows/land-on-approve.cue`. The old steward
+   mega-workflow and its proposal copy were removed when the daemon-native
+   landing pipeline became the sole shipped landing path.
+   → `docs/proposals/land-on-approve.cue`
 
 2. **No per-instance `budget` cap** on the fan-out / unattended workflows
    (missing guardrail). The schema's `#WorkflowBudget` (`budget: {max_usd}`) is

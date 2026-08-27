@@ -32,6 +32,8 @@ fn scratch_repo(dir: &Path) {
     git(dir, &["config", "user.email", "rat@example.com"]);
     git(dir, &["config", "user.name", "Rat"]);
     std::fs::write(dir.join("README.md"), "# startup race\n").unwrap();
+    std::fs::create_dir_all(dir.join(".rk")).unwrap();
+    std::fs::write(dir.join(".rk/repo.cue"), "repo: {}\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
 }
@@ -94,6 +96,13 @@ async fn first_rk_call_survives_spawn_startup_race() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut operator = connect(&layout).await;
+    operator
+        .call(
+            "repo.add",
+            json!({"name": "startup-race", "path": repo_dir.path()}),
+        )
+        .await
+        .unwrap();
 
     // The child runs its first authenticated call before it emits any harness
     // event. Concurrent spawns maximize overlap between launch, registry PID

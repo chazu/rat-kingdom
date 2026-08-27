@@ -673,14 +673,23 @@ require_named_checks = false     # true => a workflow `run` step may ONLY invoke
                                  # raw inline `command` is refused fail-closed, so
                                  # a compromised/untrusted workflow def cannot run
                                  # arbitrary shell in a rat's worktree.
-require_approval_for_landing = true # land/open_pr normally needs a human gate
-automated_landing_workflows = ["steward"] # land-only exception for managed global
-                                          # definitions; local shadows stay untrusted
-default_merge_mode = "direct"    # fleet-wide fallback for repos registered
-                                 # without an activated `.rk/repo.cue`: "direct" merges the
-                                 # branch, "pr" pushes it and opens a pull/merge
+require_approval_for_landing = true # workflow land/open_pr steps need a human gate;
+                                    # per-repo CUE landing triggers remain the
+                                    # non-agentic unattended policy boundary
+automated_landing_workflows = ["steward"] # land-only exception to the gate above, for
+                                          # managed *global* definitions; a repo-local
+                                          # shadow of the same name stays untrusted. The
+                                          # daemon-native landing pipeline never consults
+                                          # it, and no shipped workflow uses it anymore —
+                                          # it survives for a bespoke custom `land`
+                                          # workflow (TKT-01M048ASY8MDB5DVV5VG3WRM47).
+default_merge_mode = "direct"    # fleet-wide fallback for legacy repos registered
+                                 # without an activated `.rk/repo.cue`: "direct" merges
+                                 # the branch, "pr" pushes it and opens a pull/merge
                                  # request for review (see docs/pr-merge-mode.md).
-                                 # Versioned repository policy takes precedence.
+                                 # Versioned repository policy takes precedence, and
+                                 # `rk repo add --merge-mode/--remote` is rejected once
+                                 # `.rk/repo.cue` exists.
 
 # The unattended authority ladder (`rk reconcile`/`rk attention`/`rk lease`):
 # who may resolve a detected cross-ledger contradiction without a human in

@@ -14,8 +14,8 @@
 /// now it is one line of the script.
 ///
 /// The declaration has to come from inside the fake rather than from the test
-/// process: `Pattern::for_agent_since` bounds the lookup to a generation whose
-/// name does not exist until after the spawn, and a `for_each` fan-out names
+/// process: exact matching requires a spawn id that does not exist until after
+/// dispatch, and a `for_each` fan-out names
 /// its rats itself, so the test often never learns who to write it for. See
 /// `src/bin/rk-fixture-done.rs`.
 ///

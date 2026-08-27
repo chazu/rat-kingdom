@@ -49,6 +49,7 @@ async fn supervisor_persists_transcript_and_log_serves_it() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let spawned = client
         .call(
@@ -274,7 +275,7 @@ async fn a_name_that_named_two_rats_serves_each_generation_separately() {
 fn terminal_record(name: &str, created_at: DateTime<Utc>) -> AgentRecord {
     AgentRecord {
         name: name.into(),
-        spawn: None,
+        spawn: Some(rk_core::id::SpawnId::new()),
         role: "rat".into(),
         coordination: None,
         harness: "fake".into(),
@@ -339,4 +340,5 @@ fn scratch_repo(dir: &std::path::Path) {
     std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 }

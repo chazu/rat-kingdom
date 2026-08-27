@@ -46,6 +46,7 @@ fn scratch_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 }
 
 /// One process-global fake harness for the whole binary (mirrors
@@ -273,6 +274,7 @@ async fn finalize_dismisses_agents_the_workflow_never_dismissed() {
     });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let instance = run_workflow(&mut client, repo_dir.path(), "no-dismiss").await;
     wait_workflow_terminal(&mut client, &instance).await;
@@ -331,6 +333,7 @@ async fn finalize_sweep_parks_a_dirty_worktree() {
     });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let instance = run_workflow(&mut client, repo_dir.path(), "dirty-no-dismiss").await;
     wait_workflow_terminal(&mut client, &instance).await;
@@ -398,6 +401,7 @@ async fn reap_git_leaves_a_dirty_worktree_standing() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let name = spawn(&mut client, repo_dir.path(), "dirty-1", json!({})).await;
     wait_for_state(&mut client, &name, "completed").await;
@@ -462,6 +466,7 @@ async fn periodic_sweep_reclaims_a_leaked_worktree() {
     });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // A clean, trivially-merged (never diverged from base) leftover — exactly
     // the leaked-worktree scenario the sweep exists to reclaim.
@@ -514,6 +519,7 @@ async fn periodic_sweep_reaps_terminal_artifacts_regardless_of_merge_state() {
     });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let live = spawn(
         &mut client,
@@ -620,6 +626,7 @@ async fn periodic_sweep_reaps_artifacts_immediately_under_default_after_days() {
     });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let repo_name = repo_dir.path().file_name().unwrap().to_string_lossy();
     let added = client
@@ -697,6 +704,7 @@ async fn periodic_sweep_reaps_nothing_for_a_repo_with_no_declared_artifact_paths
     });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let name = spawn(
         &mut client,
@@ -748,6 +756,7 @@ async fn periodic_sweep_rejects_artifact_path_that_resolves_to_worktree_root() {
     });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let spawned = spawn_record(
         &mut client,
@@ -801,6 +810,7 @@ async fn spawn_refused_when_disk_floor_breached() {
     daemon.set_min_free_disk_gb(1_000_000_000);
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let refused = client
         .call(
@@ -855,6 +865,7 @@ async fn disk_floor_refusal_announces_through_the_recovery_sinks() {
     daemon.set_min_free_disk_gb(1_000_000_000);
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     for _ in 0..2 {
         let _ = client

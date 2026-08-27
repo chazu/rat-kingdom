@@ -118,8 +118,13 @@ schema and other modes.
 
 ### Fleet-wide default
 
-A legacy repo registered **without** an activated `.rk/repo.cue` falls back to the daemon's
-`[policy] default_merge_mode` in `~/.rat-kingdom/config.toml`:
+For a repository **with** an activated `.rk/repo.cue`, delivery mode and remote
+come only from that policy — `rk repo add --merge-mode/--remote` is rejected
+outright when the file exists, so the two can never disagree.
+
+A legacy repo registered **without** an activated `.rk/repo.cue` still falls
+back to `rk repo add --merge-mode/--remote`, and when neither flag is given, to
+the daemon's `[policy] default_merge_mode` in `~/.rat-kingdom/config.toml`:
 
 ```toml
 [policy]
@@ -127,9 +132,8 @@ default_merge_mode = "direct"    # or "pr" — fleet-wide fallback for repos
                                  # registered without a versioned policy.
 ```
 
-Default is `direct`, so old registry files behave exactly as before. The legacy
-`rk repo add --merge-mode/--remote` flags remain available only when the repo
-has no `.rk/repo.cue`.
+Default is `direct`, so old registry files behave exactly as before. Onboard
+the repository to move it off the legacy flags and onto versioned policy.
 
 ---
 
@@ -254,11 +258,15 @@ fetch_timeout_secs = 30 # hard timeout so a stuck fetch cannot pin the sweep
 ## 6. Quick reference
 
 ```bash
-# switch a repo to PR mode (push + open PR instead of merging)
-rk repo add <path> --merge-mode pr [--remote <name>]
-rk repo show <name>            # merge / remote / host as recorded
+# Preferred: set repo.delivery.mode: "pr" and repo.delivery.remote in
+# .rk/repo.cue, commit it, then validate and activate that exact digest:
+rk repo onboard start <path>
+rk repo show <name>            # delivery / remote / host as recorded
 
-# fleet-wide default (config.toml)
+# Legacy, only for a repo with no .rk/repo.cue (rejected once one exists):
+rk repo add <path> --merge-mode pr [--remote <name>]
+
+# fleet-wide fallback for those legacy repos (config.toml)
 [policy]
 default_merge_mode = "pr"      # or "direct" (the default)
 ```
