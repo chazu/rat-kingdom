@@ -520,12 +520,8 @@ pub(crate) struct LandingQueueEntry {
     pub(crate) head_sha: String,
     pub(crate) diff_class: String,
     pub(crate) task: String,
-    /// Exact source generation off the triggering `harness_result`, so
-    /// `finalize_delivery` resolves onto it instead of guessing by recency.
-    /// `None` is the compatibility fallback: a pre-migration queue entry or a
-    /// bare manual land with no dispatched agent (`crate::lifecycle`).
-    #[serde(default)]
-    pub(crate) source_agent: Option<String>,
+    /// Exact source generation off the triggering `harness_result`. `None`
+    /// is the compatibility fallback for pre-migration/manual entries.
     #[serde(default)]
     pub(crate) source_spawn: Option<rk_core::id::SpawnId>,
     /// Exact merge object built before gates run. Persisted so a daemon

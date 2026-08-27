@@ -1232,16 +1232,17 @@ impl Reactor {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        // Exact generation, straight off `harness_result` — generation-fences
-        // automatic finalization (`crate::lifecycle::resolve_merge_pointer`).
-        let source_agent = payload
-            .get("agent")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let source_spawn = payload
-            .get("spawn")
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse().ok());
+        let source_spawn = match parse_source_spawn(payload) {
+            Ok(spawn) => spawn,
+            Err(error) => {
+                return self.give_up_or_retry(
+                    key,
+                    &trigger.name,
+                    tuple_id,
+                    format!("reactor trigger '{}': {error}", trigger.name),
+                );
+            }
+        };
 
         let entry = LandingQueueEntry {
             repo_name: repo_name.to_string(),
@@ -1251,7 +1252,6 @@ impl Reactor {
             head_sha,
             diff_class,
             task,
-            source_agent,
             source_spawn,
             ..Default::default()
         };
@@ -2614,6 +2614,21 @@ impl Reactor {
     }
 }
 
+/// Missing means a pre-migration completion and retains the observable legacy
+/// fallback. A present but invalid value is corrupt generation evidence and
+/// must never silently select a newer namesake.
+fn parse_source_spawn(payload: &Value) -> rk_core::Result<Option<rk_core::id::SpawnId>> {
+    match payload.get("spawn") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => raw.parse().map(Some).map_err(|error| {
+            rk_core::Error::other(format!("invalid harness_result spawn: {error}"))
+        }),
+        Some(_) => Err(rk_core::Error::other(
+            "invalid harness_result spawn: expected a string",
+        )),
+    }
+}
+
 fn stable_workflow_instance_id(key: &str) -> String {
     let digest = Sha256::digest(key.as_bytes());
     format!("reactor-{}", hex::encode(&digest[..16]))
@@ -3005,6 +3020,18 @@ mod tests {
             "Whisker",
             json!({"suggestion": "sug-1", "count": 3}),
         )
+    }
+
+    #[test]
+    fn source_spawn_distinguishes_legacy_absence_from_corrupt_evidence() {
+        let spawn = rk_core::id::SpawnId::new();
+        assert_eq!(
+            parse_source_spawn(&json!({"spawn": spawn.to_string()})).unwrap(),
+            Some(spawn)
+        );
+        assert_eq!(parse_source_spawn(&json!({})).unwrap(), None);
+        assert!(parse_source_spawn(&json!({"spawn": "not-a-spawn"})).is_err());
+        assert!(parse_source_spawn(&json!({"spawn": 7})).is_err());
     }
 
     fn trigger(params: &[(&str, &str)]) -> Trigger {
