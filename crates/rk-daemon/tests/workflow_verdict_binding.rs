@@ -10,7 +10,7 @@
 //! last, and the `when` behind it routes an APPROVE — a land onto main — on a
 //! stranger's review of code this instance never looked at. Same shape as
 //! TKT-146 (a read satisfied by a record that is not the one being waited on),
-//! so it takes the same cure: bind to the author plus its generation floor.
+//! so it takes the same cure: bind to the author's exact spawn id.
 //!
 //! The test runs two instances of one workflow against one repo, with each
 //! reviewer's verdict differing (APPROVE vs REWORK) and the verdicts routing to
@@ -130,6 +130,7 @@ fn init_repo(dir: &Path, from_agent: bool) -> String {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
     let wf_dir = dir.join(".rk").join("workflows");
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(
@@ -207,6 +208,13 @@ fn release_reviewers(home: &Path) {
 /// care.
 async fn plant_verdict(client: &mut Client, scope: &str, agent: &str, recommendation: &str) {
     tokio::time::sleep(Duration::from_millis(2)).await;
+    let status = client
+        .call("agent.status", json!({"name": agent}))
+        .await
+        .unwrap();
+    let spawn = status["agent"]["spawn"]
+        .as_str()
+        .expect("reviewer must carry an exact spawn id");
     client
         .call(
             "space.out",
@@ -217,6 +225,7 @@ async fn plant_verdict(client: &mut Client, scope: &str, agent: &str, recommenda
                 // The stamp `rk out` now adds for any spawn-session write.
                 "payload": {
                     "agent": agent,
+                    "spawn": spawn,
                     "task": "review-the-branch",
                     "recommendation": recommendation,
                     "notes": format!("verdict for {agent}"),
@@ -245,6 +254,7 @@ async fn concurrent_instances_each_route_on_their_own_reviewers_verdict() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // Both stewards in flight at once, exactly as the reactor produces them.
     let first = run_workflow(&mut client, repo_dir.path()).await;
@@ -324,6 +334,7 @@ async fn an_unbound_read_still_takes_the_newest_strangers_verdict() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let first = run_workflow(&mut client, repo_dir.path()).await;
     let second = run_workflow(&mut client, repo_dir.path()).await;

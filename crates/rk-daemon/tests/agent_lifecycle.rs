@@ -7,7 +7,7 @@ mod fixture;
 mod support;
 
 use rk_core::paths::Layout;
-use rk_daemon::Daemon;
+use rk_daemon::{Client, Daemon};
 use serde_json::json;
 use std::path::Path;
 use std::process::Command;
@@ -58,6 +58,20 @@ fn scratch_repo(dir: &Path) {
     support::install_passing_landing_checks(dir);
 }
 
+async fn register_repo(client: &mut Client, repo: &Path) {
+    let name = repo
+        .file_name()
+        .expect("scratch repo must have a final path component")
+        .to_string_lossy();
+    client
+        .call(
+            "repo.add",
+            json!({"name": name, "path": repo.to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+}
+
 /// Fake harness script: does real git work in its cwd (the worktree), then
 /// emits a Claude-style completion.
 const WORKING_FAKE: &str = r#"
@@ -82,6 +96,7 @@ async fn spawn_complete_route_dismiss_merge() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    register_repo(&mut client, repo_dir.path()).await;
 
     // Spawn with a parent so completion routing is exercised.
     let spawned = client
@@ -202,6 +217,7 @@ async fn ticket_dispatched_rat_closes_its_ticket() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    register_repo(&mut client, repo_dir.path()).await;
 
     // File a ticket, then dispatch a rat whose task IS that ticket id.
     let ticket = client
@@ -309,6 +325,7 @@ async fn ticket_dispatched_rat_with_content_free_branch_does_not_close_its_ticke
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    register_repo(&mut client, repo_dir.path()).await;
 
     let ticket = client
         .call(
@@ -385,6 +402,7 @@ async fn ticket_with_a_queued_landing_entry_is_not_closed_on_dismiss() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    register_repo(&mut client, repo_dir.path()).await;
 
     let ticket = client
         .call(

@@ -47,6 +47,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
     support::install_passing_landing_checks(dir);
 }
 
@@ -127,6 +128,7 @@ async fn sub_workflow_runs_child_and_joins_its_result() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -204,6 +206,7 @@ async fn nested_sub_workflow_clears_its_link_only_with_the_top_level_cursor() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     let started = client
         .call(
             "workflow.run",
@@ -262,6 +265,7 @@ async fn sub_workflow_cycle_fails_closed_at_depth_cap() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -343,6 +347,7 @@ async fn interrupted_sub_workflow_rejoins_the_same_durable_child_after_restart()
     let daemon_a = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle_a = tokio::spawn(daemon_a.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     client
         .call(
             "workflow.run",
@@ -373,6 +378,7 @@ async fn interrupted_sub_workflow_rejoins_the_same_durable_child_after_restart()
     let daemon_b = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle_b = tokio::spawn(daemon_b.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     let list = client.call("workflow.list", json!({})).await.unwrap();
     let children: Vec<_> = list["instances"]
@@ -391,150 +397,6 @@ async fn interrupted_sub_workflow_rejoins_the_same_durable_child_after_restart()
 }
 
 #[tokio::test]
-async fn legacy_unlinked_running_child_fails_closed_instead_of_duplicating() {
-    let home = tempfile::tempdir().unwrap();
-    let repo_dir = tempfile::tempdir().unwrap();
-    init_repo(repo_dir.path());
-    let wf_dir = repo_dir.path().join(".rk").join("workflows");
-    std::fs::create_dir_all(&wf_dir).unwrap();
-    std::fs::write(wf_dir.join("parked-child.cue"), PARKED_CHILD).unwrap();
-    std::fs::write(wf_dir.join("parked-parent.cue"), PARKED_PARENT).unwrap();
-
-    let layout = Layout::at(home.path());
-    let daemon_a = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
-    let handle_a = tokio::spawn(daemon_a.run());
-    let mut client = connect(&layout).await;
-    let started = client
-        .call(
-            "workflow.run",
-            json!({
-                "name": "parked-parent",
-                "repo": repo_dir.path().to_string_lossy(),
-                "params": {},
-            }),
-        )
-        .await
-        .unwrap();
-    let parent_id = started["instance"]["id"].as_str().unwrap().to_string();
-
-    loop {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        let list = client.call("workflow.list", json!({})).await.unwrap();
-        if list["instances"]
-            .as_array()
-            .is_some_and(|instances| instances.iter().any(|i| i["workflow"] == "parked-child"))
-        {
-            break;
-        }
-    }
-    client.call("stop", json!({})).await.ok();
-    wait_socket_gone(&layout).await;
-    let _ = handle_a.await;
-
-    let parent_file = home
-        .path()
-        .join("workflow-instances")
-        .join(format!("{parent_id}.json"));
-    let mut parent: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&parent_file).unwrap()).unwrap();
-    parent["context"]
-        .as_object_mut()
-        .unwrap()
-        .remove("active_subworkflow");
-    std::fs::write(&parent_file, serde_json::to_vec_pretty(&parent).unwrap()).unwrap();
-
-    let daemon_b = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
-    let _handle_b = tokio::spawn(daemon_b.run());
-    let mut client = connect(&layout).await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let list = client.call("workflow.list", json!({})).await.unwrap();
-    let instances = list["instances"].as_array().unwrap();
-    assert_eq!(
-        instances
-            .iter()
-            .filter(|i| i["workflow"] == "parked-child")
-            .count(),
-        1,
-        "an unlinked legacy child must not cause a replacement child launch: {list}"
-    );
-    assert_eq!(
-        instances.iter().find(|i| i["id"] == parent_id).unwrap()["status"],
-        "failed",
-        "ambiguous legacy ownership must fail closed"
-    );
-}
-
-#[tokio::test]
-async fn legacy_unlinked_completed_child_fails_parent_closed_without_relaunch() {
-    let home = tempfile::tempdir().unwrap();
-    let repo_dir = tempfile::tempdir().unwrap();
-    init_repo(repo_dir.path());
-    let wf_dir = repo_dir.path().join(".rk").join("workflows");
-    std::fs::create_dir_all(&wf_dir).unwrap();
-    std::fs::write(wf_dir.join("parked-child.cue"), PARKED_CHILD).unwrap();
-    std::fs::write(wf_dir.join("parked-parent.cue"), PARKED_PARENT).unwrap();
-
-    let layout = Layout::at(home.path());
-    let daemon_a = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
-    let handle_a = tokio::spawn(daemon_a.run());
-    let mut client = connect(&layout).await;
-    let started = client
-        .call(
-            "workflow.run",
-            json!({
-                "name": "parked-parent",
-                "repo": repo_dir.path().to_string_lossy(),
-                "params": {},
-            }),
-        )
-        .await
-        .unwrap();
-    let parent_id = started["instance"]["id"].as_str().unwrap().to_string();
-    loop {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        if client.call("workflow.list", json!({})).await.unwrap()["instances"]
-            .as_array()
-            .is_some_and(|instances| instances.iter().any(|i| i["workflow"] == "parked-child"))
-        {
-            break;
-        }
-    }
-    client.call("stop", json!({})).await.ok();
-    wait_socket_gone(&layout).await;
-    let _ = handle_a.await;
-
-    let (parent_path, mut parent) = snapshot_for(home.path(), "parked-parent");
-    parent["context"]
-        .as_object_mut()
-        .unwrap()
-        .remove("active_subworkflow");
-    std::fs::write(&parent_path, serde_json::to_vec_pretty(&parent).unwrap()).unwrap();
-    let (child_path, mut child) = snapshot_for(home.path(), "parked-child");
-    child["status"] = json!("completed");
-    child["completed_at"] = json!(chrono::Utc::now());
-    std::fs::write(&child_path, serde_json::to_vec_pretty(&child).unwrap()).unwrap();
-
-    let daemon_b = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
-    let _handle_b = tokio::spawn(daemon_b.run());
-    let mut client = connect(&layout).await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let list = client.call("workflow.list", json!({})).await.unwrap();
-    let instances = list["instances"].as_array().unwrap();
-    assert_eq!(
-        instances
-            .iter()
-            .filter(|i| i["workflow"] == "parked-child")
-            .count(),
-        1,
-        "a terminal legacy child must not be relaunched: {list}"
-    );
-    assert_eq!(
-        instances.iter().find(|i| i["id"] == parent_id).unwrap()["status"],
-        "failed"
-    );
-}
-
-#[tokio::test]
 async fn terminal_parent_does_not_shield_a_running_linked_child_from_recovery() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
@@ -548,6 +410,7 @@ async fn terminal_parent_does_not_shield_a_running_linked_child_from_recovery() 
     let daemon_a = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle_a = tokio::spawn(daemon_a.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     client
         .call(
             "workflow.run",
@@ -581,6 +444,7 @@ async fn terminal_parent_does_not_shield_a_running_linked_child_from_recovery() 
     let daemon_b = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle_b = tokio::spawn(daemon_b.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     let list = client.call("workflow.list", json!({})).await.unwrap();
     let child = list["instances"]
@@ -609,6 +473,7 @@ async fn mismatched_linked_child_is_failed_with_its_parent_instead_of_becoming_a
     let daemon_a = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle_a = tokio::spawn(daemon_a.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     client
         .call(
             "workflow.run",
@@ -640,6 +505,7 @@ async fn mismatched_linked_child_is_failed_with_its_parent_instead_of_becoming_a
     let daemon_b = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle_b = tokio::spawn(daemon_b.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let list = client.call("workflow.list", json!({})).await.unwrap();
     let instances = list["instances"].as_array().unwrap();

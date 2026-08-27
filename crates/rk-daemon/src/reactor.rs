@@ -1252,7 +1252,7 @@ impl Reactor {
             head_sha,
             diff_class,
             task,
-            source_spawn,
+            source_spawn: Some(source_spawn),
             ..Default::default()
         };
         match landing.enqueue(entry) {
@@ -2614,15 +2614,16 @@ impl Reactor {
     }
 }
 
-/// Missing means a pre-migration completion and retains the observable legacy
-/// fallback. A present but invalid value is corrupt generation evidence and
-/// must never silently select a newer namesake.
-fn parse_source_spawn(payload: &Value) -> rk_core::Result<Option<rk_core::id::SpawnId>> {
+/// Automatic landing requires exact generation evidence. Missing and malformed
+/// values both fail closed; manual recovery submissions use a separate path.
+fn parse_source_spawn(payload: &Value) -> rk_core::Result<rk_core::id::SpawnId> {
     match payload.get("spawn") {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(raw)) => raw.parse().map(Some).map_err(|error| {
+        Some(Value::String(raw)) => raw.parse().map_err(|error| {
             rk_core::Error::other(format!("invalid harness_result spawn: {error}"))
         }),
+        None | Some(Value::Null) => Err(rk_core::Error::other(
+            "harness_result missing required spawn",
+        )),
         Some(_) => Err(rk_core::Error::other(
             "invalid harness_result spawn: expected a string",
         )),
@@ -3023,13 +3024,13 @@ mod tests {
     }
 
     #[test]
-    fn source_spawn_distinguishes_legacy_absence_from_corrupt_evidence() {
+    fn source_spawn_is_required_and_corruption_fails_closed() {
         let spawn = rk_core::id::SpawnId::new();
         assert_eq!(
             parse_source_spawn(&json!({"spawn": spawn.to_string()})).unwrap(),
-            Some(spawn)
+            spawn
         );
-        assert_eq!(parse_source_spawn(&json!({})).unwrap(), None);
+        assert!(parse_source_spawn(&json!({})).is_err());
         assert!(parse_source_spawn(&json!({"spawn": "not-a-spawn"})).is_err());
         assert!(parse_source_spawn(&json!({"spawn": 7})).is_err());
     }
@@ -3205,7 +3206,7 @@ mod tests {
     fn agent(name: &str, repo: &str, state: crate::agents::AgentState) -> AgentRecord {
         AgentRecord {
             name: name.into(),
-            spawn: None,
+            spawn: Some(rk_core::id::SpawnId::new()),
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),

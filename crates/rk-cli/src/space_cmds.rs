@@ -535,17 +535,15 @@ pub async fn watch(layout: &Layout, args: ScanArgs) -> Result<()> {
 
 pub async fn done(layout: &Layout, args: DoneArgs, as_json: bool) -> Result<()> {
     let agent = env_required("RK_AGENT")?;
+    let spawn = env_required("RK_SPAWN")?;
     let repo = env_required("RK_REPO")?;
     let task = env_required("RK_TASK")?;
     let mut payload = json!({
         "task": task,
         "agent": agent,
-        // `Pattern::for_spawn`'s join key (C1/S3a,
-        // docs/2026-08-17-tkt-c1-generation-identity.md). Optional: RK_SPAWN
-        // is only set once the daemon mints one at spawn (C6), so a `rk done`
-        // run under an unmigrated daemon still resolves via the name+floor
-        // fallback instead of writing a null field a reader would trip on.
-        "spawn": std::env::var("RK_SPAWN").ok(),
+        // Exact generation join key. A primed worker without RK_SPAWN is an
+        // invalid runtime environment, not a name/time compatibility case.
+        "spawn": spawn,
         "branch": std::env::var("RK_BRANCH").ok(),
         "parent": std::env::var("RK_PARENT").ok(),
         "workflow_instance": std::env::var("RK_WORKFLOW_INSTANCE").ok(),
@@ -950,16 +948,14 @@ mod tests {
         }
     }
 
-    /// The stamp is what makes a durable tuple attributable, so a workflow
-    /// `read` with `fromAgent: true` can tell this instance's reviewer from a
-    /// concurrent instance's (TKT-161).
+    /// The CLI adds the display author; the authenticated daemon adds exact
+    /// spawn attribution before an operational `fromAgent` read can match it.
     #[test]
     fn out_stamps_the_writing_agent() {
         let mut payload = json!({"recommendation": "APPROVE"});
         stamp_author(&mut payload, Some("Filch-2".into()));
         assert_eq!(payload["agent"], json!("Filch-2"));
         assert_eq!(payload["recommendation"], json!("APPROVE"));
-        // Exactly the substring `Pattern::for_agent_since` searches for.
         assert!(payload.to_string().contains("\"agent\":\"Filch-2\""));
     }
 

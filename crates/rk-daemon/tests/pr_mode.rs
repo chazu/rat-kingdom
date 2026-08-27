@@ -1,11 +1,12 @@
-//! TKT-65: PR-mode landing. A repo registered with `merge_mode = pr` must,
+//! TKT-65: PR-mode landing. A repo whose activated CUE policy selects PR
+//! delivery must,
 //! on explicit land, push the rat's branch and open a pull request against the base
 //! rather than merging it — leaving the branch standing for review, reporting
 //! `{merged: false, pr_opened: true}`, and never touching the base branch.
 //!
 //! This is the counterpart to `merge_queue.rs`, which proves the Direct path:
 //! there dismiss merges into `main` and deletes the branch. Here the identical
-//! dismiss call, differing only in the repo's registered merge mode, must take
+//! dismiss call, differing only in the repo's versioned delivery policy, must take
 //! the PR fork instead.
 
 use rk_core::config::ReviewSweepConfig;
@@ -55,6 +56,20 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","ses
     )
 }
 
+fn install_pr_policy_and_checks(repo: &Path) {
+    let rk_dir = repo.join(".rk");
+    std::fs::create_dir_all(&rk_dir).unwrap();
+    std::fs::write(
+        rk_dir.join("repo.cue"),
+        r#"repo: {
+    delivery: {target: "main", mode: "pr", remote: "origin", remoteBranch: "{{branch}}", deleteSource: false}
+}
+"#,
+    )
+    .unwrap();
+    support::install_passing_landing_checks(repo);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pr_mode_dismiss_opens_pr_and_keeps_branch() {
     let home = tempfile::tempdir().unwrap();
@@ -76,6 +91,7 @@ async fn pr_mode_dismiss_opens_pr_and_keeps_branch() {
     std::fs::write(repo_path.join("README.md"), "# x\n").unwrap();
     git(repo_path, &["add", "."]);
     git(repo_path, &["commit", "-m", "init"]);
+    install_pr_policy_and_checks(repo_path);
     git(repo_path, &["push", "-u", "origin", "main"]);
     let base_head = git(repo_path, &["rev-parse", "main"]).trim().to_string();
 
@@ -85,8 +101,9 @@ async fn pr_mode_dismiss_opens_pr_and_keeps_branch() {
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
 
-    // Register the repo in PR mode. `repo.name()` (the dir basename) is what a
-    // spawned rat records as its repo_name and what dismiss resolves against.
+    // Register the repo. `repo.name()` (the dir basename) is what a spawned rat
+    // records as its repo_name and what dismiss resolves against; delivery mode
+    // comes only from the activated CUE policy above.
     let repo_name = repo_path.file_name().unwrap().to_string_lossy().to_string();
     client
         .call(
@@ -94,8 +111,6 @@ async fn pr_mode_dismiss_opens_pr_and_keeps_branch() {
             json!({
                 "name": repo_name,
                 "path": repo_path.to_string_lossy(),
-                "merge_mode": "pr",
-                "remote": "origin",
             }),
         )
         .await
@@ -254,6 +269,7 @@ async fn review_sweep_clears_awaiting_review_on_forge_merge_without_a_pull() {
     std::fs::write(repo_path.join("README.md"), "# x\n").unwrap();
     git(repo_path, &["add", "."]);
     git(repo_path, &["commit", "-m", "init"]);
+    install_pr_policy_and_checks(repo_path);
     git(repo_path, &["push", "-u", "origin", "main"]);
     let base_head = git(repo_path, &["rev-parse", "main"]).trim().to_string();
 
@@ -285,8 +301,6 @@ async fn review_sweep_clears_awaiting_review_on_forge_merge_without_a_pull() {
             json!({
                 "name": repo_name,
                 "path": repo_path.to_string_lossy(),
-                "merge_mode": "pr",
-                "remote": "origin",
             }),
         )
         .await

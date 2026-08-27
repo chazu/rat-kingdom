@@ -4,10 +4,9 @@
 //! together, not just the pure `build()` unit tests in
 //! `rk-daemon/src/reconcile.rs`.
 //!
-//! Reproduces TKT-171's "currently observed" contradiction family directly:
-//! a `land` step reports a clean `{merged: false, pr_opened: false}` when a
-//! merge conflicts, leaving finished work stranded outside its target with
-//! nothing else in the fleet tracking it.
+//! Proves the current bounded conflict-hold contract directly: an exactly
+//! keyed branch that remains outside its target is reported, then self-clears
+//! once an operator resolves the git state.
 
 mod support;
 
@@ -34,7 +33,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_dropped_land_surfaces_as_a_conflict_held_violation_and_self_clears() {
+async fn an_exact_conflict_hold_surfaces_as_a_violation_and_self_clears() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let repo_path = repo_dir.path();
@@ -47,6 +46,7 @@ async fn a_dropped_land_surfaces_as_a_conflict_held_violation_and_self_clears() 
     git(repo_path, &["checkout", "-b", "rat/whisker/work"]);
     std::fs::write(repo_path.join("README.md"), "# rat version\n").unwrap();
     git(repo_path, &["commit", "-am", "rat work"]);
+    let head_sha = git(repo_path, &["rev-parse", "HEAD"]).trim().to_string();
     git(repo_path, &["checkout", "main"]);
 
     let layout = Layout::at(home.path());
@@ -75,10 +75,11 @@ async fn a_dropped_land_surfaces_as_a_conflict_held_violation_and_self_clears() 
         "an untouched repo must converge cleanly: {clean}"
     );
 
-    // The exact event shape `land` writes for a conflict it deliberately
-    // reports as clean rather than an error (TKT-171): `content_free: false`
-    // (the branch really did change something) is what makes this event
-    // "content proven" and worth asking git about at all.
+    // A current conflict hold carries its exact bounded-chain identity.
+    // `content_free: false` proves the branch really changed something and
+    // is worth asking git about at all.
+    let chain_key =
+        format!("{repo_name}\0rat/whisker/work\0{head_sha}\0main\0TKT-WORK\0TKT-REWORK");
     client
         .call(
             "space.out",
@@ -92,6 +93,7 @@ async fn a_dropped_land_surfaces_as_a_conflict_held_violation_and_self_clears() 
                     "merged": false,
                     "pr_opened": false,
                     "content_free": false,
+                    "chain_key": chain_key,
                     "detail": "conflict in README.md",
                 },
                 "lifecycle": "furniture",
