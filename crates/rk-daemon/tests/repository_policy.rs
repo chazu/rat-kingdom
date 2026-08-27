@@ -69,6 +69,61 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+#[tokio::test]
+async fn registered_repo_without_activated_cue_is_visible_but_cannot_dispatch() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo = repo_dir.path();
+    git(repo, &["init", "-b", "main"]);
+    git(repo, &["config", "user.email", "r@x"]);
+    git(repo, &["config", "user.name", "R"]);
+    std::fs::write(repo.join("README.md"), "# inactive policy\n").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-m", "init"]);
+
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "inactive-policy".into()).unwrap();
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+    let name = repo.file_name().unwrap().to_string_lossy().to_string();
+
+    let added = client
+        .call(
+            "repo.add",
+            json!({"name": name, "path": repo.to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        added["repo"]["activated_policy"].is_null(),
+        "registration must not invent a policy: {added}"
+    );
+
+    let listed = client.call("repo.list", json!({})).await.unwrap();
+    assert!(
+        listed["repos"]
+            .as_array()
+            .is_some_and(|repos| repos.iter().any(|entry| entry["name"] == name)),
+        "inactive repo must remain inspectable: {listed}"
+    );
+
+    let error = client
+        .call(
+            "agent.spawn",
+            json!({"repo": repo.to_string_lossy(), "task": "must-onboard", "harness": "fake"}),
+        )
+        .await
+        .expect_err("dispatch must fail closed without activated repo CUE");
+    let message = error.to_string();
+    assert!(
+        message.contains("no activated .rk/repo.cue policy"),
+        "{message}"
+    );
+    assert!(message.contains("rk repo onboard"), "{message}");
+
+    handle.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn activated_policy_controls_names_target_and_remote_delivery() {
     let _env_guard = HARNESS_ENV_LOCK.lock().await;

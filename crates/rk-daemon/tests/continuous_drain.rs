@@ -4,7 +4,7 @@
 //! spawns the next ready ticket the moment a slot frees. The test drives a
 //! backlog deeper than the cap through a slow fake harness and asserts:
 //!   - the live count never exceeds `max_wip` (the cap holds);
-//!   - every ready ticket is eventually dispatched and reaches `done` (refill);
+//!   - every ready ticket is eventually dispatched and its rat settles (refill);
 //!   - each ticket is dispatched exactly once (atomic claim, no double-grab);
 //!   - a system-scope ticket (no registered repo) is never dispatched.
 //!
@@ -45,17 +45,8 @@ fn git(dir: &Path, args: &[&str]) {
 
 // This suite's fake harness (`SLOW_FAKE`) never touches the worktree — it
 // exists purely to exercise the WIP-capped scheduler cheaply, not delivery.
-// Under the default "merge" delivery mode a ticket only reaches `done` once
-// its branch is actually merged (TKT-01M08HB566GFBZVMDKZ8DT1ES0's C3 gate,
-// see `ticket_done_binding.rs`), which nothing here ever does — these tests
-// never dismiss. Activate "push-branch" instead: the routed-completion gate
-// (`ticket_delivered`, `gate_push_branch: false`) never checks push-branch
-// delivery at all, so a clean `rk_done` alone is enough to close the ticket,
-// same as this suite always assumed. Before commit-count awareness landed
-// (TKT-01M0CTC4DPFV7Q2642AZH354BV), the default merge-mode gate happened to
-// let an empty branch through too — this suite was unknowingly relying on
-// that bug rather than on real delivery, which is exactly the class that fix
-// closes.
+// Agent completion therefore leaves tickets `in_progress`; only the canonical
+// landing finalizer may close them.
 const PUSH_BRANCH_POLICY: &str = r#"
 repo: {
     delivery: {
@@ -171,7 +162,8 @@ async fn continuous_drain_refills_up_to_wip_and_never_exceeds_it() {
         .await
         .unwrap();
 
-    // Poll the fleet: track the peak live count and wait for all five to finish.
+    // Poll the fleet: track the peak live count and wait for all five rats to
+    // settle. Ticket closure is intentionally outside this test's scope.
     let mut peak_live = 0usize;
     let mut all_done = false;
     let deadline = tokio::time::Instant::now() + DRAIN_DEADLINE;
@@ -185,24 +177,27 @@ async fn continuous_drain_refills_up_to_wip_and_never_exceeds_it() {
             .count();
         peak_live = peak_live.max(live);
 
-        let tickets = client
-            .call("ticket.list", json!({"scope": repo_name}))
-            .await
-            .unwrap();
-        let done = tickets["tickets"]
+        let repo_agents: Vec<_> = agents["agents"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|t| t["payload"]["status"] == "done")
-            .count();
-        if done == 5 {
+            .filter(|agent| agent["repo_name"] == repo_name)
+            .collect();
+        if repo_agents.len() == 5
+            && repo_agents
+                .iter()
+                .all(|agent| !matches!(agent["state"].as_str(), Some("spawning") | Some("running")))
+        {
             all_done = true;
             break;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 
-    assert!(all_done, "all five ready tickets should be drained to done");
+    assert!(
+        all_done,
+        "all five ready tickets should dispatch and settle"
+    );
     // The cap is the invariant, and it is an UPPER bound. A lower bound here
     // would only assert that a 50ms sampler happened to catch one of the ~0.4s
     // live windows, which is sampling luck, not behaviour — that rats really
@@ -219,6 +214,11 @@ async fn continuous_drain_refills_up_to_wip_and_never_exceeds_it() {
         list.len(),
         5,
         "one rat per ready ticket, dispatched once each"
+    );
+    assert_eq!(
+        ticket_status_count(&mut client, &repo_name, "in_progress").await,
+        5,
+        "drain claims tickets but completion alone must not fabricate delivery"
     );
 
     // The system-scope ticket was left untouched (no repo to dispatch into).
@@ -342,16 +342,19 @@ async fn partition_caps_hold_per_repo_and_allowlist_excludes_unlisted() {
         peak_alpha = peak_alpha.max(live_alpha);
         peak_beta = peak_beta.max(live_beta);
 
-        let a_done = ticket_done_count(&mut client, &alpha).await;
-        let b_done = ticket_done_count(&mut client, &beta).await;
-        if a_done == 3 && b_done == 3 {
+        let alpha_total = agents_for_repo_value(&agents, &alpha);
+        let beta_total = agents_for_repo_value(&agents, &beta);
+        if alpha_total == 3 && beta_total == 3 && live_alpha == 0 && live_beta == 0 {
             both_done = true;
             break;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 
-    assert!(both_done, "both allowlisted repos should drain to done");
+    assert!(
+        both_done,
+        "both allowlisted repos should dispatch and settle every rat"
+    );
     // Each per-repo cap is an UPPER bound on concurrency, so that is what the
     // sampled peak asserts. Requiring `== 1` also demanded that the 50ms poll
     // caught one of the ~0.4s live windows; under parallel load this loop's own
@@ -383,6 +386,16 @@ async fn partition_caps_hold_per_repo_and_allowlist_excludes_unlisted() {
         "one rat per beta ticket, dispatched once each"
     );
     assert_eq!(
+        ticket_status_count(&mut client, &alpha, "in_progress").await,
+        3,
+        "alpha tickets await canonical delivery"
+    );
+    assert_eq!(
+        ticket_status_count(&mut client, &beta, "in_progress").await,
+        3,
+        "beta tickets await canonical delivery"
+    );
+    assert_eq!(
         agents_for_repo(&mut client, &gamma).await,
         0,
         "unlisted repo must never have a rat dispatched into it"
@@ -409,6 +422,10 @@ async fn partition_caps_hold_per_repo_and_allowlist_excludes_unlisted() {
 /// count rather than a race against completion.
 async fn agents_for_repo(client: &mut Client, scope: &str) -> usize {
     let agents = client.call("agent.list", json!({})).await.unwrap();
+    agents_for_repo_value(&agents, scope)
+}
+
+fn agents_for_repo_value(agents: &serde_json::Value, scope: &str) -> usize {
     agents["agents"]
         .as_array()
         .unwrap()
@@ -417,7 +434,7 @@ async fn agents_for_repo(client: &mut Client, scope: &str) -> usize {
         .count()
 }
 
-async fn ticket_done_count(client: &mut Client, scope: &str) -> usize {
+async fn ticket_status_count(client: &mut Client, scope: &str, status: &str) -> usize {
     let tickets = client
         .call("ticket.list", json!({"scope": scope}))
         .await
@@ -426,6 +443,6 @@ async fn ticket_done_count(client: &mut Client, scope: &str) -> usize {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|t| t["payload"]["status"] == "done")
+        .filter(|t| t["payload"]["status"] == status)
         .count()
 }

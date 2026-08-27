@@ -79,6 +79,7 @@ async fn an_ungated_land_fails_closed_before_git_side_effects() {
     std::fs::write(repo_path.join("README.md"), "# x\n").unwrap();
     git(repo_path, &["add", "."]);
     git(repo_path, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_path);
 
     let wf_dir = repo_path.join(".rk").join("workflows");
     std::fs::create_dir_all(&wf_dir).unwrap();
@@ -136,8 +137,7 @@ async fn an_ungated_land_fails_closed_before_git_side_effects() {
         "an ungated land must fail closed: {status}"
     );
     assert_eq!(
-        status["instance"]["error"],
-        "land step requires a prior approved human gate or a trusted automated workflow",
+        status["instance"]["error"], "land step requires a prior approved human gate",
         "the failure should explain the required operator action: {status}"
     );
     let branch = status["instance"]["context"]["active_branch"]

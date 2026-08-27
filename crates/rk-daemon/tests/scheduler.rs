@@ -63,8 +63,6 @@ fn register_repo(layout: &Layout, name: &str, path: &Path) {
         name: name.into(),
         path: path.to_path_buf(),
         created_at: chrono::Utc::now(),
-        merge_mode: Default::default(),
-        remote: None,
         host: None,
         activated_policy: None,
     })
@@ -103,8 +101,6 @@ fn build_engine(layout: &Layout, space: rk_space::Space) -> Arc<WorkflowEngine> 
         false,
         false,
         false,
-        Vec::new(),
-        vec!["main".into(), "master".into()],
         0,
         false,
     ))

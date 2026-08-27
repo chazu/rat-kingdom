@@ -418,11 +418,6 @@ pub struct Daemon {
     /// checks; raw inline commands are refused (TKT-30, `[policy]`).
     require_named_checks: bool,
     require_approval_for_landing: bool,
-    automated_landing_workflows: Vec<String>,
-    /// Fleet-wide default merge mode a repo is registered with when `rk repo
-    /// add` names no explicit `--merge-mode` (`[policy] default_merge_mode`).
-    default_merge_mode: rk_core::config::MergeMode,
-    allowed_target_branches: Vec<String>,
     auth_token: String,
     engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
     landing: std::sync::OnceLock<Arc<crate::landing::LandingPipeline>>,
@@ -617,9 +612,6 @@ impl Daemon {
         daemon.king_config = config.king.clone();
         daemon.require_named_checks = config.policy.require_named_checks;
         daemon.require_approval_for_landing = config.policy.require_approval_for_landing;
-        daemon.automated_landing_workflows = config.policy.automated_landing_workflows.clone();
-        daemon.default_merge_mode = config.policy.default_merge_mode;
-        daemon.allowed_target_branches = config.policy.allowed_target_branches.clone();
         daemon.authority_policy = crate::authority::AuthorityPolicy::from_config(&config.policy)?;
         if config.sync.enabled {
             let syncer = crate::sync::Syncer::new(
@@ -940,11 +932,6 @@ impl Daemon {
             default_harness,
             require_named_checks: false,
             require_approval_for_landing: true,
-            automated_landing_workflows: rk_core::config::PolicyConfig::default()
-                .automated_landing_workflows,
-            default_merge_mode: rk_core::config::MergeMode::default(),
-            allowed_target_branches: rk_core::config::PolicyConfig::default()
-                .allowed_target_branches,
             auth_token,
             engine: std::sync::OnceLock::new(),
             landing: std::sync::OnceLock::new(),
@@ -1720,8 +1707,6 @@ impl Daemon {
                 // a `wait` only gives up on one when it cannot be (TKT-147).
                 self.sweep_config.respawn_enabled && self.sweep_config.respawn_max_attempts > 0,
                 self.require_approval_for_landing,
-                self.automated_landing_workflows.clone(),
-                self.allowed_target_branches.clone(),
                 // Shared with the continuous-drain autoscaler regardless of
                 // whether its own refill loop is enabled: `max_wip` is the
                 // fleet-wide concurrency ceiling either way, and 0 (the
@@ -2703,12 +2688,12 @@ impl Daemon {
             // waiting on. Does not touch already-running agents.
             "daemon.pause_dispatch" => {
                 self.supervisor.set_dispatch_paused(true);
-                let live: Vec<String> = self
+                let live: Vec<Value> = self
                     .supervisor
                     .list()
                     .into_iter()
                     .filter(|r| r.state.is_live())
-                    .map(|r| r.name)
+                    .map(|r| json!({"name": r.name, "spawn": r.spawn_id()}))
                     .collect();
                 reply(Response::ok(
                     id,
@@ -3768,8 +3753,9 @@ impl Daemon {
             };
             let protected_paths = supervisor
                 .repository_policy(&git_repo)
-                .landing
-                .protected_paths;
+                .ok()
+                .map(|policy| policy.landing.protected_paths)
+                .unwrap_or_default();
             for record in records {
                 if let Some(touch) =
                     touches_protected_path(&git_repo, &record.merge_commit, &protected_paths)
@@ -6212,7 +6198,9 @@ impl Daemon {
         let queue = crate::landing::landing_queue_snapshot(&self.space);
         let mut announced = 0;
         for repo in repos {
-            let policy = repo.effective_policy().phase_latency;
+            let Ok(policy) = repo.effective_policy().map(|policy| policy.phase_latency) else {
+                continue;
+            };
             if policy.targets.is_empty() {
                 continue;
             }
@@ -6355,42 +6343,7 @@ impl Daemon {
         if in_progress.is_empty() {
             return 0;
         }
-        // Landing-awareness (TKT-01M0C663BZ86SMA2PVMFP5QJ8D): a ticket whose
-        // branch already landed must never be reopened just because its rat
-        // went terminal without being dismissed — the async
-        // steward-review flow leaves exactly that gap (O14: the harness's
-        // own `rk done` finds the branch not yet merged and refuses to close
-        // the ticket, so it sits `in_progress` until the landing pipeline
-        // records delivery). Reopening it dispatches a duplicate rat onto
-        // already-delivered work. `landing_processed` is
-        // keyed by `(repo, branch, head_sha)` — the wrong shape for "does
-        // this ticket have a landed outcome" — so read `payload.task`
-        // instead, which the reactor's landing-trigger dispatch (`reactor.rs`)
-        // populates from the completing rat's own `task` (== ticket id by
-        // fleet convention). One unscoped scan up front, not one probe per
-        // ticket: `landing_processed` is a `Furniture` event with no
-        // per-ticket index, same tradeoff `build()`'s `branch_landed` scan
-        // already makes for `rk inbox`.
-        let landed_tickets: std::collections::HashSet<String> = self
-            .space
-            .scan(
-                &Pattern::category(Category::Event)
-                    .identity(crate::landing::LANDING_PROCESSED_IDENTITY),
-            )
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|t| t.payload.get("outcome").and_then(Value::as_str) == Some("landed"))
-            .filter_map(|t| {
-                t.payload
-                    .get("task")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .filter(|task| !task.is_empty())
-            .collect();
-        // Landing-awareness, part 2 (probes O8/O17, TKT-01M0CTC4DYBRX6P5X2NPEZF0EZ):
-        // `landed_tickets` above only covers the terminal case. A ticket
-        // whose rat went non-live (paused, killed, orphaned) WHILE its
+        // A ticket whose rat went non-live (paused, killed, orphaned) WHILE its
         // branch is still queued for landing — `Queued`, `RunningGates`, or
         // `AwaitingReview` — has no live agent and no `landing_processed`
         // marker yet, so without this it sails through both guards and gets
@@ -6404,11 +6357,6 @@ impl Daemon {
         let announcer = crate::recovery::RecoveryAnnouncer::new();
         let mut reopened = 0usize;
         for ticket in in_progress {
-            if landed_tickets.contains(&ticket.identity) {
-                // Already delivered — leave it for the landing-driven ticket
-                // transition to close rather than reopening onto a duplicate.
-                continue;
-            }
             if queued_tickets.contains(&ticket.identity) {
                 // Branch is queued/gating/awaiting review — the owning rat
                 // going non-live here is expected (it may have already
@@ -6546,13 +6494,6 @@ impl Daemon {
         };
         let policy_file = path.join(".rk").join("repo.cue");
         let activated_policy = if policy_file.is_file() {
-            if params.merge_mode.is_some() || params.remote.is_some() {
-                return Response::err(
-                    req.id,
-                    codes::BAD_PARAMS,
-                    "a repository with .rk/repo.cue cannot also use --merge-mode or --remote; edit and activate the versioned policy instead",
-                );
-            }
             let policy_file_for_load = policy_file.clone();
             match tokio::task::spawn_blocking(move || {
                 let (policy, digest) =
@@ -6576,13 +6517,11 @@ impl Daemon {
         } else {
             None
         };
-        let remote = activated_policy
+        let remote_name = activated_policy
             .as_ref()
             .map(|approved| approved.policy.delivery.remote.clone())
-            .or(params.remote);
-        let remote_name = remote.as_deref().unwrap_or("origin");
+            .unwrap_or_else(|| "origin".to_string());
         let path_for_remote = path.clone();
-        let remote_name = remote_name.to_string();
         let host = match tokio::task::spawn_blocking(move || {
             repo_remote_url(&path_for_remote, &remote_name)
                 .and_then(|url| crate::repos::infer_host(&url))
@@ -6602,17 +6541,6 @@ impl Daemon {
             name: params.name,
             path,
             created_at: chrono::Utc::now(),
-            merge_mode: activated_policy
-                .as_ref()
-                .map(|approved| match approved.policy.delivery.mode {
-                    rk_workflow::DeliveryMode::Pr => rk_core::config::MergeMode::Pr,
-                    rk_workflow::DeliveryMode::Merge
-                    | rk_workflow::DeliveryMode::MergePush
-                    | rk_workflow::DeliveryMode::PushBranch => rk_core::config::MergeMode::Direct,
-                })
-                .or(params.merge_mode)
-                .unwrap_or(self.default_merge_mode),
-            remote,
             host,
             activated_policy,
         };
@@ -8167,7 +8095,7 @@ impl Daemon {
     }
 
     async fn handle_respawn(&self, req: Request) -> Response {
-        let params: NameParams = match parse_params(&req.params) {
+        let params: RespawnParams = match parse_params(&req.params) {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
@@ -8180,7 +8108,7 @@ impl Daemon {
         let result = tokio::task::spawn_blocking(move || {
             let _entered = handle.enter();
             supervisor
-                .respawn(&name)
+                .respawn_generation(&name, params.spawn)
                 .map(|record| json!({"agent": record}))
         })
         .await;
@@ -9485,12 +9413,23 @@ impl Daemon {
     }
 
     fn handle_out(&self, req: Request) -> Response {
-        let params: OutParams = match parse_params(&req.params) {
+        let mut params: OutParams = match parse_params(&req.params) {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
         let caller = req.caller.clone();
         let is_agent = caller != "operator" && !caller.is_empty();
+        if is_agent {
+            if let (Some(record), Some(payload)) = (
+                self.supervisor.status(&caller),
+                params.payload.as_object_mut(),
+            ) {
+                // The authenticated daemon, not the agent process, owns exact
+                // generation attribution. Overwrite a missing or forged value
+                // so `fromAgent` consumers can use one trustworthy join key.
+                payload.insert("spawn".into(), json!(record.spawn_id()));
+            }
+        }
         if is_agent && params.category == Category::Artifact && params.identity == "review" {
             if let Some(review) = self
                 .supervisor
@@ -10531,6 +10470,13 @@ struct NameParams {
     name: String,
 }
 
+#[derive(Deserialize)]
+struct RespawnParams {
+    name: String,
+    #[serde(default)]
+    spawn: Option<rk_core::id::SpawnId>,
+}
+
 #[derive(Default, Deserialize)]
 struct InboxParams {
     #[serde(default)]
@@ -10891,12 +10837,6 @@ fn repo_remote_url(path: &std::path::Path, remote: &str) -> Option<String> {
 struct RepoAddParams {
     name: String,
     path: String,
-    /// Explicit merge mode; when absent the daemon's `[policy]` default applies.
-    #[serde(default)]
-    merge_mode: Option<rk_core::config::MergeMode>,
-    /// Explicit remote name; when absent, `origin` is used at operation time.
-    #[serde(default)]
-    remote: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -11987,7 +11927,7 @@ mod authorize_reasoned_tests {
         let now = chrono::Utc::now();
         let record = AgentRecord {
             name: name.into(),
-            spawn: None,
+            spawn: Some(rk_core::id::SpawnId::new()),
             role: role.into(),
             coordination: None,
             harness: "fake".into(),
@@ -12353,6 +12293,40 @@ mod review_artifact_binding_tests {
 }
 
 #[cfg(test)]
+mod agent_tuple_generation_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_overwrites_agent_tuple_spawn_with_authenticated_generation() {
+        let (_dir, daemon) =
+            super::authorize_reasoned_tests::test_daemon_with_named_role("Brie-10", "reviewer");
+        let spawn = daemon.supervisor.status("Brie-10").unwrap().spawn_id();
+
+        let response = daemon.handle_out(Request {
+            id: "exact-generation".into(),
+            method: "space.out".into(),
+            auth: String::new(),
+            caller: "Brie-10".into(),
+            client_version: None,
+            params: json!({
+                "category": "artifact",
+                "scope": "repo",
+                "identity": "audit",
+                "payload": {"spawn": rk_core::id::SpawnId::new(), "finding": "valid"}
+            }),
+        });
+        assert!(response.error.is_none(), "write failed: {response:?}");
+
+        let tuples = daemon
+            .space
+            .scan(&Pattern::category(Category::Artifact).identity("audit"))
+            .unwrap();
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0].payload["spawn"], json!(spawn));
+    }
+}
+
+#[cfg(test)]
 mod groomer_ticket_update_tests {
     //! `handle_ticket_update`'s own shape check and audit event, exercised
     //! directly (bypassing the wire) the way `authorize_reasoned_tests` above
@@ -12531,7 +12505,7 @@ mod ticket_reopen_sweep_tests {
         let now = chrono::Utc::now();
         let record = AgentRecord {
             name: name.into(),
-            spawn: None,
+            spawn: Some(rk_core::id::SpawnId::new()),
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),
@@ -12762,15 +12736,12 @@ mod ticket_reopen_sweep_tests {
         assert_eq!(ticket.payload["status"], json!("done"));
     }
 
-    /// TKT-01M0C663BZ86SMA2PVMFP5QJ8D: the O14 gap left by the async
-    /// steward-review flow — `rk done` finds the branch not yet merged and
-    /// refuses to close the ticket (the C3 delivery-mode gate), so the
-    /// ticket sits `in_progress` with its rat gone terminal. The sweep must
-    /// not treat that as ownerless-and-abandoned when a `landing_processed`
-    /// event proves the branch landed after the rat went terminal —
-    /// reopening it dispatches a duplicate rat onto already-delivered work.
+    /// A queue dedup marker is not an alternate ticket-delivery authority.
+    /// A real landing writes the canonical delivery record and closes the
+    /// ticket atomically; a leftover marker without that record must not hide
+    /// an abandoned in-progress ticket from recovery.
     #[tokio::test]
-    async fn a_ticket_whose_branch_already_landed_is_not_reopened() {
+    async fn a_landing_processed_marker_alone_does_not_prevent_reopen() {
         let (_dir, daemon) = daemon_with_agent("Clover-Alike", AgentState::Completed);
         let id = in_progress_ticket(&daemon, Some("Clover-Alike")).await;
 
@@ -12793,9 +12764,9 @@ mod ticket_reopen_sweep_tests {
         let far_future = chrono::Utc::now() + chrono::Duration::hours(2);
         let reopened = daemon.ticket_reopen_sweep_at(far_future).await;
 
-        assert_eq!(reopened, 0);
+        assert_eq!(reopened, 1);
         let ticket = daemon.tickets.get(&id).unwrap().unwrap();
-        assert_eq!(ticket.payload["status"], json!("in_progress"));
+        assert_eq!(ticket.payload["status"], json!("open"));
     }
 
     /// A ticket whose only `landing_processed` marker recorded a NON-landed
@@ -12942,8 +12913,6 @@ mod ticket_reopen_sweep_tests {
                 name: "some-repo".to_string(),
                 path: dir.path().join("some-repo"),
                 created_at: chrono::Utc::now(),
-                merge_mode: Default::default(),
-                remote: None,
                 host: None,
                 activated_policy: Some(crate::repos::ActivatedRepositoryPolicy {
                     digest: "test-digest".to_string(),

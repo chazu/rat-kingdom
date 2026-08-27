@@ -6,8 +6,7 @@
 //! registry in [`crate::agents`].
 
 use chrono::{DateTime, Utc};
-use rk_core::config::MergeMode;
-use rk_workflow::{DeliveryMode, RepositoryPolicy};
+use rk_workflow::RepositoryPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,22 +16,13 @@ pub struct RepoRecord {
     pub name: String,
     pub path: PathBuf,
     pub created_at: DateTime<Utc>,
-    /// How this repo's agent branches reach their base — a direct git merge
-    /// (default) or an opened pull/merge request left for review. Old registry
-    /// files without the field load as `Direct`.
-    #[serde(default)]
-    pub merge_mode: MergeMode,
-    /// The git remote to push/open-PR against. `None` means the conventional
-    /// `origin`; see [`RepoRecord::remote_or_default`].
-    #[serde(default)]
-    pub remote: Option<String>,
     /// The git host (e.g. `github.com`, `gitlab.com`) inferred from the remote's
     /// URL at registration time. `None` if the repo had no such remote.
     #[serde(default)]
     pub host: Option<String>,
     /// Exact `.rk/repo.cue` policy approved by an operator, plus the digest of
-    /// the activated file. `None` preserves the legacy CLI/config behavior for
-    /// registries written before repository policies existed.
+    /// the activated file. `None` keeps the repo registered and inspectable,
+    /// but operational behavior fails closed until onboarding activates it.
     #[serde(default)]
     pub activated_policy: Option<ActivatedRepositoryPolicy>,
 }
@@ -44,29 +34,18 @@ pub struct ActivatedRepositoryPolicy {
 }
 
 impl RepoRecord {
-    /// The remote to use for push / PR operations, defaulting to `origin` when
-    /// none was configured.
-    pub fn remote_or_default(&self) -> &str {
-        self.activated_policy
-            .as_ref()
-            .map(|approved| approved.policy.delivery.remote.as_str())
-            .or(self.remote.as_deref())
-            .unwrap_or("origin")
-    }
-
-    /// Active behavior with legacy fields translated into the same model.
-    pub fn effective_policy(&self) -> RepositoryPolicy {
+    /// The only active repository behavior is the operator-approved CUE
+    /// policy. Unknown historical JSON fields are ignored by deserialization
+    /// and never synthesize authority.
+    pub fn effective_policy(&self) -> rk_core::Result<RepositoryPolicy> {
         self.activated_policy
             .as_ref()
             .map(|approved| approved.policy.clone())
-            .unwrap_or_else(|| {
-                let mut policy = RepositoryPolicy::default();
-                policy.delivery.mode = match self.merge_mode {
-                    MergeMode::Direct => DeliveryMode::Merge,
-                    MergeMode::Pr => DeliveryMode::Pr,
-                };
-                policy.delivery.remote = self.remote_or_default().to_string();
-                policy
+            .ok_or_else(|| {
+                rk_core::Error::other(format!(
+                    "repository '{}' has no activated .rk/repo.cue policy; run `rk repo onboard start {}`",
+                    self.name, self.name
+                ))
             })
     }
 }
@@ -163,13 +142,6 @@ impl RepoRegistry {
         let mut names = Vec::new();
         for record in self.repos.values_mut() {
             if record.path == repo_path {
-                record.merge_mode = match activated.policy.delivery.mode {
-                    DeliveryMode::Pr => MergeMode::Pr,
-                    DeliveryMode::Merge | DeliveryMode::MergePush | DeliveryMode::PushBranch => {
-                        MergeMode::Direct
-                    }
-                };
-                record.remote = Some(activated.policy.delivery.remote.clone());
                 record.activated_policy = Some(activated.clone());
                 names.push(record.name.clone());
             }
@@ -205,8 +177,6 @@ mod tests {
             name: name.into(),
             path: path.into(),
             created_at: Utc::now(),
-            merge_mode: MergeMode::default(),
-            remote: None,
             host: None,
             activated_policy: None,
         }
@@ -238,22 +208,20 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_backward_compatible() {
-        // A registry file written before merge_mode/remote/host existed loads
-        // with Direct mode and the conventional origin remote.
+    fn unknown_historical_registry_fields_grant_no_policy() {
+        // Unknown fields are ignored as data, never translated into behavior.
+        // Only an activated CUE policy can authorize operations.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("repos.json");
         std::fs::write(
             &path,
-            r#"{"old":{"name":"old","path":"/tmp/old","created_at":"2020-01-01T00:00:00Z"}}"#,
+            r#"{"old":{"name":"old","path":"/tmp/old","created_at":"2020-01-01T00:00:00Z","merge_mode":"pr","remote":"upstream"}}"#,
         )
         .unwrap();
         let reg = RepoRegistry::load(&path).unwrap();
         let old = reg.get("old").unwrap();
-        assert_eq!(old.merge_mode, MergeMode::Direct);
-        assert_eq!(old.remote, None);
-        assert_eq!(old.remote_or_default(), "origin");
         assert_eq!(old.host, None);
+        assert!(old.effective_policy().is_err());
     }
 
     #[test]

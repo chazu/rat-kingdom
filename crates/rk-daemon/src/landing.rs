@@ -100,7 +100,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Identity of a durably-queued landing candidate (`Furniture`, scoped to the
 /// repo it belongs to) — the T2 counterpart to the reactor's
@@ -208,9 +208,7 @@ pub(crate) struct LandingQueueSnapshotEntry {
     pub(crate) branch: String,
     pub(crate) task: String,
     pub(crate) status: LandingEntryStatus,
-    /// Seconds since [`LandingQueueEntry::enqueued_at`]. `0` for a legacy
-    /// entry written before that field existed — under-reporting age rather
-    /// than fabricating one.
+    /// Seconds since [`LandingQueueEntry::enqueued_at`].
     pub(crate) age_secs: i64,
     /// Seconds since this entry entered the phase it is in RIGHT NOW
     /// ([`LandingQueueEntry::phase_entered_at`]) — total queue age MINUS
@@ -218,10 +216,7 @@ pub(crate) struct LandingQueueSnapshotEntry {
     /// latency consumer may use: `age_secs` is deliberately cumulative
     /// (see [`LandingQueueEntry::enqueued_at`]), so reusing it as the
     /// elapsed time of the current phase reports every prior phase's wait
-    /// against the phase that just started. `0` for a legacy entry written
-    /// before the field existed, matching `age_secs`' under-report-rather-
-    /// than-fabricate rule — a phase-latency sweep reading `0` raises
-    /// nothing, which is the safe direction.
+    /// against the phase that just started.
     pub(crate) phase_age_secs: i64,
 }
 
@@ -271,14 +266,10 @@ pub(crate) fn landing_queue_snapshot(space: &Space) -> Vec<LandingQueueSnapshotE
         .into_values()
         .filter_map(|tuple| {
             let entry: LandingQueueEntry = serde_json::from_value(tuple.payload).ok()?;
-            let age_secs = entry
-                .enqueued_at
-                .map(|enqueued_at| (now - enqueued_at).num_seconds().max(0))
-                .unwrap_or(0);
-            let phase_age_secs = entry
-                .phase_entered_at
-                .map(|entered_at| (now - entered_at).num_seconds().max(0))
-                .unwrap_or(0);
+            let enqueued_at = entry.enqueued_at?;
+            let phase_entered_at = entry.phase_entered_at?;
+            let age_secs = (now - enqueued_at).num_seconds().max(0);
+            let phase_age_secs = (now - phase_entered_at).num_seconds().max(0);
             Some(LandingQueueSnapshotEntry {
                 repo: entry.repo_name,
                 target: entry.target,
@@ -339,7 +330,7 @@ pub(crate) fn landing_queue_summary(space: &Space) -> Vec<LandingQueueSummary> {
 }
 
 /// The two gates that guard every landing attempt regardless of tier —
-/// `examples/workflows/steward.cue`'s `_gates` block, POLICY (#19) and
+/// the retired steward mega-workflow's `_gates` block, POLICY (#19) and
 /// DIFF-SCOPE (#20). Named-check registry entries, not raw commands: a repo
 /// must register them in `.rk/checks.cue` exactly as it does for the
 /// workflow-driven steward today.
@@ -347,7 +338,7 @@ const PROTECTED_PATHS_CHECK: &str = "steward-protected-paths";
 const DIFF_SCOPE_CHECK: &str = "steward-diff-scope";
 
 /// Wall-clock bound for the two cheap policy/scope gates — matches
-/// `_gates`' own `timeout: "2m"` in `examples/workflows/steward.cue`.
+/// that retired workflow's own `timeout: "2m"`.
 const POLICY_GATE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 /// Fallback when a named check carries no `timeout` of its own (mirrors
@@ -392,7 +383,7 @@ const BARRIER_CEILING_PRE_MARKER: &str = "review-ceiling-pre-marker";
 const BARRIER_CEILING_POST_MARKER: &str = "review-ceiling-post-marker";
 
 /// Identity of the steward's escalation `need` tuple. Matches
-/// `examples/workflows/steward.cue`'s `steward-report-stop`/
+/// the retired steward workflow's `steward-report-stop`/
 /// `steward-report-unknown-verdict`/`steward-report-timeout` named checks,
 /// which all write `(need, <repo>, steward)` — `rk inbox` already ranks this
 /// identity, so escalating through the identical shape keeps operator-facing
@@ -521,7 +512,7 @@ pub(crate) struct LandingQueueEntry {
     pub(crate) diff_class: String,
     pub(crate) task: String,
     /// Exact source generation off the triggering `harness_result`. `None`
-    /// is the compatibility fallback for pre-migration/manual entries.
+    /// is reserved for operator submissions not attributable to an agent.
     #[serde(default)]
     pub(crate) source_spawn: Option<rk_core::id::SpawnId>,
     /// Exact merge object built before gates run. Persisted so a daemon
@@ -574,7 +565,8 @@ pub(crate) struct LandingQueueEntry {
     /// entry: a candidate stuck in a stale-target requeue loop must keep
     /// aging from when it first arrived, not reset to zero on every retry —
     /// that reset is exactly what would hide a genuine wedge (probe O18).
-    /// `None` only for a durable tuple written before this field existed.
+    /// `None` only before a fresh in-memory entry is enqueued; persisted rows
+    /// without it are refused.
     #[serde(default)]
     pub(crate) enqueued_at: Option<DateTime<Utc>>,
     /// When this candidate entered the PHASE it is currently in — the
@@ -597,7 +589,8 @@ pub(crate) struct LandingQueueEntry {
     /// verification phase, so a candidate stuck in a requeue loop keeps
     /// aging instead of zeroing its phase clock on every retry.
     ///
-    /// `None` only for a durable tuple written before this field existed.
+    /// `None` only before a fresh in-memory entry first transitions; persisted
+    /// rows without it are refused.
     #[serde(default)]
     pub(crate) phase_entered_at: Option<DateTime<Utc>>,
     /// Whether this exact prepared candidate has already spent its one
@@ -639,6 +632,15 @@ pub(crate) struct LandingQueueEntry {
 }
 
 impl LandingQueueEntry {
+    fn validate_persisted(&self) -> rk_core::Result<()> {
+        if self.enqueued_at.is_none() || self.phase_entered_at.is_none() {
+            return Err(rk_core::Error::other(
+                "landing queue entry predates the exact phase-clock schema; drain or clear it with the previous release before upgrading",
+            ));
+        }
+        Ok(())
+    }
+
     /// Move this entry to `status`, maintaining the per-phase clock
     /// [`LandingQueueEntry::phase_entered_at`] alongside it. EVERY status
     /// write goes through here (`enqueue`, `claim_next`, `claim_batch`,
@@ -648,10 +650,8 @@ impl LandingQueueEntry {
     /// The clock restarts only when the transition crosses a
     /// [`crate::span::Phase`] boundary — see the field's doc for why that is
     /// phase-granular and not status-granular. A first-ever transition on an
-    /// entry that has no clock yet (a fresh enqueue, or a legacy durable
-    /// tuple written before the field existed) starts one, so an entry
-    /// carried forward across a daemon upgrade begins aging from its next
-    /// transition rather than staying `None` forever.
+    /// fresh entry that has no clock yet starts one. Persisted entries missing
+    /// the clock are rejected before reaching this method.
     fn transition_to(&mut self, status: LandingEntryStatus, now: DateTime<Utc>) {
         if self.phase_entered_at.is_none() || status.phase() != self.status.phase() {
             self.phase_entered_at = Some(now);
@@ -907,6 +907,7 @@ impl LandingQueue {
         };
         let mut entry: LandingQueueEntry = serde_json::from_value(tuple.payload.clone())
             .map_err(|e| rk_core::Error::other(format!("landing queue entry: {e}")))?;
+        entry.validate_persisted()?;
         if entry.status != LandingEntryStatus::Landing {
             entry.transition_to(LandingEntryStatus::RunningGates, Utc::now());
         }
@@ -944,6 +945,7 @@ impl LandingQueue {
         for tuple in pending.into_iter().take(max) {
             let mut entry: LandingQueueEntry = serde_json::from_value(tuple.payload.clone())
                 .map_err(|error| rk_core::Error::other(format!("landing queue entry: {error}")))?;
+            entry.validate_persisted()?;
             if entry.status != LandingEntryStatus::Landing {
                 entry.transition_to(LandingEntryStatus::RunningGates, Utc::now());
             }
@@ -1256,7 +1258,7 @@ fn select_focused_checks(
 }
 
 /// The gate/tier tuning steward.cue exposes as workflow params
-/// (`examples/workflows/steward.cue`'s `params` block) — same names, same
+/// (formerly its `params` block) — same names, same
 /// defaults, now owned by the daemon-native pipeline instead of CUE.
 #[derive(Debug, Clone)]
 pub(crate) struct GateConfig {
@@ -1274,7 +1276,7 @@ pub(crate) struct GateConfig {
     /// Wall-clock bound for a review request: how long
     /// [`LandingPipeline::request_review`] waits on the reviewer's verdict
     /// tuple before checking whether the reviewer is still alive (liveness-
-    /// aware wait, module doc) — matches `examples/workflows/steward.cue`'s
+    /// aware wait, module doc) — matches the retired workflow's
     /// `reviewTimeout` param default. A reviewer still running past this
     /// point is NOT abandoned; see [`Self::review_max_wait`].
     pub(crate) review_timeout: Duration,
@@ -1515,20 +1517,19 @@ impl LandingPipeline {
     /// Resolve this entry's repo-owned gate/review policy from its activated
     /// `.rk/repo.cue` (`RepositoryPolicy.landing`, digest-activated like
     /// `delivery` — `Supervisor::repository_policy`) — the daemon-native
-    /// replacement for what `examples/workflows/steward.cue`'s mega-workflow
+    /// replacement for what the retired steward mega-workflow
     /// used to expose as workflow params (`protectedPaths`, `maxDiffFiles`,
-    /// `maxDiffLines`, `gateTimeout`, `reviewTimeout`). A repo registered
-    /// without an activated policy falls back to `GateConfig::default()`'s
-    /// values, matching `repository_policy`'s own legacy-translation
-    /// fallback. `check_name` is not repo.cue-configurable: every repo's
+    /// `maxDiffLines`, `gateTimeout`, `reviewTimeout`). A repo without an
+    /// activated policy fails closed. `check_name` is not
+    /// repo.cue-configurable: every repo's
     /// PROTECTED-FINAL edge (`protected_targets`, default `["main"]`) runs
     /// this same named `verify` check; an INNER edge instead runs whatever
     /// `focused_checks` selects (both repo.cue-configurable, see
     /// [`LandingEdgeClass`]).
-    fn gate_config(&self, repo: &rk_git::Repo) -> GateConfig {
-        let policy = self.supervisor.repository_policy(repo).landing;
+    fn gate_config(&self, repo: &rk_git::Repo) -> rk_core::Result<GateConfig> {
+        let policy = self.supervisor.repository_policy(repo)?.landing;
         let defaults = GateConfig::default();
-        GateConfig {
+        Ok(GateConfig {
             check_name: defaults.check_name,
             protected_paths: policy.protected_paths,
             max_diff_files: policy.max_diff_files,
@@ -1543,7 +1544,7 @@ impl LandingPipeline {
             shadow_review_harness: policy.shadow_review_harness,
             protected_targets: policy.protected_targets,
             focused_checks: policy.focused_checks,
-        }
+        })
     }
 
     /// Enqueue a fresh completion as a landing candidate, guarded by the
@@ -1669,6 +1670,7 @@ impl LandingPipeline {
         target: &str,
         keep_branch: bool,
         task: Option<String>,
+        source_spawn: Option<rk_core::id::SpawnId>,
     ) -> rk_core::Result<Value> {
         let Some(task) = task.filter(|t| !t.trim().is_empty()) else {
             return Err(rk_core::Error::other(format!(
@@ -1690,6 +1692,7 @@ impl LandingPipeline {
             head_sha: head_sha.clone(),
             diff_class: crate::supervisor::classify_diff(&stat.files, stat.lines).to_string(),
             task,
+            source_spawn,
             operator_fast_lane: true,
             keep_branch,
             ..Default::default()
@@ -2152,7 +2155,7 @@ impl LandingPipeline {
             self.mark_processed(&entry, &outcome)?;
             return Ok(outcome);
         }
-        let gates = self.gate_config(&git_repo);
+        let gates = self.gate_config(&git_repo)?;
         let candidate = if let (Some(commit), Some(base), Some(candidate_ref)) = (
             entry.candidate_sha.clone(),
             entry.candidate_base.clone(),
@@ -2319,7 +2322,7 @@ impl LandingPipeline {
         }
 
         let repo = rk_git::Repo::discover(Path::new(&entries[0].repo_path))?;
-        let gates = self.gate_config(&repo);
+        let gates = self.gate_config(&repo)?;
 
         let branch_names: Vec<String> = entries.iter().map(|e| e.branch.clone()).collect();
         let recovered = entries.iter().find_map(|entry| {
@@ -2427,7 +2430,7 @@ impl LandingPipeline {
             }
         };
 
-        let policy = self.supervisor.repository_policy(&repo);
+        let policy = self.supervisor.repository_policy(&repo)?;
         let mut all_deleted = true;
         if policy.delivery.delete_source {
             for entry in &entries {
@@ -3573,7 +3576,7 @@ impl LandingPipeline {
             task: task.to_string(),
             ..Default::default()
         };
-        let gates = self.gate_config(&git_repo);
+        let gates = self.gate_config(&git_repo)?;
         self.reenqueue_after_ceiling(&entry, &gates, settled_attempt)
             .await
     }
@@ -3889,7 +3892,7 @@ impl LandingPipeline {
             return Ok(ReviewDeathOutcome::Escalated(need));
         }
         let policy =
-            ReviewDeathPolicy::from_landing(&self.supervisor.repository_policy(git_repo).landing);
+            ReviewDeathPolicy::from_landing(&self.supervisor.repository_policy(git_repo)?.landing);
         let spent_usd = self.review_death_chain_spend(entry);
         match landing_review_retry::route(&policy, attempts_used, spent_usd) {
             ReviewDeathRoute::Withhold(withheld) => {
@@ -3922,7 +3925,7 @@ impl LandingPipeline {
                 // `not_before` back rather than drawing its own jitter, so
                 // duplicates always converge on one schedule.
                 let backoff_policy = landing_review_retry::ReviewDeathBackoffPolicy::from_landing(
-                    &self.supervisor.repository_policy(git_repo).landing,
+                    &self.supervisor.repository_policy(git_repo)?.landing,
                 );
                 let delay = landing_review_retry::retry_delay(
                     &backoff_policy,
@@ -4273,9 +4276,6 @@ impl LandingPipeline {
                     .ended_at(landed_at),
             );
         }
-        if entry.source_spawn.is_none() {
-            debug!(task = %entry.task, "record_delivery: no source generation on entry (legacy fallback)");
-        }
         match self
             .supervisor
             .finalize_delivery(
@@ -4344,7 +4344,8 @@ impl LandingPipeline {
         if entry.status != LandingEntryStatus::Landing {
             return Ok(None);
         }
-        if self.supervisor.repository_policy(repo).delivery.mode != rk_workflow::DeliveryMode::Merge
+        if self.supervisor.repository_policy(repo)?.delivery.mode
+            != rk_workflow::DeliveryMode::Merge
         {
             return Ok(None);
         }
@@ -4439,8 +4440,10 @@ impl LandingPipeline {
     }
 
     /// Resolve unattended-rework bounds from the activated repository policy.
-    fn rework_policy(&self, repo: &rk_git::Repo) -> ReworkPolicy {
-        ReworkPolicy::from_landing(&self.supervisor.repository_policy(repo).landing)
+    fn rework_policy(&self, repo: &rk_git::Repo) -> rk_core::Result<ReworkPolicy> {
+        Ok(ReworkPolicy::from_landing(
+            &self.supervisor.repository_policy(repo)?.landing,
+        ))
     }
 
     /// Chain-scoped markers. Counting by head would reset the attempt cap after
@@ -4661,8 +4664,7 @@ impl LandingPipeline {
     ///
     /// `None` when `entry` has no durable queue tuple at all — a synthetic
     /// conflict entry ([`Self::synthetic_conflict_entry`]), which never
-    /// passed through [`LandingQueue::enqueue`] — or a legacy durable tuple
-    /// written before this field existed. Either way, the resulting span is
+    /// passed through [`LandingQueue::enqueue`]. The resulting span is
     /// left without a `started_at`, so [`crate::span::PhaseSpan::duration_ms`]
     /// comes out `None` rather than a fabricated value.
     fn phase_started_at(&self, entry: &LandingQueueEntry) -> Option<DateTime<Utc>> {
@@ -4895,7 +4897,7 @@ impl LandingPipeline {
             return Ok(LandingOutcome::ReworkFiled(ticket));
         }
 
-        let policy = self.rework_policy(git_repo);
+        let policy = self.rework_policy(git_repo)?;
         let attempts_used = self.rework_attempts_used(&ctx)?;
         let spent_usd = self.rework_chain_spend(&ctx)?;
 
@@ -5034,8 +5036,10 @@ impl LandingPipeline {
 
     /// Resolve unattended-conflict-recovery bounds from the activated
     /// repository policy.
-    fn conflict_policy(&self, repo: &rk_git::Repo) -> ConflictPolicy {
-        ConflictPolicy::from_landing(&self.supervisor.repository_policy(repo).landing)
+    fn conflict_policy(&self, repo: &rk_git::Repo) -> rk_core::Result<ConflictPolicy> {
+        Ok(ConflictPolicy::from_landing(
+            &self.supervisor.repository_policy(repo)?.landing,
+        ))
     }
 
     /// Chain-scoped markers, mirroring [`Self::rework_dispatch_markers`] but
@@ -5330,7 +5334,7 @@ impl LandingPipeline {
             return Ok(LandingOutcome::ReworkFiled(ticket));
         }
 
-        let landing_policy = self.supervisor.repository_policy(git_repo).landing;
+        let landing_policy = self.supervisor.repository_policy(git_repo)?.landing;
         let protected_path_hit = ere_matches_any(&landing_policy.protected_paths, &stat.files);
         let evidence = ConflictEvidence {
             conflict_detail: &ctx.conflict_detail,
@@ -5340,7 +5344,7 @@ impl LandingPipeline {
             max_diff_files: landing_policy.max_diff_files,
             max_diff_lines: landing_policy.max_diff_lines,
         };
-        let policy = self.conflict_policy(git_repo);
+        let policy = self.conflict_policy(git_repo)?;
         let attempts_used = self.conflict_attempts_used(&ctx)?;
         let spent_usd = self.conflict_chain_spend(&ctx)?;
 
@@ -5487,30 +5491,10 @@ impl LandingPipeline {
         }
     }
 
-    /// The dispatch_key a marker belongs to, falling back to the same
-    /// `head_sha`+`rework_ticket` pair [`Self::conflict_marker_matches`]
-    /// uses for a marker written before that field existed.
-    fn conflict_marker_chain_key(marker: &Tuple) -> String {
-        marker
-            .payload
-            .get("dispatch_key")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                format!(
-                    "{}\0{}",
-                    marker
-                        .payload
-                        .get("head_sha")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    marker
-                        .payload
-                        .get("rework_ticket")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                )
-            })
+    /// The exact dispatch key a current marker belongs to. Missing identity is
+    /// not reconstructed from content fields.
+    fn conflict_marker_chain_key(marker: &Tuple) -> Option<&str> {
+        marker.payload.get("dispatch_key").and_then(Value::as_str)
     }
 
     fn conflict_markers_for_branch(&self, repo: &str, branch: &str) -> rk_core::Result<Vec<Tuple>> {
@@ -5529,10 +5513,7 @@ impl LandingPipeline {
     /// different, possibly newer chain on the same branch. This is what
     /// [`Self::dispatch_held_conflict`] and [`Self::pending_conflict_attempt`]
     /// use whenever the caller (an already-decided `Violation`) knows which
-    /// chain it means: `Self::latest_conflict_marker`'s "whichever chain is
-    /// newest for this branch right now" is a DIFFERENT, weaker query, only
-    /// appropriate when no chain_key is available at all (a legacy
-    /// violation predating that field).
+    /// chain it means. There is no branch-latest fallback.
     fn conflict_marker_for_chain_key(
         &self,
         repo: &str,
@@ -5542,40 +5523,8 @@ impl LandingPipeline {
         Ok(self
             .conflict_markers_for_branch(repo, branch)?
             .into_iter()
-            .filter(|m| Self::conflict_marker_chain_key(m) == chain_key)
+            .filter(|m| Self::conflict_marker_chain_key(m) == Some(chain_key))
             .max_by_key(|m| (Self::conflict_state_rank(m), m.id)))
-    }
-
-    /// The most recent chain's current marker for a (repo, branch) pair,
-    /// regardless of its exact chain_key — used ONLY when the caller has no
-    /// chain_key to bind to (a legacy violation, from before that field
-    /// existed). Prefer [`Self::conflict_marker_for_chain_key`] whenever a
-    /// chain_key is available: picking "whichever chain is newest right
-    /// now" is a materially different, weaker query than "the chain this
-    /// specific decision named," and can rebind to a genuinely newer chain
-    /// that appeared on the same branch after the decision was authorized
-    /// but before this dispatch's own independent read.
-    fn latest_conflict_marker(&self, repo: &str, branch: &str) -> rk_core::Result<Option<Tuple>> {
-        let markers = self.conflict_markers_for_branch(repo, branch)?;
-        let mut by_chain: HashMap<String, Vec<Tuple>> = HashMap::new();
-        for marker in markers {
-            by_chain
-                .entry(Self::conflict_marker_chain_key(&marker))
-                .or_default()
-                .push(marker);
-        }
-        // Distinct CHAINS are always separated by real elapsed time (a new
-        // conflict only opens after the prior one visibly resolved), so
-        // picking the chain with the greatest max tuple id is safe — the
-        // flakiness risk above is specific to markers WITHIN one chain.
-        let latest_chain = by_chain
-            .into_values()
-            .max_by_key(|group| group.iter().map(|m| m.id).max());
-        Ok(latest_chain.and_then(|group| {
-            group
-                .into_iter()
-                .max_by_key(|m| (Self::conflict_state_rank(m), m.id))
-        }))
     }
 
     /// The in-flight attempt number for a conflict chain awaiting an
@@ -5585,20 +5534,16 @@ impl LandingPipeline {
     /// runs. Returns `None` for a branch with no held chain at all rather
     /// than guessing an attempt number. `chain_key` (from the violation's
     /// own evidence, when present) binds this to the EXACT chain the
-    /// decision named; `None` falls back to the branch's newest chain,
-    /// which is only correct for a legacy violation with no chain_key.
+    /// decision named; missing exact chain identity is not actionable.
     pub(crate) fn pending_conflict_attempt(
         &self,
         repo: &str,
         branch: &str,
         chain_key: Option<&str>,
     ) -> Option<u32> {
-        let marker = match chain_key {
-            Some(key) => self
-                .conflict_marker_for_chain_key(repo, branch, key)
-                .ok()??,
-            None => self.latest_conflict_marker(repo, branch).ok()??,
-        };
+        let marker = self
+            .conflict_marker_for_chain_key(repo, branch, chain_key?)
+            .ok()??;
         marker
             .payload
             .get("attempt")
@@ -5620,19 +5565,20 @@ impl LandingPipeline {
     /// present) binds this dispatch to the EXACT chain that violation
     /// named — never a different, possibly newer chain that appeared on
     /// the same branch between when `attention.decide` authorized this call
-    /// and this function's own independent marker read. `None` falls back
-    /// to the branch's newest chain, correct only for a legacy violation
-    /// with no chain_key.
+    /// and this function's own independent marker read. Missing exact chain
+    /// identity fails closed.
     pub(crate) async fn dispatch_held_conflict(
         &self,
         repo: &str,
         branch: &str,
         chain_key: Option<&str>,
     ) -> rk_core::Result<String> {
-        let marker = match chain_key {
-            Some(key) => self.conflict_marker_for_chain_key(repo, branch, key)?,
-            None => self.latest_conflict_marker(repo, branch)?,
-        };
+        let chain_key = chain_key.ok_or_else(|| {
+            rk_core::Error::other(format!(
+                "conflict correction for {repo}/{branch} requires an exact chain key"
+            ))
+        })?;
+        let marker = self.conflict_marker_for_chain_key(repo, branch, chain_key)?;
         let Some(marker) = marker else {
             return Err(rk_core::Error::other(format!(
                 "no conflict-correction chain for {repo}/{branch} has ever been held for a \
@@ -7457,8 +7403,6 @@ checks: [
             false,
             true,
             false,
-            Vec::new(),
-            Vec::new(),
             0,
             false,
         ))
@@ -7850,8 +7794,6 @@ workflow: {
             false,
             true,
             false,
-            Vec::new(),
-            Vec::new(),
             0,
             false,
         );
@@ -8115,28 +8057,21 @@ workflow: {
         );
     }
 
-    /// A durable tuple written before `phase_entered_at` existed reads as
-    /// `None`, which must render as `0` — under-reporting the phase age
-    /// rather than fabricating one from `enqueued_at`, so an upgrade can
-    /// never replay a backlog of instant breaches. The next real transition
-    /// starts a clock for it.
     #[test]
-    fn legacy_entry_without_a_phase_clock_reports_zero_then_starts_one() {
+    fn persisted_entry_without_a_phase_clock_is_refused() {
         let home = tempfile::tempdir().unwrap();
         let layout = Layout::at(home.path());
         let space = Space::open_in_memory().unwrap();
         let queue = LandingQueue::new(space.clone(), &layout);
 
-        // Hand-write the pre-upgrade tuple shape: `enqueued_at` present,
-        // `phase_entered_at` absent entirely.
         let payload = json!({
             "repo_name": "alpha",
             "repo_path": "/repos/alpha",
             "branch": "b1",
             "target": "main",
-            "head_sha": "sha-legacy",
+            "head_sha": "sha-old",
             "diff_class": "trivial",
-            "task": "TKT-legacy",
+            "task": "TKT-old",
             "seq": 1,
             "rev": 0,
             "status": "queued",
@@ -8155,88 +8090,11 @@ workflow: {
             )
             .unwrap();
 
-        let legacy = landing_queue_snapshot(&space)
-            .into_iter()
-            .find(|e| e.branch == "b1")
-            .unwrap();
-        assert!(legacy.age_secs >= 5 * 3600 - 5, "total age still reads");
-        assert_eq!(
-            legacy.phase_age_secs, 0,
-            "no phase clock must under-report, never inherit total age"
-        );
-
-        // The next transition adopts one rather than leaving it `None`.
-        let claimed = queue.claim_next("alpha", "main").unwrap().unwrap();
-        assert!(claimed.phase_entered_at.is_some());
-    }
-
-    /// Legacy unavailable evidence, at the span level: a durable landing-
-    /// queue tuple written before `phase_entered_at` existed has no clock to
-    /// derive a `SemanticReview`/`Rework` `started_at` from.
-    /// [`LandingPipeline::phase_started_at`] must report `None` for it (not
-    /// panic, not fall back to some other timestamp), and the resulting span
-    /// must carry no `duration_ms` at all — never a fabricated one.
-    #[test]
-    fn legacy_queue_tuple_without_a_phase_clock_yields_no_fabricated_review_duration() {
-        let home = tempfile::tempdir().unwrap();
-        let space = Space::open_in_memory().unwrap();
-        let pipeline = test_pipeline(home.path(), space.clone());
-
-        let entry = LandingQueueEntry {
-            repo_name: "legacy-repo".into(),
-            repo_path: "/repos/legacy".into(),
-            branch: "b1".into(),
-            target: "main".into(),
-            head_sha: "sha-legacy".into(),
-            diff_class: "trivial".into(),
-            task: "TKT-legacy".into(),
-            seq: 1,
-            status: LandingEntryStatus::AwaitingReview,
-            ..Default::default()
-        };
-        // Hand-write the pre-upgrade tuple shape (module doc,
-        // `legacy_entry_without_a_phase_clock_reports_zero_then_starts_one`
-        // above): no `phase_entered_at` field at all.
-        space
-            .out(
-                Tuple::new(
-                    Category::Event,
-                    entry.repo_name.clone(),
-                    LANDING_QUEUE_IDENTITY,
-                    "daemon",
-                    json!({
-                        "repo_name": entry.repo_name,
-                        "repo_path": entry.repo_path,
-                        "branch": entry.branch,
-                        "target": entry.target,
-                        "head_sha": entry.head_sha,
-                        "diff_class": entry.diff_class,
-                        "task": entry.task,
-                        "seq": entry.seq,
-                        "rev": 0,
-                        "status": "awaiting_review",
-                    }),
-                )
-                .with_lifecycle(Lifecycle::Furniture),
-            )
-            .unwrap();
-
-        assert!(pipeline.phase_started_at(&entry).is_none());
-
-        let span = LandingPipeline::timed_review_span(
-            &entry.task,
-            crate::span::Phase::SemanticReview,
-            1,
-            &entry.repo_name,
-            pipeline.phase_started_at(&entry),
-            Utc::now(),
-            "approved",
-        );
-        assert!(span.started_at.is_none(), "{span:?}");
-        assert!(
-            span.duration_ms().is_none(),
-            "a legacy record with no start clock must never fabricate a duration: {span:?}"
-        );
+        assert!(landing_queue_snapshot(&space).is_empty());
+        let error = queue.claim_next("alpha", "main").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("predates the exact phase-clock schema"));
     }
 
     #[test]
@@ -8354,6 +8212,9 @@ workflow: {
         };
         let seq = queue.enqueue(entry.clone()).unwrap();
         entry.seq = seq;
+        let now = Utc::now();
+        entry.enqueued_at = Some(now);
+        entry.phase_entered_at = Some(now);
         assert!(
             queue.find(&entry).unwrap().is_some(),
             "predecessor tuple must exist right after enqueue"
@@ -10257,8 +10118,6 @@ workflow: {
                 name: "code-repo".into(),
                 path: root,
                 created_at: Utc::now(),
-                merge_mode: Default::default(),
-                remote: None,
                 host: None,
                 activated_policy: Some(crate::repos::ActivatedRepositoryPolicy {
                     digest: "test-digest".into(),
@@ -10354,6 +10213,18 @@ workflow: {
                     .identity(identity),
             )
             .unwrap()
+    }
+
+    fn only_conflict_chain_key(space: &Space) -> String {
+        let keys: std::collections::HashSet<String> =
+            scoped_tuples(space, Category::Event, CONFLICT_DISPATCH_IDENTITY)
+                .into_iter()
+                .filter_map(|tuple| {
+                    LandingPipeline::conflict_marker_chain_key(&tuple).map(str::to_string)
+                })
+                .collect();
+        assert_eq!(keys.len(), 1, "expected one exact conflict chain: {keys:?}");
+        keys.into_iter().next().unwrap()
     }
 
     fn rework_context(head: &str, task: &str, rework_ticket: &str) -> ReworkContext {
@@ -10557,8 +10428,9 @@ workflow: {
 
         // Standing in for `Server::execute_orchestrator`, reachable only
         // after `attention.decide` fenced the call through a live lease.
+        let chain_key = only_conflict_chain_key(&space);
         let dispatch_detail = pipeline
-            .dispatch_held_conflict("code-repo", "feature", None)
+            .dispatch_held_conflict("code-repo", "feature", Some(&chain_key))
             .await
             .unwrap();
         assert!(
@@ -10587,7 +10459,7 @@ workflow: {
 
         // A second decision for the same chain must not double-dispatch.
         let replay = pipeline
-            .dispatch_held_conflict("code-repo", "feature", None)
+            .dispatch_held_conflict("code-repo", "feature", Some(&chain_key))
             .await
             .unwrap();
         assert!(replay.contains("already"), "{replay}");
@@ -10613,8 +10485,7 @@ workflow: {
         // `entry` here is the synthetic conflict entry — no durable landing-
         // queue tuple, so no `phase_entered_at` clock exists to derive a
         // `started_at` from. `duration_ms` must be left absent (`null`),
-        // never fabricated, exactly like the "legacy/unavailable evidence"
-        // case for a real queue entry predating the clock.
+        // never fabricated when evidence is unavailable.
         assert!(review["started_at"].is_null(), "{review:?}");
         assert!(review["duration_ms"].is_null(), "{review:?}");
         let rework = spans
@@ -10852,8 +10723,9 @@ workflow: {
         // Only pause dispatch once the chain is already held for a decision
         // — the hold itself must never touch the supervisor at all.
         pipeline.supervisor.set_dispatch_paused(true);
+        let chain_key = only_conflict_chain_key(&space);
         let refusal = pipeline
-            .dispatch_held_conflict("code-repo", "feature", None)
+            .dispatch_held_conflict("code-repo", "feature", Some(&chain_key))
             .await;
         assert!(refusal.is_err(), "{refusal:?}");
 
@@ -10898,7 +10770,7 @@ workflow: {
         // the chain. See the `dispatch_held_conflict` `other` match arm.
         pipeline.supervisor.set_dispatch_paused(false);
         let replay = pipeline
-            .dispatch_held_conflict("code-repo", "feature", None)
+            .dispatch_held_conflict("code-repo", "feature", Some(&chain_key))
             .await
             .unwrap_err()
             .to_string();
@@ -11509,8 +11381,9 @@ workflow: {
             .await
             .unwrap();
         assert!(matches!(held, LandingOutcome::ReworkFiled(_)));
+        let chain_key = only_conflict_chain_key(&space);
         pipeline
-            .dispatch_held_conflict("code-repo", "feature", None)
+            .dispatch_held_conflict("code-repo", "feature", Some(&chain_key))
             .await
             .unwrap();
 
@@ -13432,6 +13305,7 @@ checks: [
                 "main",
                 false,
                 Some("direct-land-empty-task".into()),
+                None,
             )
             .await
             .unwrap();
@@ -13450,6 +13324,7 @@ checks: [
                 "main",
                 false,
                 Some("direct-land-empty-task".into()),
+                None,
             )
             .await
             .unwrap();

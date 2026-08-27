@@ -94,8 +94,6 @@ fn register_repo(layout: &Layout, name: &str, path: &Path) {
         name: name.into(),
         path,
         created_at: chrono::Utc::now(),
-        merge_mode: Default::default(),
-        remote: None,
         host: None,
         activated_policy: Some(ActivatedRepositoryPolicy { digest, policy }),
     })
@@ -192,8 +190,6 @@ fn build_reactor_parts(
         false,
         false,
         false,
-        Vec::new(),
-        vec!["main".into(), "master".into()],
         0,
         false,
     ));

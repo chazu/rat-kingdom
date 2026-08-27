@@ -788,7 +788,6 @@ mod tests {
             instance_max_usd: None,
             definition: "feature-set".into(),
             definition_digest: String::new(),
-            automated_landing_authorized: false,
             params: Default::default(),
             depth: 0,
             started_at: chrono::Utc::now(),
