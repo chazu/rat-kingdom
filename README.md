@@ -501,11 +501,20 @@ rk ticket new "Add SSO" --body "SAML + OIDC" --parent TKT-<id>   # use the id re
 rk ticket list --repo svc --status open
 rk ticket show TKT-<id>                                       # details + sub-tickets
 rk ticket update TKT-<id> --status in_progress --assignee Whisker
+rk ticket deliver TKT-<id> --repo svc --commit <sha> --target main \
+  --verification "mise run verify passed in CI run 123"
 ```
 
 Statuses: `open → claimed → in_progress → blocked → done → closed`. Rats are
 primed to *file* or *decompose* tickets for follow-up work rather than starting
 it themselves — the orchestrator routes them.
+
+`rk ticket deliver` is the operator-only recovery path for work landed outside
+Rat Kingdom. It fails closed unless the commit is reachable from the registered
+repository's target, records the delivery and closes the ticket atomically, and
+keeps dependency edges intact. `--verification` is durable audit evidence, not
+a request to execute checks: normal Rat Kingdom landing continues to resolve
+and run the repository's activated CUE policy.
 
 **Dependencies.** A ticket can be blocked by others (distinct from parent/child
 decomposition — this is a DAG of "must finish first" edges). Cycles are

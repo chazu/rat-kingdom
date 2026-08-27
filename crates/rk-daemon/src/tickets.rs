@@ -71,6 +71,14 @@ pub enum CasOutcome {
     Gone,
 }
 
+/// Outcome of the content-bound, write-once delivery path used when an
+/// operator records work that landed outside the agent landing pipeline.
+#[derive(Debug)]
+pub enum DeliveryWrite {
+    Recorded(Tuple),
+    Already(Tuple),
+}
+
 /// Read a ticket tuple's delivery record, if it carries one.
 pub fn delivery_of(ticket: &Tuple) -> Option<DeliveryRecord> {
     serde_json::from_value(ticket.payload.get(DELIVERY_FIELD)?.clone()).ok()
@@ -430,6 +438,41 @@ impl Tickets {
             obj.insert("status".into(), json!("closed"));
         })
         .await
+    }
+
+    /// Record one delivery without ever replacing different provenance.
+    /// The lookup and write share the ticket mutation lock, so concurrent
+    /// operator retries either replay the same fact or fail closed.
+    pub async fn record_delivery_once(
+        &self,
+        id: &str,
+        record: &DeliveryRecord,
+    ) -> rk_core::Result<DeliveryWrite> {
+        let _guard = self.lock.lock().await;
+        let Some(existing) = self.get(id)? else {
+            return Err(rk_core::Error::other(format!("no such ticket: {id}")));
+        };
+        if let Some(prior) = delivery_of(&existing) {
+            return if prior.merge_commit == record.merge_commit
+                && prior.branch == record.branch
+                && prior.target == record.target
+            {
+                Ok(DeliveryWrite::Already(existing))
+            } else {
+                Err(rk_core::Error::other(format!(
+                    "ticket {id} already has a different delivery record"
+                )))
+            };
+        }
+        let value = serde_json::to_value(record)
+            .map_err(|e| rk_core::Error::other(format!("delivery record: {e}")))?;
+        let ticket = self
+            .edit(id, move |obj| {
+                obj.insert(DELIVERY_FIELD.into(), value);
+                obj.insert("status".into(), json!("closed"));
+            })
+            .await?;
+        Ok(DeliveryWrite::Recorded(ticket))
     }
 
     /// Drop a ticket's delivery record and reopen it at `status` — the revert

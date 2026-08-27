@@ -2052,6 +2052,7 @@ impl Daemon {
                 | "ticket.update"
                 | "ticket.dep"
                 | "ticket.reopen"
+                | "ticket.deliver"
                 | "reconcile.repair"
                 | "attention.invalidate"
                 | "king.spawn"
@@ -3281,6 +3282,7 @@ impl Daemon {
             "ticket.update" => reply(self.handle_ticket_update(req).await),
             "ticket.dep" => reply(self.handle_ticket_dep(req).await),
             "ticket.reopen" => reply(self.handle_ticket_reopen(req).await),
+            "ticket.deliver" => reply(self.handle_ticket_deliver(req).await),
             "ticket.ready" => reply(self.handle_ticket_ready(req)),
             other => reply(Response::err(
                 id,
@@ -7843,6 +7845,139 @@ impl Daemon {
         }
     }
 
+    /// Record delivery performed outside the agent landing pipeline. This
+    /// establishes git reachability and provenance only; repository CUE
+    /// remains authoritative for automated validation and landing policy.
+    async fn handle_ticket_deliver(&self, req: Request) -> Response {
+        let params: TicketDeliverParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        if params.verification.trim().is_empty() {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                "verification evidence is required",
+            );
+        }
+        let repo_name = match self.resolve_inbox_repo(Some(params.repo.clone())) {
+            Ok(Some(name)) => name,
+            Ok(None) => return Response::err(req.id, codes::BAD_PARAMS, "repo is required"),
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        let repo_path = {
+            let registry = match self.repos.lock() {
+                Ok(registry) => registry,
+                Err(_) => {
+                    return Response::err(req.id, codes::INTERNAL, "repo registry lock poisoned")
+                }
+            };
+            match registry.get(&repo_name) {
+                Some(record) => record.path.clone(),
+                None => {
+                    return Response::err(
+                        req.id,
+                        codes::BAD_PARAMS,
+                        format!("repository is not registered: {}", params.repo),
+                    )
+                }
+            }
+        };
+        let ticket = match self.tickets.get(&params.id) {
+            Ok(Some(ticket)) => ticket,
+            Ok(None) => {
+                return Response::err(
+                    req.id,
+                    codes::BAD_PARAMS,
+                    format!("no such ticket: {}", params.id),
+                )
+            }
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        if ticket.scope != repo_name {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                format!(
+                    "ticket {} belongs to repo {}, not {}",
+                    params.id, ticket.scope, repo_name
+                ),
+            );
+        }
+
+        let commit_input = params.commit.clone();
+        let target_input = params.target.clone();
+        let checked = tokio::task::spawn_blocking(move || -> rk_core::Result<String> {
+            let repo = rk_git::Repo::discover(&repo_path)?;
+            let commit = repo.rev_parse(&commit_input)?;
+            let target_ref = format!("refs/heads/{target_input}");
+            let target_commit = repo.rev_parse(&target_ref)?;
+            match repo.ancestry(&commit, &target_commit) {
+                rk_git::Ancestry::Present => Ok(commit),
+                rk_git::Ancestry::Absent => Err(rk_core::Error::other(format!(
+                    "commit {commit} is not reachable from target {target_input}"
+                ))),
+                rk_git::Ancestry::Unknown => Err(rk_core::Error::other(format!(
+                    "could not establish whether commit {commit} is reachable from target {target_input}"
+                ))),
+            }
+        })
+        .await;
+        let commit = match checked {
+            Ok(Ok(commit)) => commit,
+            Ok(Err(e)) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+            Err(e) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    format!("git verification task failed: {e}"),
+                )
+            }
+        };
+        let delivery = crate::tickets::DeliveryRecord {
+            merge_commit: commit,
+            branch: params
+                .source_branch
+                .clone()
+                .unwrap_or_else(|| "operator/manual".to_string()),
+            target: params.target.clone(),
+            landed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        match self
+            .tickets
+            .record_delivery_once(&params.id, &delivery)
+            .await
+        {
+            Ok(crate::tickets::DeliveryWrite::Already(ticket)) => {
+                let durable_delivery = crate::tickets::delivery_of(&ticket).unwrap_or(delivery);
+                Response::ok(
+                    req.id,
+                    json!({"ticket": ticket, "delivery": durable_delivery, "already_recorded": true}),
+                )
+            }
+            Ok(crate::tickets::DeliveryWrite::Recorded(ticket)) => {
+                self.emit_event(
+                    &ticket.scope,
+                    "ticket_manual_delivery",
+                    json!({
+                        "ticket": ticket.identity,
+                        "repo": repo_name,
+                        "commit": delivery.merge_commit,
+                        "source_branch": delivery.branch,
+                        "target": delivery.target,
+                        "verification": params.verification,
+                        "by": "human-operator",
+                    }),
+                );
+                Response::ok(
+                    req.id,
+                    json!({"ticket": ticket, "delivery": delivery, "already_recorded": false}),
+                )
+            }
+            Err(e) => Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        }
+    }
+
     fn handle_ticket_ready(&self, req: Request) -> Response {
         let params: TicketReadyParams = match parse_params(&req.params) {
             Ok(p) => p,
@@ -10851,6 +10986,17 @@ struct TicketReopenParams {
     /// `Tickets::reopen` itself.
     #[serde(default)]
     status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TicketDeliverParams {
+    id: String,
+    repo: String,
+    commit: String,
+    target: String,
+    verification: String,
+    #[serde(default)]
+    source_branch: Option<String>,
 }
 
 fn parse_params<T: serde::de::DeserializeOwned>(params: &Value) -> Result<T, String> {

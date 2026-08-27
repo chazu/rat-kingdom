@@ -110,3 +110,11 @@ The short manual delivery journey is `rk work` -> `rk spawn --ticket` -> `rk
 land` (when the selected workflow does not land automatically) -> `rk work`.
 Landing still resolves the repository's activated CUE plan and runs its named
 checks before target advancement.
+
+Work already landed outside that journey can be bound to a ticket with `rk
+ticket deliver`. The operator supplies the registered repository, commit,
+target, and verification evidence; Rat Kingdom proves local git reachability,
+writes the existing delivery record, and closes the ticket in one mutation.
+This command deliberately does not execute or translate checks. It is a
+content-bound recovery seam, while repository CUE remains the authority for
+automated validation and landing.
