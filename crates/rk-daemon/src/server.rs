@@ -3230,7 +3230,7 @@ impl Daemon {
             }),
             "repo.get" => reply(self.handle_repo_get(req)),
             "repo.onboard.start" => reply(self.handle_onboarding_start(req).await),
-            "repo.onboard.propose" => reply(self.handle_onboarding_propose(req)),
+            "repo.onboard.propose" => reply(self.handle_onboarding_propose(req).await),
             "repo.onboard.approve" => reply(self.handle_onboarding_approve(req)),
             "repo.onboard.decline" => reply(self.handle_onboarding_decline(req)),
             "repo.onboard.apply" => reply(self.handle_onboarding_apply(req).await),
@@ -6686,9 +6686,9 @@ impl Daemon {
             );
         };
         let path_for_git = repo_path.clone();
-        let (repo_name, base_branch) = match tokio::task::spawn_blocking(move || {
+        let (repo_name, base_branch, base_revision) = match tokio::task::spawn_blocking(move || {
             let repo = rk_git::Repo::discover(&path_for_git)?;
-            Ok::<_, rk_core::Error>((repo.name(), repo.current_branch()?))
+            Ok::<_, rk_core::Error>((repo.name(), repo.current_branch()?, repo.rev_parse("HEAD")?))
         })
         .await
         {
@@ -6707,6 +6707,7 @@ impl Daemon {
             repo_name,
             repo_path,
             base_branch,
+            base_revision,
             harness,
             params.model,
             params.attach,
@@ -6804,7 +6805,7 @@ impl Daemon {
         }
     }
 
-    fn handle_onboarding_propose(&self, req: Request) -> Response {
+    async fn handle_onboarding_propose(&self, req: Request) -> Response {
         let params: RepoOnboardingProposeParams = match parse_params(&req.params) {
             Ok(params) => params,
             Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
@@ -6845,18 +6846,38 @@ impl Daemon {
                     return Response::err(req.id, codes::BAD_PARAMS, error.to_string());
                 }
             };
+        let proposal = match crate::onboarding_proposals::OnboardingProposal::new(
+            session.id.clone(),
+            crate::onboarding_proposals::repository_identity(&session.repo_path),
+            tree_revision,
+            params.proposal,
+            req.caller.clone(),
+        ) {
+            Ok(proposal) => proposal,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+        };
+        let preflight_session = session.clone();
+        let preflight_proposal = proposal.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::onboarding_apply::preflight_proposal(&preflight_session, &preflight_proposal)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+            Err(error) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    format!("onboarding proposal preflight failed: {error}"),
+                )
+            }
+        }
         let result = self
             .onboarding_sessions
             .lock()
             .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
-            .and_then(|mut sessions| {
-                sessions.propose(
-                    &params.session,
-                    params.proposal,
-                    req.caller.clone(),
-                    tree_revision,
-                )
-            });
+            .and_then(|mut sessions| sessions.journal_proposal(&params.session, proposal));
         match result {
             Ok((proposal, created)) => {
                 Response::ok(req.id, json!({"proposal": proposal, "created": created}))
@@ -7023,6 +7044,18 @@ impl Daemon {
             Ok(result) => result,
             Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
         };
+
+        // A generic repository file is fully verified by the preflighted,
+        // exact-target patch and content-bound application commit. Executable
+        // checks and CUE automation retain their stronger dedicated validators.
+        if applied_proposal.status
+            == crate::onboarding_proposals::OnboardingProposalStatus::Verified
+        {
+            return Response::ok(
+                req.id,
+                json!({"proposal": applied_proposal, "applied": applied, "verified": true}),
+            );
+        }
 
         let proposal = if let Some(contract) = applied_proposal.named_check.as_ref() {
             let attempt = applied_proposal.verification_results.len() as u32 + 1;
