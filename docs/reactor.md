@@ -292,39 +292,17 @@ The **steward** is the reactor's flagship autonomy loop and the biggest single
 reduction in per-task operator attention: it automates the most-repeated
 operator decision, *"is this branch good to merge?"*, reactively triaging
 every rat completion (`Event/harness_result`, emitted by `route_completion`).
-It ships in two forms, and as of **2026-08-16 the daemon-native form is the one
-actually live on this fleet** (`docs/proposals/daemon-native-landing-pipeline.md`
-§6, Phase 3/4 of the steward remediation, `memory/steward-investigation`):
+It ships as an **`action: "land"` CUE trigger**. The repository's activated
+trigger (an example is `steward-landing-on-completion` in
+`examples/triggers-landing-pipeline.cue`) hands each matching completion
+straight to `LandingPipeline` (`crates/rk-daemon/src/landing.rs`) without a
+workflow instance. The retired workflow-driven mega-workflow is no longer a
+supported alternate landing path.
 
-- **`action: "land"` — the daemon-native landing pipeline (live).** A trigger
-  (shipped as `steward-landing-on-completion` in
-  `examples/triggers-landing-pipeline.cue`) hands each matching completion
-  straight to `LandingPipeline` (`crates/rk-daemon/src/landing.rs`) — no
-  workflow instance spawned to carry it. See
-  [The daemon-native landing pipeline](#the-daemon-native-landing-pipeline)
-  below.
-- **`run: "steward"` — the workflow-driven mega-workflow (pre-cutover
-  reference).** The original design: a trigger (`steward-on-completion` in
-  `examples/triggers.cue`) spawns `examples/workflows/steward.cue`, which
-  hosts the gates, the verdict read, and the routing itself as CUE steps.
-  Nothing in a default installation fires it anymore — the operator's
-  `~/.rat-kingdom/triggers/` copy was swapped to the landing-pipeline trigger
-  in the same cutover — but the file remains in the tree as the reference
-  implementation and for its dedicated schema/routing test coverage
-  (`crates/rk-workflow/tests/examples.rs`,
-  `crates/rk-daemon/tests/workflow_verdict_cache.rs`). It is still the
-  behavior you get if you install `examples/triggers.cue`'s copy instead of
-  the landing-pipeline one — both remain valid, mutually exclusive choices;
-  see [Cutover and rollback](#cutover-and-rollback). Its removal is tracked
-  separately (TKT-01M048ASYM00N37EBK1VM7FH5H) and not yet done as of this
-  writing.
-
-Both forms triage a completed branch through the same five decisions — a
-policy gate, a diff-scope gate, the repo's real test/lint gate, a review
-verdict, and a routed outcome — described once below for the live form; the
-mega-workflow's steps are the identical logic expressed as CUE (see the
-extensive comments at the top of `examples/workflows/steward.cue` if you need
-the pre-cutover shape specifically).
+The pipeline triages a completed branch through five decisions: a policy gate,
+a diff-scope gate, the repo's real test/lint gate, a review verdict, and a
+routed outcome. The trigger, policy, and named checks are all digest-activated
+per-repo CUE; the deterministic gates run without an agent.
 
 ### The daemon-native landing pipeline
 
@@ -399,21 +377,14 @@ it from process logs.
    policy gate, a within-budget diff, a green suite, and (when review wasn't
    skipped) an explicit `APPROVE`.
 
-**Operator-facing landing authority has moved.** The mega-workflow's `land`
-step was gated by two daemon config knobs — `policy.automated_landing_workflows`
-(only a workflow named in this list may `land` unattended) and
-`policy.require_approval_for_landing` — both enforced in
-`crates/rk-daemon/src/workflow_exec.rs`. `LandingPipeline` calls
-`Supervisor::land` directly and never passes through that code path, so
-**neither knob governs the daemon-native pipeline**: for a repo whose triggers
-include an `action: "land"` entry, the trigger's own existence and match
-predicate *is* the unattended-landing authorization. This is the intended end
-state (steward remediation Phase 4, item 4: "landing authority becomes the
-daemon pipeline's own, not a string match on a workflow filename"), but the
-two config fields are not yet narrowed or removed from `rk-core`'s
-`PolicyConfig` (still `automated_landing_workflows: ["steward"]` by default) —
-they remain load-bearing only for the pre-cutover mega-workflow path. Tracked:
-TKT-01M048ASY8MDB5DVV5VG3WRM47.
+**Operator-facing landing authority is repository policy.** `LandingPipeline`
+calls `Supervisor::land` directly: for a repo whose activated CUE triggers
+include an `action: "land"` entry, that trigger's existence and match predicate
+is the unattended-landing authorization. Its activated landing limits and
+named checks are evaluated mechanically. The old workflow-name exception has
+been removed. Workflow `land`/`open_pr` steps instead obey
+`policy.require_approval_for_landing` uniformly and may target only the branch
+authorized by the activated repository policy.
 
 ### Land target inheritance
 
@@ -513,34 +484,23 @@ Covered end to end by `crates/rk-daemon/src/landing.rs`'s own test module —
 `crates/rk-daemon/tests/{land_on_approve,automated_landing,dropped_land}.rs`
 for the surrounding merge/delivery/inbox behavior.
 
-### Cutover and rollback
+### Activation and acceptance
 
-Full runbook: `docs/proposals/daemon-native-landing-pipeline.md` §6. Summary:
-
-1. **Preconditions** — T1–T4 merged and the daemon rebuilt/restarted (a merged
-   Rust change is not live until redeployed); the target repo's
-   `.rk/checks.cue` registers `steward-protected-paths`, `steward-diff-scope`,
-   and its real `verify` check; `examples/workflows/steward-review.cue` is
-   installed wherever `steward.cue` was.
-2. **Swap the trigger** — copy `examples/triggers-landing-pipeline.cue`
-   alongside the existing trigger file under a *new* filename, then remove or
-   rename the old `steward-on-completion` entry in the same change (never run
-   both at once — see the warning above). Restart the daemon, or wait for the
-   trigger file's mtime-based reparse.
-3. **Verify parity by hand** before trusting it unattended (no automated
+1. **Activate policy and checks** — commit `.rk/repo.cue`, register
+   `steward-protected-paths`, `steward-diff-scope`, and the repository's real
+   `verify` check in `.rk/checks.cue`, then activate the exact digest through
+   repository onboarding.
+2. **Activate the trigger** — install the repository's `action: "land"`
+   trigger and restart the daemon or wait for the trigger file's mtime reparse.
+3. **Verify by hand** before trusting it unattended (no automated
    `rk workflow drift`-equivalent exists yet, §6.5): land one doc-only/trivial
    change and confirm zero agent spawns; land one change needing real review
    and confirm exactly one reviewer spawn; force a REWORK and a STOP and
-   confirm they surface in `rk inbox` in the same shape the workflow-driven
-   steward's did; force a failing gate and confirm a `gate-failure` artifact
+   confirm they surface in `rk inbox`; force a failing gate and confirm a `gate-failure` artifact
    plus a held branch.
-4. **Rollback** — restore the original `steward-on-completion` trigger file
-   and remove/rename the `action: "land"` one. Nothing about the swap is
-   destructive to in-flight state: a fully-processed candidate has no live
-   queue entry to roll back, and one still mid-flight when the trigger set is
-   swapped back simply stops being drained (it stays inert in the durable
-   queue until the landing trigger is restored or an operator manually
-   inspects/clears it — there is no automatic queue-to-workflow migration).
+4. **Pause** — deactivate the land trigger. Existing durable queue entries
+   remain visible and resume when the trigger is reactivated; do not install a
+   second workflow landing path over them.
 5. **Known gaps**, tracked rather than fixed inline: no automated drift/parity
    check; no attempt-counter backstop on `LandingQueue` analogous to the
    reactor's `MAX_FIRE_ATTEMPTS` (a candidate whose processing keeps erroring —

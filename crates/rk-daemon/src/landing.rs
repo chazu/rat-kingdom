@@ -208,9 +208,7 @@ pub(crate) struct LandingQueueSnapshotEntry {
     pub(crate) branch: String,
     pub(crate) task: String,
     pub(crate) status: LandingEntryStatus,
-    /// Seconds since [`LandingQueueEntry::enqueued_at`]. `0` for a legacy
-    /// entry written before that field existed — under-reporting age rather
-    /// than fabricating one.
+    /// Seconds since [`LandingQueueEntry::enqueued_at`].
     pub(crate) age_secs: i64,
     /// Seconds since this entry entered the phase it is in RIGHT NOW
     /// ([`LandingQueueEntry::phase_entered_at`]) — total queue age MINUS
@@ -218,10 +216,7 @@ pub(crate) struct LandingQueueSnapshotEntry {
     /// latency consumer may use: `age_secs` is deliberately cumulative
     /// (see [`LandingQueueEntry::enqueued_at`]), so reusing it as the
     /// elapsed time of the current phase reports every prior phase's wait
-    /// against the phase that just started. `0` for a legacy entry written
-    /// before the field existed, matching `age_secs`' under-report-rather-
-    /// than-fabricate rule — a phase-latency sweep reading `0` raises
-    /// nothing, which is the safe direction.
+    /// against the phase that just started.
     pub(crate) phase_age_secs: i64,
 }
 
@@ -271,14 +266,10 @@ pub(crate) fn landing_queue_snapshot(space: &Space) -> Vec<LandingQueueSnapshotE
         .into_values()
         .filter_map(|tuple| {
             let entry: LandingQueueEntry = serde_json::from_value(tuple.payload).ok()?;
-            let age_secs = entry
-                .enqueued_at
-                .map(|enqueued_at| (now - enqueued_at).num_seconds().max(0))
-                .unwrap_or(0);
-            let phase_age_secs = entry
-                .phase_entered_at
-                .map(|entered_at| (now - entered_at).num_seconds().max(0))
-                .unwrap_or(0);
+            let enqueued_at = entry.enqueued_at?;
+            let phase_entered_at = entry.phase_entered_at?;
+            let age_secs = (now - enqueued_at).num_seconds().max(0);
+            let phase_age_secs = (now - phase_entered_at).num_seconds().max(0);
             Some(LandingQueueSnapshotEntry {
                 repo: entry.repo_name,
                 target: entry.target,
@@ -339,7 +330,7 @@ pub(crate) fn landing_queue_summary(space: &Space) -> Vec<LandingQueueSummary> {
 }
 
 /// The two gates that guard every landing attempt regardless of tier —
-/// `examples/workflows/steward.cue`'s `_gates` block, POLICY (#19) and
+/// the retired steward mega-workflow's `_gates` block, POLICY (#19) and
 /// DIFF-SCOPE (#20). Named-check registry entries, not raw commands: a repo
 /// must register them in `.rk/checks.cue` exactly as it does for the
 /// workflow-driven steward today.
@@ -347,7 +338,7 @@ const PROTECTED_PATHS_CHECK: &str = "steward-protected-paths";
 const DIFF_SCOPE_CHECK: &str = "steward-diff-scope";
 
 /// Wall-clock bound for the two cheap policy/scope gates — matches
-/// `_gates`' own `timeout: "2m"` in `examples/workflows/steward.cue`.
+/// that retired workflow's own `timeout: "2m"`.
 const POLICY_GATE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 /// Fallback when a named check carries no `timeout` of its own (mirrors
@@ -392,7 +383,7 @@ const BARRIER_CEILING_PRE_MARKER: &str = "review-ceiling-pre-marker";
 const BARRIER_CEILING_POST_MARKER: &str = "review-ceiling-post-marker";
 
 /// Identity of the steward's escalation `need` tuple. Matches
-/// `examples/workflows/steward.cue`'s `steward-report-stop`/
+/// the retired steward workflow's `steward-report-stop`/
 /// `steward-report-unknown-verdict`/`steward-report-timeout` named checks,
 /// which all write `(need, <repo>, steward)` — `rk inbox` already ranks this
 /// identity, so escalating through the identical shape keeps operator-facing
@@ -520,6 +511,10 @@ pub(crate) struct LandingQueueEntry {
     pub(crate) head_sha: String,
     pub(crate) diff_class: String,
     pub(crate) task: String,
+    /// Exact source generation off the triggering `harness_result`. `None`
+    /// is reserved for operator submissions not attributable to an agent.
+    #[serde(default)]
+    pub(crate) source_spawn: Option<rk_core::id::SpawnId>,
     /// Exact merge object built before gates run. Persisted so a daemon
     /// rollover can retest and land the same parked object.
     #[serde(default)]
@@ -570,7 +565,8 @@ pub(crate) struct LandingQueueEntry {
     /// entry: a candidate stuck in a stale-target requeue loop must keep
     /// aging from when it first arrived, not reset to zero on every retry —
     /// that reset is exactly what would hide a genuine wedge (probe O18).
-    /// `None` only for a durable tuple written before this field existed.
+    /// `None` only before a fresh in-memory entry is enqueued; persisted rows
+    /// without it are refused.
     #[serde(default)]
     pub(crate) enqueued_at: Option<DateTime<Utc>>,
     /// When this candidate entered the PHASE it is currently in — the
@@ -593,7 +589,8 @@ pub(crate) struct LandingQueueEntry {
     /// verification phase, so a candidate stuck in a requeue loop keeps
     /// aging instead of zeroing its phase clock on every retry.
     ///
-    /// `None` only for a durable tuple written before this field existed.
+    /// `None` only before a fresh in-memory entry first transitions; persisted
+    /// rows without it are refused.
     #[serde(default)]
     pub(crate) phase_entered_at: Option<DateTime<Utc>>,
     /// Whether this exact prepared candidate has already spent its one
@@ -635,6 +632,15 @@ pub(crate) struct LandingQueueEntry {
 }
 
 impl LandingQueueEntry {
+    fn validate_persisted(&self) -> rk_core::Result<()> {
+        if self.enqueued_at.is_none() || self.phase_entered_at.is_none() {
+            return Err(rk_core::Error::other(
+                "landing queue entry predates the exact phase-clock schema; drain or clear it with the previous release before upgrading",
+            ));
+        }
+        Ok(())
+    }
+
     /// Move this entry to `status`, maintaining the per-phase clock
     /// [`LandingQueueEntry::phase_entered_at`] alongside it. EVERY status
     /// write goes through here (`enqueue`, `claim_next`, `claim_batch`,
@@ -644,10 +650,8 @@ impl LandingQueueEntry {
     /// The clock restarts only when the transition crosses a
     /// [`crate::span::Phase`] boundary — see the field's doc for why that is
     /// phase-granular and not status-granular. A first-ever transition on an
-    /// entry that has no clock yet (a fresh enqueue, or a legacy durable
-    /// tuple written before the field existed) starts one, so an entry
-    /// carried forward across a daemon upgrade begins aging from its next
-    /// transition rather than staying `None` forever.
+    /// fresh entry that has no clock yet starts one. Persisted entries missing
+    /// the clock are rejected before reaching this method.
     fn transition_to(&mut self, status: LandingEntryStatus, now: DateTime<Utc>) {
         if self.phase_entered_at.is_none() || status.phase() != self.status.phase() {
             self.phase_entered_at = Some(now);
@@ -903,6 +907,7 @@ impl LandingQueue {
         };
         let mut entry: LandingQueueEntry = serde_json::from_value(tuple.payload.clone())
             .map_err(|e| rk_core::Error::other(format!("landing queue entry: {e}")))?;
+        entry.validate_persisted()?;
         if entry.status != LandingEntryStatus::Landing {
             entry.transition_to(LandingEntryStatus::RunningGates, Utc::now());
         }
@@ -940,6 +945,7 @@ impl LandingQueue {
         for tuple in pending.into_iter().take(max) {
             let mut entry: LandingQueueEntry = serde_json::from_value(tuple.payload.clone())
                 .map_err(|error| rk_core::Error::other(format!("landing queue entry: {error}")))?;
+            entry.validate_persisted()?;
             if entry.status != LandingEntryStatus::Landing {
                 entry.transition_to(LandingEntryStatus::RunningGates, Utc::now());
             }
@@ -1131,9 +1137,26 @@ impl Default for RetrySchedule {
     }
 }
 
-/// One resolved named check plus the env pairs and wall-clock bound it runs
-/// with, in the order [`LandingPipeline::gate_plan`] wants them run.
-type GatePlan = Vec<(rk_workflow::Check, Vec<(String, String)>, Duration)>;
+/// The complete, repo-owned gate decision for one exact candidate and target.
+/// Built once from `.rk/repo.cue`, `.rk/checks.cue`, and the candidate's
+/// changed paths, then consumed without reading either policy file again.
+type ResolvedGateCheck = (rk_workflow::Check, Vec<(String, String)>, Duration);
+
+struct ResolvedGatePlan {
+    checks: Vec<ResolvedGateCheck>,
+    edge_class: LandingEdgeClass,
+    full_check_required: bool,
+    reason: String,
+}
+
+/// Classification of the one prepared-target advance implementation. Callers
+/// still own mode-specific reporting, but none may call `land_prepared`
+/// directly or reinterpret its stale/blocked flags independently.
+enum TargetAdvance {
+    Landed(Value),
+    Stale(Value),
+    Blocked(Value),
+}
 
 /// Which of the two landing-edge classes `GateConfig::protected_targets`
 /// (`LandingPolicy::protected_targets`, `.rk/repo.cue`) puts a candidate's
@@ -1235,7 +1258,7 @@ fn select_focused_checks(
 }
 
 /// The gate/tier tuning steward.cue exposes as workflow params
-/// (`examples/workflows/steward.cue`'s `params` block) — same names, same
+/// (formerly its `params` block) — same names, same
 /// defaults, now owned by the daemon-native pipeline instead of CUE.
 #[derive(Debug, Clone)]
 pub(crate) struct GateConfig {
@@ -1253,7 +1276,7 @@ pub(crate) struct GateConfig {
     /// Wall-clock bound for a review request: how long
     /// [`LandingPipeline::request_review`] waits on the reviewer's verdict
     /// tuple before checking whether the reviewer is still alive (liveness-
-    /// aware wait, module doc) — matches `examples/workflows/steward.cue`'s
+    /// aware wait, module doc) — matches the retired workflow's
     /// `reviewTimeout` param default. A reviewer still running past this
     /// point is NOT abandoned; see [`Self::review_max_wait`].
     pub(crate) review_timeout: Duration,
@@ -1494,20 +1517,19 @@ impl LandingPipeline {
     /// Resolve this entry's repo-owned gate/review policy from its activated
     /// `.rk/repo.cue` (`RepositoryPolicy.landing`, digest-activated like
     /// `delivery` — `Supervisor::repository_policy`) — the daemon-native
-    /// replacement for what `examples/workflows/steward.cue`'s mega-workflow
+    /// replacement for what the retired steward mega-workflow
     /// used to expose as workflow params (`protectedPaths`, `maxDiffFiles`,
-    /// `maxDiffLines`, `gateTimeout`, `reviewTimeout`). A repo registered
-    /// without an activated policy falls back to `GateConfig::default()`'s
-    /// values, matching `repository_policy`'s own legacy-translation
-    /// fallback. `check_name` is not repo.cue-configurable: every repo's
+    /// `maxDiffLines`, `gateTimeout`, `reviewTimeout`). A repo without an
+    /// activated policy fails closed. `check_name` is not
+    /// repo.cue-configurable: every repo's
     /// PROTECTED-FINAL edge (`protected_targets`, default `["main"]`) runs
     /// this same named `verify` check; an INNER edge instead runs whatever
     /// `focused_checks` selects (both repo.cue-configurable, see
     /// [`LandingEdgeClass`]).
-    fn gate_config(&self, repo: &rk_git::Repo) -> GateConfig {
-        let policy = self.supervisor.repository_policy(repo).landing;
+    fn gate_config(&self, repo: &rk_git::Repo) -> rk_core::Result<GateConfig> {
+        let policy = self.supervisor.repository_policy(repo)?.landing;
         let defaults = GateConfig::default();
-        GateConfig {
+        Ok(GateConfig {
             check_name: defaults.check_name,
             protected_paths: policy.protected_paths,
             max_diff_files: policy.max_diff_files,
@@ -1522,7 +1544,7 @@ impl LandingPipeline {
             shadow_review_harness: policy.shadow_review_harness,
             protected_targets: policy.protected_targets,
             focused_checks: policy.focused_checks,
-        }
+        })
     }
 
     /// Enqueue a fresh completion as a landing candidate, guarded by the
@@ -1648,6 +1670,7 @@ impl LandingPipeline {
         target: &str,
         keep_branch: bool,
         task: Option<String>,
+        source_spawn: Option<rk_core::id::SpawnId>,
     ) -> rk_core::Result<Value> {
         let Some(task) = task.filter(|t| !t.trim().is_empty()) else {
             return Err(rk_core::Error::other(format!(
@@ -1669,6 +1692,7 @@ impl LandingPipeline {
             head_sha: head_sha.clone(),
             diff_class: crate::supervisor::classify_diff(&stat.files, stat.lines).to_string(),
             task,
+            source_spawn,
             operator_fast_lane: true,
             keep_branch,
             ..Default::default()
@@ -2040,6 +2064,43 @@ impl LandingPipeline {
         result.map(Some)
     }
 
+    /// Terminal fail-closed transition for a candidate whose repo-owned CUE
+    /// policy cannot produce a complete gate plan. Policy errors are verdicts
+    /// on admissibility, not transient daemon faults, so retrying the queue
+    /// forever would only hide the required human action.
+    fn hold_no_gate(
+        &self,
+        entry: &LandingQueueEntry,
+        error: String,
+    ) -> rk_core::Result<LandingOutcome> {
+        let need = self.escalate(
+            entry,
+            format!(
+                "steward: NO GATE for {} on {} — branch held unmerged: {error}",
+                entry.task, entry.branch
+            ),
+        )?;
+        self.space.out(
+            Tuple::new(
+                Category::Event,
+                entry.repo_name.clone(),
+                "landing_no_gate",
+                "daemon",
+                json!({
+                    "branch": entry.branch,
+                    "target": entry.target,
+                    "task": entry.task,
+                    "error": error,
+                    "state": "no-gate",
+                }),
+            )
+            .with_lifecycle(Lifecycle::Furniture),
+        )?;
+        let outcome = LandingOutcome::NoGate(need);
+        self.mark_processed(entry, &outcome)?;
+        Ok(outcome)
+    }
+
     async fn process_entry(&self, entry: &LandingQueueEntry) -> rk_core::Result<LandingOutcome> {
         // Crash-window reconciliation (review round 2): a crash between
         // `mark_processed` and the caller's queue removal leaves both the
@@ -2094,36 +2155,7 @@ impl LandingPipeline {
             self.mark_processed(&entry, &outcome)?;
             return Ok(outcome);
         }
-        let gates = self.gate_config(&git_repo);
-        let checks_file = repo_path.join(".rk").join("checks.cue");
-        if let Err(error) = self.gate_plan(&checks_file, &entry.target, &gates, &[]) {
-            let need = self.escalate(
-                &entry,
-                format!(
-                    "steward: NO GATE for {} on {} — branch held unmerged: {error}",
-                    entry.task, entry.branch
-                ),
-            )?;
-            self.space.out(
-                Tuple::new(
-                    Category::Event,
-                    entry.repo_name.clone(),
-                    "landing_no_gate",
-                    "daemon",
-                    json!({
-                        "branch": entry.branch,
-                        "target": entry.target,
-                        "task": entry.task,
-                        "error": error.to_string(),
-                        "state": "no-gate",
-                    }),
-                )
-                .with_lifecycle(Lifecycle::Furniture),
-            )?;
-            let outcome = LandingOutcome::NoGate(need);
-            self.mark_processed(&entry, &outcome)?;
-            return Ok(outcome);
-        }
+        let gates = self.gate_config(&git_repo)?;
         let candidate = if let (Some(commit), Some(base), Some(candidate_ref)) = (
             entry.candidate_sha.clone(),
             entry.candidate_base.clone(),
@@ -2154,8 +2186,18 @@ impl LandingPipeline {
                 }
             }
         };
+        let gate_plan = match self
+            .resolve_gate_plan_at(&entry, &git_repo, &gates, &candidate.commit)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                git_repo.discard_candidate(&candidate.candidate_ref)?;
+                return self.hold_no_gate(&entry, error.to_string());
+            }
+        };
         let gate_outcome = self
-            .run_gates_at(&mut entry, &git_repo, &gates, &candidate.commit)
+            .execute_gate_plan_at(&mut entry, &git_repo, gate_plan, &candidate.commit)
             .await?;
         if gate_outcome != GateRunOutcome::Pass {
             git_repo.discard_candidate(&candidate.candidate_ref)?;
@@ -2186,29 +2228,19 @@ impl LandingPipeline {
             return Ok(outcome);
         }
         if matches!(entry.diff_class.as_str(), "doc-only" | "trivial") {
-            self.note_non_main_land_target(&entry);
             self.queue.set_status(&entry, LandingEntryStatus::Landing)?;
-            let result = self
-                .supervisor
-                .land_prepared(
-                    Path::new(&entry.repo_path),
-                    &entry.branch,
-                    &entry.target,
-                    entry.keep_branch,
-                    &candidate,
-                )
-                .await?;
-            if result.get("stale").and_then(Value::as_bool) == Some(true) {
-                return self.requeue_stale(&entry, &git_repo, &candidate, &result);
-            }
-            if result.get("blocked").and_then(Value::as_bool) == Some(true) {
-                let outcome =
-                    LandingOutcome::Escalated(self.worktree_blocked_gate(&entry, &result)?);
-                self.mark_processed(&entry, &outcome)?;
-                return Ok(outcome);
-            }
-            self.record_delivery(&entry, &result).await;
-            let outcome = LandingOutcome::Landed(result);
+            let outcome = match self
+                .advance_target(&entry, entry.keep_branch, &candidate)
+                .await?
+            {
+                TargetAdvance::Landed(result) => self.finalize_landed(&entry, result).await,
+                TargetAdvance::Stale(result) => {
+                    return self.requeue_stale(&entry, &git_repo, &candidate, &result);
+                }
+                TargetAdvance::Blocked(result) => {
+                    LandingOutcome::Escalated(self.worktree_blocked_gate(&entry, &result)?)
+                }
+            };
             self.mark_processed(&entry, &outcome)?;
             return Ok(outcome);
         }
@@ -2290,20 +2322,7 @@ impl LandingPipeline {
         }
 
         let repo = rk_git::Repo::discover(Path::new(&entries[0].repo_path))?;
-        let gates = self.gate_config(&repo);
-        let checks_file = Path::new(&entries[0].repo_path)
-            .join(".rk")
-            .join("checks.cue");
-        if self
-            .gate_plan(&checks_file, &entries[0].target, &gates, &[])
-            .is_err()
-        {
-            let mut outcomes = Vec::with_capacity(entries.len());
-            for entry in entries {
-                outcomes.push((entry.clone(), self.process_entry(&entry).await?));
-            }
-            return Ok(outcomes);
-        }
+        let gates = self.gate_config(&repo)?;
 
         let branch_names: Vec<String> = entries.iter().map(|e| e.branch.clone()).collect();
         let recovered = entries.iter().find_map(|entry| {
@@ -2346,6 +2365,23 @@ impl LandingPipeline {
                 .persist(entry, LandingEntryStatus::RunningGates)?;
         }
 
+        let gate_plan = match self
+            .resolve_gate_plan_at(&entries[0], &repo, &gates, &candidate.commit)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                repo.discard_candidate(&candidate.candidate_ref)?;
+                let error = error.to_string();
+                let mut outcomes = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let outcome = self.hold_no_gate(&entry, error.clone())?;
+                    outcomes.push((entry, outcome));
+                }
+                return Ok(outcomes);
+            }
+        };
+
         // The gate run mutates and durably persists `entries[0]`'s own
         // infra-retry-budget fields (and, on the infra-retry path, re-persists
         // its candidate identity too — see `run_gates_at`). It must run
@@ -2361,7 +2397,7 @@ impl LandingPipeline {
         // later `bisect_batch`/`mark_processed` pass over `entries` grant a
         // second retry the durable store had already spent.
         if !self
-            .run_gates_at(&mut entries[0], &repo, &gates, &candidate.commit)
+            .execute_gate_plan_at(&mut entries[0], &repo, gate_plan, &candidate.commit)
             .await?
             .passed()
         {
@@ -2369,37 +2405,32 @@ impl LandingPipeline {
         }
 
         let first = entries[0].clone();
-        self.note_non_main_land_target(&first);
-        let mut result = self
-            .supervisor
-            .land_prepared(
-                Path::new(&first.repo_path),
-                &first.branch,
-                &first.target,
-                true,
-                &candidate,
-            )
-            .await?;
-        if result.get("stale").and_then(Value::as_bool) == Some(true) {
-            let mut outcomes = Vec::with_capacity(entries.len());
-            for entry in entries {
-                let outcome = self.requeue_stale(&entry, &repo, &candidate, &result)?;
-                outcomes.push((entry, outcome));
-            }
-            return Ok(outcomes);
+        for entry in &entries {
+            self.queue.set_status(entry, LandingEntryStatus::Landing)?;
         }
-        if result.get("blocked").and_then(Value::as_bool) == Some(true) {
-            let mut outcomes = Vec::with_capacity(entries.len());
-            for entry in entries {
-                let outcome =
-                    LandingOutcome::Escalated(self.worktree_blocked_gate(&entry, &result)?);
-                self.mark_processed(&entry, &outcome)?;
-                outcomes.push((entry, outcome));
+        let mut result = match self.advance_target(&first, true, &candidate).await? {
+            TargetAdvance::Landed(result) => result,
+            TargetAdvance::Stale(result) => {
+                let mut outcomes = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let outcome = self.requeue_stale(&entry, &repo, &candidate, &result)?;
+                    outcomes.push((entry, outcome));
+                }
+                return Ok(outcomes);
             }
-            return Ok(outcomes);
-        }
+            TargetAdvance::Blocked(result) => {
+                let mut outcomes = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let outcome =
+                        LandingOutcome::Escalated(self.worktree_blocked_gate(&entry, &result)?);
+                    self.mark_processed(&entry, &outcome)?;
+                    outcomes.push((entry, outcome));
+                }
+                return Ok(outcomes);
+            }
+        };
 
-        let policy = self.supervisor.repository_policy(&repo);
+        let policy = self.supervisor.repository_policy(&repo)?;
         let mut all_deleted = true;
         if policy.delivery.delete_source {
             for entry in &entries {
@@ -2420,8 +2451,7 @@ impl LandingPipeline {
 
         let mut outcomes = Vec::with_capacity(entries.len());
         for entry in entries {
-            self.record_delivery(&entry, &result).await;
-            let outcome = LandingOutcome::Landed(result.clone());
+            let outcome = self.finalize_landed(&entry, result.clone()).await;
             self.mark_processed(&entry, &outcome)?;
             outcomes.push((entry, outcome));
         }
@@ -3213,7 +3243,6 @@ impl LandingPipeline {
         };
         match verdict.as_str() {
             "APPROVE" => {
-                self.note_non_main_land_target(entry);
                 // Capture the review phase's own clock BEFORE the status
                 // transition below moves the durable candidate into `Landing`
                 // (`Phase::Merge`) — that transition resets
@@ -3237,26 +3266,18 @@ impl LandingPipeline {
                     ),
                 );
                 self.queue.set_status(entry, LandingEntryStatus::Landing)?;
-                let result = self
-                    .supervisor
-                    .land_prepared(
-                        Path::new(&entry.repo_path),
-                        &entry.branch,
-                        &entry.target,
-                        entry.keep_branch,
-                        candidate,
-                    )
-                    .await?;
-                if result.get("stale").and_then(Value::as_bool) == Some(true) {
-                    return self.requeue_stale(entry, git_repo, candidate, &result);
-                }
-                if result.get("blocked").and_then(Value::as_bool) == Some(true) {
-                    return Ok(LandingOutcome::Escalated(
+                match self
+                    .advance_target(entry, entry.keep_branch, candidate)
+                    .await?
+                {
+                    TargetAdvance::Landed(result) => Ok(self.finalize_landed(entry, result).await),
+                    TargetAdvance::Stale(result) => {
+                        self.requeue_stale(entry, git_repo, candidate, &result)
+                    }
+                    TargetAdvance::Blocked(result) => Ok(LandingOutcome::Escalated(
                         self.worktree_blocked_gate(entry, &result)?,
-                    ));
+                    )),
                 }
-                self.record_delivery(entry, &result).await;
-                Ok(LandingOutcome::Landed(result))
             }
             "REWORK" => self.route_rework(entry, git_repo).await,
             "STOP" => Ok(LandingOutcome::Escalated(self.review_human_gate(
@@ -3555,7 +3576,7 @@ impl LandingPipeline {
             task: task.to_string(),
             ..Default::default()
         };
-        let gates = self.gate_config(&git_repo);
+        let gates = self.gate_config(&git_repo)?;
         self.reenqueue_after_ceiling(&entry, &gates, settled_attempt)
             .await
     }
@@ -3871,7 +3892,7 @@ impl LandingPipeline {
             return Ok(ReviewDeathOutcome::Escalated(need));
         }
         let policy =
-            ReviewDeathPolicy::from_landing(&self.supervisor.repository_policy(git_repo).landing);
+            ReviewDeathPolicy::from_landing(&self.supervisor.repository_policy(git_repo)?.landing);
         let spent_usd = self.review_death_chain_spend(entry);
         match landing_review_retry::route(&policy, attempts_used, spent_usd) {
             ReviewDeathRoute::Withhold(withheld) => {
@@ -3904,7 +3925,7 @@ impl LandingPipeline {
                 // `not_before` back rather than drawing its own jitter, so
                 // duplicates always converge on one schedule.
                 let backoff_policy = landing_review_retry::ReviewDeathBackoffPolicy::from_landing(
-                    &self.supervisor.repository_policy(git_repo).landing,
+                    &self.supervisor.repository_policy(git_repo)?.landing,
                 );
                 let delay = landing_review_retry::retry_delay(
                     &backoff_policy,
@@ -4161,6 +4182,44 @@ impl LandingPipeline {
             .await
     }
 
+    /// The sole prepared target-advance implementation. Every ordinary,
+    /// workflow, automatic, and batch merge reaches this method after its
+    /// CUE plan passes; mode-specific callers only decide how to report or
+    /// requeue the classified result.
+    async fn advance_target(
+        &self,
+        entry: &LandingQueueEntry,
+        keep_branch: bool,
+        candidate: &rk_git::PreparedMerge,
+    ) -> rk_core::Result<TargetAdvance> {
+        self.note_non_main_land_target(entry);
+        let result = self
+            .supervisor
+            .land_prepared(
+                Path::new(&entry.repo_path),
+                &entry.branch,
+                &entry.target,
+                keep_branch,
+                candidate,
+            )
+            .await?;
+        if result.get("stale").and_then(Value::as_bool) == Some(true) {
+            Ok(TargetAdvance::Stale(result))
+        } else if result.get("blocked").and_then(Value::as_bool) == Some(true) {
+            Ok(TargetAdvance::Blocked(result))
+        } else {
+            Ok(TargetAdvance::Landed(result))
+        }
+    }
+
+    /// The sole successful-land finalization transition. Delivery facts,
+    /// generation-fenced ticket closure, and the terminal landing outcome
+    /// cannot drift apart because all successful paths pass through here.
+    async fn finalize_landed(&self, entry: &LandingQueueEntry, result: Value) -> LandingOutcome {
+        self.record_delivery(entry, &result).await;
+        LandingOutcome::Landed(result)
+    }
+
     /// Write the durable delivery record onto `entry`'s ticket and close it
     /// (P1b). Called from every successful-land path in this module, which is
     /// the whole fix: nothing used to close a ticket after a land, so
@@ -4179,9 +4238,6 @@ impl LandingPipeline {
     /// the branch and target it landed on. No build tooling is consulted and
     /// no language convention is assumed.
     async fn record_delivery(&self, entry: &LandingQueueEntry, result: &Value) {
-        if !entry.task.starts_with(crate::tickets::ID_PREFIX) {
-            return;
-        }
         if result.get("content_free").and_then(Value::as_bool) == Some(true) {
             info!(
                 task = %entry.task,
@@ -4197,6 +4253,10 @@ impl LandingPipeline {
         else {
             return;
         };
+        // A non-ticket candidate (a bare named-branch land the reactor picked
+        // up with no `--task`) still owns an agent generation whose merge
+        // pointer must be derived — only the ticket-side write is skipped.
+        let is_ticket = entry.task.starts_with(crate::tickets::ID_PREFIX);
         let landed_at = Utc::now();
         let record = crate::tickets::DeliveryRecord {
             merge_commit: merge_commit.to_string(),
@@ -4204,29 +4264,38 @@ impl LandingPipeline {
             target: entry.target.clone(),
             landed_at: landed_at.to_rfc3339(),
         };
-        let _ = crate::span::record_phase_span(
-            &self.space,
-            &entry.repo_name,
-            "daemon",
-            &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::Merge)
-                .repo(&entry.repo_name)
-                .target(&entry.target)
-                .candidate(merge_commit)
-                .ended_at(landed_at),
-        );
-        match self.tickets.record_delivery(&entry.task, &record).await {
-            Ok(_) => info!(
-                task = %entry.task,
-                merge_commit,
-                target = %entry.target,
-                "recorded delivery and closed ticket"
-            ),
-            Err(e) => warn!(
-                task = %entry.task,
-                merge_commit,
-                error = %e,
-                "landed but failed to record delivery on the ticket"
-            ),
+        if is_ticket {
+            let _ = crate::span::record_phase_span(
+                &self.space,
+                &entry.repo_name,
+                "daemon",
+                &crate::span::PhaseSpan::new(&entry.task, crate::span::Phase::Merge)
+                    .repo(&entry.repo_name)
+                    .target(&entry.target)
+                    .candidate(merge_commit)
+                    .ended_at(landed_at),
+            );
+        }
+        match self
+            .supervisor
+            .finalize_delivery(
+                std::path::Path::new(&entry.repo_path),
+                &entry.repo_name,
+                is_ticket.then_some(entry.task.as_str()),
+                &record,
+                entry.source_spawn,
+            )
+            .await
+        {
+            Ok(_) => {
+                info!(task = %entry.task, merge_commit, target = %entry.target, "recorded delivery")
+            }
+            Err(e) => {
+                warn!(task = %entry.task, merge_commit, error = %e, "landed but failed to finalize delivery")
+            }
+        }
+        if !is_ticket {
+            return;
         }
         if let Err(error) = self.resubmit_reworked_parent(entry) {
             // The merge is durable; surface bookkeeping failure without denying it.
@@ -4275,7 +4344,8 @@ impl LandingPipeline {
         if entry.status != LandingEntryStatus::Landing {
             return Ok(None);
         }
-        if self.supervisor.repository_policy(repo).delivery.mode != rk_workflow::DeliveryMode::Merge
+        if self.supervisor.repository_policy(repo)?.delivery.mode
+            != rk_workflow::DeliveryMode::Merge
         {
             return Ok(None);
         }
@@ -4290,8 +4360,7 @@ impl LandingPipeline {
             "merged": true, "merge_commit": commit, "content_free": commit == base,
             "recovered": true,
         });
-        self.record_delivery(entry, &result).await;
-        let outcome = LandingOutcome::Landed(result);
+        let outcome = self.finalize_landed(entry, result).await;
         self.mark_processed(entry, &outcome)?;
         Ok(Some(outcome))
     }
@@ -4371,8 +4440,10 @@ impl LandingPipeline {
     }
 
     /// Resolve unattended-rework bounds from the activated repository policy.
-    fn rework_policy(&self, repo: &rk_git::Repo) -> ReworkPolicy {
-        ReworkPolicy::from_landing(&self.supervisor.repository_policy(repo).landing)
+    fn rework_policy(&self, repo: &rk_git::Repo) -> rk_core::Result<ReworkPolicy> {
+        Ok(ReworkPolicy::from_landing(
+            &self.supervisor.repository_policy(repo)?.landing,
+        ))
     }
 
     /// Chain-scoped markers. Counting by head would reset the attempt cap after
@@ -4593,8 +4664,7 @@ impl LandingPipeline {
     ///
     /// `None` when `entry` has no durable queue tuple at all — a synthetic
     /// conflict entry ([`Self::synthetic_conflict_entry`]), which never
-    /// passed through [`LandingQueue::enqueue`] — or a legacy durable tuple
-    /// written before this field existed. Either way, the resulting span is
+    /// passed through [`LandingQueue::enqueue`]. The resulting span is
     /// left without a `started_at`, so [`crate::span::PhaseSpan::duration_ms`]
     /// comes out `None` rather than a fabricated value.
     fn phase_started_at(&self, entry: &LandingQueueEntry) -> Option<DateTime<Utc>> {
@@ -4827,7 +4897,7 @@ impl LandingPipeline {
             return Ok(LandingOutcome::ReworkFiled(ticket));
         }
 
-        let policy = self.rework_policy(git_repo);
+        let policy = self.rework_policy(git_repo)?;
         let attempts_used = self.rework_attempts_used(&ctx)?;
         let spent_usd = self.rework_chain_spend(&ctx)?;
 
@@ -4966,8 +5036,10 @@ impl LandingPipeline {
 
     /// Resolve unattended-conflict-recovery bounds from the activated
     /// repository policy.
-    fn conflict_policy(&self, repo: &rk_git::Repo) -> ConflictPolicy {
-        ConflictPolicy::from_landing(&self.supervisor.repository_policy(repo).landing)
+    fn conflict_policy(&self, repo: &rk_git::Repo) -> rk_core::Result<ConflictPolicy> {
+        Ok(ConflictPolicy::from_landing(
+            &self.supervisor.repository_policy(repo)?.landing,
+        ))
     }
 
     /// Chain-scoped markers, mirroring [`Self::rework_dispatch_markers`] but
@@ -5262,7 +5334,7 @@ impl LandingPipeline {
             return Ok(LandingOutcome::ReworkFiled(ticket));
         }
 
-        let landing_policy = self.supervisor.repository_policy(git_repo).landing;
+        let landing_policy = self.supervisor.repository_policy(git_repo)?.landing;
         let protected_path_hit = ere_matches_any(&landing_policy.protected_paths, &stat.files);
         let evidence = ConflictEvidence {
             conflict_detail: &ctx.conflict_detail,
@@ -5272,7 +5344,7 @@ impl LandingPipeline {
             max_diff_files: landing_policy.max_diff_files,
             max_diff_lines: landing_policy.max_diff_lines,
         };
-        let policy = self.conflict_policy(git_repo);
+        let policy = self.conflict_policy(git_repo)?;
         let attempts_used = self.conflict_attempts_used(&ctx)?;
         let spent_usd = self.conflict_chain_spend(&ctx)?;
 
@@ -5419,30 +5491,10 @@ impl LandingPipeline {
         }
     }
 
-    /// The dispatch_key a marker belongs to, falling back to the same
-    /// `head_sha`+`rework_ticket` pair [`Self::conflict_marker_matches`]
-    /// uses for a marker written before that field existed.
-    fn conflict_marker_chain_key(marker: &Tuple) -> String {
-        marker
-            .payload
-            .get("dispatch_key")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                format!(
-                    "{}\0{}",
-                    marker
-                        .payload
-                        .get("head_sha")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    marker
-                        .payload
-                        .get("rework_ticket")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                )
-            })
+    /// The exact dispatch key a current marker belongs to. Missing identity is
+    /// not reconstructed from content fields.
+    fn conflict_marker_chain_key(marker: &Tuple) -> Option<&str> {
+        marker.payload.get("dispatch_key").and_then(Value::as_str)
     }
 
     fn conflict_markers_for_branch(&self, repo: &str, branch: &str) -> rk_core::Result<Vec<Tuple>> {
@@ -5461,10 +5513,7 @@ impl LandingPipeline {
     /// different, possibly newer chain on the same branch. This is what
     /// [`Self::dispatch_held_conflict`] and [`Self::pending_conflict_attempt`]
     /// use whenever the caller (an already-decided `Violation`) knows which
-    /// chain it means: `Self::latest_conflict_marker`'s "whichever chain is
-    /// newest for this branch right now" is a DIFFERENT, weaker query, only
-    /// appropriate when no chain_key is available at all (a legacy
-    /// violation predating that field).
+    /// chain it means. There is no branch-latest fallback.
     fn conflict_marker_for_chain_key(
         &self,
         repo: &str,
@@ -5474,40 +5523,8 @@ impl LandingPipeline {
         Ok(self
             .conflict_markers_for_branch(repo, branch)?
             .into_iter()
-            .filter(|m| Self::conflict_marker_chain_key(m) == chain_key)
+            .filter(|m| Self::conflict_marker_chain_key(m) == Some(chain_key))
             .max_by_key(|m| (Self::conflict_state_rank(m), m.id)))
-    }
-
-    /// The most recent chain's current marker for a (repo, branch) pair,
-    /// regardless of its exact chain_key — used ONLY when the caller has no
-    /// chain_key to bind to (a legacy violation, from before that field
-    /// existed). Prefer [`Self::conflict_marker_for_chain_key`] whenever a
-    /// chain_key is available: picking "whichever chain is newest right
-    /// now" is a materially different, weaker query than "the chain this
-    /// specific decision named," and can rebind to a genuinely newer chain
-    /// that appeared on the same branch after the decision was authorized
-    /// but before this dispatch's own independent read.
-    fn latest_conflict_marker(&self, repo: &str, branch: &str) -> rk_core::Result<Option<Tuple>> {
-        let markers = self.conflict_markers_for_branch(repo, branch)?;
-        let mut by_chain: HashMap<String, Vec<Tuple>> = HashMap::new();
-        for marker in markers {
-            by_chain
-                .entry(Self::conflict_marker_chain_key(&marker))
-                .or_default()
-                .push(marker);
-        }
-        // Distinct CHAINS are always separated by real elapsed time (a new
-        // conflict only opens after the prior one visibly resolved), so
-        // picking the chain with the greatest max tuple id is safe — the
-        // flakiness risk above is specific to markers WITHIN one chain.
-        let latest_chain = by_chain
-            .into_values()
-            .max_by_key(|group| group.iter().map(|m| m.id).max());
-        Ok(latest_chain.and_then(|group| {
-            group
-                .into_iter()
-                .max_by_key(|m| (Self::conflict_state_rank(m), m.id))
-        }))
     }
 
     /// The in-flight attempt number for a conflict chain awaiting an
@@ -5517,20 +5534,16 @@ impl LandingPipeline {
     /// runs. Returns `None` for a branch with no held chain at all rather
     /// than guessing an attempt number. `chain_key` (from the violation's
     /// own evidence, when present) binds this to the EXACT chain the
-    /// decision named; `None` falls back to the branch's newest chain,
-    /// which is only correct for a legacy violation with no chain_key.
+    /// decision named; missing exact chain identity is not actionable.
     pub(crate) fn pending_conflict_attempt(
         &self,
         repo: &str,
         branch: &str,
         chain_key: Option<&str>,
     ) -> Option<u32> {
-        let marker = match chain_key {
-            Some(key) => self
-                .conflict_marker_for_chain_key(repo, branch, key)
-                .ok()??,
-            None => self.latest_conflict_marker(repo, branch).ok()??,
-        };
+        let marker = self
+            .conflict_marker_for_chain_key(repo, branch, chain_key?)
+            .ok()??;
         marker
             .payload
             .get("attempt")
@@ -5552,19 +5565,20 @@ impl LandingPipeline {
     /// present) binds this dispatch to the EXACT chain that violation
     /// named — never a different, possibly newer chain that appeared on
     /// the same branch between when `attention.decide` authorized this call
-    /// and this function's own independent marker read. `None` falls back
-    /// to the branch's newest chain, correct only for a legacy violation
-    /// with no chain_key.
+    /// and this function's own independent marker read. Missing exact chain
+    /// identity fails closed.
     pub(crate) async fn dispatch_held_conflict(
         &self,
         repo: &str,
         branch: &str,
         chain_key: Option<&str>,
     ) -> rk_core::Result<String> {
-        let marker = match chain_key {
-            Some(key) => self.conflict_marker_for_chain_key(repo, branch, key)?,
-            None => self.latest_conflict_marker(repo, branch)?,
-        };
+        let chain_key = chain_key.ok_or_else(|| {
+            rk_core::Error::other(format!(
+                "conflict correction for {repo}/{branch} requires an exact chain key"
+            ))
+        })?;
+        let marker = self.conflict_marker_for_chain_key(repo, branch, chain_key)?;
         let Some(marker) = marker else {
             return Err(rk_core::Error::other(format!(
                 "no conflict-correction chain for {repo}/{branch} has ever been held for a \
@@ -6122,17 +6136,45 @@ impl LandingPipeline {
             .join(sanitize_path_component(target))
     }
 
+    /// Resolve the repo-owned CUE policy once for this exact prepared
+    /// candidate. The returned value is data-only and can be executed later
+    /// without rereading either policy file.
+    async fn resolve_gate_plan_at(
+        &self,
+        entry: &LandingQueueEntry,
+        git_repo: &rk_git::Repo,
+        gates: &GateConfig,
+        tested_sha: &str,
+    ) -> rk_core::Result<ResolvedGatePlan> {
+        let changed_paths = {
+            let git_repo = git_repo.clone();
+            let target = entry.target.clone();
+            let sha = tested_sha.to_string();
+            blocking(move || {
+                Ok(git_repo
+                    .diff_stat(&target, &sha)
+                    .map(|stat| stat.files)
+                    .unwrap_or_default())
+            })
+            .await?
+        };
+        let checks_file = PathBuf::from(&entry.repo_path)
+            .join(".rk")
+            .join("checks.cue");
+        self.gate_plan(&checks_file, &entry.target, gates, &changed_paths)
+    }
+
     /// Run the same three gates `steward.cue`'s `_gates` block runs today
     /// (POLICY, DIFF-SCOPE, the repo's named `verify` check) against a
     /// persistent daemon-owned worktree reset to the candidate's tip.
     /// Returns [`GateRunOutcome::Pass`] only if every gate reported
     /// `verdict: "pass"`; a caller that needs a plain pass/fail bool can
     /// use [`GateRunOutcome::passed`].
-    async fn run_gates_at(
+    async fn execute_gate_plan_at(
         &self,
         entry: &mut LandingQueueEntry,
         git_repo: &rk_git::Repo,
-        gates: &GateConfig,
+        gate_plan: ResolvedGatePlan,
         tested_sha: &str,
     ) -> rk_core::Result<GateRunOutcome> {
         let started = Instant::now();
@@ -6152,7 +6194,6 @@ impl LandingPipeline {
         // name, which said nothing about whether the command/toolchain/
         // environment that actually ran still matches a later caller's.
         let mut check_proof_keys: Vec<(String, Option<String>)> = Vec::new();
-        let repo_path = PathBuf::from(&entry.repo_path);
         let gate_dir = self.gate_worktree_path(&entry.repo_name, &entry.target);
         {
             let git_repo = git_repo.clone();
@@ -6170,40 +6211,21 @@ impl LandingPipeline {
         // worktree "just used" that was not actually touched.
         self.touch_gate_worktree_marker(&entry.repo_name, &entry.target);
 
-        let checks_file = repo_path.join(".rk").join("checks.cue");
-        // Best-effort: only feeds INNER-edge focused-check selection
-        // (`gate_plan`'s `select_focused_checks`), never a PROTECTED-FINAL
-        // edge's full-check decision, which does not look at changed paths
-        // at all. A target that fails to resolve as a revision (synthetic
-        // test target names, an exotic history shape) falls back to no
-        // known changed paths — the same fail-closed-toward-fewer-checks
-        // direction `ere_matches_any` already takes, never toward silently
-        // promoting to the full suite.
-        let changed_paths = {
-            let git_repo = git_repo.clone();
-            let target = entry.target.clone();
-            let sha = tested_sha.to_string();
-            blocking(move || {
-                Ok(git_repo
-                    .diff_stat(&target, &sha)
-                    .map(|stat| stat.files)
-                    .unwrap_or_default())
-            })
-            .await?
-        };
-        let (plan, edge_class, full_check_required, reason) =
-            self.gate_plan(&checks_file, &entry.target, gates, &changed_paths)?;
+        let ResolvedGatePlan {
+            checks,
+            edge_class,
+            full_check_required,
+            reason,
+        } = gate_plan;
 
-        let selected_checks: Vec<String> = plan
+        let selected_checks: Vec<String> = checks
             .iter()
             .map(|(check, _, _)| check.name.clone())
             .collect();
         let proof_key = if full_check_required {
-            plan.iter()
-                .find(|(check, _, _)| check.name == gates.check_name)
-                .and_then(|(check, _, _)| {
-                    verification_proof_key(&entry.repo_name, tested_sha, check)
-                })
+            checks.last().and_then(|(check, _, _)| {
+                verification_proof_key(&entry.repo_name, tested_sha, check)
+            })
         } else {
             None
         };
@@ -6243,7 +6265,7 @@ impl LandingPipeline {
         );
 
         let id = format!("landing:{}", entry.branch);
-        for (check_index, (check, env, timeout)) in plan.into_iter().enumerate() {
+        for (check_index, (check, env, timeout)) in checks.into_iter().enumerate() {
             // This check's position in the plan, not a rework-round counter:
             // stable across a crash-resume re-run of this same plan (so a
             // repeated earlier check dedupes against the span it already
@@ -6941,10 +6963,31 @@ impl LandingPipeline {
         gates: &GateConfig,
     ) -> rk_core::Result<bool> {
         let head_sha = entry.head_sha.clone();
+        let gate_plan = self
+            .resolve_gate_plan_at(entry, git_repo, gates, &head_sha)
+            .await?;
         Ok(self
-            .run_gates_at(entry, git_repo, gates, &head_sha)
+            .execute_gate_plan_at(entry, git_repo, gate_plan, &head_sha)
             .await?
             .passed())
+    }
+
+    /// Test convenience for cases that exercise an exact prepared candidate.
+    /// Production resolves the CUE plan in `process_entry`/`process_batch`
+    /// and passes the immutable plan directly to `execute_gate_plan_at`.
+    #[cfg(test)]
+    async fn run_gates_at(
+        &self,
+        entry: &mut LandingQueueEntry,
+        git_repo: &rk_git::Repo,
+        gates: &GateConfig,
+        tested_sha: &str,
+    ) -> rk_core::Result<GateRunOutcome> {
+        let gate_plan = self
+            .resolve_gate_plan_at(entry, git_repo, gates, tested_sha)
+            .await?;
+        self.execute_gate_plan_at(entry, git_repo, gate_plan, tested_sha)
+            .await
     }
 
     /// Resolve the protected-paths/diff-scope policy gates plus this edge's
@@ -6971,7 +7014,7 @@ impl LandingPipeline {
         target: &str,
         gates: &GateConfig,
         changed_paths: &[String],
-    ) -> rk_core::Result<(GatePlan, LandingEdgeClass, bool, String)> {
+    ) -> rk_core::Result<ResolvedGatePlan> {
         if !checks_file.exists() {
             return Err(rk_core::Error::other(format!(
                 "landing pipeline: no check registry at {}",
@@ -6995,7 +7038,7 @@ impl LandingPipeline {
         let protected_paths = find(PROTECTED_PATHS_CHECK)?;
         let diff_scope = find(DIFF_SCOPE_CHECK)?;
 
-        let mut plan: GatePlan = vec![
+        let mut checks = vec![
             (
                 protected_paths,
                 vec![
@@ -7027,7 +7070,7 @@ impl LandingPipeline {
         let is_protected_final = gates.protected_targets.iter().any(|t| t == target);
         let (edge_class, full_check_required, reason) = if is_protected_final {
             let verify = find(&gates.check_name)?;
-            plan.push((verify, Vec::new(), gates.gate_timeout));
+            checks.push((verify, Vec::new(), gates.gate_timeout));
             (
                 LandingEdgeClass::ProtectedFinal,
                 true,
@@ -7051,7 +7094,7 @@ impl LandingPipeline {
             } else {
                 for check_name in &selected {
                     let check = find(check_name)?;
-                    plan.push((
+                    checks.push((
                         check,
                         vec![("RK_CHECK_TARGET".to_string(), target.to_string())],
                         gates.gate_timeout,
@@ -7069,7 +7112,12 @@ impl LandingPipeline {
             }
         };
 
-        Ok((plan, edge_class, full_check_required, reason))
+        Ok(ResolvedGatePlan {
+            checks,
+            edge_class,
+            full_check_required,
+            reason,
+        })
     }
 
     /// Sibling marker file recording when `gate_worktree_path(repo, target)`
@@ -7355,8 +7403,6 @@ checks: [
             false,
             true,
             false,
-            Vec::new(),
-            Vec::new(),
             0,
             false,
         ))
@@ -7748,8 +7794,6 @@ workflow: {
             false,
             true,
             false,
-            Vec::new(),
-            Vec::new(),
             0,
             false,
         );
@@ -8013,28 +8057,21 @@ workflow: {
         );
     }
 
-    /// A durable tuple written before `phase_entered_at` existed reads as
-    /// `None`, which must render as `0` — under-reporting the phase age
-    /// rather than fabricating one from `enqueued_at`, so an upgrade can
-    /// never replay a backlog of instant breaches. The next real transition
-    /// starts a clock for it.
     #[test]
-    fn legacy_entry_without_a_phase_clock_reports_zero_then_starts_one() {
+    fn persisted_entry_without_a_phase_clock_is_refused() {
         let home = tempfile::tempdir().unwrap();
         let layout = Layout::at(home.path());
         let space = Space::open_in_memory().unwrap();
         let queue = LandingQueue::new(space.clone(), &layout);
 
-        // Hand-write the pre-upgrade tuple shape: `enqueued_at` present,
-        // `phase_entered_at` absent entirely.
         let payload = json!({
             "repo_name": "alpha",
             "repo_path": "/repos/alpha",
             "branch": "b1",
             "target": "main",
-            "head_sha": "sha-legacy",
+            "head_sha": "sha-old",
             "diff_class": "trivial",
-            "task": "TKT-legacy",
+            "task": "TKT-old",
             "seq": 1,
             "rev": 0,
             "status": "queued",
@@ -8053,88 +8090,11 @@ workflow: {
             )
             .unwrap();
 
-        let legacy = landing_queue_snapshot(&space)
-            .into_iter()
-            .find(|e| e.branch == "b1")
-            .unwrap();
-        assert!(legacy.age_secs >= 5 * 3600 - 5, "total age still reads");
-        assert_eq!(
-            legacy.phase_age_secs, 0,
-            "no phase clock must under-report, never inherit total age"
-        );
-
-        // The next transition adopts one rather than leaving it `None`.
-        let claimed = queue.claim_next("alpha", "main").unwrap().unwrap();
-        assert!(claimed.phase_entered_at.is_some());
-    }
-
-    /// Legacy unavailable evidence, at the span level: a durable landing-
-    /// queue tuple written before `phase_entered_at` existed has no clock to
-    /// derive a `SemanticReview`/`Rework` `started_at` from.
-    /// [`LandingPipeline::phase_started_at`] must report `None` for it (not
-    /// panic, not fall back to some other timestamp), and the resulting span
-    /// must carry no `duration_ms` at all — never a fabricated one.
-    #[test]
-    fn legacy_queue_tuple_without_a_phase_clock_yields_no_fabricated_review_duration() {
-        let home = tempfile::tempdir().unwrap();
-        let space = Space::open_in_memory().unwrap();
-        let pipeline = test_pipeline(home.path(), space.clone());
-
-        let entry = LandingQueueEntry {
-            repo_name: "legacy-repo".into(),
-            repo_path: "/repos/legacy".into(),
-            branch: "b1".into(),
-            target: "main".into(),
-            head_sha: "sha-legacy".into(),
-            diff_class: "trivial".into(),
-            task: "TKT-legacy".into(),
-            seq: 1,
-            status: LandingEntryStatus::AwaitingReview,
-            ..Default::default()
-        };
-        // Hand-write the pre-upgrade tuple shape (module doc,
-        // `legacy_entry_without_a_phase_clock_reports_zero_then_starts_one`
-        // above): no `phase_entered_at` field at all.
-        space
-            .out(
-                Tuple::new(
-                    Category::Event,
-                    entry.repo_name.clone(),
-                    LANDING_QUEUE_IDENTITY,
-                    "daemon",
-                    json!({
-                        "repo_name": entry.repo_name,
-                        "repo_path": entry.repo_path,
-                        "branch": entry.branch,
-                        "target": entry.target,
-                        "head_sha": entry.head_sha,
-                        "diff_class": entry.diff_class,
-                        "task": entry.task,
-                        "seq": entry.seq,
-                        "rev": 0,
-                        "status": "awaiting_review",
-                    }),
-                )
-                .with_lifecycle(Lifecycle::Furniture),
-            )
-            .unwrap();
-
-        assert!(pipeline.phase_started_at(&entry).is_none());
-
-        let span = LandingPipeline::timed_review_span(
-            &entry.task,
-            crate::span::Phase::SemanticReview,
-            1,
-            &entry.repo_name,
-            pipeline.phase_started_at(&entry),
-            Utc::now(),
-            "approved",
-        );
-        assert!(span.started_at.is_none(), "{span:?}");
-        assert!(
-            span.duration_ms().is_none(),
-            "a legacy record with no start clock must never fabricate a duration: {span:?}"
-        );
+        assert!(landing_queue_snapshot(&space).is_empty());
+        let error = queue.claim_next("alpha", "main").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("predates the exact phase-clock schema"));
     }
 
     #[test]
@@ -8252,6 +8212,9 @@ workflow: {
         };
         let seq = queue.enqueue(entry.clone()).unwrap();
         entry.seq = seq;
+        let now = Utc::now();
+        entry.enqueued_at = Some(now);
+        entry.phase_entered_at = Some(now);
         assert!(
             queue.find(&entry).unwrap().is_some(),
             "predecessor tuple must exist right after enqueue"
@@ -10155,8 +10118,6 @@ workflow: {
                 name: "code-repo".into(),
                 path: root,
                 created_at: Utc::now(),
-                merge_mode: Default::default(),
-                remote: None,
                 host: None,
                 activated_policy: Some(crate::repos::ActivatedRepositoryPolicy {
                     digest: "test-digest".into(),
@@ -10252,6 +10213,18 @@ workflow: {
                     .identity(identity),
             )
             .unwrap()
+    }
+
+    fn only_conflict_chain_key(space: &Space) -> String {
+        let keys: std::collections::HashSet<String> =
+            scoped_tuples(space, Category::Event, CONFLICT_DISPATCH_IDENTITY)
+                .into_iter()
+                .filter_map(|tuple| {
+                    LandingPipeline::conflict_marker_chain_key(&tuple).map(str::to_string)
+                })
+                .collect();
+        assert_eq!(keys.len(), 1, "expected one exact conflict chain: {keys:?}");
+        keys.into_iter().next().unwrap()
     }
 
     fn rework_context(head: &str, task: &str, rework_ticket: &str) -> ReworkContext {
@@ -10455,8 +10428,9 @@ workflow: {
 
         // Standing in for `Server::execute_orchestrator`, reachable only
         // after `attention.decide` fenced the call through a live lease.
+        let chain_key = only_conflict_chain_key(&space);
         let dispatch_detail = pipeline
-            .dispatch_held_conflict("code-repo", "feature", None)
+            .dispatch_held_conflict("code-repo", "feature", Some(&chain_key))
             .await
             .unwrap();
         assert!(
@@ -10485,7 +10459,7 @@ workflow: {
 
         // A second decision for the same chain must not double-dispatch.
         let replay = pipeline
-            .dispatch_held_conflict("code-repo", "feature", None)
+            .dispatch_held_conflict("code-repo", "feature", Some(&chain_key))
             .await
             .unwrap();
         assert!(replay.contains("already"), "{replay}");
@@ -10511,8 +10485,7 @@ workflow: {
         // `entry` here is the synthetic conflict entry — no durable landing-
         // queue tuple, so no `phase_entered_at` clock exists to derive a
         // `started_at` from. `duration_ms` must be left absent (`null`),
-        // never fabricated, exactly like the "legacy/unavailable evidence"
-        // case for a real queue entry predating the clock.
+        // never fabricated when evidence is unavailable.
         assert!(review["started_at"].is_null(), "{review:?}");
         assert!(review["duration_ms"].is_null(), "{review:?}");
         let rework = spans
@@ -10750,8 +10723,9 @@ workflow: {
         // Only pause dispatch once the chain is already held for a decision
         // — the hold itself must never touch the supervisor at all.
         pipeline.supervisor.set_dispatch_paused(true);
+        let chain_key = only_conflict_chain_key(&space);
         let refusal = pipeline
-            .dispatch_held_conflict("code-repo", "feature", None)
+            .dispatch_held_conflict("code-repo", "feature", Some(&chain_key))
             .await;
         assert!(refusal.is_err(), "{refusal:?}");
 
@@ -10796,7 +10770,7 @@ workflow: {
         // the chain. See the `dispatch_held_conflict` `other` match arm.
         pipeline.supervisor.set_dispatch_paused(false);
         let replay = pipeline
-            .dispatch_held_conflict("code-repo", "feature", None)
+            .dispatch_held_conflict("code-repo", "feature", Some(&chain_key))
             .await
             .unwrap_err()
             .to_string();
@@ -11407,8 +11381,9 @@ workflow: {
             .await
             .unwrap();
         assert!(matches!(held, LandingOutcome::ReworkFiled(_)));
+        let chain_key = only_conflict_chain_key(&space);
         pipeline
-            .dispatch_held_conflict("code-repo", "feature", None)
+            .dispatch_held_conflict("code-repo", "feature", Some(&chain_key))
             .await
             .unwrap();
 
@@ -13330,6 +13305,7 @@ checks: [
                 "main",
                 false,
                 Some("direct-land-empty-task".into()),
+                None,
             )
             .await
             .unwrap();
@@ -13348,6 +13324,7 @@ checks: [
                 "main",
                 false,
                 Some("direct-land-empty-task".into()),
+                None,
             )
             .await
             .unwrap();
@@ -16560,6 +16537,79 @@ checks: [
             .scan(&Pattern::category(Category::Event).identity(GATE_PASS_IDENTITY))
             .unwrap();
         assert_eq!(pass_events.len(), 2, "pass events: {pass_events:?}");
+    }
+
+    /// Resolution and execution are one admission decision: once the exact
+    /// candidate's CUE plan has been built, a concurrent edit to the live
+    /// registry cannot swap the command underneath that in-flight run. A
+    /// later candidate resolves the new registry normally.
+    #[tokio::test]
+    async fn landing_gate_executes_the_single_resolved_cue_plan() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let resolved_log = home.path().join("resolved.log");
+        let late_log = home.path().join("late.log");
+        write_checks(
+            repo_dir.path(),
+            &checks_cue_with_verify(
+                &format!("echo resolved >> '{}'", resolved_log.display()),
+                "rust-stable",
+                "inherit",
+            ),
+        );
+        git(repo_dir.path(), &["checkout", "-b", "feature"]);
+        std::fs::write(repo_dir.path().join("src.rs"), "fn x() {}\n").unwrap();
+        git(repo_dir.path(), &["add", "."]);
+        git(repo_dir.path(), &["commit", "-m", "feat: add src"]);
+        let head_sha = rev_parse(repo_dir.path(), "feature");
+        git(repo_dir.path(), &["checkout", "main"]);
+
+        let space = Space::open_in_memory().unwrap();
+        let pipeline = test_pipeline(home.path(), space);
+        let git_repo = rk_git::Repo::discover(repo_dir.path()).unwrap();
+        let gates = GateConfig::default();
+        let candidate = match git_repo.prepare_merge("feature", "main").unwrap() {
+            rk_git::PrepareOutcome::Prepared(candidate) => candidate,
+            other => panic!("expected prepared merge, got {other:?}"),
+        };
+        let mut entry = LandingQueueEntry {
+            repo_name: "single-resolution-repo".into(),
+            repo_path: repo_dir.path().display().to_string(),
+            branch: "feature".into(),
+            target: "main".into(),
+            head_sha,
+            candidate_sha: Some(candidate.commit.clone()),
+            candidate_base: Some(candidate.base.clone()),
+            candidate_ref: Some(candidate.candidate_ref.clone()),
+            diff_class: "feature".into(),
+            task: "single-resolution-task".into(),
+            ..Default::default()
+        };
+
+        let plan = pipeline
+            .resolve_gate_plan_at(&entry, &git_repo, &gates, &candidate.commit)
+            .await
+            .unwrap();
+        write_checks_uncommitted(
+            repo_dir.path(),
+            &checks_cue_with_verify(
+                &format!("echo late >> '{}'", late_log.display()),
+                "rust-stable",
+                "inherit",
+            ),
+        );
+
+        let outcome = pipeline
+            .execute_gate_plan_at(&mut entry, &git_repo, plan, &candidate.commit)
+            .await
+            .unwrap();
+        assert_eq!(outcome, GateRunOutcome::Pass);
+        assert!(resolved_log.exists(), "the resolved command must run");
+        assert!(
+            !late_log.exists(),
+            "execution must not reread and substitute the later CUE command"
+        );
     }
 
     /// Builds a `checks.cue` registry identical to the replay test's own,

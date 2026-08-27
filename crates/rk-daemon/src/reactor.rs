@@ -1232,6 +1232,17 @@ impl Reactor {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let source_spawn = match parse_source_spawn(payload) {
+            Ok(spawn) => spawn,
+            Err(error) => {
+                return self.give_up_or_retry(
+                    key,
+                    &trigger.name,
+                    tuple_id,
+                    format!("reactor trigger '{}': {error}", trigger.name),
+                );
+            }
+        };
 
         let entry = LandingQueueEntry {
             repo_name: repo_name.to_string(),
@@ -1241,6 +1252,7 @@ impl Reactor {
             head_sha,
             diff_class,
             task,
+            source_spawn: Some(source_spawn),
             ..Default::default()
         };
         match landing.enqueue(entry) {
@@ -2602,6 +2614,22 @@ impl Reactor {
     }
 }
 
+/// Automatic landing requires exact generation evidence. Missing and malformed
+/// values both fail closed; manual recovery submissions use a separate path.
+fn parse_source_spawn(payload: &Value) -> rk_core::Result<rk_core::id::SpawnId> {
+    match payload.get("spawn") {
+        Some(Value::String(raw)) => raw.parse().map_err(|error| {
+            rk_core::Error::other(format!("invalid harness_result spawn: {error}"))
+        }),
+        None | Some(Value::Null) => Err(rk_core::Error::other(
+            "harness_result missing required spawn",
+        )),
+        Some(_) => Err(rk_core::Error::other(
+            "invalid harness_result spawn: expected a string",
+        )),
+    }
+}
+
 fn stable_workflow_instance_id(key: &str) -> String {
     let digest = Sha256::digest(key.as_bytes());
     format!("reactor-{}", hex::encode(&digest[..16]))
@@ -2995,6 +3023,18 @@ mod tests {
         )
     }
 
+    #[test]
+    fn source_spawn_is_required_and_corruption_fails_closed() {
+        let spawn = rk_core::id::SpawnId::new();
+        assert_eq!(
+            parse_source_spawn(&json!({"spawn": spawn.to_string()})).unwrap(),
+            spawn
+        );
+        assert!(parse_source_spawn(&json!({})).is_err());
+        assert!(parse_source_spawn(&json!({"spawn": "not-a-spawn"})).is_err());
+        assert!(parse_source_spawn(&json!({"spawn": 7})).is_err());
+    }
+
     fn trigger(params: &[(&str, &str)]) -> Trigger {
         Trigger {
             name: "t".into(),
@@ -3166,7 +3206,7 @@ mod tests {
     fn agent(name: &str, repo: &str, state: crate::agents::AgentState) -> AgentRecord {
         AgentRecord {
             name: name.into(),
-            spawn: None,
+            spawn: Some(rk_core::id::SpawnId::new()),
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),

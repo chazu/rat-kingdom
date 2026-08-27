@@ -45,6 +45,16 @@ pub struct Repo {
     root: PathBuf,
 }
 
+/// Git's three-valued answer to an ancestry question. `Unknown` is distinct
+/// from `Absent`: a deleted historical ref or missing object is not evidence
+/// that a previously recorded delivery never happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ancestry {
+    Present,
+    Absent,
+    Unknown,
+}
+
 /// File list and total changed-line count for a diff range. See
 /// [`Repo::diff_stat`].
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -266,29 +276,24 @@ impl Repo {
     /// (branch name, tag, sha). Returns false when either revision is
     /// unresolvable, so the caller cannot mistake "couldn't tell" for merged.
     pub fn is_ancestor(&self, commit: &str, of: &str) -> bool {
-        // `merge-base --is-ancestor A B` exits 0 when A is an ancestor of B,
-        // 1 when it is not, and non-0/1 on a bad revision — `git()` maps every
-        // non-zero exit to Err, collapsing "not an ancestor" and "bad rev" into
-        // the same false. That is the safe direction: unknown ⇒ not merged.
-        self.git(&["merge-base", "--is-ancestor", commit, of])
-            .is_ok()
+        matches!(self.ancestry(commit, of), Ancestry::Present)
     }
 
-    /// Commit-count-aware delivery check: true iff `commit` was genuinely
-    /// absorbed into `of` — `of` contains it AND has moved past it.
-    ///
-    /// Plain [`is_ancestor`](Repo::is_ancestor) alone also returns true when
-    /// `commit` merely *equals* `of`'s history without ever diverging — an
-    /// empty branch, cut from `of` and never touched, is trivially "an
-    /// ancestor of" its own fork point forever, which reads a rat that
-    /// committed nothing as delivered. Requiring `of` to also NOT be an
-    /// ancestor of `commit` excludes that trivial-equal case while still
-    /// recognizing a real merge: `rk` always lands with `--no-ff` (see
-    /// [`merge_branch`](Repo::merge_branch)), so a genuine merge commit is
-    /// always distinct from `commit`'s own tip, making this exact rather
-    /// than a heuristic.
-    fn advanced_past(&self, commit: &str, of: &str) -> bool {
-        self.is_ancestor(commit, of) && !self.is_ancestor(of, commit)
+    /// Tri-state ancestry for reconciliation and historical evidence checks.
+    /// Git documents exit 0 as ancestor, 1 as a clean negative, and every
+    /// other result as an inability to answer (bad/missing revision, corrupt
+    /// repository, or an unavailable git executable).
+    pub fn ancestry(&self, commit: &str, of: &str) -> Ancestry {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["merge-base", "--is-ancestor", commit, of])
+            .output();
+        match output.ok().and_then(|out| out.status.code()) {
+            Some(0) => Ancestry::Present,
+            Some(1) => Ancestry::Absent,
+            _ => Ancestry::Unknown,
+        }
     }
 
     /// Whether an awaiting-review branch has been dealt with on the forge:
@@ -307,34 +312,13 @@ impl Repo {
     /// NOT commit-count aware, deliberately: a genuine fast-forward (target
     /// had no other commits since the branch forked) leaves `target`
     /// pointing at exactly `branch`'s tip, which is indistinguishable here
-    /// from a branch that never diverged at all — [`advanced_past`] would
-    /// misread a real FF-merged PR as still-open. Callers that need to
-    /// exclude the never-diverged case (crash-vs-delivered) use a check with
-    /// more context than a bare ref pair — see
-    /// [`branch_verified_merged`](Repo::branch_verified_merged), which is
-    /// safe here only because its caller's merges are always `--no-ff`.
+    /// from a branch that never diverged at all. This helper clears review
+    /// artifacts; it is not ticket-delivery authority.
     pub fn branch_merged_or_gone(&self, branch: &str, target: &str) -> bool {
         if !self.branch_exists(branch) {
             return true;
         }
         self.is_ancestor(branch, target)
-    }
-
-    /// Whether `branch` has *verifiably* merged into `target`: it still
-    /// exists and its tip is an ancestor of `target`. Unlike
-    /// [`branch_merged_or_gone`](Repo::branch_merged_or_gone), a branch that
-    /// no longer exists does NOT count as delivered here — that "gone ⇒
-    /// dealt with" reading only holds where the daemon's own post-merge
-    /// cleanup or a human's forge-side delete is the expected cause (PR/
-    /// push-branch awaiting-review clearing). For merge-mode ticket-done
-    /// gating we cannot tell that apart from a branch that vanished before
-    /// ever landing (the exact "approved but never merged" class behind
-    /// TKT-18/46/147), so an absent branch fails closed as "not delivered".
-    /// Commit-count aware via [`advanced_past`](Repo::advanced_past): an
-    /// empty branch (zero commits since its fork point) is not "verified
-    /// merged" either — a rat that never committed must not read as done.
-    pub fn branch_verified_merged(&self, branch: &str, target: &str) -> bool {
-        self.branch_exists(branch) && self.advanced_past(branch, target)
     }
 
     /// Whether `branch` contains at least one commit after its recorded
@@ -1473,7 +1457,7 @@ mod tests {
         );
         // The invariant.
         assert_eq!(repo.rev_parse("refs/heads/main").unwrap(), tested);
-        assert!(repo.branch_verified_merged(&branch, "main"));
+        assert!(repo.is_ancestor(&branch, "main"));
 
         repo.discard_candidate(&candidate.candidate_ref).unwrap();
         assert!(repo.rev_parse(&candidate.candidate_ref).is_err());
@@ -1510,7 +1494,7 @@ mod tests {
         assert_eq!(outcome.commit(), None);
         // Nothing landed: main still carries only the other rat's merge.
         assert_eq!(repo.rev_parse("refs/heads/main").unwrap(), moved_to);
-        assert!(!repo.branch_verified_merged(&branch, "main"));
+        assert!(!repo.is_ancestor(&branch, "main"));
         // Nothing lost: the candidate is still parked, so a retry can rebuild.
         assert_eq!(
             repo.rev_parse(&candidate.candidate_ref).unwrap(),
@@ -2367,16 +2351,6 @@ mod tests {
     }
 
     #[test]
-    fn branch_verified_merged_false_for_a_branch_that_never_diverged() {
-        let (dir, repo) = scratch_repo();
-        let branch = empty_branch(dir.path(), &repo, "nibbles", "task-empty");
-        assert!(
-            !repo.branch_verified_merged(&branch, "main"),
-            "an empty branch must not read as verifiably merged"
-        );
-    }
-
-    #[test]
     fn recorded_fork_point_distinguishes_empty_from_fast_forward_merged() {
         let (dir, repo) = scratch_repo();
         let fork = repo.rev_parse("main").unwrap();
@@ -2402,6 +2376,43 @@ mod tests {
         // A bad revision must read as "not an ancestor", never merged.
         assert!(!repo.is_ancestor("rat/does-not-exist/tkt", "main"));
         assert!(!repo.is_ancestor("main", "no-such-target"));
+        assert_eq!(
+            repo.ancestry("rat/does-not-exist/tkt", "main"),
+            Ancestry::Unknown
+        );
+        assert_eq!(repo.ancestry("main", "no-such-target"), Ancestry::Unknown);
+    }
+
+    #[test]
+    fn ancestry_distinguishes_a_clean_negative_from_an_unknown_revision() {
+        let (dir, repo) = scratch_repo();
+        let branch = commit_on_branch(dir.path(), &repo, "pip", "task-ancestry");
+
+        assert_eq!(repo.ancestry("main", &branch), Ancestry::Present);
+        assert_eq!(repo.ancestry(&branch, "main"), Ancestry::Absent);
+        assert_eq!(repo.ancestry("deleted-history", "main"), Ancestry::Unknown);
+    }
+
+    #[test]
+    fn deleted_intermediate_delivery_target_is_unknown_after_reaching_main() {
+        let (dir, repo) = scratch_repo();
+        let temporary_target = "temp/provolone";
+        run(repo.root(), &["branch", temporary_target, "main"]);
+        let work = commit_on_branch(dir.path(), &repo, "provolone", "task-history");
+
+        let temporary_delivery = repo.merge_branch(&work, temporary_target).unwrap();
+        assert!(temporary_delivery.merged, "{}", temporary_delivery.detail);
+        let temporary_commit = temporary_delivery.commit.unwrap();
+        let final_delivery = repo.merge_branch(temporary_target, "main").unwrap();
+        assert!(final_delivery.merged, "{}", final_delivery.detail);
+        assert_eq!(repo.ancestry(&temporary_commit, "main"), Ancestry::Present);
+
+        repo.delete_branch(temporary_target).unwrap();
+        assert_eq!(
+            repo.ancestry(&temporary_commit, temporary_target),
+            Ancestry::Unknown,
+            "deleting the historical target must not become a clean negative"
+        );
     }
 
     #[test]

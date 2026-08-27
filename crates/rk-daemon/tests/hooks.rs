@@ -40,6 +40,8 @@ fn scratch_repo(dir: &Path) {
     git(dir, &["config", "user.email", "rat@example.com"]);
     git(dir, &["config", "user.name", "Rat"]);
     std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
+    std::fs::create_dir_all(dir.join(".rk")).unwrap();
+    std::fs::write(dir.join(".rk/repo.cue"), "repo: {}\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
 }

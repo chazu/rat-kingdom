@@ -24,6 +24,7 @@ use rk_space::{CoordinatorEvent, Space};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -63,6 +64,87 @@ const MAX_INBOX_ITEMS: usize = 2_048;
 /// whenever `RK_AGENT` is unset, and an empty caller means the same thing.
 const OPERATOR_ACTOR: &str = "operator";
 
+/// One independently configured deadline owned by the shared convergence
+/// scheduler. Scheduler memory is never an idempotency source: it only decides
+/// when to rescan durable facts, and every action remains replay-safe itself.
+#[derive(Debug, Clone, Copy)]
+struct ReconcileCadence {
+    enabled: bool,
+    interval: Duration,
+    next: Instant,
+}
+
+impl ReconcileCadence {
+    fn new(enabled: bool, interval: Duration, now: Instant) -> Self {
+        let interval = interval.max(Duration::from_secs(1));
+        Self {
+            enabled,
+            interval,
+            next: now + interval,
+        }
+    }
+
+    fn immediate(enabled: bool, interval: Duration, now: Instant) -> Self {
+        let mut cadence = Self::new(enabled, interval, now);
+        cadence.next = now;
+        cadence
+    }
+
+    fn next(self) -> Option<Instant> {
+        self.enabled.then_some(self.next)
+    }
+
+    /// Spend one or more elapsed deadlines as a single coalesced pass. Advancing
+    /// before the action runs prevents a slow pass from creating a tight retry
+    /// loop; durable action evidence, not this clock, governs replay.
+    fn take_due(&mut self, now: Instant) -> bool {
+        if !self.enabled || now < self.next {
+            return false;
+        }
+        while self.next <= now {
+            self.next += self.interval;
+        }
+        true
+    }
+}
+
+/// Run one async convergence action behind a panic boundary without detaching
+/// it from the daemon task tree. A scoped `JoinSet` aborts its child if the
+/// scheduler itself is cancelled, while `join_next` turns a child panic into a
+/// value the scheduler can log and continue past.
+async fn isolate_convergence_action<T, F>(action: F) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    let mut task = tokio::task::JoinSet::new();
+    task.spawn(action);
+    task.join_next()
+        .await
+        .expect("convergence action task is present")
+}
+
+fn current_inbox_resolution(mut item: Value) -> Option<Value> {
+    let kind = item.get("kind")?.as_str()?;
+    let action = item.get("action")?.as_str()?;
+    let supported = match kind {
+        "agent-failed" | "agent-orphaned" => action.starts_with("rk respawn "),
+        // A transport outage still in automatic retry is diagnostic only;
+        // the exhausted form's action changes to the bounded respawn command.
+        "transport-outage" => action.starts_with("rk respawn "),
+        "recovery-action" => action.starts_with("rk inbox ack "),
+        _ => false,
+    };
+    if !supported {
+        return None;
+    }
+    let fields = item.as_object_mut()?;
+    let command = fields.remove("action")?;
+    fields.insert("source".into(), json!("inbox"));
+    fields.insert("command".into(), command);
+    Some(item)
+}
+
 /// Bound every leaf in a King pull/checkpoint. Counts alone are insufficient:
 /// one operator-authored tuple field may itself approach the request frame
 /// ceiling. The full resource remains available through its native RPC.
@@ -94,6 +176,112 @@ fn king_snapshot_bound_truncates_nested_strings_and_arrays() {
     let mut value = json!({"items": [{"text": "abcdefgh"}, {"text": "ijklmnop"}]});
     bound_json(&mut value, 4, 1);
     assert_eq!(value, json!({"items": [{"text": "abcd"}]}));
+}
+
+#[cfg(test)]
+#[test]
+fn reconcile_cadence_preserves_grace_and_coalesces_elapsed_deadlines() {
+    let start = Instant::now();
+    let interval = Duration::from_secs(5);
+    let mut cadence = ReconcileCadence::new(true, interval, start);
+
+    assert_eq!(cadence.next(), Some(start + interval));
+    assert!(!cadence.take_due(start + Duration::from_secs(4)));
+    assert!(cadence.take_due(start + interval));
+    assert_eq!(cadence.next(), Some(start + Duration::from_secs(10)));
+
+    // Missing several deadlines produces one pass and advances beyond now.
+    assert!(cadence.take_due(start + Duration::from_secs(26)));
+    assert_eq!(cadence.next(), Some(start + Duration::from_secs(30)));
+    assert!(!cadence.take_due(start + Duration::from_secs(26)));
+}
+
+#[cfg(test)]
+#[test]
+fn reconcile_cadence_supports_immediate_and_disabled_jobs() {
+    let start = Instant::now();
+    let mut immediate = ReconcileCadence::immediate(true, Duration::ZERO, start);
+    assert_eq!(immediate.next(), Some(start));
+    assert!(immediate.take_due(start));
+    assert_eq!(immediate.next(), Some(start + Duration::from_secs(1)));
+
+    let mut disabled = ReconcileCadence::new(false, Duration::from_secs(1), start);
+    assert_eq!(disabled.next(), None);
+    assert!(!disabled.take_due(start + Duration::from_secs(60)));
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn convergence_action_panic_is_observed_without_panicking_the_scheduler() {
+    let success = isolate_convergence_action(async { 7usize }).await;
+    assert_eq!(success.unwrap(), 7);
+
+    let panic = isolate_convergence_action(async {
+        panic!("one action failed");
+    })
+    .await;
+    assert!(panic.unwrap_err().is_panic());
+
+    // A later sibling can still run after the failed action was joined.
+    assert_eq!(
+        isolate_convergence_action(async { 9usize }).await.unwrap(),
+        9
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn current_work_only_admits_single_supported_resolutions() {
+    let row = |kind: &str, action: &str| json!({"kind": kind, "action": action});
+    for (kind, action) in [
+        ("agent-failed", "rk respawn Tails"),
+        ("agent-orphaned", "rk respawn Tails"),
+        ("transport-outage", "rk respawn Tails"),
+        ("recovery-action", "rk inbox ack 01M10ABC"),
+    ] {
+        let current = current_inbox_resolution(row(kind, action)).unwrap();
+        assert_eq!(current["source"], "inbox");
+        assert_eq!(current["command"], action);
+        assert!(current.get("action").is_none());
+    }
+    for (kind, action) in [
+        ("workflow-failed", "rk workflow status wf-1"),
+        ("workflow-gate", "rk approve wf-1 | rk reject wf-1"),
+        (
+            "awaiting-review",
+            "review & merge: https://example.invalid/1",
+        ),
+        ("transport-outage", "rk status Tails"),
+        ("landing-queue-stalled", "rk status --json"),
+    ] {
+        assert!(
+            current_inbox_resolution(row(kind, action)).is_none(),
+            "{kind} is diagnostic or unbounded, not one-command attention"
+        );
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn empty_current_work_has_exact_zero_counts_and_diagnostic_pointers() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::new(Layout::at(dir.path()), &rk_core::config::Config::default()).unwrap();
+
+    let work = daemon.current_work_value(None).await.unwrap();
+
+    assert_eq!(work["counts"]["live_agents"], 0);
+    assert_eq!(work["counts"]["ready_tickets"], 0);
+    assert_eq!(work["counts"]["attention"], 0);
+    assert_eq!(work["live_agents"].as_array().unwrap().len(), 0);
+    assert_eq!(work["ready_tickets"].as_array().unwrap().len(), 0);
+    assert_eq!(work["attention"].as_array().unwrap().len(), 0);
+    assert_eq!(work["no_current_work"], true);
+    assert_eq!(work["history_command"], "rk digest --since 1d");
+    assert_eq!(work["diagnostics_command"], "rk top");
+    assert!(work["wake_note"]
+        .as_str()
+        .unwrap()
+        .contains("not the work itself"));
 }
 
 type FactVoteKey = (String, String, String);
@@ -230,11 +418,6 @@ pub struct Daemon {
     /// checks; raw inline commands are refused (TKT-30, `[policy]`).
     require_named_checks: bool,
     require_approval_for_landing: bool,
-    automated_landing_workflows: Vec<String>,
-    /// Fleet-wide default merge mode a repo is registered with when `rk repo
-    /// add` names no explicit `--merge-mode` (`[policy] default_merge_mode`).
-    default_merge_mode: rk_core::config::MergeMode,
-    allowed_target_branches: Vec<String>,
     auth_token: String,
     engine: std::sync::OnceLock<Arc<crate::workflow_exec::WorkflowEngine>>,
     landing: std::sync::OnceLock<Arc<crate::landing::LandingPipeline>>,
@@ -429,9 +612,6 @@ impl Daemon {
         daemon.king_config = config.king.clone();
         daemon.require_named_checks = config.policy.require_named_checks;
         daemon.require_approval_for_landing = config.policy.require_approval_for_landing;
-        daemon.automated_landing_workflows = config.policy.automated_landing_workflows.clone();
-        daemon.default_merge_mode = config.policy.default_merge_mode;
-        daemon.allowed_target_branches = config.policy.allowed_target_branches.clone();
         daemon.authority_policy = crate::authority::AuthorityPolicy::from_config(&config.policy)?;
         if config.sync.enabled {
             let syncer = crate::sync::Syncer::new(
@@ -752,11 +932,6 @@ impl Daemon {
             default_harness,
             require_named_checks: false,
             require_approval_for_landing: true,
-            automated_landing_workflows: rk_core::config::PolicyConfig::default()
-                .automated_landing_workflows,
-            default_merge_mode: rk_core::config::MergeMode::default(),
-            allowed_target_branches: rk_core::config::PolicyConfig::default()
-                .allowed_target_branches,
             auth_token,
             engine: std::sync::OnceLock::new(),
             landing: std::sync::OnceLock::new(),
@@ -944,42 +1119,6 @@ impl Daemon {
             });
         }
 
-        // `task_done` vs budget/stuck/stop reconciliation
-        // (TKT-01M0J5KT4TCH03W48MR9T7EJ27, 2026-08-21 Cinder-11 incident):
-        // event-feed + interval loop, same shape as the late-review
-        // reconciler below and for the same reason — a harness's own
-        // `Completed` event can be lost to a concurrent hard stop, so
-        // something has to react to the durable `task_done` tuple
-        // independently. Unconditional (not gated on `sweep_config.enabled`):
-        // the race it closes is between `rk done` and `enforce_budget`, which
-        // runs on every `Usage` event regardless of whether the liveness/
-        // burn-rate sweep is turned on.
-        {
-            let task_done_supervisor = Arc::clone(&daemon.supervisor);
-            let mut task_done_feed = daemon.space.subscribe();
-            let mut task_done_shutdown = daemon.shutdown_tx.subscribe();
-            let task_done_interval = Duration::from_secs(daemon.sweep_config.interval_secs.max(1));
-            background_tasks.spawn(async move {
-                let mut tick = tokio::time::interval(task_done_interval);
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {}
-                        recv = task_done_feed.recv() => match recv {
-                            Ok(_) => while task_done_feed.try_recv().is_ok() {},
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        },
-                        _ = task_done_shutdown.changed() => break,
-                    }
-                    match task_done_supervisor.reconcile_task_done().await {
-                        Ok(0) => {}
-                        Ok(n) => debug!(settled = n, "reconciled task_done vs terminal state"),
-                        Err(e) => warn!(error = %e, "task_done reconciliation failed"),
-                    }
-                }
-            });
-        }
-
         // Fetch-driven awaiting-review clear (TKT-70). Periodically fetch+prune
         // each repo with an open PR and check whether the forge merged/deleted
         // the branch upstream — clearing the inbox row for a merge the operator
@@ -1006,176 +1145,6 @@ impl Daemon {
                             }
                         }
                         _ = rs_shutdown.changed() => break,
-                    }
-                }
-            });
-        }
-
-        // Periodic worktree-leak sweep (`[worktree_sweep]`, TKT-01M04N6W4X47KMXDA6MH0WPH8H):
-        // the automated, unattended counterpart to `rk prune --reap-git`. A
-        // steward/workflow failure path that skips its own `dismiss` step
-        // leaves a terminal agent's worktree (and its multi-GB cargo
-        // `target/`) on disk indefinitely; this loop reclaims those on a
-        // timer instead of waiting for an operator to run `rk prune` by hand.
-        // Enabled by default (unlike the other sweeps here) because every
-        // removal it performs is already gated safe by `Supervisor::reap_git`
-        // (branch merged-or-gone AND worktree clean, or the worktree is left
-        // standing) — see the 2026-08-16 104-worktree/298GB incident this
-        // closes the gap on.
-        if daemon.worktree_sweep_config.enabled {
-            let daemon_ref = Arc::clone(&daemon);
-            let mut ws_shutdown = daemon.shutdown_tx.subscribe();
-            let interval = Duration::from_secs(daemon.worktree_sweep_config.interval_secs.max(1));
-            background_tasks.spawn(async move {
-                let mut tick = tokio::time::interval(interval);
-                // Consume the immediate first tick: give a freshly-terminal
-                // agent a full `after_days` window before the first sweep.
-                tick.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {
-                            let d = Arc::clone(&daemon_ref);
-                            match tokio::task::spawn_blocking(move || d.worktree_sweep_once()).await {
-                                Ok(0) => {}
-                                Ok(n) => info!(reclaimed = n, "worktree sweep reclaimed leaked worktrees"),
-                                Err(e) => warn!(error = %e, "worktree sweep task panicked"),
-                            }
-                        }
-                        _ = ws_shutdown.changed() => break,
-                    }
-                }
-            });
-        }
-
-        // Periodic gate-worktree retention sweep (`[gate_worktree_sweep]`):
-        // the persistent per-`(repo,target)` daemon-owned worktrees the
-        // landing pipeline gates against (`landing.rs` §2.2) have no
-        // dismiss-time cleanup the way an agent worktree does, so nothing
-        // else ever reclaims one — see
-        // docs/proposals/daemon-native-landing-pipeline.md §5 open question
-        // 4. Every reclaim this loop performs is gated the same way
-        // `worktree_sweep_once` gates agent reclaims: skipped outright while
-        // the `(repo, target)` key has any live `LandingQueue` entry.
-        if daemon.gate_worktree_sweep_config.enabled {
-            let daemon_ref = Arc::clone(&daemon);
-            let mut gws_shutdown = daemon.shutdown_tx.subscribe();
-            let interval =
-                Duration::from_secs(daemon.gate_worktree_sweep_config.interval_secs.max(1));
-            background_tasks.spawn(async move {
-                let mut tick = tokio::time::interval(interval);
-                tick.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {
-                            let d = Arc::clone(&daemon_ref);
-                            match tokio::task::spawn_blocking(move || d.gate_worktree_sweep_once()).await {
-                                Ok(0) => {}
-                                Ok(n) => info!(reclaimed = n, "gate worktree sweep reclaimed stale worktrees"),
-                                Err(e) => warn!(error = %e, "gate worktree sweep task panicked"),
-                            }
-                        }
-                        _ = gws_shutdown.changed() => break,
-                    }
-                }
-            });
-        }
-
-        // B2 re-notify sweep: an unacked `recovery-action` escalation
-        // re-pushes at `first_renotify_secs`, then every
-        // `repeat_renotify_secs`, up to `max_renotifies` times — after which
-        // it stands as a passive `rk inbox` row with no further pushes. `rk
-        // inbox ack <id>` is the only thing that stops it early.
-        //
-        // The repository-policy phase latency sweep (TKT-01M0P974MQK5XE1MR9KQCWT654,
-        // `Daemon::phase_latency_sweep_once`) shares this exact tick rather than
-        // getting its own config/timer: both are periodic housekeeping this
-        // daemon already runs by default, and a repo with no `phaseLatency`
-        // targets configured short-circuits immediately.
-        if daemon.recovery_sweep_config.enabled {
-            let daemon_ref = Arc::clone(&daemon);
-            let mut rc_shutdown = daemon.shutdown_tx.subscribe();
-            let interval = Duration::from_secs(daemon.recovery_sweep_config.interval_secs.max(1));
-            background_tasks.spawn(async move {
-                let mut tick = tokio::time::interval(interval);
-                tick.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {
-                            let d = Arc::clone(&daemon_ref);
-                            match tokio::task::spawn_blocking(move || {
-                                let recovery = d.recovery_renotify_sweep_once();
-                                let phase_latency = d.phase_latency_sweep_once();
-                                (recovery, phase_latency)
-                            }).await {
-                                Ok((0, 0)) => {}
-                                Ok((recovery, phase_latency)) => debug!(
-                                    pushed = recovery,
-                                    phase_latency_breaches = phase_latency,
-                                    "recovery re-notify sweep pushed escalations"
-                                ),
-                                Err(e) => warn!(error = %e, "recovery re-notify sweep task panicked"),
-                            }
-                        }
-                        _ = rc_shutdown.changed() => break,
-                    }
-                }
-            });
-        }
-
-        // B8 stale-`Running`-instance hard timeout sweep: a Running instance
-        // older than its effective timeout (workflow `staleTimeout:` override,
-        // else `default_timeout_secs`) is marked failed, finalized, and
-        // escalated through the B2 announce helper. Not spawn_blocking'd like
-        // the sweeps above — it awaits `WorkflowEngine::stale_timeout_sweep_once`
-        // directly (guaranteed-cleanup dismissal is already async), the same
-        // shape as the landing pipeline loop below.
-        if daemon.instance_timeout_sweep_config.enabled {
-            let daemon_ref = Arc::clone(&daemon);
-            let mut it_shutdown = daemon.shutdown_tx.subscribe();
-            let interval =
-                Duration::from_secs(daemon.instance_timeout_sweep_config.interval_secs.max(1));
-            background_tasks.spawn(async move {
-                let mut tick = tokio::time::interval(interval);
-                tick.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {
-                            match daemon_ref.stale_instance_timeout_sweep_once().await {
-                                0 => {}
-                                n => info!(timed_out = n, "stale-instance timeout sweep marked instances failed"),
-                            }
-                        }
-                        _ = it_shutdown.changed() => break,
-                    }
-                }
-            });
-        }
-
-        // B9 orphaned-ticket sweep (seam 5): an `in_progress` ticket whose
-        // assignee has had no live agent record for `stale_after_secs`
-        // reopens to `open` (drain-eligible again), announced through the B2
-        // helper. Drain only refills from `status = open`, so without this an
-        // errored rat's ticket is stuck `in_progress` forever. Runs directly
-        // on this async task rather than `spawn_blocking` — same as the drain
-        // loop below, which touches the same `Tickets`/`Space` methods this
-        // does — because they are lock-based, not blocking I/O.
-        if daemon.ticket_reopen_sweep_config.enabled {
-            let daemon_ref = Arc::clone(&daemon);
-            let mut tr_shutdown = daemon.shutdown_tx.subscribe();
-            let interval =
-                Duration::from_secs(daemon.ticket_reopen_sweep_config.interval_secs.max(1));
-            background_tasks.spawn(async move {
-                let mut tick = tokio::time::interval(interval);
-                tick.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {
-                            match daemon_ref.ticket_reopen_sweep_once().await {
-                                0 => {}
-                                n => debug!(reopened = n, "ticket reopen sweep reopened orphaned tickets"),
-                            }
-                        }
-                        _ = tr_shutdown.changed() => break,
                     }
                 }
             });
@@ -1224,6 +1193,192 @@ impl Daemon {
                 reclaimed_candidates,
                 "reclaimed orphaned landing candidate refs"
             );
+        }
+
+        // Durable convergence loop. These repairs used to be seven separate
+        // feed/timer/shutdown task shells. They retain independent policy
+        // switches and cadences here, but share one wake source because all of
+        // them converge durable RK facts through replay-safe actions. CUE
+        // remains the repository-owned policy authority; this scheduler only
+        // decides when Rust should rescan and execute those resolved policies.
+        {
+            let convergence_daemon = Arc::clone(&daemon);
+            let convergence_landing = Arc::clone(&daemon_landing);
+            let mut convergence_feed = daemon.space.subscribe();
+            let mut convergence_shutdown = daemon.shutdown_tx.subscribe();
+            let now = Instant::now();
+
+            // The two event reconcilers historically ran immediately and on
+            // every tuple-feed wake. Cleanup/recovery jobs retain a full first
+            // interval of grace.
+            let mut task_done = ReconcileCadence::immediate(
+                true,
+                Duration::from_secs(daemon.sweep_config.interval_secs.max(1)),
+                now,
+            );
+            let mut late_review = ReconcileCadence::immediate(
+                daemon.reactor_config.enabled,
+                Duration::from_secs(daemon.reactor_config.interval_secs.max(1)),
+                now,
+            );
+            let mut worktree = ReconcileCadence::new(
+                daemon.worktree_sweep_config.enabled,
+                Duration::from_secs(daemon.worktree_sweep_config.interval_secs.max(1)),
+                now,
+            );
+            let mut gate_worktree = ReconcileCadence::new(
+                daemon.gate_worktree_sweep_config.enabled,
+                Duration::from_secs(daemon.gate_worktree_sweep_config.interval_secs.max(1)),
+                now,
+            );
+            let mut recovery = ReconcileCadence::new(
+                daemon.recovery_sweep_config.enabled,
+                Duration::from_secs(daemon.recovery_sweep_config.interval_secs.max(1)),
+                now,
+            );
+            let mut stale_instance = ReconcileCadence::new(
+                daemon.instance_timeout_sweep_config.enabled,
+                Duration::from_secs(daemon.instance_timeout_sweep_config.interval_secs.max(1)),
+                now,
+            );
+            let mut ticket_reopen = ReconcileCadence::new(
+                daemon.ticket_reopen_sweep_config.enabled,
+                Duration::from_secs(daemon.ticket_reopen_sweep_config.interval_secs.max(1)),
+                now,
+            );
+
+            background_tasks.spawn(async move {
+                loop {
+                    let next_deadline = [
+                        task_done.next(),
+                        late_review.next(),
+                        worktree.next(),
+                        gate_worktree.next(),
+                        recovery.next(),
+                        stale_instance.next(),
+                        ticket_reopen.next(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .expect("task_done convergence cadence is always enabled");
+
+                    let feed_wake = tokio::select! {
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_deadline)) => false,
+                        recv = convergence_feed.recv() => match recv {
+                            Ok(_) => {
+                                while convergence_feed.try_recv().is_ok() {}
+                                true
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        },
+                        _ = convergence_shutdown.changed() => break,
+                    };
+
+                    let now = Instant::now();
+                    let run_task_done = task_done.take_due(now) || feed_wake;
+                    let run_late_review = late_review.take_due(now) || (late_review.enabled && feed_wake);
+                    let run_worktree = worktree.take_due(now);
+                    let run_gate_worktree = gate_worktree.take_due(now);
+                    let run_recovery = recovery.take_due(now);
+                    let run_stale_instance = stale_instance.take_due(now);
+                    let run_ticket_reopen = ticket_reopen.take_due(now);
+
+                    // Event-driven convergence runs first so infrequent cleanup
+                    // shell-outs cannot delay evidence already in the feed.
+                    if run_task_done {
+                        let d = Arc::clone(&convergence_daemon);
+                        match isolate_convergence_action(async move {
+                            d.supervisor.reconcile_task_done().await
+                        })
+                        .await
+                        {
+                            Ok(Ok(0)) => {}
+                            Ok(Ok(n)) => {
+                                debug!(settled = n, "reconciled task_done vs terminal state")
+                            }
+                            Ok(Err(e)) => warn!(error = %e, "task_done reconciliation failed"),
+                            Err(e) => warn!(error = %e, "task_done reconciliation panicked"),
+                        }
+                    }
+                    if run_late_review {
+                        let landing = Arc::clone(&convergence_landing);
+                        match tokio::task::spawn_blocking(move || {
+                            landing.reconcile_late_review_evidence()
+                        })
+                        .await
+                        {
+                            Ok(Ok(0)) => {}
+                            Ok(Ok(n)) => debug!(retained = n, "retained late review evidence"),
+                            Ok(Err(e)) => {
+                                warn!(error = %e, "late review evidence reconciliation failed")
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "late review evidence reconciliation panicked")
+                            }
+                        }
+                    }
+                    if run_stale_instance {
+                        let d = Arc::clone(&convergence_daemon);
+                        match isolate_convergence_action(async move {
+                            d.stale_instance_timeout_sweep_once().await
+                        })
+                        .await
+                        {
+                            Ok(0) => {}
+                            Ok(n) => info!(timed_out = n, "stale-instance timeout sweep marked instances failed"),
+                            Err(e) => warn!(error = %e, "stale-instance timeout sweep panicked"),
+                        }
+                    }
+                    if run_ticket_reopen {
+                        let d = Arc::clone(&convergence_daemon);
+                        match isolate_convergence_action(async move {
+                            d.ticket_reopen_sweep_once().await
+                        })
+                        .await
+                        {
+                            Ok(0) => {}
+                            Ok(n) => debug!(reopened = n, "ticket reopen sweep reopened orphaned tickets"),
+                            Err(e) => warn!(error = %e, "ticket reopen sweep panicked"),
+                        }
+                    }
+
+                    // Each blocking action gets its own task boundary so one
+                    // panic cannot suppress the other due convergence passes.
+                    if run_worktree {
+                        let d = Arc::clone(&convergence_daemon);
+                        match tokio::task::spawn_blocking(move || d.worktree_sweep_once()).await {
+                            Ok(0) => {}
+                            Ok(n) => info!(reclaimed = n, "worktree sweep reclaimed leaked worktrees"),
+                            Err(e) => warn!(error = %e, "worktree sweep task panicked"),
+                        }
+                    }
+                    if run_gate_worktree {
+                        let d = Arc::clone(&convergence_daemon);
+                        match tokio::task::spawn_blocking(move || d.gate_worktree_sweep_once()).await {
+                            Ok(0) => {}
+                            Ok(n) => info!(reclaimed = n, "gate worktree sweep reclaimed stale worktrees"),
+                            Err(e) => warn!(error = %e, "gate worktree sweep task panicked"),
+                        }
+                    }
+                    if run_recovery {
+                        let d = Arc::clone(&convergence_daemon);
+                        match tokio::task::spawn_blocking(move || d.recovery_renotify_sweep_once()).await {
+                            Ok(0) => {}
+                            Ok(n) => debug!(pushed = n, "recovery re-notify sweep pushed escalations"),
+                            Err(e) => warn!(error = %e, "recovery re-notify sweep task panicked"),
+                        }
+
+                        let d = Arc::clone(&convergence_daemon);
+                        match tokio::task::spawn_blocking(move || d.phase_latency_sweep_once()).await {
+                            Ok(0) => {}
+                            Ok(n) => debug!(breaches = n, "phase latency sweep found policy breaches"),
+                            Err(e) => warn!(error = %e, "phase latency sweep task panicked"),
+                        }
+                    }
+                }
+            });
         }
 
         // Reactor loop: fire registered #Trigger workflows on matching tuples.
@@ -1327,36 +1482,6 @@ impl Daemon {
                             debug!(processed = outcomes.len(), "landing pipeline cycle")
                         }
                         Err(e) => warn!(error = %e, "landing pipeline cycle failed"),
-                    }
-                }
-            });
-
-            // Late-review reconciliation must not share the drain task above.
-            // `run_cycle()` may legitimately spend the whole review ceiling in
-            // `await_primary_verdict`; putting reconciliation after that await
-            // starves late evidence for every other settled attempt (and for a
-            // restarted copy of the same awaiting entry). Keep its feed/timer
-            // independent so a verdict arriving from a fenced generation is
-            // retained promptly even while another review wait is live.
-            let landing_reconciler = Arc::clone(&daemon_landing);
-            let mut late_review_feed = daemon.space.subscribe();
-            let mut late_review_shutdown = daemon.shutdown_tx.subscribe();
-            background_tasks.spawn(async move {
-                let mut tick = tokio::time::interval(landing_interval);
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {}
-                        recv = late_review_feed.recv() => match recv {
-                            Ok(_) => while late_review_feed.try_recv().is_ok() {},
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        },
-                        _ = late_review_shutdown.changed() => break,
-                    }
-                    match landing_reconciler.reconcile_late_review_evidence() {
-                        Ok(0) => {}
-                        Ok(n) => debug!(retained = n, "retained late review evidence"),
-                        Err(e) => warn!(error = %e, "late review evidence reconciliation failed"),
                     }
                 }
             });
@@ -1582,8 +1707,6 @@ impl Daemon {
                 // a `wait` only gives up on one when it cannot be (TKT-147).
                 self.sweep_config.respawn_enabled && self.sweep_config.respawn_max_attempts > 0,
                 self.require_approval_for_landing,
-                self.automated_landing_workflows.clone(),
-                self.allowed_target_branches.clone(),
                 // Shared with the continuous-drain autoscaler regardless of
                 // whether its own refill loop is enabled: `max_wip` is the
                 // fleet-wide concurrency ceiling either way, and 0 (the
@@ -1914,7 +2037,9 @@ impl Daemon {
                 | "ticket.update"
                 | "ticket.dep"
                 | "ticket.reopen"
+                | "ticket.deliver"
                 | "reconcile.repair"
+                | "attention.invalidate"
                 | "king.spawn"
                 | "king.register"
                 | "king.dismiss"
@@ -2563,12 +2688,12 @@ impl Daemon {
             // waiting on. Does not touch already-running agents.
             "daemon.pause_dispatch" => {
                 self.supervisor.set_dispatch_paused(true);
-                let live: Vec<String> = self
+                let live: Vec<Value> = self
                     .supervisor
                     .list()
                     .into_iter()
                     .filter(|r| r.state.is_live())
-                    .map(|r| r.name)
+                    .map(|r| json!({"name": r.name, "spawn": r.spawn_id()}))
                     .collect();
                 reply(Response::ok(
                     id,
@@ -2650,6 +2775,7 @@ impl Daemon {
                 reply(self.handle_named(req, |sup, name| sup.unarchive_agent(&name)))
             }
             "budget.rollup" => reply(Response::ok(id, self.supervisor.fleet_rollup())),
+            "work.current" => reply(self.handle_current_work(req).await),
             "inbox.list" => reply(self.handle_inbox(req).await),
             "inbox.ack" => reply(self.handle_inbox_ack(req)),
             "reconcile.report" => reply(self.handle_reconcile(req).await),
@@ -2658,6 +2784,7 @@ impl Daemon {
             "lease.renew" => reply(self.handle_lease_renew(req).await),
             "attention.next" => reply(self.handle_attention_next(req).await),
             "attention.decide" => reply(self.handle_attention_decide(req).await),
+            "attention.invalidate" => reply(self.handle_attention_invalidate(req).await),
             "king.spawn" => reply(self.handle_king_spawn(req).await),
             "king.register" => reply(self.handle_king_register(req).await),
             "king.dismiss" => reply(self.handle_king_dismiss(req).await),
@@ -3088,7 +3215,7 @@ impl Daemon {
             }),
             "repo.get" => reply(self.handle_repo_get(req)),
             "repo.onboard.start" => reply(self.handle_onboarding_start(req).await),
-            "repo.onboard.propose" => reply(self.handle_onboarding_propose(req)),
+            "repo.onboard.propose" => reply(self.handle_onboarding_propose(req).await),
             "repo.onboard.approve" => reply(self.handle_onboarding_approve(req)),
             "repo.onboard.decline" => reply(self.handle_onboarding_decline(req)),
             "repo.onboard.apply" => reply(self.handle_onboarding_apply(req).await),
@@ -3140,6 +3267,7 @@ impl Daemon {
             "ticket.update" => reply(self.handle_ticket_update(req).await),
             "ticket.dep" => reply(self.handle_ticket_dep(req).await),
             "ticket.reopen" => reply(self.handle_ticket_reopen(req).await),
+            "ticket.deliver" => reply(self.handle_ticket_deliver(req).await),
             "ticket.ready" => reply(self.handle_ticket_ready(req)),
             other => reply(Response::err(
                 id,
@@ -3472,23 +3600,22 @@ impl Daemon {
     }
 
     /// Assemble a repair plan for the two mechanically-repairable
-    /// convergence violations (`crate::reconcile_repair`) and either preview
-    /// it (`apply = false`) or execute it (`apply = true`). Reuses the same
+    /// convergence violations (`crate::reconcile_repair`) — the same
     /// ticket/agent/carve-out scans `reconcile_value` performs, plus one
     /// extra round of durable-evidence git checks a read-only report never
     /// needs to answer: whether a delivered commit touches a protected path,
     /// and whether its landed branch has since diverged from what was
     /// recorded — both gathered fresh on every call, never cached, so a
-    /// repair can never act on stale evidence.
-    async fn reconcile_repair_value(
+    /// repair can never act on stale evidence. Shared by `reconcile_repair_value`
+    /// (the `reconcile.repair` RPC, which may act on every eligible item in
+    /// `repo`) and `execute_mechanical` (which must narrow the resulting
+    /// plan down to one violation's own subject before applying, so that
+    /// resolving one attention item can never repair a sibling ticket as a
+    /// side effect).
+    async fn build_repair_plan(
         &self,
-        requested_repo: String,
-        apply: bool,
-    ) -> rk_core::Result<Value> {
-        let repo = self
-            .resolve_inbox_repo(Some(requested_repo))?
-            .ok_or_else(|| rk_core::Error::other("repo is required"))?;
-
+        repo: &str,
+    ) -> rk_core::Result<crate::reconcile_repair::RepairPlan> {
         let agents: Vec<crate::agents::AgentRecord> = self
             .supervisor
             .list_all()
@@ -3496,7 +3623,7 @@ impl Daemon {
             .filter(|a| a.repo_name == repo)
             .collect();
 
-        let tickets = self.tickets.list(Some(repo.clone()), None, None)?;
+        let tickets = self.tickets.list(Some(repo.to_string()), None, None)?;
 
         // The same hand-off carve-outs `reconcile_value`/`Server::ticket_reopen_sweep_at`
         // use — see `reconcile_value` for the full rationale.
@@ -3526,9 +3653,9 @@ impl Daemon {
             .map(|d| (d.merge_commit, d.target))
             .collect();
         let is_ancestor = self
-            .merge_commit_ancestry(&repo, delivered_pairs.into_iter().collect())
+            .merge_commit_ancestry(repo, delivered_pairs.into_iter().collect())
             .await?;
-        let (protected_touch, diverged) = self.repair_git_facts(&repo, &tickets).await?;
+        let (protected_touch, diverged) = self.repair_git_facts(repo, &tickets).await?;
 
         let facts = crate::reconcile_repair::RepairFacts {
             git: crate::reconcile::GitFacts {
@@ -3539,14 +3666,26 @@ impl Daemon {
             diverged,
         };
 
-        let plan = crate::reconcile_repair::plan(
-            &repo,
+        Ok(crate::reconcile_repair::plan(
+            repo,
             &tickets,
             &agents,
             &landed_tickets,
             &queued_tickets,
             &facts,
-        );
+        ))
+    }
+
+    async fn reconcile_repair_value(
+        &self,
+        requested_repo: String,
+        apply: bool,
+    ) -> rk_core::Result<Value> {
+        let repo = self
+            .resolve_inbox_repo(Some(requested_repo))?
+            .ok_or_else(|| rk_core::Error::other("repo is required"))?;
+
+        let plan = self.build_repair_plan(&repo).await?;
         let report = if apply {
             // Re-fetch agents right here, immediately before the write: the
             // slice `plan` was built from can be seconds old by the time we
@@ -3614,8 +3753,9 @@ impl Daemon {
             };
             let protected_paths = supervisor
                 .repository_policy(&git_repo)
-                .landing
-                .protected_paths;
+                .ok()
+                .map(|policy| policy.landing.protected_paths)
+                .unwrap_or_default();
             for record in records {
                 if let Some(touch) =
                     touches_protected_path(&git_repo, &record.merge_commit, &protected_paths)
@@ -3637,7 +3777,7 @@ impl Daemon {
         .map_err(|e| rk_core::Error::other(format!("repair git facts panicked: {e}")))
     }
 
-    /// `(merge_commit, target) -> is merge_commit an ancestor of target?` for
+    /// `(merge_commit, target) -> present | absent | unknown ancestry` for
     /// every pair in `pairs`, resolved against the repo registered as `repo`.
     /// An unregistered or unopenable repo returns an empty map — "cannot
     /// check", which `reconcile::build` reads as no evidence rather than a
@@ -3647,7 +3787,7 @@ impl Daemon {
         &self,
         repo: &str,
         pairs: Vec<(String, String)>,
-    ) -> rk_core::Result<HashMap<(String, String), bool>> {
+    ) -> rk_core::Result<HashMap<(String, String), rk_git::Ancestry>> {
         if pairs.is_empty() {
             return Ok(HashMap::new());
         }
@@ -3667,7 +3807,7 @@ impl Daemon {
                 return result;
             };
             for (commit, target) in pairs {
-                let verdict = git_repo.is_ancestor(&commit, &target);
+                let verdict = git_repo.ancestry(&commit, &target);
                 result.insert((commit, target), verdict);
             }
             result
@@ -3685,6 +3825,149 @@ impl Daemon {
             Ok(value) => Response::ok(req.id, value),
             Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
         }
+    }
+
+    /// `work.current` — the ordinary operator read model. This deliberately
+    /// composes existing authoritative views instead of inventing a new
+    /// lifecycle store: tickets remain tickets, agent generations remain in
+    /// the registry, repository contradictions remain reconciliation facts,
+    /// and repo-owned CUE remains the validation/trigger/schedule authority.
+    async fn handle_current_work(&self, req: Request) -> Response {
+        let params: CurrentWorkParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        match self.current_work_value(params.repo).await {
+            Ok(value) => Response::ok(req.id, value),
+            Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
+        }
+    }
+
+    async fn current_work_value(&self, requested_repo: Option<String>) -> rk_core::Result<Value> {
+        let repo = match requested_repo {
+            Some(repo) => self.resolve_inbox_repo(Some(repo))?,
+            None => None,
+        };
+
+        let live_agents = self
+            .supervisor
+            .list()
+            .into_iter()
+            .filter(|agent| agent.state.is_live())
+            .filter(|agent| repo.as_deref().is_none_or(|repo| agent.repo_name == repo))
+            .map(|agent| {
+                json!({
+                    "name": agent.name,
+                    "generation": agent.spawn_id(),
+                    "repo": agent.repo_name,
+                    "role": agent.role,
+                    "state": agent.state,
+                    "task": agent.task,
+                    "updated_at": agent.updated_at,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let ready_tickets = self
+            .tickets
+            .ready(repo.clone())?
+            .into_iter()
+            .map(|ticket| {
+                json!({
+                    "id": ticket.identity,
+                    "repo": ticket.scope,
+                    "title": ticket.payload["title"],
+                    "priority": ticket.payload["priority"],
+                    "labels": ticket.payload["labels"],
+                    "command": format!("rk spawn --ticket {}", ticket.identity),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut inbox = self.inbox_value(repo.clone()).await?;
+        let mut inbox_rows = inbox["items"]
+            .as_array_mut()
+            .map(std::mem::take)
+            .unwrap_or_default();
+        // `rk inbox` intentionally remains the broad diagnostic surface. The
+        // daily view is narrower: only rows whose existing action is one
+        // supported, bounded, replay-safe resolution belong under
+        // "attention". Advice, external git/forge work, open-ended needs,
+        // and two-way approval choices remain visible in `rk inbox` without
+        // pretending they are one-command work.
+        inbox_rows = inbox_rows
+            .into_iter()
+            .filter_map(current_inbox_resolution)
+            .collect();
+
+        let registered_repos = self
+            .repos
+            .lock()
+            .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?
+            .list();
+        let mut convergence_rows = Vec::new();
+        for registered in registered_repos {
+            if repo
+                .as_deref()
+                .is_some_and(|selected| selected != registered.name)
+            {
+                continue;
+            }
+            let report = self.reconcile_report(registered.name.clone()).await?;
+            for violation in &report.violations {
+                // A terminal journal decision settles this exact item even if
+                // the underlying fact remains deliberately accepted. The raw
+                // report and decision stay queryable for diagnostics.
+                if self.find_decision(&report.scope, &violation.id)?.is_some() {
+                    continue;
+                }
+                let effective_authority = self.authority_policy.effective_authority(violation);
+                let command = match effective_authority {
+                    crate::reconcile::Authority::Mechanical => {
+                        format!("rk attention decide {} {}", report.scope, violation.id)
+                    }
+                    // Orchestrator work belongs to the King control loop, not
+                    // the human's daily attention count. It remains visible
+                    // through `rk attention next` and `rk reconcile`.
+                    crate::reconcile::Authority::Orchestrator => continue,
+                    crate::reconcile::Authority::Human => {
+                        format!("rk attention invalidate {} {}", report.scope, violation.id)
+                    }
+                };
+                let item = crate::attention::AttentionItem {
+                    violation: violation.clone(),
+                    effective_authority,
+                };
+                let mut row = serde_json::to_value(item)?;
+                row["source"] = json!("reconcile");
+                row["repo"] = json!(report.scope);
+                row["command"] = json!(command);
+                convergence_rows.push(row);
+            }
+        }
+
+        let mut attention = inbox_rows;
+        attention.extend(convergence_rows);
+        let counts = json!({
+            "live_agents": live_agents.len(),
+            "ready_tickets": ready_tickets.len(),
+            "attention": attention.len(),
+        });
+        let no_current_work =
+            live_agents.is_empty() && ready_tickets.is_empty() && attention.is_empty();
+        Ok(json!({
+            "generated_at": (self.request_clock)(),
+            "repo": repo,
+            "daemon": self.status(),
+            "counts": counts,
+            "live_agents": live_agents,
+            "ready_tickets": ready_tickets,
+            "attention": attention,
+            "no_current_work": no_current_work,
+            "history_command": "rk digest --since 1d",
+            "diagnostics_command": "rk top",
+            "wake_note": "King wakes are durable notifications, not the work itself; settling a wake does not imply this current work view is empty.",
+        }))
     }
 
     /// `inbox.ack` (B2) — durably close out a `recovery-action` inbox row so
@@ -4518,9 +4801,121 @@ impl Daemon {
         if let Err(e) = self.heal_dangling_defer_at_cursor(&report.scope, cursor.as_deref()) {
             return Response::err(req.id, codes::INTERNAL, e.to_string());
         }
-        let item =
-            crate::attention::next_attention(&report, &self.authority_policy, cursor.as_deref());
+        let item = match self.next_unsettled_attention(&report, cursor.as_deref()) {
+            Ok(item) => item,
+            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+        };
         Response::ok(req.id, json!({"repo": report.scope, "item": item}))
+    }
+
+    /// Skip terminal journal decisions as well as the lease cursor. This is
+    /// what makes an explicit human invalidation disappear from the live
+    /// queue while leaving both the raw contradiction and its audit record
+    /// available in diagnostics.
+    fn next_unsettled_attention(
+        &self,
+        report: &crate::reconcile::ConvergenceReport,
+        cursor: Option<&str>,
+    ) -> rk_core::Result<Option<crate::attention::AttentionItem>> {
+        let mut after = cursor.map(str::to_string);
+        loop {
+            let Some(item) =
+                crate::attention::next_attention(report, &self.authority_policy, after.as_deref())
+            else {
+                return Ok(None);
+            };
+            if self
+                .find_decision(&report.scope, &item.violation.id)?
+                .is_none()
+            {
+                return Ok(Some(item));
+            }
+            after = Some(item.violation.id);
+        }
+    }
+
+    /// Explicitly settle one Human-authority attention item without changing
+    /// the fact that raised it. This is the human operator's "that item is no
+    /// longer relevant" control: durable, exact-item scoped, and idempotent.
+    async fn handle_attention_invalidate(&self, req: Request) -> Response {
+        let params: AttentionInvalidateParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        match self.attention_invalidate(params).await {
+            Ok(value) => Response::ok(req.id, value),
+            Err(AttentionDecideError::Refused(message)) => {
+                Response::err(req.id, codes::FORBIDDEN, message)
+            }
+            Err(AttentionDecideError::BadParams(message)) => {
+                Response::err(req.id, codes::BAD_PARAMS, message)
+            }
+            Err(AttentionDecideError::Internal(message)) => {
+                Response::err(req.id, codes::INTERNAL, message)
+            }
+        }
+    }
+
+    async fn attention_invalidate(
+        &self,
+        params: AttentionInvalidateParams,
+    ) -> Result<Value, AttentionDecideError> {
+        let repo = self
+            .resolve_inbox_repo(Some(params.repo.clone()))
+            .map_err(|error| AttentionDecideError::Internal(error.to_string()))?
+            .ok_or_else(|| AttentionDecideError::BadParams("repo is required".into()))?;
+        if let Some(existing) = self
+            .find_decision(&repo, &params.item)
+            .map_err(|error| AttentionDecideError::Internal(error.to_string()))?
+        {
+            return Ok(json!({"resolved": true, "replay": true, "decision": existing}));
+        }
+        let report = self
+            .reconcile_report(repo.clone())
+            .await
+            .map_err(|error| AttentionDecideError::Internal(error.to_string()))?;
+        let Some(violation) = report.violations.iter().find(|v| v.id == params.item) else {
+            // The contradiction already self-cleared. Treat a repeated human
+            // intent as success without inventing a decision record for a
+            // fact that no longer exists.
+            return Ok(json!({
+                "resolved": true,
+                "replay": true,
+                "decision": Value::Null,
+                "reason": "attention item is no longer current",
+            }));
+        };
+        let authority = self.authority_policy.effective_authority(violation);
+        if authority != crate::reconcile::Authority::Human {
+            return Err(AttentionDecideError::Refused(format!(
+                "{} has effective authority {authority:?}; only Human-authority items may be invalidated",
+                violation.id
+            )));
+        }
+        let reason = params
+            .reason
+            .as_deref()
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or("invalidated by human operator");
+        let outcome = format!("human operator invalidated this current attention item: {reason}");
+        let decision = self
+            .record_decision(
+                &repo,
+                violation,
+                authority,
+                crate::attention::DECIDED_BY_HUMAN,
+                crate::attention::ACTION_INVALIDATE,
+                None,
+                None,
+                None,
+                None,
+                &outcome,
+                true,
+                true,
+                None,
+            )
+            .map_err(|error| AttentionDecideError::Internal(error.to_string()))?;
+        Ok(json!({"resolved": true, "replay": false, "decision": decision}))
     }
 
     /// `attention.decide` — TKT-01M0E8PN9C41BWECGNW0990R3J: resolve one
@@ -5150,11 +5545,52 @@ impl Daemon {
     /// The one registered mechanical repair this tracer bullet wires up:
     /// `delivered-but-open`'s own doc comment names the fix — the delivery
     /// record is the durable proof, so the ticket's status is what is wrong.
+    /// Routed through `crate::reconcile_repair` — the same CAS-guarded,
+    /// evidence-checked, replay-marked writer `reconcile.repair` uses —
+    /// rather than calling `Tickets::set_status` directly, so this arm gets
+    /// the same fail-closed ancestry/protected-path checks and idempotent
+    /// replay marker instead of being a third, independent writer. The plan
+    /// is built for the whole repo but then narrowed to `v`'s own subject
+    /// before applying: this call is authorizing a repair for exactly ONE
+    /// violation, and must never widen into repairing a sibling ticket that
+    /// happens to also be eligible.
     async fn execute_mechanical(&self, v: &crate::reconcile::Violation) -> rk_core::Result<String> {
         match v.kind.as_str() {
             crate::reconcile::kind::DELIVERED_BUT_OPEN => {
-                self.tickets.set_status(&v.subject, "closed").await?;
-                Ok(format!("{} set to closed", v.subject))
+                let mut plan = self.build_repair_plan(&v.scope).await?;
+                retain_matching_violation(&mut plan, v);
+                let agents: Vec<crate::agents::AgentRecord> = self
+                    .supervisor
+                    .list_all()
+                    .into_iter()
+                    .filter(|a| a.repo_name == v.scope)
+                    .collect();
+                let report = crate::reconcile_repair::apply(
+                    plan,
+                    &crate::reconcile_repair::ApplyContext {
+                        tickets: &self.tickets,
+                        space: &self.space,
+                        castle: &self.castle,
+                        agents: &agents,
+                    },
+                )
+                .await?;
+                let Some(result) = report.results.into_iter().next() else {
+                    return Err(rk_core::Error::other(format!(
+                        "{} no longer trips delivered-but-open — nothing to repair",
+                        v.subject
+                    )));
+                };
+                match result.outcome {
+                    crate::reconcile_repair::Outcome::Applied { detail, .. }
+                    | crate::reconcile_repair::Outcome::AlreadyApplied { detail } => Ok(detail),
+                    crate::reconcile_repair::Outcome::WouldApply { .. } => {
+                        unreachable!("apply() never returns WouldApply")
+                    }
+                    crate::reconcile_repair::Outcome::Held { reason, detail } => Err(
+                        rk_core::Error::other(format!("held ({reason:?}): {detail}")),
+                    ),
+                }
             }
             other => Err(rk_core::Error::other(format!(
                 "no mechanical repair implemented for kind {other}"
@@ -5762,7 +6198,9 @@ impl Daemon {
         let queue = crate::landing::landing_queue_snapshot(&self.space);
         let mut announced = 0;
         for repo in repos {
-            let policy = repo.effective_policy().phase_latency;
+            let Ok(policy) = repo.effective_policy().map(|policy| policy.phase_latency) else {
+                continue;
+            };
             if policy.targets.is_empty() {
                 continue;
             }
@@ -5905,42 +6343,7 @@ impl Daemon {
         if in_progress.is_empty() {
             return 0;
         }
-        // Landing-awareness (TKT-01M0C663BZ86SMA2PVMFP5QJ8D): a ticket whose
-        // branch already landed must never be reopened just because its rat
-        // went terminal without being dismissed — the async
-        // steward-review flow leaves exactly that gap (O14: the harness's
-        // own `rk done` finds the branch not yet merged and refuses to close
-        // the ticket, so it sits `in_progress` until the landing pipeline
-        // records delivery). Reopening it dispatches a duplicate rat onto
-        // already-delivered work. `landing_processed` is
-        // keyed by `(repo, branch, head_sha)` — the wrong shape for "does
-        // this ticket have a landed outcome" — so read `payload.task`
-        // instead, which the reactor's landing-trigger dispatch (`reactor.rs`)
-        // populates from the completing rat's own `task` (== ticket id by
-        // fleet convention). One unscoped scan up front, not one probe per
-        // ticket: `landing_processed` is a `Furniture` event with no
-        // per-ticket index, same tradeoff `build()`'s `branch_landed` scan
-        // already makes for `rk inbox`.
-        let landed_tickets: std::collections::HashSet<String> = self
-            .space
-            .scan(
-                &Pattern::category(Category::Event)
-                    .identity(crate::landing::LANDING_PROCESSED_IDENTITY),
-            )
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|t| t.payload.get("outcome").and_then(Value::as_str) == Some("landed"))
-            .filter_map(|t| {
-                t.payload
-                    .get("task")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .filter(|task| !task.is_empty())
-            .collect();
-        // Landing-awareness, part 2 (probes O8/O17, TKT-01M0CTC4DYBRX6P5X2NPEZF0EZ):
-        // `landed_tickets` above only covers the terminal case. A ticket
-        // whose rat went non-live (paused, killed, orphaned) WHILE its
+        // A ticket whose rat went non-live (paused, killed, orphaned) WHILE its
         // branch is still queued for landing — `Queued`, `RunningGates`, or
         // `AwaitingReview` — has no live agent and no `landing_processed`
         // marker yet, so without this it sails through both guards and gets
@@ -5954,11 +6357,6 @@ impl Daemon {
         let announcer = crate::recovery::RecoveryAnnouncer::new();
         let mut reopened = 0usize;
         for ticket in in_progress {
-            if landed_tickets.contains(&ticket.identity) {
-                // Already delivered — leave it for the landing-driven ticket
-                // transition to close rather than reopening onto a duplicate.
-                continue;
-            }
             if queued_tickets.contains(&ticket.identity) {
                 // Branch is queued/gating/awaiting review — the owning rat
                 // going non-live here is expected (it may have already
@@ -6096,13 +6494,6 @@ impl Daemon {
         };
         let policy_file = path.join(".rk").join("repo.cue");
         let activated_policy = if policy_file.is_file() {
-            if params.merge_mode.is_some() || params.remote.is_some() {
-                return Response::err(
-                    req.id,
-                    codes::BAD_PARAMS,
-                    "a repository with .rk/repo.cue cannot also use --merge-mode or --remote; edit and activate the versioned policy instead",
-                );
-            }
             let policy_file_for_load = policy_file.clone();
             match tokio::task::spawn_blocking(move || {
                 let (policy, digest) =
@@ -6126,13 +6517,11 @@ impl Daemon {
         } else {
             None
         };
-        let remote = activated_policy
+        let remote_name = activated_policy
             .as_ref()
             .map(|approved| approved.policy.delivery.remote.clone())
-            .or(params.remote);
-        let remote_name = remote.as_deref().unwrap_or("origin");
+            .unwrap_or_else(|| "origin".to_string());
         let path_for_remote = path.clone();
-        let remote_name = remote_name.to_string();
         let host = match tokio::task::spawn_blocking(move || {
             repo_remote_url(&path_for_remote, &remote_name)
                 .and_then(|url| crate::repos::infer_host(&url))
@@ -6152,17 +6541,6 @@ impl Daemon {
             name: params.name,
             path,
             created_at: chrono::Utc::now(),
-            merge_mode: activated_policy
-                .as_ref()
-                .map(|approved| match approved.policy.delivery.mode {
-                    rk_workflow::DeliveryMode::Pr => rk_core::config::MergeMode::Pr,
-                    rk_workflow::DeliveryMode::Merge
-                    | rk_workflow::DeliveryMode::MergePush
-                    | rk_workflow::DeliveryMode::PushBranch => rk_core::config::MergeMode::Direct,
-                })
-                .or(params.merge_mode)
-                .unwrap_or(self.default_merge_mode),
-            remote,
             host,
             activated_policy,
         };
@@ -6236,9 +6614,9 @@ impl Daemon {
             );
         };
         let path_for_git = repo_path.clone();
-        let (repo_name, base_branch) = match tokio::task::spawn_blocking(move || {
+        let (repo_name, base_branch, base_revision) = match tokio::task::spawn_blocking(move || {
             let repo = rk_git::Repo::discover(&path_for_git)?;
-            Ok::<_, rk_core::Error>((repo.name(), repo.current_branch()?))
+            Ok::<_, rk_core::Error>((repo.name(), repo.current_branch()?, repo.rev_parse("HEAD")?))
         })
         .await
         {
@@ -6257,6 +6635,7 @@ impl Daemon {
             repo_name,
             repo_path,
             base_branch,
+            base_revision,
             harness,
             params.model,
             params.attach,
@@ -6354,7 +6733,7 @@ impl Daemon {
         }
     }
 
-    fn handle_onboarding_propose(&self, req: Request) -> Response {
+    async fn handle_onboarding_propose(&self, req: Request) -> Response {
         let params: RepoOnboardingProposeParams = match parse_params(&req.params) {
             Ok(params) => params,
             Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
@@ -6395,18 +6774,38 @@ impl Daemon {
                     return Response::err(req.id, codes::BAD_PARAMS, error.to_string());
                 }
             };
+        let proposal = match crate::onboarding_proposals::OnboardingProposal::new(
+            session.id.clone(),
+            crate::onboarding_proposals::repository_identity(&session.repo_path),
+            tree_revision,
+            params.proposal,
+            req.caller.clone(),
+        ) {
+            Ok(proposal) => proposal,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+        };
+        let preflight_session = session.clone();
+        let preflight_proposal = proposal.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::onboarding_apply::preflight_proposal(&preflight_session, &preflight_proposal)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Response::err(req.id, codes::BAD_PARAMS, error.to_string()),
+            Err(error) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    format!("onboarding proposal preflight failed: {error}"),
+                )
+            }
+        }
         let result = self
             .onboarding_sessions
             .lock()
             .map_err(|_| rk_core::Error::other("onboarding session registry lock poisoned"))
-            .and_then(|mut sessions| {
-                sessions.propose(
-                    &params.session,
-                    params.proposal,
-                    req.caller.clone(),
-                    tree_revision,
-                )
-            });
+            .and_then(|mut sessions| sessions.journal_proposal(&params.session, proposal));
         match result {
             Ok((proposal, created)) => {
                 Response::ok(req.id, json!({"proposal": proposal, "created": created}))
@@ -6573,6 +6972,18 @@ impl Daemon {
             Ok(result) => result,
             Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
         };
+
+        // A generic repository file is fully verified by the preflighted,
+        // exact-target patch and content-bound application commit. Executable
+        // checks and CUE automation retain their stronger dedicated validators.
+        if applied_proposal.status
+            == crate::onboarding_proposals::OnboardingProposalStatus::Verified
+        {
+            return Response::ok(
+                req.id,
+                json!({"proposal": applied_proposal, "applied": applied, "verified": true}),
+            );
+        }
 
         let proposal = if let Some(contract) = applied_proposal.named_check.as_ref() {
             let attempt = applied_proposal.verification_results.len() as u32 + 1;
@@ -7395,6 +7806,139 @@ impl Daemon {
         }
     }
 
+    /// Record delivery performed outside the agent landing pipeline. This
+    /// establishes git reachability and provenance only; repository CUE
+    /// remains authoritative for automated validation and landing policy.
+    async fn handle_ticket_deliver(&self, req: Request) -> Response {
+        let params: TicketDeliverParams = match parse_params(&req.params) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
+        };
+        if params.verification.trim().is_empty() {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                "verification evidence is required",
+            );
+        }
+        let repo_name = match self.resolve_inbox_repo(Some(params.repo.clone())) {
+            Ok(Some(name)) => name,
+            Ok(None) => return Response::err(req.id, codes::BAD_PARAMS, "repo is required"),
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        let repo_path = {
+            let registry = match self.repos.lock() {
+                Ok(registry) => registry,
+                Err(_) => {
+                    return Response::err(req.id, codes::INTERNAL, "repo registry lock poisoned")
+                }
+            };
+            match registry.get(&repo_name) {
+                Some(record) => record.path.clone(),
+                None => {
+                    return Response::err(
+                        req.id,
+                        codes::BAD_PARAMS,
+                        format!("repository is not registered: {}", params.repo),
+                    )
+                }
+            }
+        };
+        let ticket = match self.tickets.get(&params.id) {
+            Ok(Some(ticket)) => ticket,
+            Ok(None) => {
+                return Response::err(
+                    req.id,
+                    codes::BAD_PARAMS,
+                    format!("no such ticket: {}", params.id),
+                )
+            }
+            Err(e) => return Response::err(req.id, codes::INTERNAL, e.to_string()),
+        };
+        if ticket.scope != repo_name {
+            return Response::err(
+                req.id,
+                codes::BAD_PARAMS,
+                format!(
+                    "ticket {} belongs to repo {}, not {}",
+                    params.id, ticket.scope, repo_name
+                ),
+            );
+        }
+
+        let commit_input = params.commit.clone();
+        let target_input = params.target.clone();
+        let checked = tokio::task::spawn_blocking(move || -> rk_core::Result<String> {
+            let repo = rk_git::Repo::discover(&repo_path)?;
+            let commit = repo.rev_parse(&commit_input)?;
+            let target_ref = format!("refs/heads/{target_input}");
+            let target_commit = repo.rev_parse(&target_ref)?;
+            match repo.ancestry(&commit, &target_commit) {
+                rk_git::Ancestry::Present => Ok(commit),
+                rk_git::Ancestry::Absent => Err(rk_core::Error::other(format!(
+                    "commit {commit} is not reachable from target {target_input}"
+                ))),
+                rk_git::Ancestry::Unknown => Err(rk_core::Error::other(format!(
+                    "could not establish whether commit {commit} is reachable from target {target_input}"
+                ))),
+            }
+        })
+        .await;
+        let commit = match checked {
+            Ok(Ok(commit)) => commit,
+            Ok(Err(e)) => return Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+            Err(e) => {
+                return Response::err(
+                    req.id,
+                    codes::INTERNAL,
+                    format!("git verification task failed: {e}"),
+                )
+            }
+        };
+        let delivery = crate::tickets::DeliveryRecord {
+            merge_commit: commit,
+            branch: params
+                .source_branch
+                .clone()
+                .unwrap_or_else(|| "operator/manual".to_string()),
+            target: params.target.clone(),
+            landed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        match self
+            .tickets
+            .record_delivery_once(&params.id, &delivery)
+            .await
+        {
+            Ok(crate::tickets::DeliveryWrite::Already(ticket)) => {
+                let durable_delivery = crate::tickets::delivery_of(&ticket).unwrap_or(delivery);
+                Response::ok(
+                    req.id,
+                    json!({"ticket": ticket, "delivery": durable_delivery, "already_recorded": true}),
+                )
+            }
+            Ok(crate::tickets::DeliveryWrite::Recorded(ticket)) => {
+                self.emit_event(
+                    &ticket.scope,
+                    "ticket_manual_delivery",
+                    json!({
+                        "ticket": ticket.identity,
+                        "repo": repo_name,
+                        "commit": delivery.merge_commit,
+                        "source_branch": delivery.branch,
+                        "target": delivery.target,
+                        "verification": params.verification,
+                        "by": "human-operator",
+                    }),
+                );
+                Response::ok(
+                    req.id,
+                    json!({"ticket": ticket, "delivery": delivery, "already_recorded": false}),
+                )
+            }
+            Err(e) => Response::err(req.id, codes::BAD_PARAMS, e.to_string()),
+        }
+    }
+
     fn handle_ticket_ready(&self, req: Request) -> Response {
         let params: TicketReadyParams = match parse_params(&req.params) {
             Ok(p) => p,
@@ -7551,7 +8095,7 @@ impl Daemon {
     }
 
     async fn handle_respawn(&self, req: Request) -> Response {
-        let params: NameParams = match parse_params(&req.params) {
+        let params: RespawnParams = match parse_params(&req.params) {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
@@ -7564,7 +8108,7 @@ impl Daemon {
         let result = tokio::task::spawn_blocking(move || {
             let _entered = handle.enter();
             supervisor
-                .respawn(&name)
+                .respawn_generation(&name, params.spawn)
                 .map(|record| json!({"agent": record}))
         })
         .await;
@@ -8869,12 +9413,23 @@ impl Daemon {
     }
 
     fn handle_out(&self, req: Request) -> Response {
-        let params: OutParams = match parse_params(&req.params) {
+        let mut params: OutParams = match parse_params(&req.params) {
             Ok(p) => p,
             Err(e) => return Response::err(req.id, codes::BAD_PARAMS, e),
         };
         let caller = req.caller.clone();
         let is_agent = caller != "operator" && !caller.is_empty();
+        if is_agent {
+            if let (Some(record), Some(payload)) = (
+                self.supervisor.status(&caller),
+                params.payload.as_object_mut(),
+            ) {
+                // The authenticated daemon, not the agent process, owns exact
+                // generation attribution. Overwrite a missing or forged value
+                // so `fromAgent` consumers can use one trustworthy join key.
+                payload.insert("spawn".into(), json!(record.spawn_id()));
+            }
+        }
         if is_agent && params.category == Category::Artifact && params.identity == "review" {
             if let Some(review) = self
                 .supervisor
@@ -9915,8 +10470,21 @@ struct NameParams {
     name: String,
 }
 
+#[derive(Deserialize)]
+struct RespawnParams {
+    name: String,
+    #[serde(default)]
+    spawn: Option<rk_core::id::SpawnId>,
+}
+
 #[derive(Default, Deserialize)]
 struct InboxParams {
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CurrentWorkParams {
     #[serde(default)]
     repo: Option<String>,
 }
@@ -10026,6 +10594,16 @@ struct AttentionDecideParams {
     /// this. Falls back to generic text derived from the violation if
     /// omitted.
     resolving_action: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AttentionInvalidateParams {
+    repo: String,
+    item: String,
+    /// Optional audit rationale. The explicit invalidate verb remains a valid
+    /// human decision when omitted, and the journal records that default.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// `attention.decide`'s three failure shapes, mapped to distinct wire error
@@ -10259,12 +10837,6 @@ fn repo_remote_url(path: &std::path::Path, remote: &str) -> Option<String> {
 struct RepoAddParams {
     name: String,
     path: String,
-    /// Explicit merge mode; when absent the daemon's `[policy]` default applies.
-    #[serde(default)]
-    merge_mode: Option<rk_core::config::MergeMode>,
-    /// Explicit remote name; when absent, `origin` is used at operation time.
-    #[serde(default)]
-    remote: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -10389,8 +10961,109 @@ struct TicketReopenParams {
     status: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct TicketDeliverParams {
+    id: String,
+    repo: String,
+    commit: String,
+    target: String,
+    verification: String,
+    #[serde(default)]
+    source_branch: Option<String>,
+}
+
 fn parse_params<T: serde::de::DeserializeOwned>(params: &Value) -> Result<T, String> {
     serde_json::from_value(params.clone()).map_err(|e| e.to_string())
+}
+
+/// Narrow a freshly built repair plan down to exactly the one violation `v`
+/// names, in place — `execute_mechanical`'s subject-scoping guard. Matches
+/// the full violation identity (`violation_id`, `kind`, AND `subject`), not
+/// `subject` alone: a ticket can trip more than one repairable kind at once
+/// (e.g. a delivered-but-open ticket whose stale assignee also trips
+/// terminal-assignee-active-work), and those two kinds carry different
+/// authorities (`Mechanical` vs. `Orchestrator` — see
+/// `reconcile_repair`'s module doc). A subject-only filter would let this
+/// call, authorized for exactly one Mechanical violation, also execute a
+/// same-subject Orchestrator-authority repair as an unrequested side effect
+/// of the same `apply()` call.
+fn retain_matching_violation(
+    plan: &mut crate::reconcile_repair::RepairPlan,
+    v: &crate::reconcile::Violation,
+) {
+    plan.items.retain(|item| {
+        item.violation_id == v.id && item.kind == v.kind && item.subject == v.subject
+    });
+}
+
+#[cfg(test)]
+mod retain_matching_violation_tests {
+    use super::*;
+    use crate::reconcile::{kind as vkind, Authority, Violation};
+    use crate::reconcile_repair::{Disposition, RepairAction, RepairItem, RepairPlan};
+
+    fn item(kind: &str, subject: &str) -> RepairItem {
+        RepairItem {
+            violation_id: format!("{kind}:{subject}"),
+            kind: kind.to_string(),
+            scope: "myrepo".to_string(),
+            subject: subject.to_string(),
+            detail: "test".to_string(),
+            evidence: vec![],
+            disposition: Disposition::Planned(RepairAction::CloseDelivered {
+                merge_commit: "abc123".to_string(),
+            }),
+        }
+    }
+
+    fn violation(kind: &str, subject: &str) -> Violation {
+        Violation {
+            id: format!("{kind}:{subject}"),
+            kind: kind.to_string(),
+            scope: "myrepo".to_string(),
+            subject: subject.to_string(),
+            detail: "test".to_string(),
+            evidence: vec![],
+            authority: Authority::Mechanical,
+        }
+    }
+
+    /// The bug this guards against: a ticket that trips BOTH
+    /// `delivered-but-open` and `terminal-assignee-active-work` at once
+    /// produces two plan items sharing one `subject`. A subject-only filter
+    /// (the version this replaces) would retain both, letting a call
+    /// authorized for only the `delivered-but-open` violation also execute
+    /// the OTHER kind's repair as a side effect.
+    #[test]
+    fn keeps_only_the_exact_kind_for_a_shared_subject() {
+        let mut plan = RepairPlan {
+            scope: "myrepo".into(),
+            items: vec![
+                item(vkind::DELIVERED_BUT_OPEN, "TKT-1"),
+                item(vkind::TERMINAL_ASSIGNEE_ACTIVE_WORK, "TKT-1"),
+            ],
+        };
+        let v = violation(vkind::DELIVERED_BUT_OPEN, "TKT-1");
+        retain_matching_violation(&mut plan, &v);
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].kind, vkind::DELIVERED_BUT_OPEN);
+        assert_eq!(plan.items[0].subject, "TKT-1");
+    }
+
+    #[test]
+    fn drops_a_sibling_ticket_with_the_same_kind() {
+        let mut plan = RepairPlan {
+            scope: "myrepo".into(),
+            items: vec![
+                item(vkind::DELIVERED_BUT_OPEN, "TKT-1"),
+                item(vkind::DELIVERED_BUT_OPEN, "TKT-2"),
+            ],
+        };
+        let v = violation(vkind::DELIVERED_BUT_OPEN, "TKT-1");
+        retain_matching_violation(&mut plan, &v);
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].subject, "TKT-1");
+    }
 }
 
 /// Does `commit`'s own diff (against its first parent) touch a path matched
@@ -11254,7 +11927,7 @@ mod authorize_reasoned_tests {
         let now = chrono::Utc::now();
         let record = AgentRecord {
             name: name.into(),
-            spawn: None,
+            spawn: Some(rk_core::id::SpawnId::new()),
             role: role.into(),
             coordination: None,
             harness: "fake".into(),
@@ -11478,6 +12151,23 @@ mod authorize_reasoned_tests {
     }
 
     #[test]
+    fn an_ordinary_rat_cannot_invalidate_human_attention() {
+        let (_dir, daemon) = test_daemon_with_role("rat");
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "invalid-rat");
+        let request = Request {
+            id: "1".into(),
+            method: "attention.invalidate".into(),
+            auth: token,
+            caller: "invalid-rat".into(),
+            client_version: None,
+            params: json!({"repo": "repo", "item": "violation"}),
+        };
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
+        assert!(!allowed);
+        assert_eq!(reason, "operator_only_method");
+    }
+
+    #[test]
     fn repo_land_reenqueue_refuses_an_ordinary_rat() {
         let (_dir, daemon) = test_daemon_with_role("rat");
         let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "invalid-rat");
@@ -11599,6 +12289,40 @@ mod review_artifact_binding_tests {
                 .is_empty(),
             "a rejected artifact must not enter the tuplespace"
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_tuple_generation_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_overwrites_agent_tuple_spawn_with_authenticated_generation() {
+        let (_dir, daemon) =
+            super::authorize_reasoned_tests::test_daemon_with_named_role("Brie-10", "reviewer");
+        let spawn = daemon.supervisor.status("Brie-10").unwrap().spawn_id();
+
+        let response = daemon.handle_out(Request {
+            id: "exact-generation".into(),
+            method: "space.out".into(),
+            auth: String::new(),
+            caller: "Brie-10".into(),
+            client_version: None,
+            params: json!({
+                "category": "artifact",
+                "scope": "repo",
+                "identity": "audit",
+                "payload": {"spawn": rk_core::id::SpawnId::new(), "finding": "valid"}
+            }),
+        });
+        assert!(response.error.is_none(), "write failed: {response:?}");
+
+        let tuples = daemon
+            .space
+            .scan(&Pattern::category(Category::Artifact).identity("audit"))
+            .unwrap();
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0].payload["spawn"], json!(spawn));
     }
 }
 
@@ -11781,7 +12505,7 @@ mod ticket_reopen_sweep_tests {
         let now = chrono::Utc::now();
         let record = AgentRecord {
             name: name.into(),
-            spawn: None,
+            spawn: Some(rk_core::id::SpawnId::new()),
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),
@@ -12012,15 +12736,12 @@ mod ticket_reopen_sweep_tests {
         assert_eq!(ticket.payload["status"], json!("done"));
     }
 
-    /// TKT-01M0C663BZ86SMA2PVMFP5QJ8D: the O14 gap left by the async
-    /// steward-review flow — `rk done` finds the branch not yet merged and
-    /// refuses to close the ticket (the C3 delivery-mode gate), so the
-    /// ticket sits `in_progress` with its rat gone terminal. The sweep must
-    /// not treat that as ownerless-and-abandoned when a `landing_processed`
-    /// event proves the branch landed after the rat went terminal —
-    /// reopening it dispatches a duplicate rat onto already-delivered work.
+    /// A queue dedup marker is not an alternate ticket-delivery authority.
+    /// A real landing writes the canonical delivery record and closes the
+    /// ticket atomically; a leftover marker without that record must not hide
+    /// an abandoned in-progress ticket from recovery.
     #[tokio::test]
-    async fn a_ticket_whose_branch_already_landed_is_not_reopened() {
+    async fn a_landing_processed_marker_alone_does_not_prevent_reopen() {
         let (_dir, daemon) = daemon_with_agent("Clover-Alike", AgentState::Completed);
         let id = in_progress_ticket(&daemon, Some("Clover-Alike")).await;
 
@@ -12043,9 +12764,9 @@ mod ticket_reopen_sweep_tests {
         let far_future = chrono::Utc::now() + chrono::Duration::hours(2);
         let reopened = daemon.ticket_reopen_sweep_at(far_future).await;
 
-        assert_eq!(reopened, 0);
+        assert_eq!(reopened, 1);
         let ticket = daemon.tickets.get(&id).unwrap().unwrap();
-        assert_eq!(ticket.payload["status"], json!("in_progress"));
+        assert_eq!(ticket.payload["status"], json!("open"));
     }
 
     /// A ticket whose only `landing_processed` marker recorded a NON-landed
@@ -12192,8 +12913,6 @@ mod ticket_reopen_sweep_tests {
                 name: "some-repo".to_string(),
                 path: dir.path().join("some-repo"),
                 created_at: chrono::Utc::now(),
-                merge_mode: Default::default(),
-                remote: None,
                 host: None,
                 activated_policy: Some(crate::repos::ActivatedRepositoryPolicy {
                     digest: "test-digest".to_string(),

@@ -82,6 +82,7 @@ async fn two_concurrent_workflow_spawns_share_the_fleet_wip_cap_and_both_complet
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
 
     let wf_dir = repo_dir.path().join(".rk").join("workflows");
     std::fs::create_dir_all(&wf_dir).unwrap();
@@ -105,6 +106,7 @@ async fn two_concurrent_workflow_spawns_share_the_fleet_wip_cap_and_both_complet
     });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let repo = repo_dir.path().to_string_lossy().to_string();
     let mut ids = Vec::new();

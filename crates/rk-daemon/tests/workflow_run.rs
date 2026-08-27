@@ -77,6 +77,7 @@ async fn cue_workflow_runs_end_to_end_with_agent_resolution() {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
     support::install_passing_landing_checks(repo_dir.path());
 
     // Definition discovered from the repo-local workflows dir.
@@ -90,6 +91,7 @@ async fn cue_workflow_runs_end_to_end_with_agent_resolution() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let defs = client
         .call(
@@ -224,6 +226,7 @@ async fn approval_gate_blocks_until_approved_then_merges() {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
     support::install_passing_landing_checks(repo_dir.path());
 
     let wf_dir = repo_dir.path().join(".rk").join("workflows");
@@ -236,6 +239,7 @@ async fn approval_gate_blocks_until_approved_then_merges() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -323,6 +327,7 @@ async fn approval_gate_rejection_leaves_branch_unmerged() {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
     support::install_passing_landing_checks(repo_dir.path());
 
     let wf_dir = repo_dir.path().join(".rk").join("workflows");
@@ -335,6 +340,7 @@ async fn approval_gate_rejection_leaves_branch_unmerged() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -438,6 +444,7 @@ async fn run_step_green_check_gates_and_merges() {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
     support::install_passing_landing_checks(repo_dir.path());
 
     let wf_dir = repo_dir.path().join(".rk").join("workflows");
@@ -450,6 +457,7 @@ async fn run_step_green_check_gates_and_merges() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -529,6 +537,7 @@ async fn run_step_red_check_fails_closed_and_holds_branch() {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
     support::install_passing_landing_checks(repo_dir.path());
 
     let wf_dir = repo_dir.path().join(".rk").join("workflows");
@@ -541,6 +550,7 @@ async fn run_step_red_check_fails_closed_and_holds_branch() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -644,6 +654,7 @@ async fn run_step_fails_closed_on_a_failing_check_piped_to_a_successful_consumer
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
 
     // Same shape as `support::install_passing_landing_checks`, except `verify`
     // is the masked-failure check under test: a failing stage whose status the
@@ -678,6 +689,7 @@ async fn run_step_fails_closed_on_a_failing_check_piped_to_a_successful_consumer
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -787,6 +799,7 @@ async fn run_step_failure_persists_a_durable_gate_failure_artifact() {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
     support::install_passing_landing_checks(repo_dir.path());
 
     let wf_dir = repo_dir.path().join(".rk").join("workflows");
@@ -803,6 +816,7 @@ async fn run_step_failure_persists_a_durable_gate_failure_artifact() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -904,6 +918,7 @@ async fn run_step_retry_on_fail_recovers_and_records_the_retry() {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
     support::install_passing_landing_checks(repo_dir.path());
 
     let wf_dir = repo_dir.path().join(".rk").join("workflows");
@@ -920,6 +935,7 @@ async fn run_step_retry_on_fail_recovers_and_records_the_retry() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(
@@ -1029,6 +1045,7 @@ async fn run_step_default_timeout_persists_a_durable_gate_failure_artifact() {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
     support::install_passing_landing_checks(repo_dir.path());
 
     let wf_dir = repo_dir.path().join(".rk").join("workflows");
@@ -1045,6 +1062,7 @@ async fn run_step_default_timeout_persists_a_durable_gate_failure_artifact() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(

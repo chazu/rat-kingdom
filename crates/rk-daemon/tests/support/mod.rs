@@ -10,6 +10,23 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::Instant;
 
+/// Register a scratch repository after its versioned CUE policy has been
+/// installed. Production dispatch intentionally refuses unregistered repos.
+#[allow(dead_code)]
+pub async fn register_repo(client: &mut Client, repo: &Path) {
+    let name = repo
+        .file_name()
+        .expect("scratch repo must have a final path component")
+        .to_string_lossy();
+    client
+        .call(
+            "repo.add",
+            serde_json::json!({"name": name, "path": repo.to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+}
+
 /// Resolve the workspace root at RUNTIME instead of baking
 /// `env!("CARGO_MANIFEST_DIR")` into the test binary at compile time.
 ///
@@ -53,6 +70,16 @@ pub fn install_passing_landing_checks(repo: &std::path::Path) {
 "#,
     )
     .unwrap();
+    if !rk_dir.join("repo.cue").is_file() {
+        std::fs::write(
+            rk_dir.join("repo.cue"),
+            r#"repo: {
+    delivery: {target: "agent-base", mode: "merge", remote: "origin", remoteBranch: "{{branch}}", deleteSource: true}
+}
+"#,
+        )
+        .unwrap();
+    }
     let run = |args: &[&str]| {
         let status = std::process::Command::new("git")
             .args(args)
@@ -61,8 +88,40 @@ pub fn install_passing_landing_checks(repo: &std::path::Path) {
             .unwrap();
         assert!(status.success(), "git {args:?} failed");
     };
-    run(&["add", ".rk/checks.cue"]);
-    run(&["commit", "-m", "test: register landing checks"]);
+    run(&["add", ".rk/checks.cue", ".rk/repo.cue"]);
+    run(&[
+        "commit",
+        "-m",
+        "test: register repository policy and landing checks",
+    ]);
+}
+
+/// Install the minimal versioned repository policy needed for tests that
+/// exercise dispatch but not landing gates.
+#[allow(dead_code)]
+pub fn install_default_repository_policy(repo: &std::path::Path) {
+    let rk_dir = repo.join(".rk");
+    std::fs::create_dir_all(&rk_dir).unwrap();
+    std::fs::write(
+        rk_dir.join("repo.cue"),
+        r#"repo: {
+    delivery: {target: "agent-base", mode: "merge", remote: "origin", remoteBranch: "{{branch}}", deleteSource: true}
+}
+"#,
+    )
+    .unwrap();
+    let status = std::process::Command::new("git")
+        .args(["add", ".rk/repo.cue"])
+        .current_dir(repo)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let status = std::process::Command::new("git")
+        .args(["commit", "-m", "test: register repository policy"])
+        .current_dir(repo)
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 /// Poll `attempt` at a fixed `interval` until it returns `Some` or a

@@ -96,6 +96,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 
     let rk_dir = dir.join(".rk");
     std::fs::create_dir_all(&rk_dir).unwrap();
@@ -272,6 +273,20 @@ async fn two_daemon_restart_mid_gate_resumes_and_lands_through_the_reactor() {
     assert!(
         git(repo_dir.path(), &["show", "main:docs/note.md"]).contains("note"),
         "the rat's doc-only work must be on main"
+    );
+
+    // This candidate carries no `--task` (a bare named-branch land) and
+    // survived a daemon restart mid-flight — proving both that automatic
+    // finalization derives the agent's merge pointer for a non-ticket
+    // delivery, and that the derivation itself is restart/replay-safe.
+    let status = client
+        .call("agent.status", json!({"name": &agent_name}))
+        .await
+        .unwrap();
+    assert_eq!(
+        status["agent"]["merge_commit"].as_str(),
+        Some(main_after.as_str()),
+        "the rat's own generation must carry the merge pointer it landed"
     );
 
     handle_b.abort();

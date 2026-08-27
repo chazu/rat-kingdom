@@ -81,7 +81,7 @@ impl Default for DeliveryPolicy {
 
 /// Per-repository landing-pipeline gate policy: the protected-path and
 /// diff-scope guardrails plus the review-tier wall-clock budgets that
-/// `examples/workflows/steward.cue`'s mega-workflow used to expose as
+/// the retired steward mega-workflow used to expose as
 /// workflow params (`protectedPaths`, `maxDiffFiles`, `maxDiffLines`,
 /// `gateTimeout`, `reviewTimeout`) before Phase 4 of the steward remediation
 /// moved gate execution into the daemon-native `LandingPipeline`
@@ -930,13 +930,12 @@ pub struct ReadStep {
     /// reviewers writing `artifact/<repo>/review` concurrently. "Newest wins"
     /// then hands one instance the other's verdict, and the `when` behind it
     /// routes a land on a stranger's review. Setting this narrows the match to
-    /// `"agent":"<ctx.activeAgent>"` above that agent's own generation floor,
-    /// the same bound `wait`/`wait_all` carry (see [`rk_core::tuple::Pattern::
-    /// for_agent_since`]).
+    /// the exact `"spawn":"<ctx.activeAgentSpawn>"` written by that
+    /// generation, the same identity `wait`/`wait_all` carry.
     ///
     /// Mutually exclusive with [`ReadStep::search`], which owns the same
     /// predicate slot. Fails closed: no active agent, or an agent whose tuple
-    /// never carries its name, times the step out rather than routing on a
+    /// never carries its spawn id, times the step out rather than routing on a
     /// tuple it cannot attribute.
     #[serde(default, rename = "fromAgent")]
     pub from_agent: bool,

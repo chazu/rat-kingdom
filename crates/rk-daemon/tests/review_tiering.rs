@@ -2,7 +2,7 @@
 //! reviewer spawn for a diff classified "doc-only"/"trivial", replacing it
 //! with a near-zero gate-holder — same deterministic gates, unconditional
 //! land, no LLM verdict. `TIERED_STEWARD` mirrors the shape of
-//! examples/workflows/steward.cue's tiering (a `list.Concat`/`if` selection
+//! the retired steward mega-workflow's tiering (a `list.Concat`/`if` selection
 //! over `_input.diffClass` at CUE load time, a shared `_gate`, distinct
 //! `reviewer`/`gateholder` agent profiles), trimmed to a fast fake-harness
 //! run rather than the real named checks.
@@ -31,7 +31,7 @@ rk_done "work done"
 echo '{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"tier-fake","total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'
 "#;
 
-// Mirrors examples/workflows/steward.cue's tiering shape at the size a fast
+// Mirrors that retired workflow's tiering shape at the size a fast
 // fake-harness test needs: the deterministic `_gate` and the land tail are
 // shared between both tiers via `list.Concat`; only the spawned agent profile
 // (and, in the real file, the verdict routing) differs.
@@ -55,6 +55,7 @@ workflow: {
     ]
     _tail: [
         {type: "dismiss", noMerge: true},
+        {type: "gate", gateType: "approval", timeout: "60s"},
         {type: "land", branch: "{{ctx.activeBranch}}", target: "main"},
         {type: "evaluate", expect: {delivered: true}},
     ]
@@ -120,13 +121,28 @@ async fn run_and_wait(
         )
         .await
         .unwrap();
-    let id = started["instance"]["id"].as_str().unwrap();
+    let id = started["instance"]["id"].as_str().unwrap().to_string();
+    let mut approved = false;
     for _ in 0..300 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let status = client
             .call("workflow.status", json!({"name": id}))
             .await
             .unwrap();
+        if !approved
+            && status["instance"]["status"] == "running"
+            && status["instance"]["current_step"] == 6
+        {
+            client
+                .call(
+                    "workflow.approve",
+                    json!({"instance": id, "approved": true, "by": "operator"}),
+                )
+                .await
+                .unwrap();
+            approved = true;
+            continue;
+        }
         if status["instance"]["status"] != "running" {
             return status;
         }
@@ -153,6 +169,7 @@ async fn doc_only_diff_class_skips_reviewer_but_still_gates_and_lands() {
     let daemon = Daemon::new_in_memory(layout.clone(), "tiered".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo.path()).await;
 
     let result = run_and_wait(&mut client, repo.path(), json!({"diffClass": "doc-only"})).await;
     assert_eq!(result["instance"]["status"], "completed", "{result}");
@@ -206,6 +223,7 @@ async fn missing_diff_class_defaults_to_the_review_tier() {
     let daemon = Daemon::new_in_memory(layout.clone(), "tiered-default".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo.path()).await;
 
     // No diffClass param at all — exactly what a completion predating this
     // feature (or the reactor's null-templated-param omission) produces.

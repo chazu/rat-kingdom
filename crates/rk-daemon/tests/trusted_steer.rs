@@ -48,6 +48,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# trusted steer\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 }
 
 fn install_codex(dir: &Path) {
@@ -156,6 +157,7 @@ async fn rpc_steer_persists_live_generation_and_ignores_tool_lookalikes() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _daemon = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo.path()).await;
     let spawned = client
         .call(
             "agent.spawn",
@@ -253,6 +255,7 @@ async fn unacknowledged_control_replays_once_after_restart_and_never_after_ack()
     let daemon_a = Daemon::new(layout.clone(), &config).unwrap();
     let _daemon_a = tokio::spawn(daemon_a.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo.path()).await;
     let spawned = client
         .call(
             "agent.spawn",
@@ -306,6 +309,7 @@ async fn unacknowledged_control_replays_once_after_restart_and_never_after_ack()
     let daemon_b = Daemon::new(layout.clone(), &config).unwrap();
     let _daemon_b = tokio::spawn(daemon_b.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo.path()).await;
     client
         .call("agent.respawn", json!({"name": agent}))
         .await

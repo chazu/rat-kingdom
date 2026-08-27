@@ -1008,7 +1008,7 @@ mod tests {
     fn agent(name: &str, state: AgentState) -> AgentRecord {
         AgentRecord {
             name: name.into(),
-            spawn: None,
+            spawn: Some(rk_core::id::SpawnId::new()),
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),
@@ -1067,7 +1067,6 @@ mod tests {
             instance_max_usd: None,
             definition: "gated-merge".into(),
             definition_digest: String::new(),
-            automated_landing_authorized: false,
             params: Default::default(),
             depth: 0,
             started_at: Utc::now(),

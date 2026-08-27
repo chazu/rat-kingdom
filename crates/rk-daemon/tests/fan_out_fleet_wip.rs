@@ -83,6 +83,7 @@ async fn for_each_fan_out_shares_the_fleet_wip_cap_and_still_completes() {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
 
     let repo_name = repo_dir
         .path()
@@ -113,6 +114,7 @@ async fn for_each_fan_out_shares_the_fleet_wip_cap_and_still_completes() {
     });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // Five ready tickets — deeper than the fleet cap of 2, so at least some
     // fan-out spawns must be refused and retried rather than dispatched

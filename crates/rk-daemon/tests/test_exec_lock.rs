@@ -116,6 +116,7 @@ fn init_repo(repo: &Path) {
     std::fs::write(repo.join("README.md"), "# x\n").unwrap();
     git(repo, &["add", "."]);
     git(repo, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo);
 }
 
 fn write_def(repo: &Path, name: &str, src: &str) {
@@ -163,6 +164,8 @@ fn read_peak(marker_dir: &Path) -> u64 {
 /// rat/worktree, and return the peak concurrent occupancy the check observed.
 async fn run_two_concurrently(layout: &Layout, repo: &Path, marker_dir: &Path) -> u64 {
     std::env::set_var("RK_FAKE_HARNESS_CMD", WORKING_FAKE);
+    let mut registrar = connect(layout).await;
+    support::register_repo(&mut registrar, repo).await;
 
     let mut handles = Vec::with_capacity(2);
     for i in 0..2 {

@@ -27,6 +27,43 @@ rk ping                                    # auto-starts the daemon → "pong"
 Everything lives under `~/.rat-kingdom/` (override with `RK_HOME`): config,
 tuplespace db, worktrees, logs, workflow definitions, sync state.
 
+## Daily operator loop
+
+Start with one command:
+
+```bash
+rk work                         # all registered repos
+rk work rat-kingdom             # one repo
+rk --json work rat-kingdom      # same exact counts and rows for scripts
+```
+
+It reports installed/daemon build parity, live rats, ready tickets, and only
+bounded human attention that has one supported, idempotent resolving command.
+Run the command printed under a row, then run `rk work` again; a successful
+resolution removes that row. `rk inbox`, `rk reconcile`, `rk attention`, and
+`rk top` remain the broad diagnostic surfaces for history, open-ended choices,
+and control-loop internals.
+
+A ready ticket can reach landed-and-clean in four operator commands (often
+three when the landing workflow is automatic):
+
+```bash
+rk work rat-kingdom
+rk spawn --ticket TKT-...                   # prints the rat and branch
+rk land rat/<rat>/<task> --repo rat-kingdom # omit when its workflow lands it
+rk work rat-kingdom                         # confirms the current state
+```
+
+King wakes are durable notification transport, not a second work queue. Daily
+operation requires no wake id or wake phase knowledge, and settling a wake does
+not mean the ticket backlog or `rk work` is empty. Use the `rk king ...`
+commands below only to administer or diagnose the delegate itself.
+
+Repository-owned CUE remains the policy authority throughout this shorter
+journey. `.rk/repo.cue`, `.rk/checks.cue`, `.rk/triggers.cue`, schedules, and
+named non-agentic checks still decide validation and automation; `rk work`
+changes presentation and explicit human disposition only.
+
 ## Factory Foreman
 
 Factory Foreman provides a Rust-native read-only dashboard plus daemon snapshots/events, structured-source-only self-optimization scorecards and advisory recommendations, five local stdio MCP tools, and digest-bound typed `workflow.run` proposals whose execution authority remains in the daemon. Open the operator dashboard with:
@@ -372,10 +409,12 @@ Inspection never registers the repository, launches an agent, runs a project
 check, or edits repository/castle state. It also does not auto-start the daemon;
 if the daemon is down, start it separately with `rk ping` and then inspect.
 
-`repo onboard start` journals one stable session per canonical repository and
+`repo onboard start` journals one stable session per canonical repository
+revision and
 creates `onboarding/onb-...` in a Rat Kingdom-owned worktree. Repeating start
-reuses that session, branch, and worktree rather than touching the human
-checkout or launching a duplicate. Headless and `--attach` runs write the same
+at the same `HEAD` reuses that session, branch, and worktree; advancing `HEAD`
+creates a fresh content-bound assessment rather than reviving stale terminal
+work. Headless and `--attach` runs write the same
 `onboarding-sessions.json` record and expose the same status/report RPCs.
 Daemon restart marks an in-flight session orphaned; `resume` reuses the
 preserved worktree and, for attached runs, reattaches to a surviving herdr pane
@@ -389,6 +428,10 @@ journals immutable advice: it does not edit the worktree or castle. Onboarders
 cannot approve or decline proposals, spawn agents, mutate tickets/repos,
 approve workflows, use ordinary rat tuple writes, or gain operator authority by
 clearing `RK_AGENT`/`RK_AUTH_TOKEN`.
+
+Before a proposal is journaled, the daemon runs `git apply --check` against the
+assessed tree and proves the patch changes exactly its declared target. A
+malformed patch therefore never reaches the human approval queue.
 
 Each proposal records its evidence, exact diff, risk, target/action, verification
 plan, stable repository identity, and the onboarding Git tree revision. Its
@@ -417,6 +460,11 @@ recommits nor reruns a verified check. After a failed check, retry reuses the
 recorded commit and executes a new attempt. An interrupted exact patch or
 trailer-bearing commit is recovered; unrelated dirt, an edited applied file,
 or branch movement is recorded as failure and never swept into the proposal.
+Ordinary `repo_file` proposals such as `AGENTS.md` and `mise.toml` use this same
+exact-target preflight and content-bound commit path. Several proposals approved
+against one assessment can apply in order; each later application accepts only
+a predecessor commit already journaled by that onboarding session. Executable
+checks and CUE policy/automation files retain their dedicated validators.
 
 Repository policy, workflow, trigger, and schedule proposals use distinct
 activation kinds and actions. A policy is a `repo_file` proposal targeting
@@ -465,11 +513,20 @@ rk ticket new "Add SSO" --body "SAML + OIDC" --parent TKT-<id>   # use the id re
 rk ticket list --repo svc --status open
 rk ticket show TKT-<id>                                       # details + sub-tickets
 rk ticket update TKT-<id> --status in_progress --assignee Whisker
+rk ticket deliver TKT-<id> --repo svc --commit <sha> --target main \
+  --verification "mise run verify passed in CI run 123"
 ```
 
 Statuses: `open → claimed → in_progress → blocked → done → closed`. Rats are
 primed to *file* or *decompose* tickets for follow-up work rather than starting
 it themselves — the orchestrator routes them.
+
+`rk ticket deliver` is the operator-only recovery path for work landed outside
+Rat Kingdom. It fails closed unless the commit is reachable from the registered
+repository's target, records the delivery and closes the ticket atomically, and
+keeps dependency edges intact. `--verification` is durable audit evidence, not
+a request to execute checks: normal Rat Kingdom landing continues to resolve
+and run the repository's activated CUE policy.
 
 **Dependencies.** A ticket can be blocked by others (distinct from parent/child
 decomposition — this is a DAG of "must finish first" edges). Cycles are
@@ -617,14 +674,9 @@ require_named_checks = false     # true => a workflow `run` step may ONLY invoke
                                  # raw inline `command` is refused fail-closed, so
                                  # a compromised/untrusted workflow def cannot run
                                  # arbitrary shell in a rat's worktree.
-require_approval_for_landing = true # land/open_pr normally needs a human gate
-automated_landing_workflows = ["steward"] # land-only exception for managed global
-                                          # definitions; local shadows stay untrusted
-default_merge_mode = "direct"    # fleet-wide fallback for repos registered
-                                 # without an activated `.rk/repo.cue`: "direct" merges the
-                                 # branch, "pr" pushes it and opens a pull/merge
-                                 # request for review (see docs/pr-merge-mode.md).
-                                 # Versioned repository policy takes precedence.
+require_approval_for_landing = true # workflow land/open_pr steps need a human gate;
+                                    # per-repo CUE landing triggers remain the
+                                    # non-agentic unattended policy boundary
 
 # The unattended authority ladder (`rk reconcile`/`rk attention`/`rk lease`):
 # who may resolve a detected cross-ledger contradiction without a human in

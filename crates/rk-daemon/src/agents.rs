@@ -103,11 +103,9 @@ impl AgentState {
 pub struct AgentRecord {
     pub name: String,
     /// Identity of this generation — the join key (`docs/2026-08-17-tkt-c1-generation-identity.md`).
-    /// `None` on a pre-migration record; use [`AgentRecord::spawn_id`], never
-    /// this field directly, so a reader always gets a stable id whether the
-    /// record was minted with one or predates the type. Never rewritten into
-    /// `agents.json` for a backfilled record — the accessor derives it fresh
-    /// every load instead.
+    /// `None` is accepted only while deserializing a pre-migration record.
+    /// [`Registry::load`] durably backfills terminal history and refuses a
+    /// live record without an exact id before any operational reader sees it.
     #[serde(default)]
     pub spawn: Option<rk_core::id::SpawnId>,
     pub role: String,
@@ -458,23 +456,19 @@ impl AgentRecord {
         })
     }
 
-    /// Identity of one *generation* of a name. Names are not recycled (see
-    /// [`Registry::reserve_name`]), so this exists for the one case that can
-    /// still put two rows under one name: the archive/persist crash window,
-    /// where `created_at` tells the archived copy from the live one.
-    fn generation(&self) -> (&str, DateTime<Utc>) {
-        (self.name.as_str(), self.created_at)
+    /// Identity of one generation, including the display name only to keep
+    /// registry corruption obvious at the archive boundary.
+    fn generation(&self) -> (&str, rk_core::id::SpawnId) {
+        (self.name.as_str(), self.spawn_id())
     }
 
-    /// This generation's [`rk_core::id::SpawnId`] — the join key a consumer
-    /// should key on instead of `name` (§2.2 of the design doc). Records
-    /// minted after the migration carry one; a `None` (pre-migration) record
-    /// gets a deterministic synthetic id derived from `created_at`, computed
-    /// fresh on every call rather than rewritten into storage — see
-    /// [`rk_core::id::SpawnId::synthetic_for`].
+    /// This generation's [`rk_core::id::SpawnId`] join key. Registry loading
+    /// durably establishes the exact value before operational use. A missing
+    /// value is an invariant violation, never permission to synthesize
+    /// identity from a timestamp.
     pub fn spawn_id(&self) -> rk_core::id::SpawnId {
         self.spawn
-            .unwrap_or_else(|| rk_core::id::SpawnId::synthetic_for(self.created_at))
+            .expect("AgentRecord must be registry-migrated before operational use")
     }
 }
 
@@ -510,6 +504,7 @@ pub fn append_stderr_tail(tail: &mut Option<String>, line: &str) {
 
 /// Default archive file name, kept beside `agents.json` in the same home.
 const ARCHIVE_FILE: &str = "agents-archive.json";
+const SPAWN_ID_MIGRATION_BACKUP_SUFFIX: &str = ".pre-spawn-id-v1.bak";
 
 /// JSON-file-backed registry. All mutation goes through [`Registry::update`],
 /// which persists synchronously — the file is the daemon's restart memory.
@@ -663,19 +658,66 @@ impl Lane {
 
 impl Registry {
     pub fn load(path: &Path) -> rk_core::Result<Self> {
-        let agents = if path.exists() {
-            let data = std::fs::read_to_string(path)?;
-            serde_json::from_str(&data)?
+        let agents_bytes = if path.exists() {
+            Some(std::fs::read(path)?)
         } else {
-            HashMap::new()
+            None
         };
+        let mut agents: HashMap<String, AgentRecord> = agents_bytes
+            .as_deref()
+            .map(serde_json::from_slice)
+            .transpose()?
+            .unwrap_or_default();
         let archive_path = path.with_file_name(ARCHIVE_FILE);
-        let archived: Vec<AgentRecord> = if archive_path.exists() {
-            let data = std::fs::read_to_string(&archive_path)?;
-            serde_json::from_str(&data)?
+        let archive_bytes = if archive_path.exists() {
+            Some(std::fs::read(&archive_path)?)
         } else {
-            Vec::new()
+            None
         };
+        let mut archived: Vec<AgentRecord> = archive_bytes
+            .as_deref()
+            .map(serde_json::from_slice)
+            .transpose()?
+            .unwrap_or_default();
+
+        let missing_live = agents
+            .values()
+            .chain(archived.iter())
+            .find(|record| record.spawn.is_none() && record.state.is_live());
+        if let Some(record) = missing_live {
+            return Err(rk_core::Error::other(format!(
+                "agent '{}' is live but has no exact spawn id; stop or settle that legacy generation before restarting the daemon",
+                record.name
+            )));
+        }
+        let agents_changed = backfill_terminal_spawn_ids(agents.values_mut());
+        let archive_changed = backfill_terminal_spawn_ids(archived.iter_mut());
+        // Write every rollback copy before changing either ledger. A crash
+        // after one rewrite is restart-safe: the rewritten side is already
+        // current, and the other side is migrated on the next load.
+        if agents_changed {
+            write_migration_backup(path, agents_bytes.as_deref().unwrap_or(b"{}"))?;
+        }
+        if archive_changed {
+            write_migration_backup(&archive_path, archive_bytes.as_deref().unwrap_or(b"[]"))?;
+        }
+        // Copy old name/timestamp keyed transcripts before publishing the
+        // migrated ledgers. The old files stay in place for rollback; exact
+        // runtime readers use only the spawn-keyed copies. Running this on
+        // every load closes the crash window after a ledger rewrite but before
+        // every transcript target was written.
+        let transcript_generations = transcript_migration_generations(&agents, &archived);
+        let transcript_dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("agent-logs");
+        crate::agent_log::migrate_legacy_transcripts(&transcript_dir, &transcript_generations)?;
+        if agents_changed {
+            write_atomic(path, &serde_json::to_vec_pretty(&agents)?)?;
+        }
+        if archive_changed {
+            write_atomic(&archive_path, &serde_json::to_vec_pretty(&archived)?)?;
+        }
         let lane_waiters_path = path.with_file_name(LANE_WAITERS_FILE);
         let lane_waiters: Vec<LaneWaiter> = if lane_waiters_path.exists() {
             let data = std::fs::read_to_string(&lane_waiters_path)?;
@@ -1286,6 +1328,62 @@ impl Registry {
     }
 }
 
+fn backfill_terminal_spawn_ids<'a>(records: impl Iterator<Item = &'a mut AgentRecord>) -> bool {
+    let mut changed = false;
+    for record in records {
+        if record.spawn.is_none() {
+            debug_assert!(!record.state.is_live());
+            record.spawn = Some(rk_core::id::SpawnId::synthetic_for(record.created_at));
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn transcript_migration_generations(
+    agents: &HashMap<String, AgentRecord>,
+    archived: &[AgentRecord],
+) -> Vec<crate::agent_log::Generation> {
+    let mut records: Vec<&AgentRecord> = agents.values().chain(archived.iter()).collect();
+    records.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.created_at.cmp(&right.created_at))
+    });
+    records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let end = records
+                .get(index + 1)
+                .filter(|next| next.name == record.name)
+                .map(|next| next.created_at);
+            crate::agent_log::Generation::of(
+                &record.name,
+                record.spawn_id(),
+                record.created_at,
+                end,
+            )
+        })
+        .collect()
+}
+
+fn migration_backup_path(path: &Path) -> PathBuf {
+    let file = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "agents.json".to_string());
+    path.with_file_name(format!("{file}{SPAWN_ID_MIGRATION_BACKUP_SUFFIX}"))
+}
+
+fn write_migration_backup(path: &Path, original: &[u8]) -> rk_core::Result<()> {
+    let backup = migration_backup_path(path);
+    if !backup.exists() {
+        write_atomic(&backup, original)?;
+    }
+    Ok(())
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> rk_core::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1350,7 +1448,7 @@ mod tests {
     fn record(name: &str, state: AgentState) -> AgentRecord {
         AgentRecord {
             name: name.into(),
-            spawn: None,
+            spawn: Some(rk_core::id::SpawnId::new()),
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),
@@ -1407,6 +1505,81 @@ mod tests {
         r.usage.input = 100;
         r.usage.output = 50;
         r
+    }
+
+    #[test]
+    fn terminal_spawn_id_migration_is_idempotent_and_rollback_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.json");
+        let mut legacy = record("Legacy", AgentState::Completed);
+        legacy.spawn = None;
+        let original =
+            serde_json::to_vec_pretty(&HashMap::from([(legacy.name.clone(), legacy.clone())]))
+                .unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let logs = dir.path().join("agent-logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let old_log = logs.join(format!(
+            "Legacy.{}.jsonl",
+            legacy.created_at.format("%Y%m%dT%H%M%S%3fZ")
+        ));
+        let old_log_bytes = format!(
+            "{}\n",
+            serde_json::to_string(&crate::agent_log::LogEntry {
+                ts: legacy.created_at,
+                event: crate::agent_log::LogEvent::Text {
+                    text: "before migration".into(),
+                },
+            })
+            .unwrap()
+        );
+        std::fs::write(&old_log, &old_log_bytes).unwrap();
+
+        let first = Registry::load(&path).unwrap();
+        let migrated = first.get("Legacy").unwrap();
+        assert_eq!(
+            migrated.spawn,
+            Some(rk_core::id::SpawnId::synthetic_for(legacy.created_at))
+        );
+        let exact_log = logs.join(format!("Legacy.{}.jsonl", migrated.spawn_id()));
+        assert_eq!(std::fs::read_to_string(&exact_log).unwrap(), old_log_bytes);
+        assert_eq!(std::fs::read_to_string(&old_log).unwrap(), old_log_bytes);
+        let migrated_bytes = std::fs::read(&path).unwrap();
+        let backup = migration_backup_path(&path);
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+
+        // Restart is a no-op: neither the current ledger nor its rollback
+        // copy changes once the exact id is present.
+        drop(first);
+        Registry::load(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), migrated_bytes);
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&exact_log).unwrap(), old_log_bytes);
+
+        // Rollback restores the byte-for-byte previous ledger. A later start
+        // may safely reapply the same deterministic migration.
+        std::fs::copy(&backup, &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        Registry::load(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), migrated_bytes);
+    }
+
+    #[test]
+    fn live_legacy_generation_refuses_migration_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.json");
+        let mut legacy = record("Still-Running", AgentState::Running);
+        legacy.spawn = None;
+        let original =
+            serde_json::to_vec_pretty(&HashMap::from([(legacy.name.clone(), legacy)])).unwrap();
+        std::fs::write(&path, &original).unwrap();
+
+        let error = Registry::load(&path)
+            .err()
+            .expect("live legacy row must fail closed");
+        assert!(error.to_string().contains("no exact spawn id"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!migration_backup_path(&path).exists());
     }
 
     /// An actively retrying waiter must refresh its durable heartbeat even

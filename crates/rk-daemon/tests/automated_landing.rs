@@ -1,5 +1,6 @@
-//! Automated landing is an operator-granted capability for managed global
-//! workflows, not a name-based escape hatch available to repo-local files.
+//! Workflow names never grant landing authority. Both managed global and
+//! repo-local definitions must pass the configured human gate; an activated
+//! per-repo CUE policy then constrains the target and mechanical checks.
 
 mod fixture;
 
@@ -109,11 +110,11 @@ async fn run_and_wait(client: &mut Client, repo: &Path) -> serde_json::Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn only_the_managed_global_steward_may_land_without_a_human_gate() {
+async fn neither_global_nor_repo_local_steward_bypasses_the_human_gate() {
     let _env_guard = HARNESS_ENV_LOCK.lock().await;
     std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
 
-    // The managed global definition is explicitly trusted by policy.
+    // A managed global definition carries no name-based exception.
     let trusted_home = tempfile::tempdir().unwrap();
     let trusted_repo = tempfile::tempdir().unwrap();
     init_repo(trusted_repo.path());
@@ -123,15 +124,26 @@ async fn only_the_managed_global_steward_may_land_without_a_human_gate() {
     let trusted_daemon = Daemon::new_in_memory(trusted_layout.clone(), "trusted".into()).unwrap();
     let trusted_handle = tokio::spawn(trusted_daemon.run());
     let mut trusted_client = connect(&trusted_layout).await;
+    trusted_client
+        .call(
+            "repo.add",
+            json!({"name": "trusted", "path": trusted_repo.path()}),
+        )
+        .await
+        .unwrap();
     let trusted = run_and_wait(&mut trusted_client, trusted_repo.path()).await;
-    assert_eq!(trusted["instance"]["status"], "completed", "{trusted}");
+    assert_eq!(trusted["instance"]["status"], "failed", "{trusted}");
+    assert_eq!(
+        trusted["instance"]["error"],
+        "land step requires a prior approved human gate"
+    );
     assert!(
-        trusted_repo.path().join("steward.txt").exists(),
-        "managed steward work must land on main"
+        !trusted_repo.path().join("steward.txt").exists(),
+        "managed workflow work must not land without approval"
     );
     trusted_handle.abort();
 
-    // A repository cannot shadow the trusted name and inherit that authority.
+    // A repository-local definition has the same rule.
     let local_home = tempfile::tempdir().unwrap();
     let local_repo = tempfile::tempdir().unwrap();
     init_repo(local_repo.path());
@@ -142,11 +154,18 @@ async fn only_the_managed_global_steward_may_land_without_a_human_gate() {
     let local_daemon = Daemon::new_in_memory(local_layout.clone(), "local".into()).unwrap();
     let local_handle = tokio::spawn(local_daemon.run());
     let mut local_client = connect(&local_layout).await;
+    local_client
+        .call(
+            "repo.add",
+            json!({"name": "local", "path": local_repo.path()}),
+        )
+        .await
+        .unwrap();
     let local = run_and_wait(&mut local_client, local_repo.path()).await;
     assert_eq!(local["instance"]["status"], "failed", "{local}");
     assert_eq!(
         local["instance"]["error"],
-        "land step requires a prior approved human gate or a trusted automated workflow"
+        "land step requires a prior approved human gate"
     );
     assert!(
         !local_repo.path().join("steward.txt").exists(),
@@ -158,7 +177,7 @@ async fn only_the_managed_global_steward_may_land_without_a_human_gate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn activated_agent_base_policy_authorizes_unattended_feature_branch_landing() {
+async fn activated_agent_base_policy_does_not_replace_human_approval() {
     let _env_guard = HARNESS_ENV_LOCK.lock().await;
     std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     let home = tempfile::tempdir().unwrap();
@@ -188,19 +207,18 @@ async fn activated_agent_base_policy_authorizes_unattended_feature_branch_landin
         .unwrap();
 
     let result = run_and_wait(&mut client, repo.path()).await;
-    assert_eq!(result["instance"]["status"], "completed", "{result}");
+    assert_eq!(result["instance"]["status"], "failed", "{result}");
     assert_eq!(result["instance"]["context"]["approval_granted"], false);
-    assert_eq!(
-        result["instance"]["context"]["previous_result"]["target"],
-        "feature/integration"
-    );
-    assert_eq!(
-        result["instance"]["context"]["previous_result"]["delivered"],
-        true
-    );
     assert!(
-        git(repo.path(), &["show", "feature/integration:steward.txt"])
-            .contains("trusted workflow landed")
+        !Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["show", "feature/integration:steward.txt"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "activated CUE target policy constrains an approved landing; it does not grant approval"
     );
     assert!(
         !Command::new("git")

@@ -9,7 +9,8 @@
 
 use crate::onboarding_proposals::{
     onboarding_tree_revision, OnboardingApplication, OnboardingAutomationKind,
-    OnboardingNamedCheck, OnboardingProposal, OnboardingValidation, OnboardingVerification,
+    OnboardingNamedCheck, OnboardingProposal, OnboardingProposalAction, OnboardingProposalKind,
+    OnboardingValidation, OnboardingVerification,
 };
 use crate::onboarding_sessions::OnboardingSession;
 use chrono::Utc;
@@ -22,6 +23,43 @@ use std::time::Duration;
 
 const CHECKS_TARGET: &str = ".rk/checks.cue";
 const OUTPUT_SUMMARY_LIMIT: usize = 8 * 1024;
+
+/// Prove an immutable proposal is executable before it can be shown for human
+/// approval. This is intentionally git-only: CUE and named-check validation
+/// still run after application in the isolated onboarding worktree.
+pub fn preflight_proposal(
+    session: &OnboardingSession,
+    proposal: &OnboardingProposal,
+) -> rk_core::Result<()> {
+    proposal.validate_integrity()?;
+    validate_supported_target(proposal)?;
+    require_clean(&session.worktree)?;
+    let current_tree = onboarding_tree_revision(&session.worktree)?;
+    if current_tree != proposal.tree_revision {
+        return Err(rk_core::Error::other(format!(
+            "stale onboarding tree before proposal: proposed {}, current {current_tree}",
+            proposal.tree_revision
+        )));
+    }
+    git_with_stdin(
+        &session.worktree,
+        &["apply", "--check", "-"],
+        &proposal.diff,
+    )?;
+    let output = git_with_stdin_output(
+        &session.worktree,
+        &["apply", "--numstat", "-z", "-"],
+        &proposal.diff,
+    )?;
+    let paths = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .filter_map(|record| record.splitn(3, |byte| *byte == b'\t').nth(2))
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect::<Vec<_>>();
+    require_only_target(&paths, &proposal.target_path)
+}
 
 /// Apply (or recover) the exact approved patch and return durable evidence for
 /// its one onboarding-branch commit.
@@ -63,24 +101,12 @@ pub fn ensure_application(
         .any(|line| line.trim() == expected_trailer);
     if committed_recovery {
         require_clean(worktree)?;
-        let parent_tree = git_text(worktree, &["rev-parse", "HEAD^^{tree}"])?;
-        if parent_tree != proposal.tree_revision {
-            return Err(rk_core::Error::other(format!(
-                "recovered onboarding commit parent drifted: proposed {}, current {parent_tree}",
-                proposal.tree_revision
-            )));
-        }
+        require_proposal_base(session, proposal, "HEAD^")?;
         validate_target(&target, proposal)?;
         return application_evidence(worktree, &target, actor);
     }
 
-    let current_tree = onboarding_tree_revision(worktree)?;
-    if current_tree != proposal.tree_revision {
-        return Err(rk_core::Error::other(format!(
-            "stale onboarding tree before apply: proposed {}, current {current_tree}",
-            proposal.tree_revision
-        )));
-    }
+    require_proposal_base(session, proposal, "HEAD")?;
 
     let dirty_paths = status_paths(worktree)?;
     if dirty_paths.is_empty() {
@@ -276,6 +302,11 @@ fn application_evidence(
 }
 
 fn validate_supported_target(proposal: &OnboardingProposal) -> rk_core::Result<()> {
+    if proposal.kind == OnboardingProposalKind::RepoFile
+        && proposal.action == OnboardingProposalAction::WriteRepoFile
+    {
+        return Ok(());
+    }
     if proposal.target_path == CHECKS_TARGET && proposal.named_check.is_some() {
         return Ok(());
     }
@@ -292,6 +323,20 @@ fn validate_target(path: &Path, proposal: &OnboardingProposal) -> rk_core::Resul
     if let Some(contract) = proposal.named_check.as_ref() {
         return validate_contract(path, contract).map(|_| ());
     }
+    if proposal.kind == OnboardingProposalKind::RepoFile
+        && proposal.action == OnboardingProposalAction::WriteRepoFile
+    {
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+            rk_core::Error::other(format!("read staged repo file {}: {error}", path.display()))
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(rk_core::Error::other(format!(
+                "staged repo-file target must be a regular file: {}",
+                path.display()
+            )));
+        }
+        return Ok(());
+    }
     let kind = proposal.automation_kind().ok_or_else(|| {
         rk_core::Error::other(format!(
             "proposal {} has no supported validation contract",
@@ -299,6 +344,43 @@ fn validate_target(path: &Path, proposal: &OnboardingProposal) -> rk_core::Resul
         ))
     })?;
     validate_automation_file(path, kind).map(|_| ())
+}
+
+/// Accept the proposal's exact reviewed tree, or a descendant made solely by
+/// a previously journaled application in this same onboarding session. This
+/// lets several proposals approved against one assessment apply in order while
+/// refusing arbitrary branch movement.
+fn require_proposal_base(
+    session: &OnboardingSession,
+    proposal: &OnboardingProposal,
+    revision: &str,
+) -> rk_core::Result<()> {
+    let tree = git_text(
+        &session.worktree,
+        &["rev-parse", &format!("{revision}^{{tree}}")],
+    )?;
+    if tree == proposal.tree_revision {
+        return Ok(());
+    }
+    let commit = git_text(&session.worktree, &["rev-parse", revision])?;
+    let recorded_predecessor = session.proposals.iter().any(|candidate| {
+        candidate.id != proposal.id
+            && candidate
+                .application
+                .as_ref()
+                .is_some_and(|application| application.commit == commit)
+    });
+    let reviewed_tree_is_ancestor = git_text(&session.worktree, &["log", "--format=%T", revision])?
+        .lines()
+        .any(|candidate| candidate == proposal.tree_revision);
+    if recorded_predecessor && reviewed_tree_is_ancestor {
+        Ok(())
+    } else {
+        Err(rk_core::Error::other(format!(
+            "stale onboarding tree before apply: proposed {}, current {tree}",
+            proposal.tree_revision
+        )))
+    }
 }
 
 fn validate_contract(path: &Path, contract: &OnboardingNamedCheck) -> rk_core::Result<Check> {
@@ -532,6 +614,10 @@ fn git_text(worktree: &Path, args: &[&str]) -> rk_core::Result<String> {
 }
 
 fn git_with_stdin(worktree: &Path, args: &[&str], input: &str) -> rk_core::Result<()> {
+    git_with_stdin_output(worktree, args, input).map(|_| ())
+}
+
+fn git_with_stdin_output(worktree: &Path, args: &[&str], input: &str) -> rk_core::Result<Output> {
     let mut child = Command::new("git")
         .arg("-C")
         .arg(worktree)
@@ -548,7 +634,7 @@ fn git_with_stdin(worktree: &Path, args: &[&str], input: &str) -> rk_core::Resul
         .write_all(input.as_bytes())?;
     let output = child.wait_with_output()?;
     if output.status.success() {
-        Ok(())
+        Ok(output)
     } else {
         Err(rk_core::Error::other(format!(
             "git {} failed: {}",

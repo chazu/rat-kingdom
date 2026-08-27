@@ -39,6 +39,7 @@
 use crate::agents::AgentRecord;
 use crate::workflow_exec::{Instance, InstanceStatus};
 use rk_core::tuple::Tuple;
+use rk_git::Ancestry;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -150,12 +151,12 @@ pub struct ConvergenceReport {
 /// repository.
 #[derive(Debug, Default, Clone)]
 pub struct GitFacts {
-    /// `(merge_commit, target) -> is merge_commit an ancestor of target?`
+    /// `(merge_commit, target) -> present | absent | unknown ancestry`
     /// Answers [`kind::TRACKER_CONTRADICTS_GIT`] for each ticket's delivery
     /// record. A pair absent from this map means the caller could not check
     /// it (unregistered or unopenable repo) — treated as "no evidence
     /// either way", never as a violation.
-    pub is_ancestor: HashMap<(String, String), bool>,
+    pub is_ancestor: HashMap<(String, String), Ancestry>,
     /// `(scope, branch)` pairs a dropped land has since actually reached its
     /// target by any route (merged, or the branch is gone) — the same
     /// self-clearing check `rk inbox`'s `unlanded-branch` row uses.
@@ -348,16 +349,15 @@ fn conflict_held_landing(lands: &[Tuple], git: &GitFacts) -> Vec<Violation> {
                 .and_then(Value::as_str)
                 .filter(|d| !d.trim().is_empty())
                 .unwrap_or("no detail recorded");
+            let chain_key = t.payload.get("chain_key").and_then(Value::as_str)?;
             // Distinct held conflicts on the SAME branch (this one corrected,
             // then a later, genuinely new conflict) must never share an id:
             // `find_decision`'s terminal-replay lookup and the orchestrator
             // lease's cursor both key off `Violation::id` alone, so a shared
             // id would either replay the OLD chain's decision forever or
             // leave the new chain permanently behind the cursor. A land with
-            // no `chain_key` (the pre-existing workflow-`land`-step source of
-            // this same violation kind) falls back to the bare
-            // `kind:scope:branch` id, unchanged from before this field
-            // existed.
+            // no exact chain key remains visible in the ordinary inbox but is
+            // not eligible for orchestrator action.
             //
             // The differentiator is the land tuple's OWN `t.id`, not the raw
             // `chain_key` string: `chain_key` is `ConflictContext::dispatch_key`,
@@ -369,17 +369,13 @@ fn conflict_held_landing(lands: &[Tuple], git: &GitFacts) -> Vec<Violation> {
             // cursor. `t.id` (`rk_core::id::RecordId`, a ULID) is guaranteed
             // unique AND lexicographically sortable by real creation time,
             // which is exactly what "distinct AND reachable" requires.
-            let chain_key = t.payload.get("chain_key").and_then(Value::as_str);
-            let id = match chain_key {
-                Some(_) => format!(
-                    "{}:{}:{}:{}",
-                    kind::CONFLICT_HELD_LANDING,
-                    t.scope,
-                    branch,
-                    t.id
-                ),
-                None => format!("{}:{}:{}", kind::CONFLICT_HELD_LANDING, t.scope, branch),
-            };
+            let id = format!(
+                "{}:{}:{}:{}",
+                kind::CONFLICT_HELD_LANDING,
+                t.scope,
+                branch,
+                t.id
+            );
             let mut evidence = vec![
                 format!("branch_landed:{}", t.id),
                 format!("branch:{branch}"),
@@ -396,9 +392,7 @@ fn conflict_held_landing(lands: &[Tuple], git: &GitFacts) -> Vec<Violation> {
             // named by `violation.id` — a TOCTOU window between the report
             // snapshot `attention.decide` authorized against and the
             // dispatch's own re-read moments later.
-            if let Some(chain_key) = chain_key {
-                evidence.push(format!("chain_key:{chain_key}"));
-            }
+            evidence.push(format!("chain_key:{chain_key}"));
             Some(Violation {
                 id,
                 kind: kind::CONFLICT_HELD_LANDING.into(),
@@ -428,10 +422,11 @@ fn tracker_contradicts_git(tickets: &[Tuple], git: &GitFacts) -> Vec<Violation> 
                 return None;
             }
             let key = (record.merge_commit.clone(), record.target.clone());
-            // `None` means the caller could not check (unregistered or
-            // unopenable repo) — absence of evidence, not evidence of a
-            // contradiction, so no violation is raised.
-            if git.is_ancestor.get(&key).copied().unwrap_or(true) {
+            // Only a clean negative is contradictory. `None` and `Unknown`
+            // mean the caller could not check (unregistered/unopenable repo,
+            // or deleted historical revision) — absence of evidence, not
+            // evidence of absence.
+            if git.is_ancestor.get(&key) != Some(&Ancestry::Absent) {
                 return None;
             }
             Some(Violation {
@@ -495,27 +490,12 @@ fn generation_of<'a>(
 /// means that generation is no longer in the agent view at all — nothing to
 /// report, never a fall back to the name.
 ///
-/// Legacy instances snapshotted before `active_agent_spawn` existed carry no
-/// generation identity, so they fall back to the name join this check has
-/// always used, fenced by the instant the run settled: an agent record
-/// created at or after that instant cannot be the one the run was
-/// supervising, so a newer namesake is still never mistaken for a leak. An
-/// instance with no settlement timestamp has no fence to apply and stays
-/// silent rather than risk a mechanical dismissal on a name alone.
-fn supervised_generation<'a>(
-    i: &Instance,
-    agents: &'a [AgentRecord],
-    by_name: &HashMap<&str, &'a AgentRecord>,
-) -> Option<&'a AgentRecord> {
+/// A persisted instance without `active_agent_spawn` cannot be joined safely.
+/// It stays silent rather than reintroducing a name/time heuristic into a
+/// mechanically actionable check.
+fn supervised_generation<'a>(i: &Instance, agents: &'a [AgentRecord]) -> Option<&'a AgentRecord> {
     let active = i.context.active_agent.as_deref()?;
-    match i.context.active_agent_spawn {
-        Some(spawn) => generation_of(agents, active, spawn),
-        None => {
-            let settled_at = i.completed_at?;
-            let candidate = by_name.get(active).copied()?;
-            (candidate.created_at < settled_at).then_some(candidate)
-        }
-    }
+    generation_of(agents, active, i.context.active_agent_spawn?)
 }
 
 /// A workflow instance's own ledger records the run as settled
@@ -532,13 +512,12 @@ fn workflow_settled_agent_still_live(
     instances: &[Instance],
     agents: &[AgentRecord],
 ) -> Vec<Violation> {
-    let by_name = latest_by(agents, |a| Some(a.name.as_str()));
     instances
         .iter()
         .filter(|i| i.archived_at.is_none())
         .filter(|i| matches!(i.status, InstanceStatus::Completed | InstanceStatus::Failed))
         .filter_map(|i| {
-            let agent = supervised_generation(i, agents, &by_name)?;
+            let agent = supervised_generation(i, agents)?;
             if !agent.state.is_live() {
                 return None;
             }
@@ -673,7 +652,7 @@ mod tests {
     fn agent(name: &str, task: Option<&str>, state: AgentState) -> AgentRecord {
         AgentRecord {
             name: name.into(),
-            spawn: None,
+            spawn: Some(rk_core::id::SpawnId::new()),
             role: "worker".into(),
             coordination: None,
             harness: "claude".into(),
@@ -736,7 +715,6 @@ mod tests {
             instance_max_usd: None,
             definition: "some-workflow".into(),
             definition_digest: String::new(),
-            automated_landing_authorized: false,
             params: Default::default(),
             depth: 0,
             started_at: Utc::now(),
@@ -941,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_land_uncleared_by_git_is_flagged() {
+    fn a_dropped_land_without_an_exact_chain_is_not_orchestrator_actionable() {
         let land = branch_landed("myrepo", "rat/x/tkt-1", "main", false, false);
         let report = build(
             "myrepo",
@@ -953,18 +931,7 @@ mod tests {
             &[],
             &GitFacts::default(),
         );
-        assert_eq!(report.violations.len(), 1);
-        assert_eq!(report.violations[0].kind, kind::CONFLICT_HELD_LANDING);
-        assert_eq!(report.violations[0].subject, "rat/x/tkt-1");
-        // Legacy path (no `chain_key`, the pre-existing workflow-`land`-step
-        // source of this violation): the id stays the bare `kind:scope:branch`
-        // shape it had before `chain_key` existed, not the tuple-id-suffixed
-        // shape a conflict-correction hold now gets — an already-decided
-        // legacy item must keep resolving to the same id it always has.
-        assert_eq!(
-            report.violations[0].id,
-            format!("{}:myrepo:rat/x/tkt-1", kind::CONFLICT_HELD_LANDING)
-        );
+        assert!(report.violations.is_empty());
     }
 
     #[test]
@@ -1081,7 +1048,7 @@ mod tests {
     fn git_disagreeing_with_a_delivery_record_is_flagged() {
         let t = ticket("TKT-1", "myrepo", "closed", delivery_json("abc123", "main"));
         let mut is_ancestor = HashMap::new();
-        is_ancestor.insert(("abc123".to_string(), "main".to_string()), false);
+        is_ancestor.insert(("abc123".to_string(), "main".to_string()), Ancestry::Absent);
         let git = GitFacts {
             is_ancestor,
             ..Default::default()
@@ -1121,10 +1088,49 @@ mod tests {
     }
 
     #[test]
+    fn deleted_historical_intermediate_target_is_unknown_not_a_contradiction() {
+        // Regression: work landed as 01011fec on a temporary Provolone
+        // target, main later advanced to 7a6a4e8, and the intermediate ref was
+        // deleted. Git can no longer resolve the historical target; that is
+        // not a clean negative ancestry verdict and must not page a human.
+        let t = ticket(
+            "TKT-1",
+            "myrepo",
+            "closed",
+            delivery_json("01011fec", "temp/provolone"),
+        );
+        let mut is_ancestor = HashMap::new();
+        is_ancestor.insert(
+            ("01011fec".to_string(), "temp/provolone".to_string()),
+            Ancestry::Unknown,
+        );
+        let git = GitFacts {
+            is_ancestor,
+            ..Default::default()
+        };
+
+        let report = build(
+            "myrepo",
+            &[t],
+            &[],
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            &git,
+        );
+
+        assert!(report.violations.is_empty());
+    }
+
+    #[test]
     fn git_confirming_the_delivery_record_is_not_flagged() {
         let t = ticket("TKT-1", "myrepo", "closed", delivery_json("abc123", "main"));
         let mut is_ancestor = HashMap::new();
-        is_ancestor.insert(("abc123".to_string(), "main".to_string()), true);
+        is_ancestor.insert(
+            ("abc123".to_string(), "main".to_string()),
+            Ancestry::Present,
+        );
         let git = GitFacts {
             is_ancestor,
             ..Default::default()
@@ -1362,58 +1368,11 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_instance_without_a_spawn_id_still_flags_its_own_live_agent() {
-        // Pre-migration snapshot: no generation identity recorded, so the
-        // name join stands — fenced by the settlement instant, which this
-        // agent predates.
+    fn an_instance_without_a_spawn_id_cannot_trigger_mechanical_action() {
         let a = agent("Whisker", None, AgentState::Running);
         let mut i = instance("wf-1", "myrepo", InstanceStatus::Completed, Some("Whisker"));
         assert!(i.context.active_agent_spawn.is_none());
         i.completed_at = Some(a.created_at + chrono::Duration::seconds(60));
-        let report = build(
-            "myrepo",
-            &[],
-            &[a],
-            &[],
-            &HashSet::new(),
-            &HashSet::new(),
-            &[i],
-            &GitFacts::default(),
-        );
-        assert_eq!(report.violations.len(), 1);
-        assert_eq!(
-            report.violations[0].kind,
-            kind::WORKFLOW_SETTLED_AGENT_STILL_LIVE
-        );
-    }
-
-    #[test]
-    fn a_legacy_instance_does_not_flag_a_namesake_spawned_after_it_settled() {
-        // Same legacy shape, but the only record holding the name was created
-        // after the run was already over, so it cannot be what the run held.
-        let a = agent("Whisker", None, AgentState::Running);
-        let mut i = instance("wf-1", "myrepo", InstanceStatus::Completed, Some("Whisker"));
-        i.completed_at = Some(a.created_at - chrono::Duration::seconds(60));
-        let report = build(
-            "myrepo",
-            &[],
-            &[a],
-            &[],
-            &HashSet::new(),
-            &HashSet::new(),
-            &[i],
-            &GitFacts::default(),
-        );
-        assert!(report.violations.is_empty());
-    }
-
-    #[test]
-    fn a_legacy_instance_with_no_settlement_timestamp_is_not_flagged() {
-        // No generation identity and no fence to apply: silence beats a
-        // mechanical dismissal decided on a reusable name alone.
-        let a = agent("Whisker", None, AgentState::Running);
-        let i = instance("wf-1", "myrepo", InstanceStatus::Completed, Some("Whisker"));
-        assert!(i.completed_at.is_none());
         let report = build(
             "myrepo",
             &[],
@@ -1439,9 +1398,10 @@ mod tests {
             delivery_json("abc123", "main"),
         );
         let agent_rec = agent("Whisker", Some("TKT-1"), AgentState::Dismissed);
-        let land = branch_landed("myrepo", "rat/x/tkt-1", "main", false, false);
+        let mut land = branch_landed("myrepo", "rat/x/tkt-1", "main", false, false);
+        land.payload["chain_key"] = Value::String("chain-1".into());
         let mut is_ancestor = HashMap::new();
-        is_ancestor.insert(("def456".to_string(), "main".to_string()), false);
+        is_ancestor.insert(("def456".to_string(), "main".to_string()), Ancestry::Absent);
         let human_ticket = ticket("TKT-2", "myrepo", "closed", delivery_json("def456", "main"));
         let git = GitFacts {
             is_ancestor,

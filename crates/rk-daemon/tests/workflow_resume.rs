@@ -71,6 +71,7 @@ fn init_repo() -> tempfile::TempDir {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
     support::install_passing_landing_checks(repo_dir.path());
 
     let wf_dir = repo_dir.path().join(".rk").join("workflows");
@@ -166,6 +167,7 @@ async fn parked_gate_instance_survives_restart_and_completes() {
     let daemon_a = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle_a = tokio::spawn(daemon_a.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     let id = run_to_gate(&mut client, repo_dir.path(), "restart-me").await;
 
     // The parked instance was persisted to disk — the state the successor reads.
@@ -184,6 +186,7 @@ async fn parked_gate_instance_survives_restart_and_completes() {
     let daemon_b = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle_b = tokio::spawn(daemon_b.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // The resumed instance is back in the registry, still Running and re-parked
     // at the approval gate (step 3) — rehydrate both LOADED and RESUMED it.

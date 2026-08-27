@@ -47,6 +47,13 @@ async fn connect(layout: &Layout) -> Client {
 }
 
 fn draft(title: &str, suffix: &str) -> Value {
+    let source = format!(
+        "checks: [{{name: \"{suffix}\", command: \"cargo test\", cwd: \".\", expectExit: 0, timeout: \"10m\", environmentPolicy: \"strip_rk_spawn\", toolchain: \"repository Rust toolchain\"}}]\n"
+    );
+    let body = source
+        .lines()
+        .map(|line| format!("+{line}\n"))
+        .collect::<String>();
     json!({
         "kind": "repo_file",
         "title": title,
@@ -54,7 +61,8 @@ fn draft(title: &str, suffix: &str) -> Value {
         "target_path": ".rk/checks.cue",
         "action": "write_repo_file",
         "diff": format!(
-            "--- /dev/null\n+++ b/.rk/checks.cue\n+{suffix}: {{ command: \"cargo test\" }}\n"
+            "diff --git a/.rk/checks.cue b/.rk/checks.cue\nnew file mode 100644\n--- /dev/null\n+++ b/.rk/checks.cue\n@@ -0,0 +1,{} @@\n{body}",
+            source.lines().count()
         ),
         "risk": "low",
         "verification": ["cargo test"],

@@ -17,7 +17,7 @@
 
 mod support;
 
-use rk_core::paths::Layout;
+use rk_core::{id::SpawnId, paths::Layout};
 use rk_daemon::{Client, Daemon};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -47,6 +47,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 }
 
 /// Commits `.rk/checks.cue` onto `main` before any branch forks off it, so
@@ -119,6 +120,7 @@ struct Completion<'a> {
 /// without needing to reproduce the full respawn/pause machinery that
 /// produced the duplicate `task_done` in the field.
 async fn emit_harness_result(client: &mut Client, repo_name: &str, c: Completion<'_>) {
+    let spawn = SpawnId::new();
     client
         .call(
             "space.out",
@@ -128,7 +130,7 @@ async fn emit_harness_result(client: &mut Client, repo_name: &str, c: Completion
                 "identity": "harness_result",
                 "payload": {
                     "agent": c.agent,
-                    "spawn": format!("spawn-{}", c.agent),
+                    "spawn": spawn.to_string(),
                     "role": "rat",
                     "task": c.task,
                     "branch": c.branch,
@@ -333,6 +335,7 @@ async fn concurrent_duplicate_land_submissions_produce_one_live_landing_entry() 
     let daemon = Daemon::new_in_memory(layout.clone(), "dedup-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, &repo).await;
 
     let ticket = client
         .call(

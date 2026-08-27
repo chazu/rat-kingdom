@@ -3,16 +3,12 @@
 //! execute to a durable human gate, and advance the resumable cursor past
 //! it — without ever claiming the underlying problem is resolved.
 //!
-//! The motivating shape is the LIVE evidence the ticket names verbatim: a
-//! `conflict-held-landing` violation with a `branch_landed:` evidence
-//! reference and NO `chain_key` marker at all — a legacy item that predates
-//! the bounded-chain marker feature. `conflict.dispatch_correction`
-//! (`Server::execute_orchestrator`) fails closed against exactly this shape
-//! (`landing.rs::dispatch_held_conflict`'s "no conflict-correction chain ...
-//! has ever been held" error), and — before this ticket — a failed,
-//! non-terminal attempt never advances the lease cursor, so this ONE
-//! historical item pins the entire resumable queue forever and hides every
-//! later, genuinely bounded conflict behind it.
+//! The motivating shape is a current, exactly keyed
+//! `conflict-held-landing` violation whose matching dispatch marker is
+//! missing. `conflict.dispatch_correction` (`Server::execute_orchestrator`)
+//! fails closed against this shape because there is no authoritative
+//! `ConflictContext` to execute. A human can still decide how to repair or
+//! abandon the branch without reviving the removed branch-latest fallback.
 //!
 //! This file proves `disposition: "defer_to_human"`:
 //! - requires the SAME live, fenced lease the execute arm requires — no/stale
@@ -24,8 +20,8 @@
 //!   inbox`/`rk inbox ack` boundary every other automated recovery
 //!   escalation in this daemon uses — no second queue;
 //! - advances the SAME orchestrator cursor `attention.decide`'s execute arm
-//!   advances, so `attention.next` reaches a later, genuinely bounded
-//!   conflict instead of being pinned behind the legacy item forever;
+//!   advances, so `attention.next` reaches a later executable conflict
+//!   instead of being pinned behind the markerless item forever;
 //! - is idempotent: replaying the same deferral returns the same record and
 //!   never duplicates the decision, the gate, or the cursor advance;
 //! - survives a genuine daemon restart; and
@@ -79,6 +75,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 }
 
 fn branch_off_main(dir: &Path, branch: &str, file: &str) -> String {
@@ -114,13 +111,13 @@ async fn attention_next(client: &mut Client, repo: &str) -> Option<Value> {
     res.get("item").filter(|v| !v.is_null()).cloned()
 }
 
-/// The EXACT live evidence shape the ticket names: a `branch_landed` event
-/// with no accompanying `landing_conflict_rework_dispatch` marker at all and
-/// no `chain_key` — a legacy `conflict-held-landing` item from before the
-/// bounded-chain marker feature existed. `dispatch_held_conflict` fails
-/// closed against this (no marker to reconstruct a `ConflictContext` from),
-/// which is precisely what makes `disposition: "defer_to_human"` necessary.
-async fn legacy_held_conflict(client: &mut Client, repo: &str, branch: &str, target: &str) {
+/// An exactly keyed `branch_landed` event whose matching
+/// `landing_conflict_rework_dispatch` marker is absent. It is safe to surface
+/// for a human disposition because its identity is exact, but execution
+/// fails closed because no authoritative `ConflictContext` exists.
+async fn markerless_held_conflict(client: &mut Client, repo: &str, branch: &str, target: &str) {
+    let chain_key =
+        format!("{repo}\0{branch}\0missing-head\0{target}\0missing-task\0missing-rework");
     client
         .call(
             "space.out",
@@ -133,6 +130,7 @@ async fn legacy_held_conflict(client: &mut Client, repo: &str, branch: &str, tar
                     "target": target,
                     "merged": false,
                     "pr_opened": false,
+                    "chain_key": chain_key,
                     "detail": "merge conflict or failure: CONFLICT (content): Merge conflict in lib.rs",
                 },
             }),
@@ -226,7 +224,7 @@ async fn defer(
                 "holder": holder,
                 "generation": generation,
                 "disposition": "defer_to_human",
-                "reason": "no bounded chain marker exists for this legacy item; dispatch would refuse",
+                "reason": "the exact conflict dispatch marker is missing; dispatch would refuse",
                 "requested_decision": "resolve or abandon the feature branch by hand",
             }),
         )
@@ -414,11 +412,11 @@ async fn defer_requires_a_live_fenced_lease_and_refuses_with_zero_side_effect() 
         .await
         .unwrap();
 
-    legacy_held_conflict(&mut client, repo, "feature", "main").await;
+    markerless_held_conflict(&mut client, repo, "feature", "main").await;
 
     let item = attention_next(&mut client, repo)
         .await
-        .expect("a legacy held conflict must still surface as an attention item");
+        .expect("an exactly keyed markerless conflict must surface for a human disposition");
     assert_eq!(item["kind"], "conflict-held-landing");
     assert_eq!(item["effective_authority"], "orchestrator");
     let item_id = item["id"].as_str().unwrap().to_string();
@@ -482,7 +480,7 @@ async fn defer_writes_one_gated_terminal_decision_and_a_durable_inbox_gate_repla
         .await
         .unwrap();
 
-    legacy_held_conflict(&mut client, repo, "feature", "main").await;
+    markerless_held_conflict(&mut client, repo, "feature", "main").await;
     let item = attention_next(&mut client, repo).await.unwrap();
     let item_id = item["id"].as_str().unwrap().to_string();
 
@@ -519,7 +517,7 @@ async fn defer_writes_one_gated_terminal_decision_and_a_durable_inbox_gate_repla
     assert!(decision["reason"]
         .as_str()
         .unwrap()
-        .contains("no bounded chain marker"));
+        .contains("exact conflict dispatch marker is missing"));
 
     // No mutation happened: no ticket/repo/agent action, no correction agent.
     assert_eq!(agent_spawn_count(&mut client, repo).await, 0);
@@ -607,7 +605,7 @@ async fn defer_writes_one_gated_terminal_decision_and_a_durable_inbox_gate_repla
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deferring_a_legacy_item_lets_attention_next_reach_a_later_bounded_conflict() {
+async fn deferring_a_markerless_item_lets_attention_next_reach_a_later_executable_conflict() {
     let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
@@ -624,10 +622,10 @@ async fn deferring_a_legacy_item_lets_attention_next_reach_a_later_bounded_confl
         .await
         .unwrap();
 
-    // The legacy item that would otherwise pin the queue forever.
-    legacy_held_conflict(&mut client, repo, "feature", "main").await;
-    let legacy_item = attention_next(&mut client, repo).await.unwrap();
-    let legacy_id = legacy_item["id"].as_str().unwrap().to_string();
+    // The exactly keyed but markerless item that would otherwise pin the queue forever.
+    markerless_held_conflict(&mut client, repo, "feature", "main").await;
+    let markerless_item = attention_next(&mut client, repo).await.unwrap();
+    let markerless_id = markerless_item["id"].as_str().unwrap().to_string();
 
     // A genuinely later, bounded, chain-keyed conflict on ANOTHER branch.
     bounded_held_conflict(
@@ -647,15 +645,15 @@ async fn deferring_a_legacy_item_lets_attention_next_reach_a_later_bounded_confl
         .unwrap();
     let generation = lease["generation"].as_u64().unwrap();
 
-    // Before deferring: `attention.next` still starts at the legacy item
+    // Before deferring: `attention.next` still starts at the markerless item
     // (lexicographically first / no cursor yet).
     let next = attention_next(&mut client, repo).await.unwrap();
-    assert_eq!(next["id"], legacy_id);
+    assert_eq!(next["id"], markerless_id);
 
     let deferred = defer(
         &mut client,
         repo,
-        &legacy_id,
+        &markerless_id,
         Some("orch-1"),
         Some(generation),
     )
@@ -665,11 +663,11 @@ async fn deferring_a_legacy_item_lets_attention_next_reach_a_later_bounded_confl
     assert_eq!(deferred["gated"], true);
 
     // The queue is unstuck: the next item is the later bounded conflict, not
-    // the same legacy item again.
+    // the same markerless item again.
     let next = attention_next(&mut client, repo)
         .await
         .expect("a later, genuinely bounded conflict must be reachable after a deferral");
-    assert_ne!(next["id"], legacy_id);
+    assert_ne!(next["id"], markerless_id);
     assert_eq!(next["kind"], "conflict-held-landing");
     assert_eq!(next["subject"], "other-feature");
     let bounded_id = next["id"].as_str().unwrap().to_string();
@@ -711,7 +709,7 @@ async fn defer_is_refused_for_non_orchestrator_authority_and_unrecognized_dispos
         .await
         .unwrap();
 
-    legacy_held_conflict(&mut client, repo, "feature", "main").await;
+    markerless_held_conflict(&mut client, repo, "feature", "main").await;
     let item = attention_next(&mut client, repo).await.unwrap();
     let item_id = item["id"].as_str().unwrap().to_string();
 
@@ -803,7 +801,7 @@ async fn deferred_decision_and_inbox_gate_survive_a_genuine_daemon_restart() {
         .call("repo.add", json!({"name": repo, "path": &repo_path}))
         .await
         .unwrap();
-    legacy_held_conflict(&mut client, repo, "feature", "main").await;
+    markerless_held_conflict(&mut client, repo, "feature", "main").await;
 
     let lease = client
         .call("lease.acquire", json!({"repo": repo, "holder": "orch-1"}))
@@ -887,7 +885,7 @@ async fn a_stray_non_terminal_intent_never_blocks_or_duplicates_a_resumed_deferr
         .await
         .unwrap();
 
-    legacy_held_conflict(&mut client, repo, "feature", "main").await;
+    markerless_held_conflict(&mut client, repo, "feature", "main").await;
     let item = attention_next(&mut client, repo).await.unwrap();
     let item_id = item["id"].as_str().unwrap().to_string();
 
@@ -943,7 +941,7 @@ async fn a_gate_already_written_before_a_crash_is_reused_not_duplicated_on_resum
         .await
         .unwrap();
 
-    legacy_held_conflict(&mut client, repo, "feature", "main").await;
+    markerless_held_conflict(&mut client, repo, "feature", "main").await;
     let item = attention_next(&mut client, repo).await.unwrap();
     let item_id = item["id"].as_str().unwrap().to_string();
 
@@ -1034,7 +1032,7 @@ async fn a_cursor_advanced_before_a_crash_still_converges_to_one_terminal_decisi
         .await
         .unwrap();
 
-    legacy_held_conflict(&mut client, repo, "feature", "main").await;
+    markerless_held_conflict(&mut client, repo, "feature", "main").await;
     let item = attention_next(&mut client, repo).await.unwrap();
     let item_id = item["id"].as_str().unwrap().to_string();
 
@@ -1131,7 +1129,7 @@ async fn attention_next_alone_completes_a_terminal_record_left_dangling_by_a_cur
         .call("repo.add", json!({"name": repo, "path": &repo_path}))
         .await
         .unwrap();
-    legacy_held_conflict(&mut client, repo, "feature", "main").await;
+    markerless_held_conflict(&mut client, repo, "feature", "main").await;
     let item = attention_next(&mut client, repo).await.unwrap();
     let item_id = item["id"].as_str().unwrap().to_string();
 

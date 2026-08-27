@@ -1145,20 +1145,6 @@ impl Default for EvaporationConfig {
     }
 }
 
-/// How an agent's branch reaches its base once the work is done: `Direct` is a
-/// plain git merge into the base (the historical behaviour); `Pr` opens a
-/// pull/merge request via git and leaves the branch for review rather than
-/// merging it. Per-repo on [`crate::config`]-consuming `RepoRecord`; the
-/// fleet-wide fallback for repos registered without an explicit mode is
-/// [`PolicyConfig::default_merge_mode`].
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum MergeMode {
-    #[default]
-    Direct,
-    Pr,
-}
-
 /// Workflow-execution policy. The seed of the #19 policy engine: today it gates
 /// the one primitive that can run arbitrary shell — the workflow `run` step.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1174,34 +1160,8 @@ pub struct PolicyConfig {
     /// legacy definitions.
     pub require_named_checks: bool,
     /// Require an explicit human approval gate to have granted access before a
-    /// workflow may land a branch or open a PR. Managed global definitions in
-    /// `automated_landing_workflows` are the narrow exception for `land` only;
-    /// `open_pr` remains human-gated.
+    /// workflow may land a branch or open a PR.
     pub require_approval_for_landing: bool,
-    /// Managed global workflow names allowed to land without a human approval
-    /// gate. The executor binds this authority to a definition loaded directly
-    /// from the operator-owned global workflow directory; a repo-local file
-    /// with the same name cannot inherit it.
-    ///
-    /// NARROWED SCOPE since the daemon-native landing pipeline (Phase 3/4 of
-    /// the steward remediation, `crates/rk-daemon/src/landing.rs`): the
-    /// primary unattended-landing path no longer goes through a workflow
-    /// `land` step at all — `LandingPipeline` calls `Supervisor::land`
-    /// directly on an APPROVE/gates-passed decision, so this list is never
-    /// consulted for it. This knob now exists only for an operator-authored
-    /// CUSTOM workflow that still uses an explicit `land` step (e.g. a
-    /// bespoke `curator` workflow); it is not, and no longer needs to be, the
-    /// fleet's primary landing authority.
-    pub automated_landing_workflows: Vec<String>,
-    /// Fleet-wide default merge mode for a repo registered without an explicit
-    /// `rk repo add --merge-mode`. A repo's own `RepoRecord.merge_mode` overrides
-    /// this. Defaults to `Direct` (plain git merge) for backward compatibility.
-    pub default_merge_mode: MergeMode,
-    /// Exact branch names workflow `land`/`open_pr` may target. This is an
-    /// explicit allowlist because those steps can change shared repository
-    /// state. Configure the project base branch here when it is not `main` or
-    /// `master`; an empty list denies all workflow landing targets.
-    pub allowed_target_branches: Vec<String>,
     /// The authority-ladder matrix (`crate::action`'s unattended-orchestration
     /// counterpart to the mechanical/orchestrator/human split
     /// `rk-daemon::reconcile::Authority` assigns each cross-ledger
@@ -1285,9 +1245,6 @@ impl Default for PolicyConfig {
         Self {
             require_named_checks: true,
             require_approval_for_landing: true,
-            automated_landing_workflows: vec!["steward".into()],
-            default_merge_mode: MergeMode::default(),
-            allowed_target_branches: vec!["main".into(), "master".into()],
             authority_overrides: BTreeMap::new(),
             orchestrator_action_allowlist: Vec::new(),
             orchestrator_rate_cap: 5,
@@ -1422,7 +1379,6 @@ mod tests {
         let cfg = Config::load(Path::new("/nonexistent/config.toml")).unwrap();
         assert_eq!(cfg, Config::default());
         assert_eq!(cfg.harness.default, "claude");
-        assert_eq!(cfg.policy.automated_landing_workflows, ["steward"]);
         assert!(!cfg.king.enabled);
         assert_eq!(cfg.king.compact_after_idle_secs, 300);
         assert_eq!(cfg.king.hibernate_after_idle_secs, 3600);
@@ -1560,13 +1516,13 @@ delivered-but-open = "human"
         let file = dir.join("config.toml");
         std::fs::write(
             &file,
-            "castle_name = \"burrow\"\n[log]\nfilter = \"debug\"\n[policy]\nautomated_landing_workflows = [\"curator\"]\n",
+            "castle_name = \"burrow\"\n[log]\nfilter = \"debug\"\n[policy]\nrequire_named_checks = false\n",
         )
         .unwrap();
         let cfg = Config::load(&file).unwrap();
         assert_eq!(cfg.castle_name.as_deref(), Some("burrow"));
         assert_eq!(cfg.log.filter, "debug");
-        assert_eq!(cfg.policy.automated_landing_workflows, ["curator"]);
+        assert!(!cfg.policy.require_named_checks);
         std::fs::remove_dir_all(&dir).ok();
     }
 

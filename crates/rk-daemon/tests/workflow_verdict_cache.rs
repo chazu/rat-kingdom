@@ -156,6 +156,7 @@ fn init_repo(dir: &Path) -> String {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
     let wf_dir = dir.join(".rk").join("workflows");
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(wf_dir.join("verdict-cache-test.cue"), WORKFLOW).unwrap();
@@ -231,6 +232,22 @@ async fn plant_verdict(
     head_sha: &str,
     branch: &str,
 ) {
+    let spawn = client
+        .call("agent.status", json!({"name": agent}))
+        .await
+        .ok()
+        .and_then(|status| status["agent"]["spawn"].as_str().map(str::to_string));
+    let mut payload = json!({
+        "agent": agent,
+        "task": "review-the-branch",
+        "recommendation": recommendation,
+        "notes": format!("verdict for {agent}"),
+        "head_sha": head_sha,
+        "branch": branch,
+    });
+    if let Some(spawn) = spawn {
+        payload["spawn"] = json!(spawn);
+    }
     client
         .call(
             "space.out",
@@ -238,14 +255,7 @@ async fn plant_verdict(
                 "category": "artifact",
                 "scope": scope,
                 "identity": "review",
-                "payload": {
-                    "agent": agent,
-                    "task": "review-the-branch",
-                    "recommendation": recommendation,
-                    "notes": format!("verdict for {agent}"),
-                    "head_sha": head_sha,
-                    "branch": branch,
-                },
+                "payload": payload,
             }),
         )
         .await
@@ -277,6 +287,7 @@ async fn same_sha_retry_consumes_cached_approve_without_spawning_a_reviewer() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // A prior run's reviewer (any agent, any run) already recorded APPROVE
     // for this exact commit on this exact branch.
@@ -327,6 +338,7 @@ async fn a_different_commit_is_a_cache_miss_and_spawns_a_fresh_reviewer() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // A verdict exists, but for a stale commit — it must NOT satisfy a probe
     // for the new tip.
@@ -395,6 +407,7 @@ async fn cached_rework_routes_to_rework_without_spawning_a_reviewer() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     plant_verdict(
         &mut client,
@@ -454,6 +467,7 @@ async fn a_different_branch_at_the_same_sha_is_a_cache_miss_and_spawns_a_fresh_r
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // Branch A's reviewer already recorded APPROVE for the shared tip.
     plant_verdict(

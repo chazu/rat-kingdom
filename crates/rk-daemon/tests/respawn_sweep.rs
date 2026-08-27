@@ -43,6 +43,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("f"), "x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 }
 
 /// Count `agent_respawned` events emitted for `name`.
@@ -96,6 +97,7 @@ async fn crashed_agent_auto_respawns_up_to_cap_then_escalates() {
     });
     tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let spawned = client
         .call(
@@ -194,6 +196,7 @@ async fn castle_wide_respawn_rate_cap_holds_the_excess() {
     });
     tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // Three independently-crashing agents so a single sweep tick has more
     // respawn candidates than the castle-wide cap allows.

@@ -20,6 +20,7 @@ mod landing;
 mod landing_conflict;
 mod landing_review_retry;
 mod landing_rework;
+pub mod lifecycle;
 pub mod machine;
 pub mod onboarding;
 pub mod onboarding_activation;
@@ -538,7 +539,7 @@ mod tests {
             let now = chrono::Utc::now();
             AgentRecord {
                 name: name.into(),
-                spawn: None,
+                spawn: Some(rk_core::id::SpawnId::new()),
                 role: "rat".into(),
                 coordination: None,
                 harness: "fake".into(),

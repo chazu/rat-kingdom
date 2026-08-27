@@ -416,100 +416,33 @@ where
 /// Free-function core of [`Supervisor::repository_policy`] — split out so the
 /// ticket-delivery gate can resolve a policy from an owned `home` path inside
 /// a `'static` spawned task, without borrowing a `Supervisor`.
-fn resolve_repository_policy(home: &std::path::Path, repo: &Repo) -> rk_workflow::RepositoryPolicy {
-    let path = home.join("repos.json");
-    crate::repos::RepoRegistry::load(&path)
-        .ok()
-        .and_then(|registry| {
-            registry
-                .get_by_path(repo.root())
-                .map(|record| record.effective_policy())
-        })
-        .unwrap_or_default()
-}
-
-/// Why `branch` has not been delivered under `policy`'s mode, or `None` if it
-/// has (or the mode isn't gated). `gate_push_branch` controls whether
-/// `push-branch` is enforced — see [`Supervisor::require_ticket_delivered`]
-/// for why the automatic completion path leaves it `false`.
-fn ticket_undelivered_reason(
-    policy: &rk_workflow::RepositoryPolicy,
+fn resolve_repository_policy(
+    home: &std::path::Path,
     repo: &Repo,
-    branch: &str,
-    target: &str,
-    fork_point: Option<&str>,
-    gate_push_branch: bool,
-) -> Option<String> {
-    match policy.delivery.mode {
-        DeliveryMode::Merge | DeliveryMode::MergePush => {
-            // Requires a *verified* merge, not `branch_merged_or_gone`'s
-            // "gone counts as delivered" — a deleted-but-never-merged branch
-            // must not read as done (TKT-18/46/147).
-            if repo.branch_verified_merged(branch, target) {
-                None
-            } else {
-                Some(format!(
-                    "branch '{branch}' has not merged into '{target}' yet (delivery mode: {:?})",
-                    policy.delivery.mode
-                ))
-            }
-        }
-        DeliveryMode::PushBranch if gate_push_branch => {
-            let carries_work =
-                fork_point.is_some_and(|fork| repo.branch_has_commits_since(branch, fork));
-            if carries_work
-                && repo.remote_branch_merged_or_gone(branch, target, &policy.delivery.remote)
-            {
-                None
-            } else {
-                Some(format!(
-                    "branch '{branch}' has not landed on '{}/{target}' yet (delivery mode: push-branch)",
-                    policy.delivery.remote
-                ))
-            }
-        }
-        DeliveryMode::PushBranch | DeliveryMode::Pr => None,
+) -> rk_core::Result<rk_workflow::RepositoryPolicy> {
+    let path = home.join("repos.json");
+    let registry = crate::repos::RepoRegistry::load(&path)?;
+    // Unit tests construct narrow supervisors directly and exercise behavior
+    // unrelated to repository onboarding. Integration tests compile the
+    // library without `cfg(test)` and therefore exercise the production
+    // fail-closed path below.
+    #[cfg(test)]
+    {
+        Ok(registry
+            .get_by_path(repo.root())
+            .and_then(|record| record.effective_policy().ok())
+            .unwrap_or_default())
     }
-}
-
-/// Whether `branch` (bound for `target` in the repo rooted at `repo_root`)
-/// has been delivered per that repo's activated delivery-mode policy. Runs
-/// the git reads on a blocking-pool thread — see [`blocking_io`] — since this
-/// is called from spawned tasks, never the hot event-handling path.
-async fn ticket_delivered(
-    home: PathBuf,
-    repo_root: PathBuf,
-    branch: String,
-    target: String,
-    fork_point: Option<String>,
-    gate_push_branch: bool,
-) -> rk_core::Result<()> {
-    blocking_io("ticket delivery gate", move || {
-        let repo = Repo::discover(&repo_root).map_err(|e| {
-            // Unresolvable repo: fail CLOSED, unlike
-            // Supervisor::branch_already_merged's fail-safe "not merged" —
-            // that guard only ever skips a respawn (safe to under-trigger),
-            // while this one gates `done`, and open-failing it would let a
-            // ticket close without ever having checked delivery.
+    #[cfg(not(test))]
+    {
+        let record = registry.get_by_path(repo.root()).ok_or_else(|| {
             rk_core::Error::other(format!(
-                "repo at {} is unresolvable, cannot verify delivery: {e}",
-                repo_root.display()
+                "repository '{}' is not registered; run `rk repo add` then `rk repo onboard start <path-or-name>`",
+                repo.root().display()
             ))
         })?;
-        let policy = resolve_repository_policy(&home, &repo);
-        match ticket_undelivered_reason(
-            &policy,
-            &repo,
-            &branch,
-            &target,
-            fork_point.as_deref(),
-            gate_push_branch,
-        ) {
-            None => Ok(()),
-            Some(reason) => Err(rk_core::Error::other(reason)),
-        }
-    })
-    .await
+        record.effective_policy()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1771,8 +1704,8 @@ impl Supervisor {
 
     /// Every transcript generation of `name`, oldest first, each carrying its
     /// [`rk_core::id::SpawnId`] (E3, docs/2026-08-17-tkt-c1-generation-identity.md)
-    /// and the exclusive upper bound (the next generation's `created_at`) that
-    /// isolates it inside a legacy name-keyed log file.
+    /// and migration/display timestamps. Runtime transcript reads use the
+    /// spawn id only.
     ///
     /// Empty when no record — live or archived — carries the name. Callers
     /// reading a transcript anyway should fall back to
@@ -1919,7 +1852,14 @@ impl Supervisor {
         validate_role(&params.role)?;
         let repo = Repo::discover(std::path::Path::new(&params.repo))?;
         let repo_name = repo.name();
-        let repo_policy = self.repository_policy(&repo);
+        // Onboarding is the one pre-policy capability: its session id, fixed
+        // branch/worktree, read-only role, and explicit base are daemon-owned.
+        // Every ordinary worker still requires an activated repository policy.
+        let repo_policy = if params.role == ONBOARDER_ROLE {
+            None
+        } else {
+            Some(self.repository_policy(&repo)?)
+        };
 
         // Hierarchical fleet/repo budget guard: the wallet kill-switch. Once the
         // fleet-wide (or per-repo) cost sum reaches its cap we refuse the spawn
@@ -1935,7 +1875,12 @@ impl Supervisor {
         self.check_disk_floor(&repo_name)?;
         let target_branch = match &params.base {
             Some(b) => b.clone(),
-            None => repo_policy.delivery_target(&repo.current_branch()?),
+            None => repo_policy
+                .as_ref()
+                .ok_or_else(|| {
+                    rk_core::Error::other("onboarder spawn requires an explicit base branch")
+                })?
+                .delivery_target(&repo.current_branch()?),
         };
         let instruction_base = self.instruction_base(&params.role, &target_branch, &repo);
         // Capture before creating the branch. Unlike a later merge-base read,
@@ -2037,6 +1982,9 @@ impl Supervisor {
                 onboarding_worktree(&self.layout.worktrees_dir(), &repo_name, &params.task),
             )
         } else {
+            let repo_policy = repo_policy
+                .as_ref()
+                .expect("ordinary worker policy resolved before spawn side effects");
             (
                 repo_policy.branch_name(&name, &params.task, &repo_name, &params.role),
                 self.layout.worktrees_dir().join(repo_policy.worktree_path(
@@ -2060,6 +2008,7 @@ impl Supervisor {
             model: effective.model.clone(),
             permission_mode: effective.permission_mode.clone(),
         });
+        let spawn = spawning.spawn_id();
         if let Err(e) = self.lock_registry().insert(spawning) {
             let mut reg = self.lock_registry();
             reg.release_name(&name);
@@ -2109,6 +2058,7 @@ impl Supervisor {
 
         let mut env = self.agent_env(
             &name,
+            spawn,
             &params.role,
             &repo_name,
             &params.task,
@@ -2339,18 +2289,9 @@ impl Supervisor {
         // Bound the read to this generation of the name. `task_done` events
         // are durable and outlive the rat they name, so an unbounded name
         // search matches a predecessor's completion.
-        let since = record.created_at;
-        // Generation-identity migration (C1/S3a, docs/2026-08-17-tkt-c1-
-        // generation-identity.md): key on the minted `SpawnId` when this
-        // generation has one — an equality predicate no namesake can satisfy —
-        // falling back to the name+floor test for a record written before the
-        // migration.
-        let spawn = record.spawn;
+        let spawn = record.spawn_id();
         tokio::spawn(async move {
-            let pattern = match spawn {
-                Some(spawn) => Pattern::for_spawn(Category::Event, "task_done", spawn),
-                None => Pattern::for_agent_since(Category::Event, "task_done", &agent, since),
-            };
+            let pattern = Pattern::for_spawn(Category::Event, "task_done", spawn);
             match space
                 .rd(&pattern, std::time::Duration::from_secs(24 * 3600))
                 .await
@@ -2380,7 +2321,17 @@ impl Supervisor {
 
     /// Resume an orphaned/failed agent in its preserved worktree.
     pub fn respawn(self: &Arc<Self>, name: &str) -> rk_core::Result<AgentRecord> {
-        self.respawn_mode(name, false)
+        self.respawn_generation(name, None)
+    }
+
+    /// Resume one exact generation. Lifecycle automation passes the spawn id;
+    /// interactive name-only `rk respawn` remains an explicit operator action.
+    pub fn respawn_generation(
+        self: &Arc<Self>,
+        name: &str,
+        spawn: Option<rk_core::id::SpawnId>,
+    ) -> rk_core::Result<AgentRecord> {
+        self.respawn_mode(name, false, spawn)
     }
 
     /// Resume an onboarding agent in either durable presentation mode. Unlike
@@ -2400,7 +2351,7 @@ impl Supervisor {
                 "onboarding session agent {name} has downgraded role {role:?}"
             )));
         }
-        self.respawn_mode(name, attach)
+        self.respawn_mode(name, attach, None)
     }
 
     pub async fn respawn_onboarding_async(
@@ -2417,12 +2368,23 @@ impl Supervisor {
         .await
     }
 
-    fn respawn_mode(self: &Arc<Self>, name: &str, attach: bool) -> rk_core::Result<AgentRecord> {
+    fn respawn_mode(
+        self: &Arc<Self>,
+        name: &str,
+        attach: bool,
+        spawn: Option<rk_core::id::SpawnId>,
+    ) -> rk_core::Result<AgentRecord> {
         let record = self
             .lock_registry()
             .get(name)
             .cloned()
             .ok_or_else(|| rk_core::Error::other(format!("no such agent: {name}")))?;
+        if spawn.is_some_and(|expected| expected != record.spawn_id()) {
+            return Err(rk_core::Error::other(format!(
+                "stale generation for {name}: expected {spawn:?}, current is {}",
+                record.spawn_id()
+            )));
+        }
         if record.state.is_live() {
             return Err(rk_core::Error::other(format!("{name} is still running")));
         }
@@ -2447,6 +2409,7 @@ impl Supervisor {
 
         let env = self.agent_env(
             &record.name,
+            record.spawn_id(),
             &record.role,
             &record.repo_name,
             &task,
@@ -3226,10 +3189,7 @@ impl Supervisor {
                 // `reconcile_task_done` supplies the bounded fallback when it
                 // does not. Storage errors fail closed here: an unreadable
                 // completion signal must not disable a hard budget cap.
-                if matches!(
-                    self.find_task_done(&record.name, record.created_at, record.spawn),
-                    Ok(Some(_))
-                ) {
+                if matches!(self.find_task_done(record.spawn), Ok(Some(_))) {
                     return;
                 }
                 warn!(agent = %record.name, cost = record.cost_usd, tokens = record.usage.total(), "budget cap hit — stopping agent");
@@ -3900,10 +3860,7 @@ impl Supervisor {
                     // generation's `task_done` exists, reconciliation owns
                     // terminalization and the sweep must not kill the harness
                     // before it can flush its richer final result.
-                    if matches!(
-                        self.find_task_done(&record.name, record.created_at, record.spawn),
-                        Ok(Some(_))
-                    ) {
+                    if matches!(self.find_task_done(record.spawn), Ok(Some(_))) {
                         continue;
                     }
                     warn!(agent = %record.name, kind, %detail, "supervisor sweep killing agent after grace");
@@ -4363,21 +4320,14 @@ impl Supervisor {
             .unwrap_or(false)
     }
 
-    /// The merged-branch guardrail: true if this agent's work already landed
-    /// (so a respawn would redo merged work) or its branch is gone (nothing to
-    /// resume). "Merged" here is precise — the branch is *strictly behind* its
-    /// target: contained in it yet the target has advanced past it. That
-    /// deliberately excludes a branch that merely equals its target (an agent
-    /// that crashed before committing anything: tip == base), which is exactly
-    /// the transient crash we most want to auto-respawn — a plain
-    /// "is-ancestor" test would mis-skip it. An unmerged branch (commits not in
-    /// target) is not an ancestor, so it respawns. Fail-safe: an unresolvable
-    /// repo reads as "not merged" so we never wrongly skip a recoverable agent.
-    /// Not delegated to [`Repo::branch_merged_or_gone`] (which must stay
-    /// FF-tolerant for its other callers): this call site's target only ever
-    /// advances via `rk`'s own `--no-ff` `merge_branch`, so the strict check
-    /// is safe here specifically.
+    /// Whether this agent has a canonical landing result or no resumable
+    /// branch. Git ancestry is deliberately not delivery authority: only the
+    /// finalizer may write `merge_commit`. A missing branch still prevents a
+    /// useful respawn because there is no worktree target to resume.
     fn branch_already_merged(&self, record: &AgentRecord) -> bool {
+        if record.merge_commit.is_some() {
+            return true;
+        }
         let Some(branch) = record.branch.as_deref() else {
             return false;
         };
@@ -4387,8 +4337,7 @@ impl Supervisor {
         if !repo.branch_exists(branch) {
             return true; // gone: the worktree can't be resumed onto it.
         }
-        let target = &record.target_branch;
-        repo.is_ancestor(branch, target) && !repo.is_ancestor(target, branch)
+        false
     }
 
     /// Escalate an exhausted crash-loop to a human: emit a `need` tuple (which
@@ -4641,6 +4590,7 @@ impl Supervisor {
         let instruction_base = self.instruction_base(&record.role, &record.target_branch, &repo);
         let env = self.agent_env(
             &record.name,
+            record.spawn_id(),
             &record.role,
             &record.repo_name,
             &task,
@@ -5088,7 +5038,7 @@ impl Supervisor {
         // Jcode onboarding runs one headless request with no Bash tool. Its
         // native `done` event is therefore the only safe positive completion
         // signal and, unlike an interactive turn boundary, ends the process.
-        let declared_done = harness_terminal || self.declared_done(name, generation, spawn);
+        let declared_done = harness_terminal || self.declared_done(name, spawn);
         let terminal = is_error || declared_done;
         let mut completions = self.lock_completions();
         let state = completions
@@ -5128,47 +5078,27 @@ impl Supervisor {
 
     /// Whether this generation of `name` has written its `rk done` tuple.
     ///
-    /// Bounded to the generation via [`Pattern::for_agent_since`]: `task_done`
-    /// is durable and a name is an identity key that outlives the rat wearing
-    /// it, so an unbounded name search here would read a predecessor's `rk done`
-    /// as this rat's (TKT-146/TKT-159).
-    ///
-    /// Generation-identity migration (C1, docs/2026-08-17-tkt-c1-generation-
-    /// identity.md): `rk done` now stamps `spawn` into the `task_done` payload
-    /// (C2/C6) whenever this generation was minted one, so a record carrying a
-    /// real `SpawnId` keys the read on [`Pattern::for_spawn`] — an equality
-    /// predicate no namesake can satisfy, no floor required. Falls back to the
-    /// name+floor predicate for a record with no minted id (unreachable, or
-    /// written before this migration).
-    ///
     /// The durable `task_done` tuple this generation wrote via `rk done`, if
     /// any — the shared lookup behind [`Self::declared_done`] (bool) and
-    /// [`Self::reconcile_task_done`] (needs the tuple itself, for its
-    /// `summary` payload). Same generation-scoping as `declared_done`: keyed
-    /// on `spawn` when minted, else the name+floor fallback.
+    /// [`Self::reconcile_task_done`] (needs the tuple itself, for its summary
+    /// payload). A generation without a persisted spawn cannot match; no
+    /// name/time fallback is allowed.
     fn find_task_done(
         &self,
-        name: &str,
-        generation: DateTime<Utc>,
         spawn: Option<rk_core::id::SpawnId>,
     ) -> rk_core::Result<Option<Tuple>> {
-        let pattern = match spawn {
-            Some(spawn) => Pattern::for_spawn(Category::Event, "task_done", spawn),
-            None => Pattern::for_agent_since(Category::Event, "task_done", name, generation),
+        let Some(spawn) = spawn else {
+            return Ok(None);
         };
+        let pattern = Pattern::for_spawn(Category::Event, "task_done", spawn);
         Ok(self.space.scan(&pattern)?.into_iter().next())
     }
 
     /// Fails OPEN — an unreadable space means "publish", which is the behaviour
     /// that predates this gate. Withholding on a storage error would strand
     /// every workflow waiting on the agent until its step timeout.
-    fn declared_done(
-        &self,
-        name: &str,
-        generation: DateTime<Utc>,
-        spawn: Option<rk_core::id::SpawnId>,
-    ) -> bool {
-        match self.find_task_done(name, generation, spawn) {
+    fn declared_done(&self, name: &str, spawn: Option<rk_core::id::SpawnId>) -> bool {
+        match self.find_task_done(spawn) {
             Ok(found) => {
                 let found = found.is_some();
                 // Deliberately logged on every call, not just the negative
@@ -5258,9 +5188,7 @@ impl Supervisor {
             if record.state == AgentState::Dismissed {
                 continue;
             }
-            let Some(task_done) =
-                self.find_task_done(&record.name, record.created_at, record.spawn)?
-            else {
+            let Some(task_done) = self.find_task_done(record.spawn)? else {
                 continue;
             };
 
@@ -5334,15 +5262,7 @@ impl Supervisor {
     /// `harness_result`. Unlike the in-memory completion claim, this survives
     /// a daemon restart and therefore closes the CAS-then-publish crash window.
     fn harness_result_exists(&self, record: &AgentRecord) -> rk_core::Result<bool> {
-        let pattern = match record.spawn {
-            Some(spawn) => Pattern::for_spawn(Category::Event, "harness_result", spawn),
-            None => Pattern::for_agent_since(
-                Category::Event,
-                "harness_result",
-                &record.name,
-                record.created_at,
-            ),
-        };
+        let pattern = Pattern::for_spawn(Category::Event, "harness_result", record.spawn_id());
         Ok(!self.space.scan(&pattern)?.is_empty())
     }
 
@@ -5544,10 +5464,9 @@ impl Supervisor {
             json!({
                 "agent": record.name,
                 // Generation join key (docs/2026-08-17-tkt-c1-generation-identity.md,
-                // consumer C3): the producer side of B1/C1's dual-key read. A
+                // consumer C3): the producer side of exact generation reads. A
                 // namesake predecessor's `harness_result` never carries this
-                // generation's id, so a spawn-keyed reader cannot match it —
-                // unlike "agent", which only a name+floor test disambiguates.
+                // generation's id, so a spawn-keyed reader cannot match it.
                 "spawn": record.spawn_id().to_string(),
                 // The completed agent's role ("rat", "reviewer", ...). Carried so
                 // a reactor trigger can scope reactively — e.g. the steward fires
@@ -5639,65 +5558,9 @@ impl Supervisor {
                 warn!(error = %e, "failed to notify parent");
             }
         }
-        // A rat dispatched from a ticket closes that ticket's loop: a clean
-        // finish marks it done (which unblocks any dependents), an error leaves
-        // it in_progress for inspection. Fire-and-forget so completion routing
-        // is never held up by the ticket's serialization lock.
-        //
-        // Since TKT-173 a rat KILLED mid-task reports an error, so it no longer
-        // closes the ticket it never finished — and no dependent is unblocked
-        // behind it. A rat that exits without `rk done` still closes its ticket;
-        // TKT-175 is where that gets revisited.
-        if !is_error {
-            if let Some(task) = record.task.clone() {
-                if task.starts_with(crate::tickets::ID_PREFIX) {
-                    let tickets = self.tickets.clone();
-                    let home = self.layout.home().to_path_buf();
-                    let repo_root = record.repo_root.clone();
-                    let branch = record.branch.clone();
-                    let target = record.target_branch.clone();
-                    let fork_point = record.fork_point.clone();
-                    tokio::spawn(async move {
-                        // Bind `done` to delivery per delivery-mode policy
-                        // (TKT-01M08HB566GFBZVMDKZ8DT1ES0 / strategic-review
-                        // C3): a merge/merge-push ticket must not read `done`
-                        // while its branch is still unmerged — the class
-                        // behind TKT-18/46/147, where an approved-looking
-                        // ticket's code never reached main. `push-branch` is
-                        // deliberately NOT gated here: its delivery (the
-                        // push) hasn't even been attempted yet at this point
-                        // in the lifecycle (that happens later, on dismiss),
-                        // and unlike merge-mode there is no later merge-driven
-                        // transition to `closed` to fall back on — gating it
-                        // here would strand the ticket at `in_progress`
-                        // forever. `pr` mode is deferred per the ticket. A
-                        // ticket with no branch (e.g. a grooming-only pass)
-                        // has nothing to gate on and proceeds as before.
-                        let gate = match branch {
-                            Some(branch) => {
-                                ticket_delivered(home, repo_root, branch, target, fork_point, false)
-                                    .await
-                            }
-                            None => Ok(()),
-                        };
-                        match gate {
-                            Ok(()) => {
-                                if let Err(e) = tickets.set_status(&task, "done").await {
-                                    warn!(ticket = %task, error = %e, "failed to mark ticket done");
-                                }
-                            }
-                            Err(e) => {
-                                info!(
-                                    ticket = %task,
-                                    reason = %e,
-                                    "completion left ticket in_progress: not yet delivered per its repo's delivery-mode policy"
-                                );
-                            }
-                        }
-                    });
-                }
-            }
-        }
+        // Completion is evidence that work stopped, not that it shipped.
+        // The landing finalizer owns the single ticket-closing transition and
+        // writes the durable delivery record atomically with it.
     }
 
     /// Seam 7 (strategic-review B5): arm a one-shot grace timer the moment a
@@ -5892,16 +5755,19 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Resolve the activated repository policy, translating legacy registry
-    /// fields into the same defaults. The registry is operator-owned and
-    /// content-bound; live `.rk/repo.cue` edits do not take effect until the
-    /// repository is re-added or an onboarding activation updates the record.
+    /// Resolve the activated repository policy. The registry is operator-owned
+    /// and content-bound; live `.rk/repo.cue` edits do not take effect until an
+    /// onboarding activation updates the record. Missing activation fails
+    /// closed rather than translating legacy CLI fields into authority.
     ///
     /// `pub(crate)` so [`crate::landing::LandingPipeline`] can resolve a
     /// candidate's `landing` gate policy (protected paths, diff-scope
     /// budget, gate/review timeouts) the same way `deliver_branch` resolves
     /// `delivery` — one activated policy, one lookup.
-    pub(crate) fn repository_policy(&self, repo: &Repo) -> rk_workflow::RepositoryPolicy {
+    pub(crate) fn repository_policy(
+        &self,
+        repo: &Repo,
+    ) -> rk_core::Result<rk_workflow::RepositoryPolicy> {
         resolve_repository_policy(self.layout.home(), repo)
     }
 
@@ -5920,18 +5786,36 @@ impl Supervisor {
             .and_then(Weak::upgrade)
     }
 
-    fn task_for_branch(&self, repo_root: &std::path::Path, branch: &str) -> Option<String> {
-        self.lock_registry()
-            .list_all()
-            .into_iter()
-            .filter(|r| r.repo_root == repo_root && r.branch.as_deref() == Some(branch))
-            .max_by_key(|r| r.created_at)
-            .and_then(|r| r.task.clone())
+    /// Resolve branch metadata only when every matching registry row names the
+    /// same exact spawn. The archive/persist crash window may duplicate one
+    /// generation, but branch reuse across generations is ambiguous and must
+    /// never be settled by a newest-record guess.
+    fn record_for_branch(&self, repo_root: &std::path::Path, branch: &str) -> Option<AgentRecord> {
+        let registry = self.lock_registry();
+        let mut matches = registry.list_all().into_iter().filter(|record| {
+            record.repo_root == repo_root && record.branch.as_deref() == Some(branch)
+        });
+        let first = matches.next()?;
+        if matches.any(|record| record.spawn_id() != first.spawn_id()) {
+            return None;
+        }
+        Some(first.clone())
+    }
+
+    fn binding_for_branch(
+        &self,
+        repo_root: &std::path::Path,
+        branch: &str,
+    ) -> Option<(Option<String>, rk_core::id::SpawnId)> {
+        self.record_for_branch(repo_root, branch).map(|record| {
+            let spawn = record.spawn_id();
+            (record.task, spawn)
+        })
     }
 
     /// Resolve the task identity a `land` submission delivers against.
     ///
-    /// `task_for_branch` only ever finds a task if some agent record was
+    /// `binding_for_branch` only ever finds a task if one exact generation was
     /// spawned onto exactly this branch — a recovery branch built by hand
     /// (e.g. resubmitting escalated work after a reviewer died) carries no
     /// such record, so that lookup silently returns `None` and the landing
@@ -5945,17 +5829,22 @@ impl Supervisor {
     ///     agree with the explicit one (fail closed on disagreement rather
     ///     than silently letting the explicit value override real evidence).
     ///
-    /// With no explicit task, behavior is unchanged: fall back to whatever
-    /// `task_for_branch` finds (possibly `None`, for untracked work).
+    /// The returned generation is exact evidence for delivery finalization.
+    /// A hand-built recovery branch has no generation and therefore cannot
+    /// acquire an agent merge pointer by branch/name/recency inference.
     fn resolve_land_task(
         &self,
         repo_name: &str,
         repo_root: &std::path::Path,
         branch: &str,
         explicit: Option<String>,
-    ) -> rk_core::Result<Option<String>> {
+    ) -> rk_core::Result<(Option<String>, Option<rk_core::id::SpawnId>)> {
+        let inferred = self.binding_for_branch(repo_root, branch);
         let Some(task) = explicit else {
-            return Ok(self.task_for_branch(repo_root, branch));
+            return Ok(match inferred {
+                Some((task, spawn)) => (task, Some(spawn)),
+                None => (None, None),
+            });
         };
         let task = task.trim().to_string();
         if task.is_empty() {
@@ -5972,112 +5861,114 @@ impl Supervisor {
                 ticket.scope
             )));
         }
-        if let Some(found) = self.task_for_branch(repo_root, branch) {
-            if found != task {
+        if let Some((Some(found), _)) = inferred.as_ref() {
+            if found != &task {
                 return Err(rk_core::Error::other(format!(
                     "task {task} disagrees with {found}, which an agent record already binds to \
                      branch {branch} — refusing to override real evidence with --task"
                 )));
             }
         }
-        Ok(Some(task))
+        Ok((Some(task), inferred.map(|(_, spawn)| spawn)))
     }
 
-    fn record_merge_for_branch(
+    /// Canonical delivery-finalization seam (TKT-01M0P96ZSQAJGRE7WTGDBWAXJ9):
+    /// writes the ticket's [`crate::tickets::DeliveryRecord`] (if `task` names
+    /// one), then derives the matching generation's `merge_commit` via
+    /// [`crate::lifecycle::resolve_merge_pointer`] under one held registry
+    /// lock, so concurrent deliveries against the same generation cannot both
+    /// observe "unset" and both win. `exact_spawn` generation-fences
+    /// resolution; `None` records ticket delivery without deriving an agent
+    /// pointer. A resolved generation carrying a DIFFERENT commit fails
+    /// closed: an error plus a durable `delivery_merge_pointer_conflict`
+    /// event, so a caller past irreversible git effects can still surface the
+    /// drift without claiming the merge itself failed.
+    pub(crate) async fn finalize_delivery(
         &self,
         repo_root: &std::path::Path,
-        branch: &str,
-        result: &serde_json::Value,
-    ) {
-        let Some(commit) = result
-            .get("merge_commit")
-            .and_then(serde_json::Value::as_str)
-        else {
-            return;
-        };
-        let name = self
-            .lock_registry()
-            .list_all()
-            .into_iter()
-            .filter(|r| r.repo_root == repo_root && r.branch.as_deref() == Some(branch))
-            .max_by_key(|r| r.created_at)
-            .map(|r| r.name.clone());
-        if let Some(name) = name {
-            let _ = self.lock_registry().update(&name, |record| {
-                record.merge_commit = Some(commit.to_string())
-            });
+        repo_name: &str,
+        task: Option<&str>,
+        record: &crate::tickets::DeliveryRecord,
+        exact_spawn: Option<rk_core::id::SpawnId>,
+    ) -> rk_core::Result<()> {
+        if let Some(task) = task {
+            self.tickets.record_delivery(task, record).await?;
         }
-    }
-
-    /// The most recent agent generation (live or archived) dispatched against
-    /// ticket `task`, if any — used to resolve the branch/repo a ticket's
-    /// `done` transition is checked against (TKT-01M08HB566GFBZVMDKZ8DT1ES0 /
-    /// strategic-review C3).
-    fn latest_task_record(&self, task: &str) -> Option<AgentRecord> {
-        self.lock_registry()
-            .list_all()
-            .into_iter()
-            .filter(|r| r.task.as_deref() == Some(task))
-            .max_by_key(|r| r.created_at)
-            .cloned()
+        use crate::lifecycle::MergePointerDecision;
+        let mut registry = self.lock_registry();
+        let decision = {
+            let agents = registry.list_all();
+            crate::lifecycle::resolve_merge_pointer(
+                agents.into_iter(),
+                repo_root,
+                &record.branch,
+                &record.target,
+                &record.merge_commit,
+                exact_spawn,
+            )
+        };
+        match decision {
+            MergePointerDecision::Set { agent } => {
+                let commit = record.merge_commit.clone();
+                registry.update(&agent, move |r| r.merge_commit = Some(commit))?;
+            }
+            MergePointerDecision::AlreadyRecorded | MergePointerDecision::NoTarget => {}
+            MergePointerDecision::Conflict { agent, recorded } => {
+                drop(registry);
+                self.emit_event(
+                    repo_name,
+                    "delivery_merge_pointer_conflict",
+                    json!({
+                        "agent": &agent,
+                        "recorded_merge_commit": &recorded,
+                        "candidate_merge_commit": &record.merge_commit,
+                        "branch": &record.branch,
+                        "target": &record.target,
+                        "text": format!(
+                            "agent {agent} already carries a different merge commit \
+                             ({recorded}) than this delivery's candidate ({}) — not \
+                             overwritten, needs manual reconciliation",
+                            record.merge_commit
+                        ),
+                    }),
+                );
+                return Err(rk_core::Error::other(format!(
+                    "agent {agent} already carries a different merge commit ({recorded}) than \
+                     this delivery's candidate ({}); refusing to overwrite",
+                    record.merge_commit
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn recorded_fork_point(&self, repo_root: &std::path::Path, branch: &str) -> Option<String> {
-        self.lock_registry()
-            .list_all()
-            .into_iter()
-            .filter(|r| r.repo_root == repo_root && r.branch.as_deref() == Some(branch))
-            .max_by_key(|r| r.created_at)
-            .and_then(|r| r.fork_point.clone())
+        self.record_for_branch(repo_root, branch)
+            .and_then(|record| record.fork_point)
     }
 
-    /// Refuse an explicit `done` (steward/operator `rk ticket update --status
-    /// done`) on a ticket whose branch has not actually landed per its repo's
-    /// delivery-mode policy — closing the "approved but never merged" class
-    /// (TKT-18/46/147) at the point a human can act on the refusal instead of
-    /// silently believing the work shipped. `merge`/`merge-push` require the
-    /// branch to already be merged into (or gone from) its target;
-    /// `push-branch` requires the same against the remote-tracking ref (the
-    /// manual path can afford checking push-branch too — refusing an explicit
-    /// request never stalls anything, unlike gating the automatic completion
-    /// path before delivery has even been attempted, see the ticket-done
-    /// block in [`Self::route_completion`]). `pr` is intentionally left
-    /// unchecked:
-    /// its binding is deferred until a forge ingest source exists (see
-    /// strategic-review C4). A ticket with no dispatched branch (or an
-    /// unresolvable repo) has nothing to gate on and is left unaffected.
+    /// Whether a ticket has ever produced a branch-bearing implementation
+    /// candidate. This decides whether delivery evidence is applicable; it
+    /// never decides whether delivery occurred.
+    fn ticket_has_delivery_candidate(&self, task: &str) -> bool {
+        self.lock_registry()
+            .list_all()
+            .iter()
+            .any(|record| record.task.as_deref() == Some(task) && record.branch.is_some())
+    }
+
+    /// Refuse an explicit `done` unless the landing finalizer has written the
+    /// ticket's durable delivery record. Git refs and archived agent records
+    /// are evidence inputs, not alternate delivery authorities.
     pub(crate) async fn require_ticket_delivered(&self, task: &str) -> rk_core::Result<()> {
-        // The durable delivery record wins outright (P1b). It is written by
-        // the landing pipeline at land time and survives the branch deletion
-        // that landing performs, so a ticket that genuinely shipped still
-        // reads delivered here — where the branch-ref fallback below would
-        // see a missing ref and refuse. Only fall through to git when no
-        // record exists (a ticket landed before this field, or delivered by a
-        // path that predates the pipeline).
-        if self
-            .tickets
-            .delivery(task)
-            .map(|d| d.is_some())
-            .unwrap_or(false)
-        {
-            return Ok(());
+        match self.tickets.delivery(task)? {
+            Some(_) => Ok(()),
+            None if !self.ticket_has_delivery_candidate(task) => Ok(()),
+            None => Err(rk_core::Error::other(format!(
+                "ticket {task} cannot be marked done: no canonical delivery record; land its \
+                 candidate through rk, or use the explicit non-delivery dismissal path"
+            ))),
         }
-        let Some(record) = self.latest_task_record(task) else {
-            return Ok(());
-        };
-        let Some(branch) = record.branch.clone() else {
-            return Ok(());
-        };
-        ticket_delivered(
-            self.layout.home().to_path_buf(),
-            record.repo_root.clone(),
-            branch,
-            record.target_branch.clone(),
-            record.fork_point.clone(),
-            true,
-        )
-        .await
-        .map_err(|e| rk_core::Error::other(format!("ticket {task} cannot be marked done: {e}")))
     }
 
     /// Execute one repository policy against a source branch. Every delivery
@@ -6091,7 +5982,7 @@ impl Supervisor {
         agent_base: &str,
         keep_branch: bool,
     ) -> rk_core::Result<BranchDelivery> {
-        let policy = self.repository_policy(repo);
+        let policy = self.repository_policy(repo)?;
         let target = policy.delivery_target(agent_base);
         let remote = policy.delivery.remote.clone();
         let remote_branch = policy.remote_branch(branch, &target, repo_name);
@@ -6252,15 +6143,14 @@ impl Supervisor {
     /// `dismiss_all` used to resolve purely by name, so a fanned-out
     /// `dismiss` could — if the name it captured were ever reused before the
     /// dismiss ran — tear down a different, unrelated live rat instead of the
-    /// one it fanned out. `expected_spawn: None` (a pre-migration
-    /// `FannedAgent` with no `spawn`) preserves the old, unchecked behaviour.
+    /// one it fanned out. Missing exact identity is rejected by the caller.
     pub async fn dismiss_checked(
         &self,
         name: &str,
-        expected_spawn: Option<rk_core::id::SpawnId>,
+        expected_spawn: rk_core::id::SpawnId,
         no_merge: bool,
     ) -> rk_core::Result<serde_json::Value> {
-        self.dismiss_inner(name, no_merge, false, expected_spawn)
+        self.dismiss_inner(name, no_merge, false, Some(expected_spawn))
             .await
     }
 
@@ -6317,7 +6207,7 @@ impl Supervisor {
         let repo_path = record.repo_root.clone();
         let repo =
             blocking_io("dismiss repo discovery", move || Repo::discover(&repo_path)).await?;
-        let policy = self.repository_policy(&repo);
+        let policy = self.repository_policy(&repo)?;
         let mut delivery = BranchDelivery {
             target: record.target_branch.clone(),
             remote: policy.delivery.remote.clone(),
@@ -6672,7 +6562,7 @@ impl Supervisor {
         })
         .await?;
         let repo_name = repo.name();
-        let policy = self.repository_policy(&repo);
+        let policy = self.repository_policy(&repo)?;
         let effective_target = policy.delivery_target(target);
         if effective_target != target {
             return Err(rk_core::Error::other(format!(
@@ -6837,17 +6727,18 @@ impl Supervisor {
         let repo_name = repo.name();
         let fork_point = self.recorded_fork_point(repo.root(), branch);
         let head_sha = repo.rev_parse(branch).ok();
-        let policy = self.repository_policy(&repo);
+        let policy = self.repository_policy(&repo)?;
         if matches!(
             policy.delivery.mode,
             DeliveryMode::Merge | DeliveryMode::MergePush
         ) {
             if let Some(pipeline) = self.landing_pipeline() {
-                let task = self.resolve_land_task(&repo_name, repo.root(), branch, task)?;
+                let (task, source_spawn) =
+                    self.resolve_land_task(&repo_name, repo.root(), branch, task)?;
+                // `submit_manual` drives `finalize_delivery` internally; nothing left to record.
                 let result = pipeline
-                    .submit_manual(repo.root(), branch, target, keep_branch, task)
+                    .submit_manual(repo.root(), branch, target, keep_branch, task, source_spawn)
                     .await?;
-                self.record_merge_for_branch(repo.root(), branch, &result);
                 return Ok(result);
             }
             if !cfg!(test) {
@@ -6933,9 +6824,33 @@ impl Supervisor {
         })
         .await?;
         let repo_name = repo.name();
+        let source_spawn = self
+            .binding_for_branch(repo.root(), branch)
+            .map(|(_, spawn)| spawn);
         let delivery = self
             .deliver_branch(&repo, &repo_name, branch, target, keep_branch)
             .await?;
+        // Best-effort: the merge above already happened, so a derivation
+        // failure is logged, never propagated — it must not make this RPC
+        // claim the completed merge failed or skip the evidence emitted below.
+        if let Some(commit) = delivery
+            .merge_commit
+            .as_deref()
+            .filter(|c| !c.is_empty() && !delivery.content_free)
+        {
+            let record = crate::tickets::DeliveryRecord {
+                merge_commit: commit.to_string(),
+                branch: branch.to_string(),
+                target: delivery.target.clone(),
+                landed_at: chrono::Utc::now().to_rfc3339(),
+            };
+            if let Err(error) = self
+                .finalize_delivery(repo.root(), &repo_name, None, &record, source_spawn)
+                .await
+            {
+                warn!(repo = %repo_name, branch, %error, "forced landing merged but failed to derive its agent merge pointer");
+            }
+        }
         let result = json!({
             "branch": branch,
             "target": delivery.target,
@@ -6953,7 +6868,6 @@ impl Supervisor {
             "forced": true,
             "reason": reason,
         });
-        self.record_merge_for_branch(repo.root(), branch, &result);
         self.emit_event(&repo_name, "branch_landed", result.clone());
         self.emit_event(
             &repo_name,
@@ -7009,7 +6923,7 @@ impl Supervisor {
         let repo_name = repo.name();
         let fork_point = self.recorded_fork_point(repo.root(), branch);
         let head_sha = repo.rev_parse(branch).ok();
-        let policy = self.repository_policy(&repo);
+        let policy = self.repository_policy(&repo)?;
         let remote = policy.delivery.remote.clone();
         let remote_branch = policy.remote_branch(branch, target, &repo_name);
         let repo_for_pr = repo.clone();
@@ -7630,7 +7544,8 @@ impl Supervisor {
         }
         let policy_paths = Repo::discover(&record.repo_root)
             .ok()
-            .map(|repo| self.repository_policy(&repo).reap.artifact_paths)
+            .and_then(|repo| self.repository_policy(&repo).ok())
+            .map(|policy| policy.reap.artifact_paths)
             .unwrap_or_default();
         let paths: &[String] = if !policy_paths.is_empty() {
             &policy_paths
@@ -7701,6 +7616,7 @@ impl Supervisor {
     fn agent_env(
         &self,
         name: &str,
+        spawn: rk_core::id::SpawnId,
         role: &str,
         repo_name: &str,
         task: &str,
@@ -7716,12 +7632,8 @@ impl Supervisor {
         // Generation-identity migration (C6, docs/2026-08-17-tkt-c1-generation-identity.md):
         // RK_AGENT stays the display label a rat and every `rk` sugar command
         // read; RK_SPAWN is the join key `rk done`/`rk out` stamp into their
-        // payloads so a reader can key on `Pattern::for_spawn` instead of a
-        // name+floor test. Absent only if the registry row vanished between
-        // insert and here, which never happens on the live spawn path.
-        if let Some(spawn) = self.status(name).and_then(|r| r.spawn) {
-            env.insert("RK_SPAWN".into(), spawn.to_string());
-        }
+        // payloads so readers key on `Pattern::for_spawn`.
+        env.insert("RK_SPAWN".into(), spawn.to_string());
         if let Ok(token) = self.layout.agent_auth_token(name) {
             env.insert("RK_AUTH_TOKEN".into(), token);
         }
@@ -8148,6 +8060,7 @@ mod respawn_tests {
         };
         let env = sup.agent_env(
             "Nibble",
+            rk_core::id::SpawnId::new(),
             "reviewer",
             "repo",
             "review",
@@ -8170,6 +8083,7 @@ mod respawn_tests {
         let sup = supervisor(home.path());
         let env = sup.agent_env(
             "Nibble",
+            rk_core::id::SpawnId::new(),
             "rat",
             "repo",
             "task",
@@ -8190,6 +8104,7 @@ mod respawn_tests {
         sup.set_shared_cargo_target(true);
         let env = sup.agent_env(
             "Nibble",
+            rk_core::id::SpawnId::new(),
             "rat",
             "repo",
             "task",
@@ -8594,7 +8509,7 @@ mod respawn_tests {
         let now = Utc::now();
         AgentRecord {
             name: "Nibble".into(),
-            spawn: None,
+            spawn: Some(rk_core::id::SpawnId::new()),
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),
@@ -8632,34 +8547,127 @@ mod respawn_tests {
         }
     }
 
-    /// The merged-branch guardrail is precise: a branch whose work landed (and
-    /// whose target advanced past it) is skipped; a crashed-before-committing
-    /// branch (tip == base) and an unmerged-work branch are both respawnable.
+    /// TKT-01M10FQRYBS73BXY3NVYYSDRWW must_fix #2: the resolve-then-write must
+    /// not split across two lock acquisitions. N concurrent deliveries racing
+    /// the same generation with distinct candidate commits must yield exactly
+    /// one winner, never two — the old two-lock version could let two callers
+    /// both observe "unset" and both succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finalize_delivery_serializes_concurrent_writers_to_one_generation() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let sup = supervisor(home.path());
+        let mut rec = record(repo_dir.path(), Some("feature"));
+        rec.name = "gen1".into();
+        let source_spawn = rec.spawn;
+        sup.lock_registry().insert(rec).unwrap();
+
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let sup = Arc::clone(&sup);
+            let repo_root = repo_dir.path().to_path_buf();
+            let spawn = source_spawn;
+            tasks.push(tokio::spawn(async move {
+                let delivery = crate::tickets::DeliveryRecord {
+                    merge_commit: format!("sha-{i}"),
+                    branch: "feature".into(),
+                    target: "main".into(),
+                    landed_at: chrono::Utc::now().to_rfc3339(),
+                };
+                sup.finalize_delivery(&repo_root, "repo", None, &delivery, spawn)
+                    .await
+            }));
+        }
+        let mut oks = 0;
+        for t in tasks {
+            if t.await.unwrap().is_ok() {
+                oks += 1;
+            }
+        }
+        assert_eq!(
+            oks, 1,
+            "exactly one concurrent delivery may win the merge pointer"
+        );
+        assert!(sup
+            .lock_registry()
+            .get("gen1")
+            .unwrap()
+            .merge_commit
+            .is_some());
+    }
+
+    /// TKT-01M10FQRYBS73BXY3NVYYSDRWW must_fix #1: a merge-pointer conflict
+    /// discovered AFTER `land_force`'s git merge already ran must never make
+    /// the RPC claim that merge failed, and must never suppress its evidence.
+    #[tokio::test]
+    async fn land_force_reports_the_real_merge_even_when_its_pointer_conflicts() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_repo(repo_dir.path());
+        let p = repo_dir.path();
+        git(p, &["checkout", "-b", "feature"]);
+        std::fs::write(p.join("f"), "1\n").unwrap();
+        git(p, &["commit", "-am", "c1"]);
+        let sup = supervisor(home.path());
+        let canonical_root = Repo::discover(p).unwrap().root().to_path_buf();
+        let mut rec = record(&canonical_root, Some("feature"));
+        rec.name = "worker1".into();
+        sup.lock_registry().insert(rec).unwrap();
+
+        let first = sup
+            .land_force(p, "feature", "main", true, "test")
+            .await
+            .unwrap();
+        assert_eq!(first["merged"], true);
+        let first_commit = sup
+            .lock_registry()
+            .get("worker1")
+            .unwrap()
+            .merge_commit
+            .clone();
+        assert!(first_commit.is_some());
+
+        // A second, independent change on the same branch/generation lands a
+        // DIFFERENT commit — the pointer resolution must conflict, but the
+        // git merge itself still genuinely succeeds and must be reported so.
+        std::fs::write(p.join("f"), "2\n").unwrap();
+        git(p, &["commit", "-am", "c2"]);
+        let second = sup
+            .land_force(p, "feature", "main", true, "test")
+            .await
+            .unwrap();
+        assert_eq!(
+            second["merged"], true,
+            "the real git merge must still be reported"
+        );
+        assert_eq!(
+            sup.lock_registry().get("worker1").unwrap().merge_commit,
+            first_commit,
+            "a conflicting pointer must fail closed, not overwrite the first delivery"
+        );
+    }
+
+    /// The respawn guard uses the canonical merge pointer, never Git ancestry.
     #[test]
-    fn guardrail_skips_only_genuinely_merged_branches() {
+    fn guardrail_skips_canonical_landings_and_missing_branches() {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
         let sup = supervisor(home.path());
         let p = repo.path();
 
-        // (a) A branch that made a commit, then merged into a target that then
-        // advanced past it => genuinely merged => skip.
-        git(p, &["checkout", "-b", "merged", "main"]);
-        std::fs::write(p.join("f"), "merged\n").unwrap();
-        git(p, &["commit", "-am", "work"]);
+        git(p, &["checkout", "-b", "landed", "main"]);
         git(p, &["checkout", "main"]);
-        std::fs::write(p.join("g"), "other\n").unwrap();
-        git(p, &["add", "."]);
-        git(p, &["commit", "-m", "other-main"]);
-        git(p, &["merge", "--no-ff", "-m", "merge", "merged"]);
+        let mut landed = record(p, Some("landed"));
+        landed.merge_commit = Some("canonical-merge".into());
         assert!(
-            sup.branch_already_merged(&record(p, Some("merged"))),
-            "a branch merged into an advanced target must be skipped"
+            sup.branch_already_merged(&landed),
+            "a canonical merge pointer must prevent duplicate respawn"
         );
 
-        // (b) A branch cut from main with NO commits (crashed before work):
-        // tip == base, not strictly behind => respawnable.
+        // A branch cut from main with no canonical delivery remains resumable,
+        // regardless of whether Git happens to consider it an ancestor.
         git(p, &["checkout", "-b", "nowork", "main"]);
         git(p, &["checkout", "main"]);
         assert!(
@@ -8667,7 +8675,7 @@ mod respawn_tests {
             "a no-commit branch (crashed early) must be respawnable"
         );
 
-        // (c) A branch with commits NOT in the target => unmerged work => respawn.
+        // A branch with pending work remains resumable too.
         git(p, &["checkout", "-b", "unmerged", "main"]);
         std::fs::write(p.join("h"), "wip\n").unwrap();
         git(p, &["add", "."]);
@@ -8678,82 +8686,14 @@ mod respawn_tests {
             "unmerged work must be respawnable"
         );
 
-        // (d) A branch that no longer exists => nothing to resume => skip.
+        // A branch that no longer exists has nothing to resume.
         assert!(
             sup.branch_already_merged(&record(p, Some("ghost"))),
             "a vanished branch must be skipped"
         );
 
-        // (e) No branch recorded => not merged (fail-safe, respawn preflight handles it).
+        // No branch recorded is left to the normal respawn preflight.
         assert!(!sup.branch_already_merged(&record(p, None)));
-    }
-
-    /// Commit-count awareness at the done-gate call site
-    /// (TKT-01M0CTC4DPFV7Q2642AZH354BV): a branch that never diverged from
-    /// its target trivially satisfies `is_ancestor`, so a naive check would
-    /// let `rk done` through for a rat that committed nothing. The
-    /// merge-mode gate (`branch_verified_merged`) refuses it: rk's own
-    /// merges are always `--no-ff`, so there is no legitimate
-    /// fast-forward case to protect here. The push-branch gate
-    /// (`remote_branch_merged_or_gone`) is deliberately NOT fixed the same
-    /// way — a forge merge is very often a fast-forward, indistinguishable
-    /// from "never diverged" from ref state alone; see
-    /// `Repo::remote_branch_merged_or_gone`'s doc comment. That gap is
-    /// tracked as a follow-up rather than fixed here unsafely.
-    #[test]
-    fn ticket_undelivered_reason_refuses_an_empty_branch() {
-        let repo_dir = tempfile::tempdir().unwrap();
-        let p = repo_dir.path();
-        init_repo(p);
-        git(p, &["checkout", "-b", "nowork", "main"]);
-        git(p, &["checkout", "main"]);
-        let repo = Repo::discover(p).unwrap();
-        let fork_point = repo.rev_parse("main").unwrap();
-
-        let merge_policy = rk_workflow::RepositoryPolicy::default();
-        assert_eq!(merge_policy.delivery.mode, DeliveryMode::Merge);
-        assert!(
-            ticket_undelivered_reason(&merge_policy, &repo, "nowork", "main", None, true).is_some(),
-            "an empty branch must not read as delivered under merge mode"
-        );
-
-        let mut push_policy = merge_policy.clone();
-        push_policy.delivery.mode = DeliveryMode::PushBranch;
-        assert!(
-            ticket_undelivered_reason(
-                &push_policy,
-                &repo,
-                "nowork",
-                "main",
-                Some(&fork_point),
-                true,
-            )
-            .is_some(),
-            "a missing remote ref must not make a never-diverged branch read delivered"
-        );
-
-        // A branch that actually made a commit still hasn't merged yet, so it
-        // is refused too — confirming the fix doesn't also refuse real,
-        // pending work as "empty".
-        git(p, &["checkout", "-b", "work", "main"]);
-        std::fs::write(p.join("g"), "1\n").unwrap();
-        git(p, &["add", "g"]);
-        git(p, &["commit", "-m", "work"]);
-        git(p, &["checkout", "main"]);
-        let repo = Repo::discover(p).unwrap();
-        assert!(
-            ticket_undelivered_reason(&merge_policy, &repo, "work", "main", None, true).is_some(),
-            "unmerged real work is also not yet delivered"
-        );
-
-        // Once genuinely merged (target advances past the branch), the gate
-        // clears.
-        git(p, &["merge", "--no-ff", "-m", "merge", "work"]);
-        let repo = Repo::discover(p).unwrap();
-        assert!(
-            ticket_undelivered_reason(&merge_policy, &repo, "work", "main", None, true).is_none(),
-            "a genuinely merged branch must clear the done-gate"
-        );
     }
 
     /// Lifecycle cleanup is never delivery: even a content-free duplicate
@@ -8831,9 +8771,7 @@ mod respawn_tests {
         assert_ne!(live.spawn, Some(fanned_out_spawn));
         sup.lock_registry().insert(live).unwrap();
 
-        let outcome = sup
-            .dismiss_checked("Nibble", Some(fanned_out_spawn), true)
-            .await;
+        let outcome = sup.dismiss_checked("Nibble", fanned_out_spawn, true).await;
         let error = outcome.expect_err("must refuse to dismiss a different generation");
         assert!(
             error.to_string().contains("dismiss target mismatch"),
@@ -8860,7 +8798,7 @@ mod respawn_tests {
         live.worktree = None;
         sup.lock_registry().insert(live).unwrap();
 
-        let outcome = sup.dismiss_checked("Nibble", Some(spawn), true).await;
+        let outcome = sup.dismiss_checked("Nibble", spawn, true).await;
         assert!(
             outcome.is_ok(),
             "the expected generation must not be refused: {outcome:?}"
@@ -8878,7 +8816,6 @@ mod respawn_tests {
     fn declared_done_keys_on_spawn_and_rejects_a_namesake_predecessors_tuple() {
         let home = tempfile::tempdir().unwrap();
         let sup = supervisor(home.path());
-        let generation = Utc::now();
 
         let predecessor_spawn = rk_core::id::SpawnId::new();
         let mine_spawn = rk_core::id::SpawnId::new();
@@ -8893,7 +8830,7 @@ mod respawn_tests {
             ))
             .unwrap();
         assert!(
-            !sup.declared_done("Nibble", generation, Some(mine_spawn)),
+            !sup.declared_done("Nibble", Some(mine_spawn)),
             "a namesake predecessor's task_done must not satisfy this generation's gate"
         );
 
@@ -8907,15 +8844,13 @@ mod respawn_tests {
             ))
             .unwrap();
         assert!(
-            sup.declared_done("Nibble", generation, Some(mine_spawn)),
+            sup.declared_done("Nibble", Some(mine_spawn)),
             "this generation's own task_done must satisfy the gate"
         );
 
-        // No minted id (pre-migration record): falls back to the name+floor
-        // predicate, unaffected by either spawn-keyed tuple above.
         assert!(
-            sup.declared_done("Nibble", generation, None),
-            "the name+floor fallback must still see a task_done written after the floor"
+            !sup.declared_done("Nibble", None),
+            "a generation without exact spawn evidence must not match by name/time"
         );
     }
 
@@ -10824,8 +10759,6 @@ mod verification_admission_tests {
                 name: name.into(),
                 path: path.to_path_buf(),
                 created_at: Utc::now(),
-                merge_mode: Default::default(),
-                remote: None,
                 host: None,
                 activated_policy: None,
             })

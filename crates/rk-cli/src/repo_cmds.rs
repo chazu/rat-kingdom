@@ -9,14 +9,7 @@ use rk_daemon::Client;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-pub async fn add(
-    layout: &Layout,
-    path: String,
-    name: Option<String>,
-    merge_mode: Option<String>,
-    remote: Option<String>,
-    as_json: bool,
-) -> Result<()> {
+pub async fn add(layout: &Layout, path: String, name: Option<String>, as_json: bool) -> Result<()> {
     let canonical = std::fs::canonicalize(&path)
         .map_err(|e| anyhow::anyhow!("cannot resolve path {path}: {e}"))?;
     let name = match name {
@@ -32,13 +25,7 @@ pub async fn add(
                 )
             })?,
     };
-    let mut params = json!({ "name": name, "path": canonical.to_string_lossy() });
-    if let Some(mode) = merge_mode {
-        params["merge_mode"] = json!(mode);
-    }
-    if let Some(remote) = remote {
-        params["remote"] = json!(remote);
-    }
+    let params = json!({ "name": name, "path": canonical.to_string_lossy() });
     let mut client = Client::connect_or_spawn(layout).await?;
     let result = client.call("repo.add", params).await?;
     let repo = &result["repo"];
@@ -58,10 +45,10 @@ pub async fn add(
             );
         } else {
             println!(
-                "registered {} → {} (legacy {} mode)",
+                "registered {} → {} (inactive: run `rk repo onboard start {}`)",
                 repo["name"].as_str().unwrap_or("?"),
                 repo["path"].as_str().unwrap_or("?"),
-                repo["merge_mode"].as_str().unwrap_or("direct")
+                repo["name"].as_str().unwrap_or("?")
             );
         }
     }
@@ -112,14 +99,6 @@ pub async fn show(layout: &Layout, name: String, as_json: bool) -> Result<()> {
         "  registered {}",
         repo["created_at"].as_str().unwrap_or("?")
     );
-    println!(
-        "  merge      {}",
-        repo["merge_mode"].as_str().unwrap_or("direct")
-    );
-    println!(
-        "  remote     {}",
-        repo["remote"].as_str().unwrap_or("origin")
-    );
     if let Some(activated) = repo["activated_policy"].as_object() {
         let policy = &activated["policy"];
         let work = &policy["work"];
@@ -166,7 +145,7 @@ pub async fn show(layout: &Layout, name: String, as_json: bool) -> Result<()> {
             Err(error) => println!("  drift      unreadable: {error}"),
         }
     } else {
-        println!("  policy     legacy registry fields (no activated .rk/repo.cue)");
+        println!("  policy     inactive (run `rk repo onboard start {name}`)");
     }
     if let Some(host) = repo["host"].as_str() {
         println!("  host       {host}");

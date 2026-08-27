@@ -45,6 +45,7 @@ fn scratch_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 }
 
 /// Fake harness that captures the system prompt it was primed with into a
@@ -79,6 +80,7 @@ async fn promoted_convention_reaches_spawned_rat_prompt() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // A system-scope convention (as the reactor's quorum-promotion would emit)
     // and a repo-scope one, to prove both scopes are picked up at spawn.
@@ -245,6 +247,7 @@ async fn repo_named_checks_reach_spawned_rat_prompt() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let spawned = client
         .call(

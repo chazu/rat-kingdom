@@ -11,7 +11,7 @@ mod support;
 use rk_core::paths::Layout;
 use rk_core::tuple::{Category, Pattern, Tuple, FULL_STRENGTH};
 use rk_daemon::reactor::{Reactor, REACTOR_INSTANCE};
-use rk_daemon::repos::{RepoRecord, RepoRegistry};
+use rk_daemon::repos::{ActivatedRepositoryPolicy, RepoRecord, RepoRegistry};
 use rk_daemon::supervisor::Supervisor;
 use rk_daemon::tickets::{NewTicket, Tickets};
 use rk_daemon::workflow_exec::{InstanceStatus, Selection, WorkflowEngine};
@@ -66,6 +66,18 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    let rk_dir = dir.join(".rk");
+    std::fs::create_dir_all(&rk_dir).unwrap();
+    std::fs::write(
+        rk_dir.join("repo.cue"),
+        r#"repo: {
+    delivery: {target: "main", mode: "merge", remote: "origin", remoteBranch: "{{branch}}", deleteSource: true}
+}
+"#,
+    )
+    .unwrap();
+    git(dir, &["add", ".rk/repo.cue"]);
+    git(dir, &["commit", "-m", "test: register repository policy"]);
     let wf_dir = dir.join(".rk").join("workflows");
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(wf_dir.join("react-work.cue"), WORKFLOW).unwrap();
@@ -74,15 +86,16 @@ fn init_repo(dir: &Path) {
 /// Register `myrepo` in the on-disk registry the reactor reads, so a tuple in
 /// that scope resolves to a real checkout the fired workflow can run in.
 fn register_repo(layout: &Layout, name: &str, path: &Path) {
+    let path = std::fs::canonicalize(path).unwrap();
+    let (policy, digest) =
+        rk_workflow::load_repository_policy_with_digest(&path.join(".rk/repo.cue")).unwrap();
     let mut reg = RepoRegistry::load(&layout.home().join("repos.json")).unwrap();
     reg.add(RepoRecord {
         name: name.into(),
-        path: path.to_path_buf(),
+        path,
         created_at: chrono::Utc::now(),
-        merge_mode: Default::default(),
-        remote: None,
         host: None,
-        activated_policy: None,
+        activated_policy: Some(ActivatedRepositoryPolicy { digest, policy }),
     })
     .unwrap();
 }
@@ -177,8 +190,6 @@ fn build_reactor_parts(
         false,
         false,
         false,
-        Vec::new(),
-        vec!["main".into(), "master".into()],
         0,
         false,
     ));
@@ -1184,11 +1195,9 @@ async fn non_main_land_target_is_reported_main_is_not() {
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
-/// A trigger param templated from a payload field the matched tuple does not
-/// carry (the "legacy completion" case: an older/differently-shaped
-/// `harness_result`, or — going forward — any completion predating the
-/// `diff_class` enrichment) must still fire, falling back to the target
-/// workflow's own declared default rather than hard-failing on a `Null` param.
+/// A trigger param templated from an optional payload field the matched tuple
+/// does not carry must still fire, falling back to the target workflow's own
+/// declared default rather than hard-failing on a `Null` param.
 ///
 /// Before the null-guard fix, `template_params` passed the absent field
 /// through as a present `Value::Null`, which skips the workflow loader's
@@ -1233,18 +1242,22 @@ async fn trigger_param_over_an_absent_payload_field_falls_back_to_the_workflow_d
     .unwrap();
 
     let space = rk_space::Space::open_in_memory().unwrap();
-    let reactor = build_reactor_with_space(&layout, ReactorConfig::default(), space.clone());
+    let (reactor, engine) =
+        build_reactor_and_engine_with_space(&layout, ReactorConfig::default(), space.clone());
 
-    // No "tag" field in this payload at all — and, deliberately, no "spawn"
-    // either: this doubles as the legacy/pre-C3 completion shape, which stays
-    // durable in the space forever and must not crash a trigger fire.
+    // No "tag" field in this otherwise current completion payload. The exact
+    // generation remains present; only the workflow's optional input is absent.
     space
         .out(Tuple::new(
             Category::Event,
             "myrepo",
             "harness_result",
             "test-castle",
-            json!({"agent": "basil-6", "role": "rat"}),
+            json!({
+                "agent": "basil-6",
+                "spawn": rk_core::id::SpawnId::new().to_string(),
+                "role": "rat",
+            }),
         ))
         .unwrap();
     assert_eq!(
@@ -1270,7 +1283,8 @@ async fn trigger_param_over_an_absent_payload_field_falls_back_to_the_workflow_d
     assert_eq!(
         spawns.len(),
         1,
-        "the tagged workflow's spawn step never ran"
+        "the tagged workflow's spawn step never ran: {:#?}",
+        engine.list()
     );
     assert_eq!(spawns[0].payload["task"], "reacted-no-tag");
 

@@ -729,7 +729,7 @@ mod tests {
         let now = chrono::Utc::now();
         AgentRecord {
             name: name.into(),
-            spawn: None,
+            spawn: Some(rk_core::id::SpawnId::new()),
             role: role.into(),
             coordination: (role == "foreman").then(|| rk_workflow::Coordination {
                 reports_to: Some("coordinator".into()),
@@ -788,7 +788,6 @@ mod tests {
             instance_max_usd: None,
             definition: "feature-set".into(),
             definition_digest: String::new(),
-            automated_landing_authorized: false,
             params: Default::default(),
             depth: 0,
             started_at: chrono::Utc::now(),

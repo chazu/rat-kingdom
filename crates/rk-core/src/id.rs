@@ -129,36 +129,13 @@ impl SpawnId {
     /// against minted ids, and collides only if two records share a name *and* a
     /// millisecond — which the non-recycling naming policy already forbids.
     ///
-    /// A synthetic id has a zero random suffix, so [`Self::is_synthetic`]
-    /// distinguishes it from a minted one and a reader can tell "backfilled"
-    /// from "stamped at spawn" while the dual-key compatibility window is open.
+    /// The zero random suffix is an implementation detail of deterministic
+    /// migration, not an operational identity mode.
     pub fn synthetic_for(created_at: DateTime<Utc>) -> Self {
         Self(Ulid::from_parts(
             created_at.timestamp_millis().max(0) as u64,
             0,
         ))
-    }
-
-    /// Whether this id was backfilled by [`Self::synthetic_for`] rather than
-    /// minted at spawn.
-    pub fn is_synthetic(&self) -> bool {
-        self.0.random() == 0
-    }
-
-    /// The spawn instant, in milliseconds since the epoch.
-    pub fn timestamp_ms(&self) -> u64 {
-        self.0.timestamp_ms()
-    }
-
-    /// An exclusive [`RecordId`] floor at this generation's spawn instant: the
-    /// bound a legacy, name-keyed read needs to exclude a namesake predecessor.
-    ///
-    /// This is the compatibility bridge. A migrated reader keys on the id
-    /// directly and needs no floor at all; a reader still falling back to a
-    /// name match during the dual-key window gets its bound from here instead of
-    /// from a registry lookup that may fail.
-    pub fn floor(&self) -> RecordId {
-        RecordId(Ulid::from_parts(self.0.timestamp_ms(), 0))
     }
 
     /// The 8-char prefix used in the `Name@<short>` operator rendering. A
@@ -255,26 +232,11 @@ mod tests {
     /// Backfill is deterministic: the same pre-migration record synthesises the
     /// same id on every restart, so a reader never sees a generation change key.
     #[test]
-    fn synthetic_ids_are_deterministic_and_marked() {
+    fn synthetic_ids_are_deterministic() {
         let created_at = Utc::now();
         let once = SpawnId::synthetic_for(created_at);
         let twice = SpawnId::synthetic_for(created_at);
         assert_eq!(once, twice, "backfill must be stable across loads");
-        assert!(once.is_synthetic());
-        assert!(
-            !SpawnId::new().is_synthetic(),
-            "a minted id must not read as backfilled"
-        );
-    }
-
-    /// The compatibility bridge (§2.4): a spawn id yields the same floor a
-    /// name-keyed reader would have computed from the registry's `created_at`,
-    /// so the dual-key fallback arm needs no registry lookup.
-    #[test]
-    fn floor_matches_the_record_id_floor_at_the_spawn_instant() {
-        let created_at = Utc::now();
-        let spawn = SpawnId::synthetic_for(created_at);
-        assert_eq!(spawn.floor(), RecordId::floor_at(created_at));
     }
 
     /// A spawn id round-trips through its rendered form — it travels as a string

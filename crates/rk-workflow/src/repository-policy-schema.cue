@@ -33,9 +33,9 @@ repo: #RepositoryPolicy
 
 // Landing-pipeline gate policy (Phase 4 of the steward remediation): the
 // same protectedPaths/maxDiffFiles/maxDiffLines/gateTimeout/reviewTimeout
-// knobs `examples/workflows/steward.cue`'s mega-workflow used to expose as
-// workflow params, now owned by the daemon-native LandingPipeline
-// (crates/rk-daemon/src/landing.rs) instead of CUE.
+// knobs the retired steward mega-workflow used to expose as workflow params,
+// now versioned and digest-activated here in per-repo CUE and mechanically
+// executed by the daemon-native LandingPipeline (crates/rk-daemon/src/landing.rs).
 #LandingPolicy: {
 	// POLICY GUARDRAIL (#19): an ERE matched against changed file paths, run
 	// through the repo's `steward-protected-paths` named check.

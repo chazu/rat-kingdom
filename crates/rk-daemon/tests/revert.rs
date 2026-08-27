@@ -80,6 +80,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","ses
 /// Spawn a ticket-dispatched rat, wait for completion, dismiss (auto-merge).
 /// Returns (agent name, ticket id).
 async fn merge_one_rat(client: &mut Client, repo: &Path) -> (String, String) {
+    support::register_repo(client, repo).await;
     let ticket = client
         .call(
             "ticket.new",
@@ -212,6 +213,108 @@ async fn revert_undoes_merge_reopens_ticket_and_emits_fact() {
     // the revert.
     let again = client.call("agent.revert", json!({"name": &name})).await;
     assert!(again.is_err(), "second revert must error");
+}
+
+/// The bug TKT-01M0P96ZSQAJGRE7WTGDBWAXJ9 exists to fix: before
+/// `finalize_delivery`, only manual `rk land` recorded the agent-side merge
+/// pointer, so `rk revert` on anything the reactor's own `action: "land"`
+/// trigger landed automatically (no `agent.dismiss`, no manual `repo.land`)
+/// failed with "no recorded merge commit" even though the ticket showed
+/// delivered. This drives that exact path end to end.
+#[tokio::test]
+async fn automatic_reactor_landing_can_be_reverted() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    scratch_repo(repo_dir.path());
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", working_fake());
+    let layout = Layout::at(home.path());
+    std::fs::create_dir_all(layout.triggers_dir()).unwrap();
+    std::fs::write(
+        layout.triggers_dir().join("landing.cue"),
+        r#"triggers: [{name: "landing-on-completion", action: "land",
+            match: {category: "event", identity: "harness_result", search: "\"role\":\"rat\""},
+            maxFires: 20}]"#,
+    )
+    .unwrap();
+    let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
+    let _handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    let repo_name = repo_dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    client
+        .call(
+            "repo.add",
+            json!({"name": &repo_name, "path": repo_dir.path().to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+    let ticket = client
+        .call(
+            "ticket.new",
+            json!({"title": "do the thing", "scope": "svc"}),
+        )
+        .await
+        .unwrap();
+    let ticket_id = ticket["ticket"]["identity"].as_str().unwrap().to_string();
+    let spawned = client
+        .call(
+            "agent.spawn",
+            json!({"repo": repo_dir.path().to_string_lossy(), "task": &ticket_id, "harness": "fake"}),
+        )
+        .await
+        .unwrap();
+    let name = spawned["agent"]["name"].as_str().unwrap().to_string();
+
+    let mut merge_commit = None;
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = client
+            .call("agent.status", json!({"name": &name}))
+            .await
+            .unwrap();
+        if let Some(c) = status["agent"]["merge_commit"]
+            .as_str()
+            .filter(|c| !c.is_empty())
+        {
+            merge_commit = Some(c.to_string());
+            break;
+        }
+    }
+    assert!(
+        merge_commit.is_some(),
+        "the reactor's automatic land never derived this generation's merge pointer"
+    );
+
+    let t = client
+        .call("ticket.get", json!({"id": &ticket_id}))
+        .await
+        .unwrap();
+    assert_eq!(t["ticket"]["payload"]["status"], "closed");
+
+    let reverted = client
+        .call("agent.revert", json!({"name": &name}))
+        .await
+        .unwrap();
+    assert_eq!(reverted["reverted"], true, "detail: {}", reverted["detail"]);
+
+    let t = client
+        .call("ticket.get", json!({"id": &ticket_id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        t["ticket"]["payload"]["status"], "open",
+        "revert must reopen the ticket the automatic landing closed"
+    );
+    // No `remove_var` here: this binary's tests run concurrently and share
+    // one process env (see `working_fake`'s doc) — both set the identical
+    // command, so leaving it set is harmless, but unsetting mid-flight would
+    // break a sibling test still spawning its own rat.
 }
 
 #[tokio::test]

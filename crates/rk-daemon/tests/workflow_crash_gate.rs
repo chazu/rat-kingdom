@@ -102,6 +102,7 @@ fn init_repo(dir: &Path) -> String {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
     let wf_dir = dir.join(".rk").join("workflows");
     std::fs::create_dir_all(&wf_dir).unwrap();
     std::fs::write(wf_dir.join("crash-gate-test.cue"), WORKFLOW).unwrap();
@@ -170,6 +171,7 @@ async fn a_rat_that_dies_without_reporting_fails_the_chain() {
     });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = Instant::now();
     let id = run_workflow(&mut client, repo_dir.path()).await;
@@ -200,13 +202,16 @@ async fn a_rat_that_dies_without_reporting_fails_the_chain() {
 
     // Nothing was merged: the rat never committed anything to merge.
     let log = git(repo_dir.path(), &["log", "--oneline", "main"]);
-    assert_eq!(log.lines().count(), 1, "main should be untouched: {log}");
+    assert_eq!(
+        log.lines().count(),
+        2,
+        "main should contain only init plus the activated policy: {log}"
+    );
 }
 
 /// The silent-no-op shape itself: a `harness_result` that unifies with the
-/// gate's `expect` is sitting in the space under the crashed rat's name, newer
-/// than the rat's own record (so the TKT-146 generation floor does not catch
-/// it). The old chain read it, evaluated it clean, dismissed the rat and
+/// gate's `expect` is sitting in the space under the crashed rat's exact spawn.
+/// The old chain read it, evaluated it clean, dismissed the rat and
 /// reported `Completed` — having done nothing at all. The liveness assertion
 /// rejects it because the rat it is attributed to never ran.
 #[tokio::test]
@@ -232,11 +237,12 @@ async fn a_result_the_crashed_rat_could_not_have_produced_is_rejected() {
     });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let id = run_workflow(&mut client, repo_dir.path()).await;
 
-    // Wait for the rat to exist, then plant a clean result under its name —
-    // after its record's `created_at`, so it passes the generation floor.
+    // Wait for the rat to exist, then plant a clean result under its exact
+    // spawn id.
     let mut doomed = String::new();
     let mut doomed_spawn = String::new();
     for _ in 0..100 {
@@ -261,8 +267,7 @@ async fn a_result_the_crashed_rat_could_not_have_produced_is_rejected() {
                     "agent": doomed,
                     // The doomed rat's OWN spawn id (docs/2026-08-17-tkt-c1-
                     // generation-identity.md §3G, G5): even a plant that
-                    // matches down to the spawn-keyed join, not merely the
-                    // name+floor one, must still fail the liveness proof
+                    // matches the spawn-keyed join must still fail the liveness proof
                     // below — that proof is orthogonal to which key found
                     // the tuple.
                     "spawn": doomed_spawn,
@@ -326,6 +331,7 @@ async fn a_crashed_rat_in_a_fan_out_fails_the_join() {
     });
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     for title in ["add caching", "fix pagination"] {
         client
