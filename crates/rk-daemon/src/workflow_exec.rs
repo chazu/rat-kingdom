@@ -438,11 +438,6 @@ pub struct Instance {
     /// workflow refuses to execute a changed definition after restart.
     #[serde(default)]
     pub definition_digest: String,
-    /// Operator-granted capability for this exact workflow run. Set only when
-    /// the configured workflow name resolved directly from the managed global
-    /// workflow directory; repo-local name shadowing cannot set it.
-    #[serde(default)]
-    pub automated_landing_authorized: bool,
     /// The original `_input` params this instance launched with, replayed at
     /// reload so a resumed workflow validates and interpolates identically to
     /// its first run (TKT-52).
@@ -1326,8 +1321,6 @@ pub struct WorkflowEngine {
     /// `rk_core::config::WorktreeSweepConfig::finalize_cleanup_enabled`.
     finalize_cleanup_enabled: bool,
     require_approval_for_landing: bool,
-    automated_landing_workflows: Vec<String>,
-    allowed_target_branches: Vec<String>,
     /// Fleet-wide concurrent-agent ceiling shared with the continuous-drain
     /// autoscaler (`[drain] max_wip`): a `spawn` step waits for a free slot
     /// under the same cap a drain refill respects, so workflow-spawned agents
@@ -1360,8 +1353,6 @@ impl WorkflowEngine {
         require_named_checks: bool,
         respawn_enabled: bool,
         require_approval_for_landing: bool,
-        automated_landing_workflows: Vec<String>,
-        allowed_target_branches: Vec<String>,
         fleet_wip_cap: usize,
         finalize_cleanup_enabled: bool,
     ) -> Self {
@@ -1377,8 +1368,6 @@ impl WorkflowEngine {
             respawn_enabled,
             finalize_cleanup_enabled,
             require_approval_for_landing,
-            automated_landing_workflows,
-            allowed_target_branches,
             fleet_wip_cap,
             instances: Mutex::new(HashMap::new()),
             archived: Mutex::new(HashMap::new()),
@@ -1427,28 +1416,6 @@ impl WorkflowEngine {
             repo_local.display(),
             global.display()
         )))
-    }
-
-    /// Whether this exact definition carries the operator's configured
-    /// unattended-landing authority. Name membership alone is insufficient:
-    /// repo-local definitions shadow global ones during normal resolution, so
-    /// trusting only the name would let a repository replace `steward.cue` and
-    /// inherit a capability intended for an operator-managed definition.
-    fn is_automated_landing_definition(&self, file: &Path, workflow: &str) -> bool {
-        if !self
-            .automated_landing_workflows
-            .iter()
-            .any(|trusted| trusted == workflow)
-        {
-            return false;
-        }
-        let Ok(managed_dir) = std::fs::canonicalize(self.layout.workflows_dir()) else {
-            return false;
-        };
-        let Ok(definition) = std::fs::canonicalize(file) else {
-            return false;
-        };
-        definition.parent() == Some(managed_dir.as_path())
     }
 
     pub fn definitions(&self, repo: &str) -> Vec<String> {
@@ -1591,8 +1558,6 @@ impl WorkflowEngine {
         let file = self.find_definition(name, repo)?;
         let definition_digest = definition_digest(&file)?;
         let workflow = rk_workflow::load(&file, &params)?;
-        let automated_landing_authorized =
-            self.is_automated_landing_definition(&file, &workflow.name);
         let stale_timeout_secs = resolve_stale_timeout_secs(&workflow)?;
 
         let instance = Instance {
@@ -1614,7 +1579,6 @@ impl WorkflowEngine {
             instance_max_usd: workflow.budget.map(|b| b.max_usd),
             definition: name.to_string(),
             definition_digest,
-            automated_landing_authorized,
             params,
             depth: 0,
             started_at: chrono::Utc::now(),
@@ -2249,7 +2213,13 @@ impl WorkflowEngine {
                         .ok_or_else(|| rk_core::Error::other("wait step with no active agent"))?;
                     let deadline = tokio::time::Instant::now() + parse_duration(&wait.timeout)?;
                     let payload = self
-                        .await_result(id, &agent, deadline, "wait", &wait.timeout)
+                        .await_result(
+                            &agent,
+                            ctx.active_agent_spawn,
+                            deadline,
+                            "wait",
+                            &wait.timeout,
+                        )
                         .await?;
                     self.update(id, |i| {
                         i.context.previous_result = Some(payload.clone());
@@ -2290,7 +2260,9 @@ impl WorkflowEngine {
                     let agent = ctx.active_agent.clone().ok_or_else(|| {
                         rk_core::Error::other("dismiss step with no active agent")
                     })?;
-                    let expected_spawn = ctx.active_agent_spawn;
+                    let expected_spawn = ctx.active_agent_spawn.ok_or_else(|| {
+                        rk_core::Error::other("dismiss step has no exact active-agent spawn")
+                    })?;
                     let landing = self.supervisor.status(&agent).and_then(|record| {
                         record
                             .branch
@@ -2404,9 +2376,7 @@ impl WorkflowEngine {
                     //   completion, so concurrent reviewers write
                     //   `artifact/<repo>/review` at the same time and an unbound
                     //   read can hand a steward the OTHER steward's verdict to
-                    //   land on. Cured by the agent's name plus its generation
-                    //   floor (`for_agent_since`), since a name keys a
-                    //   generation and not a rat.
+                    //   land on. Cured by the rat generation's exact spawn id.
                     // - `fromInstance` (TKT-172) — what was written FOR this
                     //   run. The `workflow_approval` event behind an approval
                     //   gate is the case: two gated instances on one repo, one
@@ -2414,8 +2384,7 @@ impl WorkflowEngine {
                     //   both on whichever decision landed last. Cured by the
                     //   instance id (`for_workflow_instance`) — the same
                     //   predicate the gate itself waits on, so gate and read
-                    //   cannot disagree about whose decision this is. No
-                    //   generation floor: an instance id is never reused.
+                    //   cannot disagree about whose decision this is.
                     // - `forCommit` (steward Phase 2 verdict cache) — what was
                     //   written for a specific branch tip, regardless of who
                     //   wrote it or which run it belongs to. Deliberately the
@@ -2437,18 +2406,18 @@ impl WorkflowEngine {
                         ));
                     }
                     let mut pattern = if read.from_agent {
-                        let agent = ctx.active_agent.clone().ok_or_else(|| {
-                            rk_core::Error::other(
+                        if ctx.active_agent.is_none() {
+                            return Err(rk_core::Error::other(
                                 "read step has `fromAgent` but no active agent; only a step \
                                  after a `spawn` can bind a read to its author",
+                            ));
+                        }
+                        let spawn = ctx.active_agent_spawn.ok_or_else(|| {
+                            rk_core::Error::other(
+                                "read step has `fromAgent` but no exact active agent generation",
                             )
                         })?;
-                        Pattern::for_agent_since(
-                            category,
-                            read.identity.clone(),
-                            &agent,
-                            self.generation_floor(id, &agent),
-                        )
+                        Pattern::for_spawn(category, read.identity.clone(), spawn)
                     } else if read.from_instance {
                         Pattern::for_workflow_instance(category, read.identity.clone(), id)
                     } else if let Some(sha) = read.for_commit.as_deref() {
@@ -2647,12 +2616,9 @@ impl WorkflowEngine {
                     });
                 }
                 Step::Land(land) => {
-                    let automated = self
-                        .status(id)
-                        .is_some_and(|instance| instance.automated_landing_authorized);
-                    if self.require_approval_for_landing && !ctx.approval_granted && !automated {
+                    if self.require_approval_for_landing && !ctx.approval_granted {
                         return Err(rk_core::Error::other(
-                            "land step requires a prior approved human gate or a trusted automated workflow",
+                            "land step requires a prior approved human gate",
                         ));
                     }
                     let branch = interpolate(&land.branch, &ctx);
@@ -2666,7 +2632,7 @@ impl WorkflowEngine {
                     if target.is_empty() {
                         return Err(rk_core::Error::other("land step: target resolved to empty"));
                     }
-                    self.require_allowed_target(&target, repo, automated)?;
+                    self.require_allowed_target(&target, repo)?;
                     let result = self
                         .supervisor
                         .land(
@@ -2701,7 +2667,7 @@ impl WorkflowEngine {
                             "open_pr step: target resolved to empty",
                         ));
                     }
-                    self.require_allowed_target(&target, repo, false)?;
+                    self.require_allowed_target(&target, repo)?;
                     let result = self
                         .supervisor
                         .open_pr(std::path::Path::new(repo), &branch, &target)
@@ -2771,8 +2737,6 @@ impl WorkflowEngine {
         let definition_digest = definition_digest(&file)?;
         let workflow = rk_workflow::load(&file, &params)?;
         let workflow_name = workflow.name.clone();
-        let automated_landing_authorized =
-            self.is_automated_landing_definition(&file, &workflow_name);
         let child_id = if let Some(existing) = ctx.active_subworkflow.clone() {
             existing
         } else {
@@ -2804,7 +2768,6 @@ impl WorkflowEngine {
             instance_max_usd: workflow.budget.map(|b| b.max_usd),
             definition: sub.workflow.clone(),
             definition_digest: definition_digest.clone(),
-            automated_landing_authorized,
             params: params.clone(),
             depth,
             started_at: chrono::Utc::now(),
@@ -3038,20 +3001,12 @@ impl WorkflowEngine {
     /// a rat one second into its task (SIGTERM, so `code None`, no session,
     /// zero tokens). Whole workflows reported success having done nothing.
     ///
-    /// `reserve_name` no longer recycles names, so the collision should not
-    /// arise — but a `wait` that can be satisfied by a tuple predating the rat
-    /// it waits on is wrong on its own terms. Bounding the read below the
-    /// agent record's `created_at` makes the predicate generation-exact and
-    /// keeps it correct however the naming policy moves.
+    /// The tuple is keyed by the rat generation's minted spawn id, so neither
+    /// a predecessor nor a newer namesake can satisfy the read. Missing exact
+    /// identity fails closed.
     ///
-    /// TKT-159: the bound is now unconditional. It previously degraded to an
-    /// UNBOUNDED read when the agent's registry record was unreachable, which
-    /// left the exact defect this method exists to prevent live on that path.
-    /// [`generation_floor`](Self::generation_floor) now always yields a valid
-    /// bound, so there is no case in which a `wait` can match a namesake.
-    ///
-    /// TKT-160: the generation floor is necessary but NOT sufficient. It
-    /// separates generations; it does not separate the TURNS within one, and a
+    /// TKT-160: generation identity separates generations, not the TURNS within
+    /// one, and a
     /// harness reports a result per turn — so this read used to be satisfied by
     /// a mid-flight "tests still running" turn milliseconds after the rat
     /// started. That is fixed on the producer side (a generation now publishes
@@ -3060,48 +3015,17 @@ impl WorkflowEngine {
     /// the reactor's steward trigger and the ticket auto-close read the same
     /// event. Do not reintroduce a per-turn `harness_result`.
     ///
-    /// Generation-identity migration (consumer B1,
-    /// `docs/2026-08-17-tkt-c1-generation-identity.md`): every `harness_result`
-    /// now carries `spawn` (`Supervisor::route_completion`), so a reachable
-    /// registry record with a minted `SpawnId` keys the read on
-    /// [`Pattern::for_spawn`] instead — an equality predicate that cannot match
-    /// a namesake regardless of timing, no floor required. Falls back to the
-    /// name+floor predicate only for a record with no minted id (unreachable,
-    /// or written before this migration).
-    fn result_pattern(&self, id: &str, agent: &str) -> Pattern {
-        if let Some(spawn) = self.supervisor.status(agent).and_then(|r| r.spawn) {
-            return Pattern::for_spawn(Category::Event, "harness_result", spawn);
-        }
-        Pattern::for_agent_since(
-            Category::Event,
-            "harness_result",
-            agent,
-            self.generation_floor(id, agent),
-        )
-    }
-
-    /// The instant a waited-on agent's `harness_result` provably postdates.
-    ///
-    /// The agent record's own `created_at` is the exact answer. When no record
-    /// is reachable — it was removed, or the registry file was replaced under a
-    /// resumed instance — fall back to when THIS workflow instance started:
-    /// every agent a `wait`/`wait_all` blocks on was spawned by this instance
-    /// (`ctx.active_agent` is only set by `spawn`, `ctx.fanout` only by
-    /// `for_each`), so its result cannot predate the instance. That makes the
-    /// fallback a sound lower bound rather than no bound at all — never too
-    /// tight to miss the real tuple, and still tight enough to exclude every
-    /// namesake predecessor from before the run.
-    fn generation_floor(&self, id: &str, agent: &str) -> DateTime<Utc> {
-        let record_created_at = self.supervisor.status(agent).map(|r| r.created_at);
-        if record_created_at.is_none() {
-            warn!(
-                agent,
-                instance = id,
-                "no registry record for waited-on agent; falling back to the instance start"
-            );
-        }
-        let instance_started_at = self.lock().get(id).map(|i| i.started_at);
-        generation_floor_of(record_created_at, instance_started_at, Utc::now())
+    fn result_pattern(
+        &self,
+        agent: &str,
+        spawn: Option<rk_core::id::SpawnId>,
+    ) -> rk_core::Result<Pattern> {
+        let spawn = spawn.ok_or_else(|| {
+            rk_core::Error::other(format!(
+                "agent {agent} has no exact generation in the workflow snapshot"
+            ))
+        })?;
+        Ok(Pattern::for_spawn(Category::Event, "harness_result", spawn))
     }
 
     /// The liveness assertion under every result a workflow acts on (TKT-147):
@@ -3215,13 +3139,13 @@ impl WorkflowEngine {
     /// result payload, or an error naming why no result is coming.
     async fn await_result(
         &self,
-        id: &str,
         agent: &str,
+        spawn: Option<rk_core::id::SpawnId>,
         deadline: tokio::time::Instant,
         step: &str,
         timeout: &str,
     ) -> rk_core::Result<Value> {
-        let pattern = self.result_pattern(id, agent);
+        let pattern = self.result_pattern(agent, spawn)?;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -3236,10 +3160,9 @@ impl WorkflowEngine {
                 .await
                 .map_err(|e| rk_core::Error::other(format!("{step} failed: {e}")))?
             {
-                // The result is this generation's by construction (the pattern
-                // is floored at the record's own created_at); the liveness gate
-                // is the belt to that braces, covering the degraded unbounded
-                // read and any future path that lands a foreign result here.
+                // The result is this generation's by construction: the
+                // pattern binds its exact spawn id. The liveness gate also
+                // rejects any future path that lands a foreign result here.
                 if let Some(why) = self.liveness_failure(agent) {
                     return Err(rk_core::Error::other(format!("{step} failed: {why}")));
                 }
@@ -3283,7 +3206,7 @@ impl WorkflowEngine {
             // one crashed rat fails the join rather than being counted as a
             // clean member of the batch.
             results.push(
-                self.await_result(id, &fa.agent, deadline, "wait_all", &wait_all.timeout)
+                self.await_result(&fa.agent, fa.spawn, deadline, "wait_all", &wait_all.timeout)
                     .await?,
             );
         }
@@ -3376,7 +3299,12 @@ impl WorkflowEngine {
         for fa in fanout {
             let supervisor = Arc::clone(&self.supervisor);
             let agent = fa.agent.clone();
-            let spawn = fa.spawn;
+            let spawn = fa.spawn.ok_or_else(|| {
+                rk_core::Error::other(format!(
+                    "dismiss_all member {} has no exact spawn id",
+                    fa.agent
+                ))
+            })?;
             let landing = supervisor.status(&agent).and_then(|record| {
                 record
                     .branch
@@ -4506,56 +4434,39 @@ impl WorkflowEngine {
         );
     }
 
-    fn require_allowed_target(
-        &self,
-        target: &str,
-        repo: &str,
-        automated: bool,
-    ) -> rk_core::Result<()> {
-        if automated {
-            // `Repo::discover` shells out to git; `run_step` runs this
-            // synchronously inside its own async future, so keep the
-            // subprocess off the worker thread the same way
-            // `Supervisor::diff_summary_for` does. The flavor check (rather
-            // than an unconditional `block_in_place`) is needed because
-            // `#[tokio::test]` defaults to a current-thread runtime, where
-            // `block_in_place` panics.
-            let on_multithread = tokio::runtime::Handle::try_current()
-                .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
-                .unwrap_or(false);
-            let repo_path = Path::new(repo);
-            let discovered = if on_multithread {
-                tokio::task::block_in_place(|| rk_git::Repo::discover(repo_path))
-            } else {
-                rk_git::Repo::discover(repo_path)
-            };
-            if let Ok(git_repo) = discovered {
-                let registry_path = self.layout.home().join("repos.json");
-                if let Ok(registry) = crate::repos::RepoRegistry::load(&registry_path) {
-                    if let Some(approved) = registry
-                        .get_by_path(git_repo.root())
-                        .and_then(|record| record.activated_policy.as_ref())
-                    {
-                        let policy_target = approved.policy.delivery.target.as_str();
-                        if policy_target == "agent-base" || policy_target == target {
-                            return Ok(());
-                        }
-                        return Err(rk_core::Error::other(format!(
-                            "workflow target '{target}' does not match activated repository policy target '{policy_target}'"
-                        )));
-                    }
-                }
-            }
-        }
-        if self
-            .allowed_target_branches
-            .iter()
-            .any(|allowed| allowed == target)
-        {
+    fn require_allowed_target(&self, target: &str, repo: &str) -> rk_core::Result<()> {
+        // `Repo::discover` shells out to git; `run_step` runs this
+        // synchronously inside its own async future, so keep the subprocess
+        // off a multi-thread worker. Current-thread tests cannot use
+        // `block_in_place`, hence the runtime flavor check.
+        let on_multithread = tokio::runtime::Handle::try_current()
+            .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            .unwrap_or(false);
+        let repo_path = Path::new(repo);
+        let git_repo = if on_multithread {
+            tokio::task::block_in_place(|| rk_git::Repo::discover(repo_path))
+        } else {
+            rk_git::Repo::discover(repo_path)
+        }?;
+        let registry = crate::repos::RepoRegistry::load(&self.layout.home().join("repos.json"))?;
+        let record = registry.get_by_path(git_repo.root()).ok_or_else(|| {
+            rk_core::Error::other(format!(
+                "repository '{}' is not registered; run `rk repo add` and activate .rk/repo.cue",
+                git_repo.root().display()
+            ))
+        })?;
+        let approved = record.activated_policy.as_ref().ok_or_else(|| {
+            rk_core::Error::other(format!(
+                "repository '{0}' has no activated .rk/repo.cue policy; run `rk repo onboard start {0}` before workflow landing",
+                record.name,
+            ))
+        })?;
+        let policy_target = approved.policy.delivery.target.as_str();
+        if policy_target == "agent-base" || policy_target == target {
             return Ok(());
         }
         Err(rk_core::Error::other(format!(
-            "workflow target '{target}' is not authorized by the activated repository policy or policy.allowed_target_branches"
+            "workflow target '{target}' does not match activated repository policy target '{policy_target}'"
         )))
     }
 
@@ -5603,31 +5514,6 @@ fn definition_digest(path: &Path) -> rk_core::Result<String> {
     Ok(hex::encode(Sha256::digest(data)))
 }
 
-/// Pick the lower bound for a generation-exact `harness_result` read, given
-/// what is still known about the waited-on agent. Pure so the choice is
-/// testable without a live supervisor; see
-/// [`WorkflowEngine::generation_floor`].
-///
-/// Ordered by how tight a bound each source gives, and every arm returns SOME
-/// instant — there is deliberately no "unbounded" result. That is the TKT-159
-/// fix: this decision used to fall through to no bound at all when the agent
-/// record was missing, which reinstated the TKT-146 defect (a `wait` satisfied
-/// by a namesake predecessor's two-day-old tuple) on exactly that path.
-fn generation_floor_of(
-    record_created_at: Option<DateTime<Utc>>,
-    instance_started_at: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> DateTime<Utc> {
-    // 1. The agent record's own birth: exact, and the normal case.
-    // 2. The instance's start: every waited-on agent was spawned by this
-    //    instance, so its result cannot predate the run. Looser but sound.
-    // 3. `now`: nothing is known. Cannot admit an older namesake's tuple, which
-    //    is the failure mode that kills a live rat. The cost is a wait that
-    //    times out if the result already landed — fail toward waiting, never
-    //    toward a stranger's record.
-    record_created_at.or(instance_started_at).unwrap_or(now)
-}
-
 fn repo_name_of(repo: &str) -> String {
     PathBuf::from(repo)
         .file_name()
@@ -5870,7 +5756,6 @@ fn step_label(step: &Step) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rk_core::id::RecordId;
     use rk_workflow::DismissStep;
 
     #[test]
@@ -6004,7 +5889,6 @@ mod tests {
             instance_max_usd: None,
             definition: "parent".into(),
             definition_digest: String::new(),
-            automated_landing_authorized: false,
             params: HashMap::new(),
             depth: 0,
             started_at: Utc::now(),
@@ -6045,7 +5929,6 @@ mod tests {
             instance_max_usd: None,
             definition: "parent".into(),
             definition_digest: String::new(),
-            automated_landing_authorized: false,
             params: HashMap::new(),
             depth: 0,
             started_at: Utc::now(),
@@ -6125,7 +6008,6 @@ mod tests {
             instance_max_usd: None,
             definition: "child".into(),
             definition_digest: String::new(),
-            automated_landing_authorized: false,
             params: HashMap::new(),
             depth: 1,
             started_at: Utc::now(),
@@ -6344,65 +6226,6 @@ test a::flaky ... FAILED
         assert_eq!(interpolate(text, &ctx), "verdict=REWORK rounds=3");
     }
 
-    /// TKT-159 regression. Reverting the fallback — i.e. leaving the wait
-    /// unbounded when the agent record is gone — makes this read admit a
-    /// namesake predecessor's `harness_result` again, which is the TKT-146
-    /// kill-a-live-rat defect. Every arm must yield a floor that excludes any
-    /// tuple written before the run started.
-    #[test]
-    fn generation_floor_is_never_unbounded() {
-        let started_at = Utc::now();
-        let spawned_at = started_at + chrono::Duration::seconds(5);
-        // A namesake's durable tuple from a previous night — the input that made
-        // TKT-146 fire, and which the 24 duplicated name generations supply today.
-        let predecessor = RecordId::floor_at(started_at - chrono::Duration::days(2));
-
-        // Record present: the exact, tightest bound.
-        assert_eq!(
-            generation_floor_of(Some(spawned_at), Some(started_at), Utc::now()),
-            spawned_at,
-        );
-        // Record gone: fall back to the instance start, which the agent this
-        // instance spawned provably postdates.
-        assert_eq!(
-            generation_floor_of(None, Some(started_at), Utc::now()),
-            started_at,
-        );
-        // Neither survives: `now`, the most conservative bound.
-        let now = Utc::now();
-        assert_eq!(generation_floor_of(None, None, now), now);
-
-        // The property that actually matters on every arm.
-        for floor in [
-            generation_floor_of(Some(spawned_at), Some(started_at), now),
-            generation_floor_of(None, Some(started_at), now),
-            generation_floor_of(None, None, now),
-        ] {
-            assert!(
-                predecessor <= RecordId::floor_at(floor),
-                "floor {floor} would admit a predecessor's tuple",
-            );
-        }
-    }
-
-    /// The fallback must never be so tight that it misses the tuple the wait is
-    /// actually for: a result written after the instance started still matches.
-    #[test]
-    fn instance_start_fallback_still_admits_this_generations_result() {
-        let started_at = Utc::now();
-        let floor = generation_floor_of(None, Some(started_at), Utc::now());
-        let pattern = Pattern::for_agent_since(Category::Event, "harness_result", "Whisker", floor);
-        let mut mine = rk_core::tuple::Tuple::new(
-            Category::Event,
-            "myrepo",
-            "harness_result",
-            "castle",
-            json!({"agent": "Whisker", "is_error": false}),
-        );
-        mine.id = RecordId::floor_at(started_at + chrono::Duration::seconds(90));
-        assert!(pattern.matches(&mine));
-    }
-
     #[test]
     fn value_as_key_renders_variants() {
         assert_eq!(value_as_key(&json!("APPROVE")), "APPROVE");
@@ -6567,7 +6390,6 @@ test a::flaky ... FAILED
             instance_max_usd: None,
             definition: "steward".into(),
             definition_digest: "aaaa".into(),
-            automated_landing_authorized: false,
             params: params(&[("ticket", "TKT-1")]),
             depth: 0,
             started_at: Utc::now(),
@@ -7381,8 +7203,6 @@ test a::flaky ... FAILED
             false,
             true,
             false,
-            Vec::new(),
-            Vec::new(),
             0,
             false,
         )
@@ -7420,8 +7240,6 @@ test a::flaky ... FAILED
             false,
             true,
             false,
-            Vec::new(),
-            Vec::new(),
             0,
             true,
         )
@@ -8004,7 +7822,6 @@ test a::flaky ... FAILED
             instance_max_usd: None,
             definition: "wf".into(),
             definition_digest: String::new(),
-            automated_landing_authorized: false,
             params: HashMap::new(),
             depth: 0,
             started_at: now,
@@ -8096,7 +7913,6 @@ test a::flaky ... FAILED
             instance_max_usd: None,
             definition: "steward".into(),
             definition_digest: String::new(),
-            automated_landing_authorized: false,
             params: HashMap::new(),
             depth: 0,
             started_at,
@@ -8886,8 +8702,6 @@ test a::flaky ... FAILED
                     name: repo_name.into(),
                     path: repo_dir.path().to_path_buf(),
                     created_at: Utc::now(),
-                    merge_mode: Default::default(),
-                    remote: None,
                     host: None,
                     activated_policy: None,
                 })

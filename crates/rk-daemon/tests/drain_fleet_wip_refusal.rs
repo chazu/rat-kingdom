@@ -12,10 +12,9 @@
 //! cap of 1, one ready ticket for the drain to claim, and a competing
 //! workflow `spawn` step hammering the SAME cap concurrently. Under the old
 //! code, any refusal during that contention permanently strands the ticket at
-//! `in_progress` and it can never reach `done` — the test times out. Under the
-//! fix, a refused claim is reopened to `open`, so a later cycle (drain's own,
-//! once contention eases) picks it back up and it reaches `done` within the
-//! deadline.
+//! `in_progress` with no owning rat. Under the fix, a refused claim is reopened
+//! to `open`, so a later cycle (drain's own, once contention eases) picks it
+//! back up and dispatches a rat within the deadline.
 
 mod fixture;
 
@@ -47,13 +46,8 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 // `FAST_FAKE` never touches the worktree — it exists to race the admission
-// TOCTOU cheaply, not to exercise delivery. Under the default "merge"
-// delivery mode a ticket only reaches `done` once its branch is actually
-// merged (TKT-01M08HB566GFBZVMDKZ8DT1ES0's C3 gate), which nothing here ever
-// does. Activate "push-branch" instead: the routed-completion gate never
-// checks push-branch delivery, so a clean `rk_done` alone closes the ticket —
-// see continuous_drain.rs's `PUSH_BRANCH_POLICY` for the full rationale
-// (TKT-01M0CTC4DPFV7Q2642AZH354BV).
+// TOCTOU cheaply, not to exercise delivery. Its ticket must therefore remain
+// `in_progress`; only canonical landing evidence may close it.
 const PUSH_BRANCH_POLICY: &str = r#"
 repo: {
     delivery: {
@@ -188,26 +182,26 @@ async fn drain_reopens_ticket_refused_by_fleet_wip_cap_instead_of_stranding_it()
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    client
+    let ticket = client
         .call(
             "ticket.new",
             json!({"title": "race ticket", "body": "do it", "scope": repo_name}),
         )
         .await
         .unwrap();
+    let ticket_id = ticket["ticket"]["identity"].as_str().unwrap().to_string();
 
-    let mut done = false;
+    let mut dispatched_and_settled = false;
     let deadline = tokio::time::Instant::now() + RACE_DEADLINE;
     while tokio::time::Instant::now() < deadline {
-        let tickets = client
-            .call("ticket.list", json!({"scope": repo_name}))
-            .await
-            .unwrap();
-        let status = tickets["tickets"][0]["payload"]["status"]
-            .as_str()
-            .unwrap_or("");
-        if status == "done" {
-            done = true;
+        let agents = client.call("agent.list", json!({})).await.unwrap();
+        if agents["agents"].as_array().is_some_and(|agents| {
+            agents.iter().any(|agent| {
+                agent["task"] == ticket_id
+                    && !matches!(agent["state"].as_str(), Some("spawning") | Some("running"))
+            })
+        }) {
+            dispatched_and_settled = true;
             break;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -217,10 +211,17 @@ async fn drain_reopens_ticket_refused_by_fleet_wip_cap_instead_of_stranding_it()
     }
 
     assert!(
-        done,
-        "the ready ticket must eventually reach done despite fleet-wip contention with \
-         a concurrent workflow spawn; a claim stranded in_progress by a refusal would hang \
-         here forever since Tickets::claim only ever wins from `open`"
+        dispatched_and_settled,
+        "the ready ticket must eventually acquire and settle an owning rat despite fleet-wip \
+         contention; a claim stranded in_progress by a refusal would have no matching agent"
+    );
+    let ticket = client
+        .call("ticket.get", json!({"id": ticket_id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        ticket["ticket"]["payload"]["status"], "in_progress",
+        "agent completion alone must not fabricate delivery"
     );
     // NOTE: deliberately no `remove_var("RK_FAKE_HARNESS_CMD")` — see
     // continuous_drain.rs's SLOW_FAKE for why.

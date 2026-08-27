@@ -810,7 +810,6 @@ mod tests {
             instance_max_usd: None,
             definition: "implement-featureset".into(),
             definition_digest: String::new(),
-            automated_landing_authorized: false,
             params: HashMap::new(),
             depth: 0,
             started_at: Utc.timestamp_opt(1_000, 0).unwrap(),

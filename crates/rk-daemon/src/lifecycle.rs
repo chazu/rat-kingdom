@@ -57,15 +57,10 @@ pub(crate) enum MergePointerDecision {
 /// matches that exact generation, never a guess by recency, so a branch name
 /// reused across two dispatches cannot resolve onto the wrong one.
 ///
-/// `exact_spawn: None` is the explicit compatibility fallback for callers
-/// with no exact generation to resolve onto: a queue entry written before
-/// source-generation capture existed, or a manual `rk land`/`rk land
-/// --force` invocation, which only ever names a branch. It falls back to the
-/// same "newest matching generation" rule
-/// [`crate::supervisor::Supervisor::latest_task_record`] applies elsewhere.
-/// Callers observe when this path is taken (see `record_delivery`'s log) and
-/// it is removable once no caller ever passes `None` for an automatic
-/// candidate.
+/// `exact_spawn: None` means the delivery is not attributable to an agent
+/// generation (for example, an explicitly ticket-bound recovery branch).
+/// Branch/name/recency guesses are deliberately forbidden: ticket delivery is
+/// still recorded, but no agent merge pointer is derived without exact proof.
 pub(crate) fn resolve_merge_pointer<'a>(
     records: impl Iterator<Item = &'a AgentRecord>,
     repo_root: &Path,
@@ -74,13 +69,16 @@ pub(crate) fn resolve_merge_pointer<'a>(
     candidate_commit: &str,
     exact_spawn: Option<SpawnId>,
 ) -> MergePointerDecision {
-    let mut matching = records.filter(|r| {
-        r.repo_root == repo_root && r.branch.as_deref() == Some(branch) && r.target_branch == target
-    });
-    let found = match exact_spawn {
-        Some(spawn) => matching.find(|r| r.spawn_id() == spawn),
-        None => matching.max_by_key(|r| r.created_at),
+    let Some(exact_spawn) = exact_spawn else {
+        return MergePointerDecision::NoTarget;
     };
+    let found = records
+        .filter(|r| {
+            r.repo_root == repo_root
+                && r.branch.as_deref() == Some(branch)
+                && r.target_branch == target
+        })
+        .find(|r| r.spawn_id() == exact_spawn);
     let Some(record) = found else {
         return MergePointerDecision::NoTarget;
     };
@@ -107,7 +105,7 @@ mod tests {
     fn record(name: &str, branch: &str, target: &str, age_secs: i64) -> AgentRecord {
         AgentRecord {
             name: name.into(),
-            spawn: None,
+            spawn: Some(rk_core::id::SpawnId::new()),
             role: "rat".into(),
             coordination: None,
             harness: "fake".into(),
@@ -180,21 +178,21 @@ mod tests {
                 MergePointerDecision::NoTarget,
             ),
             (
-                "unset pointer resolves to set",
+                "missing exact generation derives no pointer",
                 vec![record("a1", "feature", "main", 0)],
                 None,
                 "sha1",
-                MergePointerDecision::Set { agent: "a1".into() },
+                MergePointerDecision::NoTarget,
             ),
             (
-                "no exact spawn falls back to the newest generation on branch reuse",
+                "branch reuse without exact generation derives no pointer",
                 vec![
                     record("a1", "feature", "main", 100),
                     record("a2", "feature", "main", 0),
                 ],
                 None,
                 "sha1",
-                MergePointerDecision::Set { agent: "a2".into() },
+                MergePointerDecision::NoTarget,
             ),
             (
                 "an exact spawn resolves that generation even when older",
@@ -213,14 +211,14 @@ mod tests {
             (
                 "replaying the recorded commit is idempotent",
                 vec![recorded.clone()],
-                None,
+                Some(recorded.spawn_id()),
                 "sha-old",
                 MergePointerDecision::AlreadyRecorded,
             ),
             (
                 "a different candidate against a recorded commit fails closed",
                 vec![recorded.clone()],
-                None,
+                Some(recorded.spawn_id()),
                 "sha-new",
                 MergePointerDecision::Conflict {
                     agent: "a1".into(),

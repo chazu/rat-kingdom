@@ -1067,7 +1067,6 @@ mod tests {
             instance_max_usd: None,
             definition: "gated-merge".into(),
             definition_digest: String::new(),
-            automated_landing_authorized: false,
             params: Default::default(),
             depth: 0,
             started_at: Utc::now(),

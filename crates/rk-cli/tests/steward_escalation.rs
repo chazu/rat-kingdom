@@ -115,6 +115,8 @@ async fn fixture(
     git(repo_dir.path(), &["config", "user.email", "r@x"]);
     git(repo_dir.path(), &["config", "user.name", "R"]);
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
+    std::fs::create_dir_all(repo_dir.path().join(".rk")).unwrap();
+    std::fs::write(repo_dir.path().join(".rk/repo.cue"), "repo: {}\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
     let wf_dir = repo_dir.path().join(".rk").join("workflows");
@@ -130,7 +132,14 @@ async fn fixture(
     let layout = Layout::at(home.path());
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
-    let client = connect(&layout).await;
+    let mut client = connect(&layout).await;
+    client
+        .call(
+            "repo.add",
+            json!({"name": "steward-escalation", "path": repo_dir.path()}),
+        )
+        .await
+        .unwrap();
     (home, repo_dir, client, handle)
 }
 

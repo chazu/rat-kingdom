@@ -23,32 +23,13 @@
 //! their transcripts share a file, so `rk log <name>` can only present one of
 //! them, silently, as if it were the whole story.
 //!
-//! The file was first keyed on the generation's spawn *instant*
-//! (`<agent>.<rfc3339>.jsonl`) rather than its identity — the de-facto
-//! `(name, created_at)` composite `docs/2026-08-17-tkt-c1-generation-identity.md`
-//! retires. That path is now itself read-only history: new writes key on the
-//! minted [`rk_core::id::SpawnId`] instead (`<agent>.<spawn>.jsonl`), which
-//! turns every read keyed on it into an equality lookup rather than a
-//! timestamp match, and — via [`SpawnId::is_synthetic`] — lets
-//! [`AgentLog::delete_for`] tell a pre-migration generation from a minted one
-//! without a side table.
-//!
-//! Three consequences worth knowing:
-//!
-//! - A write can no longer land in the wrong rat's file, whatever a future
-//!   naming regression does — the path carries the spawn identity, not the name.
-//! - Reads are fixed *retroactively*. [`AgentLog::read`] still reads both the
-//!   truly-legacy `<agent>.jsonl` path (windowed to `[start, end)` of the
-//!   generation asked for, since generations of a name never overlap in time)
-//!   and the timestamp-keyed `<agent>.<rfc3339>.jsonl` path a pre-cutover
-//!   generation wrote to (that one needs no window — its filename already
-//!   picks out exactly one generation).
-//! - [`Generation`] — the compatibility type that carries the `[start, end)`
-//!   window — stays exactly as it was for that legacy-reading arm; it gains a
-//!   `spawn` field alongside, which is the primary key for everything else.
+//! Older name-keyed and timestamp-keyed transcripts are copied into this exact
+//! layout by [`migrate_legacy_transcripts`] while the registry migration runs.
+//! Operational reads, deletes, and hook paths then use only `(agent, spawn)`;
+//! the old files remain untouched as rollback evidence and are never consulted
+//! for authority or display by the migrated runtime.
 //!
 //! [`Registry::reserve_name`]: crate::agents::Registry::reserve_name
-//! [`SpawnId::is_synthetic`]: rk_core::id::SpawnId::is_synthetic
 
 use chrono::{DateTime, Utc};
 use rk_core::id::SpawnId;
@@ -97,8 +78,8 @@ pub struct LogRecord {
 }
 
 /// One generation of an agent name: which rat's transcript to read, keyed on
-/// its [`SpawnId`], plus the `[start, end)` time window that isolates it
-/// inside the two file shapes that predate spawn keying (E2).
+/// its [`SpawnId`]. `start`/`end` are retained as display and one-time
+/// migration metadata; operational transcript reads use only exact identity.
 ///
 /// Build these with [`Supervisor::log_generations`], which reads the bounds off
 /// the registry (live + archive) rather than guessing.
@@ -111,13 +92,10 @@ pub struct Generation {
     /// [`unrecorded`](Self::unrecorded) — no registry record means no
     /// `SpawnId` to key a read on, live or synthetic.
     pub spawn: Option<SpawnId>,
-    /// The record's `created_at`: the inclusive lower bound of its entries in
-    /// a legacy, timestamp-windowed file. `None` = no registry record for
-    /// this name at all, so there is nothing to window against and the
-    /// truly-legacy file is read whole.
+    /// The record's `created_at`, retained for display and migration.
     pub start: Option<DateTime<Utc>>,
-    /// `created_at` of the NEXT generation of this name, if there is one: the
-    /// exclusive upper bound. `None` = newest generation, unbounded above.
+    /// `created_at` of the next generation, used only while splitting an old
+    /// shared name-keyed transcript during migration.
     pub end: Option<DateTime<Utc>>,
 }
 
@@ -136,9 +114,8 @@ impl Generation {
         }
     }
 
-    /// A name with no record in the registry or the archive — a hand-pruned
-    /// `agents.json`, or a typo. Reads the legacy file unfiltered so a
-    /// transcript that outlived its record is still legible.
+    /// A name with no record in the registry or archive. With no exact spawn
+    /// identity there is no transcript Rat Kingdom can safely attribute.
     pub fn unrecorded(agent: &str) -> Self {
         Self {
             agent: agent.to_string(),
@@ -148,10 +125,8 @@ impl Generation {
         }
     }
 
-    /// Whether an entry stamped `ts` belongs to this generation. Only
-    /// meaningful for the two legacy file shapes `read` windows; the
-    /// spawn-keyed file needs no such test — its path alone selects one
-    /// generation.
+    /// Whether an old shared-file entry belongs to this generation. Used only
+    /// by the one-time migration.
     fn contains(&self, ts: DateTime<Utc>) -> bool {
         self.start.is_none_or(|start| ts >= start) && self.end.is_none_or(|end| ts < end)
     }
@@ -234,26 +209,13 @@ impl AgentLog {
     /// `tail` entries. Malformed lines (e.g. a torn write) are skipped, not
     /// fatal.
     ///
-    /// Merges up to three sources by timestamp: the generation's own
-    /// spawn-keyed file, the timestamp-keyed file a pre-cutover generation
-    /// wrote to instead, and this generation's `[start, end)` window of the
-    /// truly-legacy name-keyed file. All three exist together only for a rat
-    /// whose run straddled one of the two keying upgrades; for every other
-    /// generation, at most one actually holds entries — reading an absent file
-    /// is just an empty contribution, never an error.
+    /// Reads only the exact spawn-keyed file. Old file shapes are consumed by
+    /// startup migration, never as an operational fallback.
     pub fn read(&self, generation: &Generation, tail: Option<usize>) -> Vec<LogEntry> {
         let mut entries = match generation.spawn {
             Some(spawn) => read_entries(&self.path_for(&generation.agent, spawn)),
             None => Vec::new(),
         };
-        if let Some(start) = generation.start {
-            entries.extend(read_entries(&self.timestamp_path(&generation.agent, start)));
-        }
-        let mut legacy = read_entries(&self.legacy_path(&generation.agent));
-        if !legacy.is_empty() {
-            legacy.retain(|e| generation.contains(e.ts));
-            entries.append(&mut legacy);
-        }
         entries.sort_by_key(|e| e.ts);
         if let Some(n) = tail {
             if entries.len() > n {
@@ -277,33 +239,14 @@ impl AgentLog {
     /// taken a live namesake's transcript with it, and a live generation's
     /// `SpawnId` can never coincide with this one's.
     ///
-    /// A pre-cutover generation's transcript lives at the timestamp-keyed path
-    /// instead — its `spawn` here is [synthetic](rk_core::id::SpawnId::is_synthetic),
-    /// derived from `created_at` rather than minted at spawn, so falling back
-    /// to that exact path (never a glob) reclaims it too rather than leaking
-    /// it forever. The derivation is deterministic and one-to-one with the
-    /// generation's own `created_at`, so this can still only ever unlink the
-    /// file this exact generation wrote.
-    ///
-    /// The truly-legacy name-keyed file is deliberately never touched. It can
-    /// still hold entries of a generation that is *not* being archived — that
-    /// is the 24 two-rat names of the TKT-136 window — and its path alone
-    /// cannot tell those apart.
+    /// Old transcript files remain untouched as rollback evidence; migration
+    /// has already copied their attributed entries to the exact path.
     pub fn delete_for(&self, agent: &str, spawn: SpawnId) -> std::io::Result<bool> {
         // Share the append lock: an archived record is terminal so nothing
         // should still be writing, but a delete racing a trim is cheap to rule
         // out entirely.
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if remove_if_present(&self.path_for(agent, spawn))? {
-            return Ok(true);
-        }
-        if spawn.is_synthetic() {
-            if let Some(start) = DateTime::<Utc>::from_timestamp_millis(spawn.timestamp_ms() as i64)
-            {
-                return remove_if_present(&self.timestamp_path(agent, start));
-            }
-        }
-        Ok(false)
+        remove_if_present(&self.path_for(agent, spawn))
     }
 
     fn path_for(&self, agent: &str, spawn: SpawnId) -> PathBuf {
@@ -311,36 +254,76 @@ impl AgentLog {
             .join(format!("{}.{}.jsonl", sanitize(agent), spawn))
     }
 
-    /// Where a generation's transcript lived before the file was keyed on
-    /// [`SpawnId`] (E1): named by the generation's spawn *instant* rather than
-    /// its identity. Read-only now — [`append`](Self::append) never writes
-    /// here again — kept so a generation whose run predates the cutover is
-    /// still legible (and, via [`delete_for`](Self::delete_for)'s synthetic-id
-    /// fallback, still reclaimable).
-    fn timestamp_path(&self, agent: &str, start: DateTime<Utc>) -> PathBuf {
-        self.dir
-            .join(format!("{}.{}.jsonl", sanitize(agent), stamp(start)))
-    }
-
     /// Where one generation's transcript file lives on disk, for a caller
     /// (a lifecycle hook dispatch) that needs the path itself rather than the
     /// parsed entries `read` returns. Spawn-keyed generations resolve to the
-    /// [`SpawnId`]-named file; pre-cutover generations fall back to the
-    /// legacy timestamp-windowed name.
+    /// [`SpawnId`]-named file. Missing exact identity yields no path.
     pub fn transcript_path(&self, generation: &Generation) -> Option<PathBuf> {
         if let Some(spawn) = generation.spawn {
             return Some(self.path_for(&generation.agent, spawn));
         }
-        generation
-            .start
-            .map(|s| self.timestamp_path(&generation.agent, s))
+        None
     }
+}
 
-    /// Where transcripts lived before the file was keyed on a generation at
-    /// all: read-only history, never appended to again.
-    fn legacy_path(&self, agent: &str) -> PathBuf {
-        self.dir.join(format!("{}.jsonl", sanitize(agent)))
+/// Copy every attributable old transcript entry into its exact spawn-keyed
+/// file. Source files are deliberately retained so restoring the pre-migration
+/// registry and binary is an exact rollback. The rewrite is deterministic and
+/// idempotent: a restart midway simply recomputes the same target content.
+pub(crate) fn migrate_legacy_transcripts(
+    dir: &Path,
+    generations: &[Generation],
+) -> std::io::Result<usize> {
+    if generations.is_empty() || !dir.exists() {
+        return Ok(0);
     }
+    let mut rewritten = 0;
+    for generation in generations {
+        let Some(spawn) = generation.spawn else {
+            continue;
+        };
+        let exact = dir.join(format!("{}.{}.jsonl", sanitize(&generation.agent), spawn));
+        let mut entries = read_entries(&exact);
+        if let Some(start) = generation.start {
+            entries.extend(read_entries(&dir.join(format!(
+                "{}.{}.jsonl",
+                sanitize(&generation.agent),
+                stamp(start)
+            ))));
+        }
+        let mut shared = read_entries(&dir.join(format!("{}.jsonl", sanitize(&generation.agent))));
+        shared.retain(|entry| generation.contains(entry.ts));
+        entries.extend(shared);
+        if entries.is_empty() {
+            continue;
+        }
+
+        let mut lines: Vec<(DateTime<Utc>, String)> = entries
+            .into_iter()
+            .filter_map(|entry| {
+                serde_json::to_string(&entry)
+                    .ok()
+                    .map(|line| (entry.ts, line))
+            })
+            .collect();
+        lines.sort();
+        lines.dedup_by(|left, right| left.1 == right.1);
+        let mut body = lines
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        body.push('\n');
+        if std::fs::read(&exact).is_ok_and(|current| current == body.as_bytes()) {
+            continue;
+        }
+        std::fs::create_dir_all(dir)?;
+        let tmp = exact.with_extension("jsonl.spawn-migration.tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(tmp, exact)?;
+        rewritten += 1;
+    }
+    Ok(rewritten)
 }
 
 /// Remove `path` if present; a missing file is `Ok(false)`, not an error.
@@ -575,18 +558,12 @@ mod tests {
         assert!(!log.delete_for("silent", SpawnId::new()).unwrap());
     }
 
-    /// E6: a pre-cutover generation's `spawn` is synthetic (backfilled from
-    /// `created_at`), so its real file lives at the old timestamp-keyed path,
-    /// not the one `path_for` would build from the synthetic id. `delete_for`
-    /// must still reclaim it — and still leave a live namesake's spawn-keyed
-    /// file and the truly-legacy shared file alone.
     #[test]
-    fn delete_for_reclaims_a_synthetic_pre_cutover_generations_timestamp_keyed_file() {
+    fn migration_makes_a_synthetic_generation_exactly_reapable() {
         let tmp = tempfile::tempdir().unwrap();
         let log = log_at(tmp.path());
         let start = at(1000);
         let synthetic = SpawnId::synthetic_for(start);
-        assert!(synthetic.is_synthetic());
         write_timestamp_keyed(tmp.path(), "cinder", start, &[(at(1001), "pre-cutover")]);
 
         // A later, live generation of the same name, minted normally.
@@ -605,16 +582,22 @@ mod tests {
         )
         .unwrap();
 
+        let generation = only("cinder", synthetic, start);
+        assert_eq!(
+            migrate_legacy_transcripts(&tmp.path().join("agent-logs"), &[generation]).unwrap(),
+            1
+        );
+
         assert!(
             log.delete_for("cinder", synthetic).unwrap(),
-            "the timestamp-keyed file was there"
+            "the migrated exact file was there"
         );
         assert!(
-            !tmp.path()
+            tmp.path()
                 .join("agent-logs")
                 .join(format!("cinder.{}.jsonl", stamp(start)))
                 .exists(),
-            "the pre-cutover file is gone"
+            "the pre-cutover file remains for rollback"
         );
         // The live generation's spawn-keyed file is untouched...
         assert!(matches!(
@@ -679,12 +662,8 @@ mod tests {
         assert!(matches!(&newer[0].event, LogEvent::Text { text } if text == "gen2"));
     }
 
-    /// Retroactive half of the fix: a legacy `<name>.jsonl` written before the
-    /// keying change can hold several generations back to back. Reads split it on
-    /// the generation boundary, so the 24 historical name pairs become legible
-    /// without rewriting a single byte of history.
     #[test]
-    fn a_legacy_shared_file_is_split_on_the_generation_boundary() {
+    fn migration_splits_a_shared_file_on_exact_generation_boundaries() {
         let tmp = tempfile::tempdir().unwrap();
         let log = log_at(tmp.path());
         let (first, second) = (at(1000), at(2000));
@@ -698,15 +677,28 @@ mod tests {
             ],
         );
 
-        let older = log.read(
-            &Generation::of("Brie", SpawnId::new(), first, Some(second)),
-            None,
+        let first_spawn = SpawnId::new();
+        let second_spawn = SpawnId::new();
+        let generations = [
+            Generation::of("Brie", first_spawn, first, Some(second)),
+            Generation::of("Brie", second_spawn, second, None),
+        ];
+        assert_eq!(
+            migrate_legacy_transcripts(&tmp.path().join("agent-logs"), &generations).unwrap(),
+            2
         );
+        assert_eq!(
+            migrate_legacy_transcripts(&tmp.path().join("agent-logs"), &generations).unwrap(),
+            0,
+            "restart is idempotent"
+        );
+
+        let older = log.read(&generations[0], None);
         assert_eq!(older.len(), 2, "windowed to the first rat's run");
         assert!(matches!(&older[0].event, LogEvent::Text { text } if text == "gen1 opening"));
         assert!(matches!(&older[1].event, LogEvent::Text { text } if text == "gen1 closing"));
 
-        let newer = log.read(&only("Brie", SpawnId::new(), second), None);
+        let newer = log.read(&generations[1], None);
         assert_eq!(newer.len(), 1, "and the second rat's");
         assert!(matches!(&newer[0].event, LogEvent::Text { text } if text == "gen2 opening"));
 
@@ -718,15 +710,12 @@ mod tests {
             .is_empty());
     }
 
-    /// A name with no record at all (hand-pruned `agents.json`) still reads: the
-    /// legacy file is returned whole rather than the transcript vanishing.
     #[test]
-    fn an_unrecorded_name_reads_its_legacy_file_whole() {
+    fn an_unrecorded_name_cannot_claim_a_shared_legacy_transcript() {
         let tmp = tempfile::tempdir().unwrap();
         let log = log_at(tmp.path());
         write_legacy(tmp.path(), "Ghost", &[(at(10), "a"), (at(20), "b")]);
-        let entries = log.read(&Generation::unrecorded("Ghost"), None);
-        assert_eq!(entries.len(), 2);
+        assert!(log.read(&Generation::unrecorded("Ghost"), None).is_empty());
     }
 
     #[test]
@@ -748,12 +737,8 @@ mod tests {
         );
     }
 
-    /// The legacy-to-timestamp upgrade boundary: a rat mid-run when the daemon
-    /// first gained generation keying has a prefix in the truly-legacy shared
-    /// file and a suffix in the (then new, now itself legacy) timestamp-keyed
-    /// file. One read merges them in timestamp order.
     #[test]
-    fn a_run_straddling_the_legacy_to_timestamp_upgrade_merges_both_files() {
+    fn migration_merges_shared_and_timestamp_keyed_halves() {
         let tmp = tempfile::tempdir().unwrap();
         let log = log_at(tmp.path());
         let start = at(1000);
@@ -761,6 +746,11 @@ mod tests {
         write_timestamp_keyed(tmp.path(), "Twitch", start, &[(at(1500), "after restart")]);
 
         let generation = only("Twitch", SpawnId::synthetic_for(start), start);
+        migrate_legacy_transcripts(
+            &tmp.path().join("agent-logs"),
+            std::slice::from_ref(&generation),
+        )
+        .unwrap();
         let entries = log.read(&generation, None);
         assert_eq!(entries.len(), 2, "both halves of the run");
         assert!(matches!(&entries[0].event, LogEvent::Text { text } if text == "before restart"));
@@ -771,11 +761,8 @@ mod tests {
         assert!(matches!(&tail[0].event, LogEvent::Text { text } if text == "after restart"));
     }
 
-    /// The timestamp-to-spawn upgrade boundary (E1): a rat mid-run when the
-    /// daemon cut over to `SpawnId` keying has a prefix in its timestamp-keyed
-    /// file and a suffix in its new spawn-keyed one. One read merges them too.
     #[test]
-    fn a_run_straddling_the_e1_cutover_merges_the_timestamp_and_spawn_keyed_files() {
+    fn migration_merges_timestamp_and_existing_spawn_keyed_halves() {
         let tmp = tempfile::tempdir().unwrap();
         let log = log_at(tmp.path());
         let start = at(1000);
@@ -792,7 +779,13 @@ mod tests {
             },
         );
 
-        let entries = log.read(&only("Rennet", spawn, start), None);
+        let generation = only("Rennet", spawn, start);
+        migrate_legacy_transcripts(
+            &tmp.path().join("agent-logs"),
+            std::slice::from_ref(&generation),
+        )
+        .unwrap();
+        let entries = log.read(&generation, None);
         assert_eq!(entries.len(), 2, "both halves of the run");
         assert!(matches!(&entries[0].event, LogEvent::Text { text } if text == "before cutover"));
         assert!(matches!(&entries[1].event, LogEvent::Text { text } if text == "after cutover"));

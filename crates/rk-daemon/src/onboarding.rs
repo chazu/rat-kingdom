@@ -1818,7 +1818,6 @@ fn single_line(value: &str) -> String {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use rk_core::config::MergeMode;
     use std::fs;
 
     fn git(root: &Path, args: &[&str]) {
@@ -1868,8 +1867,6 @@ mod tests {
             name: name.into(),
             path: path.into(),
             created_at: Utc::now(),
-            merge_mode: MergeMode::Direct,
-            remote: None,
             host: None,
             activated_policy: None,
         }

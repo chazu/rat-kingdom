@@ -1,10 +1,6 @@
-//! Binds a ticket's `done` transition to actual delivery, per the repo's
-//! delivery-mode policy (strategic-review C3,
-//! TKT-01M08HB566GFBZVMDKZ8DT1ES0). Closes the "approved but never merged"
-//! class (TKT-18/46/147) structurally: a merge-mode ticket must not read
-//! `done` while its branch is still unmerged, whether that transition would
-//! have come from the rat's own completion or from an explicit
-//! `ticket.update --status done`.
+//! Binds a ticket's terminal transition to the canonical delivery record.
+//! Git ancestry alone is never enough: the landing finalizer or explicit
+//! operator delivery path must write the record that closes the ticket.
 
 mod fixture;
 
@@ -46,7 +42,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn merge_mode_ticket_stays_open_until_actually_merged() {
+async fn git_merge_without_delivery_record_does_not_close_ticket() {
     let _env_guard = HARNESS_ENV_LOCK.lock().await;
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
@@ -59,6 +55,7 @@ async fn merge_mode_ticket_stays_open_until_actually_merged() {
     std::fs::write(repo.join("README.md"), "# ticket done binding\n").unwrap();
     git(repo, &["add", "."]);
     git(repo, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo);
     // Default activated policy: delivery mode "merge", target "agent-base"
     // (resolves to "main" here) — no `.rk/repo.cue` override needed.
 
@@ -77,7 +74,10 @@ async fn merge_mode_ticket_stays_open_until_actually_merged() {
         .unwrap();
 
     let ticket = client
-        .call("ticket.new", json!({"title": "bind done to delivery"}))
+        .call(
+            "ticket.new",
+            json!({"title": "bind done to delivery", "scope": "donebindingrepo"}),
+        )
         .await
         .unwrap();
     let ticket_id = ticket["ticket"]["identity"].as_str().unwrap().to_string();
@@ -118,27 +118,51 @@ async fn merge_mode_ticket_stays_open_until_actually_merged() {
          while its branch is unmerged: {unmerged}"
     );
 
-    // The manual path ("steward mark-done") is refused the same way, with a
-    // pointed error rather than a silent no-op.
+    // The manual path is refused without canonical delivery evidence.
     let refused = client
         .call("ticket.update", json!({"id": ticket_id, "status": "done"}))
         .await;
     let err = refused.expect_err("marking an unmerged merge-mode ticket done must be refused");
     assert!(
-        err.to_string().contains(&branch) && err.to_string().to_lowercase().contains("merge"),
-        "refusal must name the unmerged branch and the delivery mode: {err}"
+        err.to_string().contains("canonical delivery record"),
+        "{err}"
     );
 
     // Deliver for real: merge the branch into its target directly (mirrors
     // what `deliver_branch` does for Merge-mode on dismiss).
     git(repo, &["merge", "--no-ff", "-m", "land it", &branch]);
 
-    // The merged path is unaffected: the same manual request now succeeds.
-    let updated = client
+    // Even a real Git merge is not an alternate ticket authority.
+    let refused = client
         .call("ticket.update", json!({"id": ticket_id, "status": "done"}))
         .await
+        .expect_err("Git ancestry without a delivery record must still be refused");
+    assert!(
+        refused.to_string().contains("canonical delivery record"),
+        "{refused}"
+    );
+
+    // The explicit operator delivery path records the canonical fact and
+    // atomically closes the ticket.
+    let commit = git(repo, &["rev-parse", "main"]).trim().to_string();
+    let delivered = client
+        .call(
+            "ticket.deliver",
+            json!({
+                "id": ticket_id,
+                "repo": "donebindingrepo",
+                "commit": commit,
+                "target": "main",
+                "source_branch": branch,
+                "verification": "test fixture merge",
+            }),
+        )
+        .await
         .unwrap();
-    assert_eq!(updated["ticket"]["payload"]["status"], "done", "{updated}");
+    assert_eq!(
+        delivered["ticket"]["payload"]["status"], "closed",
+        "{delivered}"
+    );
 
     handle.abort();
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
@@ -158,6 +182,7 @@ async fn merge_mode_ticket_stays_open_when_branch_deleted_without_merging() {
     std::fs::write(repo.join("README.md"), "# ticket done binding\n").unwrap();
     git(repo, &["add", "."]);
     git(repo, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo);
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     let layout = Layout::at(home.path());
@@ -220,8 +245,8 @@ async fn merge_mode_ticket_stays_open_when_branch_deleted_without_merging() {
          without ever merging — 'gone' is not proof of delivery",
     );
     assert!(
-        err.to_string().to_lowercase().contains("merge"),
-        "refusal must reference the delivery mode: {err}"
+        err.to_string().contains("canonical delivery record"),
+        "{err}"
     );
 
     let unmerged = client
@@ -251,6 +276,7 @@ async fn merge_mode_ticket_done_refused_when_repo_unresolvable() {
     std::fs::write(repo.join("README.md"), "# ticket done binding\n").unwrap();
     git(repo, &["add", "."]);
     git(repo, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo);
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
     let layout = Layout::at(home.path());

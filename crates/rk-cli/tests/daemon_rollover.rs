@@ -48,6 +48,8 @@ fn scratch_repo(dir: &Path) {
     git(dir, &["config", "user.email", "rat@example.com"]);
     git(dir, &["config", "user.name", "Rat"]);
     std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
+    std::fs::create_dir_all(dir.join(".rk")).unwrap();
+    std::fs::write(dir.join(".rk/repo.cue"), "repo: {}\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
 }
@@ -72,6 +74,14 @@ fn rollover_parks_a_live_rat_and_it_respawns() {
     disable_disk_floor(home.path());
     let repo_dir = tempfile::tempdir().unwrap();
     scratch_repo(repo_dir.path());
+
+    json_stdout(
+        &rk(home.path())
+            .env("RK_FAKE_HARNESS_CMD", "sleep 60")
+            .args(["--json", "repo", "add", repo_dir.path().to_str().unwrap()])
+            .output()
+            .unwrap(),
+    );
 
     // Bring the first daemon up (via `spawn`'s connect_or_spawn) with a rat
     // that hangs — still `Running` when rollover comes looking for it.
@@ -207,6 +217,12 @@ fn rollover_refuses_new_dispatch_while_draining() {
         .args(["ping"])
         .output()
         .expect("run rk ping");
+    json_stdout(
+        &rk(home.path())
+            .args(["--json", "repo", "add", repo_dir.path().to_str().unwrap()])
+            .output()
+            .unwrap(),
+    );
 
     let rollover_out = rk(home.path())
         .env(

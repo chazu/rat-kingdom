@@ -44,8 +44,6 @@ fn build_reactor_with_config(
         false,
         false,
         false,
-        Vec::new(),
-        vec!["main".into(), "master".into()],
         0,
         false,
     ));
@@ -581,8 +579,6 @@ fn test_deployment_projection_does_not_fire_configured_workflow() {
             name: "fixture".into(),
             path: repo.path().to_path_buf(),
             created_at: Utc::now(),
-            merge_mode: Default::default(),
-            remote: None,
             host: None,
             activated_policy: None,
         })
@@ -619,8 +615,6 @@ fn test_deployment_projection_does_not_fire_configured_workflow() {
         false,
         false,
         false,
-        Vec::new(),
-        vec!["main".into(), "master".into()],
         0,
         false,
     ));

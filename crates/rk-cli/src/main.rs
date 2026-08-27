@@ -24,6 +24,7 @@ use agent_cmds::print_pruned_instance;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use rk_core::config::Config;
+use rk_core::id::SpawnId;
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use serde_json::{json, Value};
@@ -313,14 +314,6 @@ enum RepoCommand {
         /// Name to register it under (defaults to the directory name).
         #[arg(long)]
         name: Option<String>,
-        /// Legacy fallback for repositories without `.rk/repo.cue`: `direct`
-        /// or `pr`. Cannot be combined with a versioned repository policy.
-        #[arg(long, value_parser = ["direct", "pr"])]
-        merge_mode: Option<String>,
-        /// Legacy fallback remote for repositories without `.rk/repo.cue`.
-        /// Cannot be combined with a versioned repository policy.
-        #[arg(long)]
-        remote: Option<String>,
     },
     /// List registered repositories.
     List,
@@ -787,20 +780,26 @@ async fn daemon_rollover(layout: &Layout, wait_secs: u64, as_json: bool) -> Resu
     let mut failed = Vec::new();
     if !live.is_empty() {
         let agents = client.call("agent.list", json!({})).await?;
-        let orphaned: std::collections::HashSet<String> = agents["agents"]
+        let recoverable: std::collections::HashSet<SpawnId> = agents["agents"]
             .as_array()
             .map(|a| {
                 a.iter()
                     .filter(|r| r["state"].as_str() == Some("orphaned"))
-                    .filter_map(|r| r["name"].as_str().map(String::from))
+                    .filter_map(|r| r["spawn"].as_str()?.parse().ok())
                     .collect()
             })
             .unwrap_or_default();
-        live.retain(|name| orphaned.contains(name));
-        for name in &live {
-            match client.call("agent.respawn", json!({"name": name})).await {
-                Ok(_) => respawned.push(name.clone()),
-                Err(e) => failed.push((name.clone(), e.to_string())),
+        live.retain(|generation| recoverable.contains(&generation.spawn));
+        for generation in &live {
+            match client
+                .call(
+                    "agent.respawn",
+                    json!({"name": generation.name, "spawn": generation.spawn}),
+                )
+                .await
+            {
+                Ok(_) => respawned.push(generation.name.clone()),
+                Err(e) => failed.push((generation.name.clone(), e.to_string())),
             }
         }
     }
@@ -832,15 +831,28 @@ async fn daemon_rollover(layout: &Layout, wait_secs: u64, as_json: bool) -> Resu
 /// The drain phase of [`daemon_rollover`]: pause dispatch, then poll live
 /// agents down to zero or `wait_secs`, whichever comes first. Returns
 /// whoever is still live at the end — the set about to be parked.
-async fn rollover_drain(client: &mut Client, wait_secs: u64, as_json: bool) -> Result<Vec<String>> {
+#[derive(Clone)]
+struct RolloverGeneration {
+    name: String,
+    spawn: SpawnId,
+}
+
+fn rollover_generation(value: &Value) -> Option<RolloverGeneration> {
+    Some(RolloverGeneration {
+        name: value["name"].as_str()?.to_string(),
+        spawn: value["spawn"].as_str()?.parse().ok()?,
+    })
+}
+
+async fn rollover_drain(
+    client: &mut Client,
+    wait_secs: u64,
+    as_json: bool,
+) -> Result<Vec<RolloverGeneration>> {
     let pause = client.call("daemon.pause_dispatch", json!({})).await?;
-    let mut live: Vec<String> = pause["live_agents"]
+    let mut live: Vec<RolloverGeneration> = pause["live_agents"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
+        .map(|a| a.iter().filter_map(rollover_generation).collect())
         .unwrap_or_default();
 
     if !as_json {
@@ -857,15 +869,16 @@ async fn rollover_drain(client: &mut Client, wait_secs: u64, as_json: bool) -> R
         };
         tokio::time::sleep(remaining.min(std::time::Duration::from_secs(2))).await;
         let agents = client.call("agent.list", json!({})).await?;
-        live = agents["agents"]
+        let still_live: std::collections::HashSet<SpawnId> = agents["agents"]
             .as_array()
             .map(|a| {
                 a.iter()
                     .filter(|r| matches!(r["state"].as_str(), Some("running" | "spawning")))
-                    .filter_map(|r| r["name"].as_str().map(String::from))
+                    .filter_map(|r| r["spawn"].as_str()?.parse().ok())
                     .collect()
             })
             .unwrap_or_default();
+        live.retain(|generation| still_live.contains(&generation.spawn));
         if !as_json {
             println!("rollover: waiting on {} live rat(s)...", live.len());
         }
@@ -1562,12 +1575,9 @@ async fn main() -> Result<()> {
         }
         Command::Onboard => print_prime("onboarding".into(), cli.json)?,
         Command::Repo { command } => match command {
-            RepoCommand::Add {
-                path,
-                name,
-                merge_mode,
-                remote,
-            } => repo_cmds::add(&layout, path, name, merge_mode, remote, cli.json).await?,
+            RepoCommand::Add { path, name } => {
+                repo_cmds::add(&layout, path, name, cli.json).await?
+            }
             RepoCommand::List => repo_cmds::list(&layout, cli.json).await?,
             RepoCommand::Show { name } => repo_cmds::show(&layout, name, cli.json).await?,
             RepoCommand::Onboard { command } => match command {
