@@ -20,6 +20,7 @@ mod landing;
 mod landing_conflict;
 mod landing_review_retry;
 mod landing_rework;
+pub mod lifecycle;
 pub mod machine;
 pub mod onboarding;
 pub mod onboarding_activation;

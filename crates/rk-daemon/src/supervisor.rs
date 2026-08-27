@@ -5983,30 +5983,107 @@ impl Supervisor {
         Ok(Some(task))
     }
 
-    fn record_merge_for_branch(
+    /// The canonical delivery-finalization seam (TKT-01M0P96ZSQAJGRE7WTGDBWAXJ9,
+    /// see `crate::lifecycle` for the full before/after ownership map). Writes
+    /// the ticket's durable [`crate::tickets::DeliveryRecord`] (when `task` names
+    /// a real ticket) FIRST, then derives the matching agent generation's
+    /// `merge_commit` from the identical commit via
+    /// [`crate::lifecycle::resolve_merge_pointer`] — replacing the old
+    /// `record_merge_for_branch`, which only the two manual land paths ever
+    /// called, leaving the automatic/reactor-triggered pipeline path (the
+    /// common case) with no agent-side record at all and `rk revert` broken
+    /// for anything it landed.
+    ///
+    /// Order matters: the ticket record is the canonical fact and the agent
+    /// pointer is explicitly a *derived* cache of it, never an independent
+    /// authority — so if the daemon crashes between the two writes, the only
+    /// state a restart can observe is "canonical fact written, derived cache
+    /// not yet caught up," never the reverse (a derived pointer pointing at a
+    /// commit the canonical record never confirmed). When `task` is `None`
+    /// (a bare named-branch land with no ticket bound) there is no canonical
+    /// fact to order against, so only the derivation runs.
+    ///
+    /// A failed derivation is never silently swallowed: `Registry::update`
+    /// errors propagate, and a resolved generation that already carries a
+    /// DIFFERENT commit ([`crate::lifecycle::MergePointerDecision::Conflict`])
+    /// fails closed — returned as an error *and* emitted as a durable
+    /// `delivery_merge_pointer_conflict` event, so the drift is reconcilable
+    /// from `rk scan`/an inbox extension rather than only a log line that
+    /// vanishes with the process.
+    ///
+    /// Called from both the manual land paths (`land`, `land_force`) and
+    /// `LandingPipeline::record_delivery`, so a delivery is finalized exactly
+    /// once per landing regardless of which path triggered it.
+    pub(crate) async fn finalize_delivery(
         &self,
         repo_root: &std::path::Path,
-        branch: &str,
-        result: &serde_json::Value,
-    ) {
-        let Some(commit) = result
-            .get("merge_commit")
-            .and_then(serde_json::Value::as_str)
-        else {
-            return;
-        };
-        let name = self
-            .lock_registry()
-            .list_all()
-            .into_iter()
-            .filter(|r| r.repo_root == repo_root && r.branch.as_deref() == Some(branch))
-            .max_by_key(|r| r.created_at)
-            .map(|r| r.name.clone());
-        if let Some(name) = name {
-            let _ = self.lock_registry().update(&name, |record| {
-                record.merge_commit = Some(commit.to_string())
-            });
+        repo_name: &str,
+        task: Option<&str>,
+        record: &crate::tickets::DeliveryRecord,
+    ) -> rk_core::Result<()> {
+        if let Some(task) = task {
+            // Canonical fact first: if this fails, the derivation below never
+            // runs, so no half-written state (agent pointer set, ticket
+            // record missing) can ever exist — exactly the "independent
+            // delivery authority" this seam exists to eliminate.
+            self.tickets.record_delivery(task, record).await?;
         }
+        let decision = {
+            let registry = self.lock_registry();
+            let agents = registry.list_all();
+            crate::lifecycle::resolve_merge_pointer(
+                agents.into_iter(),
+                repo_root,
+                &record.branch,
+                &record.target,
+                &record.merge_commit,
+            )
+        };
+        match decision {
+            crate::lifecycle::MergePointerDecision::Set { agent } => {
+                let commit = record.merge_commit.clone();
+                let updated = self
+                    .lock_registry()
+                    .update(&agent, move |r| r.merge_commit = Some(commit))?;
+                if updated.is_none() {
+                    // The generation vanished (archived/removed) between
+                    // resolution and write — a lost race, not a conflict;
+                    // never fatal to a delivery that already landed for real.
+                    warn!(
+                        agent,
+                        "finalize_delivery: resolved agent generation vanished before its \
+                         merge pointer could be written"
+                    );
+                }
+            }
+            crate::lifecycle::MergePointerDecision::AlreadyRecorded
+            | crate::lifecycle::MergePointerDecision::NoTarget => {}
+            crate::lifecycle::MergePointerDecision::Conflict { agent, recorded } => {
+                self.emit_event(
+                    repo_name,
+                    "delivery_merge_pointer_conflict",
+                    json!({
+                        "agent": &agent,
+                        "recorded_merge_commit": &recorded,
+                        "candidate_merge_commit": &record.merge_commit,
+                        "branch": &record.branch,
+                        "target": &record.target,
+                        "text": format!(
+                            "agent {agent} already carries a different merge commit \
+                             ({recorded}) than this delivery's candidate ({}) — not \
+                             overwritten, needs manual reconciliation",
+                            record.merge_commit
+                        ),
+                    }),
+                );
+                return Err(rk_core::Error::other(format!(
+                    "agent {agent} already carries a different merge commit ({recorded}) than \
+                     this delivery's candidate ({}); refusing to overwrite",
+                    record.merge_commit
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The most recent agent generation (live or archived) dispatched against
@@ -6844,10 +6921,15 @@ impl Supervisor {
         ) {
             if let Some(pipeline) = self.landing_pipeline() {
                 let task = self.resolve_land_task(&repo_name, repo.root(), branch, task)?;
+                // `submit_manual` drives the same `process_entry` ->
+                // `LandingPipeline::record_delivery` -> `finalize_delivery`
+                // chain the automatic pipeline uses, synchronously, before
+                // returning — so both the ticket's delivery record and this
+                // agent's derived merge pointer are already written by the
+                // time control returns here. Nothing left to record.
                 let result = pipeline
                     .submit_manual(repo.root(), branch, target, keep_branch, task)
                     .await?;
-                self.record_merge_for_branch(repo.root(), branch, &result);
                 return Ok(result);
             }
             if !cfg!(test) {
@@ -6936,6 +7018,23 @@ impl Supervisor {
         let delivery = self
             .deliver_branch(&repo, &repo_name, branch, target, keep_branch)
             .await?;
+        // `land_force` binds no ticket (it takes no `--task`), so only the
+        // agent-side merge pointer is derived here; `task: None` skips the
+        // ticket write in `finalize_delivery` exactly as this path always has.
+        if let Some(commit) = delivery
+            .merge_commit
+            .as_deref()
+            .filter(|c| !c.is_empty() && !delivery.content_free)
+        {
+            let record = crate::tickets::DeliveryRecord {
+                merge_commit: commit.to_string(),
+                branch: branch.to_string(),
+                target: delivery.target.clone(),
+                landed_at: chrono::Utc::now().to_rfc3339(),
+            };
+            self.finalize_delivery(repo.root(), &repo_name, None, &record)
+                .await?;
+        }
         let result = json!({
             "branch": branch,
             "target": delivery.target,
@@ -6953,7 +7052,6 @@ impl Supervisor {
             "forced": true,
             "reason": reason,
         });
-        self.record_merge_for_branch(repo.root(), branch, &result);
         self.emit_event(&repo_name, "branch_landed", result.clone());
         self.emit_event(
             &repo_name,

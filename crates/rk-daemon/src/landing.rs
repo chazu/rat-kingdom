@@ -4214,7 +4214,22 @@ impl LandingPipeline {
                 .candidate(merge_commit)
                 .ended_at(landed_at),
         );
-        match self.tickets.record_delivery(&entry.task, &record).await {
+        // Routes through the shared `finalize_delivery` seam
+        // (TKT-01M0P96ZSQAJGRE7WTGDBWAXJ9, see `crate::lifecycle`) so this
+        // automatic/reactor-triggered path derives the agent's merge pointer
+        // from the same commit as the ticket's delivery record, instead of
+        // leaving the agent side unset the way it did before this seam
+        // existed (`rk revert` silently failed for anything landed here).
+        match self
+            .supervisor
+            .finalize_delivery(
+                std::path::Path::new(&entry.repo_path),
+                &entry.repo_name,
+                Some(&entry.task),
+                &record,
+            )
+            .await
+        {
             Ok(_) => info!(
                 task = %entry.task,
                 merge_commit,
