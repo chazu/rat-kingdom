@@ -24,6 +24,7 @@ use rk_space::{CoordinatorEvent, Space};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -107,6 +108,22 @@ impl ReconcileCadence {
     }
 }
 
+/// Run one async convergence action behind a panic boundary without detaching
+/// it from the daemon task tree. A scoped `JoinSet` aborts its child if the
+/// scheduler itself is cancelled, while `join_next` turns a child panic into a
+/// value the scheduler can log and continue past.
+async fn isolate_convergence_action<T, F>(action: F) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    let mut task = tokio::task::JoinSet::new();
+    task.spawn(action);
+    task.join_next()
+        .await
+        .expect("convergence action task is present")
+}
+
 /// Bound every leaf in a King pull/checkpoint. Counts alone are insufficient:
 /// one operator-authored tuple field may itself approach the request frame
 /// ceiling. The full resource remains available through its native RPC.
@@ -170,6 +187,25 @@ fn reconcile_cadence_supports_immediate_and_disabled_jobs() {
     let mut disabled = ReconcileCadence::new(false, Duration::from_secs(1), start);
     assert_eq!(disabled.next(), None);
     assert!(!disabled.take_due(start + Duration::from_secs(60)));
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn convergence_action_panic_is_observed_without_panicking_the_scheduler() {
+    let success = isolate_convergence_action(async { 7usize }).await;
+    assert_eq!(success.unwrap(), 7);
+
+    let panic = isolate_convergence_action(async {
+        panic!("one action failed");
+    })
+    .await;
+    assert!(panic.unwrap_err().is_panic());
+
+    // A later sibling can still run after the failed action was joined.
+    assert_eq!(
+        isolate_convergence_action(async { 9usize }).await.unwrap(),
+        9
+    );
 }
 
 type FactVoteKey = (String, String, String);
@@ -1189,29 +1225,59 @@ impl Daemon {
                     // Event-driven convergence runs first so infrequent cleanup
                     // shell-outs cannot delay evidence already in the feed.
                     if run_task_done {
-                        match convergence_daemon.supervisor.reconcile_task_done().await {
-                            Ok(0) => {}
-                            Ok(n) => debug!(settled = n, "reconciled task_done vs terminal state"),
-                            Err(e) => warn!(error = %e, "task_done reconciliation failed"),
+                        let d = Arc::clone(&convergence_daemon);
+                        match isolate_convergence_action(async move {
+                            d.supervisor.reconcile_task_done().await
+                        })
+                        .await
+                        {
+                            Ok(Ok(0)) => {}
+                            Ok(Ok(n)) => {
+                                debug!(settled = n, "reconciled task_done vs terminal state")
+                            }
+                            Ok(Err(e)) => warn!(error = %e, "task_done reconciliation failed"),
+                            Err(e) => warn!(error = %e, "task_done reconciliation panicked"),
                         }
                     }
                     if run_late_review {
-                        match convergence_landing.reconcile_late_review_evidence() {
-                            Ok(0) => {}
-                            Ok(n) => debug!(retained = n, "retained late review evidence"),
-                            Err(e) => warn!(error = %e, "late review evidence reconciliation failed"),
+                        let landing = Arc::clone(&convergence_landing);
+                        match tokio::task::spawn_blocking(move || {
+                            landing.reconcile_late_review_evidence()
+                        })
+                        .await
+                        {
+                            Ok(Ok(0)) => {}
+                            Ok(Ok(n)) => debug!(retained = n, "retained late review evidence"),
+                            Ok(Err(e)) => {
+                                warn!(error = %e, "late review evidence reconciliation failed")
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "late review evidence reconciliation panicked")
+                            }
                         }
                     }
                     if run_stale_instance {
-                        match convergence_daemon.stale_instance_timeout_sweep_once().await {
-                            0 => {}
-                            n => info!(timed_out = n, "stale-instance timeout sweep marked instances failed"),
+                        let d = Arc::clone(&convergence_daemon);
+                        match isolate_convergence_action(async move {
+                            d.stale_instance_timeout_sweep_once().await
+                        })
+                        .await
+                        {
+                            Ok(0) => {}
+                            Ok(n) => info!(timed_out = n, "stale-instance timeout sweep marked instances failed"),
+                            Err(e) => warn!(error = %e, "stale-instance timeout sweep panicked"),
                         }
                     }
                     if run_ticket_reopen {
-                        match convergence_daemon.ticket_reopen_sweep_once().await {
-                            0 => {}
-                            n => debug!(reopened = n, "ticket reopen sweep reopened orphaned tickets"),
+                        let d = Arc::clone(&convergence_daemon);
+                        match isolate_convergence_action(async move {
+                            d.ticket_reopen_sweep_once().await
+                        })
+                        .await
+                        {
+                            Ok(0) => {}
+                            Ok(n) => debug!(reopened = n, "ticket reopen sweep reopened orphaned tickets"),
+                            Err(e) => warn!(error = %e, "ticket reopen sweep panicked"),
                         }
                     }
 
