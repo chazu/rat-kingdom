@@ -17,6 +17,7 @@ mod space_cmds;
 mod ticket_cmds;
 mod top;
 mod trigger_cmds;
+mod work_cmds;
 mod workflow_cmds;
 
 use agent_cmds::print_pruned_instance;
@@ -95,12 +96,16 @@ enum Command {
     Prune(agent_cmds::PruneArgs),
     /// Restore an archived agent record to the live registry.
     Unarchive(agent_cmds::NameArg),
-    /// One ranked triage list of everything awaiting a human, each row carrying
-    /// the exact `rk` command that resolves it.
+    /// Broad diagnostic triage, including rows that may require an open-ended
+    /// decision or an external forge/git action.
     Inbox {
         #[command(subcommand)]
         command: Option<InboxCommand>,
     },
+    /// Current operational work in one small view: build parity, live rats,
+    /// ready tickets, and actionable attention. Historical detail stays in
+    /// `rk digest`, `rk inbox`, `rk reconcile`, and `rk top`.
+    Work(work_cmds::WorkArgs),
     /// Cross-ledger convergence report for one repository: read-only
     /// comparison of the ticket, agent, landing, and git views, surfacing
     /// contradictions between them (delivered-but-open tickets, terminal
@@ -1156,6 +1161,7 @@ async fn main() -> Result<()> {
             None => agent_cmds::inbox(&layout, cli.json).await?,
             Some(InboxCommand::Ack { id }) => agent_cmds::inbox_ack(&layout, id, cli.json).await?,
         },
+        Command::Work(args) => work_cmds::run(&layout, args, cli.json).await?,
         Command::Reconcile(args) => reconcile_cmds::report(&layout, args, cli.json).await?,
         Command::ReconcileRepair(args) => {
             reconcile_repair_cmds::repair(&layout, args, cli.json).await?
@@ -1174,6 +1180,9 @@ async fn main() -> Result<()> {
             }
             attention_cmds::AttentionCommand::Decide(args) => {
                 attention_cmds::attention_decide(&layout, *args, cli.json).await?
+            }
+            attention_cmds::AttentionCommand::Invalidate(args) => {
+                attention_cmds::attention_invalidate(&layout, args, cli.json).await?
             }
         },
         Command::King { command } => king_cmds::run(&layout, command, cli.json).await?,

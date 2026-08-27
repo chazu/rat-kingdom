@@ -92,6 +92,8 @@ pub enum AttentionCommand {
     Next(AttentionNextArgs),
     /// Resolve one attention item, dispatched by its effective authority.
     Decide(Box<AttentionDecideArgs>),
+    /// Explicitly settle a Human-authority item as no longer relevant.
+    Invalidate(AttentionInvalidateArgs),
 }
 
 #[derive(Args)]
@@ -133,6 +135,16 @@ pub struct AttentionDecideArgs {
     /// to resolve this. Falls back to generic text if omitted.
     #[arg(long)]
     pub resolving_action: Option<String>,
+}
+
+#[derive(Args)]
+pub struct AttentionInvalidateArgs {
+    pub repo: String,
+    /// The attention item's id, as shown by `rk work` or `rk attention next`.
+    pub item: String,
+    /// Optional rationale retained in the durable decision journal.
+    #[arg(long)]
+    pub reason: Option<String>,
 }
 
 pub async fn attention_next(layout: &Layout, args: AttentionNextArgs, as_json: bool) -> Result<()> {
@@ -186,5 +198,27 @@ pub async fn attention_decide(
         return Ok(());
     }
     println!("{result:#}");
+    Ok(())
+}
+
+pub async fn attention_invalidate(
+    layout: &Layout,
+    args: AttentionInvalidateArgs,
+    as_json: bool,
+) -> Result<()> {
+    let mut client = Client::connect_or_spawn(layout).await?;
+    let result = client
+        .call(
+            "attention.invalidate",
+            json!({"repo": args.repo, "item": args.item, "reason": args.reason}),
+        )
+        .await?;
+    if as_json {
+        println!("{result}");
+    } else if result["replay"].as_bool() == Some(true) {
+        println!("attention item is already settled");
+    } else {
+        println!("attention item invalidated; repository facts and policy were not changed");
+    }
     Ok(())
 }
