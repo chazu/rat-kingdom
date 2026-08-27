@@ -408,10 +408,12 @@ Inspection never registers the repository, launches an agent, runs a project
 check, or edits repository/castle state. It also does not auto-start the daemon;
 if the daemon is down, start it separately with `rk ping` and then inspect.
 
-`repo onboard start` journals one stable session per canonical repository and
+`repo onboard start` journals one stable session per canonical repository
+revision and
 creates `onboarding/onb-...` in a Rat Kingdom-owned worktree. Repeating start
-reuses that session, branch, and worktree rather than touching the human
-checkout or launching a duplicate. Headless and `--attach` runs write the same
+at the same `HEAD` reuses that session, branch, and worktree; advancing `HEAD`
+creates a fresh content-bound assessment rather than reviving stale terminal
+work. Headless and `--attach` runs write the same
 `onboarding-sessions.json` record and expose the same status/report RPCs.
 Daemon restart marks an in-flight session orphaned; `resume` reuses the
 preserved worktree and, for attached runs, reattaches to a surviving herdr pane
@@ -425,6 +427,10 @@ journals immutable advice: it does not edit the worktree or castle. Onboarders
 cannot approve or decline proposals, spawn agents, mutate tickets/repos,
 approve workflows, use ordinary rat tuple writes, or gain operator authority by
 clearing `RK_AGENT`/`RK_AUTH_TOKEN`.
+
+Before a proposal is journaled, the daemon runs `git apply --check` against the
+assessed tree and proves the patch changes exactly its declared target. A
+malformed patch therefore never reaches the human approval queue.
 
 Each proposal records its evidence, exact diff, risk, target/action, verification
 plan, stable repository identity, and the onboarding Git tree revision. Its
@@ -453,6 +459,11 @@ recommits nor reruns a verified check. After a failed check, retry reuses the
 recorded commit and executes a new attempt. An interrupted exact patch or
 trailer-bearing commit is recovered; unrelated dirt, an edited applied file,
 or branch movement is recorded as failure and never swept into the proposal.
+Ordinary `repo_file` proposals such as `AGENTS.md` and `mise.toml` use this same
+exact-target preflight and content-bound commit path. Several proposals approved
+against one assessment can apply in order; each later application accepts only
+a predecessor commit already journaled by that onboarding session. Executable
+checks and CUE policy/automation files retain their dedicated validators.
 
 Repository policy, workflow, trigger, and schedule proposals use distinct
 activation kinds and actions. A policy is a `repo_file` proposal targeting

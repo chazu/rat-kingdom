@@ -49,7 +49,9 @@ Rat-Kingdom-owned worktree. The human checkout is not used for edits.
 
 2. **Discuss and propose.** The onboarder explains findings and submits a
    proposal for each meaningful change. A proposal contains the evidence,
-   exact diff, target and action, risk, and verification plan.
+   exact diff, target and action, risk, and verification plan. The daemon
+   rejects it before journaling unless `git apply --check` succeeds and the
+   patch changes exactly the declared target.
 
 3. **Approve or decline.** The human reviews the proposal and its digest:
 
@@ -73,6 +75,13 @@ Rat-Kingdom-owned worktree. The human checkout is not used for edits.
    branch, validates the relevant configuration, and runs the named check when
    one was specified. Verification records the command, toolchain, environment
    policy, exit status, timing, and bounded output.
+
+   Generic repository files such as `AGENTS.md` and `mise.toml` are verified by
+   the exact-target preflight and content-bound application commit. Multiple
+   proposals approved from one assessment may be applied in order; only prior
+   application commits journaled in that same session are accepted as the
+   chain advances. CUE policy and automation continue through their schema
+   validators, and named checks still execute their approved contract.
 
 5. **Activate.** Applying stages and verifies the change; activation is the
    separate decision that lands it in the registered base checkout. Repository

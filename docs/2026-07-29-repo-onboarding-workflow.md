@@ -255,6 +255,14 @@ persist the application result before reporting success. Recovery re-reads the
 proposal and working tree, then resumes or marks the proposal failed; it never
 blindly repeats a side effect.
 
+Proposal creation first proves the exact diff applies to the assessed tree and
+touches only its declared target. Repository-file applications may then chain
+when every intervening head is a prior application commit journaled in the same
+session; arbitrary branch movement still fails closed. Session identity binds
+the canonical repository path and assessed `HEAD`, so a later repository
+revision receives a fresh assessment while retries at the same revision reuse
+the existing session.
+
 The activation key additionally binds the staged application commit. The
 daemon persists `activating` before advancing the registered checkout. It then
 requires the registered checkout to be clean, on the approved base branch, and

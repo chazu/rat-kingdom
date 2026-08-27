@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const ONBOARDER_ROLE: &str = "onboarder";
-pub const SESSION_SCHEMA_VERSION: u32 = 2;
+pub const SESSION_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +39,11 @@ pub struct OnboardingSession {
     pub repo_name: String,
     pub repo_path: PathBuf,
     pub base_branch: String,
+    /// Exact repository commit assessed by this session. New sessions are
+    /// content-bound so advancing the repository creates a fresh assessment
+    /// instead of reviving a terminal session for an older tree.
+    #[serde(default)]
+    pub base_revision: String,
     pub branch: String,
     pub worktree: PathBuf,
     pub harness: String,
@@ -69,6 +74,8 @@ pub struct OnboardingSessionStatus {
     pub repo_name: String,
     pub repo_path: PathBuf,
     pub base_branch: String,
+    #[serde(default)]
+    pub base_revision: String,
     pub branch: String,
     pub worktree: PathBuf,
     pub harness: String,
@@ -125,13 +132,14 @@ impl OnboardingSession {
         repo_name: String,
         repo_path: PathBuf,
         base_branch: String,
+        base_revision: String,
         harness: String,
         model: Option<String>,
         attached: bool,
         assessment: AssessmentReport,
         worktrees_dir: &Path,
     ) -> Self {
-        let id = session_id(&repo_path);
+        let id = session_id_at(&repo_path, &base_revision);
         let now = Utc::now();
         Self {
             schema_version: SESSION_SCHEMA_VERSION,
@@ -142,6 +150,7 @@ impl OnboardingSession {
             repo_name,
             repo_path,
             base_branch,
+            base_revision,
             harness,
             model,
             attached,
@@ -165,6 +174,7 @@ impl OnboardingSession {
             repo_name: self.repo_name.clone(),
             repo_path: self.repo_path.clone(),
             base_branch: self.base_branch.clone(),
+            base_revision: self.base_revision.clone(),
             branch: self.branch.clone(),
             worktree: self.worktree.clone(),
             harness: self.harness.clone(),
@@ -193,13 +203,25 @@ impl OnboardingSession {
     }
 }
 
-/// One stable session per canonical repository path. The path is already the
-/// identity resolved by the read-only assessment, so aliases and the caller's
-/// current directory cannot mint duplicate sessions.
+/// Legacy path-only identity retained for persisted v2 sessions and callers
+/// that need to locate them.
 pub fn session_id(repo_path: &Path) -> String {
     let mut digest = Sha256::new();
     digest.update(b"rat-kingdom-onboarding-session\0");
     digest.update(repo_path.as_os_str().as_encoded_bytes());
+    let hex = hex::encode(digest.finalize());
+    format!("onb-{}", &hex[..20])
+}
+
+/// One stable session per canonical repository revision. The path is already
+/// the identity resolved by the read-only assessment, while the exact commit
+/// prevents a terminal session from shadowing a later repository state.
+pub fn session_id_at(repo_path: &Path, base_revision: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"rat-kingdom-onboarding-session-v2\0");
+    digest.update(repo_path.as_os_str().as_encoded_bytes());
+    digest.update(b"\0");
+    digest.update(base_revision.as_bytes());
     let hex = hex::encode(digest.finalize());
     format!("onb-{}", &hex[..20])
 }
@@ -286,6 +308,37 @@ impl OnboardingSessions {
             draft,
             proposer,
         )?;
+        let result = Self::journal_proposal_in(session, proposal)?;
+        self.persist()?;
+        Ok(result)
+    }
+
+    /// Persist a proposal already canonicalized and preflighted by the daemon.
+    pub fn journal_proposal(
+        &mut self,
+        id: &str,
+        proposal: OnboardingProposal,
+    ) -> rk_core::Result<(OnboardingProposal, bool)> {
+        let session = self
+            .sessions
+            .get_mut(id)
+            .ok_or_else(|| rk_core::Error::other(format!("no such onboarding session: {id}")))?;
+        let result = Self::journal_proposal_in(session, proposal)?;
+        self.persist()?;
+        Ok(result)
+    }
+
+    fn journal_proposal_in(
+        session: &mut OnboardingSession,
+        proposal: OnboardingProposal,
+    ) -> rk_core::Result<(OnboardingProposal, bool)> {
+        if proposal.session_id != session.id
+            || proposal.repository_identity != repository_identity(&session.repo_path)
+        {
+            return Err(rk_core::Error::other(
+                "proposal does not belong to onboarding session",
+            ));
+        }
         if let Some(existing) = session
             .proposals
             .iter()
@@ -302,7 +355,6 @@ impl OnboardingSessions {
         }
         session.proposals.push(proposal.clone());
         session.updated_at = Utc::now();
-        self.persist()?;
         Ok((proposal, true))
     }
 
@@ -456,10 +508,9 @@ impl OnboardingSessions {
     }
 
     /// Persist the exact commit produced by applying an approved repo-file
-    /// proposal. A matching replay is idempotent. A previously failed
-    /// verification may return to `applied` only when the immutable application
-    /// record still matches, allowing the named check to be retried without
-    /// writing the patch or commit twice.
+    /// proposal. A generic file is verified by exact target and digest during
+    /// application; CUE-backed automation and named checks remain `applied`
+    /// until their dedicated validator succeeds. Matching replay is idempotent.
     pub fn record_application(
         &mut self,
         session_id: &str,
@@ -492,12 +543,20 @@ impl OnboardingSessions {
 
         let previous = proposal.status;
         let now = Utc::now();
-        proposal.status = OnboardingProposalStatus::Applied;
+        let next = if proposal.kind == crate::onboarding_proposals::OnboardingProposalKind::RepoFile
+            && proposal.named_check.is_none()
+            && proposal.automation_kind().is_none()
+        {
+            OnboardingProposalStatus::Verified
+        } else {
+            OnboardingProposalStatus::Applied
+        };
+        proposal.status = next;
         proposal.failure = None;
         proposal.application = Some(application.clone());
         proposal.transitions.push(OnboardingProposalTransition {
             from: Some(previous),
-            to: OnboardingProposalStatus::Applied,
+            to: next,
             actor: application.actor,
             at: now,
             detail: Some(format!("committed {}", application.commit)),
@@ -1113,6 +1172,7 @@ mod tests {
             "repo".into(),
             root.clone(),
             "main".into(),
+            "base-a".into(),
             "codex".into(),
             None,
             false,
@@ -1124,6 +1184,7 @@ mod tests {
             "repo".into(),
             root,
             "main".into(),
+            "base-a".into(),
             "codex".into(),
             None,
             true,
@@ -1137,6 +1198,16 @@ mod tests {
     }
 
     #[test]
+    fn revision_identity_refreshes_without_changing_legacy_path_identity() {
+        let root = PathBuf::from("/tmp/example");
+        assert_eq!(session_id(&root), "onb-2c541cde7f18d209c903");
+        assert_ne!(
+            session_id_at(&root, "base-a"),
+            session_id_at(&root, "base-b")
+        );
+    }
+
+    #[test]
     fn store_reuses_and_recovers_a_starting_session() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("repo");
@@ -1146,6 +1217,7 @@ mod tests {
             "repo".into(),
             root.clone(),
             "main".into(),
+            "base-a".into(),
             "codex".into(),
             None,
             false,
@@ -1176,6 +1248,7 @@ mod tests {
             "repo".into(),
             root,
             "main".into(),
+            "base-a".into(),
             "codex".into(),
             None,
             false,
@@ -1298,6 +1371,7 @@ mod tests {
             "repo".into(),
             dir.path().to_path_buf(),
             "main".into(),
+            "base-a".into(),
             "codex".into(),
             None,
             false,
