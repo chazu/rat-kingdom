@@ -104,47 +104,16 @@ check. These checks are evaluated mechanically; they do not require an agent.
 A protected-path hit, an over-budget diff, or a failed/timed-out check holds
 the branch and surfaces attention instead of weakening the policy.
 
-Workflow `land` and `open_pr` steps are a separate path, and they are still
-governed by the daemon's own config rather than by the activated repository
-policy alone. When `policy.require_approval_for_landing` is true a `land` or
-`open_pr` step requires a prior approved human gate, and its target must be in
-`policy.allowed_target_branches`.
+Workflow `land` and `open_pr` steps are a separate path. When
+`policy.require_approval_for_landing` is true they require a prior approved
+human gate, regardless of workflow name, and their target must match the
+activated repository policy. There is no workflow-name exception.
 
-### The `automated_landing_workflows` exception (workflow `land` steps only)
+## Activation is mandatory
 
-`policy.automated_landing_workflows` (default `["steward"]`) is a narrow
-`land`-only exception to that approval requirement: a workflow whose name is
-in the list may `land` unattended. `open_pr` is never excepted. The authority
-is bound to the *file*, not the name — `WorkflowEngine::is_automated_landing_definition`
-(`crates/rk-daemon/src/workflow_exec.rs`) additionally requires the resolved
-definition to live directly in the operator-owned global workflow directory,
-so a repo-local file of the same name cannot inherit it.
-
-**Its scope has narrowed, but it has not been removed.** Since the
-daemon-native landing pipeline (Phase 3/4 of the steward remediation) the
-primary unattended-landing path no longer goes through a workflow `land` step
-at all: `LandingPipeline` calls `Supervisor::land` directly and never consults
-this list. The shipped `steward` mega-workflow that used to rely on it is gone
-from the tree, so the default value is now inert in a stock installation. The
-field and its enforcement remain fully live in `rk-core`'s `PolicyConfig`
-(`crates/rk-core/src/config.rs`) for an operator-authored *custom* workflow
-that still uses an explicit `land` step — a bespoke `curator`, say. Actually
-narrowing or removing the field is tracked separately and is not yet done
-(TKT-01M048ASY8MDB5DVV5VG3WRM47).
-
-## Activation and legacy registrations
-
-Activating `.rk/repo.cue` is how a repository gets a versioned policy: run
-`rk repo onboard start <path-or-name>` (or `rk repo add <path>` once the file
-is committed) to validate and activate the exact digest. An activated policy
-is the sole source of delivery mode, remote, protected paths, diff budgets,
-and timeouts, and `rk repo add --merge-mode/--remote` is *rejected* when
-`.rk/repo.cue` exists, so there cannot be two competing per-repository
-policies.
-
-A repository registered **without** an activated `.rk/repo.cue` keeps the
-previous registry behavior rather than failing closed: `rk repo add
---merge-mode direct|pr` and `--remote` still apply, and when neither is given
-the daemon falls back to `policy.default_merge_mode` from
-`~/.rat-kingdom/config.toml` (default `direct`). Add the file through
-onboarding to migrate a legacy registration onto versioned policy.
+A registered repository without an activated `.rk/repo.cue` remains visible
+to the operator but cannot dispatch or deliver work. Run `rk repo onboard
+start <path-or-name>` (or `rk repo add <path>` once the file is committed) to
+validate and activate the repository policy. Rat Kingdom does not translate
+legacy registry flags into live policy and does not fall back to a fleet-wide
+merge mode.
