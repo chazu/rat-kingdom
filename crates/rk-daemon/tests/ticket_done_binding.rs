@@ -262,6 +262,147 @@ async fn merge_mode_ticket_stays_open_when_branch_deleted_without_merging() {
     std::env::remove_var("RK_FAKE_HARNESS_CMD");
 }
 
+/// The delivery guard must hold across a legacy ticket's two spellings.
+///
+/// A `TKT-<ULID>` ticket minted before proquint ids is spawned under its
+/// ULID identity, so the lock registry's `record.task` carries that
+/// spelling verbatim. `rk ticket show`/`list` now surface the ticket's
+/// deterministic proquint alias, so the operator (or a steward) naturally
+/// addresses the follow-up `ticket.update --status done` by the alias.
+/// Both name the same ticket, so the guard must reach the same verdict for
+/// both: a raw string compare against `record.task` would find no
+/// branch-bearing candidate, read the ticket as never having produced one,
+/// and fail OPEN — marking a ticket done whose branch never landed, which
+/// is exactly the TKT-18/46/147 dropped-land class.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_ticket_done_by_alias_is_refused_when_spawned_by_ulid() {
+    let _env_guard = HARNESS_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo_path = repo_dir.path().join("donebindingrepo-alias");
+    std::fs::create_dir(&repo_path).unwrap();
+    let repo = repo_path.as_path();
+    git(repo, &["init", "-b", "main"]);
+    git(repo, &["config", "user.email", "r@x"]);
+    git(repo, &["config", "user.name", "R"]);
+    std::fs::write(repo.join("README.md"), "# ticket done binding\n").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo);
+
+    std::env::set_var("RK_FAKE_HARNESS_CMD", fixture::with_rk_done(WORKING_FAKE));
+    let layout = Layout::at(home.path());
+    let daemon = Daemon::new_in_memory(layout.clone(), "done-binding-castle".into()).unwrap();
+    let handle = tokio::spawn(daemon.run());
+    let mut client = connect(&layout).await;
+
+    client
+        .call(
+            "repo.add",
+            json!({"name": "donebindingrepo-alias", "path": repo.to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+
+    // `ticket.new` only mints proquint ids now, so the only way to get a
+    // legacy ULID-identity ticket into the store is to write the tuple
+    // directly (mirrors `tickets::tests::seed_legacy`).
+    let legacy_id = "TKT-01J000000000000000000042";
+    client
+        .call(
+            "space.out",
+            json!({
+                "category": "task",
+                "scope": "donebindingrepo-alias",
+                "identity": legacy_id,
+                "payload": {
+                    "title": "legacy ticket addressed by alias",
+                    "status": "open",
+                    "parent": null,
+                    "priority": "normal",
+                    "labels": [],
+                    "depends_on": [],
+                    "assignee": null,
+                    "created_by": "operator",
+                    "created_at": "2026-08-19T00:00:00Z",
+                    "updated_at": "2026-08-19T00:00:00Z",
+                },
+                "lifecycle": "session",
+            }),
+        )
+        .await
+        .unwrap();
+
+    let fetched = client
+        .call("ticket.get", json!({"id": legacy_id}))
+        .await
+        .unwrap();
+    let alias = fetched["ticket"]["alias"]
+        .as_str()
+        .expect("a legacy ULID ticket must surface a proquint alias")
+        .to_string();
+    assert_ne!(alias, legacy_id, "the alias must be a distinct spelling");
+
+    // Spawn under the ULID spelling: `record.task` is the ULID.
+    let spawned = client
+        .call(
+            "agent.spawn",
+            json!({"repo": repo.to_string_lossy(), "task": legacy_id, "harness": "fake"}),
+        )
+        .await
+        .unwrap();
+    let agent = spawned["agent"]["name"].as_str().unwrap().to_string();
+    assert_eq!(spawned["agent"]["task"], legacy_id);
+
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if client
+            .call("agent.status", json!({"name": agent}))
+            .await
+            .unwrap()["agent"]["state"]
+            == "completed"
+        {
+            break;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The branch is unmerged and no delivery record exists. Marking done by
+    // the ALIAS must be refused exactly as it is by the ULID.
+    let by_alias = client
+        .call("ticket.update", json!({"id": alias, "status": "done"}))
+        .await
+        .expect_err(
+            "marking an unlanded legacy ticket done by its proquint alias must be refused — \
+             the branch-bearing candidate is locked under its ULID spelling",
+        );
+    assert!(
+        by_alias.to_string().contains("canonical delivery record"),
+        "{by_alias}"
+    );
+
+    let by_ulid = client
+        .call("ticket.update", json!({"id": legacy_id, "status": "done"}))
+        .await
+        .expect_err("the same refusal must hold for the ULID spelling");
+    assert!(
+        by_ulid.to_string().contains("canonical delivery record"),
+        "{by_ulid}"
+    );
+
+    let after = client
+        .call("ticket.get", json!({"id": legacy_id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        after["ticket"]["payload"]["status"], "open",
+        "neither spelling may move an unlanded legacy ticket to done: {after}"
+    );
+
+    handle.abort();
+    std::env::remove_var("RK_FAKE_HARNESS_CMD");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn merge_mode_ticket_done_refused_when_repo_unresolvable() {
     let _env_guard = HARNESS_ENV_LOCK.lock().await;

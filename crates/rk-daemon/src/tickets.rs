@@ -493,6 +493,38 @@ impl Tickets {
         }
     }
 
+    /// Every spelling that names the same ticket as `id`: `id` itself, the
+    /// durable identity it resolves to, and — for a legacy ULID ticket —
+    /// its deterministic proquint alias.
+    ///
+    /// [`Self::resolve`] canonicalizes a caller-supplied spelling for
+    /// everything that reads or writes the ticket *tuple*. This is the
+    /// mirror image, for the places that cannot go through `resolve`: a
+    /// ticket id captured verbatim at some earlier moment and stored
+    /// outside the ticket store — an agent record's `task`, a landing queue
+    /// entry's `task` — and later compared by string equality. That stored
+    /// value is whatever spelling its caller happened to use, so comparing
+    /// it against one spelling of the same ticket silently misses. Match
+    /// against this set instead.
+    ///
+    /// Errors propagate rather than degrading to "no match": `resolve`'s
+    /// only error is an ambiguous alias, and a guard reading that as "no
+    /// record found" would fail open on exactly the input that should fail
+    /// closed. An id that simply does not resolve is not an error — the set
+    /// is then just `[id]`, which is the correct answer for a task string
+    /// that never was a ticket.
+    pub fn id_spellings(&self, id: &str) -> rk_core::Result<Vec<String>> {
+        let mut spellings = vec![id.to_string()];
+        if let Some(ticket) = self.resolve(id)? {
+            for spelling in std::iter::once(ticket.identity.clone()).chain(self.alias_of(&ticket)) {
+                if !spellings.contains(&spelling) {
+                    spellings.push(spelling);
+                }
+            }
+        }
+        Ok(spellings)
+    }
+
     pub fn list(
         &self,
         scope: Option<String>,
@@ -1502,6 +1534,40 @@ mod tests {
         t.remove_dep(&other.identity, &alias).await.unwrap();
         let after = t.get(&other.identity).unwrap().unwrap();
         assert_eq!(after.payload["depends_on"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn id_spellings_covers_both_spellings_of_a_legacy_ticket() {
+        let (t, space) = tickets_with_space();
+        let legacy = seed_legacy(&space, "TKT-01J000000000000000000003", "old");
+        let alias = t.alias_of(&legacy).unwrap();
+
+        // Symmetric: naming the ticket either way yields the same set, so a
+        // caller comparing a stored spelling against it matches regardless
+        // of which spelling was captured and which was typed.
+        for named_by in [&legacy.identity, &alias] {
+            let spellings = t.id_spellings(named_by).unwrap();
+            assert!(
+                spellings.contains(&legacy.identity) && spellings.contains(&alias),
+                "id_spellings({named_by}) must cover both spellings, got {spellings:?}"
+            );
+        }
+
+        // A native proquint ticket has no alias: exactly one spelling, not a
+        // duplicated entry.
+        let native = t.create(new("native", "system", None)).await.unwrap();
+        assert_eq!(
+            t.id_spellings(&native.identity).unwrap(),
+            vec![native.identity.clone()]
+        );
+
+        // A task string that is not a ticket at all is not an error — the
+        // landing pipeline enqueues `task: ""` for a spec-less review.
+        assert_eq!(t.id_spellings("").unwrap(), vec![String::new()]);
+        assert_eq!(
+            t.id_spellings("TKT-01J000000000000000000404").unwrap(),
+            vec!["TKT-01J000000000000000000404".to_string()]
+        );
     }
 
     #[tokio::test]
