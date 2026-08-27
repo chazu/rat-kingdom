@@ -43,6 +43,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# transport fixture\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 }
 
 fn executable(path: &Path, body: &str) {
@@ -194,6 +195,7 @@ exit 1
     layout.ensure().unwrap();
     let handle_a = tokio::spawn(daemon(&layout).run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let spawned = client
         .call(
@@ -286,6 +288,7 @@ exit 1
 
     let handle_b = tokio::spawn(daemon(&layout).run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     let exhausted = wait_for_status(
         &mut client,
         &name,
@@ -406,6 +409,7 @@ exit 1
     layout.ensure().unwrap();
     let handle_a = tokio::spawn(daemon(&layout).run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let spawned = client
         .call(
@@ -498,6 +502,7 @@ exit 1
 
     let handle_b = tokio::spawn(daemon(&layout).run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
     let exhausted = wait_for_status(
         &mut client,
         &name,

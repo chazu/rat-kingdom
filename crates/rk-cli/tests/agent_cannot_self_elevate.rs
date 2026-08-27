@@ -32,6 +32,7 @@ fn scratch_repo(dir: &Path) {
     git(dir, &["config", "user.name", "Rat"]);
     std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
     std::fs::create_dir_all(dir.join(".rk/workflows")).unwrap();
+    std::fs::write(dir.join(".rk/repo.cue"), "repo: {}\n").unwrap();
     std::fs::write(
         dir.join(".rk/workflows/authority-probe.cue"),
         r#"workflow: {

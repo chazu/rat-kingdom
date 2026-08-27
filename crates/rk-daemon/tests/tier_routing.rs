@@ -78,6 +78,7 @@ async fn tickets_route_to_their_cost_tier() {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
 
     let repo_name = repo_dir
         .path()
@@ -95,6 +96,7 @@ async fn tickets_route_to_their_cost_tier() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // A mechanical-labelled ticket → cheap tier; a high-priority one → premium.
     let mech = client
@@ -215,6 +217,7 @@ async fn spawn_step_reviewer_routes_to_its_cost_tier() {
     std::fs::write(repo_dir.path().join("README.md"), "# x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
 
     let wf_dir = repo_dir.path().join(".rk").join("workflows");
     std::fs::create_dir_all(&wf_dir).unwrap();
@@ -229,6 +232,7 @@ async fn spawn_step_reviewer_routes_to_its_cost_tier() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(

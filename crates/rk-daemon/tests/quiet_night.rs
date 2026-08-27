@@ -45,6 +45,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
     support::install_passing_landing_checks(dir);
 }
 
@@ -120,6 +121,7 @@ async fn quiet_night_completes_and_still_runs_the_phase_after_the_drain() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // Deliberately no tickets: this is the quiet night.
     let started = client
@@ -189,6 +191,7 @@ async fn wait_all_without_a_for_each_is_still_an_error() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let started = client
         .call(

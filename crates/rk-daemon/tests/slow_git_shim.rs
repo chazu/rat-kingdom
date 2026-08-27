@@ -55,6 +55,7 @@ fn scratch_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 }
 
 /// Real `git` binary, resolved before PATH is shimmed so the shim has
@@ -152,6 +153,7 @@ async fn unrelated_rpc_stays_responsive_during_slow_git_completions() {
     let daemon = Daemon::new_in_memory(layout.clone(), "slow-git-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     const N: usize = 3;
     let mut names = Vec::new();

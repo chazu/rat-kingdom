@@ -67,6 +67,7 @@ fn scratch_repo(dir: &Path) {
     std::fs::write(dir.join("f"), "x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 }
 
 fn tiny_sweep_config() -> rk_core::config::SupervisorConfig {

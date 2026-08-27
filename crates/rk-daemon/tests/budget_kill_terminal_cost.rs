@@ -6,6 +6,8 @@
 //! always carried the true number; the archived agent record did not
 //! (observed live: Wensleydale-7 recorded $3.85 vs $20.04 actual).
 
+mod support;
+
 use rk_core::paths::Layout;
 use rk_daemon::{Client, Daemon};
 use rk_ledger::Budget;
@@ -65,6 +67,7 @@ async fn budget_killed_terminal_record_keeps_the_true_cost() {
     std::fs::write(repo_dir.path().join("f"), "x\n").unwrap();
     git(repo_dir.path(), &["add", "."]);
     git(repo_dir.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_dir.path());
 
     std::env::set_var("RK_FAKE_HARNESS_CMD", RUNAWAY_THEN_UNDERREPORTS_ON_KILL);
     let layout = Layout::at(home.path());
@@ -83,6 +86,7 @@ async fn budget_killed_terminal_record_keeps_the_true_cost() {
     .unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let spawned = client
         .call(

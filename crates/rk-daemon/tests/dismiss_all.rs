@@ -142,6 +142,7 @@ async fn dismiss_all_only_clean_merges_clean_parks_failed() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // One clean ticket and one that fails (its body carries the FAIL marker the
     // fake harness keys on). The clean rat's branch should merge; the failed
@@ -258,6 +259,7 @@ async fn dismiss_all_merges_every_fanout_branch() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // Two ready tickets in this repo → two fanned-out rats → two branches.
     for title in ["add caching", "fix pagination"] {

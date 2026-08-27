@@ -50,6 +50,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# recovery continuation fixture\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 }
 
 fn executable(path: &Path, body: &str) {
@@ -337,6 +338,7 @@ async fn continue_recovery_routes_to_a_real_alternate_harness_across_a_daemon_re
     layout.ensure().unwrap();
     let handle_a = tokio::spawn(daemon(&layout).run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let spawned = client
         .call(
@@ -452,6 +454,7 @@ async fn abandoned_recovery_stays_terminal_across_a_restart_under_a_live_respawn
     layout.ensure().unwrap();
     let handle_a = tokio::spawn(daemon(&layout).run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let spawned = client
         .call(
@@ -557,6 +560,7 @@ async fn continue_recovery_resumes_the_same_provider_across_a_restart_with_budge
     };
     let handle_a = tokio::spawn(daemon_with_budget(&layout, budget).run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let spawned = client
         .call(

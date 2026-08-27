@@ -47,6 +47,7 @@ fn init_repo(dir: &Path) {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 }
 
 /// Commits `.rk/checks.cue` onto `main` before any branch forks off it, so
@@ -334,6 +335,7 @@ async fn concurrent_duplicate_land_submissions_produce_one_live_landing_entry() 
     let daemon = Daemon::new_in_memory(layout.clone(), "dedup-castle".into()).unwrap();
     let handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, &repo).await;
 
     let ticket = client
         .call(

@@ -70,6 +70,7 @@ fn init_repo() -> tempfile::TempDir {
     std::fs::write(repo.path().join("README.md"), "# x\n").unwrap();
     git(repo.path(), &["add", "."]);
     git(repo.path(), &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo.path());
 
     let wf_dir = repo.path().join(".rk").join("workflows");
     std::fs::create_dir_all(&wf_dir).unwrap();
@@ -155,6 +156,7 @@ async fn prune_clears_a_failed_instance_and_round_trips() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo.path()).await;
 
     let failed = run(&mut client, repo.path(), "flops").await;
     wait_status(&mut client, &failed, "failed").await;
@@ -299,6 +301,7 @@ async fn pruned_instance_stays_pruned_across_a_restart() {
     let daemon_a = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let handle_a = tokio::spawn(daemon_a.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo.path()).await;
     let failed = run(&mut client, repo.path(), "flops").await;
     wait_status(&mut client, &failed, "failed").await;
     client
@@ -330,6 +333,7 @@ async fn pruned_instance_stays_pruned_across_a_restart() {
     let daemon_b = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle_b = tokio::spawn(daemon_b.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo.path()).await;
 
     assert!(
         list(&mut client, json!({})).await.is_empty(),
@@ -399,6 +403,7 @@ async fn agent_prune_sweeps_settled_instances_too() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo.path()).await;
 
     let failed = run(&mut client, repo.path(), "flops").await;
     let completed = run(&mut client, repo.path(), "works").await;

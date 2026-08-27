@@ -56,6 +56,7 @@ fn init_repo(dir: &Path) -> String {
     std::fs::write(dir.join("README.md"), "# x\n").unwrap();
     git(dir, &["add", "."]);
     git(dir, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
     dir.file_name().unwrap().to_string_lossy().to_string()
 }
 
@@ -210,6 +211,7 @@ async fn spawn_verify_holder(
     repo_dir: &Path,
     task: &str,
 ) -> (String, std::path::PathBuf) {
+    support::register_repo(client, repo_dir).await;
     let spawned = client
         .call(
             "agent.spawn",

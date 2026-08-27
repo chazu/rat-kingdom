@@ -80,6 +80,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done","ses
 /// Spawn a ticket-dispatched rat, wait for completion, dismiss (auto-merge).
 /// Returns (agent name, ticket id).
 async fn merge_one_rat(client: &mut Client, repo: &Path) -> (String, String) {
+    support::register_repo(client, repo).await;
     let ticket = client
         .call(
             "ticket.new",

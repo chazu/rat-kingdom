@@ -249,6 +249,7 @@ async fn concurrent_instances_each_route_on_their_own_approval_decision() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     // Both gated runs in flight at once — two operators' worth of pending work
     // on one repo, which is the ordinary state of a busy castle, not an edge
@@ -341,6 +342,7 @@ async fn an_unbound_approval_read_still_takes_the_newest_strangers_decision() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let approved = run_to_gate(&mut client, repo_dir.path()).await;
     let rejected = run_to_gate(&mut client, repo_dir.path()).await;

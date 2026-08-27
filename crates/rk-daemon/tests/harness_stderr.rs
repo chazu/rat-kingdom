@@ -32,6 +32,7 @@ fn scratch_repo(dir: &std::path::Path) {
     std::fs::write(dir.join("README.md"), "# scratch\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-m", "init"]);
+    support::install_default_repository_policy(dir);
 }
 
 /// One script for both shapes, branching on `RK_TASK` (mirrors
@@ -95,6 +96,7 @@ async fn stderr_lines_are_tagged_in_the_agent_log() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let spawned = client
         .call(
@@ -151,6 +153,7 @@ async fn silent_death_folds_stderr_into_the_published_result() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let spawned = client
         .call(
@@ -229,6 +232,7 @@ async fn stderr_ordering_never_races_exited() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     const RUNS: usize = 12;
     let mut names = Vec::with_capacity(RUNS);
@@ -298,6 +302,7 @@ async fn respawn_clears_the_previous_generations_stderr_tail() {
     let daemon = Daemon::new_in_memory(layout.clone(), "test-castle".into()).unwrap();
     let _handle = tokio::spawn(daemon.run());
     let mut client = connect(&layout).await;
+    support::register_repo(&mut client, repo_dir.path()).await;
 
     let spawned = client
         .call(

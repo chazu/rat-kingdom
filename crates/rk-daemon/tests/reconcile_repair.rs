@@ -75,6 +75,7 @@ fn init_repo(repo_path: &Path) -> String {
     std::fs::write(repo_path.join("README.md"), "# x\n").unwrap();
     git(repo_path, &["add", "."]);
     git(repo_path, &["commit", "-m", "init"]);
+    support::install_default_repository_policy(repo_path);
     std::fs::write(repo_path.join("README.md"), "# x, delivered\n").unwrap();
     git(repo_path, &["commit", "-am", "delivered work"]);
     git(repo_path, &["rev-parse", "HEAD"])
