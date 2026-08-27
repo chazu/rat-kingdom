@@ -27,6 +27,43 @@ rk ping                                    # auto-starts the daemon → "pong"
 Everything lives under `~/.rat-kingdom/` (override with `RK_HOME`): config,
 tuplespace db, worktrees, logs, workflow definitions, sync state.
 
+## Daily operator loop
+
+Start with one command:
+
+```bash
+rk work                         # all registered repos
+rk work rat-kingdom             # one repo
+rk --json work rat-kingdom      # same exact counts and rows for scripts
+```
+
+It reports installed/daemon build parity, live rats, ready tickets, and only
+bounded human attention that has one supported, idempotent resolving command.
+Run the command printed under a row, then run `rk work` again; a successful
+resolution removes that row. `rk inbox`, `rk reconcile`, `rk attention`, and
+`rk top` remain the broad diagnostic surfaces for history, open-ended choices,
+and control-loop internals.
+
+A ready ticket can reach landed-and-clean in four operator commands (often
+three when the landing workflow is automatic):
+
+```bash
+rk work rat-kingdom
+rk spawn --ticket TKT-...                   # prints the rat and branch
+rk land rat/<rat>/<task> --repo rat-kingdom # omit when its workflow lands it
+rk work rat-kingdom                         # confirms the current state
+```
+
+King wakes are durable notification transport, not a second work queue. Daily
+operation requires no wake id or wake phase knowledge, and settling a wake does
+not mean the ticket backlog or `rk work` is empty. Use the `rk king ...`
+commands below only to administer or diagnose the delegate itself.
+
+Repository-owned CUE remains the policy authority throughout this shorter
+journey. `.rk/repo.cue`, `.rk/checks.cue`, `.rk/triggers.cue`, schedules, and
+named non-agentic checks still decide validation and automation; `rk work`
+changes presentation and explicit human disposition only.
+
 ## Factory Foreman
 
 Factory Foreman provides a Rust-native read-only dashboard plus daemon snapshots/events, structured-source-only self-optimization scorecards and advisory recommendations, five local stdio MCP tools, and digest-bound typed `workflow.run` proposals whose execution authority remains in the daemon. Open the operator dashboard with:

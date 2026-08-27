@@ -102,6 +102,15 @@ pub const DISPOSITION_DEFER_TO_HUMAN: &str = "defer_to_human";
 /// `DEFER_TO_HUMAN` disposition.
 pub const ACTION_DEFER_TO_HUMAN: &str = "attention.defer_to_human";
 
+/// Explicit human disposition for a Human-authority contradiction the
+/// operator has judged irrelevant or intentionally accepted. This settles
+/// only the exact attention item; it never mutates the repository fact or
+/// weakens the CUE policy that surfaced it.
+pub const ACTION_INVALIDATE: &str = "attention.invalidate";
+
+/// Stable journal identity for a local human operator decision.
+pub const DECIDED_BY_HUMAN: &str = "human-operator";
+
 /// `decided_by` recorded on a decision journal entry for a mechanical
 /// repair, which acts with no LLM/orchestrator session in the loop at all.
 pub const DECIDED_BY_MECHANICAL: &str = "mechanical";

@@ -73,3 +73,40 @@ from 3 to 1, successful delivery-finalization call sites from 4 to 1, and
 production CUE-plan resolution call sites from 2 to 1. Operator, workflow,
 automatic, dismiss, dismiss-all, and batch merge delivery now converge on the
 same durable candidate and finalizer.
+
+## Current-work operator surface
+
+`rk work [repo]` is the daily read model. It composes the existing daemon
+status, live-agent registry, ready-ticket query, inbox, reconciliation report,
+and decision journal; it owns no lifecycle state of its own.
+
+- Text and JSON both report installed/daemon build parity and exact counts for
+  the rows they return.
+- `attention` admits only bounded rows with one supported, idempotent command:
+  failed/orphaned or retry-exhausted rats (`rk respawn`), durable recovery
+  notices (`rk inbox ack`), mechanical convergence repair (`rk attention
+  decide`), and an explicit Human-authority invalidation (`rk attention
+  invalidate`).
+- Advice, open-ended needs, two-way workflow approvals, forge review, unlanded
+  branches, queue-stall diagnostics, and Orchestrator-authority work remain in
+  `rk inbox`, `rk reconcile`, or `rk attention`; they are not mislabeled as a
+  one-command human resolution.
+- `rk attention invalidate` records one terminal, exact-violation human
+  decision. It changes neither ticket/repository facts nor CUE policy. Replays
+  return the same durable decision, and the settled item leaves current work.
+- Empty output says `no current work` and points to `rk digest --since 1d` and
+  `rk top`. Settled workflow failures and settled wakes remain history.
+- King wakes remain durable at-least-once notification transport. Ordinary
+  operation requires no wake id or phase, and settling a wake never implies
+  this independently rebuilt current-work view is empty.
+
+Compatibility mapping: `rk list` remains the detailed agent registry, `rk
+ticket ready` remains the detailed ready query, `rk inbox` remains broad human
+triage, `rk reconcile`/`rk attention` retain authority and cursor diagnostics,
+and `rk king status` retains wake lifecycle diagnostics. Their JSON contracts
+are unchanged; `rk --json work` is an additive composed view.
+
+The short manual delivery journey is `rk work` -> `rk spawn --ticket` -> `rk
+land` (when the selected workflow does not land automatically) -> `rk work`.
+Landing still resolves the repository's activated CUE plan and runs its named
+checks before target advancement.

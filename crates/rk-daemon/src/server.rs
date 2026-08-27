@@ -124,6 +124,27 @@ where
         .expect("convergence action task is present")
 }
 
+fn current_inbox_resolution(mut item: Value) -> Option<Value> {
+    let kind = item.get("kind")?.as_str()?;
+    let action = item.get("action")?.as_str()?;
+    let supported = match kind {
+        "agent-failed" | "agent-orphaned" => action.starts_with("rk respawn "),
+        // A transport outage still in automatic retry is diagnostic only;
+        // the exhausted form's action changes to the bounded respawn command.
+        "transport-outage" => action.starts_with("rk respawn "),
+        "recovery-action" => action.starts_with("rk inbox ack "),
+        _ => false,
+    };
+    if !supported {
+        return None;
+    }
+    let fields = item.as_object_mut()?;
+    let command = fields.remove("action")?;
+    fields.insert("source".into(), json!("inbox"));
+    fields.insert("command".into(), command);
+    Some(item)
+}
+
 /// Bound every leaf in a King pull/checkpoint. Counts alone are insufficient:
 /// one operator-authored tuple field may itself approach the request frame
 /// ceiling. The full resource remains available through its native RPC.
@@ -206,6 +227,61 @@ async fn convergence_action_panic_is_observed_without_panicking_the_scheduler() 
         isolate_convergence_action(async { 9usize }).await.unwrap(),
         9
     );
+}
+
+#[cfg(test)]
+#[test]
+fn current_work_only_admits_single_supported_resolutions() {
+    let row = |kind: &str, action: &str| json!({"kind": kind, "action": action});
+    for (kind, action) in [
+        ("agent-failed", "rk respawn Tails"),
+        ("agent-orphaned", "rk respawn Tails"),
+        ("transport-outage", "rk respawn Tails"),
+        ("recovery-action", "rk inbox ack 01M10ABC"),
+    ] {
+        let current = current_inbox_resolution(row(kind, action)).unwrap();
+        assert_eq!(current["source"], "inbox");
+        assert_eq!(current["command"], action);
+        assert!(current.get("action").is_none());
+    }
+    for (kind, action) in [
+        ("workflow-failed", "rk workflow status wf-1"),
+        ("workflow-gate", "rk approve wf-1 | rk reject wf-1"),
+        (
+            "awaiting-review",
+            "review & merge: https://example.invalid/1",
+        ),
+        ("transport-outage", "rk status Tails"),
+        ("landing-queue-stalled", "rk status --json"),
+    ] {
+        assert!(
+            current_inbox_resolution(row(kind, action)).is_none(),
+            "{kind} is diagnostic or unbounded, not one-command attention"
+        );
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn empty_current_work_has_exact_zero_counts_and_diagnostic_pointers() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::new(Layout::at(dir.path()), &rk_core::config::Config::default()).unwrap();
+
+    let work = daemon.current_work_value(None).await.unwrap();
+
+    assert_eq!(work["counts"]["live_agents"], 0);
+    assert_eq!(work["counts"]["ready_tickets"], 0);
+    assert_eq!(work["counts"]["attention"], 0);
+    assert_eq!(work["live_agents"].as_array().unwrap().len(), 0);
+    assert_eq!(work["ready_tickets"].as_array().unwrap().len(), 0);
+    assert_eq!(work["attention"].as_array().unwrap().len(), 0);
+    assert_eq!(work["no_current_work"], true);
+    assert_eq!(work["history_command"], "rk digest --since 1d");
+    assert_eq!(work["diagnostics_command"], "rk top");
+    assert!(work["wake_note"]
+        .as_str()
+        .unwrap()
+        .contains("not the work itself"));
 }
 
 type FactVoteKey = (String, String, String);
@@ -1977,6 +2053,7 @@ impl Daemon {
                 | "ticket.dep"
                 | "ticket.reopen"
                 | "reconcile.repair"
+                | "attention.invalidate"
                 | "king.spawn"
                 | "king.register"
                 | "king.dismiss"
@@ -2712,6 +2789,7 @@ impl Daemon {
                 reply(self.handle_named(req, |sup, name| sup.unarchive_agent(&name)))
             }
             "budget.rollup" => reply(Response::ok(id, self.supervisor.fleet_rollup())),
+            "work.current" => reply(self.handle_current_work(req).await),
             "inbox.list" => reply(self.handle_inbox(req).await),
             "inbox.ack" => reply(self.handle_inbox_ack(req)),
             "reconcile.report" => reply(self.handle_reconcile(req).await),
@@ -2720,6 +2798,7 @@ impl Daemon {
             "lease.renew" => reply(self.handle_lease_renew(req).await),
             "attention.next" => reply(self.handle_attention_next(req).await),
             "attention.decide" => reply(self.handle_attention_decide(req).await),
+            "attention.invalidate" => reply(self.handle_attention_invalidate(req).await),
             "king.spawn" => reply(self.handle_king_spawn(req).await),
             "king.register" => reply(self.handle_king_register(req).await),
             "king.dismiss" => reply(self.handle_king_dismiss(req).await),
@@ -3760,6 +3839,149 @@ impl Daemon {
         }
     }
 
+    /// `work.current` — the ordinary operator read model. This deliberately
+    /// composes existing authoritative views instead of inventing a new
+    /// lifecycle store: tickets remain tickets, agent generations remain in
+    /// the registry, repository contradictions remain reconciliation facts,
+    /// and repo-owned CUE remains the validation/trigger/schedule authority.
+    async fn handle_current_work(&self, req: Request) -> Response {
+        let params: CurrentWorkParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        match self.current_work_value(params.repo).await {
+            Ok(value) => Response::ok(req.id, value),
+            Err(error) => Response::err(req.id, codes::INTERNAL, error.to_string()),
+        }
+    }
+
+    async fn current_work_value(&self, requested_repo: Option<String>) -> rk_core::Result<Value> {
+        let repo = match requested_repo {
+            Some(repo) => self.resolve_inbox_repo(Some(repo))?,
+            None => None,
+        };
+
+        let live_agents = self
+            .supervisor
+            .list()
+            .into_iter()
+            .filter(|agent| agent.state.is_live())
+            .filter(|agent| repo.as_deref().is_none_or(|repo| agent.repo_name == repo))
+            .map(|agent| {
+                json!({
+                    "name": agent.name,
+                    "generation": agent.spawn_id(),
+                    "repo": agent.repo_name,
+                    "role": agent.role,
+                    "state": agent.state,
+                    "task": agent.task,
+                    "updated_at": agent.updated_at,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let ready_tickets = self
+            .tickets
+            .ready(repo.clone())?
+            .into_iter()
+            .map(|ticket| {
+                json!({
+                    "id": ticket.identity,
+                    "repo": ticket.scope,
+                    "title": ticket.payload["title"],
+                    "priority": ticket.payload["priority"],
+                    "labels": ticket.payload["labels"],
+                    "command": format!("rk spawn --ticket {}", ticket.identity),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut inbox = self.inbox_value(repo.clone()).await?;
+        let mut inbox_rows = inbox["items"]
+            .as_array_mut()
+            .map(std::mem::take)
+            .unwrap_or_default();
+        // `rk inbox` intentionally remains the broad diagnostic surface. The
+        // daily view is narrower: only rows whose existing action is one
+        // supported, bounded, replay-safe resolution belong under
+        // "attention". Advice, external git/forge work, open-ended needs,
+        // and two-way approval choices remain visible in `rk inbox` without
+        // pretending they are one-command work.
+        inbox_rows = inbox_rows
+            .into_iter()
+            .filter_map(current_inbox_resolution)
+            .collect();
+
+        let registered_repos = self
+            .repos
+            .lock()
+            .map_err(|_| rk_core::Error::other("repo registry lock poisoned"))?
+            .list();
+        let mut convergence_rows = Vec::new();
+        for registered in registered_repos {
+            if repo
+                .as_deref()
+                .is_some_and(|selected| selected != registered.name)
+            {
+                continue;
+            }
+            let report = self.reconcile_report(registered.name.clone()).await?;
+            for violation in &report.violations {
+                // A terminal journal decision settles this exact item even if
+                // the underlying fact remains deliberately accepted. The raw
+                // report and decision stay queryable for diagnostics.
+                if self.find_decision(&report.scope, &violation.id)?.is_some() {
+                    continue;
+                }
+                let effective_authority = self.authority_policy.effective_authority(violation);
+                let command = match effective_authority {
+                    crate::reconcile::Authority::Mechanical => {
+                        format!("rk attention decide {} {}", report.scope, violation.id)
+                    }
+                    // Orchestrator work belongs to the King control loop, not
+                    // the human's daily attention count. It remains visible
+                    // through `rk attention next` and `rk reconcile`.
+                    crate::reconcile::Authority::Orchestrator => continue,
+                    crate::reconcile::Authority::Human => {
+                        format!("rk attention invalidate {} {}", report.scope, violation.id)
+                    }
+                };
+                let item = crate::attention::AttentionItem {
+                    violation: violation.clone(),
+                    effective_authority,
+                };
+                let mut row = serde_json::to_value(item)?;
+                row["source"] = json!("reconcile");
+                row["repo"] = json!(report.scope);
+                row["command"] = json!(command);
+                convergence_rows.push(row);
+            }
+        }
+
+        let mut attention = inbox_rows;
+        attention.extend(convergence_rows);
+        let counts = json!({
+            "live_agents": live_agents.len(),
+            "ready_tickets": ready_tickets.len(),
+            "attention": attention.len(),
+        });
+        let no_current_work =
+            live_agents.is_empty() && ready_tickets.is_empty() && attention.is_empty();
+        Ok(json!({
+            "generated_at": (self.request_clock)(),
+            "repo": repo,
+            "daemon": self.status(),
+            "counts": counts,
+            "live_agents": live_agents,
+            "ready_tickets": ready_tickets,
+            "attention": attention,
+            "no_current_work": no_current_work,
+            "history_command": "rk digest --since 1d",
+            "diagnostics_command": "rk top",
+            "wake_note": "King wakes are durable notifications, not the work itself; settling a wake does not imply this current work view is empty.",
+        }))
+    }
+
     /// `inbox.ack` (B2) — durably close out a `recovery-action` inbox row so
     /// the re-notify sweep (`crate::recovery::renotify_sweep`) stops pushing
     /// it. Sink-agnostic by design: this is the one path a human `rk inbox
@@ -4591,9 +4813,121 @@ impl Daemon {
         if let Err(e) = self.heal_dangling_defer_at_cursor(&report.scope, cursor.as_deref()) {
             return Response::err(req.id, codes::INTERNAL, e.to_string());
         }
-        let item =
-            crate::attention::next_attention(&report, &self.authority_policy, cursor.as_deref());
+        let item = match self.next_unsettled_attention(&report, cursor.as_deref()) {
+            Ok(item) => item,
+            Err(error) => return Response::err(req.id, codes::INTERNAL, error.to_string()),
+        };
         Response::ok(req.id, json!({"repo": report.scope, "item": item}))
+    }
+
+    /// Skip terminal journal decisions as well as the lease cursor. This is
+    /// what makes an explicit human invalidation disappear from the live
+    /// queue while leaving both the raw contradiction and its audit record
+    /// available in diagnostics.
+    fn next_unsettled_attention(
+        &self,
+        report: &crate::reconcile::ConvergenceReport,
+        cursor: Option<&str>,
+    ) -> rk_core::Result<Option<crate::attention::AttentionItem>> {
+        let mut after = cursor.map(str::to_string);
+        loop {
+            let Some(item) =
+                crate::attention::next_attention(report, &self.authority_policy, after.as_deref())
+            else {
+                return Ok(None);
+            };
+            if self
+                .find_decision(&report.scope, &item.violation.id)?
+                .is_none()
+            {
+                return Ok(Some(item));
+            }
+            after = Some(item.violation.id);
+        }
+    }
+
+    /// Explicitly settle one Human-authority attention item without changing
+    /// the fact that raised it. This is the human operator's "that item is no
+    /// longer relevant" control: durable, exact-item scoped, and idempotent.
+    async fn handle_attention_invalidate(&self, req: Request) -> Response {
+        let params: AttentionInvalidateParams = match parse_params(&req.params) {
+            Ok(params) => params,
+            Err(error) => return Response::err(req.id, codes::BAD_PARAMS, error),
+        };
+        match self.attention_invalidate(params).await {
+            Ok(value) => Response::ok(req.id, value),
+            Err(AttentionDecideError::Refused(message)) => {
+                Response::err(req.id, codes::FORBIDDEN, message)
+            }
+            Err(AttentionDecideError::BadParams(message)) => {
+                Response::err(req.id, codes::BAD_PARAMS, message)
+            }
+            Err(AttentionDecideError::Internal(message)) => {
+                Response::err(req.id, codes::INTERNAL, message)
+            }
+        }
+    }
+
+    async fn attention_invalidate(
+        &self,
+        params: AttentionInvalidateParams,
+    ) -> Result<Value, AttentionDecideError> {
+        let repo = self
+            .resolve_inbox_repo(Some(params.repo.clone()))
+            .map_err(|error| AttentionDecideError::Internal(error.to_string()))?
+            .ok_or_else(|| AttentionDecideError::BadParams("repo is required".into()))?;
+        if let Some(existing) = self
+            .find_decision(&repo, &params.item)
+            .map_err(|error| AttentionDecideError::Internal(error.to_string()))?
+        {
+            return Ok(json!({"resolved": true, "replay": true, "decision": existing}));
+        }
+        let report = self
+            .reconcile_report(repo.clone())
+            .await
+            .map_err(|error| AttentionDecideError::Internal(error.to_string()))?;
+        let Some(violation) = report.violations.iter().find(|v| v.id == params.item) else {
+            // The contradiction already self-cleared. Treat a repeated human
+            // intent as success without inventing a decision record for a
+            // fact that no longer exists.
+            return Ok(json!({
+                "resolved": true,
+                "replay": true,
+                "decision": Value::Null,
+                "reason": "attention item is no longer current",
+            }));
+        };
+        let authority = self.authority_policy.effective_authority(violation);
+        if authority != crate::reconcile::Authority::Human {
+            return Err(AttentionDecideError::Refused(format!(
+                "{} has effective authority {authority:?}; only Human-authority items may be invalidated",
+                violation.id
+            )));
+        }
+        let reason = params
+            .reason
+            .as_deref()
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or("invalidated by human operator");
+        let outcome = format!("human operator invalidated this current attention item: {reason}");
+        let decision = self
+            .record_decision(
+                &repo,
+                violation,
+                authority,
+                crate::attention::DECIDED_BY_HUMAN,
+                crate::attention::ACTION_INVALIDATE,
+                None,
+                None,
+                None,
+                None,
+                &outcome,
+                true,
+                true,
+                None,
+            )
+            .map_err(|error| AttentionDecideError::Internal(error.to_string()))?;
+        Ok(json!({"resolved": true, "replay": false, "decision": decision}))
     }
 
     /// `attention.decide` — TKT-01M0E8PN9C41BWECGNW0990R3J: resolve one
@@ -10036,6 +10370,12 @@ struct InboxParams {
 }
 
 #[derive(Deserialize)]
+struct CurrentWorkParams {
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct ReconcileParams {
     repo: String,
 }
@@ -10140,6 +10480,16 @@ struct AttentionDecideParams {
     /// this. Falls back to generic text derived from the violation if
     /// omitted.
     resolving_action: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AttentionInvalidateParams {
+    repo: String,
+    item: String,
+    /// Optional audit rationale. The explicit invalidate verb remains a valid
+    /// human decision when omitted, and the journal records that default.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// `attention.decide`'s three failure shapes, mapped to distinct wire error
@@ -11676,6 +12026,23 @@ mod authorize_reasoned_tests {
             json!({"id": "TKT-1", "status": "closed",
                 "reason": {"reason": "stale-rework", "evidence": "TKT-2 done"}}),
         );
+        let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
+        assert!(!allowed);
+        assert_eq!(reason, "operator_only_method");
+    }
+
+    #[test]
+    fn an_ordinary_rat_cannot_invalidate_human_attention() {
+        let (_dir, daemon) = test_daemon_with_role("rat");
+        let token = rk_core::paths::derive_agent_token(&daemon.auth_token, "invalid-rat");
+        let request = Request {
+            id: "1".into(),
+            method: "attention.invalidate".into(),
+            auth: token,
+            caller: "invalid-rat".into(),
+            client_version: None,
+            params: json!({"repo": "repo", "item": "violation"}),
+        };
         let (allowed, reason) = daemon.authorize_reasoned(&request, &groomer_origin());
         assert!(!allowed);
         assert_eq!(reason, "operator_only_method");

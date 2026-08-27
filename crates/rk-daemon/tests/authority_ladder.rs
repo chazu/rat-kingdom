@@ -566,6 +566,72 @@ async fn human_fixture_is_refused_with_zero_mutation_and_no_tuple_written() {
     assert_eq!(before, after_replay);
     let events_after_replay = decision_events(&mut client, &repo_name, &item_id).await;
     assert!(events_after_replay.is_empty());
+
+    // The daily surface turns this otherwise-unbounded human gate into one
+    // explicit, supported disposition command. It does not expose the old
+    // lease/cursor machinery to the operator.
+    let work_before = client
+        .call("work.current", json!({"repo": &repo_name}))
+        .await
+        .unwrap();
+    let current = work_before["attention"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == item_id)
+        .expect("human contradiction must be current actionable attention");
+    assert_eq!(
+        current["command"],
+        format!("rk attention invalidate {repo_name} {item_id}")
+    );
+
+    let invalidated = client
+        .call(
+            "attention.invalidate",
+            json!({
+                "repo": &repo_name,
+                "item": &item_id,
+                "reason": "operator confirmed the historical delivery claim is irrelevant",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalidated["resolved"], true);
+    assert_eq!(invalidated["replay"], false);
+    assert_eq!(invalidated["decision"]["action"], "attention.invalidate");
+    assert_eq!(invalidated["decision"]["terminal"], true);
+    assert_eq!(
+        get_ticket(&mut client, "TKT-HUMAN-1").await,
+        before,
+        "invalidation settles attention only; it must not rewrite the fact"
+    );
+    assert!(
+        attention_next(&mut client, &repo_name).await.is_none(),
+        "terminal invalidation must disappear from the live attention queue"
+    );
+    let work_after = client
+        .call("work.current", json!({"repo": &repo_name}))
+        .await
+        .unwrap();
+    assert!(work_after["attention"].as_array().unwrap().is_empty());
+
+    // Repeating the same disposition replays the one durable record and
+    // never creates a second decision.
+    let replay = client
+        .call(
+            "attention.invalidate",
+            json!({"repo": &repo_name, "item": &item_id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay["resolved"], true);
+    assert_eq!(replay["replay"], true);
+    assert_eq!(
+        decision_events(&mut client, &repo_name, &item_id)
+            .await
+            .len(),
+        1
+    );
 }
 
 // ---------------------------------------------------------------------
